@@ -43,3 +43,29 @@ class FeatureEngineer:
         df["macd"] = ema_12 - ema_26
         df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
         return df
+    
+    @staticmethod
+    def merge_price_sentiment(
+        price_df: pd.DataFrame,
+        sentiment_df: pd.DataFrame
+    ) -> pd.DataFrame:
+
+        price_df = price_df.copy()
+        price_df["date"] = pd.to_datetime(price_df["date"]).dt.date
+
+        sentiment_df = sentiment_df.copy()
+        sentiment_df["date"] = pd.to_datetime(sentiment_df["date"]).dt.date
+
+        merged = pd.merge(
+            price_df,
+            sentiment_df,
+            on="date",
+            how="left"
+        )
+
+        # Fill missing sentiment with neutral values
+        merged["avg_sentiment"] = merged["avg_sentiment"].fillna(0)
+        merged["news_count"] = merged["news_count"].fillna(0)
+        merged["sentiment_std"] = merged["sentiment_std"].fillna(0)
+
+        return merged
