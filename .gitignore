@@ -18,3 +18,11 @@ data/processed/
 
 # OS
 .DS_Store
+# Model artifacts
+models/
+*.pkl
+*.joblib
+
+# HuggingFace cache
+.cache/
+.huggingface/
