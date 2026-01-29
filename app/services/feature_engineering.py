@@ -69,3 +69,17 @@ class FeatureEngineer:
         merged["sentiment_std"] = merged["sentiment_std"].fillna(0)
 
         return merged
+    
+    @staticmethod
+    def create_ml_dataset(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+
+        # Target: next-day direction
+        df["target"] = (df["return"].shift(-1) > 0).astype(int)
+
+        # Lag features
+        df["return_lag1"] = df["return"].shift(1)
+        df["sentiment_lag1"] = df["avg_sentiment"].shift(1)
+
+        df = df.dropna().reset_index(drop=True)
+        return df
