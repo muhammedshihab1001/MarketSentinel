@@ -66,3 +66,35 @@ class SentimentAnalyzer:
 
         sentiment_df = pd.DataFrame(results)
         return pd.concat([df.reset_index(drop=True), sentiment_df], axis=1)
+    
+    def aggregate_daily_sentiment(self, df):
+        if "score" not in df.columns:
+            raise ValueError("DataFrame must contain 'score' column")
+
+        temp_df = df.copy()
+
+        # 🔹 Robust date handling
+        if "published_at" in temp_df.columns:
+            temp_df["date"] = pd.to_datetime(
+                temp_df["published_at"], errors="coerce"
+            ).dt.date
+        else:
+            temp_df["date"] = None
+
+        # 🔹 Fallback: use today's date if missing
+        temp_df["date"] = temp_df["date"].fillna(pd.Timestamp.today().date())
+
+        aggregated = (
+            temp_df
+            .groupby("date")
+            .agg(
+                avg_sentiment=("score", "mean"),
+                news_count=("score", "count"),
+                sentiment_std=("score", "std")
+            )
+            .reset_index()
+        )
+
+        aggregated["sentiment_std"] = aggregated["sentiment_std"].fillna(0)
+
+        return aggregated
