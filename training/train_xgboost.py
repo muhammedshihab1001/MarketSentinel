@@ -15,6 +15,7 @@ from app.services.data_fetcher import StockPriceFetcher
 from app.services.news_fetcher import NewsFetcher
 from app.services.sentiment import SentimentAnalyzer
 from app.services.feature_engineering import FeatureEngineer
+from app.config.features import MODEL_FEATURES
 
 
 MODEL_PATH = "models/xgboost_direction.pkl"
@@ -53,20 +54,20 @@ def load_training_data():
 
 
 def train_model(df: pd.DataFrame):
-    FEATURES = [
-        "return",
-        "volatility",
-        "rsi",
-        "macd",
-        "macd_signal",
-        "avg_sentiment",
-        "news_count",
-        "sentiment_std",
-        "return_lag1",
-        "sentiment_lag1"
-    ]
+    # FEATURES = [
+    #     "return",
+    #     "volatility",
+    #     "rsi",
+    #     "macd",
+    #     "macd_signal",
+    #     "avg_sentiment",
+    #     "news_count",
+    #     "sentiment_std",
+    #     "return_lag1",
+    #     "sentiment_lag1"
+    # ]
 
-    X = df[FEATURES]
+    X = df[MODEL_FEATURES]
     y = df["target"]
 
     X_train, X_test, y_train, y_test = train_test_split(

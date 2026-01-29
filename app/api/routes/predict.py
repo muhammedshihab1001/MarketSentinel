@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from app.services.data_fetcher import StockPriceFetcher
 from app.services.feature_engineering import FeatureEngineer
 from app.services.signal_engine import SignalEngine
+from app.config.features import MODEL_FEATURES
 
 MODEL_PATH = "models/xgboost_direction.pkl"
 
@@ -28,24 +29,25 @@ def predict_stock():
         end_date="2026-01-01"
     )
 
-    # Feature engineering
+    # Feature engineering (same as training)
     price_df = fe.add_returns(price_df)
     price_df = fe.add_volatility(price_df)
     price_df = fe.add_rsi(price_df)
     price_df = fe.add_macd(price_df)
 
+    # Sentiment placeholders (real-time safe)
+    price_df["avg_sentiment"] = 0.0
+    price_df["news_count"] = 0
+    price_df["sentiment_std"] = 0.0
+
+    # Lag features
+    price_df["return_lag1"] = price_df["return"].shift(1)
+    price_df["sentiment_lag1"] = price_df["avg_sentiment"].shift(1)
+
     price_df = price_df.dropna().reset_index(drop=True)
     latest = price_df.iloc[-1:]
 
-    FEATURES = [
-        "return",
-        "volatility",
-        "rsi",
-        "macd",
-        "macd_signal"
-    ]
-
-    X = latest[FEATURES]
+    X = latest[MODEL_FEATURES]
 
     prediction = int(model.predict(X)[0])
     prob_up = float(model.predict_proba(X)[0][1])
