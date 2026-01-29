@@ -1,0 +1,47 @@
+from dataclasses import dataclass
+
+
+@dataclass
+class SignalConfig:
+    prob_threshold: float = 0.60
+    sentiment_threshold: float = 0.10
+    volatility_cap: float = 0.05
+
+
+class SignalEngine:
+    """
+    Converts ML predictions into BUY / SELL / HOLD signals.
+    """
+
+    def __init__(self, config: SignalConfig = SignalConfig()):
+        self.config = config
+
+    def generate_signal(
+        self,
+        prediction: int,
+        prob_up: float,
+        avg_sentiment: float,
+        volatility: float
+    ) -> str:
+
+        # High volatility → HOLD (risk control)
+        if volatility is not None and volatility > self.config.volatility_cap:
+            return "HOLD"
+
+        # BUY condition
+        if (
+            prediction == 1
+            and prob_up >= self.config.prob_threshold
+            and avg_sentiment >= self.config.sentiment_threshold
+        ):
+            return "BUY"
+
+        # SELL condition
+        if (
+            prediction == 0
+            and prob_up <= (1 - self.config.prob_threshold)
+            and avg_sentiment <= -self.config.sentiment_threshold
+        ):
+            return "SELL"
+
+        return "HOLD"
