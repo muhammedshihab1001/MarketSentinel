@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+
+# Data
+data/raw/
+data/processed/
+
+# Models
+*.pkl
+*.h5
+*.pt
+
+# OS
+.DS_Store

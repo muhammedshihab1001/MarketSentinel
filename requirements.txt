@@ -1,0 +1,30 @@
+# Backend
+fastapi
+uvicorn
+
+# Data
+pandas
+numpy
+yfinance
+requests
+feedparser
+
+# ML
+scikit-learn
+xgboost
+torch
+tensorflow
+prophet
+
+# NLP
+transformers
+sentencepiece
+
+# Testing
+pytest
+
+# Monitoring
+prometheus-client
+
+# Utilities
+python-dotenv
