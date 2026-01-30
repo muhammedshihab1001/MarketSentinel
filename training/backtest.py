@@ -30,3 +30,18 @@ def backtest_strategy(df, signal_column="signal"):
         "max_drawdown": float(max_drawdown),
         "sharpe_ratio": float(sharpe)
     }
+
+def signal_hit_rate(df, signal_column="signal"):
+    df = df.copy()
+    df["future_return"] = df["close"].shift(-1) / df["close"] - 1
+
+    hits = df[
+        ((df[signal_column] == "BUY") & (df["future_return"] > 0)) |
+        ((df[signal_column] == "SELL") & (df["future_return"] < 0))
+    ]
+
+    total_signals = (df[signal_column].isin(["BUY", "SELL"])).sum()
+
+    return {
+        "hit_rate": len(hits) / total_signals if total_signals > 0 else 0
+    }
