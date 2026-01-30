@@ -10,3 +10,4 @@ httpx
 prometheus-client
 pydantic
 python-dotenv
+torch
