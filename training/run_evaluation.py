@@ -1,20 +1,20 @@
 from training.evaluate import (
     evaluate_xgboost,
     evaluate_lstm,
-    evaluate_prophet,
-    validate_metrics
+    evaluate_prophet
 )
 
-# Example dummy values (replace with real outputs)
-xgb_metrics = evaluate_xgboost([1,0,1,1], [1,0,0,1])
-lstm_metrics = evaluate_lstm([180,182,181], [179,183,180])
-prophet_metrics = evaluate_prophet(
-    actual=[180,181,182],
-    predicted=[179,182,183]
-)
+def main():
+    xgb_metrics = evaluate_xgboost()
+    lstm_metrics = evaluate_lstm()
+    prophet_metrics = evaluate_prophet()
 
-validate_metrics(xgb_metrics)
-validate_metrics(lstm_metrics)
-validate_metrics(prophet_metrics)
+    # Quality gates
+    assert xgb_metrics["accuracy"] >= 0.55
+    assert lstm_metrics["mae"] <= 5.0
+    assert prophet_metrics["mae"] <= 6.0
 
-print("All model metrics passed quality gates")
+    print("All model quality checks passed")
+
+if __name__ == "__main__":
+    main()
