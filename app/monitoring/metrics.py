@@ -1,41 +1,35 @@
 from prometheus_client import Counter, Histogram, Gauge
 
-# -----------------------------
-# API METRICS
-# -----------------------------
-
 REQUEST_COUNT = Counter(
-    "api_requests_total",
-    "Total number of API requests",
+    "http_requests_total",
+    "Total HTTP requests",
     ["endpoint"]
 )
 
 REQUEST_LATENCY = Histogram(
-    "api_request_latency_seconds",
-    "Latency of API requests",
+    "http_request_latency_seconds",
+    "HTTP request latency",
     ["endpoint"]
 )
 
 ERROR_COUNT = Counter(
-    "api_errors_total",
-    "Total number of API errors",
+    "http_errors_total",
+    "Total HTTP errors",
     ["endpoint"]
 )
 
-# -----------------------------
-# MODEL METRICS
-# -----------------------------
-
 PREDICTION_COUNT = Counter(
-    "model_predictions_total",
-    "Total number of model predictions",
-    ["signal"]
+    "predictions_total",
+    "Total predictions made",
+    ["ticker"]
 )
 
 AVG_CONFIDENCE = Gauge(
-    "model_avg_confidence",
-    "Average prediction confidence"
+    "prediction_confidence",
+    "Average prediction confidence",
+    ["ticker"]
 )
+
 
 # -----------------------------
 # DATA QUALITY METRICS

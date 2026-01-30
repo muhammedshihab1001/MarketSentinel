@@ -1,7 +1,7 @@
-from fastapi import FastAPI
-from app.api.routes import health, predict
+from fastapi import FastAPI, Response
 from prometheus_client import generate_latest
-from fastapi import Response
+
+from app.api.routes import health, predict
 
 app = FastAPI(
     title="MarketSentinel API",
@@ -9,9 +9,36 @@ app = FastAPI(
     version="1.0.0"
 )
 
-app.include_router(health.router, prefix="/health", tags=["Health"])
-app.include_router(predict.router, prefix="/predict", tags=["Prediction"])
+# ---------------------------
+# Routers
+# ---------------------------
+app.include_router(
+    health.router,
+    prefix="/health",
+    tags=["Health"]
+)
 
+app.include_router(
+    predict.router,
+    prefix="",          # IMPORTANT: no double prefix
+    tags=["Prediction"]
+)
+
+# ---------------------------
+# Root endpoint (optional but good)
+# ---------------------------
+@app.get("/")
+def root():
+    return {
+        "service": "MarketSentinel API",
+        "status": "running",
+        "docs": "/docs",
+        "metrics": "/metrics"
+    }
+
+# ---------------------------
+# Prometheus metrics endpoint
+# ---------------------------
 @app.get("/metrics")
 def metrics():
     return Response(

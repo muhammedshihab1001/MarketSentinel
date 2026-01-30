@@ -1,67 +1,89 @@
-import joblib
-import pandas as pd
+from fastapi import APIRouter
+import time
 
-from fastapi import APIRouter, HTTPException
-from app.services.data_fetcher import StockPriceFetcher
-from app.services.feature_engineering import FeatureEngineer
-from app.services.signal_engine import SignalEngine
-from app.config.features import MODEL_FEATURES
-
-MODEL_PATH = "models/xgboost_direction.pkl"
+from app.models.model_loader import ModelLoader
+from app.models.lstm_model import forecast_lstm
+from app.models.prophet_model import forecast_prophet
+from app.services.signal_engine import SignalEngine, fuse_decision
+from app.monitoring.metrics import (
+    REQUEST_COUNT,
+    REQUEST_LATENCY,
+    ERROR_COUNT,
+    PREDICTION_COUNT,
+    AVG_CONFIDENCE
+)
 
 router = APIRouter()
 
-fetcher = StockPriceFetcher()
-fe = FeatureEngineer()
-signal_engine = SignalEngine()
+models = ModelLoader()
+engine = SignalEngine()
 
-@router.get("/")
-def predict_stock():
+@router.get("/full-prediction")
+def full_prediction():
+    start_time = time.time()
+
+    REQUEST_COUNT.labels(endpoint="/full-prediction").inc()
+
     try:
-        model = joblib.load(MODEL_PATH)
-    except Exception:
-        raise HTTPException(status_code=500, detail="Model not available")
+        # -----------------------------
+        # XGBoost result (placeholder)
+        # -----------------------------
+        prediction = 1        # 1 = UP, 0 = DOWN
+        prob_up = 0.6
+        avg_sentiment = 0.25
+        volatility = 0.03
 
-    # Fetch recent data
-    price_df = fetcher.fetch(
-        ticker="AAPL",
-        start_date="2025-01-01",
-        end_date="2026-01-01"
-    )
+        # -----------------------------
+        # Base signal
+        # -----------------------------
+        base_signal = engine.generate_signal(
+            prediction=prediction,
+            prob_up=prob_up,
+            avg_sentiment=avg_sentiment,
+            volatility=volatility
+        )
 
-    # Feature engineering (same as training)
-    price_df = fe.add_returns(price_df)
-    price_df = fe.add_volatility(price_df)
-    price_df = fe.add_rsi(price_df)
-    price_df = fe.add_macd(price_df)
+        # -----------------------------
+        # LSTM forecast
+        # -----------------------------
+        recent_prices = [[p] for p in range(100, 160)]
+        lstm_prices = forecast_lstm(
+            models.lstm,
+            models.lstm_scaler,
+            recent_prices
+        )
 
-    # Sentiment placeholders (real-time safe)
-    price_df["avg_sentiment"] = 0.0
-    price_df["news_count"] = 0
-    price_df["sentiment_std"] = 0.0
+        # -----------------------------
+        # Prophet forecast
+        # -----------------------------
+        prophet_out = forecast_prophet(models.prophet)
 
-    # Lag features
-    price_df["return_lag1"] = price_df["return"].shift(1)
-    price_df["sentiment_lag1"] = price_df["avg_sentiment"].shift(1)
+        # -----------------------------
+        # Final fused decision
+        # -----------------------------
+        final_signal = fuse_decision(
+            direction_signal=base_signal,
+            prob_up=prob_up,
+            lstm_prices=lstm_prices,
+            prophet_trend=prophet_out["trend"]
+        )
 
-    price_df = price_df.dropna().reset_index(drop=True)
-    latest = price_df.iloc[-1:]
+        latency = time.time() - start_time
+        REQUEST_LATENCY.labels(endpoint="/full-prediction").observe(latency)
+        PREDICTION_COUNT.labels(ticker="AAPL").inc()
+        AVG_CONFIDENCE.labels(ticker="AAPL").set(prob_up)
 
-    X = latest[MODEL_FEATURES]
 
-    prediction = int(model.predict(X)[0])
-    prob_up = float(model.predict_proba(X)[0][1])
+        return {
+            "ticker": "AAPL",
+            "signal": final_signal,
+            "confidence": prob_up,
+            "details": {
+                "base_signal": base_signal,
+                "prophet_trend": prophet_out["trend"]
+            }
+        }
 
-    signal = signal_engine.generate_signal(
-        prediction=prediction,
-        prob_up=prob_up,
-        avg_sentiment=0.0,   # sentiment integration comes next
-        volatility=float(latest["volatility"].values[0])
-    )
-
-    return {
-        "ticker": "AAPL",
-        "prediction": "UP" if prediction == 1 else "DOWN",
-        "probability_up": round(prob_up, 3),
-        "signal": signal
-    }
+    except Exception as e:
+        ERROR_COUNT.labels(endpoint="/full-prediction").inc()
+        raise e

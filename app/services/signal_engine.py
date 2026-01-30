@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import List
 
 
 @dataclass
@@ -21,14 +22,13 @@ class SignalEngine:
         prediction: int,
         prob_up: float,
         avg_sentiment: float,
-        volatility: float
+        volatility: float | None
     ) -> str:
 
-        # High volatility → HOLD (risk control)
+        # Risk control
         if volatility is not None and volatility > self.config.volatility_cap:
             return "HOLD"
 
-        # BUY condition
         if (
             prediction == 1
             and prob_up >= self.config.prob_threshold
@@ -36,7 +36,6 @@ class SignalEngine:
         ):
             return "BUY"
 
-        # SELL condition
         if (
             prediction == 0
             and prob_up <= (1 - self.config.prob_threshold)
@@ -45,27 +44,41 @@ class SignalEngine:
             return "SELL"
 
         return "HOLD"
-    
-    def fuse_decision(
-        direction_signal: str,
-        prob_up: float,
-        lstm_prices: list,
-        prophet_trend: str
-    ):
-        expected_return = (lstm_prices[-1] - lstm_prices[0]) / lstm_prices[0]
 
-        if (
-            direction_signal == "BUY"
-            and prophet_trend == "BULLISH"
-            and expected_return > 0.02
-        ):
-            return "BUY"
 
-        if (
-            direction_signal == "SELL"
-            and prophet_trend == "BEARISH"
-            and expected_return < -0.02
-        ):
-            return "SELL"
+# STANDALONE FUNCTION (IMPORTANT)
+def fuse_decision(
+    direction_signal: str,
+    prob_up: float,
+    lstm_prices: List[float],
+    prophet_trend: str
+) -> str:
+    """
+    Final ensemble decision using:
+    - Direction model (XGBoost)
+    - LSTM forecast
+    - Prophet trend
+    """
 
+    if not lstm_prices or len(lstm_prices) < 2:
         return "HOLD"
+
+    expected_return = (lstm_prices[-1] - lstm_prices[0]) / lstm_prices[0]
+
+    if (
+        direction_signal == "BUY"
+        and prophet_trend == "BULLISH"
+        and expected_return > 0.02
+        and prob_up >= 0.6
+    ):
+        return "BUY"
+
+    if (
+        direction_signal == "SELL"
+        and prophet_trend == "BEARISH"
+        and expected_return < -0.02
+        and prob_up <= 0.4
+    ):
+        return "SELL"
+
+    return "HOLD"
