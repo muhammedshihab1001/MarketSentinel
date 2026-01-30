@@ -9,17 +9,25 @@ def evaluate_xgboost(y_true, y_pred):
 
 
 def evaluate_lstm(y_true, y_pred):
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     return {
-        "rmse": rmse
+        "rmse": float(rmse)
     }
+
 
 
 def evaluate_prophet(actual, predicted):
+    actual = np.array(actual)
+    predicted = np.array(predicted)
+
     mae = np.mean(np.abs(actual - predicted))
     return {
-        "mae": mae
+        "mae": float(mae)
     }
+
 
 def validate_metrics(metrics):
     errors = []
