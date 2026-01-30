@@ -24,3 +24,19 @@ def train_prophet(df):
 
     model.fit(prophet_df)
     return model
+
+def forecast_prophet(model, periods=30):
+    future = model.make_future_dataframe(periods=periods)
+    forecast = model.predict(future)
+
+    yhat = forecast["yhat"].tail(periods)
+    upper = forecast["yhat_upper"].tail(periods)
+    lower = forecast["yhat_lower"].tail(periods)
+
+    trend = "BULLISH" if yhat.iloc[-1] > yhat.iloc[0] else "BEARISH"
+
+    return {
+        "trend": trend,
+        "upper": float(upper.max()),
+        "lower": float(lower.min())
+    }
