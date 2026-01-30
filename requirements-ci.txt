@@ -11,3 +11,4 @@ prometheus-client
 pydantic
 python-dotenv
 torch
+transformers
