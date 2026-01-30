@@ -45,3 +45,27 @@ class SignalEngine:
             return "SELL"
 
         return "HOLD"
+    
+    def fuse_decision(
+        direction_signal: str,
+        prob_up: float,
+        lstm_prices: list,
+        prophet_trend: str
+    ):
+        expected_return = (lstm_prices[-1] - lstm_prices[0]) / lstm_prices[0]
+
+        if (
+            direction_signal == "BUY"
+            and prophet_trend == "BULLISH"
+            and expected_return > 0.02
+        ):
+            return "BUY"
+
+        if (
+            direction_signal == "SELL"
+            and prophet_trend == "BEARISH"
+            and expected_return < -0.02
+        ):
+            return "SELL"
+
+        return "HOLD"
