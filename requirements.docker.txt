@@ -1,0 +1,21 @@
+# -------------------------
+# API
+# -------------------------
+fastapi
+uvicorn
+pydantic
+
+# -------------------------
+# Core ML Runtime
+# -------------------------
+numpy
+pandas
+scikit-learn
+joblib
+tensorflow
+prophet
+
+# -------------------------
+# Monitoring
+# -------------------------
+prometheus-client
