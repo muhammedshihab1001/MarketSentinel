@@ -18,7 +18,7 @@ from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import MODEL_FEATURES
 
 
-MODEL_PATH = "models/xgboost_direction.pkl"
+MODEL_PATH = "artifacts/xgboost_direction.pkl"
 MIN_ACCURACY = 0.50
 
 

@@ -17,5 +17,5 @@ df = fetcher.fetch("AAPL", "2018-01-01", END_DATE)
 
 model = train_prophet(df)
 
-joblib.dump(model, "models/prophet_trend.pkl")
+joblib.dump(model, "artifacts/prophet_trend.pkl")
 print("Prophet model saved")

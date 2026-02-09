@@ -1,10 +1,10 @@
 import joblib
 import tensorflow as tf
 
-XGBOOST_PATH = "models/xgboost_direction.pkl"
-LSTM_PATH = "models/lstm_price_forecast.h5"
-LSTM_SCALER_PATH = "models/lstm_scaler.pkl"
-PROPHET_PATH = "models/prophet_trend.pkl"
+XGBOOST_PATH = "artifacts/xgboost_direction.pkl"
+LSTM_PATH = "artifacts/lstm_price_forecast.h5"
+LSTM_SCALER_PATH = "artifacts/lstm_scaler.pkl"
+PROPHET_PATH = "artifacts/prophet_trend.pkl"
 
 
 class ModelLoader:

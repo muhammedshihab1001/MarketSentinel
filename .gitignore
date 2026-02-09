@@ -29,3 +29,4 @@ data/processed/
 # HuggingFace cache
 .cache/
 .huggingface/
+artifacts/*
