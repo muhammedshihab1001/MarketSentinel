@@ -10,7 +10,7 @@ import joblib
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from core.data.data_fetcher import StockPriceFetcher
-from app.models.lstm_model import build_lstm_model
+from models.lstm_model import build_lstm_model
 
 LOOKBACK_WINDOW = 60
 FORECAST_HORIZON = 30

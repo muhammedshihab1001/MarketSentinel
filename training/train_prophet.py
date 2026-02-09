@@ -7,7 +7,7 @@ if PROJECT_ROOT not in sys.path:
 
 import joblib
 from core.data.data_fetcher import StockPriceFetcher
-from app.models.prophet_model import train_prophet
+from models.prophet_model import train_prophet
 import datetime
 
 
