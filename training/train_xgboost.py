@@ -1,77 +1,74 @@
-import sys
 import os
-
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
+import datetime
 import joblib
 import pandas as pd
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
 from xgboost import XGBClassifier
 
-from app.services.data_fetcher import StockPriceFetcher
-from app.services.news_fetcher import NewsFetcher
-from app.services.sentiment import SentimentAnalyzer
-from app.services.feature_engineering import FeatureEngineer
-from app.config.features import MODEL_FEATURES
+from core.data.data_fetcher import StockPriceFetcher
+from core.data.news_fetcher import NewsFetcher
+from core.sentiment.sentiment import SentimentAnalyzer
+from core.features.feature_engineering import FeatureEngineer
+from core.schema.feature_schema import MODEL_FEATURES
+from core.artifacts.metadata_manager import MetadataManager
 
 
-MODEL_PATH = "models/xgboost_direction.pkl"
+MODEL_DIR = "artifacts/xgboost"
+MODEL_PATH = f"{MODEL_DIR}/model.pkl"
+METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 MIN_ACCURACY = 0.50
 
 
+# ---------------------------------------------------
+# DATA LOADING
+# ---------------------------------------------------
+
 def load_training_data():
+    """
+    Uses canonical feature pipeline.
+    Guarantees training == inference features.
+    """
+
     fetcher = StockPriceFetcher()
     news_fetcher = NewsFetcher()
     sentiment_analyzer = SentimentAnalyzer()
-    fe = FeatureEngineer()
 
-    # Price data
+    end_date = datetime.date.today().isoformat()
+
     price_df = fetcher.fetch(
         ticker="AAPL",
-        start_date="2025-01-01",
-        end_date="2025-12-31"
+        start_date="2018-01-01",
+        end_date=end_date
     )
 
-    # Feature engineering (price)
-    price_df = fe.add_returns(price_df)
-    price_df = fe.add_volatility(price_df)
-    price_df = fe.add_rsi(price_df)
-    price_df = fe.add_macd(price_df)
+    news_df = news_fetcher.fetch("Apple stock", max_items=100)
 
-    # News + sentiment
-    news_df = news_fetcher.fetch("Apple stock", max_items=50)
     scored_df = sentiment_analyzer.analyze_dataframe(news_df)
     sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
 
-    # Merge & final dataset
-    merged_df = fe.merge_price_sentiment(price_df, sentiment_df)
-    dataset = fe.create_ml_dataset(merged_df)
+    dataset = FeatureEngineer.build_feature_pipeline(
+        price_df,
+        sentiment_df
+    )
 
-    return dataset
+    return dataset, end_date
 
+
+# ---------------------------------------------------
+# MODEL TRAINING
+# ---------------------------------------------------
 
 def train_model(df: pd.DataFrame):
-    # FEATURES = [
-    #     "return",
-    #     "volatility",
-    #     "rsi",
-    #     "macd",
-    #     "macd_signal",
-    #     "avg_sentiment",
-    #     "news_count",
-    #     "sentiment_std",
-    #     "return_lag1",
-    #     "sentiment_lag1"
-    # ]
 
     X = df[MODEL_FEATURES]
     y = df["target"]
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, shuffle=False
+        X, y,
+        test_size=0.2,
+        shuffle=False
     )
 
     model = XGBClassifier(
@@ -97,14 +94,33 @@ def train_model(df: pd.DataFrame):
             f"Model accuracy {acc:.2f} below threshold {MIN_ACCURACY}"
         )
 
-    return model
+    return model, acc
 
+
+# ---------------------------------------------------
+# EXECUTION
+# ---------------------------------------------------
 
 if __name__ == "__main__":
-    df = load_training_data()
-    model = train_model(df)
+
+    df, end_date = load_training_data()
+    model, acc = train_model(df)
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
     # Save model
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     joblib.dump(model, MODEL_PATH)
+
+    # Create metadata
+    metadata = MetadataManager.create_metadata(
+        model_name="xgboost_direction",
+        metrics={"accuracy": float(acc)},
+        features=MODEL_FEATURES,
+        training_start="2018-01-01",
+        training_end=end_date
+    )
+
+    MetadataManager.save_metadata(metadata, METADATA_PATH)
+
     print(f"Model saved to {MODEL_PATH}")
+    print(f"Metadata saved to {METADATA_PATH}")

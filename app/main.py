@@ -20,7 +20,7 @@ app.include_router(
 
 app.include_router(
     predict.router,
-    prefix="",          # IMPORTANT: no double prefix
+    prefix="/v1",
     tags=["Prediction"]
 )
 

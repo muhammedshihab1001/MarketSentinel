@@ -1,0 +1,16 @@
+-r base.txt
+
+fastapi
+uvicorn
+
+scikit-learn
+xgboost
+tensorflow
+prophet
+torch
+transformers
+vaderSentiment
+
+prometheus-client
+yfinance
+feedparser

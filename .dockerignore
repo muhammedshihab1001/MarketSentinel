@@ -1,12 +1,9 @@
 venv/
 __pycache__/
 *.pyc
-*.pyo
-*.pkl
-*.joblib
 .git/
-.gitignore
 tests/
 .cache/
-.huggingface/
 .env
+artifacts/*
+!artifacts/.keep

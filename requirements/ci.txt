@@ -1,14 +1,18 @@
+-r base.txt
+
 fastapi
 uvicorn
-pandas
-numpy
+
 scikit-learn
 xgboost
 joblib
+
 pytest
 httpx
+
 prometheus-client
-pydantic
-python-dotenv
+tensorflow
+prophet
 torch
 transformers
+vaderSentiment

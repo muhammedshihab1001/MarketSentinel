@@ -1,41 +1,64 @@
 from prometheus_client import Counter, Histogram, Gauge
 
-REQUEST_COUNT = Counter(
-    "http_requests_total",
-    "Total HTTP requests",
+# -----------------------------------------
+# REQUEST LAYER
+# -----------------------------------------
+
+API_REQUEST_COUNT = Counter(
+    "api_requests_total",
+    "Total API requests",
     ["endpoint"]
 )
 
-REQUEST_LATENCY = Histogram(
-    "http_request_latency_seconds",
-    "HTTP request latency",
+API_ERROR_COUNT = Counter(
+    "api_errors_total",
+    "Total API errors",
     ["endpoint"]
 )
 
-ERROR_COUNT = Counter(
-    "http_errors_total",
-    "Total HTTP errors",
+API_LATENCY = Histogram(
+    "api_latency_seconds",
+    "API request latency",
     ["endpoint"]
 )
 
-PREDICTION_COUNT = Counter(
-    "predictions_total",
-    "Total predictions made",
-    ["ticker"]
+# -----------------------------------------
+# INFERENCE LAYER
+# -----------------------------------------
+
+MODEL_INFERENCE_COUNT = Counter(
+    "model_inference_total",
+    "Number of model inferences",
+    ["model"]
 )
 
-AVG_CONFIDENCE = Gauge(
+MODEL_INFERENCE_LATENCY = Histogram(
+    "model_inference_latency_seconds",
+    "Latency per model",
+    ["model"]
+)
+
+SIGNAL_DISTRIBUTION = Counter(
+    "signal_distribution_total",
+    "Distribution of BUY/SELL/HOLD",
+    ["signal"]
+)
+
+FORECAST_HORIZON = Gauge(
+    "forecast_horizon_days",
+    "Forecast horizon length"
+)
+
+CONFIDENCE_SCORE = Gauge(
     "prediction_confidence",
-    "Average prediction confidence",
-    ["ticker"]
+    "Model confidence score"
 )
 
+# -----------------------------------------
+# DATA QUALITY
+# -----------------------------------------
 
-# -----------------------------
-# DATA QUALITY METRICS
-# -----------------------------
-
-MISSING_VALUE_RATIO = Gauge(
-    "data_missing_ratio",
-    "Ratio of missing values in input features"
+MISSING_FEATURE_RATIO = Gauge(
+    "missing_feature_ratio",
+    "Ratio of missing features during inference"
 )

@@ -6,6 +6,10 @@ __pycache__/
 .env
 .venv
 venv/
+Lib/
+Include/
+Scripts/
+site-packages/
 
 # Data
 data/raw/
@@ -21,7 +25,14 @@ data/processed/
 # Model artifacts
 *.pkl
 *.joblib
+# Ignore ALL runtime artifacts
+artifacts/**
+
+# Keep directory structure
+!artifacts/.keep
+!artifacts/**/.keep
 
 # HuggingFace cache
 .cache/
 .huggingface/
+project_structure.txt

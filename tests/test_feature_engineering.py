@@ -1,5 +1,5 @@
 def test_feature_columns_created():
-    from app.services.feature_engineering import FeatureEngineer
+    from core.features.feature_engineering import FeatureEngineer
     import pandas as pd
 
     fe = FeatureEngineer()

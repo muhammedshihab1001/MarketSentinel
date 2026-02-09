@@ -1,4 +1,4 @@
-from app.services.sentiment import SentimentAnalyzer
+from core.sentiment.sentiment import SentimentAnalyzer
 
 def test_sentiment_score_range():
     analyzer = SentimentAnalyzer()
@@ -12,7 +12,7 @@ def test_sentiment_label():
     assert result["label"] in ["positive", "neutral", "negative"]
 
 def test_aggregation_not_empty():
-    from app.services.sentiment import SentimentAnalyzer
+    from core.sentiment.sentiment import SentimentAnalyzer
     import pandas as pd
 
     analyzer = SentimentAnalyzer()

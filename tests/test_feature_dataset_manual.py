@@ -1,4 +1,4 @@
-from app.services.feature_engineering import FeatureEngineer
+from core.features.feature_engineering import FeatureEngineer
 
 fe = FeatureEngineer()
 

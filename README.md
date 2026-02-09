@@ -1,203 +1,371 @@
-# 📈 MarketSentinel – Intelligent Stock Forecasting & Trading Signal System
+# 📈 MarketSentinel – Institutional-Style Financial Forecasting & Decision Intelligence System
 
-MarketSentinel is an **end-to-end production-grade Machine Learning system** that generates **BUY / SELL / HOLD** trading signals by combining **market data, news sentiment, multiple ML models, and monitoring**.
+MarketSentinel is a **production-structured Machine Learning system** designed to generate **probabilistic forecasts and actionable trading signals** by combining:
 
-This project focuses on **real-world ML engineering**, not just model training.
+- Market price data  
+- Financial news sentiment (FinBERT)  
+- Multi-model forecasting  
+- Scenario analysis  
+- Decision intelligence  
+- Observability  
 
----
-
-## 🚨 Problem Statement
-
-Retail traders and analysts face several challenges:
-
-- Market price data is **highly noisy**
-- News sentiment is often **ignored or manually interpreted**
-- Single-model predictions are **unreliable**
-- Most ML projects lack **monitoring, testing, and CI/CD**
+This is **NOT a notebook-based ML project.**  
+It is engineered as a **real-world ML system** with clear domain boundaries, artifact governance, testing, and infrastructure readiness.
 
 ---
 
-## ✅ MarketSentinel Solution
+# 🚨 Problem Statement
 
-MarketSentinel solves these problems by:
+Financial markets are complex, noisy, and heavily influenced by narrative.
 
-- Combining **price action + sentiment analysis**
-- Using **multiple ML models** instead of one
-- Applying **risk-aware signal logic**
-- Providing **real-time monitoring (Prometheus + Grafana)**
-- Enforcing **model quality checks in CI/CD**
+Most retail forecasting systems fail because they rely on:
+
+- Single-model predictions  
+- Static indicators  
+- Manual sentiment interpretation  
+- No risk-aware decision logic  
+- No production monitoring  
+
+Additionally, many ML repositories stop at training — they do not address:
+
+- inference architecture  
+- artifact lifecycle  
+- model validation  
+- system reliability  
 
 ---
 
-## 📂 Project Structure
+# ✅ MarketSentinel Solution
+
+MarketSentinel is built as a **decision-support engine**, not just a predictor.
+
+It solves the above challenges through:
+
+### Multi-Signal Intelligence
+- Price-based technical features
+- Transformer-based sentiment analysis
+- Ensemble forecasting
+
+### Risk-Aware Decision Layer
+Signals are generated only when model conviction and market context align.
+
+### Canonical Feature Pipeline
+Training and inference use the **same feature generation contract**, preventing feature drift.
+
+### Artifact Governance
+Models are versioned with metadata describing:
+
+- training window  
+- metrics  
+- feature schema  
+
+### Observability Built-In
+System metrics are exported via Prometheus and visualized in Grafana.
+
+### CI-Enforced Model Quality
+Model performance thresholds are validated automatically.
+
+---
+
+# 🧠 System Architecture
+
+MarketSentinel follows a **domain-driven ML architecture**.
+
 ```
 MarketSentinel/
 │
-├── app/
-│ ├── api/ # FastAPI routes
-│ ├── services/ # Business logic
-│ ├── models/ # Model loading & inference
-│ ├── monitoring/ # Prometheus metrics
-│ └── main.py # FastAPI entry point
+├── core/                 ← Domain layer (system spine)
+│   ├── data/             ← Market + news ingestion
+│   ├── sentiment/        ← FinBERT analysis
+│   ├── features/         ← Canonical feature pipeline
+│   ├── forecasting/      ← Probabilistic modeling
+│   ├── scenario/         ← Stress testing forecasts
+│   ├── signals/          ← Decision engine
+│   ├── explainability/   ← Human-readable reasoning
+│   └── artifacts/        ← Metadata management
 │
-├── training/ # Model training & evaluation
-├── tests/ # Pytest unit tests
-├── monitoring/ # Prometheus config
-├── Dockerfile
-├── docker-compose.yml
-├── .github/workflows/ # CI/CD pipelines
-└── README.md
-└── requirements-ci.txt
-└── requirements.docker.txt
-└── requirements.txt
+├── training/             ← Offline model training
+├── app/                  ← Inference control plane (FastAPI)
+├── docker/               ← Training & inference containers
+├── tests/                ← System-level validation
+├── requirements/         ← Environment segmentation
+└── docker-compose.yml
 ```
 
 ---
 
-## 🔌 API Endpoints
+# 🤖 Model Stack
 
-| Endpoint | Description |
-|--------|------------|
-| `/` | Root service status |
-| `/health` | Health check |
-| `/full-prediction` | Complete trading signal |
-| `/metrics` | Prometheus metrics |
-| `/docs` | Swagger UI |
+MarketSentinel uses a **multi-model ensemble**, where each model answers a different market question.
+
+| Model | Role |
+|--------|--------|
+| **XGBoost** | Predict directional probability |
+| **LSTM** | Forecast short-term price trajectory |
+| **Prophet** | Identify macro trend |
+| **FinBERT** | Quantify narrative sentiment |
+
+No single model drives decisions.
+
+Signals emerge from **model agreement + risk constraints.**
 
 ---
 
-## 📊 Feature Engineering
+# ⚙️ Canonical Feature Pipeline
 
-Implemented in `app/services/feature_engineering.py`
+Implemented in:
+
+```
+core/features/feature_engineering.py
+```
+
+This pipeline is the **only approved path** for generating model inputs.
 
 Features include:
-- Daily returns
-- Volatility
-- RSI
-- MACD
-- Lagged returns
-- Lagged sentiment
 
-These features are used consistently across all models.
+- Returns  
+- Volatility  
+- RSI  
+- MACD  
+- Sentiment aggregates  
+- Lagged features  
 
----
+### Why This Matters
+Feature inconsistency is one of the biggest causes of production ML failure.
 
-## 🤖 Machine Learning Models
+MarketSentinel prevents this by enforcing a shared pipeline across:
 
-| Model | Purpose |
-|-----|--------|
-| **XGBoost** | Predict next-day direction |
-| **LSTM** | Forecast short-term price movement |
-| **Prophet** | Detect long-term trend |
-
-Models are:
-- Trained **offline**
-- Loaded in **production**
-- Evaluated automatically
+- training  
+- inference  
+- backtesting  
 
 ---
 
-## 🧠 Signal Engine
+# 🧭 Decision Intelligence Layer
 
-Implemented in `app/services/signal_engine.py`
+Located in:
 
-Decision logic:
-- Combines outputs from all models
-- Applies risk constraints
-- Avoids trading during high volatility
+```
+core/signals/
+```
 
-Example logic:
-- BUY only if all models agree
-- HOLD if volatility is too high
-- SELL only with bearish confirmation
+The decision engine:
 
----
+- evaluates model probability  
+- incorporates sentiment  
+- respects volatility caps  
+- validates expected return  
+- confirms macro trend  
 
-## 📈 Monitoring & Observability
+Signals are only issued when conviction meets risk thresholds.
 
-### Prometheus
-**File:** `app/monitoring/metrics.py`
+Otherwise → **HOLD**
 
-Tracked metrics:
-- API request count
-- Prediction count
-- Error count
-- Latency
-- Average confidence
-
+This avoids overtrading — a critical real-world behavior.
 
 ---
 
-### Grafana
-Used to visualize:
-- API health
-- Prediction volume
-- Error trends
-- Confidence distributions
+# 🔮 Scenario Engine
+
+MarketSentinel does not rely solely on point forecasts.
+
+It generates alternative futures:
+
+- Bull case  
+- Bear case  
+- Volatility shock  
+- Sentiment crash  
+
+This enables **stress-tested decision making.**
 
 ---
 
-## 🧪 Testing Strategy
+# 🧾 Explainability
 
-### Unit Tests
-Located in `tests/`
+Every signal can be translated into human-readable reasoning via:
 
-Covers:
-- Feature engineering
-- Signal logic
-- API responses
-- Metrics validation
+```
+core/explainability/decision_explainer.py
+```
 
-### Model Evaluation
-Located in `training/run_evaluation.py`
+Example outputs include:
 
-Quality thresholds:
-- XGBoost accuracy ≥ **0.55**
-- LSTM MAE ≤ **5**
-- Prophet MAE ≤ **6**
+- Model shows strong upward probability  
+- Market sentiment is positive  
+- Asset is overbought  
 
-CI fails if thresholds are not met.
+Explainability is essential for financial systems.
+
+Black-box signals are rarely trusted.
 
 ---
 
-## 🔁 CI/CD Pipeline
+# 🚀 Inference Control Plane
 
-**Tool:** GitHub Actions  
-**File:** `.github/workflows/ci.yml`
+The FastAPI service orchestrates:
 
-Pipeline steps:
-1. Install dependencies
-2. Run unit tests
-3. Run model evaluation
-4. Block merge on failure
+- data ingestion  
+- feature generation  
+- model loading  
+- decision logic  
+- scenario analysis  
 
----
+### Primary Endpoint
 
-## 🐳 Docker & Deployment
+```
+POST /predict
+```
 
-- Slim Python base image
-- Optimized requirements
-- Multi-container setup:
-  - API
-  - Prometheus
-  - Grafana
+Returns:
 
-  ---
+- signal  
+- confidence  
+- probability  
+- forecast path  
+- scenarios  
+- explanation  
 
-## 🎯 Why This Project Matters
-
-MarketSentinel demonstrates:
-
-- Production ML system design
-- Multi-model decision fusion
-- Monitoring & observability
-- CI/CD with model quality gates
-- Clean, scalable architecture
-
+Designed for direct integration with dashboards or trading interfaces.
 
 ---
 
-## 👨‍💻 Author
+# ❤️ Health & Reliability
 
-**Muhammed Shihab P**  
-Focused on **Machine Learning Engineering, MLOps & Production AI Systems**
+MarketSentinel exposes two critical probes:
+
+### Liveness
+```
+GET /health/
+```
+Confirms the container is alive.
+
+### Readiness
+```
+GET /health/ready
+```
+Verifies:
+
+- models loaded  
+- artifacts accessible  
+- inference ready  
+
+This separation is standard in production ML deployments.
+
+---
+
+# 📊 Observability
+
+### Prometheus Metrics
+
+Tracked signals include:
+
+- model inference latency  
+- prediction volume  
+- signal distribution  
+- confidence scores  
+- feature missing ratio  
+
+### Grafana Dashboards
+
+Used to visualize system behavior and detect anomalies early.
+
+Observability is treated as a **first-class system component**, not an afterthought.
+
+---
+
+# 🧪 Testing & Validation
+
+Tests live in:
+
+```
+tests/
+```
+
+Coverage includes:
+
+- feature engineering  
+- sentiment pipeline  
+- decision logic  
+- backtesting  
+- evaluation  
+
+---
+
+## Model Quality Gates
+
+Executed via:
+
+```
+training/run_evaluation.py
+```
+
+Minimum thresholds:
+
+| Model | Requirement |
+|--------|--------------|
+| XGBoost | Accuracy ≥ 0.55 |
+| LSTM | RMSE ≤ 5 |
+| Prophet | MAE ≤ 5 |
+
+CI fails if models regress.
+
+---
+
+# 🔁 CI Pipeline
+
+Implemented using GitHub Actions.
+
+Pipeline:
+
+1️⃣ Install dependencies  
+2️⃣ Run unit tests  
+3️⃣ Execute evaluation checks  
+4️⃣ Block merges on failure  
+
+Prevents silent model degradation.
+
+---
+
+# 🐳 Container Strategy
+
+MarketSentinel uses **separate containers** for:
+
+### Training Environment
+Heavy ML dependencies allowed.
+
+### Inference Environment
+Slim, fast, production-oriented.
+
+Artifacts are mounted — **not baked into images** — enabling rapid redeployment without rebuilding containers.
+
+---
+
+# 🎯 What This Project Demonstrates
+
+MarketSentinel reflects real-world ML system design principles:
+
+- Domain-driven architecture  
+- Artifact governance  
+- Feature contract enforcement  
+- Multi-model decision fusion  
+- Scenario-based forecasting  
+- Observability-first mindset  
+- CI-backed model validation  
+- Containerized infrastructure  
+
+This repository represents a transition from **ML prototype → production-shaped system.**
+
+---
+
+# 👨‍💻 Author
+
+**Muhammed Shihab P**
+
+Focused on:
+
+- Machine Learning Systems  
+- MLOps  
+- Production AI Infrastructure  
+- Decision Intelligence Architectures  
+
+---
