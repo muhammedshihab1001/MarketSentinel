@@ -11,3 +11,4 @@ pytest
 httpx
 
 prometheus-client
+torch
