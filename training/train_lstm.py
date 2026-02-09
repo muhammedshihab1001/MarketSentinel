@@ -1,63 +1,119 @@
-import sys
 import os
-
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-
 import datetime
 import joblib
 import numpy as np
+
 from sklearn.preprocessing import MinMaxScaler
 
 from core.data.data_fetcher import StockPriceFetcher
+from core.artifacts.metadata_manager import MetadataManager
 from models.lstm_model import build_lstm_model
 
+
+MODEL_DIR = "artifacts/lstm"
+MODEL_PATH = f"{MODEL_DIR}/lstm_price_forecast.h5"
+SCALER_PATH = f"{MODEL_DIR}/lstm_scaler.pkl"
+METADATA_PATH = f"{MODEL_DIR}/metadata.json"
+
 LOOKBACK_WINDOW = 60
-FORECAST_HORIZON = 30
+EPOCHS = 20
+BATCH_SIZE = 32
 
-END_DATE = datetime.date.today().isoformat()
 
-fetcher = StockPriceFetcher()
-df = fetcher.fetch("AAPL", "2018-01-01", END_DATE)
+# ---------------------------------------------------
+# DATA
+# ---------------------------------------------------
 
-if df.empty:
-    raise ValueError("No price data fetched for LSTM training")
+def load_data():
 
-if "close" not in df.columns:
-    raise ValueError(f"Expected 'close' column, found {df.columns.tolist()}")
+    end_date = datetime.date.today().isoformat()
 
-prices = df[["close"]].values
+    fetcher = StockPriceFetcher()
 
-scaler = MinMaxScaler()
-scaled_prices = scaler.fit_transform(prices)
+    df = fetcher.fetch(
+        ticker="AAPL",
+        start_date="2018-01-01",
+        end_date=end_date
+    )
 
+    if df.empty:
+        raise ValueError("No price data fetched for LSTM training")
+
+    prices = df[["close"]].values
+
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(prices)
+
+    return scaled, scaler, end_date
+
+
+# ---------------------------------------------------
+# SEQUENCE BUILDER
+# ---------------------------------------------------
 
 def create_sequences(data, lookback):
+
     X, y = [], []
+
     for i in range(len(data) - lookback):
         X.append(data[i:i + lookback])
         y.append(data[i + lookback])
+
     return np.array(X), np.array(y)
 
 
-X, y = create_sequences(scaled_prices, LOOKBACK_WINDOW)
+# ---------------------------------------------------
+# TRAIN
+# ---------------------------------------------------
 
-split = int(len(X) * 0.8)
-X_train, X_test = X[:split], X[split:]
-y_train, y_test = y[:split], y[split:]
+def train():
 
-model = build_lstm_model((LOOKBACK_WINDOW, 1))
-model.fit(
-    X_train,
-    y_train,
-    epochs=20,
-    batch_size=32,
-    validation_data=(X_test, y_test)
-)
+    scaled, scaler, end_date = load_data()
 
-model.save("artifacts/lstm_price_forecast.h5")
-joblib.dump(scaler, "artifacts/lstm_scaler.pkl")
+    X, y = create_sequences(scaled, LOOKBACK_WINDOW)
 
-print("LSTM model & scaler saved")
+    split = int(len(X) * 0.8)
+
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+
+    model = build_lstm_model((LOOKBACK_WINDOW, 1))
+
+    history = model.fit(
+        X_train,
+        y_train,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_data=(X_test, y_test)
+    )
+
+    val_loss = float(history.history["val_loss"][-1])
+
+    return model, scaler, val_loss, end_date
+
+
+# ---------------------------------------------------
+# EXECUTION
+# ---------------------------------------------------
+
+if __name__ == "__main__":
+
+    model, scaler, val_loss, end_date = train()
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    model.save(MODEL_PATH)
+    joblib.dump(scaler, SCALER_PATH)
+
+    metadata = MetadataManager.create_metadata(
+        model_name="lstm_price_forecast",
+        metrics={"val_loss": val_loss},
+        features=["close_sequence"],
+        training_start="2018-01-01",
+        training_end=end_date
+    )
+
+    MetadataManager.save_metadata(metadata, METADATA_PATH)
+
+    print("LSTM model saved")
+    print("Metadata saved")
