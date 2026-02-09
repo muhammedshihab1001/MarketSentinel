@@ -1,5 +1,5 @@
 import pandas as pd
-from training.backtest import backtest_strategy, signal_hit_rate
+from training.backtesting.backtest_engine import backtest_strategy, signal_hit_rate
 
 
 def sample_backtest_df():

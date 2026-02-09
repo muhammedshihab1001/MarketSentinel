@@ -85,3 +85,46 @@ class BacktestEngine:
             "sharpe_ratio": float(sharpe),
             "trade_count": trade_count
         }
+# -------------------------------------------------
+# Compatibility Wrapper Functions
+# Keeps older tests working while using new engine
+# -------------------------------------------------
+
+def backtest_strategy(df, signal_column="signal"):
+    """
+    Wrapper to support legacy function-based tests.
+    """
+
+    engine = BacktestEngine()
+
+    prices = df["close"].values
+    signals = df[signal_column].values
+
+    results = engine.run(prices, signals)
+
+    return {
+        "total_return": results["strategy_return"],
+        "max_drawdown": 0,  # optional: compute later if needed
+        "sharpe_ratio": results["sharpe_ratio"]
+    }
+
+
+def signal_hit_rate(df, signal_column="signal"):
+    """
+    Legacy metric retained for test compatibility.
+    """
+
+    df = df.copy()
+
+    df["future_return"] = df["close"].shift(-1) / df["close"] - 1
+
+    hits = df[
+        ((df[signal_column] == "BUY") & (df["future_return"] > 0)) |
+        ((df[signal_column] == "SELL") & (df["future_return"] < 0))
+    ]
+
+    total_signals = df[signal_column].isin(["BUY", "SELL"]).sum()
+
+    return {
+        "hit_rate": len(hits) / total_signals if total_signals > 0 else 0
+    }
