@@ -13,3 +13,4 @@ vaderSentiment
 matplotlib
 seaborn
 plotly
+feedparser

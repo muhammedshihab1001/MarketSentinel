@@ -1,13 +1,23 @@
 version: "3.9"
 
 services:
+
+  # -------------------------------------------------
+  # INFERENCE API
+  # -------------------------------------------------
+
   api:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: docker/inference.Dockerfile
     container_name: marketsentinel-api
     ports:
       - "8000:8000"
+    volumes:
+    - ./artifacts:/app/artifacts
+  # -------------------------------------------------
+  # PROMETHEUS
+  # -------------------------------------------------
 
   prometheus:
     image: prom/prometheus
@@ -20,6 +30,10 @@ services:
       - "9090:9090"
     depends_on:
       - api
+
+  # -------------------------------------------------
+  # GRAFANA
+  # -------------------------------------------------
 
   grafana:
     image: grafana/grafana

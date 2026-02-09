@@ -7,6 +7,10 @@ scikit-learn
 xgboost
 tensorflow
 prophet
+torch
+transformers
+vaderSentiment
 
 prometheus-client
 yfinance
+feedparser

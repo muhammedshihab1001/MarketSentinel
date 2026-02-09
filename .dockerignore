@@ -1,10 +1,9 @@
 venv/
 __pycache__/
 *.pyc
-*.pyo
 .git/
-.gitignore
 tests/
 .cache/
-.huggingface/
 .env
+artifacts/*
+!artifacts/.keep
