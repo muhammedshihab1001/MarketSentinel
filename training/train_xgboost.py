@@ -12,7 +12,7 @@ from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import MODEL_FEATURES
-from artifacts.metadata_manager import MetadataManager
+from core.artifacts.metadata_manager import MetadataManager
 
 
 MODEL_DIR = "artifacts/xgboost"
