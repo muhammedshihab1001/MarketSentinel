@@ -15,7 +15,7 @@ from core.data.data_fetcher import StockPriceFetcher
 from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_engineering import FeatureEngineer
-from app.config.features import MODEL_FEATURES
+from core.schema.feature_schema import MODEL_FEATURES
 
 
 MODEL_PATH = "models/xgboost_direction.pkl"
