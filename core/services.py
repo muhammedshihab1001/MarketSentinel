@@ -5,3 +5,4 @@ from app.services.data_fetcher import StockPriceFetcher
 from app.services.feature_engineering import FeatureEngineer
 from app.services.sentiment import SentimentAnalyzer
 from app.services.signal_engine import SignalEngine
+from app.services.news_fetcher import NewsFetcher

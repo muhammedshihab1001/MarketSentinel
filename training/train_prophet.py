@@ -1,7 +1,15 @@
+import sys
+import os
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import joblib
-from app.services.data_fetcher import StockPriceFetcher
+from core.services import StockPriceFetcher
 from app.models.prophet_model import train_prophet
 import datetime
+
 
 END_DATE = datetime.date.today().isoformat()
 fetcher = StockPriceFetcher()

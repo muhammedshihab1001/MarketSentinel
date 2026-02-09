@@ -1,9 +1,15 @@
+import sys
+import os
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import datetime
 import joblib
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
-
-from app.services.data_fetcher import StockPriceFetcher
+from core.services import StockPriceFetcher
 from app.models.lstm_model import build_lstm_model
 
 LOOKBACK_WINDOW = 60

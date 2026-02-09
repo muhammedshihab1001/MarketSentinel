@@ -11,10 +11,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
 from xgboost import XGBClassifier
 
-from app.services.data_fetcher import StockPriceFetcher
-from app.services.news_fetcher import NewsFetcher
-from app.services.sentiment import SentimentAnalyzer
-from app.services.feature_engineering import FeatureEngineer
+from core.services import StockPriceFetcher
+from core.services import NewsFetcher
+from core.services import SentimentAnalyzer
+from core.services import FeatureEngineer
 from app.config.features import MODEL_FEATURES
 
 
