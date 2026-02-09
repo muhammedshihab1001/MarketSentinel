@@ -36,13 +36,13 @@ RUN apt-get update && apt-get install -y \
 # 5️⃣ Copy minimal runtime requirements
 # (IMPORTANT: keeps Docker image small)
 # -------------------------------------------------
-COPY requirements/inference.txt .
+COPY requirements ./requirements
 
 # -------------------------------------------------
 # 6️⃣ Install Python dependencies
 # --no-cache-dir reduces image size
 # -------------------------------------------------
-RUN pip install --no-cache-dir -r inference.txt
+RUN pip install --no-cache-dir -r requirements/inference.txt
 
 
 # -------------------------------------------------
@@ -50,7 +50,7 @@ RUN pip install --no-cache-dir -r inference.txt
 # Only runtime-required folders
 # -------------------------------------------------
 COPY app ./app
-COPY models ./models
+COPY artifacts ./artifacts
 
 # -------------------------------------------------
 # 8️⃣ Expose FastAPI port

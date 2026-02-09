@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 import time
 
-from app.models.model_loader import ModelLoader
+from app.inference.model_loader import ModelLoader
 from app.models.lstm_model import forecast_lstm
 from app.models.prophet_model import forecast_prophet
 from app.services.signal_engine import SignalEngine, fuse_decision
