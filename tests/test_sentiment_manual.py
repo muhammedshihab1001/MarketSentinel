@@ -1,4 +1,4 @@
-from app.services.sentiment import SentimentAnalyzer
+from core.sentiment.sentiment import SentimentAnalyzer
 
 analyzer = SentimentAnalyzer()
 

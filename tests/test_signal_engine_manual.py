@@ -1,4 +1,4 @@
-from app.services.signal_engine import SignalEngine
+from core.signals.signal_engine import SignalEngine
 
 engine = SignalEngine()
 

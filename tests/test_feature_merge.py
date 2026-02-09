@@ -1,5 +1,5 @@
 import pandas as pd
-from app.services.feature_engineering import FeatureEngineer
+from core.features.feature_engineering import FeatureEngineer
 
 
 def test_feature_merge_without_external_calls():
