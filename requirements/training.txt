@@ -1,0 +1,15 @@
+-r base.txt
+
+scikit-learn
+xgboost
+tensorflow
+prophet
+
+torch
+transformers
+huggingface-hub
+vaderSentiment
+
+matplotlib
+seaborn
+plotly
