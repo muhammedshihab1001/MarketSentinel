@@ -1,8 +1,8 @@
 # Temporary proxy layer
 # Allows safe migration later
 
-from app.services.data_fetcher import StockPriceFetcher
-from app.services.feature_engineering import FeatureEngineer
-from app.services.sentiment import SentimentAnalyzer
-from app.services.signal_engine import SignalEngine
-from app.services.news_fetcher import NewsFetcher
+from core.data.data_fetcher import StockPriceFetcher
+from core.features.feature_engineering import FeatureEngineer
+from core.sentiment.sentiment import SentimentAnalyzer
+from core.signals.signal_engine import SignalEngine
+from core.data.news_fetcher import NewsFetcher
