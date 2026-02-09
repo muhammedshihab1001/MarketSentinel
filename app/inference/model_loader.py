@@ -1,15 +1,41 @@
 import joblib
 import tensorflow as tf
 
-XGBOOST_PATH = "artifacts/xgboost_direction.pkl"
-LSTM_PATH = "artifacts/lstm_price_forecast.h5"
-LSTM_SCALER_PATH = "artifacts/lstm_scaler.pkl"
-PROPHET_PATH = "artifacts/prophet_trend.pkl"
+from models.lstm_model import forecast_lstm
+from models.prophet_model import forecast_prophet
 
 
 class ModelLoader:
+
     def __init__(self):
-        self.xgb = joblib.load(XGBOOST_PATH)
-        self.lstm = tf.keras.models.load_model(LSTM_PATH,compile=False)
-        self.lstm_scaler = joblib.load(LSTM_SCALER_PATH)
-        self.prophet = joblib.load(PROPHET_PATH)
+
+        self.xgb = joblib.load("artifacts/xgboost/model.pkl")
+
+        self.lstm = tf.keras.models.load_model(
+            "artifacts/lstm/lstm_price_forecast.h5",
+            compile=False
+        )
+
+        self.lstm_scaler = joblib.load(
+            "artifacts/lstm/lstm_scaler.pkl"
+        )
+
+        self.prophet = joblib.load(
+            "artifacts/prophet/prophet_trend.pkl"
+        )
+
+    # -----------------------------
+
+    def lstm_forecast(self, recent_prices):
+
+        return forecast_lstm(
+            self.lstm,
+            self.lstm_scaler,
+            recent_prices
+        )
+
+    # -----------------------------
+
+    def prophet_forecast(self):
+
+        return forecast_prophet(self.prophet)
