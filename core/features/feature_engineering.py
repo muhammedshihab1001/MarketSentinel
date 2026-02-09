@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-from app.monitoring.metrics import MISSING_VALUE_RATIO
 
 class FeatureEngineer:
     """
@@ -161,8 +160,3 @@ class FeatureEngineer:
         df = df.dropna().reset_index(drop=True)
 
         return df
-    
-    @staticmethod
-    def monitor_data_quality(df):
-        missing_ratio = df.isnull().mean().mean()
-        MISSING_VALUE_RATIO.set(float(missing_ratio))
