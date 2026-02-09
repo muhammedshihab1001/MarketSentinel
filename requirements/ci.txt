@@ -11,4 +11,8 @@ pytest
 httpx
 
 prometheus-client
+tensorflow
+prophet
 torch
+transformers
+vaderSentiment
