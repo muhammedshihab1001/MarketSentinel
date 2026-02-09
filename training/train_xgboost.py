@@ -1,12 +1,8 @@
-import sys
 import os
-
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
+import datetime
 import joblib
 import pandas as pd
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
 from xgboost import XGBClassifier
@@ -23,49 +19,46 @@ MIN_ACCURACY = 0.50
 
 
 def load_training_data():
+    """
+    Loads data using the canonical feature pipeline.
+    Guarantees training == inference features.
+    """
+
     fetcher = StockPriceFetcher()
     news_fetcher = NewsFetcher()
     sentiment_analyzer = SentimentAnalyzer()
-    fe = FeatureEngineer()
 
-    # Price data
+    end_date = datetime.date.today().isoformat()
+
+    # -----------------------------
+    # Fetch price data
+    # -----------------------------
     price_df = fetcher.fetch(
         ticker="AAPL",
-        start_date="2025-01-01",
-        end_date="2025-12-31"
+        start_date="2018-01-01",
+        end_date=end_date
     )
 
-    # Feature engineering (price)
-    price_df = fe.add_returns(price_df)
-    price_df = fe.add_volatility(price_df)
-    price_df = fe.add_rsi(price_df)
-    price_df = fe.add_macd(price_df)
+    # -----------------------------
+    # Fetch sentiment
+    # -----------------------------
+    news_df = news_fetcher.fetch("Apple stock", max_items=100)
 
-    # News + sentiment
-    news_df = news_fetcher.fetch("Apple stock", max_items=50)
     scored_df = sentiment_analyzer.analyze_dataframe(news_df)
     sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
 
-    # Merge & final dataset
-    merged_df = fe.merge_price_sentiment(price_df, sentiment_df)
-    dataset = fe.create_ml_dataset(merged_df)
+    # -----------------------------
+    # Canonical feature pipeline
+    # -----------------------------
+    dataset = FeatureEngineer.build_feature_pipeline(
+        price_df,
+        sentiment_df
+    )
 
     return dataset
 
 
 def train_model(df: pd.DataFrame):
-    # FEATURES = [
-    #     "return",
-    #     "volatility",
-    #     "rsi",
-    #     "macd",
-    #     "macd_signal",
-    #     "avg_sentiment",
-    #     "news_count",
-    #     "sentiment_std",
-    #     "return_lag1",
-    #     "sentiment_lag1"
-    # ]
 
     X = df[MODEL_FEATURES]
     y = df["target"]
@@ -101,10 +94,12 @@ def train_model(df: pd.DataFrame):
 
 
 if __name__ == "__main__":
+
     df = load_training_data()
     model = train_model(df)
 
-    # Save model
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    os.makedirs("artifacts", exist_ok=True)
+
     joblib.dump(model, MODEL_PATH)
+
     print(f"Model saved to {MODEL_PATH}")
