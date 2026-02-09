@@ -1,0 +1,13 @@
+-r base.txt
+
+fastapi
+uvicorn
+
+scikit-learn
+xgboost
+joblib
+
+pytest
+httpx
+
+prometheus-client
