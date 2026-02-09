@@ -6,6 +6,10 @@ __pycache__/
 .env
 .venv
 venv/
+Lib/
+Include/
+Scripts/
+site-packages/
 
 # Data
 data/raw/
