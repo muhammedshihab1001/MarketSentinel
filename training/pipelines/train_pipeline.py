@@ -1,48 +1,61 @@
 """
-Master Training Pipeline
+MarketSentinel Master Training Pipeline
 
-Controls the full training workflow:
-- XGBoost
-- LSTM
-- Prophet
+Single entrypoint for ALL model training.
+
+This acts as the training control plane.
 """
 
 import subprocess
 import sys
+import time
 
 
-def run_script(module_path: str):
-    """
-    Runs a module as a subprocess.
-    Safer than importing training scripts directly.
-    Prevents memory collisions (important for TF).
-    """
+PIPELINE_STEPS = [
+    ("XGBoost", "training.train_xgboost"),
+    ("LSTM", "training.train_lstm"),
+    ("Prophet", "training.train_prophet"),
+]
 
-    print(f"\n Running {module_path}...\n")
+
+def run_step(name: str, module: str):
+
+    print("\n===================================")
+    print(f" Starting {name} training")
+    print("===================================\n")
+
+    start = time.time()
 
     result = subprocess.run(
-        [sys.executable, "-m", module_path],
+        [sys.executable, "-m", module],
         check=True
     )
 
+    duration = round(time.time() - start, 2)
+
     if result.returncode == 0:
-        print(f" Completed {module_path}")
+        print(f"\n {name} completed in {duration}s\n")
     else:
-        raise RuntimeError(f" Failed {module_path}")
+        raise RuntimeError(f"{name} training failed")
 
 
 def main():
 
-    pipeline_steps = [
-        "training.train_xgboost",
-        "training.train_lstm",
-        "training.train_prophet",
-    ]
+    total_start = time.time()
 
-    for step in pipeline_steps:
-        run_script(step)
+    print("\n########################################")
+    print("   MARKET SENTINEL — TRAINING RUN")
+    print("########################################\n")
 
-    print("\n FULL TRAINING PIPELINE COMPLETED SUCCESSFULLY\n")
+    for name, module in PIPELINE_STEPS:
+        run_step(name, module)
+
+    total_time = round(time.time() - total_start, 2)
+
+    print("\n########################################")
+    print(f" ALL MODELS TRAINED SUCCESSFULLY")
+    print(f" Total runtime: {total_time}s")
+    print("########################################\n")
 
 
 if __name__ == "__main__":
