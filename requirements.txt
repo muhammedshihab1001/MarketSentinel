@@ -23,6 +23,7 @@ joblib
 transformers
 torch
 huggingface-hub
+vaderSentiment
 
 # -------------------------
 # Finance / Data Sources
