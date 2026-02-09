@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 import time
 
 from app.inference.pipeline import InferencePipeline
@@ -9,11 +10,29 @@ from app.monitoring.metrics import (
 )
 
 router = APIRouter()
+
 pipeline = InferencePipeline()
 
 
-@router.get("/predict")
-def predict(ticker: str = "AAPL"):
+# ----------------------------------------
+# REQUEST SCHEMA
+# ----------------------------------------
+
+class PredictionRequest(BaseModel):
+
+    ticker: str = Field(
+        default="AAPL",
+        min_length=1,
+        max_length=10
+    )
+
+
+# ----------------------------------------
+# INFERENCE ROUTE
+# ----------------------------------------
+
+@router.post("/predict")
+def predict(req: PredictionRequest):
 
     endpoint = "/predict"
 
@@ -23,7 +42,7 @@ def predict(ticker: str = "AAPL"):
 
     try:
 
-        result = pipeline.run(ticker)
+        result = pipeline.run(req.ticker.upper())
 
         API_LATENCY.labels(endpoint=endpoint).observe(
             time.time() - start
