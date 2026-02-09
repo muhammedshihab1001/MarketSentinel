@@ -6,7 +6,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import joblib
-from core.services import StockPriceFetcher
+from core.data.data_fetcher import StockPriceFetcher
 from app.models.prophet_model import train_prophet
 import datetime
 
