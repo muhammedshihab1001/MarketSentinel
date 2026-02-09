@@ -25,9 +25,14 @@ data/processed/
 # Model artifacts
 *.pkl
 *.joblib
+# Ignore ALL runtime artifacts
+artifacts/**
+
+# Keep directory structure
+!artifacts/.keep
+!artifacts/**/.keep
 
 # HuggingFace cache
 .cache/
 .huggingface/
-artifacts/*
 project_structure.txt

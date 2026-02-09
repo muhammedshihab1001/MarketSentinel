@@ -1,0 +1,24 @@
+{
+    "model_name": "xgboost_direction",
+    "created_at": "2026-02-09T13:40:26.759892",
+    "training_window": {
+        "start": "2018-01-01",
+        "end": "2026-02-09"
+    },
+    "features": [
+        "return",
+        "volatility",
+        "rsi",
+        "macd",
+        "macd_signal",
+        "avg_sentiment",
+        "news_count",
+        "sentiment_std",
+        "return_lag1",
+        "sentiment_lag1"
+    ],
+    "metrics": {
+        "accuracy": 0.5358024691358024
+    },
+    "schema_version": "1.0"
+}

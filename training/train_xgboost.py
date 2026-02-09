@@ -12,15 +12,22 @@ from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import MODEL_FEATURES
+from artifacts.metadata_manager import MetadataManager
 
 
-MODEL_PATH = "artifacts/xgboost_direction.pkl"
+MODEL_DIR = "artifacts/xgboost"
+MODEL_PATH = f"{MODEL_DIR}/model.pkl"
+METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 MIN_ACCURACY = 0.50
 
 
+# ---------------------------------------------------
+# DATA LOADING
+# ---------------------------------------------------
+
 def load_training_data():
     """
-    Loads data using the canonical feature pipeline.
+    Uses canonical feature pipeline.
     Guarantees training == inference features.
     """
 
@@ -30,33 +37,28 @@ def load_training_data():
 
     end_date = datetime.date.today().isoformat()
 
-    # -----------------------------
-    # Fetch price data
-    # -----------------------------
     price_df = fetcher.fetch(
         ticker="AAPL",
         start_date="2018-01-01",
         end_date=end_date
     )
 
-    # -----------------------------
-    # Fetch sentiment
-    # -----------------------------
     news_df = news_fetcher.fetch("Apple stock", max_items=100)
 
     scored_df = sentiment_analyzer.analyze_dataframe(news_df)
     sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
 
-    # -----------------------------
-    # Canonical feature pipeline
-    # -----------------------------
     dataset = FeatureEngineer.build_feature_pipeline(
         price_df,
         sentiment_df
     )
 
-    return dataset
+    return dataset, end_date
 
+
+# ---------------------------------------------------
+# MODEL TRAINING
+# ---------------------------------------------------
 
 def train_model(df: pd.DataFrame):
 
@@ -64,7 +66,9 @@ def train_model(df: pd.DataFrame):
     y = df["target"]
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, shuffle=False
+        X, y,
+        test_size=0.2,
+        shuffle=False
     )
 
     model = XGBClassifier(
@@ -90,16 +94,33 @@ def train_model(df: pd.DataFrame):
             f"Model accuracy {acc:.2f} below threshold {MIN_ACCURACY}"
         )
 
-    return model
+    return model, acc
 
+
+# ---------------------------------------------------
+# EXECUTION
+# ---------------------------------------------------
 
 if __name__ == "__main__":
 
-    df = load_training_data()
-    model = train_model(df)
+    df, end_date = load_training_data()
+    model, acc = train_model(df)
 
-    os.makedirs("artifacts", exist_ok=True)
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
+    # Save model
     joblib.dump(model, MODEL_PATH)
 
+    # Create metadata
+    metadata = MetadataManager.create_metadata(
+        model_name="xgboost_direction",
+        metrics={"accuracy": float(acc)},
+        features=MODEL_FEATURES,
+        training_start="2018-01-01",
+        training_end=end_date
+    )
+
+    MetadataManager.save_metadata(metadata, METADATA_PATH)
+
     print(f"Model saved to {MODEL_PATH}")
+    print(f"Metadata saved to {METADATA_PATH}")
