@@ -1,21 +1,20 @@
 import pandas as pd
 import numpy as np
 
+from core.schema.feature_schema import validate_feature_schema
+
 
 class FeatureEngineer:
     """
     Institutional-grade feature engineering.
 
-    Improvements:
-    ✅ Reduced DataFrame copying
-    ✅ Faster rolling ops
-    ✅ Stable merges
-    ✅ Lower memory churn
-    ✅ Inference-friendly pipeline
+    Guarantees:
+    - no lookahead leakage in inference
+    - deterministic ordering
+    - numeric stability
+    - schema enforcement
     """
 
-    # ------------------------------------------------------------------
-    # PRICE-BASED FEATURES
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -49,9 +48,6 @@ class FeatureEngineer:
     @staticmethod
     def add_rsi(df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
 
-        if "close" not in df.columns:
-            raise ValueError("DataFrame must contain 'close' column")
-
         delta = df["close"].diff()
 
         gain = delta.clip(lower=0)
@@ -60,9 +56,14 @@ class FeatureEngineer:
         avg_gain = gain.rolling(window, min_periods=window).mean()
         avg_loss = loss.rolling(window, min_periods=window).mean()
 
+        # prevent divide-by-zero
+        avg_loss = avg_loss.replace(0, np.nan)
+
         rs = avg_gain / avg_loss
 
         df["rsi"] = 100 - (100 / (1 + rs))
+
+        df["rsi"] = df["rsi"].fillna(50)  # neutral fallback
 
         return df
 
@@ -70,9 +71,6 @@ class FeatureEngineer:
 
     @staticmethod
     def add_macd(df: pd.DataFrame) -> pd.DataFrame:
-
-        if "close" not in df.columns:
-            raise ValueError("DataFrame must contain 'close' column")
 
         ema_12 = df["close"].ewm(span=12, adjust=False).mean()
         ema_26 = df["close"].ewm(span=26, adjust=False).mean()
@@ -83,20 +81,12 @@ class FeatureEngineer:
         return df
 
     # ------------------------------------------------------------------
-    # SENTIMENT MERGING
-    # ------------------------------------------------------------------
 
     @staticmethod
     def merge_price_sentiment(
         price_df: pd.DataFrame,
         sentiment_df: pd.DataFrame
     ) -> pd.DataFrame:
-
-        if "date" not in price_df.columns:
-            raise ValueError("price_df must contain 'date' column")
-
-        if "date" not in sentiment_df.columns:
-            raise ValueError("sentiment_df must contain 'date' column")
 
         price_df["date"] = pd.to_datetime(price_df["date"]).dt.date
         sentiment_df["date"] = pd.to_datetime(sentiment_df["date"]).dt.date
@@ -109,33 +99,43 @@ class FeatureEngineer:
             sort=False
         )
 
+        merged = merged.sort_values("date")
+
         for col in ["avg_sentiment", "news_count", "sentiment_std"]:
             if col not in merged.columns:
                 merged[col] = 0.0
             else:
-                merged[col].fillna(0.0, inplace=True)
+                merged[col] = merged[col].fillna(0.0)
 
         return merged
 
     # ------------------------------------------------------------------
-    # FINAL ML DATASET
+    # TRAINING ONLY
     # ------------------------------------------------------------------
 
     @staticmethod
-    def create_ml_dataset(df: pd.DataFrame) -> pd.DataFrame:
-
-        required_cols = ["return", "avg_sentiment"]
-
-        for col in required_cols:
-            if col not in df.columns:
-                raise ValueError(f"Missing required column: {col}")
+    def create_training_dataset(df: pd.DataFrame) -> pd.DataFrame:
 
         df["target"] = (df["return"].shift(-1) > 0).astype(int)
 
         df["return_lag1"] = df["return"].shift(1)
         df["sentiment_lag1"] = df["avg_sentiment"].shift(1)
 
-        df.dropna(inplace=True)
+        df = df.dropna()
+
+        return df
+
+    # ------------------------------------------------------------------
+    # INFERENCE SAFE
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def create_inference_dataset(df: pd.DataFrame) -> pd.DataFrame:
+
+        df["return_lag1"] = df["return"].shift(1)
+        df["sentiment_lag1"] = df["avg_sentiment"].shift(1)
+
+        df = df.dropna()
 
         return df
 
@@ -147,16 +147,13 @@ class FeatureEngineer:
     def build_feature_pipeline(
         cls,
         price_df: pd.DataFrame,
-        sentiment_df: pd.DataFrame
+        sentiment_df: pd.DataFrame,
+        training: bool = False
     ) -> pd.DataFrame:
-        """
-        Canonical pipeline.
 
-        Optimized for inference workloads.
-        """
-
-        # SINGLE COPY ONLY
         df = price_df.copy()
+
+        df = df.sort_values("date")
 
         cls.add_returns(df)
         cls.add_volatility(df)
@@ -165,6 +162,11 @@ class FeatureEngineer:
 
         df = cls.merge_price_sentiment(df, sentiment_df)
 
-        df = cls.create_ml_dataset(df)
+        if training:
+            df = cls.create_training_dataset(df)
+        else:
+            df = cls.create_inference_dataset(df)
+
+        df = validate_feature_schema(df)
 
         return df.reset_index(drop=True)
