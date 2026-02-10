@@ -1,5 +1,6 @@
 from prometheus_client import Counter, Histogram, Gauge
 
+
 # =====================================================
 # REQUEST LAYER
 # =====================================================
@@ -22,6 +23,7 @@ API_LATENCY = Histogram(
     ["endpoint"]
 )
 
+
 # =====================================================
 # MODEL INFERENCE
 # =====================================================
@@ -38,9 +40,9 @@ MODEL_INFERENCE_LATENCY = Histogram(
     ["model"]
 )
 
-# 🔥 NEW — live model version visibility
+# ✅ KEEP NAME STABLE
 MODEL_VERSION = Gauge(
-    "model_version_info",
+    "model_version",
     "Currently loaded model version",
     ["model", "version"]
 )
@@ -51,7 +53,6 @@ SIGNAL_DISTRIBUTION = Counter(
     ["signal"]
 )
 
-# 🔥 NEW — prediction class skew detection
 PREDICTION_CLASS_PROBABILITY = Histogram(
     "prediction_probability",
     "Prediction probability distribution",
@@ -68,6 +69,7 @@ CONFIDENCE_SCORE = Gauge(
     "Model confidence score"
 )
 
+
 # =====================================================
 # DATA QUALITY
 # =====================================================
@@ -77,7 +79,11 @@ MISSING_FEATURE_RATIO = Gauge(
     "Ratio of missing features during inference"
 )
 
-# 🔥 NEW — feature drift sentinel
+
+# =====================================================
+# FEATURE MONITORING
+# =====================================================
+
 FEATURE_MEAN = Gauge(
     "feature_mean",
     "Live feature mean",
@@ -90,7 +96,6 @@ FEATURE_STD = Gauge(
     ["feature"]
 )
 
-# 🔥 NEW — extreme value detection
 FEATURE_MAX = Gauge(
     "feature_max",
     "Live feature max",
@@ -102,6 +107,13 @@ FEATURE_MIN = Gauge(
     "Live feature min",
     ["feature"]
 )
+
+# 🚨 GLOBAL DRIFT FLAG (VERY IMPORTANT)
+DRIFT_DETECTED = Gauge(
+    "drift_detected",
+    "Global drift detection flag"
+)
+
 
 # =====================================================
 # PIPELINE HEALTH
