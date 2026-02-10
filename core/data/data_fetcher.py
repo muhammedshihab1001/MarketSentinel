@@ -3,6 +3,7 @@ import pandas as pd
 import time
 import random
 import os
+import hashlib
 
 from datetime import datetime, timedelta
 from typing import List
@@ -12,11 +13,11 @@ class StockPriceFetcher:
     """
     Institutional-grade market data fetcher.
 
-    Upgrades:
-    ✅ Incremental append (VERY HIGH IMPACT)
-    ✅ Prevents full-history re-download
-    ✅ Faster cache refresh
-    ✅ Provider fallback preserved
+    NEW CAPABILITIES:
+    ✅ Incremental ingestion
+    ✅ Dataset snapshotting
+    ✅ Immutable dataset registry
+    ✅ Training reproducibility
     """
 
     REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
@@ -25,20 +26,60 @@ class StockPriceFetcher:
     BASE_SLEEP = 1.5
 
     CACHE_DIR = "data/cache"
+    DATASET_DIR = "data/datasets"
 
     # -----------------------------------------------------
 
     def __init__(self):
         os.makedirs(self.CACHE_DIR, exist_ok=True)
+        os.makedirs(self.DATASET_DIR, exist_ok=True)
+
+    # =====================================================
+    # 🔥 DATASET HASH
+    # =====================================================
+
+    def _hash_dataset(self, df: pd.DataFrame) -> str:
+
+        data_bytes = pd.util.hash_pandas_object(
+            df,
+            index=True
+        ).values.tobytes()
+
+        return hashlib.sha256(data_bytes).hexdigest()
 
     # -----------------------------------------------------
+
+    def _snapshot_dataset(self, ticker: str, df: pd.DataFrame):
+
+        dataset_hash = self._hash_dataset(df)
+
+        ticker_dir = os.path.join(
+            self.DATASET_DIR,
+            ticker.upper()
+        )
+
+        os.makedirs(ticker_dir, exist_ok=True)
+
+        path = os.path.join(
+            ticker_dir,
+            f"{dataset_hash}.parquet"
+        )
+
+        if not os.path.exists(path):
+            df.to_parquet(path, index=False)
+            print(f"[DatasetRegistry] Snapshot saved → {path}")
+
+        return dataset_hash
+
+    # =====================================================
 
     def fetch(
         self,
         ticker: str,
         start_date: str,
         end_date: str,
-        interval: str = "1d"
+        interval: str = "1d",
+        snapshot: bool = False   # 🔥 NEW FLAG
     ) -> pd.DataFrame:
 
         self._validate_dates(start_date, end_date)
@@ -63,13 +104,16 @@ class StockPriceFetcher:
                 request_start = pd.to_datetime(start_date)
                 request_end = pd.to_datetime(end_date)
 
-                # FULL COVERAGE
                 if cache_start <= request_start and cache_end >= request_end:
+
+                    if snapshot:
+                        self._snapshot_dataset(ticker, cached)
+
                     print(f"[Fetcher] Loaded fully from cache: {ticker}")
                     return cached
 
                 # --------------------------------------
-                # INCREMENTAL FETCH
+                # INCREMENTAL
                 # --------------------------------------
 
                 missing_start = cache_end + timedelta(days=1)
@@ -101,25 +145,25 @@ class StockPriceFetcher:
                             inplace=True
                         )
 
-                        combined.sort_values(
-                            "date",
-                            inplace=True
-                        )
+                        combined.sort_values("date", inplace=True)
 
-                        combined.to_parquet(
-                            cache_file,
-                            index=False
-                        )
+                        combined.to_parquet(cache_file, index=False)
+
+                        if snapshot:
+                            self._snapshot_dataset(ticker, combined)
 
                         return combined
+
+                if snapshot:
+                    self._snapshot_dataset(ticker, cached)
 
                 return cached
 
             except Exception:
-                pass  # corrupt cache fallback
+                pass
 
         # ==========================================
-        # NO CACHE → FULL DOWNLOAD
+        # FULL DOWNLOAD
         # ==========================================
 
         df = self._fetch_from_providers(
@@ -132,6 +176,9 @@ class StockPriceFetcher:
         if df is not None and not df.empty:
 
             df.to_parquet(cache_file, index=False)
+
+            if snapshot:
+                self._snapshot_dataset(ticker, df)
 
             print(f"[Fetcher] Saved cache for {ticker}")
 
@@ -175,8 +222,6 @@ class StockPriceFetcher:
             f"Last error: {last_exception}"
         )
 
-    # -----------------------------------------------------
-    # YAHOO
     # -----------------------------------------------------
 
     def _fetch_yahoo(
@@ -230,8 +275,6 @@ class StockPriceFetcher:
         raise RuntimeError("Yahoo failed")
 
     # -----------------------------------------------------
-    # STOOQ
-    # -----------------------------------------------------
 
     def _fetch_stooq(
         self,
@@ -279,11 +322,12 @@ class StockPriceFetcher:
         tickers: List[str],
         start_date: str,
         end_date: str,
-        interval: str = "1d"
+        interval: str = "1d",
+        snapshot: bool = False
     ) -> pd.DataFrame:
 
         data = [
-            self.fetch(t, start_date, end_date, interval)
+            self.fetch(t, start_date, end_date, interval, snapshot)
             for t in tickers
         ]
 
