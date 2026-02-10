@@ -41,9 +41,18 @@ class InferencePipeline:
 
     # ---------------------------------------------------
 
-    def run(self, ticker="AAPL"):
+    def run(
+        self,
+        ticker="AAPL",
+        start_date=None,
+        end_date=None,
+        forecast_days=30
+    ):
 
-        end_date = datetime.date.today().isoformat()
+        today = datetime.date.today()
+
+        start_date = start_date or today
+        end_date = end_date or (start_date + datetime.timedelta(days=forecast_days))
 
         # -----------------------------------
         # FETCH DATA
@@ -52,7 +61,7 @@ class InferencePipeline:
         price_df = self.fetcher.fetch(
             ticker=ticker,
             start_date="2018-01-01",
-            end_date=end_date
+            end_date=today.isoformat()
         )
 
         news_df = self.news_fetcher.fetch(
@@ -107,6 +116,9 @@ class InferencePipeline:
 
         lstm_prices = self.models.lstm_forecast(recent_prices)
 
+        # 🔥 Respect forecast_days from API
+        lstm_prices = lstm_prices[:forecast_days]
+
         MODEL_INFERENCE_COUNT.labels(model="lstm").inc()
         MODEL_INFERENCE_LATENCY.labels(model="lstm").observe(
             time.time() - start
@@ -149,10 +161,9 @@ class InferencePipeline:
 
         last_date = pd.to_datetime(price_df["date"].iloc[-1])
 
-        future_dates = pd.date_range(
+        future_dates = pd.bdate_range(
             start=last_date + pd.Timedelta(days=1),
-            periods=len(lstm_prices),
-            freq="B"  # business days only
+            periods=len(lstm_prices)
         )
 
         forecast_series = []
@@ -176,6 +187,7 @@ class InferencePipeline:
             forecast_series.append({
                 "date": str(date.date()),
                 "expected_price": float(price),
+                "expected_return_pct": round(step_return * 100, 2),
                 "signal": step_signal
             })
 
