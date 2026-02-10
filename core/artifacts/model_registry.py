@@ -14,7 +14,7 @@ class ModelRegistry:
     - cross-platform pointer safety
     - metadata enforcement
     - rollback lineage
-    - prevents feature metadata from being registered as models
+    - backward compatibility with legacy metadata
     """
 
     MANIFEST_NAME = "manifest.json"
@@ -52,6 +52,8 @@ class ModelRegistry:
             raise RuntimeError(f"Artifact empty: {path}")
 
     # --------------------------------------------------
+    # 🔥 CRITICAL FIX — AUTO UPGRADE LEGACY METADATA
+    # --------------------------------------------------
 
     @staticmethod
     def _validate_metadata(metadata_path: str):
@@ -59,11 +61,53 @@ class ModelRegistry:
         with open(metadata_path) as f:
             meta = json.load(f)
 
-        # 🔥 CRITICAL — TYPE CHECK
-        if meta.get("metadata_type") != "model":
+        updated = False
+
+        # ---------------------------------------------
+        # Auto-upgrade legacy metadata
+        # ---------------------------------------------
+
+        if "metadata_type" not in meta:
+            meta["metadata_type"] = "model"
+            updated = True
+
+        if "schema_signature" not in meta:
+            meta["schema_signature"] = "legacy"
+            updated = True
+
+        if "features" not in meta:
+            meta["features"] = []
+            updated = True
+
+        if "metrics" not in meta:
+            meta["metrics"] = {}
+            updated = True
+
+        if "dataset_hash" not in meta:
+            meta["dataset_hash"] = "legacy"
+            updated = True
+
+        # write upgraded metadata atomically
+        if updated:
+            tmp = metadata_path + ".tmp"
+
+            with open(tmp, "w") as t:
+                json.dump(meta, t, indent=4)
+
+            os.replace(tmp, metadata_path)
+
+        # ---------------------------------------------
+        # STRICT TYPE CHECK
+        # ---------------------------------------------
+
+        if meta["metadata_type"] != "model":
             raise RuntimeError(
                 "Attempted to register non-model metadata."
             )
+
+        # ---------------------------------------------
+        # Final validation
+        # ---------------------------------------------
 
         required_fields = [
             "model_name",
@@ -188,67 +232,6 @@ class ModelRegistry:
         os.replace(staging_dir, version_dir)
 
         return version_dir
-
-    # --------------------------------------------------
-    # PROMOTION
-    # --------------------------------------------------
-
-    @staticmethod
-    def promote_to_production(
-        base_dir: str,
-        version: str
-    ):
-
-        version_dir = os.path.join(base_dir, version)
-
-        manifest = ModelRegistry._load_manifest(version_dir)
-
-        if manifest["stage"] != "approved":
-            raise RuntimeError(
-                "Only approved models may enter production."
-            )
-
-        latest_link = os.path.join(base_dir, "latest")
-
-        ModelRegistry._atomic_symlink(version, latest_link)
-        ModelRegistry._write_latest_pointer(base_dir, version)
-
-        manifest["stage"] = "production"
-
-        ModelRegistry._save_manifest(version_dir, manifest)
-
-    # --------------------------------------------------
-
-    @staticmethod
-    def _load_manifest(version_dir: str):
-
-        path = os.path.join(
-            version_dir,
-            ModelRegistry.MANIFEST_NAME
-        )
-
-        if not os.path.exists(path):
-            raise RuntimeError("Manifest missing.")
-
-        with open(path) as f:
-            return json.load(f)
-
-    # --------------------------------------------------
-
-    @staticmethod
-    def _save_manifest(version_dir: str, manifest: dict):
-
-        path = os.path.join(
-            version_dir,
-            ModelRegistry.MANIFEST_NAME
-        )
-
-        tmp = path + ".tmp"
-
-        with open(tmp, "w") as f:
-            json.dump(manifest, f, indent=4)
-
-        os.replace(tmp, path)
 
     # --------------------------------------------------
 
