@@ -5,6 +5,8 @@ import datetime
 import time
 import asyncio
 import os
+import re
+import logging
 
 from app.inference.pipeline import InferencePipeline
 from core.signals.signal_engine import StrategyEngine
@@ -16,9 +18,29 @@ from app.monitoring.metrics import (
 )
 
 router = APIRouter()
+logger = logging.getLogger("marketsentinel.api")
 
-pipeline = InferencePipeline()
-strategy_engine = StrategyEngine()
+# ------------------------------------------------
+# LAZY SINGLETONS
+# ------------------------------------------------
+
+_pipeline = None
+_strategy_engine = None
+
+
+def get_pipeline():
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = InferencePipeline()
+    return _pipeline
+
+
+def get_strategy_engine():
+    global _strategy_engine
+    if _strategy_engine is None:
+        _strategy_engine = StrategyEngine()
+    return _strategy_engine
+
 
 # ------------------------------------------------
 # CONCURRENCY GATE
@@ -26,6 +48,10 @@ strategy_engine = StrategyEngine()
 
 MAX_CONCURRENT_INFERENCES = int(
     os.getenv("MAX_CONCURRENT_INFERENCES", "4")
+)
+
+REQUEST_TIMEOUT = int(
+    os.getenv("INFERENCE_TIMEOUT_SEC", "25")
 )
 
 inference_semaphore = asyncio.Semaphore(
@@ -36,13 +62,15 @@ MAX_BATCH_SIZE = int(
     os.getenv("MAX_BATCH_SIZE", "10")
 )
 
+TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,10}$")
+
 # ----------------------------------------
 # REQUEST SCHEMAS
 # ----------------------------------------
 
 class PredictionRequest(BaseModel):
 
-    ticker: str = Field(default="AAPL", min_length=1, max_length=10)
+    ticker: str = Field(default="AAPL")
 
     forecast_days: int = Field(default=30, ge=1, le=90)
 
@@ -51,8 +79,13 @@ class PredictionRequest(BaseModel):
 
     @field_validator("ticker")
     @classmethod
-    def uppercase_ticker(cls, v: str):
-        return v.upper().strip()
+    def validate_ticker(cls, v: str):
+        v = v.upper().strip()
+
+        if not TICKER_REGEX.match(v):
+            raise ValueError("Invalid ticker format")
+
+        return v
 
     @field_validator("end_date")
     @classmethod
@@ -75,7 +108,19 @@ class BatchPredictionRequest(BaseModel):
     @field_validator("tickers")
     @classmethod
     def normalize(cls, tickers):
-        return [t.upper().strip() for t in tickers]
+
+        cleaned = []
+
+        for t in tickers:
+            t = t.upper().strip()
+
+            if not TICKER_REGEX.match(t):
+                raise ValueError(f"Invalid ticker: {t}")
+
+            cleaned.append(t)
+
+        # remove duplicates
+        return list(set(cleaned))
 
 
 # ----------------------------------------
@@ -94,27 +139,45 @@ async def predict(req: PredictionRequest):
 
         async with inference_semaphore:
 
-            result = await run_in_threadpool(
-                pipeline.run,
-                req.ticker,
-                req.start_date,
-                req.end_date,
-                req.forecast_days
+            result = await asyncio.wait_for(
+                run_in_threadpool(
+                    get_pipeline().run,
+                    req.ticker,
+                    req.start_date,
+                    req.end_date,
+                    req.forecast_days
+                ),
+                timeout=REQUEST_TIMEOUT
             )
-
-        API_LATENCY.labels(endpoint=endpoint).observe(
-            time.time() - start_time
-        )
 
         return result
 
-    except Exception as e:
+    except asyncio.TimeoutError:
 
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
 
+        logger.error("Inference timeout")
+
+        raise HTTPException(
+            status_code=504,
+            detail="Inference timeout"
+        )
+
+    except Exception:
+
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+
+        logger.exception("Inference failure")
+
         raise HTTPException(
             status_code=500,
-            detail=f"Inference failed: {str(e)}"
+            detail="Inference failed"
+        )
+
+    finally:
+
+        API_LATENCY.labels(endpoint=endpoint).observe(
+            time.time() - start_time
         )
 
 
@@ -142,44 +205,42 @@ async def predict_batch(req: BatchPredictionRequest):
 
             try:
 
-                return await run_in_threadpool(
-                    pipeline.run,
-                    ticker,
-                    None,
-                    None,
-                    req.forecast_days
+                return await asyncio.wait_for(
+                    run_in_threadpool(
+                        get_pipeline().run,
+                        ticker,
+                        None,
+                        None,
+                        req.forecast_days
+                    ),
+                    timeout=REQUEST_TIMEOUT
                 )
 
-            except Exception as e:
-                return {"ticker": ticker, "error": str(e)}
+            except Exception:
+                logger.exception(f"Batch inference failed for {ticker}")
+                return {"ticker": ticker, "error": "inference_failed"}
 
     try:
 
-        results = await asyncio.gather(
-            *[infer_one(t) for t in req.tickers]
-        )
+        results = []
 
-        API_LATENCY.labels(endpoint=endpoint).observe(
-            time.time() - start_time
-        )
+        for ticker in req.tickers:
+            results.append(await infer_one(ticker))
 
         return {
             "count": len(results),
             "results": results
         }
 
-    except Exception as e:
+    finally:
 
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Batch inference failed: {str(e)}"
+        API_LATENCY.labels(endpoint=endpoint).observe(
+            time.time() - start_time
         )
 
 
 # ===================================================
-# 🔥 NEW — INSTITUTIONAL STRATEGY ENDPOINT
+# STRATEGY ENDPOINT
 # ===================================================
 
 @router.post("/strategy/top")
@@ -196,49 +257,43 @@ async def top_opportunities(req: BatchPredictionRequest):
             detail=f"Batch size exceeds limit ({MAX_BATCH_SIZE})"
         )
 
-    async def infer_one(ticker):
-
-        async with inference_semaphore:
-
-            try:
-                return await run_in_threadpool(
-                    pipeline.run,
-                    ticker,
-                    None,
-                    None,
-                    req.forecast_days
-                )
-            except Exception:
-                return None
+    predictions = []
 
     try:
 
-        predictions = await asyncio.gather(
-            *[infer_one(t) for t in req.tickers]
-        )
+        for ticker in req.tickers:
 
-        predictions = [p for p in predictions if p is not None]
+            async with inference_semaphore:
 
-        top_buys = strategy_engine.top_opportunities(predictions)
-        sell_alerts = strategy_engine.sell_alerts(predictions)
-        distribution = strategy_engine.signal_distribution(predictions)
+                try:
 
-        API_LATENCY.labels(endpoint=endpoint).observe(
-            time.time() - start_time
-        )
+                    result = await asyncio.wait_for(
+                        run_in_threadpool(
+                            get_pipeline().run,
+                            ticker,
+                            None,
+                            None,
+                            req.forecast_days
+                        ),
+                        timeout=REQUEST_TIMEOUT
+                    )
+
+                    predictions.append(result)
+
+                except Exception:
+                    logger.exception(f"Strategy inference failed for {ticker}")
+
+        strategy_engine = get_strategy_engine()
 
         return {
-            "top_buys": top_buys,
-            "sell_alerts": sell_alerts,
-            "signal_distribution": distribution,
+            "top_buys": strategy_engine.top_opportunities(predictions),
+            "sell_alerts": strategy_engine.sell_alerts(predictions),
+            "signal_distribution": strategy_engine.signal_distribution(predictions),
             "analyzed": len(predictions)
         }
 
-    except Exception as e:
+    finally:
 
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Strategy scan failed: {str(e)}"
+        API_LATENCY.labels(endpoint=endpoint).observe(
+            time.time() - start_time
         )
