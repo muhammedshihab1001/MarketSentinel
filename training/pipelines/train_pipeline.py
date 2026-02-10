@@ -2,6 +2,8 @@
 MarketSentinel Institutional Training Orchestrator
 
 Promotion-safe release pipeline.
+Cross-platform.
+Registry-aware.
 """
 
 import subprocess
@@ -16,6 +18,7 @@ import logging
 
 from core.schema.feature_schema import get_schema_signature
 from core.monitoring.drift_detector import DriftDetector
+from core.artifacts.model_registry import ModelRegistry
 
 
 logger = logging.getLogger("marketsentinel.training")
@@ -89,7 +92,15 @@ def snapshot_lineage():
 
 def load_metadata(model_name: str):
 
-    path = f"artifacts/{model_name}/latest/metadata.json"
+    version = ModelRegistry.get_latest_version(
+        f"artifacts/{model_name}"
+    )
+
+    path = os.path.join(
+        f"artifacts/{model_name}",
+        version,
+        "metadata.json"
+    )
 
     if not os.path.exists(path):
         raise RuntimeError(f"{model_name} metadata missing.")
@@ -141,19 +152,16 @@ def governance_check(model_name: str):
 
 
 # ---------------------------------------------------
-# REGISTRY SAFETY
+# REGISTRY SAFETY (FIXED)
 # ---------------------------------------------------
 
 def validate_registry(model_name: str):
 
-    latest = f"artifacts/{model_name}/latest"
+    base_dir = f"artifacts/{model_name}"
 
-    if not os.path.islink(latest):
-        raise RuntimeError(f"{model_name} production pointer missing.")
+    version = ModelRegistry.get_latest_version(base_dir)
 
-    version = os.readlink(latest)
-
-    version_dir = os.path.join(f"artifacts/{model_name}", version)
+    version_dir = os.path.join(base_dir, version)
 
     manifest = os.path.join(version_dir, "manifest.json")
     metadata = os.path.join(version_dir, "metadata.json")
@@ -229,7 +237,7 @@ def save_manifest(run_id: str, manifest: dict):
     with open(path, "w") as f:
         json.dump(manifest, f, indent=4)
 
-    logger.info(f"Training manifest saved → {path}")
+    logger.info(f"Training manifest saved -> {path}")
 
 
 # ---------------------------------------------------
@@ -289,8 +297,6 @@ def main():
 
     save_manifest(run_id, manifest)
 
-
-# ---------------------------------------------------
 
 if __name__ == "__main__":
     main()
