@@ -10,6 +10,7 @@ from core.features.feature_engineering import FeatureEngineer
 from core.signals.signal_engine import DecisionEngine
 from core.scenario.scenario_engine import ScenarioEngine
 from core.explainability.decision_explainer import DecisionExplainer
+from core.features.feature_store import FeatureStore
 
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
@@ -39,6 +40,7 @@ class InferencePipeline:
         self.decision_engine = DecisionEngine()
         self.scenario_engine = ScenarioEngine()
         self.explainer = DecisionExplainer()
+        self.feature_store = FeatureStore()
 
         self.cache = RedisCache()
 
@@ -96,10 +98,11 @@ class InferencePipeline:
         scored = self.sentiment.analyze_dataframe(news_df)
         sentiment_df = self.sentiment.aggregate_daily_sentiment(scored)
 
-        dataset = FeatureEngineer.build_feature_pipeline(
+        dataset = self.feature_store.get_features(
             price_df,
             sentiment_df
         )
+
 
         # ✅ Safety check
         if dataset.empty:
