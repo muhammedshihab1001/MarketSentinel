@@ -1,3 +1,4 @@
+import os
 import joblib
 import tensorflow as tf
 import logging
@@ -11,18 +12,54 @@ logger = logging.getLogger(__name__)
 
 class ModelLoader:
     """
-    Production-safe lazy model loader.
+    Institutional-grade process-safe lazy model loader.
 
-    Models are loaded ONLY when first requested.
-    Prevents API startup crashes.
+    Guarantees:
+    ✅ Single instance per worker
+    ✅ Lazy artifact loading
+    ✅ Prevents accidental memory duplication
+    ✅ TensorFlow thread control
+    ✅ Future pre-fork compatible
     """
 
+    _instance = None  # process-level singleton
+
+    # ---------------------------------------------------
+
+    def __new__(cls, *args, **kwargs):
+        """
+        Ensures only ONE loader exists per process.
+        Critical for memory stability.
+        """
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+
+        return cls._instance
+
+    # ---------------------------------------------------
+
     def __init__(self):
+
+        # Prevent reinitialization
+        if hasattr(self, "_initialized"):
+            return
+
+        # -------- Thread Safety (VERY IMPORTANT) --------
+        # Prevent TF from consuming all CPU cores
+        tf.config.threading.set_intra_op_parallelism_threads(1)
+        tf.config.threading.set_inter_op_parallelism_threads(1)
+
+        # Optional but recommended for many containers
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+        # ------------------------------------------------
 
         self._xgb = None
         self._lstm = None
         self._scaler = None
         self._prophet = None
+
+        self._initialized = True
 
     # ---------------------------------------------------
     # XGBoost
@@ -46,8 +83,10 @@ class ModelLoader:
 
         if self._lstm is None:
             logger.info("Loading LSTM model...")
+
             self._lstm = tf.keras.models.load_model(
-                "artifacts/lstm/model.keras"
+                "artifacts/lstm/model.keras",
+                compile=False  # 🔥 avoids unnecessary graph compile
             )
 
         return self._lstm
