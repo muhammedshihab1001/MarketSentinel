@@ -2,6 +2,7 @@ import datetime
 import time
 import numpy as np
 import pandas as pd
+import json
 
 from core.data.data_fetcher import StockPriceFetcher
 from core.data.news_fetcher import NewsFetcher
@@ -12,6 +13,7 @@ from core.scenario.scenario_engine import ScenarioEngine
 from core.explainability.decision_explainer import DecisionExplainer
 
 from app.inference.model_loader import ModelLoader
+from app.inference.cache import RedisCache   # ⭐ NEW
 
 from app.monitoring.metrics import (
     MODEL_INFERENCE_COUNT,
@@ -39,6 +41,8 @@ class InferencePipeline:
         self.scenario_engine = ScenarioEngine()
         self.explainer = DecisionExplainer()
 
+        self.cache = RedisCache()  # ⭐ NEW
+
     # ---------------------------------------------------
 
     def run(
@@ -48,6 +52,19 @@ class InferencePipeline:
         end_date=None,
         forecast_days=30
     ):
+
+        # ==========================================
+        # ⭐ CACHE CHECK (BEFORE ANY HEAVY WORK)
+        # ==========================================
+
+        cache_key = f"{ticker}:{forecast_days}"
+
+        cached = self.cache.get(cache_key)
+
+        if cached:
+            return cached
+
+        # ==========================================
 
         today = datetime.date.today()
 
@@ -154,14 +171,12 @@ class InferencePipeline:
         FORECAST_HORIZON.set(len(lstm_prices))
 
         # ==========================================
-        # 🔥 BUILD HISTORICAL + FORECAST TIMELINE
+        # TIMELINE
         # ==========================================
 
         timeline = []
 
-        # ---------- Historical ----------
-        hist_window = 120  # last ~6 months
-
+        hist_window = 120
         hist_df = price_df.tail(hist_window)
 
         for _, row in hist_df.iterrows():
@@ -170,8 +185,6 @@ class InferencePipeline:
                 "price": float(row["close"]),
                 "type": "historical"
             })
-
-        # ---------- Forecast ----------
 
         last_date = pd.to_datetime(price_df["date"].iloc[-1])
 
@@ -209,18 +222,10 @@ class InferencePipeline:
             timeline.append(point)
             forecast_series.append(point)
 
-        # -----------------------------------
-        # SCENARIOS
-        # -----------------------------------
-
         scenarios = self.scenario_engine.generate({
             "mean_forecast": float(np.mean(lstm_prices)),
             "std_dev": float(np.std(lstm_prices))
         })
-
-        # -----------------------------------
-        # EXPLANATION
-        # -----------------------------------
 
         explanation = self.explainer.explain(
             prediction=int(prediction),
@@ -230,25 +235,24 @@ class InferencePipeline:
             rsi=float(latest["rsi"])
         )
 
-        # -----------------------------------
-        # RESPONSE
-        # -----------------------------------
-
-        return {
+        response = {
 
             "ticker": ticker,
-
             "signal_today": signal_today,
             "confidence": float(confidence),
             "probability_up": float(prob_up),
-
-            # ⭐ FRONTEND GOLD
             "timeline": timeline,
-
             "forecast_start": str(future_dates[0].date()),
             "forecast_end": str(future_dates[-1].date()),
             "horizon_days": len(forecast_series),
-
             "scenarios": scenarios,
             "explanation": explanation
         }
+
+        # ==========================================
+        # ⭐ CACHE WRITE
+        # ==========================================
+
+        self.cache.set(cache_key, response, ttl=900)  # 15 min cache
+
+        return response
