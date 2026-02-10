@@ -13,6 +13,7 @@ from app.monitoring.metrics import (
 
 router = APIRouter()
 
+# ✅ Load once (VERY important)
 pipeline = InferencePipeline()
 
 
@@ -25,36 +26,42 @@ class PredictionRequest(BaseModel):
     ticker: str = Field(
         default="AAPL",
         min_length=1,
-        max_length=10
+        max_length=10,
+        description="Stock ticker symbol"
     )
 
     forecast_days: int = Field(
         default=30,
         ge=1,
-        le=90
+        le=90,
+        description="Number of days to forecast (max 90)"
     )
 
-    start_date: datetime.date | None = None
-    end_date: datetime.date | None = None
+    start_date: datetime.date | None = Field(
+        default=None,
+        description="Optional forecast start date"
+    )
 
+    end_date: datetime.date | None = Field(
+        default=None,
+        description="Optional forecast end date"
+    )
 
-    # ✅ Pydantic v2 style
+    # ✅ Normalize ticker
     @field_validator("ticker")
     @classmethod
     def uppercase_ticker(cls, v: str):
-        return v.upper()
+        return v.upper().strip()
 
-
-    # ✅ Date validation (v2)
+    # ✅ Date validation
     @field_validator("end_date")
     @classmethod
     def validate_dates(cls, v, info):
 
         start = info.data.get("start_date")
 
-        if start and v:
-            if v <= start:
-                raise ValueError("end_date must be after start_date")
+        if start and v and v <= start:
+            raise ValueError("end_date must be after start_date")
 
         return v
 
@@ -69,11 +76,11 @@ async def predict(req: PredictionRequest):
     endpoint = "/predict"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
 
-    start = time.time()
+    start_time = time.time()
 
     try:
 
-        # ⭐ RUN BLOCKING ML SAFELY
+        # ✅ Run blocking ML safely
         result = await run_in_threadpool(
             pipeline.run,
             req.ticker,
@@ -83,7 +90,7 @@ async def predict(req: PredictionRequest):
         )
 
         API_LATENCY.labels(endpoint=endpoint).observe(
-            time.time() - start
+            time.time() - start_time
         )
 
         return result
@@ -94,5 +101,5 @@ async def predict(req: PredictionRequest):
 
         raise HTTPException(
             status_code=500,
-            detail=str(e)
+            detail=f"Inference failed: {str(e)}"
         )
