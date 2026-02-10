@@ -14,6 +14,7 @@ class ModelRegistry:
     - cross-platform pointer safety
     - metadata enforcement
     - rollback lineage
+    - prevents feature metadata from being registered as models
     """
 
     MANIFEST_NAME = "manifest.json"
@@ -58,6 +59,12 @@ class ModelRegistry:
         with open(metadata_path) as f:
             meta = json.load(f)
 
+        # 🔥 CRITICAL — TYPE CHECK
+        if meta.get("metadata_type") != "model":
+            raise RuntimeError(
+                "Attempted to register non-model metadata."
+            )
+
         required_fields = [
             "model_name",
             "features",
@@ -73,6 +80,15 @@ class ModelRegistry:
                 f"Metadata missing required fields: {missing}"
             )
 
+        if not isinstance(meta["features"], list):
+            raise RuntimeError("features must be a list")
+
+        if not isinstance(meta["metrics"], dict):
+            raise RuntimeError("metrics must be a dictionary")
+
+        if not isinstance(meta["dataset_hash"], str):
+            raise RuntimeError("dataset_hash must be a string")
+
     # --------------------------------------------------
     # SAFE POINTER
     # --------------------------------------------------
@@ -81,7 +97,6 @@ class ModelRegistry:
     def _write_latest_pointer(base_dir: str, version: str):
 
         pointer_path = os.path.join(base_dir, ModelRegistry.LATEST_POINTER)
-
         tmp = pointer_path + ".tmp"
 
         with open(tmp, "w") as f:
@@ -109,8 +124,7 @@ class ModelRegistry:
             os.replace(tmp_link, link_name)
 
         except Exception:
-            # DO NOT CRASH
-            pass
+            pass  # Never crash on Windows / containers
 
     # --------------------------------------------------
 
@@ -248,7 +262,6 @@ class ModelRegistry:
             with open(pointer) as f:
                 return json.load(f)["version"]
 
-        # fallback to symlink
         latest_link = os.path.join(base_dir, "latest")
 
         if os.path.islink(latest_link):
