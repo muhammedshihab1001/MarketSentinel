@@ -10,19 +10,19 @@ from models.prophet_model import forecast_prophet
 from app.monitoring.metrics import MODEL_VERSION
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("marketsentinel.loader")
 
 
 class ModelLoader:
     """
-    Stage-Aware Institutional Model Loader.
+    Institutional Model Loader.
 
     Guarantees:
     - production pointer authority
-    - shadow model capability
-    - thread-safe lazy loading
+    - shadow isolation
     - metadata validation
-    - cold-start protection
+    - deterministic loading
+    - thread-safe lazy init
     """
 
     _instance = None
@@ -42,9 +42,14 @@ class ModelLoader:
         if hasattr(self, "_initialized"):
             return
 
+        # 🔥 Make compute configurable
         tf.config.set_visible_devices([], "GPU")
-        tf.config.threading.set_intra_op_parallelism_threads(1)
-        tf.config.threading.set_inter_op_parallelism_threads(1)
+
+        intra = int(os.getenv("TF_INTRA_THREADS", "1"))
+        inter = int(os.getenv("TF_INTER_THREADS", "1"))
+
+        tf.config.threading.set_intra_op_parallelism_threads(intra)
+        tf.config.threading.set_inter_op_parallelism_threads(inter)
 
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
@@ -58,59 +63,16 @@ class ModelLoader:
         self._initialized = True
 
     # ---------------------------------------------------
-    # REGISTRY RESOLUTION
+    # VALIDATION
     # ---------------------------------------------------
 
-    def _resolve_production_dir(self, model_dir: str):
+    def _validate_artifact(self, path):
 
-        latest_link = os.path.join(model_dir, "latest")
+        if not os.path.exists(path):
+            raise RuntimeError(f"Missing artifact: {path}")
 
-        if not os.path.islink(latest_link):
-            raise RuntimeError(
-                f"No production pointer in {model_dir}"
-            )
-
-        version = os.readlink(latest_link)
-
-        version_dir = os.path.join(model_dir, version)
-
-        if not os.path.exists(version_dir):
-            raise RuntimeError("Production pointer corrupted.")
-
-        return version_dir, version
-
-    # ---------------------------------------------------
-    # SHADOW DISCOVERY
-    # ---------------------------------------------------
-
-    def _find_shadow_version(self, model_dir: str):
-
-        if not os.path.exists(model_dir):
-            return None
-
-        for version in sorted(os.listdir(model_dir), reverse=True):
-
-            version_dir = os.path.join(model_dir, version)
-
-            manifest = os.path.join(
-                version_dir,
-                "manifest.json"
-            )
-
-            if not os.path.exists(manifest):
-                continue
-
-            try:
-                with open(manifest) as f:
-                    data = json.load(f)
-
-                if data.get("stage") in ("shadow", "approved"):
-                    return version_dir, version
-
-            except Exception:
-                continue
-
-        return None
+        if os.path.getsize(path) == 0:
+            raise RuntimeError(f"Empty artifact: {path}")
 
     # ---------------------------------------------------
 
@@ -130,9 +92,69 @@ class ModelLoader:
             raise RuntimeError("Metadata missing schema_version")
 
         if float(schema.split(".")[0]) < 2:
-            raise RuntimeError(
-                "Outdated model schema. Retrain required."
-            )
+            raise RuntimeError("Outdated model schema. Retrain required.")
+
+        if "schema_signature" not in meta:
+            raise RuntimeError("Metadata missing schema_signature")
+
+    # ---------------------------------------------------
+    # PRODUCTION RESOLUTION
+    # ---------------------------------------------------
+
+    def _resolve_production_dir(self, model_dir: str):
+
+        latest_link = os.path.join(model_dir, "latest")
+
+        if not os.path.islink(latest_link):
+            raise RuntimeError(f"No production pointer in {model_dir}")
+
+        version = os.readlink(latest_link)
+
+        version_dir = os.path.join(model_dir, version)
+
+        if not os.path.exists(version_dir):
+            raise RuntimeError("Production pointer corrupted.")
+
+        return version_dir, version
+
+    # ---------------------------------------------------
+    # SHADOW DISCOVERY
+    # ---------------------------------------------------
+
+    def _find_shadow_version(self, model_dir: str, prod_version: str):
+
+        if not os.path.exists(model_dir):
+            return None
+
+        candidates = []
+
+        for version in os.listdir(model_dir):
+
+            if version == prod_version:
+                continue
+
+            version_dir = os.path.join(model_dir, version)
+
+            manifest = os.path.join(version_dir, "manifest.json")
+
+            if not os.path.exists(manifest):
+                continue
+
+            try:
+                with open(manifest) as f:
+                    data = json.load(f)
+
+                if data.get("stage") == "shadow":
+                    candidates.append((version_dir, version))
+
+            except Exception:
+                continue
+
+        if not candidates:
+            return None
+
+        # deterministic — newest wins
+        return sorted(candidates, key=lambda x: x[1], reverse=True)[0]
 
     # ---------------------------------------------------
 
@@ -163,6 +185,7 @@ class ModelLoader:
             self._validate_metadata(version_dir)
 
             path = os.path.join(version_dir, "model.pkl")
+            self._validate_artifact(path)
 
             logger.info(f"Loading PRODUCTION XGBoost {version}")
 
@@ -186,11 +209,17 @@ class ModelLoader:
 
         def load():
 
-            result = self._find_shadow_version(
+            prod_dir, prod_version = self._resolve_production_dir(
                 "artifacts/xgboost"
             )
 
+            result = self._find_shadow_version(
+                "artifacts/xgboost",
+                prod_version
+            )
+
             if result is None:
+                logger.info("No shadow model discovered.")
                 return None
 
             version_dir, version = result
@@ -198,6 +227,7 @@ class ModelLoader:
             self._validate_metadata(version_dir)
 
             path = os.path.join(version_dir, "model.pkl")
+            self._validate_artifact(path)
 
             logger.info(f"Loading SHADOW XGBoost {version}")
 
@@ -228,6 +258,7 @@ class ModelLoader:
             self._validate_metadata(version_dir)
 
             path = os.path.join(version_dir, "model.keras")
+            self._validate_artifact(path)
 
             logger.info(f"Loading LSTM {version}")
 
@@ -257,6 +288,7 @@ class ModelLoader:
             )
 
             path = os.path.join(version_dir, "scaler.pkl")
+            self._validate_artifact(path)
 
             return joblib.load(path)
 
@@ -278,6 +310,7 @@ class ModelLoader:
             self._validate_metadata(version_dir)
 
             path = os.path.join(version_dir, "prophet_trend.pkl")
+            self._validate_artifact(path)
 
             logger.info(f"Loading Prophet {version}")
 
@@ -305,16 +338,13 @@ class ModelLoader:
         _ = self.scaler
         _ = self.prophet
 
-        # shadow is optional
         try:
             _ = self.shadow_xgb
         except Exception:
-            pass
+            logger.exception("Shadow warmup failed.")
 
         logger.info("Models ready.")
 
-    # ---------------------------------------------------
-    # Forecast Wrappers
     # ---------------------------------------------------
 
     def lstm_forecast(self, recent_prices):
