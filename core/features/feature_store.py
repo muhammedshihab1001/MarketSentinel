@@ -13,13 +13,12 @@ from core.schema.feature_schema import (
     SCHEMA_VERSION
 )
 
-
 logger = logging.getLogger("marketsentinel.feature_store")
 
 
 class FeatureStore:
     """
-    Institutional Feature Store (Phase 2+).
+    Institutional Feature Store.
 
     Guarantees:
     - schema lineage
@@ -31,12 +30,10 @@ class FeatureStore:
 
     FEATURE_DIR = "data/features"
     META_SUFFIX = ".meta.json"
-    META_VERSION = "1.0"
+    META_VERSION = "2.0"
 
     def __init__(self):
-
         os.makedirs(self.FEATURE_DIR, exist_ok=True)
-
         self.engineer = FeatureEngineer()
 
     # --------------------------------------------------
@@ -69,7 +66,6 @@ class FeatureStore:
             ).values
         )
 
-        # protect against pipeline evolution
         hasher.update(SCHEMA_VERSION.encode())
 
         return hasher.hexdigest()
@@ -90,6 +86,10 @@ class FeatureStore:
 
             with open(meta_path, "r") as f:
                 meta = json.load(f)
+
+            # Ensure this is feature metadata
+            if meta.get("metadata_type") != "feature_store":
+                raise RuntimeError("Invalid metadata type.")
 
             validate_feature_schema(df)
 
@@ -137,11 +137,13 @@ class FeatureStore:
     ) -> Dict[str, Any]:
 
         return {
+            "metadata_type": "feature_store",
             "meta_version": self.META_VERSION,
             "schema_version": SCHEMA_VERSION,
             "schema_signature": get_schema_signature(),
             "dataset_fingerprint": dataset_fp,
             "feature_count": len(features.columns),
+            "features": list(features.columns),
             "row_count": len(features)
         }
 
@@ -196,7 +198,7 @@ class FeatureStore:
             return features
 
         # --------------------------------------------------
-        # CASE 2 — Full lineage match
+        # CASE 2 — Lineage match
         # --------------------------------------------------
 
         if (
