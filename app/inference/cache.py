@@ -1,19 +1,24 @@
 import redis
 import json
 import hashlib
+import asyncio
 
 
 class RedisCache:
     """
-    Production-safe Redis cache.
+    Institutional Redis cache.
 
-    Design Goals:
-    ✔ Never crash inference
-    ✔ Deterministic keys
-    ✔ Fast connection pooling
-    ✔ Timeout protection
-    ✔ Silent fallback if Redis fails
+    Guarantees:
+    ✅ Never crashes inference
+    ✅ Deterministic keys
+    ✅ Connection pooling
+    ✅ Timeout protection
+    ✅ Silent fallback
+    ✅ Single-flight protection (VERY HIGH IMPACT)
     """
+
+    # local in-process locks
+    _locks = {}
 
     def __init__(self):
 
@@ -21,7 +26,7 @@ class RedisCache:
             pool = redis.ConnectionPool(
                 host="redis",
                 port=6379,
-                socket_timeout=2,          # prevents API freeze
+                socket_timeout=2,
                 socket_connect_timeout=2,
                 max_connections=10,
                 decode_responses=True
@@ -29,7 +34,6 @@ class RedisCache:
 
             self.client = redis.Redis(connection_pool=pool)
 
-            # Test connection
             self.client.ping()
 
             self.enabled = True
@@ -42,14 +46,25 @@ class RedisCache:
     # ----------------------------------
 
     def build_key(self, payload: dict) -> str:
-        """
-        Deterministic hash key.
-        Prevents collisions.
-        """
 
         raw = json.dumps(payload, sort_keys=True, default=str)
 
         return "prediction:" + hashlib.sha256(raw.encode()).hexdigest()
+
+    # ----------------------------------
+    # SINGLE FLIGHT LOCK
+    # ----------------------------------
+
+    def get_lock(self, key: str):
+        """
+        Ensures identical requests don't
+        execute inference simultaneously.
+        """
+
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+
+        return self._locks[key]
 
     # ----------------------------------
 
@@ -73,10 +88,6 @@ class RedisCache:
     # ----------------------------------
 
     def set(self, key: str, value: dict, ttl=900):
-        """
-        ttl default = 15 minutes
-        Perfect for stock prediction.
-        """
 
         if not self.enabled:
             return
