@@ -12,25 +12,22 @@ logger = logging.getLogger(__name__)
 
 class ModelLoader:
     """
-    Institutional-grade process-safe lazy model loader.
+    Registry-aware institutional model loader.
 
     Guarantees:
-    ✅ Single instance per worker
-    ✅ Lazy artifact loading
-    ✅ Prevents accidental memory duplication
-    ✅ TensorFlow thread control
-    ✅ Future pre-fork compatible
+    ✅ Loads ONLY versioned artifacts
+    ✅ Prevents accidental root-model loading
+    ✅ Rollback-safe
+    ✅ Singleton per worker
+    ✅ Lazy loading
     """
 
-    _instance = None  # process-level singleton
+    _instance = None
 
     # ---------------------------------------------------
 
     def __new__(cls, *args, **kwargs):
-        """
-        Ensures only ONE loader exists per process.
-        Critical for memory stability.
-        """
+
         if cls._instance is None:
             cls._instance = super().__new__(cls)
 
@@ -40,19 +37,14 @@ class ModelLoader:
 
     def __init__(self):
 
-        # Prevent reinitialization
         if hasattr(self, "_initialized"):
             return
 
-        # -------- Thread Safety (VERY IMPORTANT) --------
-        # Prevent TF from consuming all CPU cores
+        # TensorFlow thread control
         tf.config.threading.set_intra_op_parallelism_threads(1)
         tf.config.threading.set_inter_op_parallelism_threads(1)
 
-        # Optional but recommended for many containers
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-
-        # ------------------------------------------------
 
         self._xgb = None
         self._lstm = None
@@ -62,15 +54,50 @@ class ModelLoader:
         self._initialized = True
 
     # ---------------------------------------------------
-    # XGBoost
+    # INTERNAL — Resolve Latest Version
+    # ---------------------------------------------------
+
+    def _latest_path(self, model_dir: str, filename: str) -> str:
+        """
+        Resolves artifacts/<model>/latest/<file>
+
+        FAILS FAST if latest is missing.
+        """
+
+        latest_dir = os.path.join(model_dir, "latest")
+
+        if not os.path.exists(latest_dir):
+            raise RuntimeError(
+                f"No 'latest' model found in {model_dir}. "
+                f"Did you register the model?"
+            )
+
+        path = os.path.join(latest_dir, filename)
+
+        if not os.path.exists(path):
+            raise RuntimeError(
+                f"Missing artifact: {path}"
+            )
+
+        return path
+
+    # ---------------------------------------------------
+    # XGBOOST
     # ---------------------------------------------------
 
     @property
     def xgb(self):
 
         if self._xgb is None:
-            logger.info("Loading XGBoost model...")
-            self._xgb = joblib.load("artifacts/xgboost/model.pkl")
+
+            path = self._latest_path(
+                "artifacts/xgboost",
+                "model.pkl"
+            )
+
+            logger.info(f"Loading XGBoost model from {path}")
+
+            self._xgb = joblib.load(path)
 
         return self._xgb
 
@@ -82,11 +109,17 @@ class ModelLoader:
     def lstm(self):
 
         if self._lstm is None:
-            logger.info("Loading LSTM model...")
+
+            path = self._latest_path(
+                "artifacts/lstm",
+                "model.keras"
+            )
+
+            logger.info(f"Loading LSTM model from {path}")
 
             self._lstm = tf.keras.models.load_model(
-                "artifacts/lstm/model.keras",
-                compile=False  # 🔥 avoids unnecessary graph compile
+                path,
+                compile=False
             )
 
         return self._lstm
@@ -97,25 +130,35 @@ class ModelLoader:
     def scaler(self):
 
         if self._scaler is None:
-            logger.info("Loading LSTM scaler...")
-            self._scaler = joblib.load(
-                "artifacts/lstm/scaler.pkl"
+
+            path = self._latest_path(
+                "artifacts/lstm",
+                "scaler.pkl"
             )
+
+            logger.info(f"Loading LSTM scaler from {path}")
+
+            self._scaler = joblib.load(path)
 
         return self._scaler
 
     # ---------------------------------------------------
-    # Prophet
+    # PROPHET
     # ---------------------------------------------------
 
     @property
     def prophet(self):
 
         if self._prophet is None:
-            logger.info("Loading Prophet model...")
-            self._prophet = joblib.load(
-                "artifacts/prophet/model.pkl"
+
+            path = self._latest_path(
+                "artifacts/prophet",
+                "prophet_trend.pkl"
             )
+
+            logger.info(f"Loading Prophet model from {path}")
+
+            self._prophet = joblib.load(path)
 
         return self._prophet
 
