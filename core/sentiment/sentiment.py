@@ -9,11 +9,11 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 logger = logging.getLogger("marketsentinel.sentiment")
 
 
-# ---------------------------------------------------
-# SINGLETON
-# ---------------------------------------------------
-
 class FinBERTSingleton:
+    """
+    Loads FinBERT once per process.
+    Prevents memory duplication and slow container startup.
+    """
 
     _tokenizer = None
     _model = None
@@ -28,7 +28,7 @@ class FinBERTSingleton:
 
             start = time.time()
 
-            logger.info("Loading FinBERT...")
+            logger.info("Loading FinBERT model")
 
             torch.set_num_threads(1)
             torch.set_num_interop_threads(1)
@@ -47,17 +47,22 @@ class FinBERTSingleton:
             cls._model.eval()
 
             logger.info(
-                f"FinBERT loaded in {round(time.time()-start,2)}s"
+                "FinBERT loaded in %.2f seconds",
+                time.time() - start
             )
 
         return cls._tokenizer, cls._model, cls._device
 
 
-# ---------------------------------------------------
-# ANALYZER
-# ---------------------------------------------------
-
 class SentimentAnalyzer:
+    """
+    Financial news sentiment analyzer using FinBERT.
+
+    Guarantees:
+    - batch inference
+    - backward compatible API
+    - fail-soft behavior
+    """
 
     label_map = {
         0: "negative",
@@ -75,17 +80,30 @@ class SentimentAnalyzer:
             self.device
         ) = FinBERTSingleton.load()
 
-        # warmup
         self._warmup()
 
     # ---------------------------------------------------
 
     def _warmup(self):
-
         try:
             self.analyze_batch(["market is stable"])
         except Exception:
-            logger.exception("FinBERT warmup failed.")
+            logger.exception("FinBERT warmup failed")
+
+    # ---------------------------------------------------
+    # BACKWARD COMPATIBILITY
+    # ---------------------------------------------------
+
+    def analyze_text(self, text: str):
+        """
+        Single-text sentiment.
+        Required for legacy tests and APIs.
+        """
+
+        if not text:
+            return {"label": "neutral", "score": 0.0}
+
+        return self.analyze_batch([text])[0]
 
     # ---------------------------------------------------
 
@@ -97,7 +115,9 @@ class SentimentAnalyzer:
             truncation=True,
             padding=True,
             max_length=128
-        ).to(self.device)
+        )
+
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
 
@@ -136,7 +156,6 @@ class SentimentAnalyzer:
             df["headline"]
             .astype(str)
             .str.strip()
-            .str.lower()
             .tolist()
         )
 
@@ -155,10 +174,9 @@ class SentimentAnalyzer:
         except Exception:
 
             logger.exception(
-                "Sentiment inference failed — returning neutral fallback."
+                "Sentiment inference failed. Returning neutral fallback."
             )
 
-            # fail soft
             fallback = [{
                 "label": "neutral",
                 "score": 0.0
