@@ -1,14 +1,7 @@
 """
 MarketSentinel Institutional Training Orchestrator
 
-Release-grade training pipeline.
-
-Guarantees:
-- dataset snapshot
-- reproducibility stamp
-- governance gates BEFORE promotion reliance
-- registry validation
-- promotion report
+Promotion-safe release pipeline.
 """
 
 import subprocess
@@ -19,6 +12,13 @@ import datetime
 import os
 import hashlib
 import platform
+import logging
+
+from core.schema.feature_schema import get_schema_signature
+from core.monitoring.drift_detector import DriftDetector
+
+
+logger = logging.getLogger("marketsentinel.training")
 
 
 PIPELINE_STEPS = [
@@ -49,26 +49,21 @@ def reproducibility_stamp():
 
 
 # ---------------------------------------------------
-# DATASET SNAPSHOT
+# TRUE LINEAGE SNAPSHOT
 # ---------------------------------------------------
 
-def snapshot_artifacts():
-
-    """
-    Hash critical artifacts to create a lineage anchor.
-
-    This avoids requiring a full data lake while still
-    providing institutional reproducibility.
-    """
+def snapshot_lineage():
 
     hasher = hashlib.sha256()
 
-    artifact_roots = [
-        "data/features",
-        "artifacts/drift"
+    paths = [
+        "core/features",
+        "core/schema",
+        "training",
+        "requirements"
     ]
 
-    for root in artifact_roots:
+    for root in paths:
 
         if not os.path.exists(root):
             continue
@@ -77,19 +72,19 @@ def snapshot_artifacts():
 
             for f in sorted(files):
 
-                full = os.path.join(path, f)
+                if f.endswith(".py") or f.endswith(".txt"):
+                    full = os.path.join(path, f)
 
-                try:
                     with open(full, "rb") as fh:
                         hasher.update(fh.read())
-                except Exception:
-                    continue
+
+    hasher.update(get_schema_signature().encode())
 
     return hasher.hexdigest()
 
 
 # ---------------------------------------------------
-# METADATA SAFETY
+# METADATA
 # ---------------------------------------------------
 
 def load_metadata(model_name: str):
@@ -97,18 +92,16 @@ def load_metadata(model_name: str):
     path = f"artifacts/{model_name}/latest/metadata.json"
 
     if not os.path.exists(path):
-        raise RuntimeError(
-            f"Missing metadata for {model_name}. "
-            "Registry promotion likely failed."
-        )
+        raise RuntimeError(f"{model_name} metadata missing.")
 
     with open(path) as f:
         metadata = json.load(f)
 
     if "metrics" not in metadata:
-        raise RuntimeError(
-            f"{model_name} metadata missing metrics block."
-        )
+        raise RuntimeError(f"{model_name} metadata missing metrics.")
+
+    if "schema_signature" not in metadata:
+        raise RuntimeError(f"{model_name} missing schema signature.")
 
     return metadata
 
@@ -120,7 +113,6 @@ def load_metadata(model_name: str):
 def governance_check(model_name: str):
 
     metadata = load_metadata(model_name)
-
     metrics = metadata["metrics"]
 
     if model_name == "xgboost":
@@ -145,33 +137,56 @@ def governance_check(model_name: str):
             f"{model_name} rejected — drawdown too severe"
         )
 
+    return metadata
+
 
 # ---------------------------------------------------
-# REGISTRY VALIDATION
+# REGISTRY SAFETY
 # ---------------------------------------------------
 
-def validate_registry_pointer(model_name: str):
+def validate_registry(model_name: str):
 
     latest = f"artifacts/{model_name}/latest"
 
     if not os.path.islink(latest):
-        raise RuntimeError(
-            f"{model_name} latest pointer missing."
-        )
+        raise RuntimeError(f"{model_name} production pointer missing.")
 
-    resolved = os.readlink(latest)
+    version = os.readlink(latest)
 
-    version_dir = os.path.join(
-        f"artifacts/{model_name}",
-        resolved
-    )
+    version_dir = os.path.join(f"artifacts/{model_name}", version)
 
     manifest = os.path.join(version_dir, "manifest.json")
+    metadata = os.path.join(version_dir, "metadata.json")
 
     if not os.path.exists(manifest):
+        raise RuntimeError("Registry manifest missing.")
+
+    if not os.path.exists(metadata):
+        raise RuntimeError("Registry metadata missing.")
+
+    with open(manifest) as f:
+        data = json.load(f)
+
+    if data.get("stage") != "production":
         raise RuntimeError(
-            f"{model_name} manifest missing — registry corrupted."
+            f"{model_name} not promoted to production."
         )
+
+
+# ---------------------------------------------------
+# DRIFT BASELINE
+# ---------------------------------------------------
+
+def ensure_drift_baseline():
+
+    detector = DriftDetector()
+
+    if os.path.exists(detector.BASELINE_PATH):
+        return
+
+    raise RuntimeError(
+        "Drift baseline missing. Training must generate baseline."
+    )
 
 
 # ---------------------------------------------------
@@ -179,6 +194,8 @@ def validate_registry_pointer(model_name: str):
 # ---------------------------------------------------
 
 def run_step(name: str, module: str):
+
+    logger.info(f"Starting {name} training...")
 
     start = time.time()
 
@@ -189,12 +206,12 @@ def run_step(name: str, module: str):
 
     duration = round(time.time() - start, 2)
 
-    governance_check(name)
-    validate_registry_pointer(name)
+    metadata = governance_check(name)
+    validate_registry(name)
 
     return {
         "model": name,
-        "status": "success",
+        "metrics": metadata["metrics"],
         "duration_sec": duration
     }
 
@@ -212,6 +229,8 @@ def save_manifest(run_id: str, manifest: dict):
     with open(path, "w") as f:
         json.dump(manifest, f, indent=4)
 
+    logger.info(f"Training manifest saved → {path}")
+
 
 # ---------------------------------------------------
 # MAIN
@@ -225,7 +244,7 @@ def main():
 
     total_start = time.time()
 
-    dataset_hash = snapshot_artifacts()
+    lineage_hash = snapshot_lineage()
 
     results = []
 
@@ -236,20 +255,20 @@ def main():
             result = run_step(name, module)
             results.append(result)
 
+        ensure_drift_baseline()
+
     except Exception as e:
 
-        results.append({
-            "status": "failed",
-            "error": str(e)
-        })
+        logger.exception("Training run failed.")
 
         total_time = round(time.time() - total_start, 2)
 
         manifest = {
             "run_id": run_id,
-            "dataset_snapshot": dataset_hash,
+            "lineage_hash": lineage_hash,
             "reproducibility": reproducibility_stamp(),
-            "total_runtime_sec": total_time,
+            "status": "failed",
+            "error": str(e),
             "results": results
         }
 
@@ -261,8 +280,9 @@ def main():
 
     manifest = {
         "run_id": run_id,
-        "dataset_snapshot": dataset_hash,
+        "lineage_hash": lineage_hash,
         "reproducibility": reproducibility_stamp(),
+        "status": "success",
         "total_runtime_sec": total_time,
         "results": results
     }
