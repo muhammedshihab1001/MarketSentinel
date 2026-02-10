@@ -4,23 +4,36 @@ import time
 import random
 import os
 import hashlib
+import logging
 
 from datetime import datetime, timedelta
 from typing import List
 
 
+logger = logging.getLogger("marketsentinel.fetcher")
+
+
 class StockPriceFetcher:
     """
-    Institutional-grade market data fetcher.
+    Institutional Market Data Fetcher.
 
-    NEW CAPABILITIES:
-    ✅ Incremental ingestion
-    ✅ Dataset snapshotting
-    ✅ Immutable dataset registry
-    ✅ Training reproducibility
+    Guarantees:
+    - provider validation
+    - deterministic datasets
+    - corruption recovery
+    - canonical schema
     """
 
-    REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
+    REQUIRED_COLUMNS = {
+        "date",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume"
+    }
+
+    MIN_ROWS = 120
 
     MAX_RETRIES = 5
     BASE_SLEEP = 1.5
@@ -35,10 +48,39 @@ class StockPriceFetcher:
         os.makedirs(self.DATASET_DIR, exist_ok=True)
 
     # =====================================================
-    # 🔥 DATASET HASH
+    # VALIDATION
+    # =====================================================
+
+    def _validate_dataset(self, df: pd.DataFrame):
+
+        if df is None or df.empty:
+            raise RuntimeError("Provider returned empty dataset.")
+
+        missing = self.REQUIRED_COLUMNS - set(df.columns)
+
+        if missing:
+            raise RuntimeError(
+                f"Provider schema violation: missing={missing}"
+            )
+
+        if (df["close"] <= 0).any():
+            raise RuntimeError("Invalid close prices detected.")
+
+        if (df["high"] < df["low"]).any():
+            raise RuntimeError("High < Low detected.")
+
+        df = df.drop_duplicates("date")
+
+        if len(df) < self.MIN_ROWS:
+            raise RuntimeError("Dataset too small for safe usage.")
+
+        return df.sort_values("date")
+
     # =====================================================
 
     def _hash_dataset(self, df: pd.DataFrame) -> str:
+
+        df = df.sort_values("date")
 
         data_bytes = pd.util.hash_pandas_object(
             df,
@@ -67,7 +109,7 @@ class StockPriceFetcher:
 
         if not os.path.exists(path):
             df.to_parquet(path, index=False)
-            print(f"[DatasetRegistry] Snapshot saved → {path}")
+            logger.info(f"Dataset snapshot saved → {path}")
 
         return dataset_hash
 
@@ -79,24 +121,24 @@ class StockPriceFetcher:
         start_date: str,
         end_date: str,
         interval: str = "1d",
-        snapshot: bool = False   # 🔥 NEW FLAG
+        snapshot: bool = False
     ) -> pd.DataFrame:
 
         self._validate_dates(start_date, end_date)
 
         cache_file = f"{self.CACHE_DIR}/{ticker}_{interval}.parquet"
 
-        cached = None
-
         # ==========================================
         # LOAD CACHE
         # ==========================================
 
         if os.path.exists(cache_file):
+
             try:
+
                 cached = pd.read_parquet(cache_file)
 
-                cached["date"] = pd.to_datetime(cached["date"])
+                cached = self._validate_dataset(cached)
 
                 cache_start = cached["date"].min()
                 cache_end = cached["date"].max()
@@ -106,23 +148,20 @@ class StockPriceFetcher:
 
                 if cache_start <= request_start and cache_end >= request_end:
 
+                    logger.info(f"Loaded fully from cache: {ticker}")
+
                     if snapshot:
                         self._snapshot_dataset(ticker, cached)
 
-                    print(f"[Fetcher] Loaded fully from cache: {ticker}")
                     return cached
 
-                # --------------------------------------
-                # INCREMENTAL
-                # --------------------------------------
-
+                # incremental
                 missing_start = cache_end + timedelta(days=1)
 
                 if missing_start <= request_end:
 
-                    print(
-                        f"[Fetcher] Incremental update "
-                        f"{missing_start.date()} → {request_end.date()}"
+                    logger.info(
+                        f"Incremental update {missing_start.date()} → {request_end.date()}"
                     )
 
                     new_data = self._fetch_from_providers(
@@ -132,35 +171,32 @@ class StockPriceFetcher:
                         interval
                     )
 
-                    if new_data is not None and not new_data.empty:
+                    new_data = self._validate_dataset(new_data)
 
-                        combined = pd.concat(
-                            [cached, new_data],
-                            ignore_index=True
-                        )
+                    combined = pd.concat(
+                        [cached, new_data],
+                        ignore_index=True
+                    )
 
-                        combined.drop_duplicates(
-                            subset="date",
-                            keep="last",
-                            inplace=True
-                        )
+                    combined = self._validate_dataset(combined)
 
-                        combined.sort_values("date", inplace=True)
+                    combined.to_parquet(cache_file, index=False)
 
-                        combined.to_parquet(cache_file, index=False)
+                    if snapshot:
+                        self._snapshot_dataset(ticker, combined)
 
-                        if snapshot:
-                            self._snapshot_dataset(ticker, combined)
-
-                        return combined
-
-                if snapshot:
-                    self._snapshot_dataset(ticker, cached)
+                    return combined
 
                 return cached
 
             except Exception:
-                pass
+
+                logger.exception("Cache corrupted — rebuilding.")
+
+                try:
+                    os.remove(cache_file)
+                except Exception:
+                    pass
 
         # ==========================================
         # FULL DOWNLOAD
@@ -173,18 +209,16 @@ class StockPriceFetcher:
             interval
         )
 
-        if df is not None and not df.empty:
+        df = self._validate_dataset(df)
 
-            df.to_parquet(cache_file, index=False)
+        df.to_parquet(cache_file, index=False)
 
-            if snapshot:
-                self._snapshot_dataset(ticker, df)
+        logger.info(f"Saved cache for {ticker}")
 
-            print(f"[Fetcher] Saved cache for {ticker}")
+        if snapshot:
+            self._snapshot_dataset(ticker, df)
 
-            return df
-
-        raise ValueError(f"Failed to fetch data for {ticker}")
+        return df
 
     # -----------------------------------------------------
 
@@ -214,10 +248,14 @@ class StockPriceFetcher:
                 )
 
             except Exception as e:
-                last_exception = e
-                print(f"[Fetcher] Provider failed: {provider.__name__}")
 
-        raise ValueError(
+                last_exception = e
+
+                logger.warning(
+                    f"Provider failed: {provider.__name__}"
+                )
+
+        raise RuntimeError(
             f"All providers failed for {ticker}. "
             f"Last error: {last_exception}"
         )
@@ -241,19 +279,18 @@ class StockPriceFetcher:
                     start=start_date,
                     end=end_date,
                     interval=interval,
-                    auto_adjust=True,
+                    auto_adjust=False,  # CRITICAL
                     progress=False,
                     threads=False
                 )
 
                 if df.empty:
-                    raise ValueError("Yahoo returned empty dataframe")
+                    raise RuntimeError("Yahoo returned empty dataframe")
 
                 df.reset_index(inplace=True)
 
-                self._validate_columns(df)
-
                 df = df.rename(columns=str.lower)
+
                 df["ticker"] = ticker
 
                 return df
@@ -265,8 +302,8 @@ class StockPriceFetcher:
                     + random.uniform(0, 1)
                 )
 
-                print(
-                    f"[Yahoo] Retry {attempt+1}/{self.MAX_RETRIES} "
+                logger.warning(
+                    f"[Yahoo] retry {attempt+1}/{self.MAX_RETRIES} "
                     f"in {round(sleep_time,2)}s"
                 )
 
@@ -291,7 +328,7 @@ class StockPriceFetcher:
         df = pd.read_csv(url)
 
         if df.empty:
-            raise ValueError("Stooq returned empty dataframe")
+            raise RuntimeError("Stooq returned empty dataframe")
 
         df.rename(columns={
             "Date": "date",
@@ -304,34 +341,17 @@ class StockPriceFetcher:
 
         df["date"] = pd.to_datetime(df["date"])
 
-        mask = (
-            (df["date"] >= start_date) &
-            (df["date"] <= end_date)
-        )
+        start = pd.to_datetime(start_date)
+        end = pd.to_datetime(end_date)
 
-        df = df.loc[mask]
+        df = df.loc[
+            (df["date"] >= start) &
+            (df["date"] <= end)
+        ]
 
         df["ticker"] = ticker
 
         return df
-
-    # -----------------------------------------------------
-
-    def fetch_multiple(
-        self,
-        tickers: List[str],
-        start_date: str,
-        end_date: str,
-        interval: str = "1d",
-        snapshot: bool = False
-    ) -> pd.DataFrame:
-
-        data = [
-            self.fetch(t, start_date, end_date, interval, snapshot)
-            for t in tickers
-        ]
-
-        return pd.concat(data, ignore_index=True)
 
     # -----------------------------------------------------
 
@@ -343,11 +363,3 @@ class StockPriceFetcher:
 
         if start >= end:
             raise ValueError("start_date must be before end_date")
-
-    # -----------------------------------------------------
-
-    def _validate_columns(self, df):
-
-        for col in self.REQUIRED_COLUMNS:
-            if col not in df.columns:
-                raise ValueError(f"Missing column {col}")
