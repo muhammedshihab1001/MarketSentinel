@@ -13,11 +13,18 @@ from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import MODEL_FEATURES
 from core.artifacts.metadata_manager import MetadataManager
+from core.artifacts.model_registry import ModelRegistry
 
+
+# ---------------------------------------------------
+# CONFIG
+# ---------------------------------------------------
 
 MODEL_DIR = "artifacts/xgboost"
-MODEL_PATH = f"{MODEL_DIR}/model.pkl"
-METADATA_PATH = f"{MODEL_DIR}/metadata.json"
+
+TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
+TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
+
 MIN_ACCURACY = 0.50
 
 
@@ -27,7 +34,7 @@ MIN_ACCURACY = 0.50
 
 def load_training_data():
     """
-    Uses canonical feature pipeline.
+    Canonical pipeline.
     Guarantees training == inference features.
     """
 
@@ -53,6 +60,9 @@ def load_training_data():
         sentiment_df
     )
 
+    if dataset.empty:
+        raise ValueError("Feature pipeline returned empty dataset")
+
     return dataset, end_date
 
 
@@ -68,7 +78,7 @@ def train_model(df: pd.DataFrame):
     X_train, X_test, y_train, y_test = train_test_split(
         X, y,
         test_size=0.2,
-        shuffle=False
+        shuffle=False  # critical for time series
     )
 
     model = XGBClassifier(
@@ -86,7 +96,7 @@ def train_model(df: pd.DataFrame):
     preds = model.predict(X_test)
     acc = accuracy_score(y_test, preds)
 
-    print("Accuracy:", acc)
+    print("\n✅ Accuracy:", acc)
     print(classification_report(y_test, preds))
 
     if acc < MIN_ACCURACY:
@@ -103,24 +113,43 @@ def train_model(df: pd.DataFrame):
 
 if __name__ == "__main__":
 
+    print("\n🚀 Starting XGBoost training...\n")
+
     df, end_date = load_training_data()
+
+    # ---------------------------------------------------
+    # DATASET FINGERPRINT (VERY IMPORTANT)
+    # ---------------------------------------------------
+
+    dataset_hash = MetadataManager.fingerprint_dataset(df)
+
     model, acc = train_model(df)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    # Save model
-    joblib.dump(model, MODEL_PATH)
+    # Save artifacts temporarily
+    joblib.dump(model, TEMP_MODEL_PATH)
 
-    # Create metadata
     metadata = MetadataManager.create_metadata(
         model_name="xgboost_direction",
         metrics={"accuracy": float(acc)},
         features=MODEL_FEATURES,
         training_start="2018-01-01",
-        training_end=end_date
+        training_end=end_date,
+        dataset_hash=dataset_hash
     )
 
-    MetadataManager.save_metadata(metadata, METADATA_PATH)
+    MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
 
-    print(f"Model saved to {MODEL_PATH}")
-    print(f"Metadata saved to {METADATA_PATH}")
+    # ---------------------------------------------------
+    # REGISTER MODEL (CRITICAL)
+    # ---------------------------------------------------
+
+    version_dir = ModelRegistry.register_model(
+        MODEL_DIR,
+        TEMP_MODEL_PATH,
+        TEMP_METADATA_PATH
+    )
+
+    print("\nXGBoost model registered successfully.")
+    print(f"Version directory: {version_dir}")
