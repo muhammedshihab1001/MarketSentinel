@@ -16,6 +16,7 @@ class StrategyRunner:
     Guarantees:
     ✅ Backtest uses SAME pipeline as inference
     ✅ Eliminates training/inference drift
+    ✅ Prevents lookahead bias
     ✅ Enables reproducible research
     """
 
@@ -32,13 +33,17 @@ class StrategyRunner:
 
     def run(
         self,
+        model,
         ticker: str,
         start_date: str,
         end_date: str
     ):
+        """
+        Runs a TRUE model-driven backtest.
+        """
 
         # ---------------------------------------
-        # FETCH DATA (same as inference)
+        # FETCH DATA (IDENTICAL TO INFERENCE)
         # ---------------------------------------
 
         price_df = self.market_data.get_price_data(
@@ -64,23 +69,29 @@ class StrategyRunner:
             raise ValueError("Feature pipeline returned empty dataset")
 
         # ---------------------------------------
-        # GENERATE SIGNALS
+        # MODEL-DRIVEN SIGNAL GENERATION
         # ---------------------------------------
 
         signals = []
 
+        feature_cols = model.feature_names_in_
+
         for _, row in dataset.iterrows():
 
-            predicted_return = row["return"]
+            features = row[feature_cols].values.reshape(1, -1)
+
+            prob_up = model.predict_proba(features)[0][1]
+
+            predicted_return = prob_up - 0.5
 
             signal, _ = self.decision_engine.generate(
                 predicted_return=predicted_return,
                 sentiment=row["avg_sentiment"],
                 rsi=row["rsi"],
-                prob_up=0.5,  # neutral placeholder
+                prob_up=prob_up,
                 volatility=row["volatility"],
-                lstm_prices=np.array([row["close"]]),
-                prophet_trend=row["close"]
+                lstm_prices=np.array([row["close"]]),  # placeholder
+                prophet_trend="NEUTRAL"
             )
 
             signals.append(signal)
