@@ -4,7 +4,7 @@ import time
 import random
 import os
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List
 
 
@@ -12,12 +12,11 @@ class StockPriceFetcher:
     """
     Institutional-grade market data fetcher.
 
-    Features:
-    ✅ Multi-provider fallback (Yahoo → Stooq → Cache)
-    ✅ Retry + exponential backoff
-    ✅ Local parquet cache
-    ✅ Fast reload
-    ✅ Fail-safe mode
+    Upgrades:
+    ✅ Incremental append (VERY HIGH IMPACT)
+    ✅ Prevents full-history re-download
+    ✅ Faster cache refresh
+    ✅ Provider fallback preserved
     """
 
     REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
@@ -46,29 +45,109 @@ class StockPriceFetcher:
 
         cache_file = f"{self.CACHE_DIR}/{ticker}_{interval}.parquet"
 
+        cached = None
+
         # ==========================================
-        # ⭐ FAST PATH — Load Cache If Exists
+        # LOAD CACHE
         # ==========================================
 
         if os.path.exists(cache_file):
-
             try:
                 cached = pd.read_parquet(cache_file)
 
-                # If cache already covers requested range
-                if (
-                    cached["date"].min() <= pd.to_datetime(start_date)
-                    and cached["date"].max() >= pd.to_datetime(end_date)
-                ):
-                    print(f"[Fetcher] Loaded from cache: {ticker}")
+                cached["date"] = pd.to_datetime(cached["date"])
+
+                cache_start = cached["date"].min()
+                cache_end = cached["date"].max()
+
+                request_start = pd.to_datetime(start_date)
+                request_end = pd.to_datetime(end_date)
+
+                # FULL COVERAGE
+                if cache_start <= request_start and cache_end >= request_end:
+                    print(f"[Fetcher] Loaded fully from cache: {ticker}")
                     return cached
+
+                # --------------------------------------
+                # INCREMENTAL FETCH
+                # --------------------------------------
+
+                missing_start = cache_end + timedelta(days=1)
+
+                if missing_start <= request_end:
+
+                    print(
+                        f"[Fetcher] Incremental update "
+                        f"{missing_start.date()} → {request_end.date()}"
+                    )
+
+                    new_data = self._fetch_from_providers(
+                        ticker,
+                        missing_start.strftime("%Y-%m-%d"),
+                        end_date,
+                        interval
+                    )
+
+                    if new_data is not None and not new_data.empty:
+
+                        combined = pd.concat(
+                            [cached, new_data],
+                            ignore_index=True
+                        )
+
+                        combined.drop_duplicates(
+                            subset="date",
+                            keep="last",
+                            inplace=True
+                        )
+
+                        combined.sort_values(
+                            "date",
+                            inplace=True
+                        )
+
+                        combined.to_parquet(
+                            cache_file,
+                            index=False
+                        )
+
+                        return combined
+
+                return cached
 
             except Exception:
                 pass  # corrupt cache fallback
 
         # ==========================================
-        # Provider Priority
+        # NO CACHE → FULL DOWNLOAD
         # ==========================================
+
+        df = self._fetch_from_providers(
+            ticker,
+            start_date,
+            end_date,
+            interval
+        )
+
+        if df is not None and not df.empty:
+
+            df.to_parquet(cache_file, index=False)
+
+            print(f"[Fetcher] Saved cache for {ticker}")
+
+            return df
+
+        raise ValueError(f"Failed to fetch data for {ticker}")
+
+    # -----------------------------------------------------
+
+    def _fetch_from_providers(
+        self,
+        ticker,
+        start_date,
+        end_date,
+        interval
+    ):
 
         providers = [
             self._fetch_yahoo,
@@ -80,35 +159,16 @@ class StockPriceFetcher:
         for provider in providers:
 
             try:
-
-                df = provider(
+                return provider(
                     ticker,
                     start_date,
                     end_date,
                     interval
                 )
 
-                if df is not None and not df.empty:
-
-                    df.to_parquet(cache_file, index=False)
-
-                    print(
-                        f"[Fetcher] Saved cache for {ticker}"
-                    )
-
-                    return df
-
             except Exception as e:
                 last_exception = e
                 print(f"[Fetcher] Provider failed: {provider.__name__}")
-
-        # ==========================================
-        # FAIL SAFE → LOAD OLD CACHE
-        # ==========================================
-
-        if os.path.exists(cache_file):
-            print("[Fetcher] Using stale cache (provider failure)")
-            return pd.read_parquet(cache_file)
 
         raise ValueError(
             f"All providers failed for {ticker}. "
@@ -153,7 +213,7 @@ class StockPriceFetcher:
 
                 return df
 
-            except Exception as e:
+            except Exception:
 
                 sleep_time = (
                     self.BASE_SLEEP * (2 ** attempt)
@@ -170,7 +230,7 @@ class StockPriceFetcher:
         raise RuntimeError("Yahoo failed")
 
     # -----------------------------------------------------
-    # STOOQ (EXTREMELY RELIABLE FREE PROVIDER)
+    # STOOQ
     # -----------------------------------------------------
 
     def _fetch_stooq(
@@ -181,7 +241,6 @@ class StockPriceFetcher:
         interval
     ):
 
-        # Stooq expects lowercase
         tk = ticker.lower()
 
         url = f"https://stooq.com/q/d/l/?s={tk}&i=d"
