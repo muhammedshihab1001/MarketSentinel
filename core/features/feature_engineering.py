@@ -28,9 +28,7 @@ class FeatureEngineer:
 
     @staticmethod
     def _is_test_mode():
-        """
-        Automatically relaxes constraints inside CI/tests.
-        """
+
         return (
             os.getenv("CI") == "true"
             or os.getenv("TEST_MODE") == "true"
@@ -146,7 +144,7 @@ class FeatureEngineer:
     def _post_feature_guard(cls, df: pd.DataFrame):
 
         if cls._is_test_mode():
-            return  # relax constraint inside tests
+            return
 
         if len(df) < cls.MIN_ROWS_REQUIRED:
             raise RuntimeError(
@@ -160,6 +158,10 @@ class FeatureEngineer:
 
         df = df.replace([np.inf, -np.inf], np.nan)
         df = df.dropna().copy()
+
+        # CRITICAL: enforce dtype
+        for col in MODEL_FEATURES:
+            df[col] = df[col].astype("float64")
 
         return df
 
@@ -241,7 +243,7 @@ class FeatureEngineer:
 
         validated_features = validate_feature_schema(
             df[list(MODEL_FEATURES)]
-        )
+        ).copy()   # CRITICAL FIX
 
         if training:
             validated_features["target"] = df["target"].values
