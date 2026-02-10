@@ -1,27 +1,33 @@
 import pandas as pd
 import numpy as np
 
-from core.schema.feature_schema import validate_feature_schema
+from core.schema.feature_schema import (
+    validate_feature_schema,
+    MODEL_FEATURES
+)
 
 
 class FeatureEngineer:
     """
-    Institutional-grade feature engineering.
+    Institutional Feature Pipeline.
 
     Guarantees:
-    - pure functional pipeline (no side effects)
-    - no lookahead leakage
+    - zero training/inference skew
+    - no target leakage
     - deterministic ordering
     - numeric stability
-    - schema enforcement
+    - schema compliance
     """
 
-    MIN_ROWS_REQUIRED = 120   # protects rolling + lags
+    MIN_ROWS_REQUIRED = 120
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------
 
     @staticmethod
     def _validate_price_frame(df: pd.DataFrame):
+
+        if df.empty:
+            raise RuntimeError("Price dataframe is empty.")
 
         required = {"date", "close"}
 
@@ -37,11 +43,10 @@ class FeatureEngineer:
         if df["date"].duplicated().any():
             raise RuntimeError("Duplicate timestamps in price data.")
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------
 
     @staticmethod
     def add_returns(df: pd.DataFrame):
-
         df["return"] = df["close"].pct_change()
 
     # -------------------------------------------------------------
@@ -68,14 +73,10 @@ class FeatureEngineer:
         avg_gain = gain.rolling(window, min_periods=window).mean()
         avg_loss = loss.rolling(window, min_periods=window).mean()
 
-        avg_loss = avg_loss.replace(0, np.nan)
-        avg_gain = avg_gain.replace(0, np.nan)
-
-        rs = avg_gain / avg_loss
+        rs = avg_gain / (avg_loss + 1e-9)
 
         rsi = 100 - (100 / (1 + rs))
 
-        # clamp extreme edges
         df["rsi"] = rsi.clip(0, 100).fillna(50)
 
     # -------------------------------------------------------------
@@ -89,7 +90,7 @@ class FeatureEngineer:
         df["macd"] = ema_12 - ema_26
         df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------
 
     @staticmethod
     def merge_price_sentiment(
@@ -115,6 +116,7 @@ class FeatureEngineer:
         ).sort_values("date")
 
         for col in ("avg_sentiment", "news_count", "sentiment_std"):
+
             if col not in merged:
                 merged[col] = 0.0
             else:
@@ -122,7 +124,7 @@ class FeatureEngineer:
 
         return merged
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------
 
     @staticmethod
     def _post_feature_guard(df: pd.DataFrame):
@@ -132,12 +134,24 @@ class FeatureEngineer:
                 "Feature dataset too small for safe inference/training."
             )
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------
+
+    @staticmethod
+    def _sanitize_features(df: pd.DataFrame):
+
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.dropna().copy()
+
+        return df
+
+    # -------------------------------------------------------------
     # TRAINING
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------
 
     @staticmethod
     def create_training_dataset(df: pd.DataFrame):
+
+        df = df.copy()
 
         df["target"] = (df["return"].shift(-1) > 0).astype(int)
 
@@ -150,12 +164,19 @@ class FeatureEngineer:
 
         return df
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------
     # INFERENCE
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------
 
     @staticmethod
     def create_inference_dataset(df: pd.DataFrame):
+
+        df = df.copy()
+
+        if "target" in df.columns:
+            raise RuntimeError(
+                "Target column detected in inference pipeline."
+            )
 
         df["return_lag1"] = df["return"].shift(1)
         df["sentiment_lag1"] = df["avg_sentiment"].shift(1)
@@ -166,9 +187,9 @@ class FeatureEngineer:
 
         return df
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------
     # CANONICAL PIPELINE
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------
 
     @classmethod
     def build_feature_pipeline(
@@ -180,7 +201,10 @@ class FeatureEngineer:
 
         cls._validate_price_frame(price_df)
 
-        df = price_df.copy().sort_values("date")
+        df = price_df.copy()
+
+        if not df["date"].is_monotonic_increasing:
+            df = df.sort_values("date")
 
         cls.add_returns(df)
         cls.add_volatility(df)
@@ -194,6 +218,15 @@ class FeatureEngineer:
         else:
             df = cls.create_inference_dataset(df)
 
-        df = validate_feature_schema(df)
+        df = cls._sanitize_features(df)
 
-        return df.reset_index(drop=True)
+        # Validate ONLY model features
+        validated_features = validate_feature_schema(
+            df[list(MODEL_FEATURES)]
+        )
+
+        # Re-attach target safely if training
+        if training:
+            validated_features["target"] = df["target"].values
+
+        return validated_features.reset_index(drop=True)
