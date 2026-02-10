@@ -3,7 +3,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from core.data.data_fetcher import StockPriceFetcher
+from core.data.market_data_service import MarketDataService
 from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_engineering import FeatureEngineer
@@ -31,7 +31,7 @@ class InferencePipeline:
 
     def __init__(self):
 
-        self.fetcher = StockPriceFetcher()
+        self.market_data = MarketDataService()
         self.news_fetcher = NewsFetcher()
         self.sentiment = SentimentAnalyzer()
         self.models = ModelLoader()
@@ -82,7 +82,7 @@ class InferencePipeline:
         # FETCH DATA
         # -----------------------------------
 
-        price_df = self.fetcher.fetch(
+        price_df = self.market_data.get_price_data(
             ticker=ticker,
             start_date="2018-01-01",
             end_date=today.isoformat()
