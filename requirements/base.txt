@@ -34,3 +34,4 @@ yfinance==0.2.43
 # Monitoring
 ########################################
 prometheus-client==0.20.0
+pyarrow
