@@ -1,29 +1,58 @@
 import feedparser
 import pandas as pd
+import requests
+import logging
+
 from datetime import datetime, timedelta
 from typing import Dict, Tuple
 import threading
 
 
+logger = logging.getLogger("marketsentinel.news")
+
+
 class NewsFetcher:
     """
-    Institutional-grade news fetcher.
+    Institutional News Fetcher.
 
-    Upgrades:
-    ✅ In-memory TTL cache
-    ✅ Thread-safe
-    ✅ Prevents duplicate RSS calls
-    ✅ Massive latency reduction
+    Guarantees:
+    - timeout protected
+    - deduplicated
+    - freshness filtered
+    - bounded cache
+    - inference-safe fallback
     """
 
-    GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    GOOGLE_NEWS_RSS = (
+        "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    )
 
-    # cache structure:
-    # { query: (expiry_time, dataframe) }
+    CACHE_TTL = timedelta(minutes=10)
+    MAX_CACHE_KEYS = 500
+    MAX_ARTICLE_AGE = timedelta(hours=48)
+
     _cache: Dict[str, Tuple[datetime, pd.DataFrame]] = {}
     _lock = threading.Lock()
 
-    CACHE_TTL = timedelta(minutes=10)
+    HEADERS = {
+        "User-Agent": "MarketSentinel/1.0 (institutional research bot)"
+    }
+
+    # --------------------------------------------------
+
+    def _prune_cache(self):
+
+        if len(self._cache) < self.MAX_CACHE_KEYS:
+            return
+
+        # cheap prune
+        oldest = sorted(
+            self._cache.items(),
+            key=lambda x: x[1][0]
+        )[:100]
+
+        for k, _ in oldest:
+            self._cache.pop(k, None)
 
     # --------------------------------------------------
 
@@ -35,68 +64,86 @@ class NewsFetcher:
 
         now = datetime.utcnow()
 
-        # ✅ FAST CACHE CHECK
         if query in self._cache:
             expiry, df = self._cache[query]
 
             if now < expiry:
                 return df.copy()
 
-        # ------------------------------------------------
-        # LOCKED FETCH (prevents duplicate RSS calls)
-        # ------------------------------------------------
-
         with self._lock:
 
-            # double check after acquiring lock
+            # double check
             if query in self._cache:
                 expiry, df = self._cache[query]
 
                 if now < expiry:
                     return df.copy()
 
-            rss_url = self.GOOGLE_NEWS_RSS.format(
-                query=query.replace(" ", "+")
-            )
+            try:
 
-            feed = feedparser.parse(rss_url)
-
-            articles = []
-
-            for entry in feed.entries[:max_items]:
-                published = self._parse_date(
-                    entry.get("published", None)
+                rss_url = self.GOOGLE_NEWS_RSS.format(
+                    query=query.replace(" ", "+")
                 )
 
-                articles.append({
-                    "headline": entry.get("title", ""),
-                    "published_at": published,
-                    "source": entry.get("source", {}).get("title", "Unknown"),
-                    "link": entry.get("link", "")
-                })
+                response = requests.get(
+                    rss_url,
+                    headers=self.HEADERS,
+                    timeout=5
+                )
 
-            if not articles:
-                raise ValueError("No news articles fetched")
+                response.raise_for_status()
 
-            df = pd.DataFrame(articles)
+                feed = feedparser.parse(response.content)
 
-            # ✅ STORE CACHE
-            self._cache[query] = (
-                now + self.CACHE_TTL,
-                df
-            )
+                articles = []
 
-            return df.copy()
+                for entry in feed.entries[:max_items]:
 
-    # --------------------------------------------------
+                    parsed = entry.get("published_parsed")
 
-    @staticmethod
-    def _parse_date(date_str):
-        try:
-            parsed = feedparser._parse_date(date_str)
-            if parsed:
-                return datetime(*parsed[:6])
-        except Exception:
-            pass
+                    if not parsed:
+                        continue
 
-        return None
+                    published = datetime(*parsed[:6])
+
+                    # freshness filter
+                    if now - published > self.MAX_ARTICLE_AGE:
+                        continue
+
+                    headline = entry.get("title", "").strip()
+
+                    articles.append({
+                        "headline": headline,
+                        "published_at": published,
+                        "source": entry.get("source", {}).get("title", "Unknown"),
+                        "link": entry.get("link", "")
+                    })
+
+                if not articles:
+                    logger.warning("No fresh news — returning empty dataframe.")
+                    return pd.DataFrame()
+
+                df = pd.DataFrame(articles)
+
+                # dedupe headlines
+                df["headline_norm"] = df["headline"].str.lower().str.strip()
+
+                df = df.drop_duplicates("headline_norm")
+
+                df.drop(columns="headline_norm", inplace=True)
+
+                # cache
+                self._prune_cache()
+
+                self._cache[query] = (
+                    now + self.CACHE_TTL,
+                    df
+                )
+
+                return df.copy()
+
+            except Exception:
+
+                logger.exception("News fetch failure — returning empty dataframe.")
+
+                return pd.DataFrame()
