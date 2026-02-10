@@ -21,7 +21,7 @@ from training.backtesting.walk_forward import WalkForwardValidator
 
 
 # ===================================================
-# CONFIG — Institutional Gates
+# CONFIG
 # ===================================================
 
 MODEL_DIR = "artifacts/xgboost"
@@ -29,11 +29,19 @@ MODEL_DIR = "artifacts/xgboost"
 TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
-MIN_ACCURACY = 0.50
 MIN_SHARPE = 0.50
 MAX_DRAWDOWN = -0.35
 MIN_ALPHA = 0.0
-MIN_CALMAR = 0.30   # 🔥 NEW
+MIN_CALMAR = 0.30
+
+SEED = 42
+
+
+# ===================================================
+# REPRODUCIBILITY
+# ===================================================
+
+np.random.seed(SEED)
 
 
 # ===================================================
@@ -44,8 +52,10 @@ def save_model_atomic(model, path):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    with tempfile.NamedTemporaryFile(delete=False,
-                                     dir=os.path.dirname(path)) as tmp:
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        dir=os.path.dirname(path)
+    ) as tmp:
 
         joblib.dump(model, tmp.name)
         temp_name = tmp.name
@@ -84,11 +94,19 @@ def load_training_data():
     if dataset.empty:
         raise ValueError("Feature pipeline returned empty dataset")
 
+    # 🔥 schema guard
+    missing = [f for f in MODEL_FEATURES if f not in dataset.columns]
+
+    if missing:
+        raise RuntimeError(
+            f"Training aborted. Missing features: {missing}"
+        )
+
     return dataset, end_date
 
 
 # ===================================================
-# FEATURE BASELINES (🔥 VERY IMPORTANT)
+# FEATURE BASELINES
 # ===================================================
 
 def build_feature_baselines(df):
@@ -129,7 +147,7 @@ def train_on_window(df):
         subsample=0.8,
         colsample_bytree=0.8,
         eval_metric="logloss",
-        random_state=42
+        random_state=SEED
     )
 
     model.fit(X, y)
@@ -166,7 +184,7 @@ def train_full_model(df):
         colsample_bytree=0.8,
         eval_metric="logloss",
         early_stopping_rounds=50,
-        random_state=42
+        random_state=SEED
     )
 
     split = int(len(df) * 0.8)
@@ -202,7 +220,6 @@ if __name__ == "__main__":
 
     dataset_hash = MetadataManager.fingerprint_dataset(df)
 
-    # 🔥 BUILD BASELINES
     feature_baselines = build_feature_baselines(df)
 
     # ---------------------------------------------------
@@ -216,10 +233,15 @@ if __name__ == "__main__":
 
     strategy_metrics = wf.run(df)
 
-    # 🔥 CALMAR
+    if not strategy_metrics:
+        raise RuntimeError("Walk-forward returned empty metrics")
+
+    # 🔥 Safe Calmar
+    drawdown = abs(strategy_metrics["max_drawdown"]) or 1e-6
+
     calmar = (
         strategy_metrics["avg_strategy_return"]
-        / abs(strategy_metrics["max_drawdown"])
+        / drawdown
     )
 
     strategy_metrics["calmar_ratio"] = float(calmar)
@@ -262,8 +284,11 @@ if __name__ == "__main__":
         dataset_hash=dataset_hash,
     )
 
-    # 🔥 Attach baselines
+    # 🔥 Governance upgrades
     metadata["feature_baselines"] = feature_baselines
+    metadata["training_rows"] = len(df)
+    metadata["feature_count"] = len(MODEL_FEATURES)
+    metadata["schema_version"] = "3.0"
 
     MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
 
