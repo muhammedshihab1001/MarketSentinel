@@ -1,54 +1,78 @@
 import pandas as pd
+from dataclasses import dataclass
 
+
+# ---------------------------------------------------
+# CONFIG
+# ---------------------------------------------------
+
+@dataclass
+class RegimeConfig:
+    trend_window: int = 200
+    volatility_window: int = 50
+
+    bull_vol_threshold: float = 0.02
+    bear_vol_threshold: float = 0.025
+
+
+# ---------------------------------------------------
+# DETECTOR
+# ---------------------------------------------------
 
 class MarketRegimeDetector:
     """
-    Simple but powerful market regime classifier.
+    Institutional market regime classifier.
 
-    Regimes:
-    - BULL
-    - BEAR
-    - SIDEWAYS
+    Upgrades:
+    ✅ Fully vectorized (NO loops)
+    ✅ Configurable thresholds
+    ✅ Research scalable
+    ✅ Numerically safer
     """
 
-    def __init__(self, trend_window=200, volatility_window=50):
-        self.trend_window = trend_window
-        self.volatility_window = volatility_window
+    def __init__(self, config: RegimeConfig = RegimeConfig()):
+        self.config = config
+
+    # ---------------------------------------------------
 
     def detect(self, df: pd.DataFrame):
 
         df = df.copy()
 
-        # Long-term trend
-        df["ma_long"] = df["close"].rolling(self.trend_window).mean()
+        # ---------------------------------------
+        # CORE FEATURES
+        # ---------------------------------------
 
-        # Returns
+        df["ma_long"] = df["close"].rolling(
+            self.config.trend_window
+        ).mean()
+
         df["returns"] = df["close"].pct_change()
 
-        # Volatility
-        df["volatility"] = df["returns"].rolling(self.volatility_window).std()
+        df["volatility"] = df["returns"].rolling(
+            self.config.volatility_window
+        ).std()
 
-        regimes = []
+        # ---------------------------------------
+        # VECTOR REGIME CLASSIFICATION
+        # ---------------------------------------
 
-        for i in range(len(df)):
+        df["regime"] = "SIDEWAYS"
 
-            if pd.isna(df["ma_long"].iloc[i]):
-                regimes.append("UNKNOWN")
-                continue
+        bull_mask = (
+            (df["close"] > df["ma_long"]) &
+            (df["volatility"] < self.config.bull_vol_threshold)
+        )
 
-            price = df["close"].iloc[i]
-            ma = df["ma_long"].iloc[i]
-            vol = df["volatility"].iloc[i]
+        bear_mask = (
+            (df["close"] < df["ma_long"]) &
+            (df["volatility"] > self.config.bear_vol_threshold)
+        )
 
-            if price > ma and vol < 0.02:
-                regimes.append("BULL")
+        df.loc[bull_mask, "regime"] = "BULL"
+        df.loc[bear_mask, "regime"] = "BEAR"
 
-            elif price < ma and vol > 0.025:
-                regimes.append("BEAR")
-
-            else:
-                regimes.append("SIDEWAYS")
-
-        df["regime"] = regimes
+        # Unknown early rows
+        df.loc[df["ma_long"].isna(), "regime"] = "UNKNOWN"
 
         return df
