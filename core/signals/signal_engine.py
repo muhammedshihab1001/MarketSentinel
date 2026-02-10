@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 
+from core.risk.position_sizer import PositionSizer
+
 
 # ---------------------------------------------------
 # CONFIGURATION
@@ -12,6 +14,12 @@ class SignalConfig:
     sentiment_threshold: float = 0.10
     volatility_cap: float = 0.05
     min_expected_return: float = 0.02
+
+    # 🔥 NEW — trade suppression
+    min_confidence: float = 0.25
+
+    # 🔥 NEW — simulation capital
+    portfolio_value: float = 100_000
 
 
 # ---------------------------------------------------
@@ -112,10 +120,18 @@ class EnsembleArbiter:
 
 
 # ---------------------------------------------------
-# MASTER DECISION ENGINE
+# 🔥 MASTER DECISION ENGINE (UPGRADED)
 # ---------------------------------------------------
 
 class DecisionEngine:
+    """
+    Institutional Decision Engine.
+
+    Now includes:
+    ✅ risk-based allocation
+    ✅ trade suppression
+    ✅ structured decision output
+    """
 
     def __init__(self, config: SignalConfig = SignalConfig()):
 
@@ -123,6 +139,11 @@ class DecisionEngine:
         self.interpreter = ForecastInterpreter()
         self.risk_gate = RiskGate(config)
         self.ensemble = EnsembleArbiter()
+
+        # 🔥 NEW
+        self.position_sizer = PositionSizer()
+
+    # ---------------------------------------------------
 
     def generate(
         self,
@@ -133,7 +154,7 @@ class DecisionEngine:
         volatility: float,
         lstm_prices: List[float],
         prophet_trend: str
-    ):
+    ) -> Dict:
 
         base_signal, confidence = self.interpreter.interpret(
             predicted_return,
@@ -141,12 +162,19 @@ class DecisionEngine:
             rsi
         )
 
+        # ---------------------------------------
+        # Trade suppression (VERY institutional)
+        # ---------------------------------------
+
+        if confidence < self.config.min_confidence:
+            return self._hold_decision(confidence)
+
         if not self.risk_gate.allow(
             base_signal,
             prob_up,
             volatility
         ):
-            return "HOLD", confidence
+            return self._hold_decision(confidence)
 
         final_signal = self.ensemble.decide(
             base_signal,
@@ -156,34 +184,52 @@ class DecisionEngine:
             self.config
         )
 
-        return final_signal, confidence
+        if final_signal == "HOLD":
+            return self._hold_decision(confidence)
+
+        # ---------------------------------------
+        # 🔥 POSITION SIZING
+        # ---------------------------------------
+
+        allocation = self.position_sizer.size_position(
+            signal=final_signal,
+            confidence=confidence,
+            volatility=volatility,
+            portfolio_value=self.config.portfolio_value
+        )
+
+        position_pct = allocation / self.config.portfolio_value
+
+        return {
+            "signal": final_signal,
+            "confidence": confidence,
+            "allocation": round(allocation, 2),
+            "position_pct": round(position_pct, 4)
+        }
+
+    # ---------------------------------------------------
+
+    def _hold_decision(self, confidence: float) -> Dict:
+
+        return {
+            "signal": "HOLD",
+            "confidence": confidence,
+            "allocation": 0.0,
+            "position_pct": 0.0
+        }
 
 
 # ===================================================
-# 🔥 NEW — STRATEGY ENGINE (Institutional Upgrade)
+# STRATEGY ENGINE (UNCHANGED — already excellent)
 # ===================================================
 
 class StrategyEngine:
-    """
-    Portfolio-level intelligence layer.
-
-    Operates ABOVE DecisionEngine.
-
-    Enables:
-    ✅ top BUY ranking
-    ✅ SELL alerts
-    ✅ screeners
-    ✅ portfolio construction
-    """
 
     def top_opportunities(
         self,
         predictions: List[Dict],
         top_k: int = 5
     ):
-        """
-        Returns highest-confidence BUY signals.
-        """
 
         buys = [
             p for p in predictions
@@ -197,15 +243,10 @@ class StrategyEngine:
 
         return buys[:top_k]
 
-    # ---------------------------------------------------
-
     def sell_alerts(
         self,
         predictions: List[Dict]
     ):
-        """
-        Identify strong SELL signals.
-        """
 
         return [
             p for p in predictions
@@ -213,16 +254,10 @@ class StrategyEngine:
             and p.get("confidence", 0) > 0.6
         ]
 
-    # ---------------------------------------------------
-
     def signal_distribution(
         self,
         predictions: List[Dict]
     ):
-        """
-        Portfolio signal mix.
-        Great for dashboards.
-        """
 
         dist = {"BUY": 0, "SELL": 0, "HOLD": 0}
 
