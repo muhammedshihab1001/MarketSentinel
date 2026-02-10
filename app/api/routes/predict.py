@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
+from fastapi.concurrency import run_in_threadpool
 import datetime
 import time
 
@@ -36,16 +37,20 @@ class PredictionRequest(BaseModel):
     start_date: datetime.date | None = None
     end_date: datetime.date | None = None
 
-    # 🔥 Normalize ticker
-    @validator("ticker")
-    def uppercase_ticker(cls, v):
+
+    # ✅ Pydantic v2 style
+    @field_validator("ticker")
+    @classmethod
+    def uppercase_ticker(cls, v: str):
         return v.upper()
 
-    # 🔥 Validate dates
-    @validator("end_date")
-    def validate_dates(cls, v, values):
 
-        start = values.get("start_date")
+    # ✅ Date validation (v2)
+    @field_validator("end_date")
+    @classmethod
+    def validate_dates(cls, v, info):
+
+        start = info.data.get("start_date")
 
         if start and v:
             if v <= start:
@@ -55,25 +60,26 @@ class PredictionRequest(BaseModel):
 
 
 # ----------------------------------------
-# INFERENCE ROUTE
+# ASYNC INFERENCE ROUTE
 # ----------------------------------------
 
 @router.post("/predict")
-def predict(req: PredictionRequest):
+async def predict(req: PredictionRequest):
 
     endpoint = "/predict"
-
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
 
     start = time.time()
 
     try:
 
-        result = pipeline.run(
-            ticker=req.ticker,
-            start_date=req.start_date,
-            end_date=req.end_date,
-            forecast_days=req.forecast_days
+        # ⭐ RUN BLOCKING ML SAFELY
+        result = await run_in_threadpool(
+            pipeline.run,
+            req.ticker,
+            req.start_date,
+            req.end_date,
+            req.forecast_days
         )
 
         API_LATENCY.labels(endpoint=endpoint).observe(
