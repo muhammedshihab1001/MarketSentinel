@@ -4,6 +4,7 @@ import joblib
 import numpy as np
 import tensorflow as tf
 import pandas as pd
+import shutil
 
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
@@ -19,6 +20,7 @@ from models.lstm_model import build_lstm_model
 # ---------------------------------------------------
 
 MODEL_DIR = "artifacts/lstm"
+
 TEMP_MODEL_PATH = f"{MODEL_DIR}/model.keras"
 TEMP_SCALER_PATH = f"{MODEL_DIR}/scaler.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
@@ -129,7 +131,7 @@ def train():
     print(f"\n✅ Best validation loss: {best_val_loss}\n")
 
     # ---------------------------------------------------
-    # DATASET FINGERPRINT (VERY IMPORTANT)
+    # DATASET FINGERPRINT
     # ---------------------------------------------------
 
     dataset_hash = MetadataManager.fingerprint_dataset(df)
@@ -143,7 +145,7 @@ def train():
         dataset_hash=dataset_hash
     )
 
-    return model, scaler, metadata
+    return scaler, metadata
 
 
 # ---------------------------------------------------
@@ -154,16 +156,14 @@ if __name__ == "__main__":
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    model, scaler, metadata = train()
+    scaler, metadata = train()
 
-    # Save scaler temporarily
+    # Save temporary artifacts
     joblib.dump(scaler, TEMP_SCALER_PATH)
-
-    # Save metadata temporarily
     MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
 
     # ---------------------------------------------------
-    # REGISTER MODEL (CRITICAL)
+    # REGISTER MODEL
     # ---------------------------------------------------
 
     version_dir = ModelRegistry.register_model(
@@ -172,11 +172,11 @@ if __name__ == "__main__":
         TEMP_METADATA_PATH
     )
 
-    # Move scaler into version folder
-    os.rename(
+    # SAFE MOVE (never rename)
+    shutil.move(
         TEMP_SCALER_PATH,
         os.path.join(version_dir, "scaler.pkl")
     )
 
-    print("LSTM model registered successfully.")
-    print(f"Version directory: {version_dir}")
+    print("✅ LSTM model registered successfully.")
+    print(f"📦 Version directory: {version_dir}")
