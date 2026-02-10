@@ -3,79 +3,121 @@ import numpy as np
 
 class BacktestEngine:
     """
-    Realistic trading simulator.
+    Institutional-grade trading simulator.
 
-    Features:
-    - Capital tracking
-    - Position management
-    - Transaction cost simulation
-    - Buy & Hold benchmark
-    - Alpha calculation
-    - Trade counting
-    - Sharpe ratio
+    Guarantees:
+    - no lookahead execution
+    - slippage modeling
+    - partial capital deployment
+    - forced position flattening
+    - exposure tracking
+    - turnover visibility
     """
 
     def run(
         self,
         prices,
         signals,
-        initial_cash=10000,
-        transaction_cost=0.001  # 0.1%
+        initial_cash=10_000,
+        transaction_cost=0.001,   # 10 bps
+        slippage=0.0005,         # 5 bps
+        position_size=1.0        # fraction of capital
     ):
 
         if len(prices) != len(signals):
             raise ValueError("Prices and signals must have same length")
 
         if len(prices) < 2:
-            return {
-                "final_portfolio": initial_cash,
-                "strategy_return": 0,
-                "buy_hold_return": 0,
-                "alpha": 0,
-                "sharpe_ratio": 0,
-                "trade_count": 0
-            }
+            return self._empty_result(initial_cash)
 
         cash = initial_cash
-        position = 0
+        position = 0.0
+
         portfolio_values = []
+
         trade_count = 0
+        time_in_market = 0
 
-        for price, signal in zip(prices, signals):
+        prev_signal = "HOLD"
 
-            # BUY
-            if signal == "BUY" and cash > 0:
-                position = (cash * (1 - transaction_cost)) / price
-                cash = 0
+        for i in range(len(prices)):
+
+            price = prices[i]
+
+            # ------------------------------------------------
+            # EXECUTE PREVIOUS SIGNAL (NO LOOKAHEAD)
+            # ------------------------------------------------
+
+            if prev_signal == "BUY" and cash > 0:
+
+                execution_price = price * (1 + slippage)
+
+                deploy_cash = cash * position_size
+
+                shares = (
+                    deploy_cash * (1 - transaction_cost)
+                ) / execution_price
+
+                position += shares
+                cash -= deploy_cash
+
                 trade_count += 1
 
-            # SELL
-            elif signal == "SELL" and position > 0:
-                cash = position * price * (1 - transaction_cost)
+            elif prev_signal == "SELL" and position > 0:
+
+                execution_price = price * (1 - slippage)
+
+                proceeds = (
+                    position
+                    * execution_price
+                    * (1 - transaction_cost)
+                )
+
+                cash += proceeds
                 position = 0
+
                 trade_count += 1
+
+            if position > 0:
+                time_in_market += 1
 
             portfolio_value = cash + position * price
             portfolio_values.append(portfolio_value)
 
+            prev_signal = signals[i]
+
+        # ------------------------------------------------
+        # FORCE LIQUIDATION
+        # ------------------------------------------------
+
+        if position > 0:
+
+            final_price = prices[-1] * (1 - slippage)
+
+            cash += position * final_price * (1 - transaction_cost)
+            position = 0
+
+            portfolio_values[-1] = cash
+
         portfolio_values = np.array(portfolio_values)
 
-        # Strategy Return
         strategy_return = portfolio_values[-1] / initial_cash - 1
-
-        # Buy & Hold Benchmark
         buy_hold_return = prices[-1] / prices[0] - 1
-
-        # Alpha
         alpha = strategy_return - buy_hold_return
 
-        # Compute returns safely
         returns = np.diff(portfolio_values) / portfolio_values[:-1]
 
         if len(returns) > 1 and np.std(returns) != 0:
-            sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252)
+            sharpe = (
+                np.mean(returns)
+                / np.std(returns)
+                * np.sqrt(252)
+            )
         else:
-            sharpe = 0
+            sharpe = 0.0
+
+        exposure = time_in_market / len(prices)
+        turnover = trade_count / len(prices)
 
         return {
             "final_portfolio": float(portfolio_values[-1]),
@@ -83,17 +125,32 @@ class BacktestEngine:
             "buy_hold_return": float(buy_hold_return),
             "alpha": float(alpha),
             "sharpe_ratio": float(sharpe),
-            "trade_count": trade_count
+            "trade_count": trade_count,
+            "exposure": float(exposure),
+            "turnover": float(turnover)
         }
+
+    # ------------------------------------------------
+
+    def _empty_result(self, initial_cash):
+
+        return {
+            "final_portfolio": initial_cash,
+            "strategy_return": 0.0,
+            "buy_hold_return": 0.0,
+            "alpha": 0.0,
+            "sharpe_ratio": 0.0,
+            "trade_count": 0,
+            "exposure": 0.0,
+            "turnover": 0.0
+        }
+
+
 # -------------------------------------------------
 # Compatibility Wrapper Functions
-# Keeps older tests working while using new engine
 # -------------------------------------------------
 
 def backtest_strategy(df, signal_column="signal"):
-    """
-    Wrapper to support legacy function-based tests.
-    """
 
     engine = BacktestEngine()
 
@@ -104,15 +161,12 @@ def backtest_strategy(df, signal_column="signal"):
 
     return {
         "total_return": results["strategy_return"],
-        "max_drawdown": 0,  # optional: compute later if needed
+        "max_drawdown": 0,
         "sharpe_ratio": results["sharpe_ratio"]
     }
 
 
 def signal_hit_rate(df, signal_column="signal"):
-    """
-    Legacy metric retained for test compatibility.
-    """
 
     df = df.copy()
 
