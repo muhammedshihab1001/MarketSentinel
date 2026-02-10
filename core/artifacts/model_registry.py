@@ -7,17 +7,25 @@ from typing import Dict, Any
 
 class ModelRegistry:
     """
-    Transactional filesystem model registry.
+    Transactional Release-Controlled Model Registry.
 
     Guarantees:
     - atomic promotion
+    - release stages
     - pointer safety
     - rollback integrity
     - artifact validation
-    - version manifest
+    - manifest lineage
     """
 
     MANIFEST_NAME = "manifest.json"
+
+    STAGES = (
+        "candidate",
+        "shadow",
+        "approved",
+        "production"
+    )
 
     # --------------------------------------------------
 
@@ -25,8 +33,6 @@ class ModelRegistry:
     def _version() -> str:
         return datetime.datetime.utcnow().strftime("v%Y_%m_%d_%H%M%S")
 
-    # --------------------------------------------------
-    # SAFETY VALIDATION
     # --------------------------------------------------
 
     @staticmethod
@@ -39,8 +45,6 @@ class ModelRegistry:
             raise RuntimeError(f"Artifact empty: {path}")
 
     # --------------------------------------------------
-    # ATOMIC POINTER SWAP
-    # --------------------------------------------------
 
     @staticmethod
     def _atomic_symlink(target: str, link_name: str):
@@ -51,12 +55,8 @@ class ModelRegistry:
             os.remove(tmp_link)
 
         os.symlink(target, tmp_link)
-
-        # atomic replace
         os.replace(tmp_link, link_name)
 
-    # --------------------------------------------------
-    # MANIFEST CREATION
     # --------------------------------------------------
 
     @staticmethod
@@ -68,16 +68,49 @@ class ModelRegistry:
         manifest: Dict[str, Any] = {
             "version": os.path.basename(version_dir),
             "created_utc": datetime.datetime.utcnow().isoformat(),
+            "stage": "candidate",
             "metadata": metadata
         }
 
-        manifest_path = os.path.join(version_dir, ModelRegistry.MANIFEST_NAME)
+        manifest_path = os.path.join(
+            version_dir,
+            ModelRegistry.MANIFEST_NAME
+        )
 
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=4)
 
     # --------------------------------------------------
-    # REGISTRATION
+
+    @staticmethod
+    def _load_manifest(version_dir: str):
+
+        path = os.path.join(
+            version_dir,
+            ModelRegistry.MANIFEST_NAME
+        )
+
+        if not os.path.exists(path):
+            raise RuntimeError("Manifest missing.")
+
+        with open(path) as f:
+            return json.load(f)
+
+    # --------------------------------------------------
+
+    @staticmethod
+    def _save_manifest(version_dir: str, manifest: dict):
+
+        path = os.path.join(
+            version_dir,
+            ModelRegistry.MANIFEST_NAME
+        )
+
+        with open(path, "w") as f:
+            json.dump(manifest, f, indent=4)
+
+    # --------------------------------------------------
+    # REGISTRATION (CANDIDATE ONLY)
     # --------------------------------------------------
 
     @staticmethod
@@ -86,13 +119,6 @@ class ModelRegistry:
         model_path: str,
         metadata_path: str
     ) -> str:
-        """
-        Transactionally registers a model version.
-
-        Flow:
-
-        validate → stage → manifest → promote pointer
-        """
 
         os.makedirs(base_dir, exist_ok=True)
 
@@ -104,10 +130,6 @@ class ModelRegistry:
 
         if os.path.exists(version_dir):
             raise RuntimeError("Version collision detected.")
-
-        # -----------------------------
-        # STAGING
-        # -----------------------------
 
         staging_dir = version_dir + ".staging"
         os.makedirs(staging_dir, exist_ok=False)
@@ -125,25 +147,85 @@ class ModelRegistry:
         shutil.copy2(model_path, staged_model)
         shutil.copy2(metadata_path, staged_meta)
 
-        # verify staged artifacts
         ModelRegistry._validate_artifact(staged_model)
         ModelRegistry._validate_artifact(staged_meta)
 
-        # write manifest BEFORE promotion
-        ModelRegistry._write_manifest(staging_dir, staged_meta)
+        ModelRegistry._write_manifest(
+            staging_dir,
+            staged_meta
+        )
 
-        # atomic directory promote
         os.replace(staging_dir, version_dir)
 
-        # -----------------------------
-        # POINTER UPDATE
-        # -----------------------------
+        # DO NOT update production pointer here
+        return version_dir
+
+    # --------------------------------------------------
+    # STAGE TRANSITION
+    # --------------------------------------------------
+
+    @staticmethod
+    def transition_stage(
+        base_dir: str,
+        version: str,
+        new_stage: str
+    ):
+
+        if new_stage not in ModelRegistry.STAGES:
+            raise RuntimeError("Invalid stage.")
+
+        version_dir = os.path.join(base_dir, version)
+
+        if not os.path.exists(version_dir):
+            raise RuntimeError("Version not found.")
+
+        manifest = ModelRegistry._load_manifest(version_dir)
+
+        manifest["stage"] = new_stage
+        manifest["stage_updated_utc"] = (
+            datetime.datetime.utcnow().isoformat()
+        )
+
+        ModelRegistry._save_manifest(version_dir, manifest)
+
+    # --------------------------------------------------
+    # PROMOTE TO PRODUCTION
+    # --------------------------------------------------
+
+    @staticmethod
+    def promote_to_production(
+        base_dir: str,
+        version: str
+    ):
+        """
+        Explicit promotion gate.
+        """
+
+        version_dir = os.path.join(base_dir, version)
+
+        if not os.path.exists(version_dir):
+            raise RuntimeError("Version not found.")
+
+        manifest = ModelRegistry._load_manifest(version_dir)
+
+        if manifest["stage"] not in ("approved", "shadow"):
+            raise RuntimeError(
+                "Model must be approved before production."
+            )
 
         latest_path = os.path.join(base_dir, "latest")
 
-        ModelRegistry._atomic_symlink(version, latest_path)
+        ModelRegistry._atomic_symlink(
+            version,
+            latest_path
+        )
 
-        return version_dir
+        manifest["stage"] = "production"
+        manifest["promoted_utc"] = (
+            datetime.datetime.utcnow().isoformat()
+        )
+
+        ModelRegistry._save_manifest(version_dir, manifest)
 
     # --------------------------------------------------
     # ROLLBACK
@@ -151,21 +233,25 @@ class ModelRegistry:
 
     @staticmethod
     def rollback(base_dir: str, version: str):
-        """
-        Instantly repoints 'latest' to a previous version.
-        """
 
         version_dir = os.path.join(base_dir, version)
 
         if not os.path.exists(version_dir):
             raise RuntimeError("Rollback failed — version not found.")
 
-        latest_path = os.path.join(base_dir, "latest")
+        ModelRegistry._atomic_symlink(
+            version,
+            os.path.join(base_dir, "latest")
+        )
 
-        ModelRegistry._atomic_symlink(version, latest_path)
+        manifest = ModelRegistry._load_manifest(version_dir)
+        manifest["stage"] = "production"
+        manifest["rollback_utc"] = (
+            datetime.datetime.utcnow().isoformat()
+        )
 
-    # --------------------------------------------------
-    # LOAD LATEST
+        ModelRegistry._save_manifest(version_dir, manifest)
+
     # --------------------------------------------------
 
     @staticmethod
