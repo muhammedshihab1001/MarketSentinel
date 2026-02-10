@@ -1,40 +1,98 @@
 import joblib
 import tensorflow as tf
+import logging
 
 from models.lstm_model import forecast_lstm
 from models.prophet_model import forecast_prophet
 
 
+logger = logging.getLogger(__name__)
+
+
 class ModelLoader:
+    """
+    Production-safe lazy model loader.
+
+    Models are loaded ONLY when first requested.
+    Prevents API startup crashes.
+    """
 
     def __init__(self):
 
-        self.xgb = joblib.load("artifacts/xgboost/model.pkl")
+        self._xgb = None
+        self._lstm = None
+        self._scaler = None
+        self._prophet = None
 
-        self.lstm = tf.keras.models.load_model(
-            "artifacts/lstm/lstm_price_forecast.h5",
-            compile=False
-        )
+    # ---------------------------------------------------
+    # XGBoost
+    # ---------------------------------------------------
 
-        self.lstm_scaler = joblib.load(
-            "artifacts/lstm/lstm_scaler.pkl"
-        )
+    @property
+    def xgb(self):
 
-        self.prophet = joblib.load(
-            "artifacts/prophet/prophet_trend.pkl"
-        )
+        if self._xgb is None:
+            logger.info("Loading XGBoost model...")
+            self._xgb = joblib.load("artifacts/xgboost/model.pkl")
 
-    # -----------------------------
+        return self._xgb
+
+    # ---------------------------------------------------
+    # LSTM
+    # ---------------------------------------------------
+
+    @property
+    def lstm(self):
+
+        if self._lstm is None:
+            logger.info("Loading LSTM model...")
+            self._lstm = tf.keras.models.load_model(
+                "artifacts/lstm/model.keras"
+            )
+
+        return self._lstm
+
+    # ---------------------------------------------------
+
+    @property
+    def scaler(self):
+
+        if self._scaler is None:
+            logger.info("Loading LSTM scaler...")
+            self._scaler = joblib.load(
+                "artifacts/lstm/scaler.pkl"
+            )
+
+        return self._scaler
+
+    # ---------------------------------------------------
+    # Prophet
+    # ---------------------------------------------------
+
+    @property
+    def prophet(self):
+
+        if self._prophet is None:
+            logger.info("Loading Prophet model...")
+            self._prophet = joblib.load(
+                "artifacts/prophet/model.pkl"
+            )
+
+        return self._prophet
+
+    # ---------------------------------------------------
+    # Forecast Wrappers
+    # ---------------------------------------------------
 
     def lstm_forecast(self, recent_prices):
 
         return forecast_lstm(
             self.lstm,
-            self.lstm_scaler,
+            self.scaler,
             recent_prices
         )
 
-    # -----------------------------
+    # ---------------------------------------------------
 
     def prophet_forecast(self):
 
