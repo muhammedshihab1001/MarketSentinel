@@ -21,10 +21,6 @@ from core.monitoring.drift_detector import DriftDetector
 from training.backtesting.walk_forward import WalkForwardValidator
 
 
-# ===================================================
-# CONFIG
-# ===================================================
-
 MODEL_DIR = "artifacts/xgboost"
 
 TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
@@ -37,7 +33,6 @@ MIN_CALMAR = 0.30
 
 SEED = 42
 
-# Institutional basket (prevents single-asset bias)
 TRAINING_TICKERS = [
     "AAPL",
     "MSFT",
@@ -51,9 +46,9 @@ TRAINING_TICKERS = [
 np.random.seed(SEED)
 
 
-# ===================================================
+# ---------------------------------------------------
 # SAFE WRITE
-# ===================================================
+# ---------------------------------------------------
 
 def save_model_atomic(model, path):
 
@@ -70,9 +65,9 @@ def save_model_atomic(model, path):
     shutil.move(temp_name, path)
 
 
-# ===================================================
-# DATA LOADING (INSTITUTIONAL)
-# ===================================================
+# ---------------------------------------------------
+# DATA LOADING
+# ---------------------------------------------------
 
 def load_training_data():
 
@@ -103,7 +98,7 @@ def load_training_data():
         dataset = FeatureEngineer.build_feature_pipeline(
             price_df,
             sentiment_df,
-            training=True   # 🔥 CRITICAL FIX — prevents leakage
+            training=True
         )
 
         dataset["ticker"] = ticker
@@ -112,48 +107,37 @@ def load_training_data():
 
     df = pd.concat(datasets, ignore_index=True)
 
-    # HARD SORT — time safety
-    df = df.sort_values("date").reset_index(drop=True)
+    # CRITICAL FIX — prevent cross-ticker leakage
+    df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     if df.empty:
         raise RuntimeError("Training dataset is empty.")
 
-    # Regime diversity guard
     years = pd.to_datetime(df["date"]).dt.year.nunique()
 
     if years < 4:
-        raise RuntimeError(
-            "Dataset lacks regime diversity. "
-            "Minimum 4 years required."
-        )
+        raise RuntimeError("Dataset lacks regime diversity.")
 
-    # Class balance guard
     up_ratio = df["target"].mean()
 
     if not 0.35 < up_ratio < 0.65:
-        raise RuntimeError(
-            f"Target imbalance detected: {round(up_ratio,3)}"
-        )
+        raise RuntimeError(f"Target imbalance detected: {round(up_ratio,3)}")
 
-    print(f"\nTraining rows: {len(df)}")
+    print(f"Training rows: {len(df)}")
     print(f"Positive class ratio: {round(up_ratio,3)}")
 
     return df, end_date
 
 
-# ===================================================
+# ---------------------------------------------------
 # FEATURE BASELINES
-# ===================================================
+# ---------------------------------------------------
 
 def build_feature_baselines(df):
 
     baselines = {}
 
-    numeric_cols = df[MODEL_FEATURES].select_dtypes(
-        include="number"
-    ).columns
-
-    for col in numeric_cols:
+    for col in MODEL_FEATURES:
 
         series = df[col].dropna()
 
@@ -167,14 +151,32 @@ def build_feature_baselines(df):
     return baselines
 
 
-# ===================================================
+# ---------------------------------------------------
+# SAMPLE WEIGHTS (institutional upgrade)
+# ---------------------------------------------------
+
+def compute_sample_weights(df):
+
+    vol = df["volatility"].fillna(df["volatility"].median())
+
+    weights = 1 / (vol + 1e-6)
+
+    # normalize
+    weights = weights / weights.mean()
+
+    return weights
+
+
+# ---------------------------------------------------
 # WALK-FORWARD HELPERS
-# ===================================================
+# ---------------------------------------------------
 
 def train_on_window(df):
 
     X = df[MODEL_FEATURES].copy()
     y = df["target"]
+
+    weights = compute_sample_weights(df)
 
     model = XGBClassifier(
         n_estimators=500,
@@ -189,7 +191,7 @@ def train_on_window(df):
         n_jobs=1
     )
 
-    model.fit(X, y)
+    model.fit(X, y, sample_weight=weights)
 
     return model
 
@@ -206,25 +208,27 @@ def generate_signals(model, df):
     return signals.tolist()
 
 
-# ===================================================
+# ---------------------------------------------------
 # FINAL TRAIN
-# ===================================================
+# ---------------------------------------------------
 
 def train_full_model(df):
 
     X = df[MODEL_FEATURES].copy()
     y = df["target"]
 
+    weights = compute_sample_weights(df)
+
     split = int(len(df) * 0.8)
 
     model = XGBClassifier(
-        n_estimators=1000,
+        n_estimators=1200,
         max_depth=5,
-        learning_rate=0.03,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        learning_rate=0.02,
+        subsample=0.85,
+        colsample_bytree=0.85,
         eval_metric="logloss",
-        early_stopping_rounds=50,
+        early_stopping_rounds=75,
         random_state=SEED,
         tree_method="hist",
         max_bin=256,
@@ -234,6 +238,7 @@ def train_full_model(df):
     model.fit(
         X[:split],
         y[:split],
+        sample_weight=weights[:split],
         eval_set=[(X[split:], y[split:])],
         verbose=False
     )
@@ -247,16 +252,21 @@ def train_full_model(df):
         "logloss": float(log_loss(y[split:], probs)),
     }
 
-    return model, metrics
+    # governance-grade feature importance
+    importance = dict(
+        zip(MODEL_FEATURES, model.feature_importances_.tolist())
+    )
+
+    return model, metrics, importance
 
 
-# ===================================================
+# ---------------------------------------------------
 # EXECUTION
-# ===================================================
+# ---------------------------------------------------
 
 if __name__ == "__main__":
 
-    print("\nStarting Institutional XGBoost Training...\n")
+    print("Starting Institutional XGBoost Training")
 
     df, end_date = load_training_data()
 
@@ -264,12 +274,7 @@ if __name__ == "__main__":
 
     feature_baselines = build_feature_baselines(df)
 
-    # 🔥 CREATE DRIFT BASELINE
     DriftDetector().create_baseline(df[MODEL_FEATURES])
-
-    # ---------------------------------------------------
-    # WALK-FORWARD
-    # ---------------------------------------------------
 
     wf = WalkForwardValidator(
         model_trainer=train_on_window,
@@ -278,24 +283,10 @@ if __name__ == "__main__":
 
     strategy_metrics = wf.run(df)
 
-    if not strategy_metrics:
-        raise RuntimeError("Walk-forward returned empty metrics")
-
     drawdown = abs(strategy_metrics["max_drawdown"]) or 1e-6
-
-    calmar = (
-        strategy_metrics["avg_strategy_return"]
-        / drawdown
-    )
+    calmar = strategy_metrics["avg_strategy_return"] / drawdown
 
     strategy_metrics["calmar_ratio"] = float(calmar)
-
-    print("\nStrategy Metrics:")
-    print(strategy_metrics)
-
-    # ---------------------------------------------------
-    # PROMOTION GATES
-    # ---------------------------------------------------
 
     if strategy_metrics["avg_sharpe"] < MIN_SHARPE:
         raise RuntimeError("Model rejected: Sharpe too low")
@@ -309,13 +300,7 @@ if __name__ == "__main__":
     if calmar < MIN_CALMAR:
         raise RuntimeError("Model rejected: Calmar too low")
 
-    print("\nStrategy passed institutional gates.\n")
-
-    # ---------------------------------------------------
-    # TRAIN FINAL
-    # ---------------------------------------------------
-
-    model, metrics = train_full_model(df)
+    model, metrics, importance = train_full_model(df)
 
     save_model_atomic(model, TEMP_MODEL_PATH)
 
@@ -329,6 +314,7 @@ if __name__ == "__main__":
     )
 
     metadata["feature_baselines"] = feature_baselines
+    metadata["feature_importance"] = importance
     metadata["training_rows"] = len(df)
     metadata["feature_count"] = len(MODEL_FEATURES)
     metadata["schema_version"] = "3.0"
@@ -344,5 +330,5 @@ if __name__ == "__main__":
         TEMP_METADATA_PATH
     )
 
-    print("\nXGBoost model registered.")
+    print("XGBoost model registered.")
     print(f"Version directory: {version_dir}")
