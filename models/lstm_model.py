@@ -33,9 +33,9 @@ def build_lstm_model(input_shape):
         Dense(1)
     ])
 
-    optimizer = Adam(
-        learning_rate=0.0005,
-        clipnorm=1.0
+    optimizer=tf.keras.optimizers.Adam(
+    learning_rate=0.001,
+    clipnorm=1.0
     )
 
     model.compile(

@@ -20,13 +20,12 @@ from models.lstm_model import build_lstm_model
 MODEL_DIR = "artifacts/lstm"
 
 TEMP_MODEL_PATH = f"{MODEL_DIR}/model.tmp.keras"
-FINAL_MODEL_NAME = "model.keras"
 
 TEMP_SCALER_PATH = f"{MODEL_DIR}/scaler.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 LOOKBACK_WINDOW = 60
-EPOCHS = 40
+EPOCHS = 30
 BATCH_SIZE = 32
 
 MIN_SHARPE = 0.25
@@ -40,10 +39,13 @@ SEED = 42
 # ---------------------------------------------------
 
 def set_seeds():
+
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
 
-    tf.config.set_visible_devices([], "GPU")
+    # optional GPU disable
+    if os.getenv("DISABLE_GPU", "false").lower() == "true":
+        tf.config.set_visible_devices([], "GPU")
 
     tf.config.threading.set_intra_op_parallelism_threads(1)
     tf.config.threading.set_inter_op_parallelism_threads(1)
@@ -67,6 +69,8 @@ def load_data():
 
     if df.empty:
         raise ValueError("No price data fetched for LSTM training")
+
+    df = df.sort_values("date")
 
     return df, end_date
 
@@ -104,14 +108,14 @@ def train_model(train_prices):
 
     early_stop = EarlyStopping(
         monitor="loss",
-        patience=3,
+        patience=2,
         restore_best_weights=True
     )
 
     model.fit(
         X,
         y,
-        epochs=10,
+        epochs=8,
         batch_size=BATCH_SIZE,
         verbose=0,
         callbacks=[early_stop]
@@ -137,9 +141,16 @@ def generate_signals(model_scaler_tuple, test_df):
 
         seq = scaled[i-LOOKBACK_WINDOW:i].reshape(1, LOOKBACK_WINDOW, 1)
 
-        pred = model.predict(seq, verbose=0)[0][0]
+        pred_scaled = model.predict(seq, verbose=0)[0][0]
 
-        if pred > scaled[i-1]:
+        # convert prediction back to price
+        pred_price = scaler.inverse_transform(
+            [[pred_scaled]]
+        )[0][0]
+
+        current_price = prices[i-1][0]
+
+        if pred_price > current_price:
             signals.append("BUY")
         else:
             signals.append("SELL")
@@ -175,7 +186,7 @@ def train_full_model(df):
         restore_best_weights=True
     )
 
-    model.fit(
+    history = model.fit(
         X_train,
         y_train,
         epochs=EPOCHS,
@@ -185,7 +196,7 @@ def train_full_model(df):
         verbose=1
     )
 
-    val_loss = float(min(model.history.history["val_loss"]))
+    val_loss = float(min(history.history["val_loss"]))
 
     return model, scaler, val_loss
 
@@ -196,17 +207,13 @@ def train_full_model(df):
 
 if __name__ == "__main__":
 
-    print("\nInstitutional LSTM Training\n")
+    print("Institutional LSTM Training")
 
     set_seeds()
 
     df, end_date = load_data()
 
     dataset_hash = MetadataManager.fingerprint_dataset(df)
-
-    # ---------------------------------------------------
-    # WALK FORWARD
-    # ---------------------------------------------------
 
     wf = WalkForwardValidator(
         model_trainer=lambda d: train_model(d["close"].values),
@@ -221,15 +228,8 @@ if __name__ == "__main__":
     if strategy_metrics["max_drawdown"] < MAX_DRAWDOWN:
         raise RuntimeError("LSTM rejected — drawdown too high")
 
-    print("Strategy passed governance.\n")
-
-    # ---------------------------------------------------
-    # FINAL TRAIN
-    # ---------------------------------------------------
-
     model, scaler, val_loss = train_full_model(df)
 
-    # SAFE SAVE
     model.save(TEMP_MODEL_PATH)
 
     metadata = MetadataManager.create_metadata(
