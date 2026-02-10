@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 
 # ---------------------------------------------------
@@ -16,13 +16,9 @@ class SignalConfig:
 
 # ---------------------------------------------------
 # FORECAST INTERPRETER
-# (Former DecisionEngine — upgraded)
 # ---------------------------------------------------
 
 class ForecastInterpreter:
-    """
-    Interprets model forecasts and computes confidence.
-    """
 
     def interpret(
         self,
@@ -51,9 +47,6 @@ class ForecastInterpreter:
 # ---------------------------------------------------
 
 class RiskGate:
-    """
-    Applies portfolio-level protections.
-    """
 
     def __init__(self, config: SignalConfig):
         self.config = config
@@ -82,9 +75,6 @@ class RiskGate:
 # ---------------------------------------------------
 
 class EnsembleArbiter:
-    """
-    Combines multiple model outputs into final decision.
-    """
 
     def decide(
         self,
@@ -126,12 +116,6 @@ class EnsembleArbiter:
 # ---------------------------------------------------
 
 class DecisionEngine:
-    """
-    Institutional-style decision stack.
-
-    Flow:
-    forecast → interpret → risk gate → ensemble → final signal
-    """
 
     def __init__(self, config: SignalConfig = SignalConfig()):
 
@@ -173,3 +157,77 @@ class DecisionEngine:
         )
 
         return final_signal, confidence
+
+
+# ===================================================
+# 🔥 NEW — STRATEGY ENGINE (Institutional Upgrade)
+# ===================================================
+
+class StrategyEngine:
+    """
+    Portfolio-level intelligence layer.
+
+    Operates ABOVE DecisionEngine.
+
+    Enables:
+    ✅ top BUY ranking
+    ✅ SELL alerts
+    ✅ screeners
+    ✅ portfolio construction
+    """
+
+    def top_opportunities(
+        self,
+        predictions: List[Dict],
+        top_k: int = 5
+    ):
+        """
+        Returns highest-confidence BUY signals.
+        """
+
+        buys = [
+            p for p in predictions
+            if p.get("signal_today") == "BUY"
+        ]
+
+        buys.sort(
+            key=lambda x: x.get("confidence", 0),
+            reverse=True
+        )
+
+        return buys[:top_k]
+
+    # ---------------------------------------------------
+
+    def sell_alerts(
+        self,
+        predictions: List[Dict]
+    ):
+        """
+        Identify strong SELL signals.
+        """
+
+        return [
+            p for p in predictions
+            if p.get("signal_today") == "SELL"
+            and p.get("confidence", 0) > 0.6
+        ]
+
+    # ---------------------------------------------------
+
+    def signal_distribution(
+        self,
+        predictions: List[Dict]
+    ):
+        """
+        Portfolio signal mix.
+        Great for dashboards.
+        """
+
+        dist = {"BUY": 0, "SELL": 0, "HOLD": 0}
+
+        for p in predictions:
+            signal = p.get("signal_today", "HOLD")
+            dist[signal] += 1
+
+        return dist
