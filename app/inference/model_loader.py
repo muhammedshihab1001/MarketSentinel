@@ -15,21 +15,18 @@ logger = logging.getLogger(__name__)
 
 class ModelLoader:
     """
-    Institutional Registry-Aware Model Loader.
+    Stage-Aware Institutional Model Loader.
 
     Guarantees:
-    ✅ Pointer-based resolution (cross-platform)
-    ✅ Thread-safe lazy loading
-    ✅ Metadata validation
-    ✅ Cold-start prevention
-    ✅ Singleton per worker
-    ✅ TensorFlow memory safety
+    - production pointer authority
+    - shadow model capability
+    - thread-safe lazy loading
+    - metadata validation
+    - cold-start protection
     """
 
     _instance = None
     _lock = threading.Lock()
-
-    POINTER_FILE = "LATEST.json"
 
     # ---------------------------------------------------
 
@@ -45,15 +42,15 @@ class ModelLoader:
         if hasattr(self, "_initialized"):
             return
 
-        # 🔥 TensorFlow CPU Safety
         tf.config.set_visible_devices([], "GPU")
-
         tf.config.threading.set_intra_op_parallelism_threads(1)
         tf.config.threading.set_inter_op_parallelism_threads(1)
 
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
         self._xgb = None
+        self._shadow_xgb = None
+
         self._lstm = None
         self._scaler = None
         self._prophet = None
@@ -61,33 +58,60 @@ class ModelLoader:
         self._initialized = True
 
     # ---------------------------------------------------
-    # POINTER RESOLUTION
+    # REGISTRY RESOLUTION
     # ---------------------------------------------------
 
-    def _resolve_latest_dir(self, model_dir: str):
+    def _resolve_production_dir(self, model_dir: str):
 
-        pointer = os.path.join(model_dir, self.POINTER_FILE)
+        latest_link = os.path.join(model_dir, "latest")
 
-        if not os.path.exists(pointer):
+        if not os.path.islink(latest_link):
             raise RuntimeError(
-                f"No registry pointer found in {model_dir}. "
-                f"Did training run?"
+                f"No production pointer in {model_dir}"
             )
 
-        with open(pointer) as f:
-            version = json.load(f)["latest"]
+        version = os.readlink(latest_link)
 
         version_dir = os.path.join(model_dir, version)
 
         if not os.path.exists(version_dir):
-            raise RuntimeError(
-                f"Pointer references missing version: {version}"
-            )
+            raise RuntimeError("Production pointer corrupted.")
 
         return version_dir, version
 
     # ---------------------------------------------------
-    # METADATA VALIDATION
+    # SHADOW DISCOVERY
+    # ---------------------------------------------------
+
+    def _find_shadow_version(self, model_dir: str):
+
+        if not os.path.exists(model_dir):
+            return None
+
+        for version in sorted(os.listdir(model_dir), reverse=True):
+
+            version_dir = os.path.join(model_dir, version)
+
+            manifest = os.path.join(
+                version_dir,
+                "manifest.json"
+            )
+
+            if not os.path.exists(manifest):
+                continue
+
+            try:
+                with open(manifest) as f:
+                    data = json.load(f)
+
+                if data.get("stage") in ("shadow", "approved"):
+                    return version_dir, version
+
+            except Exception:
+                continue
+
+        return None
+
     # ---------------------------------------------------
 
     def _validate_metadata(self, version_dir):
@@ -105,29 +129,11 @@ class ModelLoader:
         if schema is None:
             raise RuntimeError("Metadata missing schema_version")
 
-        # future-proof gate
         if float(schema.split(".")[0]) < 2:
             raise RuntimeError(
                 "Outdated model schema. Retrain required."
             )
 
-    # ---------------------------------------------------
-
-    def _latest_path(self, model_dir: str, filename: str):
-
-        version_dir, version = self._resolve_latest_dir(model_dir)
-
-        self._validate_metadata(version_dir)
-
-        path = os.path.join(version_dir, filename)
-
-        if not os.path.exists(path):
-            raise RuntimeError(f"Missing artifact: {path}")
-
-        return path, version
-
-    # ---------------------------------------------------
-    # THREAD SAFE LOAD WRAPPER
     # ---------------------------------------------------
 
     def _load_once(self, attr_name, loader_func):
@@ -142,7 +148,7 @@ class ModelLoader:
         return getattr(self, attr_name)
 
     # ---------------------------------------------------
-    # XGBOOST
+    # XGBOOST — PRODUCTION
     # ---------------------------------------------------
 
     @property
@@ -150,23 +156,61 @@ class ModelLoader:
 
         def load():
 
-            path, version = self._latest_path(
-                "artifacts/xgboost",
-                "model.pkl"
+            version_dir, version = self._resolve_production_dir(
+                "artifacts/xgboost"
             )
 
-            logger.info(f"Loading XGBoost {version}")
+            self._validate_metadata(version_dir)
+
+            path = os.path.join(version_dir, "model.pkl")
+
+            logger.info(f"Loading PRODUCTION XGBoost {version}")
 
             model = joblib.load(path)
 
             MODEL_VERSION.labels(
-                model="xgboost",
+                model="xgboost_prod",
                 version=version
             ).set(1)
 
             return model
 
         return self._load_once("_xgb", load)
+
+    # ---------------------------------------------------
+    # XGBOOST — SHADOW
+    # ---------------------------------------------------
+
+    @property
+    def shadow_xgb(self):
+
+        def load():
+
+            result = self._find_shadow_version(
+                "artifacts/xgboost"
+            )
+
+            if result is None:
+                return None
+
+            version_dir, version = result
+
+            self._validate_metadata(version_dir)
+
+            path = os.path.join(version_dir, "model.pkl")
+
+            logger.info(f"Loading SHADOW XGBoost {version}")
+
+            model = joblib.load(path)
+
+            MODEL_VERSION.labels(
+                model="xgboost_shadow",
+                version=version
+            ).set(1)
+
+            return model
+
+        return self._load_once("_shadow_xgb", load)
 
     # ---------------------------------------------------
     # LSTM
@@ -177,10 +221,13 @@ class ModelLoader:
 
         def load():
 
-            path, version = self._latest_path(
-                "artifacts/lstm",
-                "model.keras"
+            version_dir, version = self._resolve_production_dir(
+                "artifacts/lstm"
             )
+
+            self._validate_metadata(version_dir)
+
+            path = os.path.join(version_dir, "model.keras")
 
             logger.info(f"Loading LSTM {version}")
 
@@ -205,12 +252,11 @@ class ModelLoader:
 
         def load():
 
-            path, _ = self._latest_path(
-                "artifacts/lstm",
-                "scaler.pkl"
+            version_dir, _ = self._resolve_production_dir(
+                "artifacts/lstm"
             )
 
-            logger.info("Loading LSTM scaler")
+            path = os.path.join(version_dir, "scaler.pkl")
 
             return joblib.load(path)
 
@@ -225,10 +271,13 @@ class ModelLoader:
 
         def load():
 
-            path, version = self._latest_path(
-                "artifacts/prophet",
-                "prophet_trend.pkl"
+            version_dir, version = self._resolve_production_dir(
+                "artifacts/prophet"
             )
+
+            self._validate_metadata(version_dir)
+
+            path = os.path.join(version_dir, "prophet_trend.pkl")
 
             logger.info(f"Loading Prophet {version}")
 
@@ -244,19 +293,25 @@ class ModelLoader:
         return self._load_once("_prophet", load)
 
     # ---------------------------------------------------
-    # 🔥 WARMUP
+    # WARMUP
     # ---------------------------------------------------
 
     def warmup(self):
 
-        logger.info("🔥 Warming up models...")
+        logger.info("Warming production models...")
 
         _ = self.xgb
         _ = self.lstm
         _ = self.scaler
         _ = self.prophet
 
-        logger.info("✅ Models ready for inference.")
+        # shadow is optional
+        try:
+            _ = self.shadow_xgb
+        except Exception:
+            pass
+
+        logger.info("Models ready.")
 
     # ---------------------------------------------------
     # Forecast Wrappers
