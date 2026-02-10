@@ -1,19 +1,20 @@
-from typing import List
+from typing import Tuple
 import pandas as pd
+import hashlib
 
 
 # =====================================================
-# SCHEMA VERSION (CRITICAL FOR GOVERNANCE)
+# SCHEMA VERSION
 # =====================================================
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "2.1"   # bump after hardening
 
 
 # =====================================================
-# CANONICAL FEATURE ORDER
+# IMMUTABLE FEATURE CONTRACT
 # =====================================================
 
-MODEL_FEATURES: List[str] = [
+MODEL_FEATURES: Tuple[str, ...] = (
     "return",
     "volatility",
     "rsi",
@@ -24,36 +25,44 @@ MODEL_FEATURES: List[str] = [
     "sentiment_std",
     "return_lag1",
     "sentiment_lag1"
-]
+)
 
-
-# enforce numeric expectation
 NUMERIC_FEATURES = set(MODEL_FEATURES)
+
+MAX_NAN_RATIO = 0.05  # institutional safety threshold
 
 
 # =====================================================
 # VALIDATION
 # =====================================================
 
-def validate_feature_schema(df: pd.DataFrame):
+def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Institutional schema guard.
+    Institutional schema authority.
 
     Enforces:
 
-    - column presence
-    - no unexpected columns
-    - numeric dtype
-    - deterministic order
+    - no duplicate columns
+    - strict feature set
+    - dtype normalization
+    - NaN safety
+    - deterministic ordering
     """
 
     if df.empty:
         raise RuntimeError("Feature dataset is empty.")
 
-    incoming = list(df.columns)
+    # -------------------------------------------------
+    # Duplicate column guard
+    # -------------------------------------------------
 
-    missing = set(MODEL_FEATURES) - set(incoming)
-    extra = set(incoming) - set(MODEL_FEATURES)
+    if df.columns.duplicated().any():
+        raise RuntimeError("Duplicate feature columns detected.")
+
+    incoming = set(df.columns)
+
+    missing = set(MODEL_FEATURES) - incoming
+    extra = incoming - set(MODEL_FEATURES)
 
     if missing:
         raise RuntimeError(
@@ -65,37 +74,56 @@ def validate_feature_schema(df: pd.DataFrame):
             f"Unexpected features detected: {sorted(extra)}"
         )
 
-    # dtype enforcement
-    non_numeric = [
-        col for col in MODEL_FEATURES
-        if not pd.api.types.is_numeric_dtype(df[col])
-    ]
+    # -------------------------------------------------
+    # Enforce order (IN-PLACE)
+    # -------------------------------------------------
 
-    if non_numeric:
+    df = df.loc[:, MODEL_FEATURES]
+
+    # -------------------------------------------------
+    # dtype normalization
+    # -------------------------------------------------
+
+    for col in MODEL_FEATURES:
+
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            raise RuntimeError(
+                f"Non-numeric feature detected: {col}"
+            )
+
+        df[col] = df[col].astype("float64")
+
+    # -------------------------------------------------
+    # NaN safety
+    # -------------------------------------------------
+
+    nan_ratio = df.isna().mean().mean()
+
+    if nan_ratio > MAX_NAN_RATIO:
         raise RuntimeError(
-            f"Non-numeric features detected: {non_numeric}"
+            f"Feature NaN ratio unsafe: {nan_ratio:.3f}"
         )
-
-    # enforce deterministic order
-    if incoming != MODEL_FEATURES:
-        df = df[MODEL_FEATURES]
 
     return df
 
 
 # =====================================================
-# FINGERPRINT SUPPORT
+# SCHEMA SIGNATURE
 # =====================================================
 
 def get_schema_signature() -> str:
     """
-    Produces deterministic schema fingerprint.
+    Deterministic schema fingerprint.
 
-    Used in metadata to prevent
-    training/inference skew.
+    Protects against:
+    - feature drift
+    - dtype drift
+    - ordering skew
     """
 
-    raw = "|".join(MODEL_FEATURES) + f":{SCHEMA_VERSION}"
+    raw = "|".join(MODEL_FEATURES)
+    raw += f":dtype=float64"
+    raw += f":count={len(MODEL_FEATURES)}"
+    raw += f":v={SCHEMA_VERSION}"
 
-    import hashlib
     return hashlib.sha256(raw.encode()).hexdigest()
