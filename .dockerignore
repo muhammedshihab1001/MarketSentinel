@@ -1,18 +1,46 @@
+# -----------------------------
+# Git / Metadata
+# -----------------------------
 .git
 .gitignore
-__pycache__
+
+# -----------------------------
+# Python cache
+# -----------------------------
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# -----------------------------
+# Virtual environments
+# -----------------------------
 venv/
 .env
 
+# -----------------------------
+# Development-only assets
+# -----------------------------
 tests/
 notebooks/
 datasets/
 
-artifacts/
+# DO NOT exclude model registry
+artifacts/training_runs/
 
+# -----------------------------
+# Node / frontend junk
+# -----------------------------
 node_modules/
 .cache/
+
+# -----------------------------
+# HF cache
+# -----------------------------
 .huggingface/
+
+# -----------------------------
+# OS junk
+# -----------------------------
+.DS_Store
+Thumbs.db
