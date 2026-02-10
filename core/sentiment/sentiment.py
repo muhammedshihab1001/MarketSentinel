@@ -1,29 +1,23 @@
 import torch
 import pandas as pd
 import logging
+import time
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("marketsentinel.sentiment")
 
 
 # ---------------------------------------------------
-# 🔥 SINGLETON MODEL LOADER
+# SINGLETON
 # ---------------------------------------------------
 
 class FinBERTSingleton:
-    """
-    Loads FinBERT only ONCE per process.
-
-    Prevents:
-    - duplicate memory usage
-    - slow container startup
-    - worker crashes
-    """
 
     _tokenizer = None
     _model = None
+    _device = "cpu"
 
     MODEL_NAME = "ProsusAI/finbert"
 
@@ -32,7 +26,15 @@ class FinBERTSingleton:
 
         if cls._model is None:
 
-            logger.info("Loading FinBERT model (one-time initialization)...")
+            start = time.time()
+
+            logger.info("Loading FinBERT...")
+
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+            torch.set_grad_enabled(False)
+
+            cls._device = "cpu"
 
             cls._tokenizer = AutoTokenizer.from_pretrained(
                 cls.MODEL_NAME
@@ -40,22 +42,22 @@ class FinBERTSingleton:
 
             cls._model = AutoModelForSequenceClassification.from_pretrained(
                 cls.MODEL_NAME
-            )
+            ).to(cls._device)
 
             cls._model.eval()
 
-        return cls._tokenizer, cls._model
+            logger.info(
+                f"FinBERT loaded in {round(time.time()-start,2)}s"
+            )
+
+        return cls._tokenizer, cls._model, cls._device
 
 
 # ---------------------------------------------------
-# SENTIMENT ANALYZER
+# ANALYZER
 # ---------------------------------------------------
 
 class SentimentAnalyzer:
-    """
-    Financial news sentiment analyzer using FinBERT.
-    Production optimized.
-    """
 
     label_map = {
         0: "negative",
@@ -63,58 +65,108 @@ class SentimentAnalyzer:
         2: "positive"
     }
 
+    BATCH_SIZE = 16
+
     def __init__(self):
 
-        # 🔥 loads instantly after first call
-        self.tokenizer, self.model = FinBERTSingleton.load()
+        (
+            self.tokenizer,
+            self.model,
+            self.device
+        ) = FinBERTSingleton.load()
+
+        # warmup
+        self._warmup()
 
     # ---------------------------------------------------
 
-    def analyze_text(self, text: str) -> dict:
-        """
-        Analyze sentiment for a single text string.
-        """
+    def _warmup(self):
+
+        try:
+            self.analyze_batch(["market is stable"])
+        except Exception:
+            logger.exception("FinBERT warmup failed.")
+
+    # ---------------------------------------------------
+
+    def analyze_batch(self, texts):
 
         inputs = self.tokenizer(
-            text,
+            texts,
             return_tensors="pt",
             truncation=True,
             padding=True,
             max_length=128
-        )
+        ).to(self.device)
 
         with torch.no_grad():
-            outputs = self.model(**inputs)
-            scores = torch.softmax(outputs.logits, dim=1)[0]
 
-        label_id = torch.argmax(scores).item()
-        label = self.label_map[label_id]
+            logits = self.model(**inputs).logits
+            scores = torch.softmax(logits, dim=1)
 
-        sentiment_score = scores[2].item() - scores[0].item()
-
-        return {
-            "label": label,
-            "score": round(sentiment_score, 4)
-        }
-
-    # ---------------------------------------------------
-
-    def analyze_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Analyze sentiment for a DataFrame of news.
-        Expects column: 'headline'
-        """
-
-        if "headline" not in df.columns:
-            raise ValueError("DataFrame must contain 'headline' column")
+        scores = scores.cpu().numpy()
 
         results = []
 
-        for _, row in df.iterrows():
-            sentiment = self.analyze_text(str(row["headline"]))
-            results.append(sentiment)
+        for s in scores:
 
-        sentiment_df = pd.DataFrame(results)
+            label_id = int(s.argmax())
+            label = self.label_map[label_id]
+
+            sentiment_score = float(s[2] - s[0])
+
+            results.append({
+                "label": label,
+                "score": round(sentiment_score, 4)
+            })
+
+        return results
+
+    # ---------------------------------------------------
+
+    def analyze_dataframe(self, df: pd.DataFrame):
+
+        if df.empty:
+            return df
+
+        if "headline" not in df.columns:
+            raise ValueError("Missing headline column")
+
+        headlines = (
+            df["headline"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .tolist()
+        )
+
+        all_results = []
+
+        try:
+
+            for i in range(0, len(headlines), self.BATCH_SIZE):
+
+                batch = headlines[i:i+self.BATCH_SIZE]
+
+                results = self.analyze_batch(batch)
+
+                all_results.extend(results)
+
+        except Exception:
+
+            logger.exception(
+                "Sentiment inference failed — returning neutral fallback."
+            )
+
+            # fail soft
+            fallback = [{
+                "label": "neutral",
+                "score": 0.0
+            }] * len(headlines)
+
+            all_results = fallback
+
+        sentiment_df = pd.DataFrame(all_results)
 
         return pd.concat(
             [df.reset_index(drop=True), sentiment_df],
@@ -125,21 +177,21 @@ class SentimentAnalyzer:
 
     def aggregate_daily_sentiment(self, df: pd.DataFrame):
 
-        if "score" not in df.columns:
-            raise ValueError("DataFrame must contain 'score' column")
+        if df.empty:
+            return pd.DataFrame({
+                "date": [],
+                "avg_sentiment": [],
+                "news_count": [],
+                "sentiment_std": []
+            })
 
         temp_df = df.copy()
 
-        # Robust date handling
-        if "published_at" in temp_df.columns:
-            temp_df["date"] = pd.to_datetime(
-                temp_df["published_at"],
-                errors="coerce"
-            ).dt.date
-        else:
-            temp_df["date"] = None
+        temp_df["date"] = pd.to_datetime(
+            temp_df.get("published_at"),
+            errors="coerce"
+        ).dt.date
 
-        # fallback to today
         temp_df["date"] = temp_df["date"].fillna(
             pd.Timestamp.today().date()
         )
@@ -155,6 +207,8 @@ class SentimentAnalyzer:
             .reset_index()
         )
 
-        aggregated["sentiment_std"] = aggregated["sentiment_std"].fillna(0)
+        aggregated["sentiment_std"] = aggregated[
+            "sentiment_std"
+        ].fillna(0)
 
         return aggregated
