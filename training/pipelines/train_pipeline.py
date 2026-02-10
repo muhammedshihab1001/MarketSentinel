@@ -1,13 +1,13 @@
 """
 MarketSentinel Institutional Training Orchestrator
 
-Acts as the ML control plane.
+NOW WITH MODEL GOVERNANCE.
 
 Guarantees:
-✅ Atomic training visibility
-✅ Version manifest
-✅ Failure-safe execution
-✅ Run traceability
+✅ training success
+✅ metadata validation
+✅ performance gates
+✅ deployment safety
 """
 
 import subprocess
@@ -19,12 +19,69 @@ import os
 
 
 PIPELINE_STEPS = [
-    ("XGBoost", "training.train_xgboost"),
-    ("LSTM", "training.train_lstm"),
-    ("Prophet", "training.train_prophet"),
+    ("xgboost", "training.train_xgboost"),
+    ("lstm", "training.train_lstm"),
+    ("prophet", "training.train_prophet"),
 ]
 
 RUNS_DIR = "artifacts/training_runs"
+
+# ---------------------------------------------------
+# 🔥 GOVERNANCE THRESHOLDS
+# ---------------------------------------------------
+
+MIN_ACCURACY = 0.50
+MIN_SHARPE = 0.25
+MAX_DRAWDOWN = -0.40   # -40%
+
+
+# ---------------------------------------------------
+
+def load_metadata(model_name: str):
+
+    path = f"artifacts/{model_name}/latest/metadata.json"
+
+    if not os.path.exists(path):
+        raise RuntimeError(
+            f"Missing metadata for {model_name}. "
+            "Model was not properly registered."
+        )
+
+    with open(path) as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------
+
+def governance_check(model_name: str):
+
+    metadata = load_metadata(model_name)
+
+    metrics = metadata.get("metrics", {})
+
+    # XGBoost accuracy gate
+    if model_name == "xgboost":
+
+        acc = metrics.get("accuracy")
+
+        if acc is None or acc < MIN_ACCURACY:
+            raise RuntimeError(
+                f"{model_name} rejected — accuracy below threshold"
+            )
+
+    # Walk-forward metrics (if present)
+    sharpe = metrics.get("avg_sharpe")
+    drawdown = metrics.get("max_drawdown")
+
+    if sharpe is not None and sharpe < MIN_SHARPE:
+        raise RuntimeError(
+            f"{model_name} rejected — sharpe too low"
+        )
+
+    if drawdown is not None and drawdown < MAX_DRAWDOWN:
+        raise RuntimeError(
+            f"{model_name} rejected — drawdown too severe"
+        )
 
 
 # ---------------------------------------------------
@@ -32,21 +89,24 @@ RUNS_DIR = "artifacts/training_runs"
 def run_step(name: str, module: str):
 
     print("\n===================================")
-    print(f" 🚀 Starting {name} training")
+    print(f" 🚀 Starting {name.upper()} training")
     print("===================================\n")
 
     start = time.time()
 
     try:
 
-        result = subprocess.run(
+        subprocess.run(
             [sys.executable, "-m", module],
             check=True
         )
 
         duration = round(time.time() - start, 2)
 
-        print(f"\n✅ {name} completed in {duration}s\n")
+        # 🔥 GOVERNANCE CHECK
+        governance_check(name)
+
+        print(f"\n✅ {name.upper()} PASSED governance in {duration}s\n")
 
         return {
             "model": name,
@@ -54,11 +114,11 @@ def run_step(name: str, module: str):
             "duration_sec": duration
         }
 
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
 
         duration = round(time.time() - start, 2)
 
-        print(f"\n❌ {name} FAILED after {duration}s\n")
+        print(f"\n❌ {name.upper()} FAILED after {duration}s\n")
 
         return {
             "model": name,
@@ -104,7 +164,6 @@ def main():
         result = run_step(name, module)
         results.append(result)
 
-        # STOP if critical model fails
         if result["status"] == "failed":
             break
 
@@ -119,10 +178,6 @@ def main():
 
     save_manifest(run_id, manifest)
 
-    # ---------------------------------------------------
-    # FINAL STATUS
-    # ---------------------------------------------------
-
     failures = [r for r in results if r["status"] == "failed"]
 
     if failures:
@@ -134,7 +189,7 @@ def main():
         sys.exit(1)
 
     print("\n########################################")
-    print(" ✅ ALL MODELS TRAINED SUCCESSFULLY")
+    print(" ✅ ALL MODELS PASSED GOVERNANCE")
     print(f" ⏱ Total runtime: {total_time}s")
     print("########################################\n")
 
