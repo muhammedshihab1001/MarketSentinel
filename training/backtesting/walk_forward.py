@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from training.backtesting.backtest_engine import BacktestEngine
+from training.backtesting.portfolio_engine import PortfolioBacktestEngine
 from training.backtesting.regime import MarketRegimeDetector
 
 
@@ -11,9 +11,9 @@ class WalkForwardValidator:
 
     Guarantees:
     - strict time ordering
+    - multi-asset portfolio simulation
+    - capital compounding
     - regime-aware evaluation
-    - capital-safe return compounding
-    - stability metrics
     - promotion-grade statistics
     """
 
@@ -29,7 +29,7 @@ class WalkForwardValidator:
         self.window_size = window_size
         self.step_size = step_size
 
-        self.engine = BacktestEngine()
+        self.engine = PortfolioBacktestEngine()
         self.regime_detector = MarketRegimeDetector()
 
     # ---------------------------------------------------
@@ -39,7 +39,12 @@ class WalkForwardValidator:
         if "date" not in df.columns:
             raise RuntimeError("WalkForward requires 'date' column.")
 
-        # 🔥 HARD TIME SORT (CRITICAL)
+        if "ticker" not in df.columns:
+            raise RuntimeError(
+                "Portfolio walk-forward requires 'ticker' column."
+            )
+
+        # HARD TIME SORT
         df = df.sort_values("date").reset_index(drop=True)
 
         # Detect regimes once
@@ -55,7 +60,7 @@ class WalkForwardValidator:
         }
 
         start = self.window_size
-        equity = 1.0  # normalized capital
+        capital = 10_000
 
         while start < len(df):
 
@@ -65,35 +70,55 @@ class WalkForwardValidator:
             if len(test_df) < 2:
                 break
 
-            # -----------------------------
-            # Train
-            # -----------------------------
+            # -----------------------------------
+            # TRAIN
+            # -----------------------------------
 
             model = self.model_trainer(train_df)
 
-            # -----------------------------
-            # Predict
-            # -----------------------------
+            # -----------------------------------
+            # BUILD PORTFOLIO STRUCTURE
+            # -----------------------------------
 
-            signals = self.signal_generator(model, test_df)
-            prices = test_df["close"].values
+            grouped_prices = {}
+            grouped_signals = {}
+
+            for date, slice_df in test_df.groupby("date"):
+
+                prices = dict(
+                    zip(slice_df["ticker"], slice_df["close"])
+                )
+
+                signals_list = self.signal_generator(
+                    model,
+                    slice_df
+                )
+
+                signals = dict(
+                    zip(slice_df["ticker"], signals_list)
+                )
+
+                grouped_prices[date] = prices
+                grouped_signals[date] = signals
+
+            # -----------------------------------
+            # RUN PORTFOLIO ENGINE
+            # -----------------------------------
 
             metrics = self.engine.run(
-                prices,
-                signals,
-                initial_cash=10_000
+                grouped_prices,
+                grouped_signals,
+                initial_cash=capital
             )
 
-            # 🔥 RETURN COMPOUNDING (NOT RAW CAPITAL)
-            window_return = metrics["strategy_return"]
-            equity *= (1 + window_return)
+            capital = metrics["final_portfolio"]
 
-            equity_curve.append(equity)
+            equity_curve.extend(metrics["equity_curve"])
             results.append(metrics)
 
-            # -----------------------------
+            # -----------------------------------
             # REGIME TAGGING
-            # -----------------------------
+            # -----------------------------------
 
             dominant_regime = (
                 test_df["regime"]
@@ -108,7 +133,7 @@ class WalkForwardValidator:
 
         if len(results) < 8:
             raise RuntimeError(
-                "Walk-forward insufficient windows for statistical confidence."
+                "Walk-forward produced insufficient windows."
             )
 
         return self.aggregate_results(
@@ -129,24 +154,24 @@ class WalkForwardValidator:
         df = pd.DataFrame(results)
         curve = np.array(equity_curve)
 
-        # ------------------------------------------------
+        # -------------------------------
         # MAX DRAWDOWN
-        # ------------------------------------------------
+        # -------------------------------
 
         peak = np.maximum.accumulate(curve)
         drawdowns = (curve - peak) / peak
         max_drawdown = float(drawdowns.min())
 
-        # ------------------------------------------------
+        # -------------------------------
         # STABILITY
-        # ------------------------------------------------
+        # -------------------------------
 
         return_std = float(df["strategy_return"].std())
         sharpe_std = float(df["sharpe_ratio"].std())
 
-        # ------------------------------------------------
+        # -------------------------------
         # PROFIT FACTOR
-        # ------------------------------------------------
+        # -------------------------------
 
         gains = df[df["strategy_return"] > 0]["strategy_return"].sum()
         losses = abs(
@@ -155,9 +180,9 @@ class WalkForwardValidator:
 
         profit_factor = float(gains / losses)
 
-        # ------------------------------------------------
+        # -------------------------------
         # REGIME METRICS
-        # ------------------------------------------------
+        # -------------------------------
 
         regime_summary = {}
 
@@ -174,25 +199,19 @@ class WalkForwardValidator:
                 "windows": len(bucket_df)
             }
 
-        # ------------------------------------------------
+        # -------------------------------
 
         return {
             "avg_strategy_return": float(df["strategy_return"].mean()),
-            "avg_buy_hold_return": float(df["buy_hold_return"].mean()),
-            "avg_alpha": float(df["alpha"].mean()),
             "avg_sharpe": float(df["sharpe_ratio"].mean()),
             "sharpe_std": sharpe_std,
             "profit_factor": profit_factor,
-            "avg_trades": float(df["trade_count"].mean()),
 
-            # Risk
             "max_drawdown": max_drawdown,
             "return_volatility": return_std,
             "final_equity": float(curve[-1]),
             "equity_curve": curve.tolist(),
 
-            # Regime intelligence
             "regime_performance": regime_summary,
-
             "num_windows": len(df)
         }
