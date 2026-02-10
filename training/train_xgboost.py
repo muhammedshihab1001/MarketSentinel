@@ -5,10 +5,8 @@ import shutil
 import joblib
 import pandas as pd
 
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
-    classification_report,
     roc_auc_score,
     log_loss
 )
@@ -23,9 +21,11 @@ from core.schema.feature_schema import MODEL_FEATURES
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
 
+from training.backtesting.walk_forward import WalkForwardValidator
+
 
 # ---------------------------------------------------
-# CONFIG
+# CONFIG — Institutional Gates
 # ---------------------------------------------------
 
 MODEL_DIR = "artifacts/xgboost"
@@ -34,16 +34,16 @@ TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 MIN_ACCURACY = 0.50
+MIN_SHARPE = 0.50
+MAX_DRAWDOWN = -0.35
+MIN_ALPHA = 0.0
 
 
 # ---------------------------------------------------
-# SAFE MODEL WRITE
+# SAFE WRITE
 # ---------------------------------------------------
 
 def save_model_atomic(model, path):
-    """
-    Prevents corrupted artifacts.
-    """
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -59,7 +59,7 @@ def save_model_atomic(model, path):
 
 
 # ---------------------------------------------------
-# DATA LOADING
+# DATA
 # ---------------------------------------------------
 
 def load_training_data():
@@ -93,22 +93,61 @@ def load_training_data():
 
 
 # ---------------------------------------------------
-# TRAIN MODEL
+# TRAINER FUNCTION (Used by WalkForward)
 # ---------------------------------------------------
 
-def train_model(df: pd.DataFrame):
+def train_on_window(df: pd.DataFrame):
 
     X = df[MODEL_FEATURES]
     y = df["target"]
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=0.2,
-        shuffle=False
+    model = XGBClassifier(
+        n_estimators=500,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        eval_metric="logloss",
+        random_state=42
     )
 
+    model.fit(X, y)
+
+    return model
+
+
+# ---------------------------------------------------
+# SIGNAL GENERATOR
+# ---------------------------------------------------
+
+def generate_signals(model, df):
+
+    probs = model.predict_proba(df[MODEL_FEATURES])[:, 1]
+
+    signals = []
+
+    for p in probs:
+        if p > 0.6:
+            signals.append("BUY")
+        elif p < 0.4:
+            signals.append("SELL")
+        else:
+            signals.append("HOLD")
+
+    return signals
+
+
+# ---------------------------------------------------
+# FINAL TRAIN (Full Dataset)
+# ---------------------------------------------------
+
+def train_full_model(df):
+
+    X = df[MODEL_FEATURES]
+    y = df["target"]
+
     model = XGBClassifier(
-        n_estimators=1000,  # high ceiling
+        n_estimators=1000,
         max_depth=5,
         learning_rate=0.03,
         subsample=0.8,
@@ -118,36 +157,22 @@ def train_model(df: pd.DataFrame):
         random_state=42
     )
 
+    split = int(len(df) * 0.8)
+
     model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_test, y_test)],
+        X[:split],
+        y[:split],
+        eval_set=[(X[split:], y[split:])],
         verbose=False
     )
 
-    preds = model.predict(X_test)
-    probs = model.predict_proba(X_test)[:, 1]
-
-    acc = accuracy_score(y_test, preds)
-    auc = roc_auc_score(y_test, probs)
-    loss = log_loss(y_test, probs)
-
-    print("\n✅ Accuracy:", acc)
-    print("✅ ROC-AUC:", auc)
-    print("✅ LogLoss:", loss)
-    print(classification_report(y_test, preds))
-
-    if acc < MIN_ACCURACY:
-        raise ValueError(
-            f"Model accuracy {acc:.2f} below threshold {MIN_ACCURACY}"
-        )
+    preds = model.predict(X[split:])
+    probs = model.predict_proba(X[split:])[:, 1]
 
     metrics = {
-        "accuracy": float(acc),
-        "roc_auc": float(auc),
-        "logloss": float(loss),
-        "training_rows": len(df),
-        "feature_count": len(MODEL_FEATURES)
+        "accuracy": float(accuracy_score(y[split:], preds)),
+        "roc_auc": float(roc_auc_score(y[split:], probs)),
+        "logloss": float(log_loss(y[split:], probs)),
     }
 
     return model, metrics
@@ -159,19 +184,57 @@ def train_model(df: pd.DataFrame):
 
 if __name__ == "__main__":
 
-    print("\n🚀 Starting XGBoost training...\n")
+    print("\n🚀 Starting Institutional XGBoost Training...\n")
 
     df, end_date = load_training_data()
 
     dataset_hash = MetadataManager.fingerprint_dataset(df)
 
-    model, metrics = train_model(df)
+    # ---------------------------------------------------
+    # WALK-FORWARD VALIDATION
+    # ---------------------------------------------------
+
+    print("\nRunning walk-forward validation...\n")
+
+    wf = WalkForwardValidator(
+        model_trainer=train_on_window,
+        signal_generator=generate_signals
+    )
+
+    strategy_metrics = wf.run(df)
+
+    print("\nStrategy Metrics:")
+    print(strategy_metrics)
+
+    # ---------------------------------------------------
+    # PROMOTION GATE
+    # ---------------------------------------------------
+
+    if strategy_metrics["avg_sharpe"] < MIN_SHARPE:
+        raise RuntimeError("Model rejected: Sharpe too low")
+
+    if strategy_metrics["max_drawdown"] < MAX_DRAWDOWN:
+        raise RuntimeError("Model rejected: Drawdown too high")
+
+    if strategy_metrics["avg_alpha"] < MIN_ALPHA:
+        raise RuntimeError("Model rejected: No alpha")
+
+    print("\n✅ Strategy passed institutional gates.\n")
+
+    # ---------------------------------------------------
+    # TRAIN FINAL MODEL
+    # ---------------------------------------------------
+
+    model, metrics = train_full_model(df)
 
     save_model_atomic(model, TEMP_MODEL_PATH)
 
     metadata = MetadataManager.create_metadata(
         model_name="xgboost_direction",
-        metrics=metrics,
+        metrics={
+            **metrics,
+            **strategy_metrics
+        },
         features=MODEL_FEATURES,
         training_start="2018-01-01",
         training_end=end_date,
@@ -181,7 +244,7 @@ if __name__ == "__main__":
     MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
 
     # ---------------------------------------------------
-    # REGISTER MODEL
+    # REGISTER
     # ---------------------------------------------------
 
     version_dir = ModelRegistry.register_model(
@@ -190,5 +253,5 @@ if __name__ == "__main__":
         TEMP_METADATA_PATH
     )
 
-    print("\n✅ XGBoost model registered successfully.")
+    print("\n✅ XGBoost model registered.")
     print(f"📦 Version directory: {version_dir}")
