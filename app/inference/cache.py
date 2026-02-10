@@ -1,11 +1,13 @@
 import redis
 import json
 import hashlib
-import asyncio
 import logging
 import os
 import random
 import threading
+import time
+
+from core.schema.feature_schema import get_schema_signature
 
 
 logger = logging.getLogger("marketsentinel.cache")
@@ -16,11 +18,10 @@ class RedisCache:
     Institutional Redis cache.
 
     Guarantees:
-    - never crashes inference
-    - deterministic keys
-    - connection singleton
     - thread-safe single-flight
-    - TTL jitter (stampede protection)
+    - schema-bound keys
+    - safe degradation
+    - stampede protection
     """
 
     _client = None
@@ -29,8 +30,9 @@ class RedisCache:
     _locks = {}
     _locks_guard = threading.Lock()
 
-    # prevent unbounded lock growth
     MAX_LOCKS = 10_000
+
+    RETRY_SECONDS = 30
 
     # ----------------------------------
 
@@ -39,7 +41,14 @@ class RedisCache:
         if RedisCache._client is not None:
             self.client = RedisCache._client
             self.enabled = True
+            self._disabled_until = 0
             return
+
+        self._connect()
+
+    # ----------------------------------
+
+    def _connect(self):
 
         try:
 
@@ -63,15 +72,31 @@ class RedisCache:
 
             self.client = RedisCache._client
             self.enabled = True
+            self._disabled_until = 0
 
             logger.info("Redis cache connected.")
 
         except Exception:
 
             self.enabled = False
+            self._disabled_until = time.time() + self.RETRY_SECONDS
+
             logger.warning(
-                "Redis unavailable — running without cache."
+                "Redis unavailable — retrying soon."
             )
+
+    # ----------------------------------
+
+    def _maybe_reconnect(self):
+
+        if self.enabled:
+            return
+
+        if time.time() < self._disabled_until:
+            return
+
+        logger.info("Attempting Redis reconnect...")
+        self._connect()
 
     # ----------------------------------
 
@@ -79,7 +104,9 @@ class RedisCache:
 
         raw = json.dumps(payload, sort_keys=True, default=str)
 
-        return "prediction:" + hashlib.sha256(raw.encode()).hexdigest()
+        schema = get_schema_signature()
+
+        return "prediction:" + schema + ":" + hashlib.sha256(raw.encode()).hexdigest()
 
     # ----------------------------------
     # THREAD SAFE SINGLE-FLIGHT
@@ -89,18 +116,23 @@ class RedisCache:
 
         with RedisCache._locks_guard:
 
-            if len(self._locks) > self.MAX_LOCKS:
-                # cheap pruning
-                self._locks.clear()
-
             if key not in self._locks:
-                self._locks[key] = asyncio.Lock()
+
+                if len(self._locks) >= self.MAX_LOCKS:
+                    # prune oldest
+                    RedisCache._locks.pop(
+                        next(iter(self._locks))
+                    )
+
+                self._locks[key] = threading.Lock()
 
             return self._locks[key]
 
     # ----------------------------------
 
     def get(self, key: str):
+
+        self._maybe_reconnect()
 
         if not self.enabled:
             return None
@@ -109,36 +141,55 @@ class RedisCache:
 
             data = self.client.get(key)
 
-            if data:
+            if data is None:
+                return None
+
+            try:
                 return json.loads(data)
 
-        except Exception:
-            logger.exception("Redis GET failure.")
-            self.enabled = False  # fail closed
+            except Exception:
 
-        return None
+                logger.warning(
+                    "Corrupted cache entry removed."
+                )
+
+                self.client.delete(key)
+                return None
+
+        except Exception:
+
+            logger.exception("Redis GET failure.")
+
+            self.enabled = False
+            self._disabled_until = time.time() + self.RETRY_SECONDS
+
+            return None
 
     # ----------------------------------
 
     def set(self, key: str, value: dict, ttl=900):
+
+        self._maybe_reconnect()
 
         if not self.enabled:
             return
 
         try:
 
-            # TTL jitter prevents stampedes
-            jitter = random.randint(0, int(ttl * 0.1))
-            final_ttl = ttl + jitter
+            jitter = int(ttl * 0.1)
+            final_ttl = ttl + random.randint(-jitter, jitter)
 
             payload = json.dumps(value, default=str)
 
             self.client.setex(
                 key,
-                final_ttl,
+                max(60, final_ttl),
                 payload
             )
 
         except Exception:
+
             logger.exception("Redis SET failure.")
+
             self.enabled = False
+            self._disabled_until = time.time() + self.RETRY_SECONDS
