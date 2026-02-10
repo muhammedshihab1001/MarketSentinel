@@ -9,31 +9,45 @@ class FeatureEngineer:
     Institutional-grade feature engineering.
 
     Guarantees:
-    - no lookahead leakage in inference
+    - pure functional pipeline (no side effects)
+    - no lookahead leakage
     - deterministic ordering
     - numeric stability
     - schema enforcement
     """
 
+    MIN_ROWS_REQUIRED = 120   # protects rolling + lags
+
     # ------------------------------------------------------------------
 
     @staticmethod
-    def add_returns(df: pd.DataFrame) -> pd.DataFrame:
+    def _validate_price_frame(df: pd.DataFrame):
 
-        if "close" not in df.columns:
-            raise ValueError("DataFrame must contain 'close' column")
+        required = {"date", "close"}
+
+        if not required.issubset(df.columns):
+            raise RuntimeError("Price dataframe missing required columns.")
+
+        if df["close"].isna().any():
+            raise RuntimeError("Close price contains NaNs.")
+
+        if (df["close"] <= 0).any():
+            raise RuntimeError("Invalid close prices detected.")
+
+        if df["date"].duplicated().any():
+            raise RuntimeError("Duplicate timestamps in price data.")
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def add_returns(df: pd.DataFrame):
 
         df["return"] = df["close"].pct_change()
-
-        return df
 
     # -------------------------------------------------------------
 
     @staticmethod
-    def add_volatility(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
-
-        if "return" not in df.columns:
-            raise ValueError("Call add_returns() before add_volatility()")
+    def add_volatility(df: pd.DataFrame, window: int = 5):
 
         df["volatility"] = (
             df["return"]
@@ -41,12 +55,10 @@ class FeatureEngineer:
             .std()
         )
 
-        return df
-
     # -------------------------------------------------------------
 
     @staticmethod
-    def add_rsi(df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
+    def add_rsi(df: pd.DataFrame, window: int = 14):
 
         delta = df["close"].diff()
 
@@ -56,29 +68,26 @@ class FeatureEngineer:
         avg_gain = gain.rolling(window, min_periods=window).mean()
         avg_loss = loss.rolling(window, min_periods=window).mean()
 
-        # prevent divide-by-zero
         avg_loss = avg_loss.replace(0, np.nan)
+        avg_gain = avg_gain.replace(0, np.nan)
 
         rs = avg_gain / avg_loss
 
-        df["rsi"] = 100 - (100 / (1 + rs))
+        rsi = 100 - (100 / (1 + rs))
 
-        df["rsi"] = df["rsi"].fillna(50)  # neutral fallback
-
-        return df
+        # clamp extreme edges
+        df["rsi"] = rsi.clip(0, 100).fillna(50)
 
     # -------------------------------------------------------------
 
     @staticmethod
-    def add_macd(df: pd.DataFrame) -> pd.DataFrame:
+    def add_macd(df: pd.DataFrame):
 
         ema_12 = df["close"].ewm(span=12, adjust=False).mean()
         ema_26 = df["close"].ewm(span=26, adjust=False).mean()
 
         df["macd"] = ema_12 - ema_26
         df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-
-        return df
 
     # ------------------------------------------------------------------
 
@@ -88,21 +97,25 @@ class FeatureEngineer:
         sentiment_df: pd.DataFrame
     ) -> pd.DataFrame:
 
-        price_df["date"] = pd.to_datetime(price_df["date"]).dt.date
-        sentiment_df["date"] = pd.to_datetime(sentiment_df["date"]).dt.date
+        price = price_df.copy()
+        sentiment = sentiment_df.copy()
+
+        price["date"] = pd.to_datetime(price["date"]).dt.date
+        sentiment["date"] = pd.to_datetime(sentiment["date"]).dt.date
+
+        if sentiment["date"].duplicated().any():
+            sentiment = sentiment.groupby("date").mean().reset_index()
 
         merged = pd.merge(
-            price_df,
-            sentiment_df,
+            price,
+            sentiment,
             on="date",
             how="left",
-            sort=False
-        )
+            validate="one_to_one"
+        ).sort_values("date")
 
-        merged = merged.sort_values("date")
-
-        for col in ["avg_sentiment", "news_count", "sentiment_std"]:
-            if col not in merged.columns:
+        for col in ("avg_sentiment", "news_count", "sentiment_std"):
+            if col not in merged:
                 merged[col] = 0.0
             else:
                 merged[col] = merged[col].fillna(0.0)
@@ -110,11 +123,21 @@ class FeatureEngineer:
         return merged
 
     # ------------------------------------------------------------------
-    # TRAINING ONLY
+
+    @staticmethod
+    def _post_feature_guard(df: pd.DataFrame):
+
+        if len(df) < FeatureEngineer.MIN_ROWS_REQUIRED:
+            raise RuntimeError(
+                "Feature dataset too small for safe inference/training."
+            )
+
+    # ------------------------------------------------------------------
+    # TRAINING
     # ------------------------------------------------------------------
 
     @staticmethod
-    def create_training_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    def create_training_dataset(df: pd.DataFrame):
 
         df["target"] = (df["return"].shift(-1) > 0).astype(int)
 
@@ -123,19 +146,23 @@ class FeatureEngineer:
 
         df = df.dropna()
 
+        FeatureEngineer._post_feature_guard(df)
+
         return df
 
     # ------------------------------------------------------------------
-    # INFERENCE SAFE
+    # INFERENCE
     # ------------------------------------------------------------------
 
     @staticmethod
-    def create_inference_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    def create_inference_dataset(df: pd.DataFrame):
 
         df["return_lag1"] = df["return"].shift(1)
         df["sentiment_lag1"] = df["avg_sentiment"].shift(1)
 
         df = df.dropna()
+
+        FeatureEngineer._post_feature_guard(df)
 
         return df
 
@@ -151,9 +178,9 @@ class FeatureEngineer:
         training: bool = False
     ) -> pd.DataFrame:
 
-        df = price_df.copy()
+        cls._validate_price_frame(price_df)
 
-        df = df.sort_values("date")
+        df = price_df.copy().sort_values("date")
 
         cls.add_returns(df)
         cls.add_volatility(df)
