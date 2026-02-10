@@ -2,33 +2,37 @@ import numpy as np
 import pandas as pd
 import os
 import json
+import logging
 from typing import Dict, Any
 
-from app.monitoring.metrics import DRIFT_EVENTS_COUNTER
+from app.monitoring.metrics import DRIFT_DETECTED
+from core.schema.feature_schema import get_schema_signature
+
+
+logger = logging.getLogger("marketsentinel.drift")
 
 
 class DriftDetector:
     """
-    Institutional Feature Drift Detector.
+    Production Drift Sentinel.
 
-    Detects:
-    - mean shift (z-score)
-    - variance shift
-    - min/max breach
-    - schema mismatch
-
-    Emits Prometheus alerts.
-
-    Designed as a production safety system — NOT a research tool.
+    Guarantees:
+    - schema-bound baseline
+    - non-crashing inference checks
+    - global drift emission
+    - variance safety
     """
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
+    BASELINE_VERSION = "2.0"
 
     MIN_SAMPLE_BASELINE = 50
     MIN_SAMPLE_INFERENCE = 20
 
     VARIANCE_RATIO_UPPER = 2.5
     VARIANCE_RATIO_LOWER = 0.4
+
+    EPSILON = 1e-6
 
     def __init__(self, z_threshold: float = 3.0):
 
@@ -38,7 +42,6 @@ class DriftDetector:
 
     # --------------------------------------------------
     # BASELINE CREATION
-    # MUST RUN DURING TRAINING PIPELINE
     # --------------------------------------------------
 
     def create_baseline(self, dataset: pd.DataFrame):
@@ -49,9 +52,15 @@ class DriftDetector:
         numeric = dataset.select_dtypes(include="number")
 
         if numeric.empty:
-            raise RuntimeError("No numeric features available for drift baseline.")
+            raise RuntimeError("No numeric features available.")
 
-        baseline: Dict[str, Any] = {}
+        baseline: Dict[str, Any] = {
+            "meta": {
+                "baseline_version": self.BASELINE_VERSION,
+                "schema_signature": get_schema_signature()
+            },
+            "features": {}
+        }
 
         for col in numeric.columns:
 
@@ -59,17 +68,17 @@ class DriftDetector:
 
             if len(series) < self.MIN_SAMPLE_BASELINE:
                 raise RuntimeError(
-                    f"Baseline unsafe: feature '{col}' has insufficient samples."
+                    f"Baseline unsafe: '{col}' insufficient samples."
                 )
 
             std = series.std()
 
-            if std == 0:
+            if std < self.EPSILON:
                 raise RuntimeError(
-                    f"Baseline unsafe: feature '{col}' has zero variance."
+                    f"Baseline unsafe: '{col}' near-zero variance."
                 )
 
-            baseline[col] = {
+            baseline["features"][col] = {
                 "mean": float(series.mean()),
                 "std": float(std),
                 "variance": float(series.var()),
@@ -85,17 +94,26 @@ class DriftDetector:
 
         os.replace(tmp_path, self.BASELINE_PATH)
 
+        logger.info("Drift baseline created.")
+
     # --------------------------------------------------
 
     def _load_baseline(self):
 
         if not os.path.exists(self.BASELINE_PATH):
-            raise RuntimeError(
-                "Drift baseline missing. Training pipeline must generate it."
-            )
+            raise RuntimeError("Drift baseline missing.")
 
         with open(self.BASELINE_PATH, "r") as f:
-            return json.load(f)
+            baseline = json.load(f)
+
+        meta = baseline.get("meta", {})
+
+        if meta.get("schema_signature") != get_schema_signature():
+            raise RuntimeError(
+                "Baseline schema mismatch. Retraining required."
+            )
+
+        return baseline["features"]
 
     # --------------------------------------------------
     # DETECT DRIFT
@@ -103,76 +121,103 @@ class DriftDetector:
 
     def detect(self, dataset: pd.DataFrame):
 
-        if dataset.empty:
-            raise RuntimeError("Drift detection received empty dataset.")
+        try:
 
-        baseline = self._load_baseline()
+            if dataset.empty:
+                logger.warning("Drift skipped — empty dataset.")
+                return {"drift_detected": False, "details": {}}
 
-        numeric = dataset.select_dtypes(include="number")
+            baseline = self._load_baseline()
 
-        baseline_features = set(baseline.keys())
-        incoming_features = set(numeric.columns)
+            numeric = dataset.select_dtypes(include="number")
 
-        if baseline_features != incoming_features:
-            missing = baseline_features - incoming_features
-            extra = incoming_features - baseline_features
+            baseline_features = set(baseline.keys())
+            incoming_features = set(numeric.columns)
 
-            raise RuntimeError(
-                f"Feature schema mismatch detected. "
-                f"Missing={missing}, Extra={extra}"
-            )
-
-        drift_detected = False
-        drift_report = {}
-
-        for col, stats in baseline.items():
-
-            current = numeric[col].dropna()
-
-            if len(current) < self.MIN_SAMPLE_INFERENCE:
-                raise RuntimeError(
-                    f"Inference drift check unsafe: '{col}' sample too small."
+            if baseline_features != incoming_features:
+                logger.critical(
+                    "SCHEMA DRIFT DETECTED — blocking confidence."
                 )
 
-            mean_now = current.mean()
-            var_now = current.var()
+                DRIFT_DETECTED.set(1)
 
-            z_score = abs(mean_now - stats["mean"]) / stats["std"]
+                return {
+                    "drift_detected": True,
+                    "reason": "schema_mismatch"
+                }
 
-            variance_ratio = var_now / stats["variance"]
+            drift_detected = False
+            drift_report = {}
 
-            min_breach = current.min() < stats["min"]
-            max_breach = current.max() > stats["max"]
+            for col, stats in baseline.items():
 
-            variance_shift = (
-                variance_ratio > self.VARIANCE_RATIO_UPPER
-                or variance_ratio < self.VARIANCE_RATIO_LOWER
-            )
+                current = numeric[col].dropna()
 
-            mean_shift = z_score > self.z_threshold
+                if len(current) < self.MIN_SAMPLE_INFERENCE:
+                    logger.warning(
+                        f"Drift skipped for {col} — insufficient sample."
+                    )
+                    continue
 
-            feature_drift = any([
-                mean_shift,
-                variance_shift,
-                min_breach,
-                max_breach
-            ])
+                mean_now = current.mean()
+                var_now = current.var()
 
-            if feature_drift:
-                drift_detected = True
+                std = max(stats["std"], self.EPSILON)
+                baseline_var = max(stats["variance"], self.EPSILON)
 
-                DRIFT_EVENTS_COUNTER.labels(feature=col).inc()
+                z_score = abs(mean_now - stats["mean"]) / std
+                variance_ratio = var_now / baseline_var
 
-            drift_report[col] = {
-                "mean_shift": bool(mean_shift),
-                "variance_shift": bool(variance_shift),
-                "min_breach": bool(min_breach),
-                "max_breach": bool(max_breach),
-                "z_score": float(z_score),
-                "variance_ratio": float(variance_ratio)
+                min_breach = current.min() < stats["min"]
+                max_breach = current.max() > stats["max"]
+
+                variance_shift = (
+                    variance_ratio > self.VARIANCE_RATIO_UPPER
+                    or variance_ratio < self.VARIANCE_RATIO_LOWER
+                )
+
+                mean_shift = z_score > self.z_threshold
+
+                feature_drift = any([
+                    mean_shift,
+                    variance_shift,
+                    min_breach,
+                    max_breach
+                ])
+
+                if feature_drift:
+                    drift_detected = True
+
+                    logger.warning(
+                        f"Drift detected in feature '{col}' | "
+                        f"z={z_score:.2f} var_ratio={variance_ratio:.2f}"
+                    )
+
+                drift_report[col] = {
+                    "mean_shift": bool(mean_shift),
+                    "variance_shift": bool(variance_shift),
+                    "min_breach": bool(min_breach),
+                    "max_breach": bool(max_breach),
+                    "z_score": float(z_score),
+                    "variance_ratio": float(variance_ratio)
+                }
+
+            DRIFT_DETECTED.set(1 if drift_detected else 0)
+
+            return {
+                "drift_detected": drift_detected,
+                "details": drift_report
             }
 
-        return {
-            "drift_detected": drift_detected,
-            "details": drift_report
-        }
+        except Exception:
+
+            logger.exception(
+                "Drift detector failure — forcing alert."
+            )
+
+            DRIFT_DETECTED.set(1)
+
+            return {
+                "drift_detected": True,
+                "reason": "detector_failure"
+            }
