@@ -4,15 +4,27 @@ import joblib
 
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
+from core.artifacts.model_registry import ModelRegistry
 from models.prophet_model import train_prophet
 
 
-MODEL_DIR = "artifacts/prophet"
-MODEL_PATH = f"{MODEL_DIR}/prophet_trend.pkl"
-METADATA_PATH = f"{MODEL_DIR}/metadata.json"
+# ---------------------------------------------------
+# CONFIG
+# ---------------------------------------------------
 
+MODEL_DIR = "artifacts/prophet"
+
+TEMP_MODEL_PATH = f"{MODEL_DIR}/prophet_trend.pkl"
+TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
+
+
+# ---------------------------------------------------
+# TRAIN
+# ---------------------------------------------------
 
 def train():
+
+    print("\n🚀 Starting Prophet training...\n")
 
     end_date = datetime.date.today().isoformat()
 
@@ -24,28 +36,52 @@ def train():
         end_date=end_date
     )
 
+    if df.empty:
+        raise ValueError("No price data fetched for Prophet training")
+
     model = train_prophet(df)
 
-    return model, end_date
+    # ---------------------------------------------------
+    # DATASET FINGERPRINT (CRITICAL)
+    # ---------------------------------------------------
 
-
-if __name__ == "__main__":
-
-    model, end_date = train()
-
-    os.makedirs(MODEL_DIR, exist_ok=True)
-
-    joblib.dump(model, MODEL_PATH)
+    dataset_hash = MetadataManager.fingerprint_dataset(df)
 
     metadata = MetadataManager.create_metadata(
         model_name="prophet_trend",
         metrics={"status": "trained"},
         features=["date", "close"],
         training_start="2018-01-01",
-        training_end=end_date
+        training_end=end_date,
+        dataset_hash=dataset_hash
     )
 
-    MetadataManager.save_metadata(metadata, METADATA_PATH)
+    return model, metadata
 
-    print("Prophet model saved")
-    print("Metadata saved")
+
+# ---------------------------------------------------
+# EXECUTION
+# ---------------------------------------------------
+
+if __name__ == "__main__":
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    model, metadata = train()
+
+    # Save artifacts temporarily
+    joblib.dump(model, TEMP_MODEL_PATH)
+    MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
+
+    # ---------------------------------------------------
+    # REGISTER MODEL (VERY IMPORTANT)
+    # ---------------------------------------------------
+
+    version_dir = ModelRegistry.register_model(
+        MODEL_DIR,
+        TEMP_MODEL_PATH,
+        TEMP_METADATA_PATH
+    )
+
+    print("Prophet model registered successfully.")
+    print(f"Version directory: {version_dir}")
