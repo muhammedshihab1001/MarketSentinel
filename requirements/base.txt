@@ -1,38 +1,17 @@
 ########################################
-# CORE NUMERICS (LOCKED)
+# CORE NUMERICS (SAFE BASE)
 ########################################
 numpy==1.26.4
 pandas==2.2.2
 joblib==1.4.2
 
 ########################################
-# ML CORE
-########################################
-scikit-learn==1.5.1
-xgboost==2.1.1
-
-tensorflow-cpu==2.15.0
-keras==2.15.0
-
-prophet==1.1.5
-
-########################################
-# NLP (CPU SAFE)
-########################################
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.2.2
-transformers==4.38.2
-
-########################################
 # UTIL
 ########################################
 python-dotenv==1.0.1
-feedparser==6.0.11
-yfinance==0.2.43
+pyarrow
 
 ########################################
 # Monitoring
 ########################################
 prometheus-client==0.20.0
-pyarrow
-logging
