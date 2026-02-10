@@ -3,6 +3,8 @@ from pydantic import BaseModel, Field, field_validator
 from fastapi.concurrency import run_in_threadpool
 import datetime
 import time
+import asyncio
+import os
 
 from app.inference.pipeline import InferencePipeline
 from app.monitoring.metrics import (
@@ -15,6 +17,17 @@ router = APIRouter()
 
 # ✅ Load once (VERY important)
 pipeline = InferencePipeline()
+
+# ------------------------------------------------
+# INSTITUTIONAL CONCURRENCY GATE
+# ------------------------------------------------
+MAX_CONCURRENT_INFERENCES = int(
+    os.getenv("MAX_CONCURRENT_INFERENCES", "4")
+)
+
+inference_semaphore = asyncio.Semaphore(
+    MAX_CONCURRENT_INFERENCES
+)
 
 
 # ----------------------------------------
@@ -47,13 +60,11 @@ class PredictionRequest(BaseModel):
         description="Optional forecast end date"
     )
 
-    # ✅ Normalize ticker
     @field_validator("ticker")
     @classmethod
     def uppercase_ticker(cls, v: str):
         return v.upper().strip()
 
-    # ✅ Date validation
     @field_validator("end_date")
     @classmethod
     def validate_dates(cls, v, info):
@@ -80,14 +91,15 @@ async def predict(req: PredictionRequest):
 
     try:
 
-        # ✅ Run blocking ML safely
-        result = await run_in_threadpool(
-            pipeline.run,
-            req.ticker,
-            req.start_date,
-            req.end_date,
-            req.forecast_days
-        )
+        async with inference_semaphore:
+
+            result = await run_in_threadpool(
+                pipeline.run,
+                req.ticker,
+                req.start_date,
+                req.end_date,
+                req.forecast_days
+            )
 
         API_LATENCY.labels(endpoint=endpoint).observe(
             time.time() - start_time
