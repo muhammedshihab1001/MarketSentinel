@@ -13,8 +13,11 @@ services:
     container_name: marketsentinel-api
     ports:
       - "8000:8000"
+
     volumes:
-    - ./artifacts:/app/artifacts
+      - ./artifacts:/app/artifacts
+
+    restart: always
   # -------------------------------------------------
   # PROMETHEUS
   # -------------------------------------------------

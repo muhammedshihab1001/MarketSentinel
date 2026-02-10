@@ -1,16 +1,8 @@
 -r base.txt
 
-scikit-learn
-xgboost
-tensorflow
-prophet
-
-torch
-transformers
-huggingface-hub
-vaderSentiment
-
-matplotlib
-seaborn
-plotly
-feedparser
+########################################
+# Training Visualization ONLY
+########################################
+matplotlib==3.9.2
+seaborn==0.13.2
+plotly==5.24.1
