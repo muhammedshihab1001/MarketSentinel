@@ -1,13 +1,14 @@
 """
 MarketSentinel Institutional Training Orchestrator
 
-NOW WITH MODEL GOVERNANCE.
+Release-grade training pipeline.
 
 Guarantees:
-✅ training success
-✅ metadata validation
-✅ performance gates
-✅ deployment safety
+- dataset snapshot
+- reproducibility stamp
+- governance gates BEFORE promotion reliance
+- registry validation
+- promotion report
 """
 
 import subprocess
@@ -16,6 +17,8 @@ import time
 import json
 import datetime
 import os
+import hashlib
+import platform
 
 
 PIPELINE_STEPS = [
@@ -26,15 +29,67 @@ PIPELINE_STEPS = [
 
 RUNS_DIR = "artifacts/training_runs"
 
-# ---------------------------------------------------
-# 🔥 GOVERNANCE THRESHOLDS
-# ---------------------------------------------------
 
 MIN_ACCURACY = 0.50
 MIN_SHARPE = 0.25
-MAX_DRAWDOWN = -0.40   # -40%
+MAX_DRAWDOWN = -0.40
 
 
+# ---------------------------------------------------
+# REPRODUCIBILITY
+# ---------------------------------------------------
+
+def reproducibility_stamp():
+
+    return {
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "timestamp_utc": datetime.datetime.utcnow().isoformat()
+    }
+
+
+# ---------------------------------------------------
+# DATASET SNAPSHOT
+# ---------------------------------------------------
+
+def snapshot_artifacts():
+
+    """
+    Hash critical artifacts to create a lineage anchor.
+
+    This avoids requiring a full data lake while still
+    providing institutional reproducibility.
+    """
+
+    hasher = hashlib.sha256()
+
+    artifact_roots = [
+        "data/features",
+        "artifacts/drift"
+    ]
+
+    for root in artifact_roots:
+
+        if not os.path.exists(root):
+            continue
+
+        for path, _, files in os.walk(root):
+
+            for f in sorted(files):
+
+                full = os.path.join(path, f)
+
+                try:
+                    with open(full, "rb") as fh:
+                        hasher.update(fh.read())
+                except Exception:
+                    continue
+
+    return hasher.hexdigest()
+
+
+# ---------------------------------------------------
+# METADATA SAFETY
 # ---------------------------------------------------
 
 def load_metadata(model_name: str):
@@ -44,22 +99,30 @@ def load_metadata(model_name: str):
     if not os.path.exists(path):
         raise RuntimeError(
             f"Missing metadata for {model_name}. "
-            "Model was not properly registered."
+            "Registry promotion likely failed."
         )
 
     with open(path) as f:
-        return json.load(f)
+        metadata = json.load(f)
+
+    if "metrics" not in metadata:
+        raise RuntimeError(
+            f"{model_name} metadata missing metrics block."
+        )
+
+    return metadata
 
 
+# ---------------------------------------------------
+# GOVERNANCE
 # ---------------------------------------------------
 
 def governance_check(model_name: str):
 
     metadata = load_metadata(model_name)
 
-    metrics = metadata.get("metrics", {})
+    metrics = metadata["metrics"]
 
-    # XGBoost accuracy gate
     if model_name == "xgboost":
 
         acc = metrics.get("accuracy")
@@ -69,7 +132,6 @@ def governance_check(model_name: str):
                 f"{model_name} rejected — accuracy below threshold"
             )
 
-    # Walk-forward metrics (if present)
     sharpe = metrics.get("avg_sharpe")
     drawdown = metrics.get("max_drawdown")
 
@@ -85,49 +147,60 @@ def governance_check(model_name: str):
 
 
 # ---------------------------------------------------
+# REGISTRY VALIDATION
+# ---------------------------------------------------
+
+def validate_registry_pointer(model_name: str):
+
+    latest = f"artifacts/{model_name}/latest"
+
+    if not os.path.islink(latest):
+        raise RuntimeError(
+            f"{model_name} latest pointer missing."
+        )
+
+    resolved = os.readlink(latest)
+
+    version_dir = os.path.join(
+        f"artifacts/{model_name}",
+        resolved
+    )
+
+    manifest = os.path.join(version_dir, "manifest.json")
+
+    if not os.path.exists(manifest):
+        raise RuntimeError(
+            f"{model_name} manifest missing — registry corrupted."
+        )
+
+
+# ---------------------------------------------------
+# EXECUTION
+# ---------------------------------------------------
 
 def run_step(name: str, module: str):
 
-    print("\n===================================")
-    print(f" 🚀 Starting {name.upper()} training")
-    print("===================================\n")
-
     start = time.time()
 
-    try:
+    subprocess.run(
+        [sys.executable, "-m", module],
+        check=True
+    )
 
-        subprocess.run(
-            [sys.executable, "-m", module],
-            check=True
-        )
+    duration = round(time.time() - start, 2)
 
-        duration = round(time.time() - start, 2)
+    governance_check(name)
+    validate_registry_pointer(name)
 
-        # 🔥 GOVERNANCE CHECK
-        governance_check(name)
-
-        print(f"\n✅ {name.upper()} PASSED governance in {duration}s\n")
-
-        return {
-            "model": name,
-            "status": "success",
-            "duration_sec": duration
-        }
-
-    except Exception as e:
-
-        duration = round(time.time() - start, 2)
-
-        print(f"\n❌ {name.upper()} FAILED after {duration}s\n")
-
-        return {
-            "model": name,
-            "status": "failed",
-            "duration_sec": duration,
-            "error": str(e)
-        }
+    return {
+        "model": name,
+        "status": "success",
+        "duration_sec": duration
+    }
 
 
+# ---------------------------------------------------
+# MANIFEST
 # ---------------------------------------------------
 
 def save_manifest(run_id: str, manifest: dict):
@@ -139,9 +212,9 @@ def save_manifest(run_id: str, manifest: dict):
     with open(path, "w") as f:
         json.dump(manifest, f, indent=4)
 
-    print(f"\n📄 Training manifest saved → {path}\n")
 
-
+# ---------------------------------------------------
+# MAIN
 # ---------------------------------------------------
 
 def main():
@@ -152,46 +225,49 @@ def main():
 
     total_start = time.time()
 
-    print("\n########################################")
-    print("   MARKET SENTINEL — TRAINING RUN")
-    print(f"   RUN ID: {run_id}")
-    print("########################################\n")
+    dataset_hash = snapshot_artifacts()
 
     results = []
 
-    for name, module in PIPELINE_STEPS:
+    try:
 
-        result = run_step(name, module)
-        results.append(result)
+        for name, module in PIPELINE_STEPS:
 
-        if result["status"] == "failed":
-            break
+            result = run_step(name, module)
+            results.append(result)
+
+    except Exception as e:
+
+        results.append({
+            "status": "failed",
+            "error": str(e)
+        })
+
+        total_time = round(time.time() - total_start, 2)
+
+        manifest = {
+            "run_id": run_id,
+            "dataset_snapshot": dataset_hash,
+            "reproducibility": reproducibility_stamp(),
+            "total_runtime_sec": total_time,
+            "results": results
+        }
+
+        save_manifest(run_id, manifest)
+
+        sys.exit(1)
 
     total_time = round(time.time() - total_start, 2)
 
     manifest = {
         "run_id": run_id,
-        "timestamp_utc": datetime.datetime.utcnow().isoformat(),
+        "dataset_snapshot": dataset_hash,
+        "reproducibility": reproducibility_stamp(),
         "total_runtime_sec": total_time,
         "results": results
     }
 
     save_manifest(run_id, manifest)
-
-    failures = [r for r in results if r["status"] == "failed"]
-
-    if failures:
-
-        print("\n########################################")
-        print(" ❌ TRAINING RUN FAILED")
-        print("########################################\n")
-
-        sys.exit(1)
-
-    print("\n########################################")
-    print(" ✅ ALL MODELS PASSED GOVERNANCE")
-    print(f" ⏱ Total runtime: {total_time}s")
-    print("########################################\n")
 
 
 # ---------------------------------------------------
