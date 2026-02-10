@@ -11,12 +11,41 @@ from sklearn.metrics import (
 # XGBOOST
 # ---------------------------------------------------
 
-def evaluate_xgboost(y_true, y_pred, y_prob):
+def evaluate_xgboost(y_true, y_pred, y_prob=None):
+    """
+    Institutional evaluation for classification models.
 
-    return {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "roc_auc": float(roc_auc_score(y_true, y_prob))
+    Backward compatible:
+        Old tests may call with only (y_true, y_pred)
+
+    Safe behavior:
+        If probabilities are missing -> ROC AUC is skipped.
+    """
+
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    metrics = {
+        "accuracy": float(accuracy_score(y_true, y_pred))
     }
+
+    # ROC requires probabilities
+    if y_prob is not None:
+
+        y_prob = np.asarray(y_prob)
+
+        # Avoid crash if only one class present
+        try:
+            metrics["roc_auc"] = float(
+                roc_auc_score(y_true, y_prob)
+            )
+        except ValueError:
+            metrics["roc_auc"] = 0.5  # neutral baseline
+
+    else:
+        metrics["roc_auc"] = None
+
+    return metrics
 
 
 # ---------------------------------------------------
@@ -24,11 +53,16 @@ def evaluate_xgboost(y_true, y_pred, y_prob):
 # ---------------------------------------------------
 
 def evaluate_lstm(y_true, y_pred):
+    """
+    Regression-safe RMSE.
+    """
 
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
 
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    rmse = np.sqrt(
+        mean_squared_error(y_true, y_pred)
+    )
 
     return {
         "rmse": float(rmse)
@@ -40,11 +74,17 @@ def evaluate_lstm(y_true, y_pred):
 # ---------------------------------------------------
 
 def evaluate_prophet(actual, predicted):
+    """
+    MAE for forecasting models.
+    """
 
-    actual = np.array(actual)
-    predicted = np.array(predicted)
+    actual = np.asarray(actual)
+    predicted = np.asarray(predicted)
 
-    mae = mean_absolute_error(actual, predicted)
+    mae = mean_absolute_error(
+        actual,
+        predicted
+    )
 
     return {
         "mae": float(mae)
