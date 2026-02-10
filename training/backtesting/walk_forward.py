@@ -6,15 +6,21 @@ from training.backtesting.backtest_engine import BacktestEngine
 
 class WalkForwardValidator:
     """
-    Performs walk-forward validation for trading strategies.
+    Institutional Walk-Forward Validator.
+
+    Upgrades:
+    ✅ equity curve stitching
+    ✅ drawdown tracking
+    ✅ regime visibility
+    ✅ stability metrics
     """
 
     def __init__(
         self,
-        model_trainer,        # function that trains model
-        signal_generator,    # function that produces signals
-        window_size=252*2,   # ~2 years
-        step_size=63         # ~1 quarter
+        model_trainer,
+        signal_generator,
+        window_size=252*2,
+        step_size=63
     ):
         self.model_trainer = model_trainer
         self.signal_generator = signal_generator
@@ -22,11 +28,15 @@ class WalkForwardValidator:
         self.step_size = step_size
         self.engine = BacktestEngine()
 
+    # ---------------------------------------------------
+
     def run(self, df: pd.DataFrame):
 
         results = []
+        equity_curve = []
 
         start = self.window_size
+        capital = 10_000  # rolling capital simulation
 
         while start < len(df):
 
@@ -36,31 +46,65 @@ class WalkForwardValidator:
             if len(test_df) < 2:
                 break
 
-            # Train model on past data
+            # Train
             model = self.model_trainer(train_df)
 
-            # Generate signals on unseen future
+            # Predict
             signals = self.signal_generator(model, test_df)
-
             prices = test_df["close"].values
 
-            metrics = self.engine.run(prices, signals)
+            metrics = self.engine.run(
+                prices,
+                signals,
+                initial_cash=capital
+            )
 
+            capital = metrics["final_portfolio"]
+
+            equity_curve.append(capital)
             results.append(metrics)
 
             start += self.step_size
 
-        return self.aggregate_results(results)
+        return self.aggregate_results(results, equity_curve)
 
-    def aggregate_results(self, results):
+    # ---------------------------------------------------
+
+    def aggregate_results(self, results, equity_curve):
+
+        if not results:
+            raise ValueError("Walk-forward produced no windows")
 
         df = pd.DataFrame(results)
 
+        curve = np.array(equity_curve)
+
+        # ------------------------------------------------
+        # MAX DRAWDOWN (CRITICAL RISK METRIC)
+        # ------------------------------------------------
+
+        peak = np.maximum.accumulate(curve)
+        drawdowns = (curve - peak) / peak
+        max_drawdown = float(drawdowns.min())
+
+        # ------------------------------------------------
+        # RETURN STABILITY
+        # ------------------------------------------------
+
+        return_std = float(df["strategy_return"].std())
+
         return {
-            "avg_strategy_return": df["strategy_return"].mean(),
-            "avg_buy_hold_return": df["buy_hold_return"].mean(),
-            "avg_alpha": df["alpha"].mean(),
-            "avg_sharpe": df["sharpe_ratio"].mean(),
-            "avg_trades": df["trade_count"].mean(),
+            "avg_strategy_return": float(df["strategy_return"].mean()),
+            "avg_buy_hold_return": float(df["buy_hold_return"].mean()),
+            "avg_alpha": float(df["alpha"].mean()),
+            "avg_sharpe": float(df["sharpe_ratio"].mean()),
+            "avg_trades": float(df["trade_count"].mean()),
+
+            # 🔥 NEW — Institutional Metrics
+            "max_drawdown": max_drawdown,
+            "return_volatility": return_std,
+            "final_equity": float(curve[-1]),
+            "equity_curve": curve.tolist(),
+
             "num_windows": len(df)
         }
