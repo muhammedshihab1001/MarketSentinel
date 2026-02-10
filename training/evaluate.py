@@ -8,39 +8,65 @@ from sklearn.metrics import (
 
 
 # ---------------------------------------------------
-# XGBOOST
+# INTERNAL SAFETY
+# ---------------------------------------------------
+
+def _flatten(arr):
+    """
+    Prevent silent metric corruption from (N,1) arrays.
+    """
+    return np.asarray(arr).reshape(-1)
+
+
+# ---------------------------------------------------
+# XGBOOST / CLASSIFICATION
 # ---------------------------------------------------
 
 def evaluate_xgboost(y_true, y_pred, y_prob=None):
     """
     Institutional evaluation for classification models.
 
-    Backward compatible:
-        Old tests may call with only (y_true, y_pred)
-
-    Safe behavior:
-        If probabilities are missing -> ROC AUC is skipped.
+    Guarantees:
+    - shape safety
+    - ROC protection
+    - backward compatibility
     """
 
-    y_true = np.asarray(y_true)
-    y_pred = np.asarray(y_pred)
+    y_true = _flatten(y_true)
+    y_pred = _flatten(y_pred)
 
     metrics = {
-        "accuracy": float(accuracy_score(y_true, y_pred))
+        "accuracy": float(
+            accuracy_score(y_true, y_pred)
+        )
     }
 
-    # ROC requires probabilities
+    # -----------------------------------------
+    # ROC AUC
+    # -----------------------------------------
+
     if y_prob is not None:
 
-        y_prob = np.asarray(y_prob)
+        y_prob = _flatten(y_prob)
 
-        # Avoid crash if only one class present
-        try:
-            metrics["roc_auc"] = float(
-                roc_auc_score(y_true, y_prob)
+        # Detect invalid probabilities
+        if np.any(y_prob < 0) or np.any(y_prob > 1):
+            raise RuntimeError(
+                "Invalid probabilities detected in evaluation."
             )
-        except ValueError:
-            metrics["roc_auc"] = 0.5  # neutral baseline
+
+        try:
+
+            # Guard against single-class folds
+            if len(np.unique(y_true)) < 2:
+                metrics["roc_auc"] = 0.5
+            else:
+                metrics["roc_auc"] = float(
+                    roc_auc_score(y_true, y_prob)
+                )
+
+        except Exception:
+            metrics["roc_auc"] = 0.5
 
     else:
         metrics["roc_auc"] = None
@@ -49,16 +75,23 @@ def evaluate_xgboost(y_true, y_pred, y_prob=None):
 
 
 # ---------------------------------------------------
-# LSTM
+# LSTM / REGRESSION
 # ---------------------------------------------------
 
 def evaluate_lstm(y_true, y_pred):
     """
-    Regression-safe RMSE.
+    Institutional RMSE.
+
+    Adds:
+    - shape safety
+    - NaN guard
     """
 
-    y_true = np.asarray(y_true)
-    y_pred = np.asarray(y_pred)
+    y_true = _flatten(y_true)
+    y_pred = _flatten(y_pred)
+
+    if np.isnan(y_pred).any():
+        raise RuntimeError("NaNs detected in predictions.")
 
     rmse = np.sqrt(
         mean_squared_error(y_true, y_pred)
@@ -70,16 +103,21 @@ def evaluate_lstm(y_true, y_pred):
 
 
 # ---------------------------------------------------
-# PROPHET
+# PROPHET / FORECASTING
 # ---------------------------------------------------
 
 def evaluate_prophet(actual, predicted):
     """
-    MAE for forecasting models.
+    Institutional MAE with shape safety.
     """
 
-    actual = np.asarray(actual)
-    predicted = np.asarray(predicted)
+    actual = _flatten(actual)
+    predicted = _flatten(predicted)
+
+    if len(actual) != len(predicted):
+        raise RuntimeError(
+            "Forecast length mismatch."
+        )
 
     mae = mean_absolute_error(
         actual,
