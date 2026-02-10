@@ -4,13 +4,9 @@ import tempfile
 import shutil
 import joblib
 import pandas as pd
+import numpy as np
 
-from sklearn.metrics import (
-    accuracy_score,
-    roc_auc_score,
-    log_loss
-)
-
+from sklearn.metrics import accuracy_score, roc_auc_score, log_loss
 from xgboost import XGBClassifier
 
 from core.data.data_fetcher import StockPriceFetcher
@@ -24,9 +20,9 @@ from core.artifacts.model_registry import ModelRegistry
 from training.backtesting.walk_forward import WalkForwardValidator
 
 
-# ---------------------------------------------------
+# ===================================================
 # CONFIG — Institutional Gates
-# ---------------------------------------------------
+# ===================================================
 
 MODEL_DIR = "artifacts/xgboost"
 
@@ -37,20 +33,19 @@ MIN_ACCURACY = 0.50
 MIN_SHARPE = 0.50
 MAX_DRAWDOWN = -0.35
 MIN_ALPHA = 0.0
+MIN_CALMAR = 0.30   # 🔥 NEW
 
 
-# ---------------------------------------------------
+# ===================================================
 # SAFE WRITE
-# ---------------------------------------------------
+# ===================================================
 
 def save_model_atomic(model, path):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        dir=os.path.dirname(path)
-    ) as tmp:
+    with tempfile.NamedTemporaryFile(delete=False,
+                                     dir=os.path.dirname(path)) as tmp:
 
         joblib.dump(model, tmp.name)
         temp_name = tmp.name
@@ -58,9 +53,9 @@ def save_model_atomic(model, path):
     shutil.move(temp_name, path)
 
 
-# ---------------------------------------------------
+# ===================================================
 # DATA
-# ---------------------------------------------------
+# ===================================================
 
 def load_training_data():
 
@@ -92,11 +87,37 @@ def load_training_data():
     return dataset, end_date
 
 
-# ---------------------------------------------------
-# TRAINER FUNCTION (Used by WalkForward)
-# ---------------------------------------------------
+# ===================================================
+# FEATURE BASELINES (🔥 VERY IMPORTANT)
+# ===================================================
 
-def train_on_window(df: pd.DataFrame):
+def build_feature_baselines(df):
+
+    baselines = {}
+
+    numeric_cols = df[MODEL_FEATURES].select_dtypes(
+        include="number"
+    ).columns
+
+    for col in numeric_cols:
+
+        series = df[col].dropna()
+
+        baselines[col] = {
+            "mean": float(series.mean()),
+            "std": float(series.std()),
+            "min": float(series.min()),
+            "max": float(series.max())
+        }
+
+    return baselines
+
+
+# ===================================================
+# WALK-FORWARD HELPERS
+# ===================================================
+
+def train_on_window(df):
 
     X = df[MODEL_FEATURES]
     y = df["target"]
@@ -116,30 +137,21 @@ def train_on_window(df: pd.DataFrame):
     return model
 
 
-# ---------------------------------------------------
-# SIGNAL GENERATOR
-# ---------------------------------------------------
-
 def generate_signals(model, df):
 
     probs = model.predict_proba(df[MODEL_FEATURES])[:, 1]
 
-    signals = []
+    signals = np.where(
+        probs > 0.6, "BUY",
+        np.where(probs < 0.4, "SELL", "HOLD")
+    )
 
-    for p in probs:
-        if p > 0.6:
-            signals.append("BUY")
-        elif p < 0.4:
-            signals.append("SELL")
-        else:
-            signals.append("HOLD")
-
-    return signals
+    return signals.tolist()
 
 
-# ---------------------------------------------------
-# FINAL TRAIN (Full Dataset)
-# ---------------------------------------------------
+# ===================================================
+# FINAL TRAIN
+# ===================================================
 
 def train_full_model(df):
 
@@ -178,9 +190,9 @@ def train_full_model(df):
     return model, metrics
 
 
-# ---------------------------------------------------
+# ===================================================
 # EXECUTION
-# ---------------------------------------------------
+# ===================================================
 
 if __name__ == "__main__":
 
@@ -190,11 +202,12 @@ if __name__ == "__main__":
 
     dataset_hash = MetadataManager.fingerprint_dataset(df)
 
-    # ---------------------------------------------------
-    # WALK-FORWARD VALIDATION
-    # ---------------------------------------------------
+    # 🔥 BUILD BASELINES
+    feature_baselines = build_feature_baselines(df)
 
-    print("\nRunning walk-forward validation...\n")
+    # ---------------------------------------------------
+    # WALK-FORWARD
+    # ---------------------------------------------------
 
     wf = WalkForwardValidator(
         model_trainer=train_on_window,
@@ -203,11 +216,19 @@ if __name__ == "__main__":
 
     strategy_metrics = wf.run(df)
 
+    # 🔥 CALMAR
+    calmar = (
+        strategy_metrics["avg_strategy_return"]
+        / abs(strategy_metrics["max_drawdown"])
+    )
+
+    strategy_metrics["calmar_ratio"] = float(calmar)
+
     print("\nStrategy Metrics:")
     print(strategy_metrics)
 
     # ---------------------------------------------------
-    # PROMOTION GATE
+    # PROMOTION GATES
     # ---------------------------------------------------
 
     if strategy_metrics["avg_sharpe"] < MIN_SHARPE:
@@ -219,10 +240,13 @@ if __name__ == "__main__":
     if strategy_metrics["avg_alpha"] < MIN_ALPHA:
         raise RuntimeError("Model rejected: No alpha")
 
+    if calmar < MIN_CALMAR:
+        raise RuntimeError("Model rejected: Calmar too low")
+
     print("\n✅ Strategy passed institutional gates.\n")
 
     # ---------------------------------------------------
-    # TRAIN FINAL MODEL
+    # TRAIN FINAL
     # ---------------------------------------------------
 
     model, metrics = train_full_model(df)
@@ -231,21 +255,17 @@ if __name__ == "__main__":
 
     metadata = MetadataManager.create_metadata(
         model_name="xgboost_direction",
-        metrics={
-            **metrics,
-            **strategy_metrics
-        },
+        metrics={**metrics, **strategy_metrics},
         features=MODEL_FEATURES,
         training_start="2018-01-01",
         training_end=end_date,
-        dataset_hash=dataset_hash
+        dataset_hash=dataset_hash,
     )
 
-    MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
+    # 🔥 Attach baselines
+    metadata["feature_baselines"] = feature_baselines
 
-    # ---------------------------------------------------
-    # REGISTER
-    # ---------------------------------------------------
+    MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
 
     version_dir = ModelRegistry.register_model(
         MODEL_DIR,
