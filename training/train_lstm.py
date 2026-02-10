@@ -3,12 +3,14 @@ import datetime
 import joblib
 import numpy as np
 import tensorflow as tf
+import pandas as pd
 
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
+from core.artifacts.model_registry import ModelRegistry
 from models.lstm_model import build_lstm_model
 
 
@@ -17,9 +19,9 @@ from models.lstm_model import build_lstm_model
 # ---------------------------------------------------
 
 MODEL_DIR = "artifacts/lstm"
-MODEL_PATH = f"{MODEL_DIR}/model.keras"   # ⭐ modern format
-SCALER_PATH = f"{MODEL_DIR}/scaler.pkl"
-METADATA_PATH = f"{MODEL_DIR}/metadata.json"
+TEMP_MODEL_PATH = f"{MODEL_DIR}/model.keras"
+TEMP_SCALER_PATH = f"{MODEL_DIR}/scaler.pkl"
+TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 LOOKBACK_WINDOW = 60
 EPOCHS = 50
@@ -29,7 +31,7 @@ SEED = 42
 
 
 # ---------------------------------------------------
-# REPRODUCIBILITY (VERY IMPORTANT)
+# REPRODUCIBILITY
 # ---------------------------------------------------
 
 def set_seeds():
@@ -61,7 +63,7 @@ def load_data():
     scaler = MinMaxScaler()
     scaled = scaler.fit_transform(prices)
 
-    return scaled, scaler, end_date
+    return df, scaled, scaler, end_date
 
 
 # ---------------------------------------------------
@@ -85,11 +87,11 @@ def create_sequences(data, lookback):
 
 def train():
 
-    print("\nStarting LSTM training...\n")
+    print("\n🚀 Starting LSTM training...\n")
 
     set_seeds()
 
-    scaled, scaler, end_date = load_data()
+    df, scaled, scaler, end_date = load_data()
 
     X, y = create_sequences(scaled, LOOKBACK_WINDOW)
 
@@ -100,16 +102,14 @@ def train():
 
     model = build_lstm_model((LOOKBACK_WINDOW, 1))
 
-    # ⭐ Early stopping prevents overfit + saves compute
     early_stop = EarlyStopping(
         monitor="val_loss",
         patience=5,
         restore_best_weights=True
     )
 
-    # ⭐ Safe checkpoint
     checkpoint = ModelCheckpoint(
-        MODEL_PATH,
+        TEMP_MODEL_PATH,
         monitor="val_loss",
         save_best_only=True
     )
@@ -126,9 +126,24 @@ def train():
 
     best_val_loss = float(min(history.history["val_loss"]))
 
-    print(f"\nBest validation loss: {best_val_loss}\n")
+    print(f"\n✅ Best validation loss: {best_val_loss}\n")
 
-    return model, scaler, best_val_loss, end_date
+    # ---------------------------------------------------
+    # DATASET FINGERPRINT (VERY IMPORTANT)
+    # ---------------------------------------------------
+
+    dataset_hash = MetadataManager.fingerprint_dataset(df)
+
+    metadata = MetadataManager.create_metadata(
+        model_name="lstm_price_forecast",
+        metrics={"val_loss": best_val_loss},
+        features=["close_sequence"],
+        training_start="2018-01-01",
+        training_end=end_date,
+        dataset_hash=dataset_hash
+    )
+
+    return model, scaler, metadata
 
 
 # ---------------------------------------------------
@@ -139,20 +154,29 @@ if __name__ == "__main__":
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    model, scaler, val_loss, end_date = train()
+    model, scaler, metadata = train()
 
-    # scaler save
-    joblib.dump(scaler, SCALER_PATH)
+    # Save scaler temporarily
+    joblib.dump(scaler, TEMP_SCALER_PATH)
 
-    metadata = MetadataManager.create_metadata(
-        model_name="lstm_price_forecast",
-        metrics={"val_loss": val_loss},
-        features=["close_sequence"],
-        training_start="2018-01-01",
-        training_end=end_date
+    # Save metadata temporarily
+    MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
+
+    # ---------------------------------------------------
+    # REGISTER MODEL (CRITICAL)
+    # ---------------------------------------------------
+
+    version_dir = ModelRegistry.register_model(
+        MODEL_DIR,
+        TEMP_MODEL_PATH,
+        TEMP_METADATA_PATH
     )
 
-    MetadataManager.save_metadata(metadata, METADATA_PATH)
+    # Move scaler into version folder
+    os.rename(
+        TEMP_SCALER_PATH,
+        os.path.join(version_dir, "scaler.pkl")
+    )
 
-    print("LSTM model saved")
-    print("Metadata saved")
+    print("LSTM model registered successfully.")
+    print(f"Version directory: {version_dir}")
