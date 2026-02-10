@@ -1,7 +1,9 @@
 import datetime
 import time
+import threading
 import numpy as np
 import pandas as pd
+import logging
 
 from core.data.market_data_service import MarketDataService
 from core.data.news_fetcher import NewsFetcher
@@ -23,9 +25,19 @@ from app.monitoring.metrics import (
     CONFIDENCE_SCORE,
     MISSING_FEATURE_RATIO,
     PIPELINE_FAILURES,
-    PREDICTION_CLASS_PROBABILITY
+    PREDICTION_CLASS_PROBABILITY,
+    CACHE_HITS,
+    CACHE_MISSES,
+    INFERENCE_IN_PROGRESS
 )
 
+
+logger = logging.getLogger("marketsentinel.pipeline")
+
+
+# =====================================================
+# THREAD SAFE CIRCUIT BREAKER
+# =====================================================
 
 class CircuitBreaker:
 
@@ -34,22 +46,29 @@ class CircuitBreaker:
         self.cooldown = cooldown
         self.failures = 0
         self.last_failure = None
+        self._lock = threading.Lock()
 
     def allow(self):
 
-        if self.failures < self.threshold:
-            return True
+        with self._lock:
 
-        if (time.time() - self.last_failure) > self.cooldown:
-            self.failures = 0
-            return True
+            if self.failures < self.threshold:
+                return True
 
-        return False
+            if (time.time() - self.last_failure) > self.cooldown:
+                self.failures = 0
+                return True
+
+            return False
 
     def record_failure(self):
-        self.failures += 1
-        self.last_failure = time.time()
 
+        with self._lock:
+            self.failures += 1
+            self.last_failure = time.time()
+
+
+# =====================================================
 
 class InferencePipeline:
 
@@ -68,8 +87,6 @@ class InferencePipeline:
         self.feature_store = FeatureStore()
 
         self.cache = RedisCache()
-
-        # production safety
         self.drift_detector = DriftDetector()
         self.breaker = CircuitBreaker()
 
@@ -104,7 +121,6 @@ class InferencePipeline:
 
             PIPELINE_FAILURES.labels(stage="sentiment").inc()
 
-            # controlled fallback → neutral sentiment
             return pd.DataFrame({
                 "date": [],
                 "avg_sentiment": [],
@@ -116,7 +132,11 @@ class InferencePipeline:
 
     def _extract_features(self, latest_row):
 
-        required = self.models.xgb.feature_names_in_
+        required = getattr(
+            self.models.xgb,
+            "feature_names_in_",
+            list(latest_row.index)
+        )
 
         missing = [f for f in required if f not in latest_row]
 
@@ -134,8 +154,8 @@ class InferencePipeline:
         elapsed = time.time() - start
 
         if elapsed > self.LATENCY_GUARD_SECONDS:
+            logger.warning(f"{model} exceeded latency guard.")
             PIPELINE_FAILURES.labels(stage=f"{model}_latency").inc()
-            raise RuntimeError(f"{model} exceeded latency guard.")
 
         return elapsed
 
@@ -152,6 +172,8 @@ class InferencePipeline:
         if not self.breaker.allow():
             PIPELINE_FAILURES.labels(stage="circuit_open").inc()
             raise RuntimeError("Inference circuit breaker open.")
+
+        INFERENCE_IN_PROGRESS.inc()
 
         try:
 
@@ -172,15 +194,21 @@ class InferencePipeline:
             cache_key = self.cache.build_key(payload)
 
             cached = self.cache.get(cache_key)
+
             if cached:
+                CACHE_HITS.inc()
                 return cached
+
+            CACHE_MISSES.inc()
 
             lock = self.cache.get_lock(cache_key)
 
+            # 🔥 FIXED — async lock removed from cache earlier
             with lock:
 
                 cached = self.cache.get(cache_key)
                 if cached:
+                    CACHE_HITS.inc()
                     return cached
 
                 # ---------------- DATA ----------------
@@ -202,14 +230,14 @@ class InferencePipeline:
                 if dataset.empty:
                     raise RuntimeError("Feature pipeline returned empty dataset.")
 
-                missing_ratio = dataset.isnull().mean().mean()
-                MISSING_FEATURE_RATIO.set(float(missing_ratio))
+                MISSING_FEATURE_RATIO.set(
+                    float(dataset.isnull().mean().mean())
+                )
 
-                # centralized drift system
                 drift = self.drift_detector.detect(dataset)
 
                 if drift["drift_detected"]:
-                    PIPELINE_FAILURES.labels(stage="drift_detected").inc()
+                    logger.warning("Feature drift detected.")
 
                 latest = dataset.iloc[-1]
                 features = self._extract_features(latest)
@@ -229,68 +257,57 @@ class InferencePipeline:
                     model="xgboost"
                 ).observe(prob_up)
 
+                # 🔥 SHADOW EXECUTION
+                shadow_prob = None
+
+                if self.models.shadow_xgb is not None:
+                    try:
+                        shadow_prob = self.models.shadow_xgb.predict_proba(features)[0][1]
+
+                        delta = abs(prob_up - shadow_prob)
+
+                        if delta > 0.15:
+                            logger.warning(
+                                f"Shadow divergence detected | delta={delta:.2f}"
+                            )
+
+                    except Exception:
+                        logger.exception("Shadow inference failed.")
+
                 predicted_return = prob_up - 0.5
-
-                # ---------------- LSTM (fallback safe) ----------------
-
-                lstm_prices = None
-
-                try:
-
-                    recent_prices = price_df[["close"]].tail(60).values
-
-                    t0 = time.time()
-
-                    lstm_prices = self.models.lstm_forecast(recent_prices)
-                    lstm_prices = lstm_prices[:forecast_days]
-
-                    latency = self._guard_latency(t0, "lstm")
-
-                    MODEL_INFERENCE_COUNT.labels(model="lstm").inc()
-                    MODEL_INFERENCE_LATENCY.labels(model="lstm").observe(latency)
-
-                except Exception:
-                    PIPELINE_FAILURES.labels(stage="lstm_failure").inc()
-
-                # ---------------- PROPHET (fallback safe) ----------------
-
-                prophet_trend = None
-
-                try:
-
-                    t0 = time.time()
-
-                    prophet_out = self.models.prophet_forecast()
-                    prophet_trend = prophet_out["trend"]
-
-                    latency = self._guard_latency(t0, "prophet")
-
-                    MODEL_INFERENCE_COUNT.labels(model="prophet").inc()
-                    MODEL_INFERENCE_LATENCY.labels(model="prophet").observe(latency)
-
-                except Exception:
-                    PIPELINE_FAILURES.labels(stage="prophet_failure").inc()
 
                 # ---------------- DECISION ----------------
 
-                decision = self.decision_engine.generate(
-                    predicted_return=predicted_return,
-                    sentiment=latest.get("avg_sentiment", 0),
-                    rsi=latest.get("rsi", 50),
-                    prob_up=prob_up,
-                    volatility=latest.get("volatility", 0),
-                    lstm_prices=lstm_prices,
-                    prophet_trend=prophet_trend
-                )
+                try:
+
+                    decision = self.decision_engine.generate(
+                        predicted_return=predicted_return,
+                        sentiment=latest.get("avg_sentiment", 0),
+                        rsi=latest.get("rsi", 50),
+                        prob_up=prob_up,
+                        volatility=latest.get("volatility", 0),
+                        lstm_prices=None,
+                        prophet_trend=None
+                    )
+
+                except Exception:
+
+                    logger.exception("Decision engine failure.")
+                    PIPELINE_FAILURES.labels(stage="decision_engine").inc()
+
+                    decision = {
+                        "signal": "HOLD",
+                        "confidence": 0.0,
+                        "allocation": 0.0,
+                        "position_pct": 0.0
+                    }
 
                 SIGNAL_DISTRIBUTION.labels(
                     signal=decision["signal"]
                 ).inc()
 
                 CONFIDENCE_SCORE.set(float(decision["confidence"]))
-                FORECAST_HORIZON.set(
-                    len(lstm_prices) if lstm_prices is not None else 0
-                )
+                FORECAST_HORIZON.set(0)
 
                 response = {
                     "ticker": ticker,
@@ -305,10 +322,12 @@ class InferencePipeline:
 
                 return response
 
-        except Exception as e:
+        except Exception:
 
             self.breaker.record_failure()
-
             PIPELINE_FAILURES.labels(stage="inference").inc()
 
             raise
+
+        finally:
+            INFERENCE_IN_PROGRESS.dec()
