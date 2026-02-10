@@ -25,7 +25,8 @@ from app.monitoring.metrics import (
     FEATURE_STD,
     FEATURE_MAX,
     FEATURE_MIN,
-    PIPELINE_FAILURES
+    PIPELINE_FAILURES,
+    PREDICTION_CLASS_PROBABILITY
 )
 
 
@@ -45,15 +46,11 @@ class InferencePipeline:
 
         self.cache = RedisCache()
 
-        # 🔥 LOAD BASELINES FROM MODEL METADATA
         self.feature_baselines = self._load_feature_baselines()
 
     # ---------------------------------------------------
 
     def _load_feature_baselines(self):
-        """
-        Pull baselines from registry metadata.
-        """
 
         try:
 
@@ -75,10 +72,6 @@ class InferencePipeline:
     # ---------------------------------------------------
 
     def _detect_feature_drift(self, dataset):
-        """
-        Production-grade drift detection.
-        Uses z-score vs training distribution.
-        """
 
         if not self.feature_baselines:
             return
@@ -102,15 +95,10 @@ class InferencePipeline:
             live_max = float(live_series.max())
             live_min = float(live_series.min())
 
-            # Emit metrics
             FEATURE_MEAN.labels(feature=col).set(live_mean)
             FEATURE_STD.labels(feature=col).set(live_std)
             FEATURE_MAX.labels(feature=col).set(live_max)
             FEATURE_MIN.labels(feature=col).set(live_min)
-
-            # -----------------------------------
-            # Z-SCORE DRIFT
-            # -----------------------------------
 
             baseline_mean = baseline["mean"]
             baseline_std = baseline["std"] or 1e-6
@@ -145,6 +133,24 @@ class InferencePipeline:
                 "news_count": [],
                 "sentiment_std": []
             })
+
+    # ---------------------------------------------------
+
+    def _extract_features(self, latest_row):
+        """
+        Prevent silent schema mismatch.
+        """
+
+        required = self.models.xgb.feature_names_in_
+
+        missing = [f for f in required if f not in latest_row]
+
+        if missing:
+            raise RuntimeError(
+                f"Feature mismatch detected. Missing: {missing}"
+            )
+
+        return latest_row[required].values.reshape(1, -1)
 
     # ---------------------------------------------------
 
@@ -210,14 +216,11 @@ class InferencePipeline:
                 missing_ratio = dataset.isnull().mean().mean()
                 MISSING_FEATURE_RATIO.set(float(missing_ratio))
 
-                # 🔥 DRIFT DETECTION
                 self._detect_feature_drift(dataset)
 
                 latest = dataset.iloc[-1]
 
-                features = latest[
-                    self.models.xgb.feature_names_in_
-                ].values.reshape(1, -1)
+                features = self._extract_features(latest)
 
                 # -----------------------------------
                 # XGBOOST
@@ -232,6 +235,11 @@ class InferencePipeline:
                 MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(
                     time.time() - t0
                 )
+
+                # 🔥 probability histogram
+                PREDICTION_CLASS_PROBABILITY.labels(
+                    model="xgboost"
+                ).observe(prob_up)
 
                 predicted_return = prob_up - 0.5
 
@@ -265,10 +273,10 @@ class InferencePipeline:
                 )
 
                 # -----------------------------------
-                # DECISION
+                # DECISION (NEW STRUCTURED OUTPUT)
                 # -----------------------------------
 
-                signal_today, confidence = self.decision_engine.generate(
+                decision = self.decision_engine.generate(
                     predicted_return=predicted_return,
                     sentiment=latest["avg_sentiment"],
                     rsi=latest["rsi"],
@@ -278,22 +286,29 @@ class InferencePipeline:
                     prophet_trend=prophet_out["trend"]
                 )
 
-                SIGNAL_DISTRIBUTION.labels(signal=signal_today).inc()
-                CONFIDENCE_SCORE.set(float(confidence))
+                SIGNAL_DISTRIBUTION.labels(
+                    signal=decision["signal"]
+                ).inc()
+
+                CONFIDENCE_SCORE.set(float(decision["confidence"]))
                 FORECAST_HORIZON.set(len(lstm_prices))
 
                 response = {
                     "ticker": ticker,
-                    "signal_today": signal_today,
-                    "confidence": float(confidence),
+                    "signal_today": decision["signal"],
+                    "confidence": float(decision["confidence"]),
                     "probability_up": float(prob_up),
+
+                    # 🔥 BIG upgrade
+                    "recommended_allocation": decision["allocation"],
+                    "position_size_pct": decision["position_pct"]
                 }
 
                 self.cache.set(cache_key, response, ttl=900)
 
                 return response
 
-        except Exception as e:
+        except Exception:
 
             PIPELINE_FAILURES.labels(stage="inference").inc()
             raise
