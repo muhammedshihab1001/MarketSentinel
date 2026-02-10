@@ -20,7 +20,9 @@ from app.monitoring.metrics import (
     SIGNAL_DISTRIBUTION,
     FORECAST_HORIZON,
     CONFIDENCE_SCORE,
-    MISSING_FEATURE_RATIO
+    MISSING_FEATURE_RATIO,
+    FEATURE_MEAN,
+    FEATURE_STD
 )
 
 
@@ -28,10 +30,10 @@ class InferencePipeline:
     """
     Institutional-grade inference control plane.
 
-    Now includes:
-    ✅ single-flight protection
-    ✅ cache double-check
-    ✅ thread-safe execution
+    Enhancements:
+    ✅ sentiment failover
+    ✅ feature drift metrics
+    ✅ canonical feature datasets
     """
 
     def __init__(self):
@@ -47,6 +49,59 @@ class InferencePipeline:
         self.feature_store = FeatureStore()
 
         self.cache = RedisCache()
+
+    # ---------------------------------------------------
+
+    def _safe_sentiment(self, ticker):
+        """
+        Sentiment must NEVER break inference.
+        """
+
+        try:
+
+            news_df = self.news_fetcher.fetch(
+                f"{ticker} stock",
+                max_items=50
+            )
+
+            scored = self.sentiment.analyze_dataframe(news_df)
+
+            return self.sentiment.aggregate_daily_sentiment(scored)
+
+        except Exception:
+            # Institutional fallback
+            return pd.DataFrame({
+                "date": [],
+                "avg_sentiment": [],
+                "news_count": [],
+                "sentiment_std": []
+            })
+
+    # ---------------------------------------------------
+
+    def _emit_feature_metrics(self, dataset):
+        """
+        Lightweight drift visibility.
+        """
+
+        numeric_cols = dataset.select_dtypes(
+            include="number"
+        ).columns
+
+        for col in numeric_cols:
+
+            series = dataset[col].dropna()
+
+            if len(series) == 0:
+                continue
+
+            FEATURE_MEAN.labels(feature=col).set(
+                float(series.mean())
+            )
+
+            FEATURE_STD.labels(feature=col).set(
+                float(series.std())
+            )
 
     # ---------------------------------------------------
 
@@ -74,26 +129,20 @@ class InferencePipeline:
 
         cache_key = self.cache.build_key(payload)
 
-        # ✅ FAST CACHE HIT
         cached = self.cache.get(cache_key)
         if cached:
             return cached
-
-        # =====================================================
-        # SINGLE-FLIGHT LOCK (CRITICAL FOR CPU STABILITY)
-        # =====================================================
 
         lock = self.cache.get_lock(cache_key)
 
         with lock:
 
-            # Double-check after acquiring lock
             cached = self.cache.get(cache_key)
             if cached:
                 return cached
 
             # -----------------------------------
-            # FETCH DATA
+            # MARKET DATA (dataset-first)
             # -----------------------------------
 
             price_df = self.market_data.get_price_data(
@@ -102,17 +151,20 @@ class InferencePipeline:
                 end_date=today.isoformat()
             )
 
-            news_df = self.news_fetcher.fetch(
-                f"{ticker} stock",
-                max_items=50
-            )
+            # -----------------------------------
+            # SENTIMENT — FAIL SAFE
+            # -----------------------------------
 
-            scored = self.sentiment.analyze_dataframe(news_df)
-            sentiment_df = self.sentiment.aggregate_daily_sentiment(scored)
+            sentiment_df = self._safe_sentiment(ticker)
+
+            # -----------------------------------
+            # FEATURE STORE (canonical)
+            # -----------------------------------
 
             dataset = self.feature_store.get_features(
                 price_df,
-                sentiment_df
+                sentiment_df,
+                ticker=ticker
             )
 
             if dataset.empty:
@@ -126,6 +178,8 @@ class InferencePipeline:
 
             missing_ratio = dataset.isnull().mean().mean()
             MISSING_FEATURE_RATIO.set(float(missing_ratio))
+
+            self._emit_feature_metrics(dataset)
 
             latest = dataset.iloc[-1]
 
@@ -179,7 +233,7 @@ class InferencePipeline:
             )
 
             # -----------------------------------
-            # TODAY DECISION
+            # DECISION
             # -----------------------------------
 
             signal_today, confidence = self.decision_engine.generate(
@@ -196,9 +250,9 @@ class InferencePipeline:
             CONFIDENCE_SCORE.set(float(confidence))
             FORECAST_HORIZON.set(len(lstm_prices))
 
-            # ==========================================
-            # TIMELINE
-            # ==========================================
+            # -----------------------------------
+            # TIMELINE (unchanged)
+            # -----------------------------------
 
             timeline = []
 
@@ -247,18 +301,10 @@ class InferencePipeline:
                 timeline.append(point)
                 forecast_series.append(point)
 
-            # -----------------------------------
-            # SCENARIOS
-            # -----------------------------------
-
             scenarios = self.scenario_engine.generate({
                 "mean_forecast": float(np.mean(lstm_prices)),
                 "std_dev": float(np.std(lstm_prices))
             })
-
-            # -----------------------------------
-            # EXPLANATION
-            # -----------------------------------
 
             explanation = self.explainer.explain(
                 prediction=int(prediction),
@@ -280,10 +326,6 @@ class InferencePipeline:
                 "scenarios": scenarios,
                 "explanation": explanation
             }
-
-            # ==========================================
-            # CACHE WRITE
-            # ==========================================
 
             self.cache.set(cache_key, response, ttl=900)
 
