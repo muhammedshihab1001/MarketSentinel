@@ -2,7 +2,6 @@ import datetime
 import time
 import numpy as np
 import pandas as pd
-import json
 
 from core.data.data_fetcher import StockPriceFetcher
 from core.data.news_fetcher import NewsFetcher
@@ -13,7 +12,7 @@ from core.scenario.scenario_engine import ScenarioEngine
 from core.explainability.decision_explainer import DecisionExplainer
 
 from app.inference.model_loader import ModelLoader
-from app.inference.cache import RedisCache   # ⭐ NEW
+from app.inference.cache import RedisCache
 
 from app.monitoring.metrics import (
     MODEL_INFERENCE_COUNT,
@@ -41,7 +40,7 @@ class InferencePipeline:
         self.scenario_engine = ScenarioEngine()
         self.explainer = DecisionExplainer()
 
-        self.cache = RedisCache()  # ⭐ NEW
+        self.cache = RedisCache()
 
     # ---------------------------------------------------
 
@@ -53,23 +52,31 @@ class InferencePipeline:
         forecast_days=30
     ):
 
+        today = datetime.date.today()
+
+        # ✅ Normalize BEFORE cache
+        start_date = start_date or today
+        end_date = end_date or (
+            start_date + datetime.timedelta(days=forecast_days)
+        )
+
         # ==========================================
-        # ⭐ CACHE CHECK (BEFORE ANY HEAVY WORK)
+        # SAFE CACHE KEY
         # ==========================================
 
-        cache_key = f"{ticker}:{forecast_days}"
+        payload = {
+            "ticker": ticker,
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "forecast_days": forecast_days
+        }
+
+        cache_key = self.cache.build_key(payload)
 
         cached = self.cache.get(cache_key)
 
         if cached:
             return cached
-
-        # ==========================================
-
-        today = datetime.date.today()
-
-        start_date = start_date or today
-        end_date = end_date or (start_date + datetime.timedelta(days=forecast_days))
 
         # -----------------------------------
         # FETCH DATA
@@ -94,6 +101,12 @@ class InferencePipeline:
             sentiment_df
         )
 
+        # ✅ Safety check
+        if dataset.empty:
+            raise ValueError(
+                "Feature pipeline returned empty dataset."
+            )
+
         # -----------------------------------
         # DATA QUALITY
         # -----------------------------------
@@ -111,14 +124,14 @@ class InferencePipeline:
         # XGBOOST
         # -----------------------------------
 
-        start = time.time()
+        t0 = time.time()
 
         prediction = self.models.xgb.predict(features)[0]
         prob_up = self.models.xgb.predict_proba(features)[0][1]
 
         MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
         MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(
-            time.time() - start
+            time.time() - t0
         )
 
         predicted_return = prob_up - 0.5
@@ -129,27 +142,27 @@ class InferencePipeline:
 
         recent_prices = price_df[["close"]].tail(60).values
 
-        start = time.time()
+        t0 = time.time()
 
         lstm_prices = self.models.lstm_forecast(recent_prices)
         lstm_prices = lstm_prices[:forecast_days]
 
         MODEL_INFERENCE_COUNT.labels(model="lstm").inc()
         MODEL_INFERENCE_LATENCY.labels(model="lstm").observe(
-            time.time() - start
+            time.time() - t0
         )
 
         # -----------------------------------
         # PROPHET
         # -----------------------------------
 
-        start = time.time()
+        t0 = time.time()
 
         prophet_out = self.models.prophet_forecast()
 
         MODEL_INFERENCE_COUNT.labels(model="prophet").inc()
         MODEL_INFERENCE_LATENCY.labels(model="prophet").observe(
-            time.time() - start
+            time.time() - t0
         )
 
         # -----------------------------------
@@ -171,13 +184,12 @@ class InferencePipeline:
         FORECAST_HORIZON.set(len(lstm_prices))
 
         # ==========================================
-        # TIMELINE
+        # TIMELINE (Historical + Forecast)
         # ==========================================
 
         timeline = []
 
-        hist_window = 120
-        hist_df = price_df.tail(hist_window)
+        hist_df = price_df.tail(120)
 
         for _, row in hist_df.iterrows():
             timeline.append({
@@ -222,10 +234,18 @@ class InferencePipeline:
             timeline.append(point)
             forecast_series.append(point)
 
+        # -----------------------------------
+        # SCENARIOS
+        # -----------------------------------
+
         scenarios = self.scenario_engine.generate({
             "mean_forecast": float(np.mean(lstm_prices)),
             "std_dev": float(np.std(lstm_prices))
         })
+
+        # -----------------------------------
+        # EXPLANATION
+        # -----------------------------------
 
         explanation = self.explainer.explain(
             prediction=int(prediction),
@@ -236,7 +256,6 @@ class InferencePipeline:
         )
 
         response = {
-
             "ticker": ticker,
             "signal_today": signal_today,
             "confidence": float(confidence),
@@ -250,9 +269,9 @@ class InferencePipeline:
         }
 
         # ==========================================
-        # ⭐ CACHE WRITE
+        # CACHE WRITE
         # ==========================================
 
-        self.cache.set(cache_key, response, ttl=900)  # 15 min cache
+        self.cache.set(cache_key, response, ttl=900)
 
         return response
