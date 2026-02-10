@@ -6,82 +6,184 @@ class PortfolioBacktestEngine:
     Institutional multi-asset portfolio simulator.
 
     Features:
-    - capital allocation
-    - simultaneous positions
-    - exposure limits
+    - risk-parity allocation
+    - exposure normalization
+    - portfolio rebalancing
+    - transaction cost modeling
     - realistic equity curve
     """
+
+    def __init__(
+        self,
+        transaction_cost=0.001,
+        target_vol=0.02,
+        max_gross_exposure=1.0
+    ):
+        self.transaction_cost = transaction_cost
+        self.target_vol = target_vol
+        self.max_gross_exposure = max_gross_exposure
+
+    # -----------------------------------------------------
+
+    def _estimate_vol(self, prev_prices, prices):
+
+        vols = {}
+
+        if prev_prices is None:
+            return {
+                t: self.target_vol
+                for t in prices
+            }
+
+        for ticker in prices:
+
+            if ticker in prev_prices:
+
+                ret = abs(
+                    prices[ticker] /
+                    prev_prices[ticker] - 1
+                )
+
+                vols[ticker] = max(ret, 1e-4)
+
+            else:
+                vols[ticker] = self.target_vol
+
+        return vols
+
+    # -----------------------------------------------------
+
+    def _compute_weights(self, signals, vols):
+
+        raw = {}
+
+        for ticker, signal in signals.items():
+
+            if signal != "BUY":
+                continue
+
+            vol = vols.get(ticker, self.target_vol)
+
+            raw[ticker] = 1 / vol
+
+        if not raw:
+            return {}
+
+        total = sum(raw.values())
+
+        weights = {
+            t: w / total
+            for t, w in raw.items()
+        }
+
+        # enforce gross exposure ceiling
+        scale = min(1.0, self.max_gross_exposure)
+
+        return {
+            t: w * scale
+            for t, w in weights.items()
+        }
+
+    # -----------------------------------------------------
 
     def run(
         self,
         grouped_prices,
         grouped_signals,
-        initial_cash=10000,
-        max_position_pct=0.20,
-        transaction_cost=0.001
+        initial_cash=10000
     ):
 
         cash = initial_cash
         positions = {}
+
         equity_curve = []
 
         dates = sorted(grouped_prices.keys())
+
+        prev_prices = None
 
         for date in dates:
 
             prices = grouped_prices[date]
             signals = grouped_signals[date]
 
-            portfolio_value = cash
+            vols = self._estimate_vol(
+                prev_prices,
+                prices
+            )
 
-            # mark existing positions
-            for ticker, shares in positions.items():
+            weights = self._compute_weights(
+                signals,
+                vols
+            )
 
-                if ticker in prices:
-                    portfolio_value += shares * prices[ticker]
+            portfolio_value = cash + sum(
+                positions.get(t, 0) * prices.get(t, 0)
+                for t in positions
+            )
 
-            # rebalance
-            for ticker, signal in signals.items():
+            target_positions = {}
 
-                if ticker not in prices:
-                    continue
+            # -----------------------------
+            # REBALANCE
+            # -----------------------------
 
-                price = prices[ticker]
+            for ticker, weight in weights.items():
 
-                position_value = portfolio_value * max_position_pct
+                allocation = portfolio_value * weight
 
-                # BUY
-                if signal == "BUY" and ticker not in positions:
+                shares = (
+                    allocation *
+                    (1 - self.transaction_cost)
+                ) / prices[ticker]
 
-                    if cash > position_value:
+                target_positions[ticker] = shares
 
-                        shares = (position_value * (1 - transaction_cost)) / price
+            # close removed positions
+            for ticker in list(positions.keys()):
 
-                        positions[ticker] = shares
-                        cash -= position_value
+                if ticker not in target_positions:
 
-                # SELL
-                elif signal == "SELL" and ticker in positions:
+                    cash += (
+                        positions[ticker] *
+                        prices[ticker] *
+                        (1 - self.transaction_cost)
+                    )
 
-                    shares = positions.pop(ticker)
+                    del positions[ticker]
 
-                    cash += shares * price * (1 - transaction_cost)
+            # open / adjust
+            for ticker, shares in target_positions.items():
 
-            total_equity = cash
+                cost = shares * prices[ticker]
 
-            for ticker, shares in positions.items():
+                current = positions.get(ticker, 0) * prices[ticker]
 
-                if ticker in prices:
-                    total_equity += shares * prices[ticker]
+                delta = cost - current
 
-            equity_curve.append(total_equity)
+                cash -= delta
+                positions[ticker] = shares
+
+            equity = cash + sum(
+                positions.get(t, 0) * prices.get(t, 0)
+                for t in positions
+            )
+
+            equity_curve.append(equity)
+
+            prev_prices = prices
 
         curve = np.array(equity_curve)
 
-        returns = np.diff(curve) / curve[:-1] if len(curve) > 1 else [0]
+        returns = (
+            np.diff(curve) / curve[:-1]
+            if len(curve) > 1 else [0]
+        )
 
         sharpe = (
-            np.mean(returns) / np.std(returns) * np.sqrt(252)
+            np.mean(returns) /
+            np.std(returns) *
+            np.sqrt(252)
             if np.std(returns) > 0 else 0
         )
 
