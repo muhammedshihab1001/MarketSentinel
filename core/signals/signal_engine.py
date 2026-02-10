@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
+import math
 
 from core.risk.position_sizer import PositionSizer
 
@@ -8,18 +9,33 @@ from core.risk.position_sizer import PositionSizer
 # CONFIGURATION
 # ---------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class SignalConfig:
     prob_threshold: float = 0.60
     sentiment_threshold: float = 0.10
     volatility_cap: float = 0.05
     min_expected_return: float = 0.02
 
-    # 🔥 NEW — trade suppression
     min_confidence: float = 0.25
 
-    # 🔥 NEW — simulation capital
     portfolio_value: float = 100_000
+
+    # HARD CAPITAL GUARD
+    max_position_pct: float = 0.10   # never deploy >10%
+
+
+# ---------------------------------------------------
+# UTIL
+# ---------------------------------------------------
+
+def _safe(v, fallback=0.0):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return fallback
+    return float(v)
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(v, hi))
 
 
 # ---------------------------------------------------
@@ -35,11 +51,17 @@ class ForecastInterpreter:
         rsi: float
     ) -> Tuple[str, float]:
 
+        predicted_return = _safe(predicted_return)
+        sentiment = _safe(sentiment)
+        rsi = _safe(rsi, 50)
+
         confidence = (
             abs(predicted_return) * 0.5 +
             abs(sentiment) * 0.3 +
             abs(50 - rsi) / 50 * 0.2
         )
+
+        confidence = _clamp(confidence, 0.0, 1.0)
 
         if predicted_return > 0.02 and sentiment > 0 and rsi < 70:
             return "BUY", round(confidence, 3)
@@ -66,7 +88,10 @@ class RiskGate:
         volatility: float | None
     ) -> bool:
 
-        if volatility is not None and volatility > self.config.volatility_cap:
+        prob_up = _safe(prob_up, 0.5)
+        volatility = _safe(volatility, 0.0)
+
+        if volatility > self.config.volatility_cap:
             return False
 
         if signal == "BUY" and prob_up < self.config.prob_threshold:
@@ -93,16 +118,21 @@ class EnsembleArbiter:
         config: SignalConfig
     ) -> str:
 
+        prob_up = _safe(prob_up, 0.5)
+
         if not lstm_prices or len(lstm_prices) < 2:
             return "HOLD"
 
-        expected_return = (
-            lstm_prices[-1] - lstm_prices[0]
-        ) / lstm_prices[0]
+        first = max(_safe(lstm_prices[0], 1e-6), 1e-6)
+        last = _safe(lstm_prices[-1], first)
+
+        expected_return = (last - first) / first
+
+        trend = str(prophet_trend).upper()
 
         if (
             base_signal == "BUY"
-            and prophet_trend == "BULLISH"
+            and trend == "BULLISH"
             and expected_return > config.min_expected_return
             and prob_up >= config.prob_threshold
         ):
@@ -110,7 +140,7 @@ class EnsembleArbiter:
 
         if (
             base_signal == "SELL"
-            and prophet_trend == "BEARISH"
+            and trend == "BEARISH"
             and expected_return < -config.min_expected_return
             and prob_up <= (1 - config.prob_threshold)
         ):
@@ -120,27 +150,18 @@ class EnsembleArbiter:
 
 
 # ---------------------------------------------------
-# 🔥 MASTER DECISION ENGINE (UPGRADED)
+# MASTER DECISION ENGINE
 # ---------------------------------------------------
 
 class DecisionEngine:
-    """
-    Institutional Decision Engine.
 
-    Now includes:
-    ✅ risk-based allocation
-    ✅ trade suppression
-    ✅ structured decision output
-    """
+    def __init__(self, config: SignalConfig | None = None):
 
-    def __init__(self, config: SignalConfig = SignalConfig()):
+        self.config = config or SignalConfig()
 
-        self.config = config
         self.interpreter = ForecastInterpreter()
-        self.risk_gate = RiskGate(config)
+        self.risk_gate = RiskGate(self.config)
         self.ensemble = EnsembleArbiter()
-
-        # 🔥 NEW
         self.position_sizer = PositionSizer()
 
     # ---------------------------------------------------
@@ -162,19 +183,15 @@ class DecisionEngine:
             rsi
         )
 
-        # ---------------------------------------
-        # Trade suppression (VERY institutional)
-        # ---------------------------------------
-
         if confidence < self.config.min_confidence:
-            return self._hold_decision(confidence)
+            return self._hold(confidence)
 
         if not self.risk_gate.allow(
             base_signal,
             prob_up,
             volatility
         ):
-            return self._hold_decision(confidence)
+            return self._hold(confidence)
 
         final_signal = self.ensemble.decide(
             base_signal,
@@ -185,11 +202,7 @@ class DecisionEngine:
         )
 
         if final_signal == "HOLD":
-            return self._hold_decision(confidence)
-
-        # ---------------------------------------
-        # 🔥 POSITION SIZING
-        # ---------------------------------------
+            return self._hold(confidence)
 
         allocation = self.position_sizer.size_position(
             signal=final_signal,
@@ -197,6 +210,14 @@ class DecisionEngine:
             volatility=volatility,
             portfolio_value=self.config.portfolio_value
         )
+
+        # HARD CAPITAL CEILING
+        max_allowed = (
+            self.config.portfolio_value *
+            self.config.max_position_pct
+        )
+
+        allocation = min(allocation, max_allowed)
 
         position_pct = allocation / self.config.portfolio_value
 
@@ -209,7 +230,7 @@ class DecisionEngine:
 
     # ---------------------------------------------------
 
-    def _hold_decision(self, confidence: float) -> Dict:
+    def _hold(self, confidence: float) -> Dict:
 
         return {
             "signal": "HOLD",
@@ -220,7 +241,7 @@ class DecisionEngine:
 
 
 # ===================================================
-# STRATEGY ENGINE (UNCHANGED — already excellent)
+# STRATEGY ENGINE (unchanged)
 # ===================================================
 
 class StrategyEngine:
