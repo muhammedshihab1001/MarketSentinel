@@ -8,13 +8,14 @@ class TechnicalIndicators:
 
     Guarantees:
     - numeric stability
-    - no division-by-zero
+    - zero divide protection
     - deterministic output
-    - NaN-safe indicators
+    - flat-market correctness
     """
 
     @staticmethod
     def moving_average(df: pd.DataFrame, window: int = 20):
+
         return df["Close"].rolling(
             window=window,
             min_periods=window
@@ -42,16 +43,27 @@ class TechnicalIndicators:
             min_periods=window
         ).mean()
 
-        # Prevent divide-by-zero
-        rs = avg_gain / (avg_loss + 1e-10)
+        rs = avg_gain / avg_loss
 
         rsi = 100 - (100 / (1 + rs))
 
-        # Institutional handling:
-        # flat market -> RSI = 50
-        rsi = rsi.fillna(50)
+        # -------------------------------------------
+        # Institutional Edge Handling
+        # -------------------------------------------
 
-        # Clamp for safety
+        # flat market -> RSI 50
+        flat_mask = (avg_gain == 0) & (avg_loss == 0)
+        rsi.loc[flat_mask] = 50
+
+        # only gains -> RSI 100
+        gain_mask = (avg_gain > 0) & (avg_loss == 0)
+        rsi.loc[gain_mask] = 100
+
+        # only losses -> RSI 0
+        loss_mask = (avg_gain == 0) & (avg_loss > 0)
+        rsi.loc[loss_mask] = 0
+
+        rsi = rsi.fillna(50)
         rsi = rsi.clip(0, 100)
 
         return rsi.astype("float64")
