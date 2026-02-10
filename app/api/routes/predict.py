@@ -7,6 +7,8 @@ import asyncio
 import os
 
 from app.inference.pipeline import InferencePipeline
+from core.signals.signal_engine import StrategyEngine
+
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
@@ -15,8 +17,8 @@ from app.monitoring.metrics import (
 
 router = APIRouter()
 
-# ✅ Load once
 pipeline = InferencePipeline()
+strategy_engine = StrategyEngine()
 
 # ------------------------------------------------
 # CONCURRENCY GATE
@@ -30,7 +32,6 @@ inference_semaphore = asyncio.Semaphore(
     MAX_CONCURRENT_INFERENCES
 )
 
-# 🔥 NEW — portfolio safety
 MAX_BATCH_SIZE = int(
     os.getenv("MAX_BATCH_SIZE", "10")
 )
@@ -41,17 +42,9 @@ MAX_BATCH_SIZE = int(
 
 class PredictionRequest(BaseModel):
 
-    ticker: str = Field(
-        default="AAPL",
-        min_length=1,
-        max_length=10
-    )
+    ticker: str = Field(default="AAPL", min_length=1, max_length=10)
 
-    forecast_days: int = Field(
-        default=30,
-        ge=1,
-        le=90
-    )
+    forecast_days: int = Field(default=30, ge=1, le=90)
 
     start_date: datetime.date | None = None
     end_date: datetime.date | None = None
@@ -73,20 +66,11 @@ class PredictionRequest(BaseModel):
         return v
 
 
-# 🔥 NEW — Batch Schema
 class BatchPredictionRequest(BaseModel):
 
-    tickers: list[str] = Field(
-        ...,
-        min_length=1,
-        max_length=50
-    )
+    tickers: list[str] = Field(..., min_length=1, max_length=50)
 
-    forecast_days: int = Field(
-        default=30,
-        ge=1,
-        le=90
-    )
+    forecast_days: int = Field(default=30, ge=1, le=90)
 
     @field_validator("tickers")
     @classmethod
@@ -135,7 +119,7 @@ async def predict(req: PredictionRequest):
 
 
 # ----------------------------------------
-# 🔥 PORTFOLIO / BATCH INFERENCE
+# BATCH INFERENCE
 # ----------------------------------------
 
 @router.post("/predict/batch")
@@ -167,12 +151,7 @@ async def predict_batch(req: BatchPredictionRequest):
                 )
 
             except Exception as e:
-
-                # 🔥 Failure isolation
-                return {
-                    "ticker": ticker,
-                    "error": str(e)
-                }
+                return {"ticker": ticker, "error": str(e)}
 
     try:
 
@@ -196,4 +175,70 @@ async def predict_batch(req: BatchPredictionRequest):
         raise HTTPException(
             status_code=500,
             detail=f"Batch inference failed: {str(e)}"
+        )
+
+
+# ===================================================
+# 🔥 NEW — INSTITUTIONAL STRATEGY ENDPOINT
+# ===================================================
+
+@router.post("/strategy/top")
+async def top_opportunities(req: BatchPredictionRequest):
+
+    endpoint = "/strategy/top"
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
+
+    start_time = time.time()
+
+    if len(req.tickers) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Batch size exceeds limit ({MAX_BATCH_SIZE})"
+        )
+
+    async def infer_one(ticker):
+
+        async with inference_semaphore:
+
+            try:
+                return await run_in_threadpool(
+                    pipeline.run,
+                    ticker,
+                    None,
+                    None,
+                    req.forecast_days
+                )
+            except Exception:
+                return None
+
+    try:
+
+        predictions = await asyncio.gather(
+            *[infer_one(t) for t in req.tickers]
+        )
+
+        predictions = [p for p in predictions if p is not None]
+
+        top_buys = strategy_engine.top_opportunities(predictions)
+        sell_alerts = strategy_engine.sell_alerts(predictions)
+        distribution = strategy_engine.signal_distribution(predictions)
+
+        API_LATENCY.labels(endpoint=endpoint).observe(
+            time.time() - start_time
+        )
+
+        return {
+            "top_buys": top_buys,
+            "sell_alerts": sell_alerts,
+            "signal_distribution": distribution,
+            "analyzed": len(predictions)
+        }
+
+    except Exception as e:
+
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Strategy scan failed: {str(e)}"
         )
