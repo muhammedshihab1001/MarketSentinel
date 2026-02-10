@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # STAGE 1 — Builder
 # -------------------------------------------------
-FROM python:3.10-slim AS builder
+FROM python:3.10
 
 WORKDIR /install
 
@@ -29,7 +29,7 @@ RUN pip install \
 # -------------------------------------------------
 # STAGE 2 — Runtime Image (LEAN)
 # -------------------------------------------------
-FROM python:3.10-slim
+FROM python:3.10
 
 WORKDIR /app
 

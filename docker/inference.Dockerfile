@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # STAGE 1 — Builder
 # -------------------------------------------------
-FROM python:3.10.14 AS builder
+FROM python:3.10-slim
 # ↑ Get the REAL digest from Docker Hub (shown below)
 
 WORKDIR /install
@@ -25,7 +25,7 @@ RUN pip install \
 # -------------------------------------------------
 # STAGE 2 — Runtime
 # -------------------------------------------------
-FROM python:3.10.14-slim@sha256:3f1b...REPLACE_ME...
+FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
