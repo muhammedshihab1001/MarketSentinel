@@ -1,39 +1,93 @@
-name: MarketSentinel CI Pipeline
+name: MarketSentinel ML Pipeline
 
 on:
   push:
-    branches: [ "main", "develop" ]
+    branches: ["main", "develop"]
   pull_request:
-    branches: [ "main", "develop" ]
+    branches: ["main", "develop"]
 
 jobs:
-  test-and-evaluate:
+
+# ---------------------------------------------------
+# FAST CI — Fail Quickly
+# ---------------------------------------------------
+
+  fast-ci:
+    name: Tests & Evaluation
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Checkout code
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2️⃣ Setup Python
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # 3️⃣ Install Python dependencies
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements/ci.txt
 
-
-      # 4️⃣ Run unit tests
       - name: Run unit tests
-        run: |
-          pytest tests -v
+        run: pytest tests -v
 
-      # 5️⃣ Run model evaluation (quality gates)
       - name: Run model evaluation
+        run: python -m training.run_evaluation
+
+
+# ---------------------------------------------------
+# TRAINING SMOKE TEST
+# (Prevents broken training pipelines)
+# ---------------------------------------------------
+
+  training-smoke:
+    name: Training Smoke Test
+    runs-on: ubuntu-latest
+    needs: fast-ci
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
         run: |
-          python -m training.run_evaluation
+          python -m pip install --upgrade pip
+          pip install -r requirements/training.txt
+
+      # 🔥 Critical:
+      # We DO NOT want full heavy training in CI.
+      # Instead run orchestrator with fast-fail behavior.
+
+      - name: Run Training Orchestrator
+        run: |
+          python -m training.pipelines.train_pipeline
+
+
+# ---------------------------------------------------
+# DOCKER BUILD VALIDATION
+# Guarantees deployability
+# ---------------------------------------------------
+
+  docker-build:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+    needs: training-smoke
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: Build inference image
+        run: |
+          docker build -f docker/inference.Dockerfile -t marketsentinel-inference .
+
+      - name: Build training image
+        run: |
+          docker build -f docker/training.Dockerfile -t marketsentinel-training .
