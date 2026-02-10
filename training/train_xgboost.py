@@ -16,6 +16,7 @@ from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import MODEL_FEATURES
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
+from core.monitoring.drift_detector import DriftDetector
 
 from training.backtesting.walk_forward import WalkForwardValidator
 
@@ -36,10 +37,16 @@ MIN_CALMAR = 0.30
 
 SEED = 42
 
-
-# ===================================================
-# REPRODUCIBILITY
-# ===================================================
+# Institutional basket (prevents single-asset bias)
+TRAINING_TICKERS = [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "TSLA"
+]
 
 np.random.seed(SEED)
 
@@ -64,7 +71,7 @@ def save_model_atomic(model, path):
 
 
 # ===================================================
-# DATA
+# DATA LOADING (INSTITUTIONAL)
 # ===================================================
 
 def load_training_data():
@@ -75,34 +82,63 @@ def load_training_data():
 
     end_date = datetime.date.today().isoformat()
 
-    price_df = fetcher.fetch(
-        ticker="AAPL",
-        start_date="2018-01-01",
-        end_date=end_date
-    )
+    datasets = []
 
-    news_df = news_fetcher.fetch("Apple stock", max_items=100)
+    for ticker in TRAINING_TICKERS:
 
-    scored_df = sentiment_analyzer.analyze_dataframe(news_df)
-    sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
-
-    dataset = FeatureEngineer.build_feature_pipeline(
-        price_df,
-        sentiment_df
-    )
-
-    if dataset.empty:
-        raise ValueError("Feature pipeline returned empty dataset")
-
-    # 🔥 schema guard
-    missing = [f for f in MODEL_FEATURES if f not in dataset.columns]
-
-    if missing:
-        raise RuntimeError(
-            f"Training aborted. Missing features: {missing}"
+        price_df = fetcher.fetch(
+            ticker=ticker,
+            start_date="2018-01-01",
+            end_date=end_date
         )
 
-    return dataset, end_date
+        news_df = news_fetcher.fetch(
+            f"{ticker} stock",
+            max_items=100
+        )
+
+        scored_df = sentiment_analyzer.analyze_dataframe(news_df)
+        sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
+
+        dataset = FeatureEngineer.build_feature_pipeline(
+            price_df,
+            sentiment_df,
+            training=True   # 🔥 CRITICAL FIX — prevents leakage
+        )
+
+        dataset["ticker"] = ticker
+
+        datasets.append(dataset)
+
+    df = pd.concat(datasets, ignore_index=True)
+
+    # HARD SORT — time safety
+    df = df.sort_values("date").reset_index(drop=True)
+
+    if df.empty:
+        raise RuntimeError("Training dataset is empty.")
+
+    # Regime diversity guard
+    years = pd.to_datetime(df["date"]).dt.year.nunique()
+
+    if years < 4:
+        raise RuntimeError(
+            "Dataset lacks regime diversity. "
+            "Minimum 4 years required."
+        )
+
+    # Class balance guard
+    up_ratio = df["target"].mean()
+
+    if not 0.35 < up_ratio < 0.65:
+        raise RuntimeError(
+            f"Target imbalance detected: {round(up_ratio,3)}"
+        )
+
+    print(f"\nTraining rows: {len(df)}")
+    print(f"Positive class ratio: {round(up_ratio,3)}")
+
+    return df, end_date
 
 
 # ===================================================
@@ -137,7 +173,7 @@ def build_feature_baselines(df):
 
 def train_on_window(df):
 
-    X = df[MODEL_FEATURES]
+    X = df[MODEL_FEATURES].copy()
     y = df["target"]
 
     model = XGBClassifier(
@@ -147,7 +183,10 @@ def train_on_window(df):
         subsample=0.8,
         colsample_bytree=0.8,
         eval_metric="logloss",
-        random_state=SEED
+        random_state=SEED,
+        tree_method="hist",
+        max_bin=256,
+        n_jobs=1
     )
 
     model.fit(X, y)
@@ -173,8 +212,10 @@ def generate_signals(model, df):
 
 def train_full_model(df):
 
-    X = df[MODEL_FEATURES]
+    X = df[MODEL_FEATURES].copy()
     y = df["target"]
+
+    split = int(len(df) * 0.8)
 
     model = XGBClassifier(
         n_estimators=1000,
@@ -184,10 +225,11 @@ def train_full_model(df):
         colsample_bytree=0.8,
         eval_metric="logloss",
         early_stopping_rounds=50,
-        random_state=SEED
+        random_state=SEED,
+        tree_method="hist",
+        max_bin=256,
+        n_jobs=1
     )
-
-    split = int(len(df) * 0.8)
 
     model.fit(
         X[:split],
@@ -214,13 +256,16 @@ def train_full_model(df):
 
 if __name__ == "__main__":
 
-    print("\n🚀 Starting Institutional XGBoost Training...\n")
+    print("\nStarting Institutional XGBoost Training...\n")
 
     df, end_date = load_training_data()
 
     dataset_hash = MetadataManager.fingerprint_dataset(df)
 
     feature_baselines = build_feature_baselines(df)
+
+    # 🔥 CREATE DRIFT BASELINE
+    DriftDetector().create_baseline(df[MODEL_FEATURES])
 
     # ---------------------------------------------------
     # WALK-FORWARD
@@ -236,7 +281,6 @@ if __name__ == "__main__":
     if not strategy_metrics:
         raise RuntimeError("Walk-forward returned empty metrics")
 
-    # 🔥 Safe Calmar
     drawdown = abs(strategy_metrics["max_drawdown"]) or 1e-6
 
     calmar = (
@@ -265,7 +309,7 @@ if __name__ == "__main__":
     if calmar < MIN_CALMAR:
         raise RuntimeError("Model rejected: Calmar too low")
 
-    print("\n✅ Strategy passed institutional gates.\n")
+    print("\nStrategy passed institutional gates.\n")
 
     # ---------------------------------------------------
     # TRAIN FINAL
@@ -284,13 +328,15 @@ if __name__ == "__main__":
         dataset_hash=dataset_hash,
     )
 
-    # 🔥 Governance upgrades
     metadata["feature_baselines"] = feature_baselines
     metadata["training_rows"] = len(df)
     metadata["feature_count"] = len(MODEL_FEATURES)
     metadata["schema_version"] = "3.0"
 
-    MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
+    MetadataManager.save_metadata(
+        metadata,
+        TEMP_METADATA_PATH
+    )
 
     version_dir = ModelRegistry.register_model(
         MODEL_DIR,
@@ -298,5 +344,5 @@ if __name__ == "__main__":
         TEMP_METADATA_PATH
     )
 
-    print("\n✅ XGBoost model registered.")
-    print(f"📦 Version directory: {version_dir}")
+    print("\nXGBoost model registered.")
+    print(f"Version directory: {version_dir}")
