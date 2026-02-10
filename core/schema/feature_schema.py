@@ -3,16 +3,8 @@ import pandas as pd
 import hashlib
 
 
-# =====================================================
-# SCHEMA VERSION
-# =====================================================
+SCHEMA_VERSION = "2.2"
 
-SCHEMA_VERSION = "2.1"   # bump after hardening
-
-
-# =====================================================
-# IMMUTABLE FEATURE CONTRACT
-# =====================================================
 
 MODEL_FEATURES: Tuple[str, ...] = (
     "return",
@@ -27,102 +19,74 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "sentiment_lag1"
 )
 
-NUMERIC_FEATURES = set(MODEL_FEATURES)
+NUMERIC_FEATURES = frozenset(MODEL_FEATURES)
 
-MAX_NAN_RATIO = 0.05  # institutional safety threshold
+MAX_NAN_RATIO_PER_FEATURE = 0.05
 
-
-# =====================================================
-# VALIDATION
-# =====================================================
 
 def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
     Institutional schema authority.
 
-    Enforces:
+    Validates ONLY the model feature subset.
 
-    - no duplicate columns
-    - strict feature set
-    - dtype normalization
-    - NaN safety
+    Guarantees:
+    - strict feature presence
+    - dtype enforcement
+    - NaN safety (per feature)
     - deterministic ordering
     """
 
     if df.empty:
         raise RuntimeError("Feature dataset is empty.")
 
-    # -------------------------------------------------
-    # Duplicate column guard
-    # -------------------------------------------------
-
     if df.columns.duplicated().any():
-        raise RuntimeError("Duplicate feature columns detected.")
+        raise RuntimeError("Duplicate columns detected.")
 
     incoming = set(df.columns)
 
     missing = set(MODEL_FEATURES) - incoming
-    extra = incoming - set(MODEL_FEATURES)
 
     if missing:
         raise RuntimeError(
             f"Missing required features: {sorted(missing)}"
         )
 
-    if extra:
-        raise RuntimeError(
-            f"Unexpected features detected: {sorted(extra)}"
-        )
+    # IMPORTANT:
+    # Ignore extra columns — they belong to the dataset, not schema.
 
-    # -------------------------------------------------
-    # Enforce order (IN-PLACE)
-    # -------------------------------------------------
+    feature_df = df.loc[:, MODEL_FEATURES].copy()
 
-    df = df.loc[:, MODEL_FEATURES]
-
-    # -------------------------------------------------
-    # dtype normalization
-    # -------------------------------------------------
-
+    # dtype enforcement
     for col in MODEL_FEATURES:
 
-        if not pd.api.types.is_numeric_dtype(df[col]):
+        if not pd.api.types.is_numeric_dtype(feature_df[col]):
             raise RuntimeError(
                 f"Non-numeric feature detected: {col}"
             )
 
-        df[col] = df[col].astype("float64")
+        feature_df[col] = feature_df[col].astype("float64")
 
-    # -------------------------------------------------
-    # NaN safety
-    # -------------------------------------------------
+    # per-feature NaN safety
+    nan_ratios = feature_df.isna().mean()
 
-    nan_ratio = df.isna().mean().mean()
+    unsafe = nan_ratios[nan_ratios > MAX_NAN_RATIO_PER_FEATURE]
 
-    if nan_ratio > MAX_NAN_RATIO:
+    if not unsafe.empty:
         raise RuntimeError(
-            f"Feature NaN ratio unsafe: {nan_ratio:.3f}"
+            f"Unsafe NaN ratio detected: {unsafe.to_dict()}"
         )
 
-    return df
+    return feature_df
 
-
-# =====================================================
-# SCHEMA SIGNATURE
-# =====================================================
 
 def get_schema_signature() -> str:
     """
     Deterministic schema fingerprint.
-
-    Protects against:
-    - feature drift
-    - dtype drift
-    - ordering skew
     """
 
     raw = "|".join(MODEL_FEATURES)
-    raw += f":dtype=float64"
+    raw += ":dtype=float64"
     raw += f":count={len(MODEL_FEATURES)}"
     raw += f":v={SCHEMA_VERSION}"
 
