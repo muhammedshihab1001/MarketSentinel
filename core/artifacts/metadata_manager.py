@@ -8,7 +8,7 @@ import shutil
 import platform
 import sys
 
-from core.schema.feature_schema import get_schema_signature
+from core.schema.feature_schema import get_schema_signature, SCHEMA_VERSION
 
 
 class MetadataManager:
@@ -27,7 +27,8 @@ class MetadataManager:
         "dataset_hash",
         "features",
         "metrics",
-        "schema_signature"
+        "schema_signature",
+        "schema_version"
     ]
 
     # -----------------------------------------------------
@@ -74,10 +75,14 @@ class MetadataManager:
             "features": features,
             "metrics": metrics,
 
-            # 🔥 GOVERNANCE CRITICAL
+            # GOVERNANCE CRITICAL
             "schema_signature": get_schema_signature(),
+            "schema_version": SCHEMA_VERSION,
 
-            # 🔥 AUDIT GOLD
+            # FUTURE MIGRATION SAFETY
+            "metadata_version": "1.0",
+
+            # AUDIT GOLD
             "environment": {
                 "python": sys.version,
                 "platform": platform.platform()
@@ -111,6 +116,9 @@ class MetadataManager:
 
         if not isinstance(metadata["dataset_hash"], str):
             raise RuntimeError("dataset_hash must be a string")
+
+        if not isinstance(metadata["schema_signature"], str):
+            raise RuntimeError("schema_signature must be a string")
 
     # -----------------------------------------------------
 
