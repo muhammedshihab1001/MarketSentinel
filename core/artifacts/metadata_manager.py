@@ -8,7 +8,10 @@ import shutil
 import platform
 import sys
 
-from core.schema.feature_schema import get_schema_signature, SCHEMA_VERSION
+from core.schema.feature_schema import (
+    get_schema_signature,
+    SCHEMA_VERSION
+)
 
 
 class MetadataManager:
@@ -21,6 +24,7 @@ class MetadataManager:
     """
 
     REQUIRED_METADATA_FIELDS = [
+        "metadata_type",
         "model_name",
         "created_at",
         "training_window",
@@ -58,10 +62,14 @@ class MetadataManager:
         features: list,
         training_start: str,
         training_end: str,
-        dataset_hash: str
+        dataset_hash: str,
+        metadata_type: str = "model"   # <-- FIXED
     ) -> dict:
 
         metadata = {
+
+            # 🔥 CRITICAL FOR REGISTRY
+            "metadata_type": metadata_type,
 
             "model_name": model_name,
             "created_at": datetime.datetime.utcnow().isoformat(),
@@ -106,6 +114,11 @@ class MetadataManager:
         if missing:
             raise RuntimeError(
                 f"Metadata missing required fields: {missing}"
+            )
+
+        if metadata["metadata_type"] != "model":
+            raise RuntimeError(
+                "Only model metadata allowed for registry."
             )
 
         if not isinstance(metadata["features"], list):
