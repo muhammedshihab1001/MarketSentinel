@@ -2,6 +2,7 @@ import os
 import datetime
 import tempfile
 import shutil
+import numpy as np
 
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
@@ -11,14 +12,43 @@ from models.prophet_model import train_prophet
 from prophet.serialize import model_to_json
 
 
-# ---------------------------------------------------
-# CONFIG
-# ---------------------------------------------------
-
 MODEL_DIR = "artifacts/prophet"
 
 TEMP_MODEL_PATH = f"{MODEL_DIR}/prophet_trend.json"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
+
+
+MIN_DATA_ROWS = 500
+MAX_FORECAST_STD = 0.25
+MIN_FORECAST_STD = 0.0005
+
+
+# ---------------------------------------------------
+# VALIDATION
+# ---------------------------------------------------
+
+def validate_forecast(model):
+
+    future = model.make_future_dataframe(periods=30)
+
+    forecast = model.predict(future)
+
+    preds = forecast["yhat"].tail(30).values
+
+    std = float(np.std(preds))
+
+    slope = float(preds[-1] - preds[0])
+
+    if std < MIN_FORECAST_STD:
+        raise RuntimeError("Prophet rejected: forecast collapsed (near zero variance)")
+
+    if std > MAX_FORECAST_STD * abs(preds.mean()):
+        raise RuntimeError("Prophet rejected: forecast too volatile")
+
+    return {
+        "forecast_std": std,
+        "trend_slope_30d": slope
+    }
 
 
 # ---------------------------------------------------
@@ -26,8 +56,6 @@ TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 # ---------------------------------------------------
 
 def train():
-
-    print("\n🚀 Starting Prophet training...\n")
 
     end_date = datetime.date.today().isoformat()
 
@@ -42,19 +70,20 @@ def train():
     if df.empty:
         raise ValueError("No price data fetched for Prophet training")
 
+    if len(df) < MIN_DATA_ROWS:
+        raise RuntimeError("Prophet rejected: insufficient training history")
+
     model = train_prophet(df)
 
-    # ---------------------------------------------------
-    # DATASET FINGERPRINT
-    # ---------------------------------------------------
+    governance_metrics = validate_forecast(model)
 
     dataset_hash = MetadataManager.fingerprint_dataset(df)
 
-    # 🔥 Institutional metrics
     metrics = {
         "training_rows": len(df),
         "last_price": float(df["close"].iloc[-1]),
-        "data_span_days": (df["date"].max() - df["date"].min()).days
+        "data_span_days": (df["date"].max() - df["date"].min()).days,
+        **governance_metrics
     }
 
     metadata = MetadataManager.create_metadata(
@@ -66,6 +95,8 @@ def train():
         dataset_hash=dataset_hash
     )
 
+    metadata["schema_version"] = "3.0"
+
     return model, metadata
 
 
@@ -74,11 +105,6 @@ def train():
 # ---------------------------------------------------
 
 def save_model_atomic(model, path):
-    """
-    Writes Prophet safely.
-
-    Prevents corrupted artifacts if training crashes.
-    """
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -104,7 +130,6 @@ if __name__ == "__main__":
 
     model, metadata = train()
 
-    # Safe write
     save_model_atomic(model, TEMP_MODEL_PATH)
 
     MetadataManager.save_metadata(
@@ -112,15 +137,11 @@ if __name__ == "__main__":
         TEMP_METADATA_PATH
     )
 
-    # ---------------------------------------------------
-    # REGISTER MODEL
-    # ---------------------------------------------------
-
     version_dir = ModelRegistry.register_model(
         MODEL_DIR,
         TEMP_MODEL_PATH,
         TEMP_METADATA_PATH
     )
 
-    print("✅ Prophet model registered successfully.")
-    print(f"📦 Version directory: {version_dir}")
+    print("Prophet model registered successfully.")
+    print(f"Version directory: {version_dir}")
