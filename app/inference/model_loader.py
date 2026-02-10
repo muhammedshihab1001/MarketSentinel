@@ -1,7 +1,9 @@
 import os
+import json
 import joblib
 import tensorflow as tf
 import logging
+import threading
 
 from models.lstm_model import forecast_lstm
 from models.prophet_model import forecast_prophet
@@ -16,22 +18,24 @@ class ModelLoader:
     Institutional Registry-Aware Model Loader.
 
     Guarantees:
-    ✅ Loads ONLY versioned artifacts
-    ✅ Exposes model version metrics
-    ✅ Supports warmup loading
-    ✅ Fail-fast registry validation
+    ✅ Pointer-based resolution (cross-platform)
+    ✅ Thread-safe lazy loading
+    ✅ Metadata validation
+    ✅ Cold-start prevention
     ✅ Singleton per worker
+    ✅ TensorFlow memory safety
     """
 
     _instance = None
+    _lock = threading.Lock()
+
+    POINTER_FILE = "LATEST.json"
 
     # ---------------------------------------------------
 
     def __new__(cls, *args, **kwargs):
-
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-
         return cls._instance
 
     # ---------------------------------------------------
@@ -41,7 +45,9 @@ class ModelLoader:
         if hasattr(self, "_initialized"):
             return
 
-        # TensorFlow CPU control
+        # 🔥 TensorFlow CPU Safety
+        tf.config.set_visible_devices([], "GPU")
+
         tf.config.threading.set_intra_op_parallelism_threads(1)
         tf.config.threading.set_inter_op_parallelism_threads(1)
 
@@ -55,30 +61,63 @@ class ModelLoader:
         self._initialized = True
 
     # ---------------------------------------------------
-    # INTERNAL — Resolve Latest Version
+    # POINTER RESOLUTION
     # ---------------------------------------------------
 
     def _resolve_latest_dir(self, model_dir: str):
 
-        latest_dir = os.path.join(model_dir, "latest")
+        pointer = os.path.join(model_dir, self.POINTER_FILE)
 
-        if not os.path.exists(latest_dir):
+        if not os.path.exists(pointer):
             raise RuntimeError(
-                f"No 'latest' model found in {model_dir}. "
-                f"Did training register the model?"
+                f"No registry pointer found in {model_dir}. "
+                f"Did training run?"
             )
 
-        # resolve symlink → actual version
-        version_dir = os.path.realpath(latest_dir)
-        version = os.path.basename(version_dir)
+        with open(pointer) as f:
+            version = json.load(f)["latest"]
+
+        version_dir = os.path.join(model_dir, version)
+
+        if not os.path.exists(version_dir):
+            raise RuntimeError(
+                f"Pointer references missing version: {version}"
+            )
 
         return version_dir, version
+
+    # ---------------------------------------------------
+    # METADATA VALIDATION
+    # ---------------------------------------------------
+
+    def _validate_metadata(self, version_dir):
+
+        meta_path = os.path.join(version_dir, "metadata.json")
+
+        if not os.path.exists(meta_path):
+            raise RuntimeError("Missing metadata.json")
+
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        schema = meta.get("schema_version")
+
+        if schema is None:
+            raise RuntimeError("Metadata missing schema_version")
+
+        # future-proof gate
+        if float(schema.split(".")[0]) < 2:
+            raise RuntimeError(
+                "Outdated model schema. Retrain required."
+            )
 
     # ---------------------------------------------------
 
     def _latest_path(self, model_dir: str, filename: str):
 
         version_dir, version = self._resolve_latest_dir(model_dir)
+
+        self._validate_metadata(version_dir)
 
         path = os.path.join(version_dir, filename)
 
@@ -88,29 +127,46 @@ class ModelLoader:
         return path, version
 
     # ---------------------------------------------------
+    # THREAD SAFE LOAD WRAPPER
+    # ---------------------------------------------------
+
+    def _load_once(self, attr_name, loader_func):
+
+        if getattr(self, attr_name) is None:
+
+            with self._lock:
+
+                if getattr(self, attr_name) is None:
+                    setattr(self, attr_name, loader_func())
+
+        return getattr(self, attr_name)
+
+    # ---------------------------------------------------
     # XGBOOST
     # ---------------------------------------------------
 
     @property
     def xgb(self):
 
-        if self._xgb is None:
+        def load():
 
             path, version = self._latest_path(
                 "artifacts/xgboost",
                 "model.pkl"
             )
 
-            logger.info(f"Loading XGBoost model from {path}")
+            logger.info(f"Loading XGBoost {version}")
 
-            self._xgb = joblib.load(path)
+            model = joblib.load(path)
 
             MODEL_VERSION.labels(
                 model="xgboost",
                 version=version
             ).set(1)
 
-        return self._xgb
+            return model
+
+        return self._load_once("_xgb", load)
 
     # ---------------------------------------------------
     # LSTM
@@ -119,16 +175,16 @@ class ModelLoader:
     @property
     def lstm(self):
 
-        if self._lstm is None:
+        def load():
 
             path, version = self._latest_path(
                 "artifacts/lstm",
                 "model.keras"
             )
 
-            logger.info(f"Loading LSTM model from {path}")
+            logger.info(f"Loading LSTM {version}")
 
-            self._lstm = tf.keras.models.load_model(
+            model = tf.keras.models.load_model(
                 path,
                 compile=False
             )
@@ -138,14 +194,16 @@ class ModelLoader:
                 version=version
             ).set(1)
 
-        return self._lstm
+            return model
+
+        return self._load_once("_lstm", load)
 
     # ---------------------------------------------------
 
     @property
     def scaler(self):
 
-        if self._scaler is None:
+        def load():
 
             path, _ = self._latest_path(
                 "artifacts/lstm",
@@ -154,9 +212,9 @@ class ModelLoader:
 
             logger.info("Loading LSTM scaler")
 
-            self._scaler = joblib.load(path)
+            return joblib.load(path)
 
-        return self._scaler
+        return self._load_once("_scaler", load)
 
     # ---------------------------------------------------
     # PROPHET
@@ -165,35 +223,31 @@ class ModelLoader:
     @property
     def prophet(self):
 
-        if self._prophet is None:
+        def load():
 
             path, version = self._latest_path(
                 "artifacts/prophet",
                 "prophet_trend.pkl"
             )
 
-            logger.info(f"Loading Prophet model from {path}")
+            logger.info(f"Loading Prophet {version}")
 
-            self._prophet = joblib.load(path)
+            model = joblib.load(path)
 
             MODEL_VERSION.labels(
                 model="prophet",
                 version=version
             ).set(1)
 
-        return self._prophet
+            return model
+
+        return self._load_once("_prophet", load)
 
     # ---------------------------------------------------
-    # 🔥 WARMUP (VERY IMPORTANT)
+    # 🔥 WARMUP
     # ---------------------------------------------------
 
     def warmup(self):
-        """
-        Forces model loading at startup.
-
-        Prevents cold-start latency.
-        Ensures registry validity.
-        """
 
         logger.info("🔥 Warming up models...")
 
@@ -202,7 +256,7 @@ class ModelLoader:
         _ = self.scaler
         _ = self.prophet
 
-        logger.info("✅ All models loaded successfully.")
+        logger.info("✅ Models ready for inference.")
 
     # ---------------------------------------------------
     # Forecast Wrappers
@@ -215,8 +269,6 @@ class ModelLoader:
             self.scaler,
             recent_prices
         )
-
-    # ---------------------------------------------------
 
     def prophet_forecast(self):
 
