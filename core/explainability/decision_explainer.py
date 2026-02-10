@@ -1,7 +1,23 @@
+import math
+
+
 class DecisionExplainer:
     """
-    Generates human-readable explanations for trading signals.
+    Generates bounded, deterministic explanations for signals.
+
+    Guarantees:
+    - never empty
+    - NaN safe
+    - capped verbosity
     """
+
+    MAX_REASONS = 5
+
+    @staticmethod
+    def _safe(value, fallback=0.0):
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return fallback
+        return value
 
     def explain(
         self,
@@ -12,37 +28,44 @@ class DecisionExplainer:
         rsi: float
     ):
 
+        prob_up = self._safe(prob_up, 0.5)
+        sentiment = self._safe(sentiment, 0.0)
+        volatility = self._safe(volatility, 0.0)
+        rsi = self._safe(rsi, 50)
+
         reasons = []
 
-        # Model conviction
-        if prob_up > 0.6:
-            reasons.append("Model shows strong upward probability")
+        # Direction
+        if prediction == 1:
+            reasons.append("Model favors upward movement")
+        else:
+            reasons.append("Model favors downward movement")
 
-        elif prob_up < 0.4:
-            reasons.append("Model shows strong downward probability")
+        # Conviction
+        if prob_up > 0.65:
+            reasons.append("High model conviction")
+        elif prob_up < 0.35:
+            reasons.append("Strong downside probability")
 
         # Sentiment
         if sentiment > 0.2:
-            reasons.append("Market sentiment is positive")
-
+            reasons.append("Positive market sentiment")
         elif sentiment < -0.2:
-            reasons.append("Market sentiment is negative")
+            reasons.append("Negative market sentiment")
 
         # Volatility
         if volatility > 0.04:
-            reasons.append("Market is highly volatile")
-
+            reasons.append("Elevated market volatility")
         else:
-            reasons.append("Market volatility is stable")
+            reasons.append("Stable volatility regime")
 
-        # RSI context
+        # RSI
         if rsi > 70:
-            reasons.append("Asset is overbought")
-
+            reasons.append("Overbought conditions")
         elif rsi < 30:
-            reasons.append("Asset is oversold")
+            reasons.append("Oversold conditions")
 
-        # Final explanation string
-        explanation = " | ".join(reasons)
+        if not reasons:
+            reasons.append("Signal derived from composite indicators")
 
-        return explanation
+        return " | ".join(reasons[:self.MAX_REASONS])
