@@ -3,6 +3,17 @@ version: "3.9"
 services:
 
   # -------------------------------------------------
+  # REDIS (Prediction Cache)
+  # -------------------------------------------------
+
+  redis:
+    image: redis:7-alpine
+    container_name: marketsentinel-redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  # -------------------------------------------------
   # INFERENCE API
   # -------------------------------------------------
 
@@ -17,7 +28,11 @@ services:
     volumes:
       - ./artifacts:/app/artifacts
 
+    depends_on:
+      - redis
+
     restart: always
+
   # -------------------------------------------------
   # PROMETHEUS
   # -------------------------------------------------
