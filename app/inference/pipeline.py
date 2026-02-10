@@ -115,8 +115,6 @@ class InferencePipeline:
         start = time.time()
 
         lstm_prices = self.models.lstm_forecast(recent_prices)
-
-        # 🔥 Respect forecast_days from API
         lstm_prices = lstm_prices[:forecast_days]
 
         MODEL_INFERENCE_COUNT.labels(model="lstm").inc()
@@ -155,9 +153,25 @@ class InferencePipeline:
         CONFIDENCE_SCORE.set(float(confidence))
         FORECAST_HORIZON.set(len(lstm_prices))
 
-        # -----------------------------------
-        # BUILD FORECAST CURVE
-        # -----------------------------------
+        # ==========================================
+        # 🔥 BUILD HISTORICAL + FORECAST TIMELINE
+        # ==========================================
+
+        timeline = []
+
+        # ---------- Historical ----------
+        hist_window = 120  # last ~6 months
+
+        hist_df = price_df.tail(hist_window)
+
+        for _, row in hist_df.iterrows():
+            timeline.append({
+                "date": str(pd.to_datetime(row["date"]).date()),
+                "price": float(row["close"]),
+                "type": "historical"
+            })
+
+        # ---------- Forecast ----------
 
         last_date = pd.to_datetime(price_df["date"].iloc[-1])
 
@@ -166,9 +180,9 @@ class InferencePipeline:
             periods=len(lstm_prices)
         )
 
-        forecast_series = []
-
         last_close = price_df["close"].iloc[-1]
+
+        forecast_series = []
 
         for date, price in zip(future_dates, lstm_prices):
 
@@ -184,12 +198,16 @@ class InferencePipeline:
                 prophet_trend=prophet_out["trend"]
             )
 
-            forecast_series.append({
+            point = {
                 "date": str(date.date()),
-                "expected_price": float(price),
-                "expected_return_pct": round(step_return * 100, 2),
-                "signal": step_signal
-            })
+                "price": float(price),
+                "type": "forecast",
+                "signal": step_signal,
+                "expected_return_pct": round(step_return * 100, 2)
+            }
+
+            timeline.append(point)
+            forecast_series.append(point)
 
         # -----------------------------------
         # SCENARIOS
@@ -224,7 +242,8 @@ class InferencePipeline:
             "confidence": float(confidence),
             "probability_up": float(prob_up),
 
-            "forecast": forecast_series,
+            # ⭐ FRONTEND GOLD
+            "timeline": timeline,
 
             "forecast_start": str(future_dates[0].date()),
             "forecast_end": str(future_dates[-1].date()),
