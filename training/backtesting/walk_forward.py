@@ -9,12 +9,12 @@ class WalkForwardValidator:
     """
     Institutional Walk-Forward Validator.
 
-    Upgrades:
-    ✅ regime-aware evaluation
-    ✅ equity curve stitching
-    ✅ drawdown tracking
-    ✅ stability metrics
-    ✅ promotion-grade outputs
+    Guarantees:
+    - strict time ordering
+    - regime-aware evaluation
+    - capital-safe return compounding
+    - stability metrics
+    - promotion-grade statistics
     """
 
     def __init__(
@@ -36,7 +36,13 @@ class WalkForwardValidator:
 
     def run(self, df: pd.DataFrame):
 
-        # 🔥 Detect regimes ONCE (important for speed)
+        if "date" not in df.columns:
+            raise RuntimeError("WalkForward requires 'date' column.")
+
+        # 🔥 HARD TIME SORT (CRITICAL)
+        df = df.sort_values("date").reset_index(drop=True)
+
+        # Detect regimes once
         df = self.regime_detector.detect(df)
 
         results = []
@@ -49,7 +55,7 @@ class WalkForwardValidator:
         }
 
         start = self.window_size
-        capital = 10_000
+        equity = 1.0  # normalized capital
 
         while start < len(df):
 
@@ -75,12 +81,14 @@ class WalkForwardValidator:
             metrics = self.engine.run(
                 prices,
                 signals,
-                initial_cash=capital
+                initial_cash=10_000
             )
 
-            capital = metrics["final_portfolio"]
+            # 🔥 RETURN COMPOUNDING (NOT RAW CAPITAL)
+            window_return = metrics["strategy_return"]
+            equity *= (1 + window_return)
 
-            equity_curve.append(capital)
+            equity_curve.append(equity)
             results.append(metrics)
 
             # -----------------------------
@@ -98,6 +106,11 @@ class WalkForwardValidator:
 
             start += self.step_size
 
+        if len(results) < 8:
+            raise RuntimeError(
+                "Walk-forward insufficient windows for statistical confidence."
+            )
+
         return self.aggregate_results(
             results,
             equity_curve,
@@ -113,9 +126,6 @@ class WalkForwardValidator:
         regime_buckets
     ):
 
-        if not results:
-            raise ValueError("Walk-forward produced no windows")
-
         df = pd.DataFrame(results)
         curve = np.array(equity_curve)
 
@@ -128,10 +138,22 @@ class WalkForwardValidator:
         max_drawdown = float(drawdowns.min())
 
         # ------------------------------------------------
-        # RETURN STABILITY
+        # STABILITY
         # ------------------------------------------------
 
         return_std = float(df["strategy_return"].std())
+        sharpe_std = float(df["sharpe_ratio"].std())
+
+        # ------------------------------------------------
+        # PROFIT FACTOR
+        # ------------------------------------------------
+
+        gains = df[df["strategy_return"] > 0]["strategy_return"].sum()
+        losses = abs(
+            df[df["strategy_return"] < 0]["strategy_return"].sum()
+        ) or 1e-6
+
+        profit_factor = float(gains / losses)
 
         # ------------------------------------------------
         # REGIME METRICS
@@ -159,15 +181,17 @@ class WalkForwardValidator:
             "avg_buy_hold_return": float(df["buy_hold_return"].mean()),
             "avg_alpha": float(df["alpha"].mean()),
             "avg_sharpe": float(df["sharpe_ratio"].mean()),
+            "sharpe_std": sharpe_std,
+            "profit_factor": profit_factor,
             "avg_trades": float(df["trade_count"].mean()),
 
-            # 🔥 Institutional Risk Metrics
+            # Risk
             "max_drawdown": max_drawdown,
             "return_volatility": return_std,
             "final_equity": float(curve[-1]),
             "equity_curve": curve.tolist(),
 
-            # 🔥 NEW — REGIME INTELLIGENCE
+            # Regime intelligence
             "regime_performance": regime_summary,
 
             "num_windows": len(df)
