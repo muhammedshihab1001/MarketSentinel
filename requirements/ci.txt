@@ -1,18 +1,4 @@
 -r base.txt
 
-fastapi
-uvicorn
-
-scikit-learn
-xgboost
-joblib
-
-pytest
-httpx
-
-prometheus-client
-tensorflow
-prophet
-torch
-transformers
-vaderSentiment
+pytest==8.3.2
+httpx==0.27.0

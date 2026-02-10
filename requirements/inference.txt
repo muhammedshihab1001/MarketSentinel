@@ -1,16 +1,8 @@
 -r base.txt
 
-fastapi
-uvicorn
-
-scikit-learn
-xgboost
-tensorflow
-prophet
-torch
-transformers
-vaderSentiment
-
-prometheus-client
-yfinance
-feedparser
+########################################
+# API
+########################################
+fastapi==0.112.2
+uvicorn[standard]==0.30.6
+pydantic==2.8.2
