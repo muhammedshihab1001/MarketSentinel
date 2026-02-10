@@ -35,3 +35,4 @@ yfinance==0.2.43
 ########################################
 prometheus-client==0.20.0
 pyarrow
+logging
