@@ -10,6 +10,7 @@ from core.features.feature_store import FeatureStore
 from core.signals.signal_engine import DecisionEngine
 from core.scenario.scenario_engine import ScenarioEngine
 from core.explainability.decision_explainer import DecisionExplainer
+from core.monitoring.drift_detector import DriftDetector
 
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
@@ -21,16 +22,38 @@ from app.monitoring.metrics import (
     FORECAST_HORIZON,
     CONFIDENCE_SCORE,
     MISSING_FEATURE_RATIO,
-    FEATURE_MEAN,
-    FEATURE_STD,
-    FEATURE_MAX,
-    FEATURE_MIN,
     PIPELINE_FAILURES,
     PREDICTION_CLASS_PROBABILITY
 )
 
 
+class CircuitBreaker:
+
+    def __init__(self, threshold=5, cooldown=60):
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self.failures = 0
+        self.last_failure = None
+
+    def allow(self):
+
+        if self.failures < self.threshold:
+            return True
+
+        if (time.time() - self.last_failure) > self.cooldown:
+            self.failures = 0
+            return True
+
+        return False
+
+    def record_failure(self):
+        self.failures += 1
+        self.last_failure = time.time()
+
+
 class InferencePipeline:
+
+    LATENCY_GUARD_SECONDS = 5.0
 
     def __init__(self):
 
@@ -46,67 +69,21 @@ class InferencePipeline:
 
         self.cache = RedisCache()
 
-        self.feature_baselines = self._load_feature_baselines()
+        # production safety
+        self.drift_detector = DriftDetector()
+        self.breaker = CircuitBreaker()
+
+        self._validate_models_loaded()
 
     # ---------------------------------------------------
 
-    def _load_feature_baselines(self):
+    def _validate_models_loaded(self):
 
-        try:
+        if self.models.xgb is None:
+            raise RuntimeError("XGBoost model not loaded.")
 
-            latest_dir, _ = self.models._resolve_latest_dir(
-                "artifacts/xgboost"
-            )
-
-            metadata_path = f"{latest_dir}/metadata.json"
-
-            import json
-            with open(metadata_path) as f:
-                metadata = json.load(f)
-
-            return metadata.get("feature_baselines", {})
-
-        except Exception:
-            return {}
-
-    # ---------------------------------------------------
-
-    def _detect_feature_drift(self, dataset):
-
-        if not self.feature_baselines:
-            return
-
-        numeric_cols = dataset.select_dtypes(include="number").columns
-
-        for col in numeric_cols:
-
-            if col not in self.feature_baselines:
-                continue
-
-            baseline = self.feature_baselines[col]
-
-            live_series = dataset[col].dropna()
-
-            if len(live_series) == 0:
-                continue
-
-            live_mean = float(live_series.mean())
-            live_std = float(live_series.std())
-            live_max = float(live_series.max())
-            live_min = float(live_series.min())
-
-            FEATURE_MEAN.labels(feature=col).set(live_mean)
-            FEATURE_STD.labels(feature=col).set(live_std)
-            FEATURE_MAX.labels(feature=col).set(live_max)
-            FEATURE_MIN.labels(feature=col).set(live_min)
-
-            baseline_mean = baseline["mean"]
-            baseline_std = baseline["std"] or 1e-6
-
-            z_score = abs(live_mean - baseline_mean) / baseline_std
-
-            if z_score > 3:
-                PIPELINE_FAILURES.labels(stage="feature_drift").inc()
+        if not hasattr(self.models.xgb, "predict_proba"):
+            raise RuntimeError("Invalid XGBoost artifact.")
 
     # ---------------------------------------------------
 
@@ -127,6 +104,7 @@ class InferencePipeline:
 
             PIPELINE_FAILURES.labels(stage="sentiment").inc()
 
+            # controlled fallback → neutral sentiment
             return pd.DataFrame({
                 "date": [],
                 "avg_sentiment": [],
@@ -137,9 +115,6 @@ class InferencePipeline:
     # ---------------------------------------------------
 
     def _extract_features(self, latest_row):
-        """
-        Prevent silent schema mismatch.
-        """
 
         required = self.models.xgb.feature_names_in_
 
@@ -154,6 +129,18 @@ class InferencePipeline:
 
     # ---------------------------------------------------
 
+    def _guard_latency(self, start, model):
+
+        elapsed = time.time() - start
+
+        if elapsed > self.LATENCY_GUARD_SECONDS:
+            PIPELINE_FAILURES.labels(stage=f"{model}_latency").inc()
+            raise RuntimeError(f"{model} exceeded latency guard.")
+
+        return elapsed
+
+    # ---------------------------------------------------
+
     def run(
         self,
         ticker="AAPL",
@@ -161,6 +148,10 @@ class InferencePipeline:
         end_date=None,
         forecast_days=30
     ):
+
+        if not self.breaker.allow():
+            PIPELINE_FAILURES.labels(stage="circuit_open").inc()
+            raise RuntimeError("Inference circuit breaker open.")
 
         try:
 
@@ -192,9 +183,7 @@ class InferencePipeline:
                 if cached:
                     return cached
 
-                # -----------------------------------
-                # DATA
-                # -----------------------------------
+                # ---------------- DATA ----------------
 
                 price_df = self.market_data.get_price_data(
                     ticker=ticker,
@@ -211,79 +200,87 @@ class InferencePipeline:
                 )
 
                 if dataset.empty:
-                    raise ValueError("Feature pipeline empty")
+                    raise RuntimeError("Feature pipeline returned empty dataset.")
 
                 missing_ratio = dataset.isnull().mean().mean()
                 MISSING_FEATURE_RATIO.set(float(missing_ratio))
 
-                self._detect_feature_drift(dataset)
+                # centralized drift system
+                drift = self.drift_detector.detect(dataset)
+
+                if drift["drift_detected"]:
+                    PIPELINE_FAILURES.labels(stage="drift_detected").inc()
 
                 latest = dataset.iloc[-1]
-
                 features = self._extract_features(latest)
 
-                # -----------------------------------
-                # XGBOOST
-                # -----------------------------------
+                # ---------------- XGBOOST ----------------
 
                 t0 = time.time()
 
-                prediction = self.models.xgb.predict(features)[0]
                 prob_up = self.models.xgb.predict_proba(features)[0][1]
 
-                MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-                MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(
-                    time.time() - t0
-                )
+                latency = self._guard_latency(t0, "xgboost")
 
-                # 🔥 probability histogram
+                MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
+                MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
+
                 PREDICTION_CLASS_PROBABILITY.labels(
                     model="xgboost"
                 ).observe(prob_up)
 
                 predicted_return = prob_up - 0.5
 
-                # -----------------------------------
-                # LSTM
-                # -----------------------------------
+                # ---------------- LSTM (fallback safe) ----------------
 
-                recent_prices = price_df[["close"]].tail(60).values
+                lstm_prices = None
 
-                t0 = time.time()
+                try:
 
-                lstm_prices = self.models.lstm_forecast(recent_prices)
-                lstm_prices = lstm_prices[:forecast_days]
+                    recent_prices = price_df[["close"]].tail(60).values
 
-                MODEL_INFERENCE_COUNT.labels(model="lstm").inc()
-                MODEL_INFERENCE_LATENCY.labels(model="lstm").observe(
-                    time.time() - t0
-                )
+                    t0 = time.time()
 
-                # -----------------------------------
-                # PROPHET
-                # -----------------------------------
+                    lstm_prices = self.models.lstm_forecast(recent_prices)
+                    lstm_prices = lstm_prices[:forecast_days]
 
-                t0 = time.time()
+                    latency = self._guard_latency(t0, "lstm")
 
-                prophet_out = self.models.prophet_forecast()
+                    MODEL_INFERENCE_COUNT.labels(model="lstm").inc()
+                    MODEL_INFERENCE_LATENCY.labels(model="lstm").observe(latency)
 
-                MODEL_INFERENCE_COUNT.labels(model="prophet").inc()
-                MODEL_INFERENCE_LATENCY.labels(model="prophet").observe(
-                    time.time() - t0
-                )
+                except Exception:
+                    PIPELINE_FAILURES.labels(stage="lstm_failure").inc()
 
-                # -----------------------------------
-                # DECISION (NEW STRUCTURED OUTPUT)
-                # -----------------------------------
+                # ---------------- PROPHET (fallback safe) ----------------
+
+                prophet_trend = None
+
+                try:
+
+                    t0 = time.time()
+
+                    prophet_out = self.models.prophet_forecast()
+                    prophet_trend = prophet_out["trend"]
+
+                    latency = self._guard_latency(t0, "prophet")
+
+                    MODEL_INFERENCE_COUNT.labels(model="prophet").inc()
+                    MODEL_INFERENCE_LATENCY.labels(model="prophet").observe(latency)
+
+                except Exception:
+                    PIPELINE_FAILURES.labels(stage="prophet_failure").inc()
+
+                # ---------------- DECISION ----------------
 
                 decision = self.decision_engine.generate(
                     predicted_return=predicted_return,
-                    sentiment=latest["avg_sentiment"],
-                    rsi=latest["rsi"],
+                    sentiment=latest.get("avg_sentiment", 0),
+                    rsi=latest.get("rsi", 50),
                     prob_up=prob_up,
-                    volatility=latest["volatility"],
+                    volatility=latest.get("volatility", 0),
                     lstm_prices=lstm_prices,
-                    prophet_trend=prophet_out["trend"]
+                    prophet_trend=prophet_trend
                 )
 
                 SIGNAL_DISTRIBUTION.labels(
@@ -291,15 +288,15 @@ class InferencePipeline:
                 ).inc()
 
                 CONFIDENCE_SCORE.set(float(decision["confidence"]))
-                FORECAST_HORIZON.set(len(lstm_prices))
+                FORECAST_HORIZON.set(
+                    len(lstm_prices) if lstm_prices is not None else 0
+                )
 
                 response = {
                     "ticker": ticker,
                     "signal_today": decision["signal"],
                     "confidence": float(decision["confidence"]),
                     "probability_up": float(prob_up),
-
-                    # 🔥 BIG upgrade
                     "recommended_allocation": decision["allocation"],
                     "position_size_pct": decision["position_pct"]
                 }
@@ -308,7 +305,10 @@ class InferencePipeline:
 
                 return response
 
-        except Exception:
+        except Exception as e:
+
+            self.breaker.record_failure()
 
             PIPELINE_FAILURES.labels(stage="inference").inc()
+
             raise
