@@ -22,19 +22,14 @@ from app.monitoring.metrics import (
     CONFIDENCE_SCORE,
     MISSING_FEATURE_RATIO,
     FEATURE_MEAN,
-    FEATURE_STD
+    FEATURE_STD,
+    FEATURE_MAX,
+    FEATURE_MIN,
+    PIPELINE_FAILURES
 )
 
 
 class InferencePipeline:
-    """
-    Institutional-grade inference control plane.
-
-    Enhancements:
-    ✅ sentiment failover
-    ✅ feature drift metrics
-    ✅ canonical feature datasets
-    """
 
     def __init__(self):
 
@@ -50,12 +45,84 @@ class InferencePipeline:
 
         self.cache = RedisCache()
 
+        # 🔥 LOAD BASELINES FROM MODEL METADATA
+        self.feature_baselines = self._load_feature_baselines()
+
+    # ---------------------------------------------------
+
+    def _load_feature_baselines(self):
+        """
+        Pull baselines from registry metadata.
+        """
+
+        try:
+
+            latest_dir, _ = self.models._resolve_latest_dir(
+                "artifacts/xgboost"
+            )
+
+            metadata_path = f"{latest_dir}/metadata.json"
+
+            import json
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+
+            return metadata.get("feature_baselines", {})
+
+        except Exception:
+            return {}
+
+    # ---------------------------------------------------
+
+    def _detect_feature_drift(self, dataset):
+        """
+        Production-grade drift detection.
+        Uses z-score vs training distribution.
+        """
+
+        if not self.feature_baselines:
+            return
+
+        numeric_cols = dataset.select_dtypes(include="number").columns
+
+        for col in numeric_cols:
+
+            if col not in self.feature_baselines:
+                continue
+
+            baseline = self.feature_baselines[col]
+
+            live_series = dataset[col].dropna()
+
+            if len(live_series) == 0:
+                continue
+
+            live_mean = float(live_series.mean())
+            live_std = float(live_series.std())
+            live_max = float(live_series.max())
+            live_min = float(live_series.min())
+
+            # Emit metrics
+            FEATURE_MEAN.labels(feature=col).set(live_mean)
+            FEATURE_STD.labels(feature=col).set(live_std)
+            FEATURE_MAX.labels(feature=col).set(live_max)
+            FEATURE_MIN.labels(feature=col).set(live_min)
+
+            # -----------------------------------
+            # Z-SCORE DRIFT
+            # -----------------------------------
+
+            baseline_mean = baseline["mean"]
+            baseline_std = baseline["std"] or 1e-6
+
+            z_score = abs(live_mean - baseline_mean) / baseline_std
+
+            if z_score > 3:
+                PIPELINE_FAILURES.labels(stage="feature_drift").inc()
+
     # ---------------------------------------------------
 
     def _safe_sentiment(self, ticker):
-        """
-        Sentiment must NEVER break inference.
-        """
 
         try:
 
@@ -69,39 +136,15 @@ class InferencePipeline:
             return self.sentiment.aggregate_daily_sentiment(scored)
 
         except Exception:
-            # Institutional fallback
+
+            PIPELINE_FAILURES.labels(stage="sentiment").inc()
+
             return pd.DataFrame({
                 "date": [],
                 "avg_sentiment": [],
                 "news_count": [],
                 "sentiment_std": []
             })
-
-    # ---------------------------------------------------
-
-    def _emit_feature_metrics(self, dataset):
-        """
-        Lightweight drift visibility.
-        """
-
-        numeric_cols = dataset.select_dtypes(
-            include="number"
-        ).columns
-
-        for col in numeric_cols:
-
-            series = dataset[col].dropna()
-
-            if len(series) == 0:
-                continue
-
-            FEATURE_MEAN.labels(feature=col).set(
-                float(series.mean())
-            )
-
-            FEATURE_STD.labels(feature=col).set(
-                float(series.std())
-            )
 
     # ---------------------------------------------------
 
@@ -113,175 +156,120 @@ class InferencePipeline:
         forecast_days=30
     ):
 
-        today = datetime.date.today()
+        try:
 
-        start_date = start_date or today
-        end_date = end_date or (
-            start_date + datetime.timedelta(days=forecast_days)
-        )
+            today = datetime.date.today()
 
-        payload = {
-            "ticker": ticker,
-            "start_date": str(start_date),
-            "end_date": str(end_date),
-            "forecast_days": forecast_days
-        }
+            start_date = start_date or today
+            end_date = end_date or (
+                start_date + datetime.timedelta(days=forecast_days)
+            )
 
-        cache_key = self.cache.build_key(payload)
+            payload = {
+                "ticker": ticker,
+                "start_date": str(start_date),
+                "end_date": str(end_date),
+                "forecast_days": forecast_days
+            }
 
-        cached = self.cache.get(cache_key)
-        if cached:
-            return cached
-
-        lock = self.cache.get_lock(cache_key)
-
-        with lock:
+            cache_key = self.cache.build_key(payload)
 
             cached = self.cache.get(cache_key)
             if cached:
                 return cached
 
-            # -----------------------------------
-            # MARKET DATA (dataset-first)
-            # -----------------------------------
+            lock = self.cache.get_lock(cache_key)
 
-            price_df = self.market_data.get_price_data(
-                ticker=ticker,
-                start_date="2018-01-01",
-                end_date=today.isoformat()
-            )
+            with lock:
 
-            # -----------------------------------
-            # SENTIMENT — FAIL SAFE
-            # -----------------------------------
+                cached = self.cache.get(cache_key)
+                if cached:
+                    return cached
 
-            sentiment_df = self._safe_sentiment(ticker)
+                # -----------------------------------
+                # DATA
+                # -----------------------------------
 
-            # -----------------------------------
-            # FEATURE STORE (canonical)
-            # -----------------------------------
-
-            dataset = self.feature_store.get_features(
-                price_df,
-                sentiment_df,
-                ticker=ticker
-            )
-
-            if dataset.empty:
-                raise ValueError(
-                    "Feature pipeline returned empty dataset."
+                price_df = self.market_data.get_price_data(
+                    ticker=ticker,
+                    start_date="2018-01-01",
+                    end_date=today.isoformat()
                 )
 
-            # -----------------------------------
-            # DATA QUALITY
-            # -----------------------------------
+                sentiment_df = self._safe_sentiment(ticker)
 
-            missing_ratio = dataset.isnull().mean().mean()
-            MISSING_FEATURE_RATIO.set(float(missing_ratio))
+                dataset = self.feature_store.get_features(
+                    price_df,
+                    sentiment_df,
+                    ticker=ticker
+                )
 
-            self._emit_feature_metrics(dataset)
+                if dataset.empty:
+                    raise ValueError("Feature pipeline empty")
 
-            latest = dataset.iloc[-1]
+                missing_ratio = dataset.isnull().mean().mean()
+                MISSING_FEATURE_RATIO.set(float(missing_ratio))
 
-            features = latest[
-                self.models.xgb.feature_names_in_
-            ].values.reshape(1, -1)
+                # 🔥 DRIFT DETECTION
+                self._detect_feature_drift(dataset)
 
-            # -----------------------------------
-            # XGBOOST
-            # -----------------------------------
+                latest = dataset.iloc[-1]
 
-            t0 = time.time()
+                features = latest[
+                    self.models.xgb.feature_names_in_
+                ].values.reshape(1, -1)
 
-            prediction = self.models.xgb.predict(features)[0]
-            prob_up = self.models.xgb.predict_proba(features)[0][1]
+                # -----------------------------------
+                # XGBOOST
+                # -----------------------------------
 
-            MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-            MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(
-                time.time() - t0
-            )
+                t0 = time.time()
 
-            predicted_return = prob_up - 0.5
+                prediction = self.models.xgb.predict(features)[0]
+                prob_up = self.models.xgb.predict_proba(features)[0][1]
 
-            # -----------------------------------
-            # LSTM
-            # -----------------------------------
+                MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
+                MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(
+                    time.time() - t0
+                )
 
-            recent_prices = price_df[["close"]].tail(60).values
+                predicted_return = prob_up - 0.5
 
-            t0 = time.time()
+                # -----------------------------------
+                # LSTM
+                # -----------------------------------
 
-            lstm_prices = self.models.lstm_forecast(recent_prices)
-            lstm_prices = lstm_prices[:forecast_days]
+                recent_prices = price_df[["close"]].tail(60).values
 
-            MODEL_INFERENCE_COUNT.labels(model="lstm").inc()
-            MODEL_INFERENCE_LATENCY.labels(model="lstm").observe(
-                time.time() - t0
-            )
+                t0 = time.time()
 
-            # -----------------------------------
-            # PROPHET
-            # -----------------------------------
+                lstm_prices = self.models.lstm_forecast(recent_prices)
+                lstm_prices = lstm_prices[:forecast_days]
 
-            t0 = time.time()
+                MODEL_INFERENCE_COUNT.labels(model="lstm").inc()
+                MODEL_INFERENCE_LATENCY.labels(model="lstm").observe(
+                    time.time() - t0
+                )
 
-            prophet_out = self.models.prophet_forecast()
+                # -----------------------------------
+                # PROPHET
+                # -----------------------------------
 
-            MODEL_INFERENCE_COUNT.labels(model="prophet").inc()
-            MODEL_INFERENCE_LATENCY.labels(model="prophet").observe(
-                time.time() - t0
-            )
+                t0 = time.time()
 
-            # -----------------------------------
-            # DECISION
-            # -----------------------------------
+                prophet_out = self.models.prophet_forecast()
 
-            signal_today, confidence = self.decision_engine.generate(
-                predicted_return=predicted_return,
-                sentiment=latest["avg_sentiment"],
-                rsi=latest["rsi"],
-                prob_up=prob_up,
-                volatility=latest["volatility"],
-                lstm_prices=lstm_prices,
-                prophet_trend=prophet_out["trend"]
-            )
+                MODEL_INFERENCE_COUNT.labels(model="prophet").inc()
+                MODEL_INFERENCE_LATENCY.labels(model="prophet").observe(
+                    time.time() - t0
+                )
 
-            SIGNAL_DISTRIBUTION.labels(signal=signal_today).inc()
-            CONFIDENCE_SCORE.set(float(confidence))
-            FORECAST_HORIZON.set(len(lstm_prices))
+                # -----------------------------------
+                # DECISION
+                # -----------------------------------
 
-            # -----------------------------------
-            # TIMELINE (unchanged)
-            # -----------------------------------
-
-            timeline = []
-
-            hist_df = price_df.tail(120)
-
-            for _, row in hist_df.iterrows():
-                timeline.append({
-                    "date": str(pd.to_datetime(row["date"]).date()),
-                    "price": float(row["close"]),
-                    "type": "historical"
-                })
-
-            last_date = pd.to_datetime(price_df["date"].iloc[-1])
-
-            future_dates = pd.bdate_range(
-                start=last_date + pd.Timedelta(days=1),
-                periods=len(lstm_prices)
-            )
-
-            last_close = price_df["close"].iloc[-1]
-
-            forecast_series = []
-
-            for date, price in zip(future_dates, lstm_prices):
-
-                step_return = (price - last_close) / last_close
-
-                step_signal, _ = self.decision_engine.generate(
-                    predicted_return=step_return,
+                signal_today, confidence = self.decision_engine.generate(
+                    predicted_return=predicted_return,
                     sentiment=latest["avg_sentiment"],
                     rsi=latest["rsi"],
                     prob_up=prob_up,
@@ -290,43 +278,22 @@ class InferencePipeline:
                     prophet_trend=prophet_out["trend"]
                 )
 
-                point = {
-                    "date": str(date.date()),
-                    "price": float(price),
-                    "type": "forecast",
-                    "signal": step_signal,
-                    "expected_return_pct": round(step_return * 100, 2)
+                SIGNAL_DISTRIBUTION.labels(signal=signal_today).inc()
+                CONFIDENCE_SCORE.set(float(confidence))
+                FORECAST_HORIZON.set(len(lstm_prices))
+
+                response = {
+                    "ticker": ticker,
+                    "signal_today": signal_today,
+                    "confidence": float(confidence),
+                    "probability_up": float(prob_up),
                 }
 
-                timeline.append(point)
-                forecast_series.append(point)
+                self.cache.set(cache_key, response, ttl=900)
 
-            scenarios = self.scenario_engine.generate({
-                "mean_forecast": float(np.mean(lstm_prices)),
-                "std_dev": float(np.std(lstm_prices))
-            })
+                return response
 
-            explanation = self.explainer.explain(
-                prediction=int(prediction),
-                prob_up=float(prob_up),
-                sentiment=float(latest["avg_sentiment"]),
-                volatility=float(latest["volatility"]),
-                rsi=float(latest["rsi"])
-            )
+        except Exception as e:
 
-            response = {
-                "ticker": ticker,
-                "signal_today": signal_today,
-                "confidence": float(confidence),
-                "probability_up": float(prob_up),
-                "timeline": timeline,
-                "forecast_start": str(future_dates[0].date()),
-                "forecast_end": str(future_dates[-1].date()),
-                "horizon_days": len(forecast_series),
-                "scenarios": scenarios,
-                "explanation": explanation
-            }
-
-            self.cache.set(cache_key, response, ttl=900)
-
-            return response
+            PIPELINE_FAILURES.labels(stage="inference").inc()
+            raise
