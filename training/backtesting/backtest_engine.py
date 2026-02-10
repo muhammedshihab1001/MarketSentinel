@@ -9,7 +9,8 @@ class BacktestEngine:
     - no lookahead execution
     - slippage modeling
     - partial capital deployment
-    - forced position flattening
+    - forced position flattening counted as trade
+    - no unintended pyramiding
     - exposure tracking
     - turnover visibility
     """
@@ -19,9 +20,9 @@ class BacktestEngine:
         prices,
         signals,
         initial_cash=10_000,
-        transaction_cost=0.001,   # 10 bps
-        slippage=0.0005,         # 5 bps
-        position_size=1.0        # fraction of capital
+        transaction_cost=0.001,
+        slippage=0.0005,
+        position_size=1.0
     ):
 
         if len(prices) != len(signals):
@@ -44,11 +45,12 @@ class BacktestEngine:
 
             price = prices[i]
 
-            # ------------------------------------------------
+            # --------------------------------------------
             # EXECUTE PREVIOUS SIGNAL (NO LOOKAHEAD)
-            # ------------------------------------------------
+            # --------------------------------------------
 
-            if prev_signal == "BUY" and cash > 0:
+            # BUY only if flat
+            if prev_signal == "BUY" and cash > 0 and position == 0:
 
                 execution_price = price * (1 + slippage)
 
@@ -58,11 +60,12 @@ class BacktestEngine:
                     deploy_cash * (1 - transaction_cost)
                 ) / execution_price
 
-                position += shares
+                position = shares
                 cash -= deploy_cash
 
                 trade_count += 1
 
+            # SELL only if holding
             elif prev_signal == "SELL" and position > 0:
 
                 execution_price = price * (1 - slippage)
@@ -86,9 +89,9 @@ class BacktestEngine:
 
             prev_signal = signals[i]
 
-        # ------------------------------------------------
-        # FORCE LIQUIDATION
-        # ------------------------------------------------
+        # --------------------------------------------
+        # FORCE LIQUIDATION (COUNT AS TRADE)
+        # --------------------------------------------
 
         if position > 0:
 
@@ -99,6 +102,8 @@ class BacktestEngine:
 
             portfolio_values[-1] = cash
 
+            trade_count += 1   # CRITICAL FIX
+
         portfolio_values = np.array(portfolio_values)
 
         strategy_return = portfolio_values[-1] / initial_cash - 1
@@ -107,11 +112,11 @@ class BacktestEngine:
 
         returns = np.diff(portfolio_values) / portfolio_values[:-1]
 
-        if len(returns) > 1 and np.std(returns) != 0:
+        if len(returns) > 1:
+            std = np.std(returns)
             sharpe = (
-                np.mean(returns)
-                / np.std(returns)
-                * np.sqrt(252)
+                np.mean(returns) / std * np.sqrt(252)
+                if std > 0 else 0.0
             )
         else:
             sharpe = 0.0
@@ -129,8 +134,6 @@ class BacktestEngine:
             "exposure": float(exposure),
             "turnover": float(turnover)
         }
-
-    # ------------------------------------------------
 
     def _empty_result(self, initial_cash):
 
