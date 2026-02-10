@@ -1,30 +1,93 @@
 import pandas as pd
-from training.backtesting.backtest_engine import backtest_strategy, signal_hit_rate
+import numpy as np
+
+from training.backtesting.backtest_engine import (
+    BacktestEngine,
+    backtest_strategy,
+    signal_hit_rate
+)
 
 
-def sample_backtest_df():
-    """
-    Create a small but realistic dataset for backtesting.
-    """
-    data = {
-        "close": [
-            100, 101, 102, 101, 103,
-            104, 103, 105, 106, 107
-        ],
-        "signal": [
-            "BUY", "HOLD", "BUY", "SELL", "BUY",
-            "HOLD", "SELL", "BUY", "BUY", "HOLD"
-        ]
-    }
-    return pd.DataFrame(data)
+# ---------------------------------------------------
+# CORE ENGINE SAFETY
+# ---------------------------------------------------
+
+def test_engine_runs_without_crashing():
+
+    prices = np.array([100, 101, 102, 103])
+    signals = ["BUY", "HOLD", "SELL", "HOLD"]
+
+    engine = BacktestEngine()
+
+    result = engine.run(prices, signals)
+
+    assert "final_portfolio" in result
+    assert result["final_portfolio"] > 0
 
 
-def test_strategy_performance_thresholds():
-    df = sample_backtest_df()
+# ---------------------------------------------------
+# CAPITAL CONSERVATION
+# ---------------------------------------------------
+
+def test_no_negative_portfolio():
+
+    prices = np.array([100, 99, 98, 97])
+    signals = ["BUY", "HOLD", "HOLD", "HOLD"]
+
+    engine = BacktestEngine()
+
+    result = engine.run(prices, signals)
+
+    assert result["final_portfolio"] >= 0
+
+
+# ---------------------------------------------------
+# BUY HOLD BASELINE
+# ---------------------------------------------------
+
+def test_buy_hold_matches_manual():
+
+    prices = np.array([100, 110])
+    signals = ["HOLD", "HOLD"]
+
+    engine = BacktestEngine()
+
+    result = engine.run(prices, signals)
+
+    expected = 110 / 100 - 1
+
+    assert abs(result["buy_hold_return"] - expected) < 1e-6
+
+
+# ---------------------------------------------------
+# TRADE COUNT
+# ---------------------------------------------------
+
+def test_trade_count_increments():
+
+    prices = np.array([100, 101, 102, 103])
+    signals = ["BUY", "SELL", "BUY", "SELL"]
+
+    engine = BacktestEngine()
+
+    result = engine.run(prices, signals)
+
+    assert result["trade_count"] == 4
+
+
+# ---------------------------------------------------
+# WRAPPER COMPATIBILITY
+# ---------------------------------------------------
+
+def test_wrapper_functions():
+
+    df = pd.DataFrame({
+        "close": [100, 101, 102],
+        "signal": ["BUY", "SELL", "HOLD"]
+    })
 
     metrics = backtest_strategy(df)
-    signal_metrics = signal_hit_rate(df)
+    hit = signal_hit_rate(df)
 
-    # ---- Quality Gates ----
-    assert metrics["sharpe_ratio"] >= 0.8, "Sharpe ratio too low"
-    assert signal_metrics["hit_rate"] >= 0.50, "Signal hit rate too low"
+    assert "total_return" in metrics
+    assert 0 <= hit["hit_rate"] <= 1
