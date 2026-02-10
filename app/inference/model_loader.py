@@ -5,6 +5,7 @@ import logging
 
 from models.lstm_model import forecast_lstm
 from models.prophet_model import forecast_prophet
+from app.monitoring.metrics import MODEL_VERSION
 
 
 logger = logging.getLogger(__name__)
@@ -12,14 +13,14 @@ logger = logging.getLogger(__name__)
 
 class ModelLoader:
     """
-    Registry-aware institutional model loader.
+    Institutional Registry-Aware Model Loader.
 
     Guarantees:
     ✅ Loads ONLY versioned artifacts
-    ✅ Prevents accidental root-model loading
-    ✅ Rollback-safe
+    ✅ Exposes model version metrics
+    ✅ Supports warmup loading
+    ✅ Fail-fast registry validation
     ✅ Singleton per worker
-    ✅ Lazy loading
     """
 
     _instance = None
@@ -40,7 +41,7 @@ class ModelLoader:
         if hasattr(self, "_initialized"):
             return
 
-        # TensorFlow thread control
+        # TensorFlow CPU control
         tf.config.threading.set_intra_op_parallelism_threads(1)
         tf.config.threading.set_inter_op_parallelism_threads(1)
 
@@ -57,29 +58,34 @@ class ModelLoader:
     # INTERNAL — Resolve Latest Version
     # ---------------------------------------------------
 
-    def _latest_path(self, model_dir: str, filename: str) -> str:
-        """
-        Resolves artifacts/<model>/latest/<file>
-
-        FAILS FAST if latest is missing.
-        """
+    def _resolve_latest_dir(self, model_dir: str):
 
         latest_dir = os.path.join(model_dir, "latest")
 
         if not os.path.exists(latest_dir):
             raise RuntimeError(
                 f"No 'latest' model found in {model_dir}. "
-                f"Did you register the model?"
+                f"Did training register the model?"
             )
 
-        path = os.path.join(latest_dir, filename)
+        # resolve symlink → actual version
+        version_dir = os.path.realpath(latest_dir)
+        version = os.path.basename(version_dir)
+
+        return version_dir, version
+
+    # ---------------------------------------------------
+
+    def _latest_path(self, model_dir: str, filename: str):
+
+        version_dir, version = self._resolve_latest_dir(model_dir)
+
+        path = os.path.join(version_dir, filename)
 
         if not os.path.exists(path):
-            raise RuntimeError(
-                f"Missing artifact: {path}"
-            )
+            raise RuntimeError(f"Missing artifact: {path}")
 
-        return path
+        return path, version
 
     # ---------------------------------------------------
     # XGBOOST
@@ -90,7 +96,7 @@ class ModelLoader:
 
         if self._xgb is None:
 
-            path = self._latest_path(
+            path, version = self._latest_path(
                 "artifacts/xgboost",
                 "model.pkl"
             )
@@ -98,6 +104,11 @@ class ModelLoader:
             logger.info(f"Loading XGBoost model from {path}")
 
             self._xgb = joblib.load(path)
+
+            MODEL_VERSION.labels(
+                model="xgboost",
+                version=version
+            ).set(1)
 
         return self._xgb
 
@@ -110,7 +121,7 @@ class ModelLoader:
 
         if self._lstm is None:
 
-            path = self._latest_path(
+            path, version = self._latest_path(
                 "artifacts/lstm",
                 "model.keras"
             )
@@ -122,6 +133,11 @@ class ModelLoader:
                 compile=False
             )
 
+            MODEL_VERSION.labels(
+                model="lstm",
+                version=version
+            ).set(1)
+
         return self._lstm
 
     # ---------------------------------------------------
@@ -131,12 +147,12 @@ class ModelLoader:
 
         if self._scaler is None:
 
-            path = self._latest_path(
+            path, _ = self._latest_path(
                 "artifacts/lstm",
                 "scaler.pkl"
             )
 
-            logger.info(f"Loading LSTM scaler from {path}")
+            logger.info("Loading LSTM scaler")
 
             self._scaler = joblib.load(path)
 
@@ -151,7 +167,7 @@ class ModelLoader:
 
         if self._prophet is None:
 
-            path = self._latest_path(
+            path, version = self._latest_path(
                 "artifacts/prophet",
                 "prophet_trend.pkl"
             )
@@ -160,7 +176,33 @@ class ModelLoader:
 
             self._prophet = joblib.load(path)
 
+            MODEL_VERSION.labels(
+                model="prophet",
+                version=version
+            ).set(1)
+
         return self._prophet
+
+    # ---------------------------------------------------
+    # 🔥 WARMUP (VERY IMPORTANT)
+    # ---------------------------------------------------
+
+    def warmup(self):
+        """
+        Forces model loading at startup.
+
+        Prevents cold-start latency.
+        Ensures registry validity.
+        """
+
+        logger.info("🔥 Warming up models...")
+
+        _ = self.xgb
+        _ = self.lstm
+        _ = self.scaler
+        _ = self.prophet
+
+        logger.info("✅ All models loaded successfully.")
 
     # ---------------------------------------------------
     # Forecast Wrappers

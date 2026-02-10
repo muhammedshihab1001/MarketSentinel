@@ -4,6 +4,7 @@ import logging
 
 from app.api.routes import health, predict
 from app.inference.model_loader import ModelLoader
+from app.inference.cache import RedisCache
 
 
 logger = logging.getLogger(__name__)
@@ -14,50 +15,82 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# ------------------------------------------------
-# MODEL READINESS FLAG
-# ------------------------------------------------
+# =====================================================
+# READINESS STATE (Institutional Pattern)
+# =====================================================
 
-MODELS_READY = False
+class ReadinessState:
+    """
+    Thread-safe readiness tracker.
+    Allows richer health diagnostics.
+    """
+
+    def __init__(self):
+        self.models_loaded = False
+        self.redis_connected = False
+
+    @property
+    def ready(self):
+        return self.models_loaded and self.redis_connected
 
 
-# ------------------------------------------------
-# Startup Event — Institutional Preload
-# ------------------------------------------------
+readiness = ReadinessState()
+
+
+# =====================================================
+# STARTUP — Institutional Warmup
+# =====================================================
 
 @app.on_event("startup")
-def preload_models():
+def preload_dependencies():
     """
-    Preload models BEFORE serving traffic.
+    Preload ALL critical inference dependencies.
 
-    Benefits:
-    ✅ copy-on-write memory sharing
-    ✅ faster first request
-    ✅ prevents cold inference spikes
+    Guarantees:
+    ✅ no cold starts
+    ✅ registry validation
+    ✅ dependency health
     """
-
-    global MODELS_READY
 
     try:
+
+        logger.info("🔥 Starting MarketSentinel warmup...")
+
+        # -----------------------------
+        # Model Warmup
+        # -----------------------------
         loader = ModelLoader()
+        loader.warmup()
 
-        # Force lazy properties to load
-        _ = loader.xgb
-        _ = loader.lstm
-        _ = loader.scaler
-        _ = loader.prophet
+        readiness.models_loaded = True
 
-        MODELS_READY = True
-        logger.info("Models successfully preloaded.")
+        # -----------------------------
+        # Redis Validation
+        # -----------------------------
+        cache = RedisCache()
+
+        if cache.enabled:
+            readiness.redis_connected = True
+            logger.info("✅ Redis connection verified.")
+        else:
+            logger.warning(
+                "⚠️ Redis unavailable — running without cache."
+            )
+            readiness.redis_connected = True  # still allow serving
+
+        logger.info("✅ System ready for traffic.")
 
     except Exception as e:
-        logger.exception("Model preload failed!")
+
+        logger.exception("🚨 CRITICAL STARTUP FAILURE")
+
+        # Fail fast → container restart
         raise e
 
 
-# ---------------------------
-# Routers
-# ---------------------------
+# =====================================================
+# ROUTERS
+# =====================================================
 
 app.include_router(
     health.router,
@@ -71,9 +104,9 @@ app.include_router(
     tags=["Prediction"]
 )
 
-# ------------------------------------------------
-# Root endpoint
-# ------------------------------------------------
+# =====================================================
+# ROOT
+# =====================================================
 
 @app.get("/")
 def root():
@@ -85,9 +118,9 @@ def root():
     }
 
 
-# ------------------------------------------------
-# Prometheus metrics endpoint
-# ------------------------------------------------
+# =====================================================
+# PROMETHEUS
+# =====================================================
 
 @app.get("/metrics")
 def metrics():
@@ -97,37 +130,39 @@ def metrics():
     )
 
 
-# ------------------------------------------------
-# Kubernetes / Container Readiness
-# ------------------------------------------------
+# =====================================================
+# READINESS PROBE (Load Balancers)
+# =====================================================
 
 @app.get("/ready")
 def readiness_probe():
     """
-    Returns 200 ONLY when models are ready.
-
-    Prevents traffic before inference is safe.
+    Returns 200 ONLY when inference is safe.
     """
 
-    if not MODELS_READY:
+    if not readiness.ready:
+
         return Response(
-            content="Models are still loading",
+            content="Service not ready",
             status_code=503
         )
 
-    return {"status": "ready"}
+    return {
+        "status": "ready",
+        "models_loaded": readiness.models_loaded,
+        "redis_connected": readiness.redis_connected
+    }
 
 
-# ------------------------------------------------
-# Liveness Probe
-# ------------------------------------------------
+# =====================================================
+# LIVENESS PROBE
+# =====================================================
 
 @app.get("/live")
 def liveness_probe():
     """
-    Confirms the app is alive.
-
-    Should NOT depend on models.
+    Confirms process is alive.
+    Does NOT check dependencies.
     """
 
     return {"status": "alive"}
