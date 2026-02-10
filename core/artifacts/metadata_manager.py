@@ -4,20 +4,33 @@ import datetime
 import hashlib
 import pandas as pd
 import shutil
+import tempfile
 
 
 class MetadataManager:
     """
     Institutional Metadata + Model Registry.
 
-    Now provides:
+    Provides:
 
-    ✅ dataset fingerprinting
-    ✅ versioned artifacts
-    ✅ atomic promotion
-    ✅ rollback safety
-    ✅ lineage tracking
+    dataset fingerprinting
+    metadata validation
+    atomic writes
+    versioned registry
+    rollback safety
+    lineage tracking
+    governance readiness
     """
+
+    REQUIRED_METADATA_FIELDS = [
+        "model_name",
+        "created_at",
+        "training_window",
+        "dataset_hash",
+        "features",
+        "metrics",
+        "schema_version"
+    ]
 
     # -----------------------------------------------------
     # DATASET FINGERPRINT
@@ -25,6 +38,12 @@ class MetadataManager:
 
     @staticmethod
     def fingerprint_dataset(df: pd.DataFrame) -> str:
+        """
+        Immutable dataset hash.
+        Any row change -> new fingerprint.
+        """
+
+        df = df.sort_index(axis=1)
 
         data_bytes = pd.util.hash_pandas_object(
             df,
@@ -47,7 +66,7 @@ class MetadataManager:
         dataset_hash: str
     ) -> dict:
 
-        return {
+        metadata = {
             "model_name": model_name,
             "created_at": datetime.datetime.utcnow().isoformat(),
 
@@ -63,74 +82,125 @@ class MetadataManager:
             "schema_version": "3.0"
         }
 
+        MetadataManager.validate_metadata(metadata)
+
+        return metadata
+
+    # -----------------------------------------------------
+    # VALIDATION (VERY IMPORTANT)
+    # -----------------------------------------------------
+
+    @staticmethod
+    def validate_metadata(metadata: dict):
+        """
+        Prevents registry corruption.
+        """
+
+        missing = [
+            field for field in MetadataManager.REQUIRED_METADATA_FIELDS
+            if field not in metadata
+        ]
+
+        if missing:
+            raise RuntimeError(
+                f"Metadata missing required fields: {missing}"
+            )
+
+        if not isinstance(metadata["features"], list):
+            raise RuntimeError("features must be a list")
+
+        if not isinstance(metadata["metrics"], dict):
+            raise RuntimeError("metrics must be a dictionary")
+
+        if not isinstance(metadata["dataset_hash"], str):
+            raise RuntimeError("dataset_hash must be a string")
+
     # -----------------------------------------------------
     # SAVE / LOAD
     # -----------------------------------------------------
 
     @staticmethod
     def save_metadata(metadata: dict, path: str):
+        """
+        Atomic write prevents corrupted metadata.
+        """
+
+        MetadataManager.validate_metadata(metadata)
 
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        with open(path, "w") as f:
-            json.dump(metadata, f, indent=4)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            delete=False,
+            dir=os.path.dirname(path)
+        ) as tmp:
+
+            json.dump(metadata, tmp, indent=4)
+            temp_name = tmp.name
+
+        shutil.move(temp_name, path)
 
     @staticmethod
     def load_metadata(path: str) -> dict:
 
+        if not os.path.exists(path):
+            raise RuntimeError(f"Metadata not found: {path}")
+
         with open(path, "r") as f:
-            return json.load(f)
+            metadata = json.load(f)
+
+        MetadataManager.validate_metadata(metadata)
+
+        return metadata
 
     # =====================================================
-    # 🔥 MODEL REGISTRY (NEW — VERY IMPORTANT)
+    # MODEL REGISTRY
     # =====================================================
 
     @staticmethod
     def register_model(model_dir: str):
         """
-        Promotes a freshly trained model into a versioned registry.
-
-        Expected layout BEFORE:
-
-        artifacts/xgboost/
-            model.pkl
-            metadata.json
-
-        AFTER:
-
-        artifacts/xgboost/
-            v_2026_02_10_153000/
-                model.pkl
-                metadata.json
-            latest -> symlink
+        Promotes trained artifacts into a versioned registry.
         """
 
         if not os.path.exists(model_dir):
             raise RuntimeError(f"{model_dir} does not exist")
+
+        files_to_move = [
+            f for f in os.listdir(model_dir)
+            if not f.startswith("v_") and f != "latest"
+        ]
+
+        if not files_to_move:
+            raise RuntimeError(
+                "No artifacts found to register."
+            )
 
         timestamp = datetime.datetime.utcnow().strftime(
             "v_%Y_%m_%d_%H%M%S"
         )
 
         version_path = os.path.join(model_dir, timestamp)
-
         os.makedirs(version_path, exist_ok=True)
 
-        # Move artifacts into version folder
-        for file in os.listdir(model_dir):
-
-            if file.startswith("v_") or file == "latest":
-                continue
+        for file in files_to_move:
 
             src = os.path.join(model_dir, file)
             dst = os.path.join(version_path, file)
 
             shutil.move(src, dst)
 
-        # -------------------------------------------------
-        # Update "latest"
-        # -------------------------------------------------
+        # validate metadata exists
+        metadata_path = os.path.join(version_path, "metadata.json")
 
+        if not os.path.exists(metadata_path):
+            raise RuntimeError(
+                "metadata.json missing. Refusing to register model."
+            )
+
+        MetadataManager.load_metadata(metadata_path)
+
+        # update latest symlink
         latest_path = os.path.join(model_dir, "latest")
 
         if os.path.islink(latest_path) or os.path.exists(latest_path):
@@ -141,13 +211,18 @@ class MetadataManager:
             latest_path
         )
 
-        print(f"\n✅ Model registered → {version_path}")
-        print(f"🔗 'latest' now points to {timestamp}\n")
+        print(f"Model registered -> {version_path}")
+        print(f"'latest' now points to {timestamp}")
+
+        return version_path
 
     # -----------------------------------------------------
 
     @staticmethod
     def list_versions(model_dir: str):
+
+        if not os.path.exists(model_dir):
+            return []
 
         return sorted([
             d for d in os.listdir(model_dir)
@@ -159,7 +234,7 @@ class MetadataManager:
     @staticmethod
     def rollback(model_dir: str, version: str):
         """
-        Repoints 'latest' to a previous version.
+        Repoints latest to a previous version.
         """
 
         version_path = os.path.join(model_dir, version)
@@ -168,6 +243,13 @@ class MetadataManager:
             raise RuntimeError(
                 f"Version {version} not found"
             )
+
+        metadata_path = os.path.join(
+            version_path,
+            "metadata.json"
+        )
+
+        MetadataManager.load_metadata(metadata_path)
 
         latest_path = os.path.join(model_dir, "latest")
 
@@ -179,4 +261,4 @@ class MetadataManager:
             latest_path
         )
 
-        print(f"\n⏪ Rolled back to {version}\n")
+        print(f"Rolled back to {version}")
