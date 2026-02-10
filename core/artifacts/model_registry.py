@@ -11,10 +11,10 @@ class ModelRegistry:
 
     Guarantees:
     - atomic promotion
-    - directed stage transitions
+    - metadata contract enforcement
+    - schema protection
     - pointer safety
     - rollback lineage
-    - artifact validation
     """
 
     MANIFEST_NAME = "manifest.json"
@@ -26,7 +26,6 @@ class ModelRegistry:
         "production"
     )
 
-    # Directed stage graph
     ALLOWED_TRANSITIONS = {
         "candidate": {"shadow"},
         "shadow": {"approved"},
@@ -59,11 +58,27 @@ class ModelRegistry:
         with open(metadata_path) as f:
             meta = json.load(f)
 
-        if "schema_signature" not in meta:
-            raise RuntimeError("Metadata missing schema_signature.")
+        required_fields = [
+            "model_name",
+            "features",
+            "metrics",
+            "dataset_hash",
+            "schema_version",
+            "schema_signature"
+        ]
 
-        if "metrics" not in meta:
-            raise RuntimeError("Metadata missing metrics block.")
+        missing = [k for k in required_fields if k not in meta]
+
+        if missing:
+            raise RuntimeError(
+                f"Metadata missing required fields: {missing}"
+            )
+
+        if not isinstance(meta["schema_signature"], str):
+            raise RuntimeError("schema_signature must be a string")
+
+        if not isinstance(meta["metrics"], dict):
+            raise RuntimeError("metrics must be a dictionary")
 
     # --------------------------------------------------
 
@@ -99,8 +114,12 @@ class ModelRegistry:
             ModelRegistry.MANIFEST_NAME
         )
 
-        with open(path, "w") as f:
+        tmp_path = path + ".tmp"
+
+        with open(tmp_path, "w") as f:
             json.dump(manifest, f, indent=4)
+
+        os.replace(tmp_path, path)
 
     # --------------------------------------------------
 
@@ -128,8 +147,12 @@ class ModelRegistry:
             ModelRegistry.MANIFEST_NAME
         )
 
-        with open(path, "w") as f:
+        tmp_path = path + ".tmp"
+
+        with open(tmp_path, "w") as f:
             json.dump(manifest, f, indent=4)
+
+        os.replace(tmp_path, path)
 
     # --------------------------------------------------
     # REGISTRATION
@@ -164,7 +187,7 @@ class ModelRegistry:
 
         os.replace(staging_dir, version_dir)
 
-        return version
+        return version_dir
 
     # --------------------------------------------------
     # STAGE TRANSITION
@@ -188,7 +211,7 @@ class ModelRegistry:
 
         if new_stage not in ModelRegistry.ALLOWED_TRANSITIONS[current_stage]:
             raise RuntimeError(
-                f"Illegal transition {current_stage} → {new_stage}"
+                f"Illegal transition {current_stage} -> {new_stage}"
             )
 
         manifest["history"].append({
@@ -239,8 +262,6 @@ class ModelRegistry:
 
         ModelRegistry._save_manifest(version_dir, manifest)
 
-    # --------------------------------------------------
-    # ROLLBACK
     # --------------------------------------------------
 
     @staticmethod
