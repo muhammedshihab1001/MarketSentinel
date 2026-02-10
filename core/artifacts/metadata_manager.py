@@ -3,23 +3,21 @@ import os
 import datetime
 import hashlib
 import pandas as pd
-import shutil
 import tempfile
+import shutil
+import platform
+import sys
+
+from core.schema.feature_schema import get_schema_signature
 
 
 class MetadataManager:
     """
-    Institutional Metadata + Model Registry.
+    Institutional Metadata Manager.
 
-    Provides:
+    STRICTLY handles metadata.
 
-    dataset fingerprinting
-    metadata validation
-    atomic writes
-    versioned registry
-    rollback safety
-    lineage tracking
-    governance readiness
+    DOES NOT control model promotion.
     """
 
     REQUIRED_METADATA_FIELDS = [
@@ -29,7 +27,7 @@ class MetadataManager:
         "dataset_hash",
         "features",
         "metrics",
-        "schema_version"
+        "schema_signature"
     ]
 
     # -----------------------------------------------------
@@ -38,22 +36,18 @@ class MetadataManager:
 
     @staticmethod
     def fingerprint_dataset(df: pd.DataFrame) -> str:
-        """
-        Immutable dataset hash.
-        Any row change -> new fingerprint.
-        """
 
-        df = df.sort_index(axis=1)
+        df = df.sort_index(axis=1).sort_values(
+            by=list(df.columns)
+        ).reset_index(drop=True)
 
         data_bytes = pd.util.hash_pandas_object(
             df,
-            index=True
+            index=False
         ).values.tobytes()
 
         return hashlib.sha256(data_bytes).hexdigest()
 
-    # -----------------------------------------------------
-    # METADATA
     # -----------------------------------------------------
 
     @staticmethod
@@ -67,6 +61,7 @@ class MetadataManager:
     ) -> dict:
 
         metadata = {
+
             "model_name": model_name,
             "created_at": datetime.datetime.utcnow().isoformat(),
 
@@ -79,7 +74,14 @@ class MetadataManager:
             "features": features,
             "metrics": metrics,
 
-            "schema_version": "3.0"
+            # 🔥 GOVERNANCE CRITICAL
+            "schema_signature": get_schema_signature(),
+
+            # 🔥 AUDIT GOLD
+            "environment": {
+                "python": sys.version,
+                "platform": platform.platform()
+            }
         }
 
         MetadataManager.validate_metadata(metadata)
@@ -87,14 +89,9 @@ class MetadataManager:
         return metadata
 
     # -----------------------------------------------------
-    # VALIDATION (VERY IMPORTANT)
-    # -----------------------------------------------------
 
     @staticmethod
     def validate_metadata(metadata: dict):
-        """
-        Prevents registry corruption.
-        """
 
         missing = [
             field for field in MetadataManager.REQUIRED_METADATA_FIELDS
@@ -116,14 +113,9 @@ class MetadataManager:
             raise RuntimeError("dataset_hash must be a string")
 
     # -----------------------------------------------------
-    # SAVE / LOAD
-    # -----------------------------------------------------
 
     @staticmethod
     def save_metadata(metadata: dict, path: str):
-        """
-        Atomic write prevents corrupted metadata.
-        """
 
         MetadataManager.validate_metadata(metadata)
 
@@ -140,6 +132,8 @@ class MetadataManager:
 
         shutil.move(temp_name, path)
 
+    # -----------------------------------------------------
+
     @staticmethod
     def load_metadata(path: str) -> dict:
 
@@ -152,113 +146,3 @@ class MetadataManager:
         MetadataManager.validate_metadata(metadata)
 
         return metadata
-
-    # =====================================================
-    # MODEL REGISTRY
-    # =====================================================
-
-    @staticmethod
-    def register_model(model_dir: str):
-        """
-        Promotes trained artifacts into a versioned registry.
-        """
-
-        if not os.path.exists(model_dir):
-            raise RuntimeError(f"{model_dir} does not exist")
-
-        files_to_move = [
-            f for f in os.listdir(model_dir)
-            if not f.startswith("v_") and f != "latest"
-        ]
-
-        if not files_to_move:
-            raise RuntimeError(
-                "No artifacts found to register."
-            )
-
-        timestamp = datetime.datetime.utcnow().strftime(
-            "v_%Y_%m_%d_%H%M%S"
-        )
-
-        version_path = os.path.join(model_dir, timestamp)
-        os.makedirs(version_path, exist_ok=True)
-
-        for file in files_to_move:
-
-            src = os.path.join(model_dir, file)
-            dst = os.path.join(version_path, file)
-
-            shutil.move(src, dst)
-
-        # validate metadata exists
-        metadata_path = os.path.join(version_path, "metadata.json")
-
-        if not os.path.exists(metadata_path):
-            raise RuntimeError(
-                "metadata.json missing. Refusing to register model."
-            )
-
-        MetadataManager.load_metadata(metadata_path)
-
-        # update latest symlink
-        latest_path = os.path.join(model_dir, "latest")
-
-        if os.path.islink(latest_path) or os.path.exists(latest_path):
-            os.remove(latest_path)
-
-        os.symlink(
-            os.path.abspath(version_path),
-            latest_path
-        )
-
-        print(f"Model registered -> {version_path}")
-        print(f"'latest' now points to {timestamp}")
-
-        return version_path
-
-    # -----------------------------------------------------
-
-    @staticmethod
-    def list_versions(model_dir: str):
-
-        if not os.path.exists(model_dir):
-            return []
-
-        return sorted([
-            d for d in os.listdir(model_dir)
-            if d.startswith("v_")
-        ])
-
-    # -----------------------------------------------------
-
-    @staticmethod
-    def rollback(model_dir: str, version: str):
-        """
-        Repoints latest to a previous version.
-        """
-
-        version_path = os.path.join(model_dir, version)
-
-        if not os.path.exists(version_path):
-            raise RuntimeError(
-                f"Version {version} not found"
-            )
-
-        metadata_path = os.path.join(
-            version_path,
-            "metadata.json"
-        )
-
-        MetadataManager.load_metadata(metadata_path)
-
-        latest_path = os.path.join(model_dir, "latest")
-
-        if os.path.exists(latest_path) or os.path.islink(latest_path):
-            os.remove(latest_path)
-
-        os.symlink(
-            os.path.abspath(version_path),
-            latest_path
-        )
-
-        print(f"Rolled back to {version}")

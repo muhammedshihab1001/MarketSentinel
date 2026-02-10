@@ -5,29 +5,32 @@ import numpy as np
 import tensorflow as tf
 import pandas as pd
 import shutil
+import tempfile
 
 from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.callbacks import EarlyStopping
 
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
+from training.backtesting.walk_forward import WalkForwardValidator
 from models.lstm_model import build_lstm_model
 
 
-# ---------------------------------------------------
-# CONFIG
-# ---------------------------------------------------
-
 MODEL_DIR = "artifacts/lstm"
 
-TEMP_MODEL_PATH = f"{MODEL_DIR}/model.keras"
+TEMP_MODEL_PATH = f"{MODEL_DIR}/model.tmp.keras"
+FINAL_MODEL_NAME = "model.keras"
+
 TEMP_SCALER_PATH = f"{MODEL_DIR}/scaler.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 LOOKBACK_WINDOW = 60
-EPOCHS = 50
+EPOCHS = 40
 BATCH_SIZE = 32
+
+MIN_SHARPE = 0.25
+MAX_DRAWDOWN = -0.40
 
 SEED = 42
 
@@ -39,6 +42,11 @@ SEED = 42
 def set_seeds():
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
+
+    tf.config.set_visible_devices([], "GPU")
+
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
 
 
 # ---------------------------------------------------
@@ -60,12 +68,7 @@ def load_data():
     if df.empty:
         raise ValueError("No price data fetched for LSTM training")
 
-    prices = df[["close"]].values
-
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(prices)
-
-    return df, scaled, scaler, end_date
+    return df, end_date
 
 
 # ---------------------------------------------------
@@ -84,16 +87,78 @@ def create_sequences(data, lookback):
 
 
 # ---------------------------------------------------
-# TRAIN
+# TRAIN SINGLE WINDOW
 # ---------------------------------------------------
 
-def train():
+def train_model(train_prices):
 
-    print("\n🚀 Starting LSTM training...\n")
+    scaler = MinMaxScaler()
 
-    set_seeds()
+    scaled_train = scaler.fit_transform(
+        train_prices.reshape(-1, 1)
+    )
 
-    df, scaled, scaler, end_date = load_data()
+    X, y = create_sequences(scaled_train, LOOKBACK_WINDOW)
+
+    model = build_lstm_model((LOOKBACK_WINDOW, 1))
+
+    early_stop = EarlyStopping(
+        monitor="loss",
+        patience=3,
+        restore_best_weights=True
+    )
+
+    model.fit(
+        X,
+        y,
+        epochs=10,
+        batch_size=BATCH_SIZE,
+        verbose=0,
+        callbacks=[early_stop]
+    )
+
+    return model, scaler
+
+
+# ---------------------------------------------------
+# SIGNAL GENERATOR
+# ---------------------------------------------------
+
+def generate_signals(model_scaler_tuple, test_df):
+
+    model, scaler = model_scaler_tuple
+
+    prices = test_df["close"].values.reshape(-1, 1)
+    scaled = scaler.transform(prices)
+
+    signals = []
+
+    for i in range(LOOKBACK_WINDOW, len(scaled)):
+
+        seq = scaled[i-LOOKBACK_WINDOW:i].reshape(1, LOOKBACK_WINDOW, 1)
+
+        pred = model.predict(seq, verbose=0)[0][0]
+
+        if pred > scaled[i-1]:
+            signals.append("BUY")
+        else:
+            signals.append("SELL")
+
+    signals = ["HOLD"] * LOOKBACK_WINDOW + signals
+
+    return signals
+
+
+# ---------------------------------------------------
+# FINAL TRAIN
+# ---------------------------------------------------
+
+def train_full_model(df):
+
+    prices = df["close"].values
+
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(prices.reshape(-1, 1))
 
     X, y = create_sequences(scaled, LOOKBACK_WINDOW)
 
@@ -110,42 +175,19 @@ def train():
         restore_best_weights=True
     )
 
-    checkpoint = ModelCheckpoint(
-        TEMP_MODEL_PATH,
-        monitor="val_loss",
-        save_best_only=True
-    )
-
-    history = model.fit(
+    model.fit(
         X_train,
         y_train,
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         validation_data=(X_test, y_test),
-        callbacks=[early_stop, checkpoint],
+        callbacks=[early_stop],
         verbose=1
     )
 
-    best_val_loss = float(min(history.history["val_loss"]))
+    val_loss = float(min(model.history.history["val_loss"]))
 
-    print(f"\n✅ Best validation loss: {best_val_loss}\n")
-
-    # ---------------------------------------------------
-    # DATASET FINGERPRINT
-    # ---------------------------------------------------
-
-    dataset_hash = MetadataManager.fingerprint_dataset(df)
-
-    metadata = MetadataManager.create_metadata(
-        model_name="lstm_price_forecast",
-        metrics={"val_loss": best_val_loss},
-        features=["close_sequence"],
-        training_start="2018-01-01",
-        training_end=end_date,
-        dataset_hash=dataset_hash
-    )
-
-    return scaler, metadata
+    return model, scaler, val_loss
 
 
 # ---------------------------------------------------
@@ -154,17 +196,56 @@ def train():
 
 if __name__ == "__main__":
 
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    print("\nInstitutional LSTM Training\n")
 
-    scaler, metadata = train()
+    set_seeds()
 
-    # Save temporary artifacts
+    df, end_date = load_data()
+
+    dataset_hash = MetadataManager.fingerprint_dataset(df)
+
+    # ---------------------------------------------------
+    # WALK FORWARD
+    # ---------------------------------------------------
+
+    wf = WalkForwardValidator(
+        model_trainer=lambda d: train_model(d["close"].values),
+        signal_generator=generate_signals
+    )
+
+    strategy_metrics = wf.run(df)
+
+    if strategy_metrics["avg_sharpe"] < MIN_SHARPE:
+        raise RuntimeError("LSTM rejected — Sharpe too low")
+
+    if strategy_metrics["max_drawdown"] < MAX_DRAWDOWN:
+        raise RuntimeError("LSTM rejected — drawdown too high")
+
+    print("Strategy passed governance.\n")
+
+    # ---------------------------------------------------
+    # FINAL TRAIN
+    # ---------------------------------------------------
+
+    model, scaler, val_loss = train_full_model(df)
+
+    # SAFE SAVE
+    model.save(TEMP_MODEL_PATH)
+
+    metadata = MetadataManager.create_metadata(
+        model_name="lstm_price_forecast",
+        metrics={
+            "val_loss": val_loss,
+            **strategy_metrics
+        },
+        features=["close_sequence"],
+        training_start="2018-01-01",
+        training_end=end_date,
+        dataset_hash=dataset_hash
+    )
+
     joblib.dump(scaler, TEMP_SCALER_PATH)
     MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
-
-    # ---------------------------------------------------
-    # REGISTER MODEL
-    # ---------------------------------------------------
 
     version_dir = ModelRegistry.register_model(
         MODEL_DIR,
@@ -172,11 +253,10 @@ if __name__ == "__main__":
         TEMP_METADATA_PATH
     )
 
-    # SAFE MOVE (never rename)
     shutil.move(
         TEMP_SCALER_PATH,
         os.path.join(version_dir, "scaler.pkl")
     )
 
-    print("✅ LSTM model registered successfully.")
-    print(f"📦 Version directory: {version_dir}")
+    print("LSTM registered.")
+    print(f"Version: {version_dir}")
