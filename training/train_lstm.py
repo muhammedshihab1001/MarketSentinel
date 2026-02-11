@@ -13,7 +13,6 @@ from tensorflow.keras.callbacks import EarlyStopping
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
-from core.monitoring.drift_detector import DriftDetector
 from training.backtesting.walk_forward import WalkForwardValidator
 from models.lstm_model import build_lstm_model
 
@@ -40,15 +39,11 @@ TRAINING_TICKERS = [
 ]
 
 
-# ---------------------------------------------------
-# DETERMINISM + CPU LOCK
-# ---------------------------------------------------
-
 def set_seeds():
 
     os.environ["TF_DETERMINISTIC_OPS"] = "1"
     os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # FORCE CPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
@@ -59,10 +54,6 @@ def set_seeds():
     tf.config.threading.set_inter_op_parallelism_threads(1)
 
 
-# ---------------------------------------------------
-# ATOMIC SAVE
-# ---------------------------------------------------
-
 def atomic_save_model(model, path):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -71,10 +62,6 @@ def atomic_save_model(model, path):
     model.save(tmp)
     os.replace(tmp, path)
 
-
-# ---------------------------------------------------
-# DATA
-# ---------------------------------------------------
 
 def load_data():
 
@@ -112,8 +99,6 @@ def load_data():
     return df.reset_index(drop=True), end_date
 
 
-# ---------------------------------------------------
-
 def create_sequences(data, lookback):
 
     X, y = [], []
@@ -124,8 +109,6 @@ def create_sequences(data, lookback):
 
     return np.array(X), np.array(y)
 
-
-# ---------------------------------------------------
 
 def train_window_model(train_df):
 
@@ -174,8 +157,6 @@ def generate_signals(model_scaler, test_df):
     return ["HOLD"] * LOOKBACK_WINDOW + signals
 
 
-# ---------------------------------------------------
-
 def train_full_model(df):
 
     prices = df["close"].values.reshape(-1, 1)
@@ -213,37 +194,6 @@ def train_full_model(df):
     return model, scaler, val_loss
 
 
-# ---------------------------------------------------
-
-def ensure_baseline(df, dataset_hash):
-
-    detector = DriftDetector()
-
-    if os.path.exists(detector.BASELINE_PATH):
-        return
-
-    # baseline expects feature-like structure
-    baseline_df = pd.DataFrame({
-        "return": df["close"].pct_change().fillna(0),
-        "volatility": df["close"].pct_change().rolling(5).std().fillna(0),
-        "rsi": 50,
-        "macd": 0,
-        "macd_signal": 0,
-        "avg_sentiment": 0,
-        "news_count": 0,
-        "sentiment_std": 0,
-        "return_lag1": 0,
-        "sentiment_lag1": 0
-    })
-
-    detector.create_baseline(
-        baseline_df,
-        dataset_hash=dataset_hash
-    )
-
-
-# ---------------------------------------------------
-
 if __name__ == "__main__":
 
     print("Institutional LSTM Training")
@@ -253,8 +203,6 @@ if __name__ == "__main__":
     df, end_date = load_data()
 
     dataset_hash = MetadataManager.fingerprint_dataset(df)
-
-    ensure_baseline(df, dataset_hash)
 
     wf = WalkForwardValidator(
         model_trainer=train_window_model,
