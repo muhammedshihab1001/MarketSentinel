@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 import math
+import os
 
 from core.risk.position_sizer import PositionSizer
 
@@ -11,17 +12,25 @@ from core.risk.position_sizer import PositionSizer
 
 @dataclass(frozen=True)
 class SignalConfig:
-    prob_threshold: float = 0.60
-    sentiment_threshold: float = 0.10
-    volatility_cap: float = 0.05
-    min_expected_return: float = 0.02
 
-    min_confidence: float = 0.25
+    prob_threshold: float = 0.62
+    sentiment_threshold: float = 0.12
+
+    volatility_cap: float = 0.05
+    volatility_throttle: float = 0.035
+
+    min_expected_return: float = 0.025
+    min_confidence: float = 0.30
 
     portfolio_value: float = 100_000
 
-    # HARD CAPITAL GUARD
-    max_position_pct: float = 0.10   # never deploy >10%
+    max_position_pct: float = 0.08
+    max_total_exposure_pct: float = 0.35
+
+    global_kill_switch: bool = (
+        os.getenv("GLOBAL_TRADING_DISABLED", "false")
+        .lower() == "true"
+    )
 
 
 # ---------------------------------------------------
@@ -43,30 +52,42 @@ def _clamp(v, lo, hi):
 # ---------------------------------------------------
 
 class ForecastInterpreter:
+    """
+    Converts model output into normalized conviction.
+    """
 
     def interpret(
         self,
         predicted_return: float,
         sentiment: float,
-        rsi: float
+        rsi: float,
+        volatility: float
     ) -> Tuple[str, float]:
 
         predicted_return = _safe(predicted_return)
         sentiment = _safe(sentiment)
         rsi = _safe(rsi, 50)
+        volatility = _safe(volatility)
 
-        confidence = (
-            abs(predicted_return) * 0.5 +
-            abs(sentiment) * 0.3 +
-            abs(50 - rsi) / 50 * 0.2
+        # nonlinear RSI compression
+        rsi_component = math.tanh(abs(50 - rsi) / 25)
+
+        base_confidence = (
+            abs(predicted_return) * 0.45 +
+            abs(sentiment) * 0.25 +
+            rsi_component * 0.15
         )
+
+        # volatility dampening
+        vol_penalty = min(volatility / 0.05, 1.0)
+        confidence = base_confidence * (1 - 0.4 * vol_penalty)
 
         confidence = _clamp(confidence, 0.0, 1.0)
 
-        if predicted_return > 0.02 and sentiment > 0 and rsi < 70:
+        if predicted_return > 0.025 and sentiment > 0 and rsi < 72:
             return "BUY", round(confidence, 3)
 
-        if predicted_return < -0.02 and sentiment < 0:
+        if predicted_return < -0.025 and sentiment < 0:
             return "SELL", round(confidence, 3)
 
         return "HOLD", round(confidence, 3)
@@ -85,13 +106,19 @@ class RiskGate:
         self,
         signal: str,
         prob_up: float,
-        volatility: float | None
+        volatility: float | None,
+        regime: str | None
     ) -> bool:
 
         prob_up = _safe(prob_up, 0.5)
-        volatility = _safe(volatility, 0.0)
+        volatility = _safe(volatility)
+        regime = (regime or "").upper()
 
         if volatility > self.config.volatility_cap:
+            return False
+
+        # regime firewall
+        if regime == "CRISIS":
             return False
 
         if signal == "BUY" and prob_up < self.config.prob_threshold:
@@ -127,7 +154,6 @@ class EnsembleArbiter:
         last = _safe(lstm_prices[-1], first)
 
         expected_return = (last - first) / first
-
         trend = str(prophet_trend).upper()
 
         if (
@@ -174,13 +200,19 @@ class DecisionEngine:
         prob_up: float,
         volatility: float,
         lstm_prices: List[float],
-        prophet_trend: str
+        prophet_trend: str,
+        regime: str | None = None
     ) -> Dict:
+
+        # GLOBAL KILL SWITCH
+        if self.config.global_kill_switch:
+            return self._hold(0.0)
 
         base_signal, confidence = self.interpreter.interpret(
             predicted_return,
             sentiment,
-            rsi
+            rsi,
+            volatility
         )
 
         if confidence < self.config.min_confidence:
@@ -189,7 +221,8 @@ class DecisionEngine:
         if not self.risk_gate.allow(
             base_signal,
             prob_up,
-            volatility
+            volatility,
+            regime
         ):
             return self._hold(confidence)
 
@@ -204,26 +237,34 @@ class DecisionEngine:
         if final_signal == "HOLD":
             return self._hold(confidence)
 
+        # volatility throttle
+        vol_scale = 1.0
+        if volatility > self.config.volatility_throttle:
+            vol_scale = max(
+                0.25,
+                1 - (volatility / 0.10)
+            )
+
         allocation = self.position_sizer.size_position(
             signal=final_signal,
-            confidence=confidence,
+            confidence=confidence * vol_scale,
             volatility=volatility,
             portfolio_value=self.config.portfolio_value
         )
 
         # HARD CAPITAL CEILING
-        max_allowed = (
+        max_position = (
             self.config.portfolio_value *
             self.config.max_position_pct
         )
 
-        allocation = min(allocation, max_allowed)
+        allocation = min(allocation, max_position)
 
         position_pct = allocation / self.config.portfolio_value
 
         return {
             "signal": final_signal,
-            "confidence": confidence,
+            "confidence": round(confidence, 3),
             "allocation": round(allocation, 2),
             "position_pct": round(position_pct, 4)
         }
@@ -234,14 +275,14 @@ class DecisionEngine:
 
         return {
             "signal": "HOLD",
-            "confidence": confidence,
+            "confidence": round(confidence, 3),
             "allocation": 0.0,
             "position_pct": 0.0
         }
 
 
 # ===================================================
-# STRATEGY ENGINE (unchanged)
+# STRATEGY ENGINE
 # ===================================================
 
 class StrategyEngine:
@@ -272,7 +313,7 @@ class StrategyEngine:
         return [
             p for p in predictions
             if p.get("signal_today") == "SELL"
-            and p.get("confidence", 0) > 0.6
+            and p.get("confidence", 0) > 0.65
         ]
 
     def signal_distribution(
