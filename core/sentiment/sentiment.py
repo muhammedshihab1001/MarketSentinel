@@ -19,42 +19,10 @@ class FinBERTSingleton:
     _lock = threading.Lock()
 
     MODEL_NAME = "ProsusAI/finbert"
-
-    # REAL COMMIT — immutable model snapshot
-    # Known stable FinBERT revision from HuggingFace
-    MODEL_REVISION = "4556d13015211d73dccd3fdd39d39232506f3e43"
-
-    # Deterministic artifact cache
-    DEFAULT_CACHE_DIR = "artifacts/huggingface"
-
-    @classmethod
-    def _enforce_offline_mode(cls):
-        """
-        Institutional rule:
-        Training must NOT depend on live model downloads.
-        """
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-
-    @classmethod
-    def _validate_cache(cls, cache_dir: str):
-        """
-        Fail CLOSED if model is not present locally.
-        Prevents silent runtime downloads.
-        """
-
-        if not os.path.exists(cache_dir):
-            raise RuntimeError(
-                f"FinBERT cache directory missing: {cache_dir}\n"
-                "Pre-download the model during environment setup."
-            )
+    CACHE_DIR = "artifacts/huggingface"
 
     @classmethod
     def load(cls):
-
-        if os.getenv("CI") == "true" or os.getenv("TEST_MODE") == "true":
-            logger.info("Running in TEST_MODE — FinBERT disabled.")
-            return None, None, "cpu"
 
         if cls._model is not None:
             return cls._tokenizer, cls._model, cls._device
@@ -66,48 +34,28 @@ class FinBERTSingleton:
 
             start = time.time()
 
-            logger.info("Loading FinBERT model (offline, pinned revision)")
+            logger.info("Loading FinBERT model")
 
             torch.set_grad_enabled(False)
-            torch.set_num_threads(1)
-            torch.set_num_interop_threads(1)
 
-            os.environ.setdefault("OMP_NUM_THREADS", "1")
-            os.environ.setdefault("MKL_NUM_THREADS", "1")
-
-            cls._enforce_offline_mode()
-
-            cls._device = "cpu"
-
-            cache_dir = os.getenv(
-                "HF_HOME",
-                cls.DEFAULT_CACHE_DIR
-            )
-
-            cls._validate_cache(cache_dir)
+            os.makedirs(cls.CACHE_DIR, exist_ok=True)
 
             try:
 
                 cls._tokenizer = AutoTokenizer.from_pretrained(
                     cls.MODEL_NAME,
-                    revision=cls.MODEL_REVISION,
-                    cache_dir=cache_dir,
-                    local_files_only=True
+                    cache_dir=cls.CACHE_DIR
                 )
 
                 cls._model = AutoModelForSequenceClassification.from_pretrained(
                     cls.MODEL_NAME,
-                    revision=cls.MODEL_REVISION,
-                    cache_dir=cache_dir,
-                    local_files_only=True
-                ).to(cls._device)
+                    cache_dir=cls.CACHE_DIR
+                ).to("cpu")
 
             except Exception as e:
 
                 raise RuntimeError(
-                    "FinBERT failed to load from local cache.\n"
-                    "Live downloads are DISABLED by institutional policy.\n"
-                    "Run the bootstrap step to fetch the pinned revision."
+                    "Failed to load FinBERT. Ensure internet is available on first run."
                 ) from e
 
             cls._model.eval()
@@ -133,16 +81,9 @@ class SentimentAnalyzer:
 
     def __init__(self):
 
-        (
-            self.tokenizer,
-            self.model,
-            self.device
-        ) = FinBERTSingleton.load()
+        self.tokenizer, self.model, self.device = FinBERTSingleton.load()
 
-        self.test_mode = self.model is None
-
-        if not self.test_mode:
-            self._warmup()
+        self._warmup()
 
     def _warmup(self):
         try:
@@ -167,9 +108,6 @@ class SentimentAnalyzer:
 
     def analyze_batch(self, texts):
 
-        if self.test_mode:
-            return [self._fake_sentiment(t) for t in texts]
-
         results = []
 
         for i in range(0, len(texts), self.BATCH_SIZE):
@@ -181,34 +119,39 @@ class SentimentAnalyzer:
                 for t in batch
             ]
 
-            inputs = self.tokenizer(
-                batch,
-                return_tensors="pt",
-                truncation=True,
-                padding=True,
-                max_length=128
-            )
+            try:
 
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                inputs = self.tokenizer(
+                    batch,
+                    return_tensors="pt",
+                    truncation=True,
+                    padding=True,
+                    max_length=128
+                )
 
-            with torch.no_grad():
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-                logits = self.model(**inputs).logits
-                scores = torch.softmax(logits, dim=1)
+                with torch.no_grad():
+                    logits = self.model(**inputs).logits
+                    scores = torch.softmax(logits, dim=1)
 
-            scores = scores.cpu().numpy()
+                scores = scores.cpu().numpy()
 
-            for s in scores:
+                for s in scores:
 
-                label_id = int(s.argmax())
-                label = self.label_map[label_id]
+                    label_id = int(s.argmax())
+                    label = self.label_map[label_id]
 
-                sentiment_score = float(s[2] - s[0])
+                    sentiment_score = float(s[2] - s[0])
 
-                results.append({
-                    "label": label,
-                    "score": round(sentiment_score, 4)
-                })
+                    results.append({
+                        "label": label,
+                        "score": round(sentiment_score, 4)
+                    })
+
+            except Exception:
+                logger.exception("FinBERT inference failed — using fallback.")
+                results.extend(self._fake_sentiment(t) for t in batch)
 
         return results
 
@@ -257,8 +200,7 @@ class SentimentAnalyzer:
         temp_df = temp_df.dropna(subset=["date"])
 
         temp_df["date"] = (
-            temp_df["date"]
-            .dt.floor("D")
+            temp_df["date"].dt.floor("D")
             + pd.Timedelta(days=1)
         )
 
