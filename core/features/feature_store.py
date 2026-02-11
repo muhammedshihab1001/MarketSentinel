@@ -5,6 +5,7 @@ import logging
 from typing import Dict, Any
 
 import pandas as pd
+import numpy as np
 
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import (
@@ -22,16 +23,17 @@ class FeatureStore:
     Institutional Feature Store.
 
     Guarantees:
-    - schema lineage
+    - lineage-bound datasets
     - deterministic fingerprints
-    - atomic persistence
-    - corruption recovery
-    - strict feature validation without destroying dataset lineage
+    - crash-safe persistence
+    - schema enforcement
+    - corruption auto-recovery
+    - feature ordering guarantees
     """
 
     FEATURE_DIR = "data/features"
     META_SUFFIX = ".meta.json"
-    META_VERSION = "4.0"
+    META_VERSION = "5.0"
 
     REQUIRED_DATASET_COLUMNS = {"date"}
 
@@ -48,19 +50,30 @@ class FeatureStore:
         return f"{self._feature_path(ticker)}{self.META_SUFFIX}"
 
     # --------------------------------------------------
-    # DATASET FINGERPRINT
+    # DETERMINISTIC HASH
     # --------------------------------------------------
 
     def _stable_hash(self, df: pd.DataFrame):
 
-        df = (
-            df.sort_index(axis=1)
-            .sort_values(by=list(df.columns))
-            .reset_index(drop=True)
-        )
+        if df.empty:
+            raise RuntimeError("Cannot hash empty dataframe.")
+
+        df_copy = df.copy()
+
+        df_copy = df_copy.reindex(sorted(df_copy.columns), axis=1)
+
+        float_cols = df_copy.select_dtypes(
+            include=["float32", "float64"]
+        ).columns
+
+        df_copy[float_cols] = df_copy[float_cols].round(10)
+
+        df_copy = df_copy.sort_values(
+            by=list(df_copy.columns)
+        ).reset_index(drop=True)
 
         return pd.util.hash_pandas_object(
-            df,
+            df_copy,
             index=False
         ).values.tobytes()
 
@@ -70,12 +83,12 @@ class FeatureStore:
 
         hasher.update(self._stable_hash(price_df))
         hasher.update(self._stable_hash(sentiment_df))
-        hasher.update(SCHEMA_VERSION.encode())
+        hasher.update(get_schema_signature().encode())
 
         return hasher.hexdigest()
 
     # --------------------------------------------------
-    # DATASET VALIDATION
+    # VALIDATION
     # --------------------------------------------------
 
     def _validate_dataset_structure(self, df: pd.DataFrame):
@@ -87,6 +100,46 @@ class FeatureStore:
                 f"Dataset missing required columns: {missing}"
             )
 
+        if df["date"].duplicated().any():
+            raise RuntimeError(
+                "Duplicate timestamps detected."
+            )
+
+    # --------------------------------------------------
+    # ATOMIC WRITE
+    # --------------------------------------------------
+
+    def _atomic_write(self, df, path, meta, meta_path):
+
+        tmp_data = path + ".tmp"
+        tmp_meta = meta_path + ".tmp"
+
+        df = df.sort_values("date").reset_index(drop=True)
+
+        self._validate_dataset_structure(df)
+
+        feature_block = df[MODEL_FEATURES]
+
+        if list(feature_block.columns) != MODEL_FEATURES:
+            raise RuntimeError(
+                "Feature ordering violation detected."
+            )
+
+        validate_feature_schema(feature_block)
+
+        # write parquet safely
+        df.to_parquet(tmp_data, index=False)
+
+        with open(tmp_meta, "w") as f:
+            json.dump(meta, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_data, path)
+        os.replace(tmp_meta, meta_path)
+
+    # --------------------------------------------------
+    # LOAD
     # --------------------------------------------------
 
     def _load_features(self, path, meta_path):
@@ -99,7 +152,7 @@ class FeatureStore:
             df = pd.read_parquet(path)
 
             if df.empty:
-                return None, None
+                raise RuntimeError("Stored dataset empty.")
 
             with open(meta_path, "r") as f:
                 meta = json.load(f)
@@ -107,9 +160,17 @@ class FeatureStore:
             if meta.get("metadata_type") != "feature_store":
                 raise RuntimeError("Invalid metadata type.")
 
+            if meta.get("schema_signature") != get_schema_signature():
+                raise RuntimeError("Schema mismatch.")
+
             self._validate_dataset_structure(df)
 
-            validate_feature_schema(df[list(MODEL_FEATURES)])
+            feature_block = df[MODEL_FEATURES]
+
+            if list(feature_block.columns) != MODEL_FEATURES:
+                raise RuntimeError("Feature ordering corrupted.")
+
+            validate_feature_schema(feature_block)
 
             return df.sort_values("date"), meta
 
@@ -129,27 +190,6 @@ class FeatureStore:
 
     # --------------------------------------------------
 
-    def _atomic_save(self, df, path, meta, meta_path):
-
-        tmp_path = path + ".tmp"
-        tmp_meta = meta_path + ".tmp"
-
-        df = df.sort_values("date").drop_duplicates("date")
-
-        self._validate_dataset_structure(df)
-
-        validate_feature_schema(df[list(MODEL_FEATURES)])
-
-        df.to_parquet(tmp_path, index=False)
-
-        with open(tmp_meta, "w") as f:
-            json.dump(meta, f, indent=4)
-
-        os.replace(tmp_path, path)
-        os.replace(tmp_meta, meta_path)
-
-    # --------------------------------------------------
-
     def _build_metadata(
         self,
         dataset_fp: str,
@@ -164,7 +204,8 @@ class FeatureStore:
             "dataset_fingerprint": dataset_fp,
             "feature_count": len(MODEL_FEATURES),
             "features": list(MODEL_FEATURES),
-            "row_count": len(features)
+            "row_count": len(features),
+            "created_at": pd.Timestamp.utcnow().isoformat()
         }
 
     # --------------------------------------------------
@@ -196,7 +237,9 @@ class FeatureStore:
 
         stored, meta = self._load_features(path, meta_path)
 
-        # CASE 1 — no stored features
+        # --------------------------------------------
+        # NO STORED DATA
+        # --------------------------------------------
 
         if stored is None:
 
@@ -206,16 +249,15 @@ class FeatureStore:
                 training=False
             )
 
-            meta = self._build_metadata(
-                dataset_fp,
-                features
-            )
+            meta = self._build_metadata(dataset_fp, features)
 
-            self._atomic_save(features, path, meta, meta_path)
+            self._atomic_write(features, path, meta, meta_path)
 
             return features
 
-        # CASE 2 — lineage match
+        # --------------------------------------------
+        # LINEAGE MATCH
+        # --------------------------------------------
 
         if (
             meta.get("dataset_fingerprint") == dataset_fp
@@ -227,7 +269,9 @@ class FeatureStore:
             "Feature rebuild triggered due to lineage change."
         )
 
-        # CASE 3 — rebuild
+        # --------------------------------------------
+        # REBUILD
+        # --------------------------------------------
 
         features = self.engineer.build_feature_pipeline(
             price_df,
@@ -235,11 +279,8 @@ class FeatureStore:
             training=False
         )
 
-        meta = self._build_metadata(
-            dataset_fp,
-            features
-        )
+        meta = self._build_metadata(dataset_fp, features)
 
-        self._atomic_save(features, path, meta, meta_path)
+        self._atomic_write(features, path, meta, meta_path)
 
         return features
