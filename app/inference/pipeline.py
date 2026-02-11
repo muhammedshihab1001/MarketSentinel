@@ -38,10 +38,6 @@ from app.monitoring.metrics import (
 logger = logging.getLogger("marketsentinel.pipeline")
 
 
-# =====================================================
-# CIRCUIT BREAKER
-# =====================================================
-
 class CircuitBreaker:
 
     def __init__(self, threshold=3, cooldown=120):
@@ -77,8 +73,6 @@ class CircuitBreaker:
         with self._lock:
             self.failures = 0
 
-
-# =====================================================
 
 class InferencePipeline:
 
@@ -164,7 +158,18 @@ class InferencePipeline:
                 f"Feature mismatch detected. Missing: {missing}"
             )
 
-        return latest_row.loc[list(MODEL_FEATURES)].values.reshape(1, -1)
+        vector = latest_row.loc[list(MODEL_FEATURES)].astype("float32")
+
+        null_ratio = float(np.isnan(vector).mean())
+
+        MISSING_FEATURE_RATIO.set(null_ratio)
+
+        if null_ratio > self.MAX_NULL_RATIO:
+            raise RuntimeError(
+                f"Null feature ratio exceeded: {null_ratio:.3f}"
+            )
+
+        return vector.values.reshape(1, -1)
 
     # ---------------------------------------------------
 
@@ -197,8 +202,10 @@ class InferencePipeline:
 
         try:
 
-            # MODEL VERSION SAFE CACHE
-            model_version = self.models.get_production_version("xgboost")
+            # POINTER SAFE VERSION RESOLUTION
+            _, model_version = self.models._resolve_production_dir(
+                "artifacts/xgboost"
+            )
 
             payload = {
                 "ticker": ticker,
@@ -259,6 +266,8 @@ class InferencePipeline:
                 MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
                 MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
 
+                PREDICTION_CLASS_PROBABILITY.set(float(prob_up))
+
                 predicted_return = prob_up - 0.5
 
                 decision = self.decision_engine.generate(
@@ -289,7 +298,6 @@ class InferencePipeline:
 
                 self.cache.set(cache_key, response, ttl=900)
 
-                # GLOBAL TIMEOUT
                 if (time.time() - start_pipeline) > self.HARD_PIPELINE_TIMEOUT:
                     raise RuntimeError("Pipeline exceeded hard timeout.")
 
