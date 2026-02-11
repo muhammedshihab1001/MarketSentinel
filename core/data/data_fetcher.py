@@ -5,9 +5,8 @@ import hashlib
 import logging
 import os
 import random
-import requests
-
 from datetime import datetime
+from packaging import version
 
 logger = logging.getLogger("marketsentinel.fetcher")
 
@@ -42,17 +41,21 @@ class StockPriceFetcher:
 
     CACHE_DIR = "data/cache"
 
-    # NEW — persistent session prevents Yahoo blocking
-    SESSION = requests.Session()
-    SESSION.headers.update({
-        "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        " AppleWebKit/537.36 (KHTML, like Gecko)"
-        " Chrome/120.0 Safari/537.36"
-    })
-
     def __init__(self):
         os.makedirs(self.CACHE_DIR, exist_ok=True)
+        self._validate_yfinance_version()
+
+    # =====================================================
+
+    def _validate_yfinance_version(self):
+        """
+        Ensure runtime compatibility with modern yfinance.
+        """
+
+        if version.parse(yf.__version__) < version.parse("0.2.36"):
+            logger.warning(
+                "Old yfinance detected. Consider upgrading."
+            )
 
     # =====================================================
 
@@ -142,7 +145,6 @@ class StockPriceFetcher:
         tmp = cache_file + ".tmp"
 
         df.to_parquet(tmp, index=False)
-
         os.replace(tmp, cache_file)
 
     # =====================================================
@@ -173,7 +175,7 @@ class StockPriceFetcher:
 
         cache_file = f"{self.CACHE_DIR}/{cache_name}.parquet"
 
-        # Try cache first
+        # Cache first
         if os.path.exists(cache_file):
 
             try:
@@ -195,7 +197,6 @@ class StockPriceFetcher:
 
                 os.remove(cache_file)
 
-        # Fetch from Yahoo
         try:
 
             df = self._fetch_yahoo(
@@ -207,7 +208,6 @@ class StockPriceFetcher:
 
         except Exception as e:
 
-            # ⭐ FALLBACK — use stale cache if available
             if os.path.exists(cache_file):
 
                 logger.warning(
@@ -259,8 +259,7 @@ class StockPriceFetcher:
                     interval=interval,
                     auto_adjust=True,
                     progress=False,
-                    threads=False,
-                    session=self.SESSION  #  anti-block
+                    threads=False
                 )
 
                 if df.empty:
@@ -274,7 +273,14 @@ class StockPriceFetcher:
 
             except Exception as e:
 
-                # exponential backoff + jitter
+                msg = str(e)
+
+                # Stop retrying on transport/config errors
+                if "curl_cffi" in msg or "session" in msg:
+                    raise RuntimeError(
+                        "Yahoo transport error — likely library incompatibility."
+                    ) from e
+
                 sleep_time = (
                     self.BASE_SLEEP * (2 ** attempt)
                     + random.uniform(0, 1)
