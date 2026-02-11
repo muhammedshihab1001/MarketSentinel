@@ -7,8 +7,6 @@ import hashlib
 import logging
 
 from datetime import datetime, timedelta
-from typing import List
-
 
 logger = logging.getLogger("marketsentinel.fetcher")
 
@@ -18,10 +16,11 @@ class StockPriceFetcher:
     Institutional Market Data Fetcher.
 
     Guarantees:
-    - provider validation
+    - timezone normalization (UTC naive)
+    - numeric enforcement
     - deterministic datasets
-    - corruption recovery
-    - canonical schema
+    - cache safety
+    - provider fallback
     """
 
     REQUIRED_COLUMNS = {
@@ -34,7 +33,6 @@ class StockPriceFetcher:
     }
 
     MIN_ROWS = 120
-
     MAX_RETRIES = 5
     BASE_SLEEP = 1.5
 
@@ -48,13 +46,36 @@ class StockPriceFetcher:
         os.makedirs(self.DATASET_DIR, exist_ok=True)
 
     # =====================================================
-    # VALIDATION
+    # NORMALIZATION (VERY IMPORTANT)
+    # =====================================================
+
+    def _normalize_schema(self, df: pd.DataFrame) -> pd.DataFrame:
+
+        df = df.rename(columns=str.lower)
+
+        if "adj close" in df.columns:
+            df.drop(columns=["adj close"], inplace=True)
+
+        df["date"] = pd.to_datetime(df["date"], utc=True)\
+            .dt.tz_convert(None)
+
+        numeric_cols = ["open", "high", "low", "close", "volume"]
+
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df.dropna(subset=numeric_cols)
+
+        return df
+
     # =====================================================
 
     def _validate_dataset(self, df: pd.DataFrame):
 
         if df is None or df.empty:
             raise RuntimeError("Provider returned empty dataset.")
+
+        df = self._normalize_schema(df)
 
         missing = self.REQUIRED_COLUMNS - set(df.columns)
 
@@ -71,47 +92,22 @@ class StockPriceFetcher:
 
         df = df.drop_duplicates("date")
 
+        df = df.sort_values("date")
+
+        if not df["date"].is_monotonic_increasing:
+            raise RuntimeError("Non-monotonic timestamps detected.")
+
         if len(df) < self.MIN_ROWS:
             raise RuntimeError("Dataset too small for safe usage.")
 
-        return df.sort_values("date")
+        return df.reset_index(drop=True)
 
     # =====================================================
 
-    def _hash_dataset(self, df: pd.DataFrame) -> str:
+    def _cache_key(self, ticker, start, end, interval):
 
-        df = df.sort_values("date")
-
-        data_bytes = pd.util.hash_pandas_object(
-            df,
-            index=True
-        ).values.tobytes()
-
-        return hashlib.sha256(data_bytes).hexdigest()
-
-    # -----------------------------------------------------
-
-    def _snapshot_dataset(self, ticker: str, df: pd.DataFrame):
-
-        dataset_hash = self._hash_dataset(df)
-
-        ticker_dir = os.path.join(
-            self.DATASET_DIR,
-            ticker.upper()
-        )
-
-        os.makedirs(ticker_dir, exist_ok=True)
-
-        path = os.path.join(
-            ticker_dir,
-            f"{dataset_hash}.parquet"
-        )
-
-        if not os.path.exists(path):
-            df.to_parquet(path, index=False)
-            logger.info(f"Dataset snapshot saved → {path}")
-
-        return dataset_hash
+        raw = f"{ticker}_{start}_{end}_{interval}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     # =====================================================
 
@@ -126,7 +122,14 @@ class StockPriceFetcher:
 
         self._validate_dates(start_date, end_date)
 
-        cache_file = f"{self.CACHE_DIR}/{ticker}_{interval}.parquet"
+        cache_name = self._cache_key(
+            ticker,
+            start_date,
+            end_date,
+            interval
+        )
+
+        cache_file = f"{self.CACHE_DIR}/{cache_name}.parquet"
 
         # ==========================================
         # LOAD CACHE
@@ -137,55 +140,9 @@ class StockPriceFetcher:
             try:
 
                 cached = pd.read_parquet(cache_file)
-
                 cached = self._validate_dataset(cached)
 
-                cache_start = cached["date"].min()
-                cache_end = cached["date"].max()
-
-                request_start = pd.to_datetime(start_date)
-                request_end = pd.to_datetime(end_date)
-
-                if cache_start <= request_start and cache_end >= request_end:
-
-                    logger.info(f"Loaded fully from cache: {ticker}")
-
-                    if snapshot:
-                        self._snapshot_dataset(ticker, cached)
-
-                    return cached
-
-                # incremental
-                missing_start = cache_end + timedelta(days=1)
-
-                if missing_start <= request_end:
-
-                    logger.info(
-                        f"Incremental update {missing_start.date()} → {request_end.date()}"
-                    )
-
-                    new_data = self._fetch_from_providers(
-                        ticker,
-                        missing_start.strftime("%Y-%m-%d"),
-                        end_date,
-                        interval
-                    )
-
-                    new_data = self._validate_dataset(new_data)
-
-                    combined = pd.concat(
-                        [cached, new_data],
-                        ignore_index=True
-                    )
-
-                    combined = self._validate_dataset(combined)
-
-                    combined.to_parquet(cache_file, index=False)
-
-                    if snapshot:
-                        self._snapshot_dataset(ticker, combined)
-
-                    return combined
+                logger.info(f"Loaded dataset from cache → {ticker}")
 
                 return cached
 
@@ -279,7 +236,7 @@ class StockPriceFetcher:
                     start=start_date,
                     end=end_date,
                     interval=interval,
-                    auto_adjust=False,  # CRITICAL
+                    auto_adjust=False,
                     progress=False,
                     threads=False
                 )
@@ -288,10 +245,6 @@ class StockPriceFetcher:
                     raise RuntimeError("Yahoo returned empty dataframe")
 
                 df.reset_index(inplace=True)
-
-                df = df.rename(columns=str.lower)
-
-                df["ticker"] = ticker
 
                 return df
 
@@ -339,17 +292,13 @@ class StockPriceFetcher:
             "Volume": "volume"
         }, inplace=True)
 
-        df["date"] = pd.to_datetime(df["date"])
-
         start = pd.to_datetime(start_date)
         end = pd.to_datetime(end_date)
 
         df = df.loc[
-            (df["date"] >= start) &
-            (df["date"] <= end)
+            (pd.to_datetime(df["date"]) >= start) &
+            (pd.to_datetime(df["date"]) <= end)
         ]
-
-        df["ticker"] = ticker
 
         return df
 
