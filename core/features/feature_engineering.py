@@ -176,8 +176,11 @@ class FeatureEngineer:
     def _post_feature_guard(cls, df):
 
         if len(df) < cls.MIN_ROWS_REQUIRED:
-            raise RuntimeError(
-                "Feature dataset too small for safe usage."
+            logger.error(
+                "Feature dataset below minimum rows (%s < %s). "
+                "Continuing to allow inference but signals may degrade.",
+                len(df),
+                cls.MIN_ROWS_REQUIRED
             )
 
     @staticmethod
