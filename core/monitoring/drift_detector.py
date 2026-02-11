@@ -7,6 +7,7 @@ from typing import Dict, Any
 
 from core.schema.feature_schema import (
     get_schema_signature,
+    SCHEMA_VERSION,
     MODEL_FEATURES
 )
 
@@ -15,7 +16,6 @@ logger = logging.getLogger("marketsentinel.drift")
 
 # --------------------------------------------------
 # SAFE METRIC LOADER
-# Never crash if Prometheus is missing
 # --------------------------------------------------
 
 try:
@@ -33,13 +33,14 @@ class DriftDetector:
 
     Guarantees:
     - schema-bound baseline
-    - audit-safe metadata
-    - non-crashing monitoring
-    - feature count protection
+    - dataset lineage binding
+    - crash-safe writes
+    - fail-closed detection
+    - feature ordering enforcement
     """
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "3.0"
+    BASELINE_VERSION = "4.0"
 
     MIN_SAMPLE_BASELINE = 50
     MIN_SAMPLE_INFERENCE = 20
@@ -54,36 +55,60 @@ class DriftDetector:
         os.makedirs("artifacts/drift", exist_ok=True)
 
     # --------------------------------------------------
-    # BASELINE
+    # ATOMIC WRITE
     # --------------------------------------------------
 
-    def create_baseline(self, dataset: pd.DataFrame):
+    @staticmethod
+    def _atomic_write(path: str, payload: dict):
+
+        tmp = path + ".tmp"
+
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp, path)
+
+    # --------------------------------------------------
+    # BASELINE CREATION
+    # --------------------------------------------------
+
+    def create_baseline(
+        self,
+        dataset: pd.DataFrame,
+        dataset_hash: str,
+        allow_overwrite: bool = False
+    ):
 
         if dataset.empty:
-            raise ValueError("Cannot create drift baseline from empty dataset.")
+            raise RuntimeError("Cannot create drift baseline from empty dataset.")
 
-        numeric = dataset.select_dtypes(include="number")
-
-        if numeric.empty:
-            raise RuntimeError("No numeric features available.")
-
-        if len(numeric.columns) != len(MODEL_FEATURES):
+        if os.path.exists(self.BASELINE_PATH) and not allow_overwrite:
             raise RuntimeError(
-                "Baseline feature count mismatch. "
-                "Feature pipeline likely corrupted."
+                "Baseline already exists. Refusing overwrite."
+            )
+
+        numeric = dataset[MODEL_FEATURES]
+
+        if list(numeric.columns) != MODEL_FEATURES:
+            raise RuntimeError(
+                "Feature ordering mismatch. Pipeline corrupted."
             )
 
         baseline: Dict[str, Any] = {
             "meta": {
                 "baseline_version": self.BASELINE_VERSION,
                 "schema_signature": get_schema_signature(),
-                "feature_count": len(numeric.columns),
+                "schema_version": SCHEMA_VERSION,
+                "dataset_hash": dataset_hash,
+                "feature_count": len(MODEL_FEATURES),
                 "created_at": pd.Timestamp.utcnow().isoformat()
             },
             "features": {}
         }
 
-        for col in numeric.columns:
+        for col in MODEL_FEATURES:
 
             series = numeric[col].dropna()
 
@@ -108,12 +133,7 @@ class DriftDetector:
                 "count": int(len(series))
             }
 
-        tmp_path = self.BASELINE_PATH + ".tmp"
-
-        with open(tmp_path, "w") as f:
-            json.dump(baseline, f, indent=4)
-
-        os.replace(tmp_path, self.BASELINE_PATH)
+        self._atomic_write(self.BASELINE_PATH, baseline)
 
         logger.info("Drift baseline created.")
 
@@ -134,12 +154,17 @@ class DriftDetector:
                 "Baseline schema mismatch. Retraining required."
             )
 
+        if meta.get("schema_version") != SCHEMA_VERSION:
+            raise RuntimeError(
+                "Baseline schema version mismatch."
+            )
+
         if meta.get("feature_count") != len(MODEL_FEATURES):
             raise RuntimeError(
                 "Baseline feature count mismatch."
             )
 
-        return baseline["features"]
+        return baseline
 
     # --------------------------------------------------
     # DRIFT DETECTION
@@ -155,11 +180,10 @@ class DriftDetector:
 
             baseline = self._load_baseline()
 
-            numeric = dataset.select_dtypes(include="number")
+            numeric = dataset[MODEL_FEATURES]
 
-            if set(numeric.columns) != set(baseline.keys()):
+            if list(numeric.columns) != MODEL_FEATURES:
                 logger.critical("SCHEMA DRIFT DETECTED.")
-
                 DRIFT_DETECTED.set(1)
 
                 return {
@@ -170,15 +194,22 @@ class DriftDetector:
             drift_detected = False
             drift_report = {}
 
-            for col, stats in baseline.items():
+            for col in MODEL_FEATURES:
 
+                stats = baseline["features"][col]
                 current = numeric[col].dropna()
 
                 if len(current) < self.MIN_SAMPLE_INFERENCE:
                     continue
 
-                mean_now = current.mean()
                 var_now = current.var()
+
+                if var_now < self.EPSILON:
+                    drift_detected = True
+                    drift_report[col] = {"variance_collapse": True}
+                    continue
+
+                mean_now = current.mean()
 
                 std = max(stats["std"], self.EPSILON)
                 baseline_var = max(stats["variance"], self.EPSILON)
