@@ -13,7 +13,11 @@ from prophet.serialize import model_from_json
 from models.lstm_model import forecast_lstm
 from models.prophet_model import forecast_prophet
 
-from core.schema.feature_schema import get_schema_signature
+from core.schema.feature_schema import (
+    get_schema_signature,
+    MODEL_FEATURES
+)
+
 from app.monitoring.metrics import MODEL_VERSION
 
 
@@ -27,6 +31,7 @@ class ModelLoader:
     Guarantees:
     - manifest hash verification
     - schema lock enforcement
+    - feature contract validation
     - lineage validation
     - pointer crash safety
     - atomic hot reload
@@ -172,11 +177,19 @@ class ModelLoader:
 
         meta_path = os.path.join(version_dir, "metadata.json")
 
+        self._validate_artifact(meta_path)
+
         with open(meta_path) as f:
             meta = json.load(f)
 
         if meta.get("schema_signature") != get_schema_signature():
             raise RuntimeError("Schema mismatch detected.")
+
+        # HARD FEATURE CONTRACT LOCK
+        if meta.get("features") != list(MODEL_FEATURES):
+            raise RuntimeError(
+                "Feature contract violation detected."
+            )
 
         if "training_code_hash" not in meta:
             raise RuntimeError("Training lineage missing.")
@@ -279,60 +292,6 @@ class ModelLoader:
         )
 
     # ---------------------------------------------------
-    # SHADOW MODEL
-    # ---------------------------------------------------
-
-    @property
-    def shadow_xgb(self):
-
-        prod_dir, prod_version = self._resolve_production_dir(
-            "artifacts/xgboost"
-        )
-
-        model_dir = "artifacts/xgboost"
-
-        shadow = None
-        newest_ts = None
-
-        for v in os.listdir(model_dir):
-
-            if v == prod_version:
-                continue
-
-            manifest = os.path.join(
-                model_dir,
-                v,
-                "manifest.json"
-            )
-
-            if not os.path.exists(manifest):
-                continue
-
-            with open(manifest) as f:
-                m = json.load(f)
-
-            if m.get("stage") != "shadow":
-                continue
-
-            ts = datetime.strptime(v[1:16], "%Y_%m_%d_%H%M")
-
-            if newest_ts is None or ts > newest_ts:
-                newest_ts = ts
-                shadow = v
-
-        if shadow is None:
-            raise RuntimeError("No shadow model available.")
-
-        shadow_dir = os.path.join(model_dir, shadow)
-
-        self._validate_manifest_and_hash(shadow_dir)
-        self._validate_metadata(shadow_dir)
-
-        path = os.path.join(shadow_dir, "model.pkl")
-
-        return joblib.load(path)
-
-    # ---------------------------------------------------
     # OPTIONAL WARMUP
     # ---------------------------------------------------
 
@@ -345,16 +304,18 @@ class ModelLoader:
 
         _ = self.xgb
 
-        try:
-            _ = self.shadow_xgb
-        except Exception:
-            pass
-
         logger.info("Models ready")
 
     # ---------------------------------------------------
+    # FAIL-CLOSED FORECAST BOUNDARY
+    # ---------------------------------------------------
 
     def lstm_forecast(self, recent_prices):
+
+        if self._lstm is None or self._scaler is None:
+            raise RuntimeError(
+                "LSTM model not initialized."
+            )
 
         return forecast_lstm(
             self._lstm,
@@ -363,5 +324,10 @@ class ModelLoader:
         )
 
     def prophet_forecast(self):
+
+        if self._prophet is None:
+            raise RuntimeError(
+                "Prophet model not initialized."
+            )
 
         return forecast_prophet(self._prophet)
