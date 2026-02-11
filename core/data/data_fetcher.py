@@ -6,12 +6,21 @@ import logging
 import os
 import random
 from datetime import datetime
-from packaging import version
 
 logger = logging.getLogger("marketsentinel.fetcher")
 
 
 class StockPriceFetcher:
+    """
+    Institutional Market Data Fetcher.
+
+    Guarantees:
+    schema normalization
+    business-day coverage validation
+    atomic cache writes
+    retry with jitter
+    gap detection
+    """
 
     REQUIRED_COLUMNS = {
         "date",
@@ -27,6 +36,8 @@ class StockPriceFetcher:
     BASE_SLEEP = 1.5
 
     MAX_GAP_DAYS = 10
+
+    # Institutional tolerance
     MIN_COVERAGE_RATIO = 0.85
 
     CACHE_DIR = "data/cache"
@@ -37,6 +48,9 @@ class StockPriceFetcher:
     # -----------------------------------------------------
 
     def _flatten_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalize Yahoo multi-index columns.
+        """
 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -48,10 +62,13 @@ class StockPriceFetcher:
     # -----------------------------------------------------
 
     def _normalize_schema(self, df: pd.DataFrame):
+        """
+        Force provider output into institutional schema.
+        """
 
         df = self._flatten_columns(df)
 
-        # ⭐ FORCE INDEX → DATE COLUMN (bulletproof)
+        # Force index → date column safely
         df = df.reset_index()
         df.rename(columns={df.columns[0]: "date"}, inplace=True)
 
@@ -81,6 +98,9 @@ class StockPriceFetcher:
     # -----------------------------------------------------
 
     def _detect_gaps(self, df):
+        """
+        Detect abnormal missing ranges.
+        """
 
         diffs = df["date"].diff().dt.days.dropna()
 
@@ -90,20 +110,35 @@ class StockPriceFetcher:
             )
 
     # -----------------------------------------------------
+    # FIXED — BUSINESS DAY COVERAGE 
+    # -----------------------------------------------------
 
     def _validate_coverage(self, df, start_date, end_date):
+        """
+        Validate dataset coverage using BUSINESS DAYS.
 
-        expected_days = (
-            pd.to_datetime(end_date) -
-            pd.to_datetime(start_date)
-        ).days
+        Stocks do not trade on weekends.
+        Calendar-day validation is incorrect.
+        """
 
-        coverage = len(df) / max(expected_days, 1)
+        expected_days = len(
+            pd.bdate_range(start=start_date, end=end_date)
+        )
+
+        expected_days = max(expected_days, 1)
+
+        coverage = len(df) / expected_days
 
         if coverage < self.MIN_COVERAGE_RATIO:
             raise RuntimeError(
-                f"Dataset coverage too low: {coverage:.2f}"
+                f"Dataset coverage too low: {coverage:.2f} | "
+                f"rows={len(df)} expected_business_days={expected_days}"
             )
+
+        logger.info(
+            f"Coverage OK → {coverage:.2f} "
+            f"({len(df)}/{expected_days})"
+        )
 
     # -----------------------------------------------------
 
@@ -126,7 +161,9 @@ class StockPriceFetcher:
         self._validate_coverage(df, start_date, end_date)
 
         if len(df) < self.MIN_ROWS:
-            raise RuntimeError("Dataset too small.")
+            raise RuntimeError(
+                f"Dataset too small: {len(df)} rows"
+            )
 
         return df.reset_index(drop=True)
 
