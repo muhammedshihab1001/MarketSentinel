@@ -1,22 +1,11 @@
 import os
-import json
 import joblib
 import tensorflow as tf
 import logging
 import threading
-import hashlib
-
-from datetime import datetime
-
-from prophet.serialize import model_from_json
 
 from models.lstm_model import forecast_lstm
 from models.prophet_model import forecast_prophet
-
-from core.schema.feature_schema import (
-    get_schema_signature,
-    MODEL_FEATURES
-)
 
 from app.monitoring.metrics import MODEL_VERSION
 
@@ -26,23 +15,18 @@ logger = logging.getLogger("marketsentinel.loader")
 
 class ModelLoader:
     """
-    Institutional Registry-Aware Model Loader.
+    Lightweight production model loader.
 
     Guarantees:
-    - manifest hash verification
-    - schema lock enforcement
-    - feature contract validation
-    - lineage validation
-    - pointer crash safety
-    - atomic hot reload
-    - inference boundary protection
+    - singleton instance
+    - thread-safe lazy loading
+    - optional hot reload
+    - inference-safe validation
     """
 
     _instance = None
     _instance_lock = threading.Lock()
     _tf_lock = threading.Lock()
-
-    # ---------------------------------------------------
 
     def __new__(cls, *args, **kwargs):
 
@@ -53,8 +37,6 @@ class ModelLoader:
 
         return cls._instance
 
-    # ---------------------------------------------------
-
     def __init__(self):
 
         if hasattr(self, "_initialized"):
@@ -63,9 +45,7 @@ class ModelLoader:
         self._configure_tensorflow()
 
         self._xgb = None
-        self._xgb_version = None
-
-        self._shadow_xgb = None
+        self._xgb_mtime = None
 
         self._lstm = None
         self._scaler = None
@@ -75,8 +55,6 @@ class ModelLoader:
 
         self._initialized = True
 
-    # ---------------------------------------------------
-    # SAFE TF INIT
     # ---------------------------------------------------
 
     def _configure_tensorflow(self):
@@ -107,189 +85,62 @@ class ModelLoader:
             os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
     # ---------------------------------------------------
-    # HASH
+    # SIMPLE MODEL PATH
     # ---------------------------------------------------
 
-    @staticmethod
-    def _sha256(path: str):
-
-        h = hashlib.sha256()
-
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-
-        return h.hexdigest()
+    def _model_path(self):
+        return os.getenv(
+            "XGB_MODEL_PATH",
+            "artifacts/xgboost/model.pkl"
+        )
 
     # ---------------------------------------------------
-    # ARTIFACT VALIDATION
+    # HOT RELOAD VIA MTIME
     # ---------------------------------------------------
 
-    def _validate_artifact(self, path):
+    def _reload_if_needed(self):
+
+        path = self._model_path()
 
         if not os.path.exists(path):
-            raise RuntimeError(f"Missing artifact: {path}")
+            raise RuntimeError(f"Model not found at {path}")
 
-        if os.path.getsize(path) == 0:
-            raise RuntimeError(f"Empty artifact: {path}")
+        mtime = os.path.getmtime(path)
 
-    # ---------------------------------------------------
-    # MANIFEST + HASH VERIFICATION
-    # ---------------------------------------------------
-
-    def _validate_manifest_and_hash(self, version_dir):
-
-        manifest_path = os.path.join(version_dir, "manifest.json")
-
-        if not os.path.exists(manifest_path):
-            raise RuntimeError("Manifest missing.")
-
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-
-        if manifest.get("stage") != "production":
-            raise RuntimeError(
-                "Attempted to load non-production model."
-            )
-
-        artifacts = manifest.get("artifacts", {})
-
-        for artifact, expected_hash in artifacts.items():
-
-            path = os.path.join(version_dir, artifact)
-
-            self._validate_artifact(path)
-
-            actual = self._sha256(path)
-
-            if actual != expected_hash:
-                raise RuntimeError(
-                    f"Artifact integrity failure: {artifact}"
-                )
-
-        return manifest
-
-    # ---------------------------------------------------
-    # METADATA VALIDATION
-    # ---------------------------------------------------
-
-    def _validate_metadata(self, version_dir):
-
-        meta_path = os.path.join(version_dir, "metadata.json")
-
-        self._validate_artifact(meta_path)
-
-        with open(meta_path) as f:
-            meta = json.load(f)
-
-        if meta.get("schema_signature") != get_schema_signature():
-            raise RuntimeError("Schema mismatch detected.")
-
-        # HARD FEATURE CONTRACT LOCK
-        if meta.get("features") != list(MODEL_FEATURES):
-            raise RuntimeError(
-                "Feature contract violation detected."
-            )
-
-        if "training_code_hash" not in meta:
-            raise RuntimeError("Training lineage missing.")
-
-        return meta
-
-    # ---------------------------------------------------
-    # POINTER RESOLUTION (CRASH SAFE)
-    # ---------------------------------------------------
-
-    def _resolve_production_dir(self, model_dir):
-
-        pointer = os.path.join(model_dir, "latest.json")
-
-        if not os.path.exists(pointer):
-            raise RuntimeError("Latest pointer missing.")
-
-        with open(pointer) as f:
-            version = json.load(f)["version"]
-
-        version_dir = os.path.join(model_dir, version)
-
-        if not os.path.exists(version_dir):
-            raise RuntimeError(
-                "Registry pointer corrupted. Version directory missing."
-            )
-
-        self._validate_manifest_and_hash(version_dir)
-
-        return version_dir, version
-
-    # ---------------------------------------------------
-    # HOT RELOAD
-    # ---------------------------------------------------
-
-    def _reload_if_needed(
-        self,
-        attr,
-        version_attr,
-        loader,
-        current_version
-    ):
-
-        cached_version = getattr(self, version_attr)
-
-        if cached_version == current_version:
-            return getattr(self, attr)
+        if self._xgb is not None and self._xgb_mtime == mtime:
+            return self._xgb
 
         with self._load_lock:
 
-            cached_version = getattr(self, version_attr)
+            if self._xgb is not None and self._xgb_mtime == mtime:
+                return self._xgb
 
-            if cached_version != current_version:
-
-                logger.warning(
-                    f"Reloading model due to version change → {current_version}"
-                )
-
-                model = loader()
-
-                setattr(self, attr, model)
-                setattr(self, version_attr, current_version)
-
-        return getattr(self, attr)
-
-    # ---------------------------------------------------
-    # XGBOOST
-    # ---------------------------------------------------
-
-    @property
-    def xgb(self):
-
-        version_dir, version = self._resolve_production_dir(
-            "artifacts/xgboost"
-        )
-
-        def load():
-
-            self._validate_metadata(version_dir)
-
-            path = os.path.join(version_dir, "model.pkl")
+            logger.warning("Loading XGBoost model from disk")
 
             model = joblib.load(path)
 
             if not hasattr(model, "predict_proba"):
-                raise RuntimeError("Invalid XGBoost artifact.")
+                raise RuntimeError(
+                    "Loaded model missing predict_proba"
+                )
+
+            self._xgb = model
+            self._xgb_mtime = mtime
 
             MODEL_VERSION.labels(
-                model="xgboost_prod",
-                version=version
+                model="xgboost",
+                version=str(int(mtime))
             ).set(1)
 
-            return model
+        return self._xgb
 
-        return self._reload_if_needed(
-            "_xgb",
-            "_xgb_version",
-            load,
-            version
-        )
+    # ---------------------------------------------------
+    # PUBLIC ACCESSOR
+    # ---------------------------------------------------
+
+    @property
+    def xgb(self):
+        return self._reload_if_needed()
 
     # ---------------------------------------------------
     # OPTIONAL WARMUP
@@ -300,14 +151,14 @@ class ModelLoader:
         if os.getenv("MODEL_WARMUP", "true") != "true":
             return
 
-        logger.info("Warming production models")
+        logger.info("Warming model")
 
         _ = self.xgb
 
-        logger.info("Models ready")
+        logger.info("Model ready")
 
     # ---------------------------------------------------
-    # FAIL-CLOSED FORECAST BOUNDARY
+    # OPTIONAL FORECASTS
     # ---------------------------------------------------
 
     def lstm_forecast(self, recent_prices):
