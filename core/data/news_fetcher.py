@@ -3,10 +3,10 @@ import pandas as pd
 import requests
 import logging
 import hashlib
-
-from datetime import datetime, timedelta
-from typing import Dict, Tuple
 import threading
+
+from datetime import timedelta
+from typing import Dict, Tuple
 
 
 logger = logging.getLogger("marketsentinel.news")
@@ -17,12 +17,11 @@ class NewsFetcher:
     Institutional News Fetcher.
 
     Guarantees:
-    - parameter-aware caching
-    - timezone normalization
+    - zero future leakage
     - deterministic ordering
-    - headline safety
-    - link deduplication
-    - inference-safe fallback
+    - single clock domain
+    - schema stability
+    - thread-safe caching
     """
 
     GOOGLE_NEWS_RSS = (
@@ -33,12 +32,23 @@ class NewsFetcher:
     MAX_CACHE_KEYS = 500
     MAX_ARTICLE_AGE = timedelta(hours=48)
 
-    _cache: Dict[str, Tuple[datetime, pd.DataFrame]] = {}
+    _cache: Dict[str, Tuple[pd.Timestamp, pd.DataFrame]] = {}
     _lock = threading.Lock()
 
     HEADERS = {
         "User-Agent": "MarketSentinel/1.0"
     }
+
+    EMPTY_SCHEMA = pd.DataFrame(
+        columns=["headline", "published_at", "source", "link"]
+    )
+
+    # --------------------------------------------------
+
+    @staticmethod
+    def _now():
+        # SINGLE CLOCK DOMAIN
+        return pd.Timestamp.utcnow()
 
     # --------------------------------------------------
 
@@ -67,11 +77,13 @@ class NewsFetcher:
 
         ts = pd.to_datetime(published, utc=True)
 
+        # convert to UTC-naive AFTER normalization
         return ts.tz_convert(None)
 
     # --------------------------------------------------
 
-    def _clean_headline(self, text: str):
+    @staticmethod
+    def _clean_headline(text: str):
 
         text = " ".join(text.split())
 
@@ -89,7 +101,7 @@ class NewsFetcher:
     ) -> pd.DataFrame:
 
         key = self._cache_key(query, max_items)
-        now = datetime.utcnow()
+        now = self._now()
 
         # fast path
         if key in self._cache:
@@ -124,23 +136,36 @@ class NewsFetcher:
 
                 articles = []
 
-                for entry in feed.entries[:max_items]:
+                # deterministic ordering BEFORE slicing
+                entries = sorted(
+                    feed.entries,
+                    key=lambda e: e.get("published_parsed", (0,))
+                )
+
+                for entry in entries:
 
                     parsed = entry.get("published_parsed")
 
                     if not parsed:
                         continue
 
-                    published = datetime(*parsed[:6])
+                    published = self._normalize_timestamp(
+                        pd.Timestamp(*parsed[:6])
+                    )
 
-                    published = self._normalize_timestamp(published)
+                    # 🚨 BLOCK FUTURE NEWS
+                    if published > now:
+                        logger.warning(
+                            "Future-dated article blocked."
+                        )
+                        continue
 
                     if now - published > self.MAX_ARTICLE_AGE:
                         continue
 
-                    headline = entry.get("title", "")
-
-                    headline = self._clean_headline(headline)
+                    headline = self._clean_headline(
+                        entry.get("title", "")
+                    )
 
                     if not headline:
                         continue
@@ -150,24 +175,31 @@ class NewsFetcher:
                     articles.append({
                         "headline": headline,
                         "published_at": published,
-                        "source": entry.get("source", {}).get("title", "Unknown"),
+                        "source": entry.get(
+                            "source", {}
+                        ).get("title", "Unknown"),
                         "link": link
                     })
 
+                    if len(articles) >= max_items:
+                        break
+
                 if not articles:
-                    logger.warning("No fresh news — returning empty dataframe.")
-                    return pd.DataFrame()
+                    logger.warning(
+                        "No fresh news — returning empty schema."
+                    )
+                    return self.EMPTY_SCHEMA.copy()
 
                 df = pd.DataFrame(articles)
 
-                # Institutional dedupe
-                df = df.drop_duplicates(subset=["headline", "link"])
+                df = df.drop_duplicates(
+                    subset=["headline", "link"]
+                )
 
                 df = df.sort_values("published_at")
 
                 df.reset_index(drop=True, inplace=True)
 
-                # cache safely
                 self._prune_cache()
 
                 self._cache[key] = (
@@ -180,7 +212,7 @@ class NewsFetcher:
             except Exception:
 
                 logger.exception(
-                    "News fetch failure — returning empty dataframe."
+                    "News fetch failure — returning empty schema."
                 )
 
-                return pd.DataFrame()
+                return self.EMPTY_SCHEMA.copy()
