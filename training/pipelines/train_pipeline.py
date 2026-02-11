@@ -2,8 +2,10 @@
 MarketSentinel Institutional Training Orchestrator
 
 Promotion-safe release pipeline.
-Cross-platform.
 Registry-aware.
+Deterministic.
+Crash-safe.
+Audit-grade.
 """
 
 import subprocess
@@ -32,7 +34,6 @@ PIPELINE_STEPS = [
 
 RUNS_DIR = "artifacts/training_runs"
 
-
 MIN_ACCURACY = 0.50
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
@@ -49,6 +50,25 @@ def reproducibility_stamp():
         "platform": platform.platform(),
         "timestamp_utc": datetime.datetime.utcnow().isoformat()
     }
+
+
+# ---------------------------------------------------
+# DEPENDENCY HASHING (CRITICAL FOR FORENSICS)
+# ---------------------------------------------------
+
+def _hash_requirements(hasher):
+
+    req_files = [
+        "requirements/base.txt",
+        "requirements/training.txt",
+        "requirements/inference.txt",
+        "requirements/ci.txt"
+    ]
+
+    for req in req_files:
+        if os.path.exists(req):
+            with open(req, "rb") as f:
+                hasher.update(f.read())
 
 
 # ---------------------------------------------------
@@ -81,6 +101,8 @@ def snapshot_lineage():
                     with open(full, "rb") as fh:
                         hasher.update(fh.read())
 
+    _hash_requirements(hasher)
+
     hasher.update(get_schema_signature().encode())
 
     return hasher.hexdigest()
@@ -92,21 +114,22 @@ def snapshot_lineage():
 
 def load_metadata(model_name: str):
 
-    version = ModelRegistry.get_latest_version(
-        f"artifacts/{model_name}"
-    )
+    base_dir = f"artifacts/{model_name}"
 
-    path = os.path.join(
-        f"artifacts/{model_name}",
-        version,
-        "metadata.json"
-    )
+    version = ModelRegistry.get_latest_version(base_dir)
 
-    if not os.path.exists(path):
+    version_dir = os.path.join(base_dir, version)
+
+    metadata_path = os.path.join(version_dir, "metadata.json")
+
+    if not os.path.exists(metadata_path):
         raise RuntimeError(f"{model_name} metadata missing.")
 
-    with open(path) as f:
+    with open(metadata_path) as f:
         metadata = json.load(f)
+
+    if metadata.get("metadata_type") != "model":
+        raise RuntimeError("Invalid metadata type detected.")
 
     if "metrics" not in metadata:
         raise RuntimeError(f"{model_name} metadata missing metrics.")
@@ -125,6 +148,14 @@ def governance_check(model_name: str):
 
     metadata = load_metadata(model_name)
     metrics = metadata["metrics"]
+
+    current_signature = get_schema_signature()
+    model_signature = metadata.get("schema_signature")
+
+    if model_signature != current_signature:
+        raise RuntimeError(
+            f"{model_name} rejected — schema signature mismatch."
+        )
 
     if model_name == "xgboost":
 
@@ -152,7 +183,7 @@ def governance_check(model_name: str):
 
 
 # ---------------------------------------------------
-# REGISTRY SAFETY (FIXED)
+# REGISTRY SAFETY
 # ---------------------------------------------------
 
 def validate_registry(model_name: str):
@@ -163,19 +194,19 @@ def validate_registry(model_name: str):
 
     version_dir = os.path.join(base_dir, version)
 
-    manifest = os.path.join(version_dir, "manifest.json")
-    metadata = os.path.join(version_dir, "metadata.json")
+    manifest_path = os.path.join(version_dir, "manifest.json")
+    metadata_path = os.path.join(version_dir, "metadata.json")
 
-    if not os.path.exists(manifest):
+    if not os.path.exists(manifest_path):
         raise RuntimeError("Registry manifest missing.")
 
-    if not os.path.exists(metadata):
+    if not os.path.exists(metadata_path):
         raise RuntimeError("Registry metadata missing.")
 
-    with open(manifest) as f:
-        data = json.load(f)
+    with open(manifest_path) as f:
+        manifest = json.load(f)
 
-    if data.get("stage") != "production":
+    if manifest.get("stage") != "production":
         raise RuntimeError(
             f"{model_name} not promoted to production."
         )
@@ -189,12 +220,10 @@ def ensure_drift_baseline():
 
     detector = DriftDetector()
 
-    if os.path.exists(detector.BASELINE_PATH):
-        return
-
-    raise RuntimeError(
-        "Drift baseline missing. Training must generate baseline."
-    )
+    if not os.path.exists(detector.BASELINE_PATH):
+        raise RuntimeError(
+            "Drift baseline missing. Training must generate baseline."
+        )
 
 
 # ---------------------------------------------------
@@ -207,9 +236,15 @@ def run_step(name: str, module: str):
 
     start = time.time()
 
+    env = os.environ.copy()
+
+    # deterministic hashing across subprocesses
+    env["PYTHONHASHSEED"] = "0"
+
     subprocess.run(
         [sys.executable, "-m", module],
-        check=True
+        check=True,
+        env=env
     )
 
     duration = round(time.time() - start, 2)
@@ -225,19 +260,24 @@ def run_step(name: str, module: str):
 
 
 # ---------------------------------------------------
-# MANIFEST
+# ATOMIC MANIFEST WRITER
 # ---------------------------------------------------
 
 def save_manifest(run_id: str, manifest: dict):
 
     os.makedirs(RUNS_DIR, exist_ok=True)
 
-    path = os.path.join(RUNS_DIR, f"{run_id}.json")
+    final_path = os.path.join(RUNS_DIR, f"{run_id}.json")
+    temp_path = final_path + ".tmp"
 
-    with open(path, "w") as f:
+    with open(temp_path, "w") as f:
         json.dump(manifest, f, indent=4)
+        f.flush()
+        os.fsync(f.fileno())
 
-    logger.info(f"Training manifest saved -> {path}")
+    os.replace(temp_path, final_path)
+
+    logger.info(f"Training manifest saved -> {final_path}")
 
 
 # ---------------------------------------------------
