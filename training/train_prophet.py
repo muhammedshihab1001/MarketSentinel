@@ -7,6 +7,7 @@ import numpy as np
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
+from core.monitoring.drift_detector import DriftDetector
 from models.prophet_model import train_prophet
 
 from prophet.serialize import model_to_json
@@ -17,10 +18,12 @@ MODEL_DIR = "artifacts/prophet"
 TEMP_MODEL_PATH = f"{MODEL_DIR}/prophet_trend.json"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
-
 MIN_DATA_ROWS = 500
-MAX_FORECAST_STD = 0.25
+MAX_FORECAST_STD_RATIO = 0.25
 MIN_FORECAST_STD = 0.0005
+
+SEED = 42
+EPSILON = 1e-6
 
 
 # ---------------------------------------------------
@@ -30,24 +33,31 @@ MIN_FORECAST_STD = 0.0005
 def validate_forecast(model):
 
     future = model.make_future_dataframe(periods=30)
-
     forecast = model.predict(future)
 
     preds = forecast["yhat"].tail(30).values
 
     std = float(np.std(preds))
+    mean_val = float(np.mean(preds))
 
     slope = float(preds[-1] - preds[0])
 
     if std < MIN_FORECAST_STD:
-        raise RuntimeError("Prophet rejected: forecast collapsed (near zero variance)")
+        raise RuntimeError(
+            "Prophet rejected: forecast collapsed (near zero variance)"
+        )
 
-    if std > MAX_FORECAST_STD * abs(preds.mean()):
-        raise RuntimeError("Prophet rejected: forecast too volatile")
+    ratio = std / max(abs(mean_val), EPSILON)
+
+    if ratio > MAX_FORECAST_STD_RATIO:
+        raise RuntimeError(
+            "Prophet rejected: forecast too volatile"
+        )
 
     return {
         "forecast_std": std,
-        "trend_slope_30d": slope
+        "trend_slope_30d": slope,
+        "forecast_std_ratio": ratio
     }
 
 
@@ -56,6 +66,8 @@ def validate_forecast(model):
 # ---------------------------------------------------
 
 def train():
+
+    np.random.seed(SEED)
 
     end_date = datetime.date.today().isoformat()
 
@@ -71,7 +83,11 @@ def train():
         raise ValueError("No price data fetched for Prophet training")
 
     if len(df) < MIN_DATA_ROWS:
-        raise RuntimeError("Prophet rejected: insufficient training history")
+        raise RuntimeError(
+            "Prophet rejected: insufficient training history"
+        )
+
+    df = df.sort_values("date")
 
     model = train_prophet(df)
 
@@ -79,10 +95,16 @@ def train():
 
     dataset_hash = MetadataManager.fingerprint_dataset(df)
 
+    DriftDetector().create_baseline(
+        df[["close"]].rename(columns={"close": "price"})
+    )
+
     metrics = {
         "training_rows": len(df),
         "last_price": float(df["close"].iloc[-1]),
-        "data_span_days": (df["date"].max() - df["date"].min()).days,
+        "data_span_days": int(
+            (df["date"].max() - df["date"].min()).days
+        ),
         **governance_metrics
     }
 
@@ -92,10 +114,9 @@ def train():
         features=["date", "close"],
         training_start="2018-01-01",
         training_end=end_date,
-        dataset_hash=dataset_hash
+        dataset_hash=dataset_hash,
+        metadata_type="model"
     )
-
-    metadata["schema_version"] = "3.0"
 
     return model, metadata
 
@@ -108,16 +129,12 @@ def save_model_atomic(model, path):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    with tempfile.NamedTemporaryFile(
-        "w",
-        delete=False,
-        dir=os.path.dirname(path)
-    ) as tmp:
+    tmp_path = path + ".tmp"
 
-        tmp.write(model_to_json(model))
-        temp_name = tmp.name
+    with open(tmp_path, "w") as f:
+        f.write(model_to_json(model))
 
-    shutil.move(temp_name, path)
+    os.replace(tmp_path, path)
 
 
 # ---------------------------------------------------
