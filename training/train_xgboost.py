@@ -12,7 +12,7 @@ from xgboost import XGBClassifier
 from core.data.data_fetcher import StockPriceFetcher
 from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
-from core.features.feature_engineering import FeatureEngineer
+from core.features.feature_store import FeatureStore
 from core.schema.feature_schema import MODEL_FEATURES
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
@@ -66,7 +66,7 @@ def save_model_atomic(model, path):
 
 
 # ---------------------------------------------------
-# DATA LOADING
+# DATA LOADING (INSTITUTIONAL FIX)
 # ---------------------------------------------------
 
 def load_training_data():
@@ -74,6 +74,7 @@ def load_training_data():
     fetcher = StockPriceFetcher()
     news_fetcher = NewsFetcher()
     sentiment_analyzer = SentimentAnalyzer()
+    feature_store = FeatureStore()
 
     end_date = datetime.date.today().isoformat()
 
@@ -95,10 +96,11 @@ def load_training_data():
         scored_df = sentiment_analyzer.analyze_dataframe(news_df)
         sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
 
-        dataset = FeatureEngineer.build_feature_pipeline(
+        # CRITICAL — USE FEATURE STORE
+        dataset = feature_store.get_features(
             price_df,
             sentiment_df,
-            training=True
+            ticker=ticker
         )
 
         dataset["ticker"] = ticker
@@ -107,7 +109,6 @@ def load_training_data():
 
     df = pd.concat(datasets, ignore_index=True)
 
-    # CRITICAL FIX — prevent cross-ticker leakage
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     if df.empty:
@@ -130,8 +131,6 @@ def load_training_data():
 
 
 # ---------------------------------------------------
-# FEATURE BASELINES
-# ---------------------------------------------------
 
 def build_feature_baselines(df):
 
@@ -152,28 +151,22 @@ def build_feature_baselines(df):
 
 
 # ---------------------------------------------------
-# SAMPLE WEIGHTS (institutional upgrade)
-# ---------------------------------------------------
 
 def compute_sample_weights(df):
 
     vol = df["volatility"].fillna(df["volatility"].median())
 
     weights = 1 / (vol + 1e-6)
-
-    # normalize
     weights = weights / weights.mean()
 
     return weights
 
 
 # ---------------------------------------------------
-# WALK-FORWARD HELPERS
-# ---------------------------------------------------
 
 def train_on_window(df):
 
-    X = df[MODEL_FEATURES].copy()
+    X = df[list(MODEL_FEATURES)]
     y = df["target"]
 
     weights = compute_sample_weights(df)
@@ -198,7 +191,7 @@ def train_on_window(df):
 
 def generate_signals(model, df):
 
-    probs = model.predict_proba(df[MODEL_FEATURES])[:, 1]
+    probs = model.predict_proba(df[list(MODEL_FEATURES)])[:, 1]
 
     signals = np.where(
         probs > 0.6, "BUY",
@@ -209,12 +202,10 @@ def generate_signals(model, df):
 
 
 # ---------------------------------------------------
-# FINAL TRAIN
-# ---------------------------------------------------
 
 def train_full_model(df):
 
-    X = df[MODEL_FEATURES].copy()
+    X = df[list(MODEL_FEATURES)]
     y = df["target"]
 
     weights = compute_sample_weights(df)
@@ -236,32 +227,29 @@ def train_full_model(df):
     )
 
     model.fit(
-        X[:split],
-        y[:split],
-        sample_weight=weights[:split],
-        eval_set=[(X[split:], y[split:])],
+        X.iloc[:split],
+        y.iloc[:split],
+        sample_weight=weights.iloc[:split],
+        eval_set=[(X.iloc[split:], y.iloc[split:])],
         verbose=False
     )
 
-    preds = model.predict(X[split:])
-    probs = model.predict_proba(X[split:])[:, 1]
+    preds = model.predict(X.iloc[split:])
+    probs = model.predict_proba(X.iloc[split:])[:, 1]
 
     metrics = {
-        "accuracy": float(accuracy_score(y[split:], preds)),
-        "roc_auc": float(roc_auc_score(y[split:], probs)),
-        "logloss": float(log_loss(y[split:], probs)),
+        "accuracy": float(accuracy_score(y.iloc[split:], preds)),
+        "roc_auc": float(roc_auc_score(y.iloc[split:], probs)),
+        "logloss": float(log_loss(y.iloc[split:], probs)),
     }
 
-    # governance-grade feature importance
     importance = dict(
-        zip(MODEL_FEATURES, model.feature_importances_.tolist())
+        zip(list(MODEL_FEATURES), model.feature_importances_.tolist())
     )
 
     return model, metrics, importance
 
 
-# ---------------------------------------------------
-# EXECUTION
 # ---------------------------------------------------
 
 if __name__ == "__main__":
@@ -274,7 +262,7 @@ if __name__ == "__main__":
 
     feature_baselines = build_feature_baselines(df)
 
-    DriftDetector().create_baseline(df[MODEL_FEATURES])
+    DriftDetector().create_baseline(df[list(MODEL_FEATURES)])
 
     wf = WalkForwardValidator(
         model_trainer=train_on_window,
@@ -307,17 +295,17 @@ if __name__ == "__main__":
     metadata = MetadataManager.create_metadata(
         model_name="xgboost_direction",
         metrics={**metrics, **strategy_metrics},
-        features=MODEL_FEATURES,
+        features=list(MODEL_FEATURES),
         training_start="2018-01-01",
         training_end=end_date,
         dataset_hash=dataset_hash,
+        metadata_type="model"
     )
 
     metadata["feature_baselines"] = feature_baselines
     metadata["feature_importance"] = importance
     metadata["training_rows"] = len(df)
     metadata["feature_count"] = len(MODEL_FEATURES)
-    metadata["schema_version"] = "3.0"
 
     MetadataManager.save_metadata(
         metadata,
