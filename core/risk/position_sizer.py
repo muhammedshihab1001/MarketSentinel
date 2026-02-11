@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import math
+import os
 
 
 # ---------------------------------------------------
@@ -10,14 +11,19 @@ import math
 class RiskConfig:
     """
     Institutional risk parameters.
-
     Frozen to prevent runtime mutation.
     """
 
-    max_position_size: float = 0.10
+    max_position_size: float = 0.08
     min_position_size: float = 0.01
+
     volatility_target: float = 0.02
-    confidence_boost: float = 1.5
+
+    confidence_boost: float = 1.35
+
+    max_gross_exposure_pct: float = 0.40
+
+    max_single_trade_dollars: float = 25_000
 
 
 # ---------------------------------------------------
@@ -26,23 +32,21 @@ class RiskConfig:
 
 class PositionSizer:
     """
-    Capital deployment engine.
+    Capital deployment authority.
 
     Guarantees:
-    - bounded leverage
-    - NaN safety
-    - volatility clamps
-    - confidence clamps
-    - hard institutional ceilings
+    - convexity protection
+    - drawdown throttling
+    - exposure ceilings
+    - nonlinear confidence scaling
+    - volatility-aware sizing
     """
 
-    # HARD SAFETY LIMIT — cannot be overridden by config
-    ABSOLUTE_MAX_POSITION = 0.20
+    ABSOLUTE_MAX_POSITION = 0.15
+    MIN_DEPLOYABLE_CAPITAL = 10_000
 
-    MIN_DEPLOYABLE_CAPITAL = 5_000
-
-    VOL_FLOOR = 0.005
-    VOL_CEILING = 0.10
+    VOL_FLOOR = 0.006
+    VOL_CEILING = 0.12
 
     def __init__(self, config: RiskConfig | None = None):
         self.config = config or RiskConfig()
@@ -56,21 +60,41 @@ class PositionSizer:
         return float(v)
 
     # ---------------------------------------------------
+    # DRAWdown THROTTLE
+    # ---------------------------------------------------
+
+    def _drawdown_scalar(self):
+
+        drawdown = float(
+            os.getenv("PORTFOLIO_DRAWDOWN_PCT", "0.0")
+        )
+
+        drawdown = abs(drawdown)
+
+        if drawdown < 0.05:
+            return 1.0
+
+        if drawdown < 0.10:
+            return 0.75
+
+        if drawdown < 0.20:
+            return 0.50
+
+        return 0.25
+
+    # ---------------------------------------------------
 
     def size_position(
         self,
         signal: str,
         confidence: float,
         volatility: float | None,
-        portfolio_value: float
+        portfolio_value: float,
+        current_gross_exposure: float | None = None
     ) -> float:
         """
         Returns position size in dollars.
         """
-
-        # ---------------------------------------
-        # SIGNAL VALIDATION
-        # ---------------------------------------
 
         if signal not in {"BUY", "SELL"}:
             return 0.0
@@ -99,22 +123,32 @@ class PositionSizer:
         )
 
         # ---------------------------------------
-        # VOL SCALING
+        # NONLINEAR CONFIDENCE
+        # prevents over-allocation
         # ---------------------------------------
 
-        vol_scalar = min(
-            self.config.volatility_target / volatility,
-            2.0
+        confidence_scalar = math.tanh(
+            confidence * self.config.confidence_boost
         )
 
+        confidence_scalar = max(confidence_scalar, 0.25)
+
         # ---------------------------------------
-        # CONFIDENCE SCALING
+        # SQRT VOL SCALING
+        # industry standard
         # ---------------------------------------
 
-        confidence_scalar = 1 + (
-            confidence *
-            (self.config.confidence_boost - 1)
+        vol_scalar = math.sqrt(
+            self.config.volatility_target / volatility
         )
+
+        vol_scalar = min(vol_scalar, 1.75)
+
+        # ---------------------------------------
+        # DRAWDOWN THROTTLE
+        # ---------------------------------------
+
+        dd_scalar = self._drawdown_scalar()
 
         # ---------------------------------------
         # RAW SIZE
@@ -124,17 +158,40 @@ class PositionSizer:
             portfolio_value *
             self.config.max_position_size *
             vol_scalar *
-            confidence_scalar
+            confidence_scalar *
+            dd_scalar
         )
 
         # ---------------------------------------
-        # HARD CEILINGS
+        # HARD CAPS
         # ---------------------------------------
 
         config_cap = portfolio_value * self.config.max_position_size
         absolute_cap = portfolio_value * self.ABSOLUTE_MAX_POSITION
+        trade_cap = self.config.max_single_trade_dollars
 
-        capped_size = min(raw_size, config_cap, absolute_cap)
+        capped_size = min(
+            raw_size,
+            config_cap,
+            absolute_cap,
+            trade_cap
+        )
+
+        # ---------------------------------------
+        # GROSS EXPOSURE GUARD
+        # ---------------------------------------
+
+        if current_gross_exposure is not None:
+
+            remaining_capacity = (
+                portfolio_value *
+                self.config.max_gross_exposure_pct
+            ) - current_gross_exposure
+
+            if remaining_capacity <= 0:
+                return 0.0
+
+            capped_size = min(capped_size, remaining_capacity)
 
         # ---------------------------------------
         # MICRO TRADE FILTER
