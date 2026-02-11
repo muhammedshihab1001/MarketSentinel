@@ -1,32 +1,48 @@
 -r base.txt
 
 ########################################
-# ML CORE (TRAINING ONLY)
+# ML CORE — TRAINING LOCK
 ########################################
+
 scikit-learn==1.5.1
 xgboost==2.1.1
 
 tensorflow-cpu==2.15.0
 keras==2.15.0
 
-prophet==1.1.5
+# TensorFlow stability guard
+protobuf==4.25.3
+typing_extensions==4.12.2
 
 ########################################
-# NLP (TRAINING / OFFLINE SENTIMENT)
+# PROPHET STABILITY
 ########################################
+
+prophet==1.1.5
+holidays==0.48
+
+########################################
+# TORCH / NLP (CPU ONLY)
+########################################
+
 --extra-index-url https://download.pytorch.org/whl/cpu
+
 torch==2.2.2
 transformers==4.38.2
+tokenizers==0.15.2
+safetensors==0.4.2
 
 ########################################
 # DATA SOURCES
 ########################################
+
 feedparser==6.0.11
 yfinance==0.2.43
 
 ########################################
-# Visualization (SAFE IN TRAINING)
+# VISUALIZATION — TRAINING ONLY
 ########################################
+
 matplotlib==3.9.2
 seaborn==0.13.2
 plotly==5.24.1
