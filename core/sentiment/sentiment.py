@@ -3,6 +3,7 @@ import pandas as pd
 import logging
 import time
 import os
+import threading
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
@@ -15,37 +16,60 @@ class FinBERTSingleton:
     _tokenizer = None
     _model = None
     _device = "cpu"
+    _lock = threading.Lock()
 
     MODEL_NAME = "ProsusAI/finbert"
+
+    # PIN THIS — change only intentionally
+    MODEL_REVISION = "main"
 
     @classmethod
     def load(cls):
 
-        # -----------------------------
-        # CI / TEST MODE
-        # -----------------------------
         if os.getenv("CI") == "true" or os.getenv("TEST_MODE") == "true":
             logger.info("Running in TEST_MODE — FinBERT disabled.")
             return None, None, "cpu"
 
-        if cls._model is None:
+        if cls._model is not None:
+            return cls._tokenizer, cls._model, cls._device
+
+        with cls._lock:
+
+            if cls._model is not None:
+                return cls._tokenizer, cls._model, cls._device
 
             start = time.time()
 
             logger.info("Loading FinBERT model")
 
+            # HARD DETERMINISM
+            torch.set_grad_enabled(False)
             torch.set_num_threads(1)
             torch.set_num_interop_threads(1)
-            torch.set_grad_enabled(False)
+            torch.use_deterministic_algorithms(True)
+
+            os.environ.setdefault("OMP_NUM_THREADS", "1")
+            os.environ.setdefault("MKL_NUM_THREADS", "1")
 
             cls._device = "cpu"
 
+            cache_dir = os.getenv(
+                "HF_HOME",
+                "artifacts/huggingface"
+            )
+
             cls._tokenizer = AutoTokenizer.from_pretrained(
-                cls.MODEL_NAME
+                cls.MODEL_NAME,
+                revision=cls.MODEL_REVISION,
+                cache_dir=cache_dir,
+                local_files_only=os.getenv("TRANSFORMERS_OFFLINE") == "1"
             )
 
             cls._model = AutoModelForSequenceClassification.from_pretrained(
-                cls.MODEL_NAME
+                cls.MODEL_NAME,
+                revision=cls.MODEL_REVISION,
+                cache_dir=cache_dir,
+                local_files_only=os.getenv("TRANSFORMERS_OFFLINE") == "1"
             ).to(cls._device)
 
             cls._model.eval()
@@ -67,6 +91,7 @@ class SentimentAnalyzer:
     }
 
     BATCH_SIZE = 16
+    MAX_HEADLINE_CHARS = 512
 
     def __init__(self):
 
@@ -90,7 +115,10 @@ class SentimentAnalyzer:
             logger.exception("FinBERT warmup failed")
 
     # ---------------------------------------------------
-    # BACKWARD COMPATIBILITY
+
+    def _clamp_text(self, text: str) -> str:
+        return text[:self.MAX_HEADLINE_CHARS]
+
     # ---------------------------------------------------
 
     def analyze_text(self, text: str):
@@ -106,13 +134,6 @@ class SentimentAnalyzer:
     # ---------------------------------------------------
 
     def _fake_sentiment(self, text: str):
-        """
-        Deterministic fake sentiment for CI.
-
-        No randomness.
-        No ML.
-        Always stable.
-        """
 
         text = text.lower()
 
@@ -130,6 +151,11 @@ class SentimentAnalyzer:
 
         if self.test_mode:
             return [self._fake_sentiment(t) for t in texts]
+
+        texts = [
+            self._clamp_text(str(t).strip())
+            for t in texts
+        ]
 
         inputs = self.tokenizer(
             texts,
@@ -207,11 +233,12 @@ class SentimentAnalyzer:
         temp_df["date"] = pd.to_datetime(
             temp_df.get("published_at"),
             errors="coerce"
-        ).dt.date
-
-        temp_df["date"] = temp_df["date"].fillna(
-            pd.Timestamp.today().date()
         )
+
+        # NEVER fabricate timestamps
+        temp_df = temp_df.dropna(subset=["date"])
+
+        temp_df["date"] = temp_df["date"].dt.date
 
         aggregated = (
             temp_df
