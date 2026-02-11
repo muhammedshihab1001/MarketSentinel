@@ -136,6 +136,24 @@ class ModelRegistry:
                 )
 
     @staticmethod
+    def _acquire_lock(lock_path: str):
+
+        try:
+            fd = os.open(
+                lock_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            )
+            os.close(fd)
+
+        except FileExistsError:
+            raise RuntimeError("Another promotion is in progress.")
+
+    @staticmethod
+    def _release_lock(lock_path: str):
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+
+    @staticmethod
     def register_model(
         base_dir: str,
         model_path: str,
@@ -192,10 +210,7 @@ class ModelRegistry:
 
         lock_path = os.path.join(base_dir, ModelRegistry.PROMOTION_LOCK)
 
-        if os.path.exists(lock_path):
-            raise RuntimeError("Another promotion is in progress.")
-
-        open(lock_path, "w").close()
+        ModelRegistry._acquire_lock(lock_path)
 
         try:
 
@@ -234,6 +249,8 @@ class ModelRegistry:
                 {"version": version}
             )
 
+            ModelRegistry._fsync_dir(base_dir)
+
             manifest["stage"] = "production"
             manifest["history"].append({
                 "event": "promotion",
@@ -247,8 +264,7 @@ class ModelRegistry:
             )
 
         finally:
-            if os.path.exists(lock_path):
-                os.remove(lock_path)
+            ModelRegistry._release_lock(lock_path)
 
     @staticmethod
     def rollback(base_dir: str, version: str):
@@ -264,6 +280,8 @@ class ModelRegistry:
             pointer_path,
             {"version": version}
         )
+
+        ModelRegistry._fsync_dir(base_dir)
 
     @staticmethod
     def get_latest_version(base_dir: str) -> str:
