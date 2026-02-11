@@ -5,7 +5,6 @@ import numpy as np
 import tensorflow as tf
 import pandas as pd
 import shutil
-import tempfile
 
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.callbacks import EarlyStopping
@@ -39,6 +38,10 @@ TRAINING_TICKERS = [
 ]
 
 
+# ---------------------------------------------------
+# DETERMINISM
+# ---------------------------------------------------
+
 def set_seeds():
 
     os.environ["TF_DETERMINISTIC_OPS"] = "1"
@@ -54,19 +57,34 @@ def set_seeds():
     tf.config.threading.set_inter_op_parallelism_threads(1)
 
 
+# ---------------------------------------------------
+# CRASH-SAFE MODEL SAVE
+# ---------------------------------------------------
+
 def atomic_save_model(model, path):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    tmp = path + ".tmp"
-    model.save(tmp)
-    os.replace(tmp, path)
+    tmp_dir = path + "_tmp"
 
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir)
+
+    model.save(tmp_dir)
+
+    if os.path.exists(path):
+        shutil.rmtree(path)
+
+    os.replace(tmp_dir, path)
+
+
+# ---------------------------------------------------
+# DATA
+# ---------------------------------------------------
 
 def load_data():
 
     fetcher = StockPriceFetcher()
-
     end_date = datetime.date.today().isoformat()
 
     datasets = []
@@ -99,6 +117,8 @@ def load_data():
     return df.reset_index(drop=True), end_date
 
 
+# ---------------------------------------------------
+
 def create_sequences(data, lookback):
 
     X, y = [], []
@@ -110,9 +130,16 @@ def create_sequences(data, lookback):
     return np.array(X), np.array(y)
 
 
+# ---------------------------------------------------
+# WINDOW TRAINER (Walk Forward)
+# ---------------------------------------------------
+
 def train_window_model(train_df):
 
-    prices = train_df["close"].values.reshape(-1, 1)
+    prices = train_df["close"].astype("float32").values.reshape(-1, 1)
+
+    if not np.isfinite(prices).all():
+        raise RuntimeError("Non-finite values detected in price series.")
 
     scaler = MinMaxScaler()
     scaled = scaler.fit_transform(prices)
@@ -132,11 +159,19 @@ def train_window_model(train_df):
     return model, scaler
 
 
+# ---------------------------------------------------
+# SIGNAL GENERATION
+# ---------------------------------------------------
+
 def generate_signals(model_scaler, test_df):
 
     model, scaler = model_scaler
 
-    prices = test_df["close"].values.reshape(-1, 1)
+    prices = test_df["close"].astype("float32").values.reshape(-1, 1)
+
+    if not np.isfinite(prices).all():
+        raise RuntimeError("Non-finite values detected in price series.")
+
     scaled = scaler.transform(prices)
 
     signals = []
@@ -157,9 +192,16 @@ def generate_signals(model_scaler, test_df):
     return ["HOLD"] * LOOKBACK_WINDOW + signals
 
 
+# ---------------------------------------------------
+# FULL TRAIN
+# ---------------------------------------------------
+
 def train_full_model(df):
 
-    prices = df["close"].values.reshape(-1, 1)
+    prices = df["close"].astype("float32").values.reshape(-1, 1)
+
+    if not np.isfinite(prices).all():
+        raise RuntimeError("Non-finite values detected in price series.")
 
     split = int(len(prices) * 0.8)
 
@@ -194,6 +236,10 @@ def train_full_model(df):
     return model, scaler, val_loss
 
 
+# ---------------------------------------------------
+# EXECUTION
+# ---------------------------------------------------
+
 if __name__ == "__main__":
 
     print("Institutional LSTM Training")
@@ -202,7 +248,10 @@ if __name__ == "__main__":
 
     df, end_date = load_data()
 
-    dataset_hash = MetadataManager.fingerprint_dataset(df)
+    # HASH ONLY WHAT MODEL LEARNS FROM
+    dataset_hash = MetadataManager.fingerprint_dataset(
+        df[["close"]]
+    )
 
     wf = WalkForwardValidator(
         model_trainer=train_window_model,
