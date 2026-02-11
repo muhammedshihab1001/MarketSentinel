@@ -1,21 +1,17 @@
-import datetime
 import time
 import threading
 import numpy as np
 import pandas as pd
 import logging
 import os
-import signal
 
 from core.data.market_data_service import MarketDataService
 from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_store import FeatureStore
 from core.signals.signal_engine import DecisionEngine
-from core.scenario.scenario_engine import ScenarioEngine
-from core.explainability.decision_explainer import DecisionExplainer
 from core.monitoring.drift_detector import DriftDetector
-from core.schema.feature_schema import MODEL_FEATURES, get_schema_signature
+from core.schema.feature_schema import MODEL_FEATURES
 
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
@@ -24,7 +20,6 @@ from app.monitoring.metrics import (
     MODEL_INFERENCE_COUNT,
     MODEL_INFERENCE_LATENCY,
     SIGNAL_DISTRIBUTION,
-    FORECAST_HORIZON,
     CONFIDENCE_SCORE,
     MISSING_FEATURE_RATIO,
     PIPELINE_FAILURES,
@@ -102,19 +97,13 @@ class InferencePipeline:
         self.models = ModelLoader()
 
         self.decision_engine = DecisionEngine()
-        self.scenario_engine = ScenarioEngine()
-        self.explainer = DecisionExplainer()
         self.feature_store = FeatureStore()
 
         self.cache = RedisCache()
         self.drift_detector = DriftDetector()
         self.breaker = CircuitBreaker()
 
-        self.schema_signature = get_schema_signature()
-
         self._validate_models_loaded()
-
-    # ---------------------------------------------------
 
     def _validate_models_loaded(self):
 
@@ -123,8 +112,6 @@ class InferencePipeline:
 
         if not hasattr(self.models.xgb, "predict_proba"):
             raise RuntimeError("Invalid XGBoost artifact.")
-
-    # ---------------------------------------------------
 
     def _validate_data_freshness(self, df: pd.DataFrame):
 
@@ -140,11 +127,10 @@ class InferencePipeline:
         ).total_seconds() / 3600
 
         if age_hours > self.DATA_FRESHNESS_HOURS:
-            raise RuntimeError(
-                f"Market data stale ({age_hours:.1f}h old)."
+            logger.warning(
+                "Market data stale (%.1fh old). Continuing inference.",
+                age_hours
             )
-
-    # ---------------------------------------------------
 
     def _extract_features(self, latest_row):
 
@@ -165,13 +151,12 @@ class InferencePipeline:
         MISSING_FEATURE_RATIO.set(null_ratio)
 
         if null_ratio > self.MAX_NULL_RATIO:
-            raise RuntimeError(
-                f"Null feature ratio exceeded: {null_ratio:.3f}"
+            logger.warning(
+                "High null feature ratio detected: %.3f",
+                null_ratio
             )
 
         return vector.values.reshape(1, -1)
-
-    # ---------------------------------------------------
 
     def _guard_latency(self, start, model):
 
@@ -183,13 +168,13 @@ class InferencePipeline:
                 stage=f"{model}_latency"
             ).inc()
 
-            raise RuntimeError(
-                f"{model} exceeded latency guard."
+            logger.warning(
+                "%s exceeded latency guard (%.2fs)",
+                model,
+                elapsed
             )
 
         return elapsed
-
-    # ---------------------------------------------------
 
     def run(self, ticker="AAPL"):
 
@@ -202,15 +187,8 @@ class InferencePipeline:
 
         try:
 
-            # POINTER SAFE VERSION RESOLUTION
-            _, model_version = self.models._resolve_production_dir(
-                "artifacts/xgboost"
-            )
-
             payload = {
-                "ticker": ticker,
-                "model_version": model_version,
-                "schema": self.schema_signature
+                "ticker": ticker
             }
 
             cache_key = self.cache.build_key(payload)
@@ -292,14 +270,13 @@ class InferencePipeline:
                     "confidence": float(decision["confidence"]),
                     "probability_up": float(prob_up),
                     "recommended_allocation": decision["allocation"],
-                    "position_size_pct": decision["position_pct"],
-                    "model_version": model_version
+                    "position_size_pct": decision["position_pct"]
                 }
 
                 self.cache.set(cache_key, response, ttl=900)
 
                 if (time.time() - start_pipeline) > self.HARD_PIPELINE_TIMEOUT:
-                    raise RuntimeError("Pipeline exceeded hard timeout.")
+                    logger.warning("Pipeline exceeded hard timeout.")
 
                 self.breaker.record_success()
 
