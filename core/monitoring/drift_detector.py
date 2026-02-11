@@ -5,26 +5,41 @@ import json
 import logging
 from typing import Dict, Any
 
-from app.monitoring.metrics import DRIFT_DETECTED
-from core.schema.feature_schema import get_schema_signature
-
+from core.schema.feature_schema import (
+    get_schema_signature,
+    MODEL_FEATURES
+)
 
 logger = logging.getLogger("marketsentinel.drift")
 
 
+# --------------------------------------------------
+# SAFE METRIC LOADER
+# Never crash if Prometheus is missing
+# --------------------------------------------------
+
+try:
+    from app.monitoring.metrics import DRIFT_DETECTED
+except Exception:
+    class _NoOpMetric:
+        def set(self, *_):
+            pass
+    DRIFT_DETECTED = _NoOpMetric()
+
+
 class DriftDetector:
     """
-    Production Drift Sentinel.
+    Institutional Drift Sentinel.
 
     Guarantees:
     - schema-bound baseline
-    - non-crashing inference checks
-    - global drift emission
-    - variance safety
+    - audit-safe metadata
+    - non-crashing monitoring
+    - feature count protection
     """
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "2.0"
+    BASELINE_VERSION = "3.0"
 
     MIN_SAMPLE_BASELINE = 50
     MIN_SAMPLE_INFERENCE = 20
@@ -35,13 +50,11 @@ class DriftDetector:
     EPSILON = 1e-6
 
     def __init__(self, z_threshold: float = 3.0):
-
         self.z_threshold = z_threshold
-
         os.makedirs("artifacts/drift", exist_ok=True)
 
     # --------------------------------------------------
-    # BASELINE CREATION
+    # BASELINE
     # --------------------------------------------------
 
     def create_baseline(self, dataset: pd.DataFrame):
@@ -54,10 +67,18 @@ class DriftDetector:
         if numeric.empty:
             raise RuntimeError("No numeric features available.")
 
+        if len(numeric.columns) != len(MODEL_FEATURES):
+            raise RuntimeError(
+                "Baseline feature count mismatch. "
+                "Feature pipeline likely corrupted."
+            )
+
         baseline: Dict[str, Any] = {
             "meta": {
                 "baseline_version": self.BASELINE_VERSION,
-                "schema_signature": get_schema_signature()
+                "schema_signature": get_schema_signature(),
+                "feature_count": len(numeric.columns),
+                "created_at": pd.Timestamp.utcnow().isoformat()
             },
             "features": {}
         }
@@ -113,10 +134,15 @@ class DriftDetector:
                 "Baseline schema mismatch. Retraining required."
             )
 
+        if meta.get("feature_count") != len(MODEL_FEATURES):
+            raise RuntimeError(
+                "Baseline feature count mismatch."
+            )
+
         return baseline["features"]
 
     # --------------------------------------------------
-    # DETECT DRIFT
+    # DRIFT DETECTION
     # --------------------------------------------------
 
     def detect(self, dataset: pd.DataFrame):
@@ -131,13 +157,8 @@ class DriftDetector:
 
             numeric = dataset.select_dtypes(include="number")
 
-            baseline_features = set(baseline.keys())
-            incoming_features = set(numeric.columns)
-
-            if baseline_features != incoming_features:
-                logger.critical(
-                    "SCHEMA DRIFT DETECTED — blocking confidence."
-                )
+            if set(numeric.columns) != set(baseline.keys()):
+                logger.critical("SCHEMA DRIFT DETECTED.")
 
                 DRIFT_DETECTED.set(1)
 
@@ -154,9 +175,6 @@ class DriftDetector:
                 current = numeric[col].dropna()
 
                 if len(current) < self.MIN_SAMPLE_INFERENCE:
-                    logger.warning(
-                        f"Drift skipped for {col} — insufficient sample."
-                    )
                     continue
 
                 mean_now = current.mean()
@@ -187,11 +205,6 @@ class DriftDetector:
 
                 if feature_drift:
                     drift_detected = True
-
-                    logger.warning(
-                        f"Drift detected in feature '{col}' | "
-                        f"z={z_score:.2f} var_ratio={variance_ratio:.2f}"
-                    )
 
                 drift_report[col] = {
                     "mean_shift": bool(mean_shift),
