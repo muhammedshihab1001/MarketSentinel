@@ -1,7 +1,7 @@
 # ------------------------------------------------
 # GIT
 # ------------------------------------------------
-.git
+.git/
 .gitignore
 
 # ------------------------------------------------
@@ -24,27 +24,36 @@ notebooks/
 
 # ------------------------------------------------
 # MODEL ARTIFACTS
-# (Mount at runtime instead)
+# Mount these at runtime instead
 # ------------------------------------------------
 artifacts/
-
-# allow registry metadata if ever needed
 !artifacts/.gitkeep
-
-# training logs ok to ignore
 artifacts/training_runs/
 
 # ------------------------------------------------
-# HF / Torch caches
+# HF / Torch / Pip caches
 # ------------------------------------------------
 .huggingface/
 .cache/
-torch_cache/
+.cache/huggingface/
+.cache/torch/
+.cache/pip/
 
 # ------------------------------------------------
 # Tests / Dev
 # ------------------------------------------------
 tests/
+coverage/
+htmlcov/
+.pytest_cache/
+
+# ------------------------------------------------
+# Build junk
+# ------------------------------------------------
+*.log
+*.tmp
+*.swp
+*.pid
 
 # ------------------------------------------------
 # Node junk

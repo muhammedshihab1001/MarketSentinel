@@ -2,31 +2,19 @@ version: "3.9"
 
 services:
 
-  # -------------------------------------------------
-  # REDIS (Prediction Cache)
-  # -------------------------------------------------
-
   redis:
     image: redis:7-alpine
     container_name: marketsentinel-redis
-    ports:
-      - "6379:6379"
+    expose:
+      - "6379"
     restart: always
 
-
-  # -------------------------------------------------
-  # BACKGROUND MARKET REFRESHER
-  # 🔥 Keeps datasets + features HOT
-  # -------------------------------------------------
 
   market-refresher:
     build:
       context: .
-      dockerfile: docker/training.Dockerfile
+      dockerfile: docker/refresher.Dockerfile   # create tiny image
     container_name: marketsentinel-refresher
-
-    command: >
-      python -m training.market_refresher
 
     volumes:
       - ./data:/app/data
@@ -38,14 +26,11 @@ services:
       - redis
 
 
-  # -------------------------------------------------
-  # INFERENCE API
-  # -------------------------------------------------
-
   api:
     build:
       context: .
       dockerfile: docker/inference.Dockerfile
+
     container_name: marketsentinel-api
 
     ports:
@@ -53,18 +38,16 @@ services:
 
     volumes:
       - ./artifacts:/app/artifacts
-      - ./data:/app/data   # 🔥 CRITICAL (shared datasets)
+      - ./data:/app/data
 
     depends_on:
       - redis
-      - market-refresher
 
     restart: always
 
+    environment:
+      REDIS_HOST: redis
 
-  # -------------------------------------------------
-  # PROMETHEUS
-  # -------------------------------------------------
 
   prometheus:
     image: prom/prometheus
@@ -82,10 +65,6 @@ services:
     depends_on:
       - api
 
-
-  # -------------------------------------------------
-  # GRAFANA
-  # -------------------------------------------------
 
   grafana:
     image: grafana/grafana
