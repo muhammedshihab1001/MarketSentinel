@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-import os
 import logging
 
 from core.schema.feature_schema import (
@@ -12,21 +11,8 @@ logger = logging.getLogger("marketsentinel.features")
 
 
 class FeatureEngineer:
-    """
-    Institutional Feature Pipeline.
-
-    Guarantees:
-    - zero lookahead bias
-    - deterministic ordering
-    - timezone normalization
-    - schema enforcement
-    - audit logging
-    - float32 consistency
-    """
 
     MIN_ROWS_REQUIRED = 120
-
-    # -------------------------------------------------------------
 
     @staticmethod
     def _normalize_datetime(df: pd.DataFrame):
@@ -37,8 +23,6 @@ class FeatureEngineer:
         ).dt.tz_convert(None)
 
         return df
-
-    # -------------------------------------------------------------
 
     @staticmethod
     def _validate_price_frame(df: pd.DataFrame):
@@ -60,11 +44,19 @@ class FeatureEngineer:
             raise RuntimeError("Invalid close prices detected.")
 
         if not df["date"].is_monotonic_increasing:
-            df.sort_values("date", inplace=True)
+            df = df.sort_values("date")
 
         return df
 
-    # -------------------------------------------------------------
+    @staticmethod
+    def _downcast_float32(df):
+
+        float_cols = df.select_dtypes(include=["float64"]).columns
+
+        for col in float_cols:
+            df[col] = df[col].astype("float32")
+
+        return df
 
     @staticmethod
     def add_returns(df):
@@ -101,36 +93,33 @@ class FeatureEngineer:
         df["macd"] = ema_12 - ema_26
         df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
 
-    # -------------------------------------------------------------
-    # ZERO LOOKAHEAD MERGE
-    # -------------------------------------------------------------
-
     @staticmethod
     def merge_price_sentiment(price_df, sentiment_df):
 
         price = FeatureEngineer._normalize_datetime(price_df.copy())
         sentiment = FeatureEngineer._normalize_datetime(sentiment_df.copy())
 
-        if not sentiment["date"].is_monotonic_increasing:
-            sentiment.sort_values("date", inplace=True)
+        price = price.sort_values("date")
+        sentiment = sentiment.sort_values("date")
 
         if sentiment["date"].duplicated().any():
             sentiment = sentiment.groupby("date", as_index=False).mean()
+
+        # CRITICAL: shift sentiment to prevent lookahead
+        sentiment["date"] = sentiment["date"] + pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
             price,
             sentiment,
             on="date",
             direction="backward",
-            allow_exact_matches=True
+            allow_exact_matches=False
         )
 
         for col in ("avg_sentiment", "news_count", "sentiment_std"):
             merged[col] = merged.get(col, 0.0).fillna(0.0)
 
         return merged
-
-    # -------------------------------------------------------------
 
     @classmethod
     def _post_feature_guard(cls, df):
@@ -139,8 +128,6 @@ class FeatureEngineer:
             raise RuntimeError(
                 "Feature dataset too small for safe usage."
             )
-
-    # -------------------------------------------------------------
 
     @staticmethod
     def _sanitize_features(df):
@@ -160,10 +147,6 @@ class FeatureEngineer:
 
         return df
 
-    # -------------------------------------------------------------
-    # TRAINING
-    # -------------------------------------------------------------
-
     @classmethod
     def create_training_dataset(cls, df):
 
@@ -179,10 +162,6 @@ class FeatureEngineer:
         cls._post_feature_guard(df)
 
         return df
-
-    # -------------------------------------------------------------
-    # INFERENCE
-    # -------------------------------------------------------------
 
     @classmethod
     def create_inference_dataset(cls, df):
@@ -203,10 +182,6 @@ class FeatureEngineer:
 
         return df
 
-    # -------------------------------------------------------------
-    # CANONICAL PIPELINE
-    # -------------------------------------------------------------
-
     @classmethod
     def build_feature_pipeline(
         cls,
@@ -226,6 +201,8 @@ class FeatureEngineer:
 
         df = cls.merge_price_sentiment(df, sentiment_df)
 
+        df = cls._downcast_float32(df)
+
         if training:
             df = cls.create_training_dataset(df)
         else:
@@ -233,7 +210,9 @@ class FeatureEngineer:
 
         df = cls._sanitize_features(df)
 
-        validated = validate_feature_schema(df)
+        validated = validate_feature_schema(
+            df.drop(columns=["target"], errors="ignore")
+        )
 
         non_features = [
             col for col in df.columns
