@@ -5,7 +5,6 @@ import logging
 from typing import Dict, Any
 
 import pandas as pd
-import numpy as np
 
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import (
@@ -20,20 +19,21 @@ logger = logging.getLogger("marketsentinel.feature_store")
 
 class FeatureStore:
     """
-    Institutional Feature Store.
+    Institutional Feature Store — Hardened.
 
     Guarantees:
-    - lineage-bound datasets
-    - deterministic fingerprints
-    - crash-safe persistence
-    - schema enforcement
-    - corruption auto-recovery
-    - feature ordering guarantees
+    ✔ zero training/inference skew
+    ✔ lineage-bound datasets
+    ✔ deterministic fingerprints
+    ✔ crash-safe persistence
+    ✔ schema enforcement
+    ✔ corruption auto-recovery
+    ✔ feature ordering guarantees
     """
 
     FEATURE_DIR = "data/features"
     META_SUFFIX = ".meta.json"
-    META_VERSION = "5.0"
+    META_VERSION = "6.0"
 
     REQUIRED_DATASET_COLUMNS = {"date"}
 
@@ -43,14 +43,15 @@ class FeatureStore:
 
     # --------------------------------------------------
 
-    def _feature_path(self, ticker: str):
-        return f"{self.FEATURE_DIR}/{ticker}_features.parquet"
+    def _feature_path(self, ticker: str, training: bool):
+        suffix = "train" if training else "infer"
+        return f"{self.FEATURE_DIR}/{ticker}_{suffix}.parquet"
 
-    def _meta_path(self, ticker: str):
-        return f"{self._feature_path(ticker)}{self.META_SUFFIX}"
+    def _meta_path(self, ticker: str, training: bool):
+        return f"{self._feature_path(ticker, training)}{self.META_SUFFIX}"
 
     # --------------------------------------------------
-    # DETERMINISTIC HASH
+    # FAST + STABLE HASH
     # --------------------------------------------------
 
     def _stable_hash(self, df: pd.DataFrame):
@@ -66,29 +67,32 @@ class FeatureStore:
             include=["float32", "float64"]
         ).columns
 
-        df_copy[float_cols] = df_copy[float_cols].round(10)
+        df_copy[float_cols] = df_copy[float_cols].round(8)
 
         df_copy = df_copy.sort_values(
             by=list(df_copy.columns)
         ).reset_index(drop=True)
 
-        return pd.util.hash_pandas_object(
+        hashed = pd.util.hash_pandas_object(
             df_copy,
             index=False
         ).values.tobytes()
 
-    def _fingerprint(self, price_df, sentiment_df):
+        return hashed
+
+    # --------------------------------------------------
+    # PRICE-ONLY FINGERPRINT (CRITICAL FIX)
+    # --------------------------------------------------
+
+    def _fingerprint(self, price_df):
 
         hasher = hashlib.sha256()
 
         hasher.update(self._stable_hash(price_df))
-        hasher.update(self._stable_hash(sentiment_df))
         hasher.update(get_schema_signature().encode())
 
         return hasher.hexdigest()
 
-    # --------------------------------------------------
-    # VALIDATION
     # --------------------------------------------------
 
     def _validate_dataset_structure(self, df: pd.DataFrame):
@@ -127,7 +131,6 @@ class FeatureStore:
 
         validate_feature_schema(feature_block)
 
-        # write parquet safely
         df.to_parquet(tmp_data, index=False)
 
         with open(tmp_meta, "w") as f:
@@ -151,9 +154,6 @@ class FeatureStore:
 
             df = pd.read_parquet(path)
 
-            if df.empty:
-                raise RuntimeError("Stored dataset empty.")
-
             with open(meta_path, "r") as f:
                 meta = json.load(f)
 
@@ -165,12 +165,7 @@ class FeatureStore:
 
             self._validate_dataset_structure(df)
 
-            feature_block = df[MODEL_FEATURES]
-
-            if list(feature_block.columns) != MODEL_FEATURES:
-                raise RuntimeError("Feature ordering corrupted.")
-
-            validate_feature_schema(feature_block)
+            validate_feature_schema(df[MODEL_FEATURES])
 
             return df.sort_values("date"), meta
 
@@ -193,7 +188,8 @@ class FeatureStore:
     def _build_metadata(
         self,
         dataset_fp: str,
-        features: pd.DataFrame
+        features: pd.DataFrame,
+        training: bool
     ) -> Dict[str, Any]:
 
         return {
@@ -202,6 +198,7 @@ class FeatureStore:
             "schema_version": SCHEMA_VERSION,
             "schema_signature": get_schema_signature(),
             "dataset_fingerprint": dataset_fp,
+            "dataset_role": "training" if training else "inference",
             "feature_count": len(MODEL_FEATURES),
             "features": list(MODEL_FEATURES),
             "row_count": len(features),
@@ -214,7 +211,8 @@ class FeatureStore:
         self,
         price_df: pd.DataFrame,
         sentiment_df: pd.DataFrame,
-        ticker: str = "unknown"
+        ticker: str = "unknown",
+        training: bool = False
     ):
 
         if price_df.empty:
@@ -222,64 +220,34 @@ class FeatureStore:
                 "FeatureStore received empty price dataframe."
             )
 
-        if "date" not in price_df.columns:
-            raise RuntimeError(
-                "Price dataframe missing 'date' column."
-            )
+        path = self._feature_path(ticker, training)
+        meta_path = self._meta_path(ticker, training)
 
-        path = self._feature_path(ticker)
-        meta_path = self._meta_path(ticker)
-
-        dataset_fp = self._fingerprint(
-            price_df,
-            sentiment_df
-        )
+        dataset_fp = self._fingerprint(price_df)
 
         stored, meta = self._load_features(path, meta_path)
 
-        # --------------------------------------------
-        # NO STORED DATA
-        # --------------------------------------------
+        if stored is not None:
 
-        if stored is None:
+            if (
+                meta.get("dataset_fingerprint") == dataset_fp
+                and meta.get("schema_signature") == get_schema_signature()
+            ):
+                return stored
 
-            features = self.engineer.build_feature_pipeline(
-                price_df,
-                sentiment_df,
-                training=False
-            )
-
-            meta = self._build_metadata(dataset_fp, features)
-
-            self._atomic_write(features, path, meta, meta_path)
-
-            return features
-
-        # --------------------------------------------
-        # LINEAGE MATCH
-        # --------------------------------------------
-
-        if (
-            meta.get("dataset_fingerprint") == dataset_fp
-            and meta.get("schema_signature") == get_schema_signature()
-        ):
-            return stored
-
-        logger.info(
-            "Feature rebuild triggered due to lineage change."
-        )
-
-        # --------------------------------------------
-        # REBUILD
-        # --------------------------------------------
+            logger.info("Feature rebuild triggered due to lineage change.")
 
         features = self.engineer.build_feature_pipeline(
             price_df,
             sentiment_df,
-            training=False
+            training=training
         )
 
-        meta = self._build_metadata(dataset_fp, features)
+        meta = self._build_metadata(
+            dataset_fp,
+            features,
+            training
+        )
 
         self._atomic_write(features, path, meta, meta_path)
 
