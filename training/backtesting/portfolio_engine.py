@@ -3,13 +3,10 @@ from collections import defaultdict
 
 
 class PortfolioBacktestEngine:
-    """
-    Institutional multi-asset portfolio simulator.
-    """
 
     EPSILON = 1e-12
     VOL_WINDOW = 20
-    REBALANCE_THRESHOLD = 0.02  # 2% weight change
+    REBALANCE_THRESHOLD = 0.02
 
     def __init__(
         self,
@@ -23,7 +20,8 @@ class PortfolioBacktestEngine:
 
         self.return_buffers = defaultdict(list)
 
-    # -----------------------------------------------------
+    def _reset_state(self):
+        self.return_buffers = defaultdict(list)
 
     def _update_vol_buffers(self, prev_prices, prices):
 
@@ -51,8 +49,6 @@ class PortfolioBacktestEngine:
 
         return vols
 
-    # -----------------------------------------------------
-
     def _compute_weights(self, signals, vols, current_weights):
 
         raw = {}
@@ -75,7 +71,6 @@ class PortfolioBacktestEngine:
             for t, w in raw.items()
         }
 
-        # Rebalance guard
         final = {}
 
         for t, w in new_weights.items():
@@ -91,9 +86,18 @@ class PortfolioBacktestEngine:
             scale = self.max_gross_exposure / gross
             final = {t: w * scale for t, w in final.items()}
 
-        return final
+        portfolio_vol = np.sqrt(
+            sum((vols[t] ** 2) * (w ** 2) for t, w in final.items())
+        )
 
-    # -----------------------------------------------------
+        if portfolio_vol > self.EPSILON:
+            vol_scale = min(
+                self.target_vol / portfolio_vol,
+                self.max_gross_exposure
+            )
+            final = {t: w * vol_scale for t, w in final.items()}
+
+        return final
 
     def run(
         self,
@@ -102,6 +106,8 @@ class PortfolioBacktestEngine:
         initial_cash=10000
     ):
 
+        self._reset_state()
+
         cash = float(initial_cash)
         positions = {}
 
@@ -109,11 +115,19 @@ class PortfolioBacktestEngine:
         turnover = 0.0
 
         prev_prices = None
+        prev_signals = None
 
         for date in sorted(grouped_prices.keys()):
 
             prices = grouped_prices[date]
-            signals = grouped_signals[date]
+
+            if prev_signals is None:
+                prev_prices = prices
+                prev_signals = grouped_signals[date]
+                equity_curve.append(cash)
+                continue
+
+            signals = prev_signals
 
             vols = self._update_vol_buffers(prev_prices, prices)
 
@@ -139,10 +153,6 @@ class PortfolioBacktestEngine:
                 for t, w in weights.items()
             }
 
-            # -------------------------------------------------
-            # PRE-TRADE LEVERAGE CHECK
-            # -------------------------------------------------
-
             simulated_cash = cash
 
             for ticker in set(positions) | set(target_positions):
@@ -159,10 +169,6 @@ class PortfolioBacktestEngine:
                 raise RuntimeError(
                     "Backtest attempted leverage beyond cash."
                 )
-
-            # -------------------------------------------------
-            # APPLY TRADES
-            # -------------------------------------------------
 
             for ticker in set(positions) | set(target_positions):
 
@@ -199,7 +205,9 @@ class PortfolioBacktestEngine:
                 raise RuntimeError("Portfolio capital depleted.")
 
             equity_curve.append(float(equity))
+
             prev_prices = prices
+            prev_signals = grouped_signals[date]
 
         curve = np.array(equity_curve, dtype=float)
 
@@ -217,7 +225,7 @@ class PortfolioBacktestEngine:
         peak = np.maximum.accumulate(curve)
         drawdown = (curve - peak) / np.maximum(peak, self.EPSILON)
 
-        avg_turnover = turnover / max(len(curve), 1)
+        avg_turnover = turnover / max(curve.mean(), self.EPSILON)
 
         return {
             "final_portfolio": float(curve[-1]),
