@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import json
 import logging
+import hashlib
 from typing import Dict, Any
 
 from core.schema.feature_schema import (
@@ -37,7 +38,7 @@ class DriftDetector:
     """
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "6.0"
+    BASELINE_VERSION = "6.1"
 
     MIN_SAMPLE_BASELINE = 50
     MIN_SAMPLE_INFERENCE = 20
@@ -66,7 +67,7 @@ class DriftDetector:
         os.replace(tmp, path)
 
     # --------------------------------------------------
-    # SAFE FEATURE EXTRACTION (UPGRADED)
+    # SAFE FEATURE EXTRACTION
     # --------------------------------------------------
 
     def _safe_feature_block(self, dataset: pd.DataFrame):
@@ -81,14 +82,34 @@ class DriftDetector:
                 f"Drift detector schema violation. Missing={missing}"
             )
 
-        # FORCE ORDER
         block = dataset.reindex(columns=MODEL_FEATURES)
 
-        # Final safety check
         if list(block.columns) != MODEL_FEATURES:
             raise RuntimeError("Feature ordering enforcement failed.")
 
         return block
+
+    # --------------------------------------------------
+    # NEW — deterministic lineage hashing
+    # --------------------------------------------------
+
+    @staticmethod
+    def _dataset_sha256(df: pd.DataFrame) -> str:
+        """
+        Cryptographically stable dataset fingerprint.
+
+        Guarantees:
+        deterministic across runs
+        audit-safe lineage
+        regulator-friendly reproducibility
+        """
+
+        hashed = pd.util.hash_pandas_object(
+            df.round(8),
+            index=False
+        ).values
+
+        return hashlib.sha256(hashed.tobytes()).hexdigest()
 
     # --------------------------------------------------
 
@@ -105,13 +126,7 @@ class DriftDetector:
         numeric = self._safe_feature_block(dataset)
 
         if dataset_hash is None:
-
-            hashed = pd.util.hash_pandas_object(
-                numeric.round(8),
-                index=False
-            ).values.tobytes()
-
-            dataset_hash = str(hash(hashed))
+            dataset_hash = self._dataset_sha256(numeric)
 
         if os.path.exists(self.BASELINE_PATH):
 
