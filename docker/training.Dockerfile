@@ -1,48 +1,59 @@
 # -------------------------------------------------
-# STAGE 1 — Builder
+# STAGE 1 — BUILDER
 # -------------------------------------------------
-FROM python:3.10
+
+FROM python:3.10-slim AS builder
 
 WORKDIR /install
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install build tools ONLY here
-RUN apt-get update && apt-get install -y \
+# Build deps ONLY here
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc \
     g++ \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements ./requirements
 
-RUN pip install --upgrade pip
+RUN pip install --upgrade pip setuptools wheel
 
-# Install dependencies into a temp directory
+# Install into system path inside builder
 RUN pip install \
-    --prefix=/install \
     --no-cache-dir \
     -r requirements/training.txt
 
 
 # -------------------------------------------------
-# STAGE 2 — Runtime Image (LEAN)
+# STAGE 2 — RUNTIME
 # -------------------------------------------------
-FROM python:3.10
+
+FROM python:3.10-slim
 
 WORKDIR /app
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Copy ONLY installed packages
-COPY --from=builder /install /usr/local
+# Runtime libs ONLY
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy ONLY required folders
+# Copy installed packages from builder
+COPY --from=builder /usr/local /usr/local
+
+# Copy project
 COPY core ./core
 COPY models ./models
 COPY training ./training
 COPY requirements ./requirements
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
 
 CMD ["python", "-m", "training.pipelines.train_pipeline"]
