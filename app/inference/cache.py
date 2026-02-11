@@ -7,9 +7,6 @@ import random
 import time
 import zlib
 
-from core.schema.feature_schema import get_schema_signature
-from app.inference.model_loader import ModelLoader
-
 
 logger = logging.getLogger("marketsentinel.cache")
 
@@ -22,8 +19,6 @@ class RedisCache:
     BASE_RETRY = 15
     MAX_RETRY = 120
 
-    LOCK_TIMEOUT = 10  # seconds
-
     def __init__(self):
 
         self.enabled = False
@@ -31,8 +26,6 @@ class RedisCache:
         self._retry_delay = self.BASE_RETRY
 
         self._connect()
-
-    # ------------------------------------------------
 
     def _connect(self):
 
@@ -46,8 +39,8 @@ class RedisCache:
                 port=port,
                 socket_timeout=2,
                 socket_connect_timeout=2,
-                max_connections=50,
-                decode_responses=False  # required for compression
+                max_connections=10,
+                decode_responses=False
             )
 
             RedisCache._client = redis.Redis(
@@ -76,8 +69,6 @@ class RedisCache:
                 f"Redis unavailable. Retry in {self._retry_delay}s"
             )
 
-    # ------------------------------------------------
-
     def _maybe_reconnect(self):
 
         if self.enabled:
@@ -89,56 +80,28 @@ class RedisCache:
         logger.info("Attempting Redis reconnect...")
         self._connect()
 
-    # ------------------------------------------------
-    #  MODEL VERSION SAFE KEY
-    # ------------------------------------------------
+    def _model_fingerprint(self):
+
+        path = os.getenv(
+            "XGB_MODEL_PATH",
+            "artifacts/xgboost/model.pkl"
+        )
+
+        try:
+            mtime = os.path.getmtime(path)
+            return str(int(mtime))
+        except Exception:
+            return "unknown"
 
     def build_key(self, payload: dict) -> str:
 
         raw = json.dumps(payload, sort_keys=True, default=str)
 
-        schema = get_schema_signature()
-
-        model_version = ModelLoader().get_production_version(
-            "xgboost"
-        )
-
         fingerprint = hashlib.sha256(raw.encode()).hexdigest()
 
-        return f"prediction:{schema}:{model_version}:{fingerprint}"
+        model_fp = self._model_fingerprint()
 
-    # ------------------------------------------------
-    # DISTRIBUTED LOCK
-    # ------------------------------------------------
-
-    def acquire_lock(self, key: str):
-
-        if not self.enabled:
-            return None
-
-        lock_key = f"lock:{key}"
-
-        try:
-
-            lock = self.client.lock(
-                lock_key,
-                timeout=self.LOCK_TIMEOUT,
-                blocking_timeout=3
-            )
-
-            acquired = lock.acquire()
-
-            if acquired:
-                return lock
-
-            return None
-
-        except Exception:
-
-            logger.exception("Redis lock failure.")
-            return None
-
-    # ------------------------------------------------
+        return f"prediction:{model_fp}:{fingerprint}"
 
     def get(self, key: str):
 
@@ -174,8 +137,6 @@ class RedisCache:
             self._disabled_until = time.time() + self._retry_delay
 
             return None
-
-    # ------------------------------------------------
 
     def set(self, key: str, value: dict, ttl=None):
 
