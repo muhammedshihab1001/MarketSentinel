@@ -1,9 +1,11 @@
 import logging
 import time
 import gc
+import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response, Request
+from fastapi.responses import JSONResponse
 from prometheus_client import generate_latest
 
 from app.api.routes import health, predict
@@ -12,7 +14,7 @@ from app.inference.cache import RedisCache
 
 
 # =====================================================
-# LOGGING (Institutional Baseline)
+# LOGGING
 # =====================================================
 
 logging.basicConfig(
@@ -24,13 +26,19 @@ logger = logging.getLogger("marketsentinel")
 
 
 # =====================================================
-# READINESS STATE
+# GLOBAL INFERENCE LIMITER
+# Prevent CPU death spirals
+# =====================================================
+
+MAX_CONCURRENT_INFERENCE = 4
+inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCE)
+
+
+# =====================================================
+# READINESS
 # =====================================================
 
 class ReadinessState:
-    """
-    Thread-safe readiness tracker.
-    """
 
     def __init__(self):
         self.models_loaded = False
@@ -38,7 +46,6 @@ class ReadinessState:
 
     @property
     def ready(self):
-        # Redis is now treated as a degradation signal
         return self.models_loaded
 
 
@@ -46,7 +53,21 @@ readiness = ReadinessState()
 
 
 # =====================================================
-# LIFESPAN (Replaces deprecated startup event)
+# GLOBAL EXCEPTION HANDLER
+# =====================================================
+
+async def global_exception_handler(request: Request, exc: Exception):
+
+    logger.exception("Unhandled API error")
+
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal_server_error"}
+    )
+
+
+# =====================================================
+# LIFESPAN
 # =====================================================
 
 STARTUP_TIMEOUT_SEC = 120
@@ -59,80 +80,61 @@ async def lifespan(app: FastAPI):
 
     try:
 
-        logger.info("Starting MarketSentinel boot sequence...")
-
-        # -----------------------------
-        # Model Warmup
-        # -----------------------------
+        logger.info("===================================")
+        logger.info(" MarketSentinel Boot Sequence Start ")
+        logger.info("===================================")
 
         loader = ModelLoader()
         loader.warmup()
 
         readiness.models_loaded = True
 
-        # Memory stabilization after large model loads
-        gc.collect()
-
-        # -----------------------------
-        # Redis Validation
-        # -----------------------------
-
         cache = RedisCache()
 
         if cache.enabled:
             readiness.redis_connected = True
-            logger.info("Redis connection verified.")
-
+            logger.info("Redis connected.")
         else:
-            readiness.redis_connected = False
-            logger.warning(
-                "Redis unavailable — running in DEGRADED mode (no cache)."
-            )
+            logger.warning("Redis unavailable — degraded mode.")
+
+        # GC AFTER everything is loaded
+        gc.collect()
 
         boot_time = round(time.time() - start_time, 2)
 
         if boot_time > STARTUP_TIMEOUT_SEC:
-            raise RuntimeError("Startup exceeded safety timeout.")
+            raise RuntimeError("Startup exceeded timeout.")
 
-        logger.info(f"System ready. Boot time: {boot_time}s")
+        logger.info(f"System ready in {boot_time}s")
 
         yield
 
     except Exception:
 
-        logger.exception("CRITICAL STARTUP FAILURE — refusing traffic.")
+        logger.exception("CRITICAL STARTUP FAILURE")
 
-        # Fail fast → container restart
         raise
 
 
 # =====================================================
-# FASTAPI APP
+# FASTAPI
 # =====================================================
 
 app = FastAPI(
     title="MarketSentinel API",
-    description="Stock prediction & sentiment-based trading signals",
     version="1.0.0",
     lifespan=lifespan
 )
 
+app.add_exception_handler(Exception, global_exception_handler)
+
 
 # =====================================================
-# ROUTERS
+# ROUTES
 # =====================================================
 
-app.include_router(
-    health.router,
-    prefix="/health",
-    tags=["Health"]
-)
-
-app.include_router(
-    predict.router,
-    prefix="/v1",
-    tags=["Prediction"]
-)
+app.include_router(health.router, prefix="/health")
+app.include_router(predict.router, prefix="/v1")
 
 
 # =====================================================
@@ -140,7 +142,7 @@ app.include_router(
 # =====================================================
 
 @app.get("/")
-def root():
+async def root():
     return {
         "service": "MarketSentinel API",
         "status": "running",
@@ -155,40 +157,28 @@ def root():
 
 @app.get("/metrics")
 def metrics():
-    return Response(
-        generate_latest(),
-        media_type="text/plain"
-    )
+    return Response(generate_latest(), media_type="text/plain")
 
 
 # =====================================================
-# READINESS PROBE
+# READINESS
 # =====================================================
 
 @app.get("/ready")
 def readiness_probe():
 
     if not readiness.ready:
+        return Response("Service not ready", status_code=503)
 
-        return Response(
-            content="Service not ready",
-            status_code=503
-        )
-
-    status = {
+    return {
         "status": "ready",
-        "models_loaded": readiness.models_loaded,
-        "redis_connected": readiness.redis_connected
+        "redis_connected": readiness.redis_connected,
+        "mode": "degraded" if not readiness.redis_connected else "normal"
     }
-
-    if not readiness.redis_connected:
-        status["mode"] = "degraded"
-
-    return status
 
 
 # =====================================================
-# LIVENESS PROBE
+# LIVENESS
 # =====================================================
 
 @app.get("/live")
