@@ -3,15 +3,11 @@ import math
 import os
 
 
-# ---------------------------------------------------
-# CONFIG
-# ---------------------------------------------------
-
 @dataclass(frozen=True)
 class RiskConfig:
     """
-    Institutional risk parameters.
-    Frozen to prevent runtime mutation.
+    Production risk parameters.
+    Immutable to prevent runtime mutation.
     """
 
     max_position_size: float = 0.08
@@ -26,20 +22,9 @@ class RiskConfig:
     max_single_trade_dollars: float = 25_000
 
 
-# ---------------------------------------------------
-# POSITION SIZER
-# ---------------------------------------------------
-
 class PositionSizer:
     """
-    Capital deployment authority.
-
-    Guarantees:
-    - convexity protection
-    - drawdown throttling
-    - exposure ceilings
-    - nonlinear confidence scaling
-    - volatility-aware sizing
+    Volatility-aware capital deployment engine.
     """
 
     ABSOLUTE_MAX_POSITION = 0.15
@@ -51,25 +36,25 @@ class PositionSizer:
     def __init__(self, config: RiskConfig | None = None):
         self.config = config or RiskConfig()
 
-    # ---------------------------------------------------
-
     @staticmethod
     def _safe(v, fallback):
         if v is None or (isinstance(v, float) and math.isnan(v)):
             return fallback
         return float(v)
 
-    # ---------------------------------------------------
-    # DRAWdown THROTTLE
-    # ---------------------------------------------------
-
     def _drawdown_scalar(self):
 
-        drawdown = float(
-            os.getenv("PORTFOLIO_DRAWDOWN_PCT", "0.0")
-        )
+        try:
+            drawdown = float(
+                os.getenv("PORTFOLIO_DRAWDOWN_PCT", "0.0")
+            )
+        except Exception:
+            drawdown = 0.0
 
         drawdown = abs(drawdown)
+
+        # clamp to sane bounds
+        drawdown = max(0.0, min(drawdown, 0.80))
 
         if drawdown < 0.05:
             return 1.0
@@ -82,8 +67,6 @@ class PositionSizer:
 
         return 0.25
 
-    # ---------------------------------------------------
-
     def size_position(
         self,
         signal: str,
@@ -92,9 +75,6 @@ class PositionSizer:
         portfolio_value: float,
         current_gross_exposure: float | None = None
     ) -> float:
-        """
-        Returns position size in dollars.
-        """
 
         if signal not in {"BUY", "SELL"}:
             return 0.0
@@ -104,10 +84,6 @@ class PositionSizer:
 
         if portfolio_value < self.MIN_DEPLOYABLE_CAPITAL:
             return 0.0
-
-        # ---------------------------------------
-        # SANITIZE INPUTS
-        # ---------------------------------------
 
         confidence = self._safe(confidence, 0.5)
         confidence = max(0.0, min(confidence, 1.0))
@@ -122,21 +98,11 @@ class PositionSizer:
             min(volatility, self.VOL_CEILING)
         )
 
-        # ---------------------------------------
-        # NONLINEAR CONFIDENCE
-        # prevents over-allocation
-        # ---------------------------------------
-
         confidence_scalar = math.tanh(
             confidence * self.config.confidence_boost
         )
 
         confidence_scalar = max(confidence_scalar, 0.25)
-
-        # ---------------------------------------
-        # SQRT VOL SCALING
-        # industry standard
-        # ---------------------------------------
 
         vol_scalar = math.sqrt(
             self.config.volatility_target / volatility
@@ -144,15 +110,7 @@ class PositionSizer:
 
         vol_scalar = min(vol_scalar, 1.75)
 
-        # ---------------------------------------
-        # DRAWDOWN THROTTLE
-        # ---------------------------------------
-
         dd_scalar = self._drawdown_scalar()
-
-        # ---------------------------------------
-        # RAW SIZE
-        # ---------------------------------------
 
         raw_size = (
             portfolio_value *
@@ -161,10 +119,6 @@ class PositionSizer:
             confidence_scalar *
             dd_scalar
         )
-
-        # ---------------------------------------
-        # HARD CAPS
-        # ---------------------------------------
 
         config_cap = portfolio_value * self.config.max_position_size
         absolute_cap = portfolio_value * self.ABSOLUTE_MAX_POSITION
@@ -177,10 +131,6 @@ class PositionSizer:
             trade_cap
         )
 
-        # ---------------------------------------
-        # GROSS EXPOSURE GUARD
-        # ---------------------------------------
-
         if current_gross_exposure is not None:
 
             remaining_capacity = (
@@ -192,10 +142,6 @@ class PositionSizer:
                 return 0.0
 
             capped_size = min(capped_size, remaining_capacity)
-
-        # ---------------------------------------
-        # MICRO TRADE FILTER
-        # ---------------------------------------
 
         if capped_size < portfolio_value * self.config.min_position_size:
             return 0.0
