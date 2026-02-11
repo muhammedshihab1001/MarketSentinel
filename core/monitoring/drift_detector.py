@@ -9,7 +9,8 @@ from typing import Dict, Any
 from core.schema.feature_schema import (
     get_schema_signature,
     SCHEMA_VERSION,
-    MODEL_FEATURES
+    MODEL_FEATURES,
+    DTYPE
 )
 
 logger = logging.getLogger("marketsentinel.drift")
@@ -25,20 +26,9 @@ except Exception:
 
 
 class DriftDetector:
-    """
-    Institutional Drift Sentinel — Hardened.
-
-    Guarantees:
-    schema-bound baseline
-    lineage enforcement
-    crash-safe writes
-    fail-closed detection
-    feature ordering enforcement
-    training compatibility
-    """
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "6.1"
+    BASELINE_VERSION = "6.2"
 
     MIN_SAMPLE_BASELINE = 50
     MIN_SAMPLE_INFERENCE = 20
@@ -52,8 +42,6 @@ class DriftDetector:
         self.z_threshold = z_threshold
         os.makedirs("artifacts/drift", exist_ok=True)
 
-    # --------------------------------------------------
-
     @staticmethod
     def _atomic_write(path: str, payload: dict):
 
@@ -65,10 +53,6 @@ class DriftDetector:
             os.fsync(f.fileno())
 
         os.replace(tmp, path)
-
-    # --------------------------------------------------
-    # SAFE FEATURE EXTRACTION
-    # --------------------------------------------------
 
     def _safe_feature_block(self, dataset: pd.DataFrame):
 
@@ -82,36 +66,42 @@ class DriftDetector:
                 f"Drift detector schema violation. Missing={missing}"
             )
 
-        block = dataset.reindex(columns=MODEL_FEATURES)
+        block = dataset.reindex(columns=MODEL_FEATURES).copy()
+
+        for col in MODEL_FEATURES:
+            block[col] = pd.to_numeric(block[col], errors="coerce").astype(DTYPE)
 
         if list(block.columns) != MODEL_FEATURES:
             raise RuntimeError("Feature ordering enforcement failed.")
 
         return block
 
-    # --------------------------------------------------
-    # NEW — deterministic lineage hashing
-    # --------------------------------------------------
-
     @staticmethod
     def _dataset_sha256(df: pd.DataFrame) -> str:
-        """
-        Cryptographically stable dataset fingerprint.
 
-        Guarantees:
-        deterministic across runs
-        audit-safe lineage
-        regulator-friendly reproducibility
-        """
+        ordered = df.reindex(columns=sorted(df.columns)).copy()
+        ordered = ordered.round(8)
 
         hashed = pd.util.hash_pandas_object(
-            df.round(8),
+            ordered,
             index=False
         ).values
 
         return hashlib.sha256(hashed.tobytes()).hexdigest()
 
-    # --------------------------------------------------
+    def _validate_baseline_structure(self, baseline: dict):
+
+        if "meta" not in baseline or "features" not in baseline:
+            raise RuntimeError("Baseline structure corrupted.")
+
+        if baseline["meta"].get("baseline_version") != self.BASELINE_VERSION:
+            raise RuntimeError("Baseline version mismatch.")
+
+        for feature in MODEL_FEATURES:
+            if feature not in baseline["features"]:
+                raise RuntimeError(
+                    f"Baseline missing feature stats: {feature}"
+                )
 
     def create_baseline(
         self,
@@ -135,6 +125,8 @@ class DriftDetector:
                 try:
                     with open(self.BASELINE_PATH) as f:
                         existing = json.load(f)
+
+                    self._validate_baseline_structure(existing)
 
                     if existing.get("meta", {}).get("dataset_hash") == dataset_hash:
                         logger.info("Baseline already matches dataset.")
@@ -189,8 +181,6 @@ class DriftDetector:
 
         logger.info("Drift baseline created.")
 
-    # --------------------------------------------------
-
     def _load_baseline(self):
 
         if not os.path.exists(self.BASELINE_PATH):
@@ -198,6 +188,8 @@ class DriftDetector:
 
         with open(self.BASELINE_PATH, "r") as f:
             baseline = json.load(f)
+
+        self._validate_baseline_structure(baseline)
 
         meta = baseline.get("meta", {})
 
@@ -212,8 +204,6 @@ class DriftDetector:
             )
 
         return baseline
-
-    # --------------------------------------------------
 
     def detect(self, dataset: pd.DataFrame):
 
@@ -277,6 +267,7 @@ class DriftDetector:
                     "variance_shift": bool(variance_shift),
                     "min_breach": bool(min_breach),
                     "max_breach": bool(max_breach),
+                    "range_violation": bool(min_breach or max_breach),
                     "z_score": float(z_score),
                     "variance_ratio": float(variance_ratio)
                 }
