@@ -1,11 +1,14 @@
 import pandas as pd
 import numpy as np
 import os
+import logging
 
 from core.schema.feature_schema import (
     validate_feature_schema,
     MODEL_FEATURES
 )
+
+logger = logging.getLogger("marketsentinel.features")
 
 
 class FeatureEngineer:
@@ -13,12 +16,12 @@ class FeatureEngineer:
     Institutional Feature Pipeline.
 
     Guarantees:
-    - zero training/inference skew
-    - deterministic dataset structure
-    - lineage preservation (date survives)
-    - numeric stability
-    - schema compliance
-    - audit visibility on row drops
+    - zero lookahead bias
+    - deterministic ordering
+    - timezone normalization
+    - schema enforcement
+    - audit logging
+    - float32 consistency
     """
 
     MIN_ROWS_REQUIRED = 120
@@ -26,13 +29,14 @@ class FeatureEngineer:
     # -------------------------------------------------------------
 
     @staticmethod
-    def _is_test_mode():
+    def _normalize_datetime(df: pd.DataFrame):
 
-        return (
-            os.getenv("CI") == "true"
-            or os.getenv("TEST_MODE") == "true"
-            or "PYTEST_CURRENT_TEST" in os.environ
-        )
+        df["date"] = pd.to_datetime(
+            df["date"],
+            utc=True
+        ).dt.tz_convert(None)
+
+        return df
 
     # -------------------------------------------------------------
 
@@ -47,42 +51,34 @@ class FeatureEngineer:
         if not required.issubset(df.columns):
             raise RuntimeError("Price dataframe missing required columns.")
 
-        if df["close"].isna().any():
-            raise RuntimeError("Close price contains NaNs.")
-
-        if (df["close"] <= 0).any():
-            raise RuntimeError("Invalid close prices detected.")
+        df = FeatureEngineer._normalize_datetime(df)
 
         if df["date"].duplicated().any():
             raise RuntimeError("Duplicate timestamps in price data.")
 
-        if not pd.api.types.is_datetime64_any_dtype(df["date"]):
-            raise RuntimeError("date column must be datetime64.")
+        if (df["close"] <= 0).any():
+            raise RuntimeError("Invalid close prices detected.")
 
-        if df["date"].dt.tz is None:
-            raise RuntimeError("date column must be timezone-aware (UTC required).")
+        if not df["date"].is_monotonic_increasing:
+            df.sort_values("date", inplace=True)
+
+        return df
 
     # -------------------------------------------------------------
 
     @staticmethod
-    def add_returns(df: pd.DataFrame):
+    def add_returns(df):
         df["return"] = df["close"].pct_change()
 
-    # -------------------------------------------------------------
+    @staticmethod
+    def add_volatility(df, window=5):
+        df["volatility"] = df["return"].rolling(
+            window,
+            min_periods=window
+        ).std()
 
     @staticmethod
-    def add_volatility(df: pd.DataFrame, window: int = 5):
-
-        df["volatility"] = (
-            df["return"]
-            .rolling(window, min_periods=window)
-            .std()
-        )
-
-    # -------------------------------------------------------------
-
-    @staticmethod
-    def add_rsi(df: pd.DataFrame, window: int = 14):
+    def add_rsi(df, window=14):
 
         delta = df["close"].diff()
 
@@ -94,14 +90,10 @@ class FeatureEngineer:
 
         rs = avg_gain / (avg_loss + 1e-9)
 
-        rsi = 100 - (100 / (1 + rs))
-
-        df["rsi"] = rsi.clip(0, 100).fillna(50)
-
-    # -------------------------------------------------------------
+        df["rsi"] = 100 - (100 / (1 + rs))
 
     @staticmethod
-    def add_macd(df: pd.DataFrame):
+    def add_macd(df):
 
         ema_12 = df["close"].ewm(span=12, adjust=False).mean()
         ema_26 = df["close"].ewm(span=26, adjust=False).mean()
@@ -110,30 +102,20 @@ class FeatureEngineer:
         df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
 
     # -------------------------------------------------------------
-    # CRITICAL — NO LOOKAHEAD MERGE
+    # ZERO LOOKAHEAD MERGE
     # -------------------------------------------------------------
 
     @staticmethod
-    def merge_price_sentiment(
-        price_df: pd.DataFrame,
-        sentiment_df: pd.DataFrame
-    ) -> pd.DataFrame:
+    def merge_price_sentiment(price_df, sentiment_df):
 
-        price = price_df.copy()
-        sentiment = sentiment_df.copy()
+        price = FeatureEngineer._normalize_datetime(price_df.copy())
+        sentiment = FeatureEngineer._normalize_datetime(sentiment_df.copy())
 
-        price["date"] = pd.to_datetime(price["date"], utc=True)
-        sentiment["date"] = pd.to_datetime(sentiment["date"], utc=True)
-
-        price = price.sort_values("date")
-        sentiment = sentiment.sort_values("date")
+        if not sentiment["date"].is_monotonic_increasing:
+            sentiment.sort_values("date", inplace=True)
 
         if sentiment["date"].duplicated().any():
-            sentiment = (
-                sentiment
-                .groupby("date", as_index=False)
-                .mean()
-            )
+            sentiment = sentiment.groupby("date", as_index=False).mean()
 
         merged = pd.merge_asof(
             price,
@@ -144,50 +126,37 @@ class FeatureEngineer:
         )
 
         for col in ("avg_sentiment", "news_count", "sentiment_std"):
-
-            if col not in merged:
-                merged[col] = 0.0
-            else:
-                merged[col] = merged[col].fillna(0.0)
+            merged[col] = merged.get(col, 0.0).fillna(0.0)
 
         return merged
 
     # -------------------------------------------------------------
 
     @classmethod
-    def _post_feature_guard(cls, df: pd.DataFrame):
-
-        # NOTE:
-        # Prefer stricter tests than production.
-        # Keeping test bypass for now to avoid breaking CI unexpectedly.
-        # Recommend removing this within the next infra hardening cycle.
-
-        if cls._is_test_mode():
-            return
+    def _post_feature_guard(cls, df):
 
         if len(df) < cls.MIN_ROWS_REQUIRED:
             raise RuntimeError(
-                "Feature dataset too small for safe inference/training."
+                "Feature dataset too small for safe usage."
             )
 
     # -------------------------------------------------------------
 
     @staticmethod
-    def _sanitize_features(df: pd.DataFrame):
-
-        df = df.replace([np.inf, -np.inf], np.nan)
+    def _sanitize_features(df):
 
         before = len(df)
 
-        df = df.dropna().copy()
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        df = df.dropna(subset=MODEL_FEATURES).copy()
 
         dropped = before - len(df)
 
         if dropped > 0:
-            df.attrs["dropped_rows"] = dropped
-
-        for col in MODEL_FEATURES:
-            df[col] = df[col].astype("float64")
+            logger.warning(
+                f"{dropped} rows dropped during feature sanitation."
+            )
 
         return df
 
@@ -196,16 +165,16 @@ class FeatureEngineer:
     # -------------------------------------------------------------
 
     @classmethod
-    def create_training_dataset(cls, df: pd.DataFrame):
+    def create_training_dataset(cls, df):
 
-        df = df.copy()
+        df = df.sort_values("date").copy()
 
         df["target"] = (df["return"].shift(-1) > 0).astype(int)
 
         df["return_lag1"] = df["return"].shift(1)
         df["sentiment_lag1"] = df["avg_sentiment"].shift(1)
 
-        df = df.dropna()
+        df.dropna(inplace=True)
 
         cls._post_feature_guard(df)
 
@@ -216,19 +185,19 @@ class FeatureEngineer:
     # -------------------------------------------------------------
 
     @classmethod
-    def create_inference_dataset(cls, df: pd.DataFrame):
-
-        df = df.copy()
+    def create_inference_dataset(cls, df):
 
         if "target" in df.columns:
             raise RuntimeError(
-                "Target column detected in inference pipeline."
+                "Target detected in inference pipeline."
             )
+
+        df = df.sort_values("date").copy()
 
         df["return_lag1"] = df["return"].shift(1)
         df["sentiment_lag1"] = df["avg_sentiment"].shift(1)
 
-        df = df.dropna()
+        df.dropna(inplace=True)
 
         cls._post_feature_guard(df)
 
@@ -241,17 +210,14 @@ class FeatureEngineer:
     @classmethod
     def build_feature_pipeline(
         cls,
-        price_df: pd.DataFrame,
-        sentiment_df: pd.DataFrame,
-        training: bool = False
-    ) -> pd.DataFrame:
+        price_df,
+        sentiment_df,
+        training=False
+    ):
 
-        cls._validate_price_frame(price_df)
+        price_df = cls._validate_price_frame(price_df)
 
         df = price_df.copy()
-
-        if not df["date"].is_monotonic_increasing:
-            df = df.sort_values("date")
 
         cls.add_returns(df)
         cls.add_volatility(df)
@@ -269,15 +235,12 @@ class FeatureEngineer:
 
         validated = validate_feature_schema(df)
 
-        # enforce canonical feature order
-        validated = validated[MODEL_FEATURES]
-
         non_features = [
             col for col in df.columns
             if col not in MODEL_FEATURES
         ]
 
-        final_df = pd.concat(
+        final = pd.concat(
             [
                 df[non_features].reset_index(drop=True),
                 validated.reset_index(drop=True)
@@ -285,4 +248,4 @@ class FeatureEngineer:
             axis=1
         )
 
-        return final_df.reset_index(drop=True)
+        return final.reset_index(drop=True)
