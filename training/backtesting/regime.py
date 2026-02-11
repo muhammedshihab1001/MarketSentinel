@@ -19,20 +19,9 @@ class RegimeConfig:
 
 
 class MarketRegimeDetector:
-    """
-    Institutional market regime classifier.
-
-    Guarantees:
-    - zero lookahead bias
-    - strictly trailing indicators
-    - cross-asset isolation
-    - deterministic output
-    """
 
     def __init__(self, config: RegimeConfig | None = None):
         self.config = config or RegimeConfig()
-
-    # ---------------------------------------------------
 
     def _detect_single_asset(self, df: pd.DataFrame):
 
@@ -40,53 +29,64 @@ class MarketRegimeDetector:
 
         df = df.sort_values("date").copy()
 
-        # SHIFTED — prevents same-bar leakage
+        shifted_close = df["close"].shift(1)
+
         ma_long = (
-            df["close"]
+            shifted_close
             .rolling(cfg.trend_window, min_periods=cfg.trend_window)
             .mean()
-            .shift(1)
         )
 
-        returns = df["close"].pct_change()
+        returns = shifted_close.pct_change()
 
         volatility = (
             returns
             .rolling(cfg.volatility_window,
                      min_periods=cfg.volatility_window)
             .std()
-            .shift(1)
         )
 
-        trend_dev = (df["close"] - ma_long) / ma_long
+        trend_dev = (shifted_close - ma_long) / ma_long
 
-        regime = np.full(len(df), "SIDEWAYS", dtype=object)
+        regime = np.full(len(df), "UNKNOWN", dtype=object)
 
-        crisis = volatility > cfg.crash_vol_threshold
+        ready_mask = (
+            ma_long.notna() &
+            volatility.notna()
+        )
 
         bull = (
+            ready_mask &
             (trend_dev > cfg.trend_buffer) &
             (volatility < cfg.bull_vol_threshold)
         )
 
         bear = (
+            ready_mask &
             (trend_dev < -cfg.trend_buffer) &
             (volatility > cfg.bear_vol_threshold)
         )
 
+        sideways = (
+            ready_mask &
+            ~bull &
+            ~bear
+        )
+
+        regime[sideways] = "SIDEWAYS"
+        regime[bull] = "BULL"
+        regime[bear] = "BEAR"
+
+        crisis = ready_mask & (volatility > cfg.crash_vol_threshold)
         regime[crisis] = "CRISIS"
-        regime[bull & ~crisis] = "BULL"
-        regime[bear & ~crisis] = "BEAR"
 
         regime = self._apply_persistence_trailing(regime)
 
         df["regime"] = regime
 
-        return df
+        df = df[df["regime"] != "UNKNOWN"].copy()
 
-    # ---------------------------------------------------
-    # TRAILING PERSISTENCE (NO FUTURE)
-    # ---------------------------------------------------
+        return df
 
     def _apply_persistence_trailing(self, regimes):
 
@@ -103,9 +103,7 @@ class MarketRegimeDetector:
                 streak += 1
                 continue
 
-            # new candidate begins
-            if regimes[i] != regimes[i-1]:
-                streak = 1
+            streak = 1
 
             if streak >= cfg.persistence_days:
                 current = regimes[i]
@@ -113,8 +111,6 @@ class MarketRegimeDetector:
             confirmed[i] = current
 
         return confirmed
-
-    # ---------------------------------------------------
 
     def detect(self, df: pd.DataFrame):
 
