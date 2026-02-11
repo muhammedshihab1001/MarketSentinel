@@ -6,7 +6,10 @@ import hashlib
 import uuid
 from typing import Dict, Any
 
-from core.schema.feature_schema import get_schema_signature
+from core.schema.feature_schema import (
+    get_schema_signature,
+    MODEL_FEATURES
+)
 
 
 class ModelRegistry:
@@ -22,6 +25,7 @@ class ModelRegistry:
     - lineage tracking
     - schema enforcement
     - artifact integrity verification
+    - feature ordering lock
     """
 
     MANIFEST_NAME = "manifest.json"
@@ -110,10 +114,15 @@ class ModelRegistry:
                 f"Metadata missing required fields: {missing}"
             )
 
-        # HARD SCHEMA LOCK
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError(
                 "Schema mismatch detected. Refusing registry."
+            )
+
+        # HARD FEATURE ORDER LOCK
+        if meta["features"] != list(MODEL_FEATURES):
+            raise RuntimeError(
+                "Feature ordering mismatch. Registry rejected."
             )
 
     # --------------------------------------------------
@@ -221,6 +230,9 @@ class ModelRegistry:
     @staticmethod
     def promote_to_production(base_dir: str, version: str):
 
+        # NEW — VERIFY BEFORE PROMOTION
+        ModelRegistry.verify_artifacts(base_dir, version)
+
         version_dir = os.path.join(base_dir, version)
 
         if not os.path.exists(version_dir):
@@ -279,8 +291,6 @@ class ModelRegistry:
             manifest
         )
 
-    # --------------------------------------------------
-    # ROLLBACK
     # --------------------------------------------------
 
     @staticmethod
