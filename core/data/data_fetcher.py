@@ -12,16 +12,6 @@ logger = logging.getLogger("marketsentinel.fetcher")
 
 
 class StockPriceFetcher:
-    """
-    Institutional Market Data Fetcher.
-
-    Guarantees:
-    - split-adjusted pricing
-    - atomic cache writes
-    - deterministic retries
-    - gap detection
-    - schema enforcement
-    """
 
     REQUIRED_COLUMNS = {
         "date",
@@ -45,23 +35,42 @@ class StockPriceFetcher:
         os.makedirs(self.CACHE_DIR, exist_ok=True)
         self._validate_yfinance_version()
 
-    # =====================================================
+    # -----------------------------------------------------
 
     def _validate_yfinance_version(self):
-        """
-        Ensure runtime compatibility with modern yfinance.
-        """
 
         if version.parse(yf.__version__) < version.parse("0.2.36"):
             logger.warning(
                 "Old yfinance detected. Consider upgrading."
             )
 
-    # =====================================================
+    # -----------------------------------------------------
+    #  NEW — PROVIDER NORMALIZATION LAYER
+    # -----------------------------------------------------
+
+    def _flatten_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalize Yahoo multi-index columns into flat schema.
+        """
+
+        if isinstance(df.columns, pd.MultiIndex):
+
+            # Drop ticker level (we fetch single symbol)
+            df.columns = df.columns.get_level_values(0)
+
+        df.columns = [c.lower() for c in df.columns]
+
+        return df
+
+    # -----------------------------------------------------
 
     def _normalize_schema(self, df: pd.DataFrame):
 
-        df = df.rename(columns=str.lower)
+        df = self._flatten_columns(df)
+
+        if "date" not in df.columns:
+            df.reset_index(inplace=True)
+            df.rename(columns={"index": "date"}, inplace=True)
 
         df["date"] = pd.to_datetime(
             df["date"],
@@ -71,7 +80,17 @@ class StockPriceFetcher:
         numeric = ["open", "high", "low", "close", "volume"]
 
         for col in numeric:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            if col not in df.columns:
+                raise RuntimeError(
+                    f"Provider schema violation: missing={col}"
+                )
+
+            # Force series conversion
+            df[col] = pd.to_numeric(
+                df[col].squeeze(),
+                errors="coerce"
+            )
 
         df = df.dropna(subset=numeric)
 
@@ -79,7 +98,7 @@ class StockPriceFetcher:
 
         return df
 
-    # =====================================================
+    # -----------------------------------------------------
 
     def _detect_gaps(self, df):
 
@@ -90,7 +109,7 @@ class StockPriceFetcher:
                 "Large gap detected in price history."
             )
 
-    # =====================================================
+    # -----------------------------------------------------
 
     def _validate_coverage(self, df, start_date, end_date):
 
@@ -106,7 +125,7 @@ class StockPriceFetcher:
                 f"Dataset coverage too low: {coverage:.2f}"
             )
 
-    # =====================================================
+    # -----------------------------------------------------
 
     def _validate_dataset(self, df, start_date, end_date):
 
@@ -114,13 +133,6 @@ class StockPriceFetcher:
             raise RuntimeError("Provider returned empty dataset.")
 
         df = self._normalize_schema(df)
-
-        missing = self.REQUIRED_COLUMNS - set(df.columns)
-
-        if missing:
-            raise RuntimeError(
-                f"Provider schema violation: missing={missing}"
-            )
 
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices detected.")
@@ -138,7 +150,7 @@ class StockPriceFetcher:
 
         return df.reset_index(drop=True)
 
-    # =====================================================
+    # -----------------------------------------------------
 
     def _atomic_cache_write(self, df, cache_file):
 
@@ -147,14 +159,14 @@ class StockPriceFetcher:
         df.to_parquet(tmp, index=False)
         os.replace(tmp, cache_file)
 
-    # =====================================================
+    # -----------------------------------------------------
 
     def _cache_key(self, ticker, start, end, interval):
 
         raw = f"{ticker}_{start}_{end}_{interval}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-    # =====================================================
+    # -----------------------------------------------------
 
     def fetch(
         self,
@@ -175,12 +187,10 @@ class StockPriceFetcher:
 
         cache_file = f"{self.CACHE_DIR}/{cache_name}.parquet"
 
-        # Cache first
         if os.path.exists(cache_file):
 
             try:
                 cached = pd.read_parquet(cache_file)
-
                 logger.info(f"Cache hit → {ticker}")
 
                 return self._validate_dataset(
@@ -190,41 +200,15 @@ class StockPriceFetcher:
                 )
 
             except Exception:
-
-                logger.exception(
-                    "Cache corrupted — rebuilding."
-                )
-
+                logger.exception("Cache corrupted — rebuilding.")
                 os.remove(cache_file)
 
-        try:
-
-            df = self._fetch_yahoo(
-                ticker,
-                start_date,
-                end_date,
-                interval
-            )
-
-        except Exception as e:
-
-            if os.path.exists(cache_file):
-
-                logger.warning(
-                    f"Yahoo failed — using stale cache for {ticker}"
-                )
-
-                cached = pd.read_parquet(cache_file)
-
-                return self._validate_dataset(
-                    cached,
-                    start_date,
-                    end_date
-                )
-
-            raise RuntimeError(
-                f"Yahoo failed and no cache available: {ticker}"
-            ) from e
+        df = self._fetch_yahoo(
+            ticker,
+            start_date,
+            end_date,
+            interval
+        )
 
         df = self._validate_dataset(
             df,
@@ -267,18 +251,15 @@ class StockPriceFetcher:
                         "Yahoo returned empty dataframe"
                     )
 
-                df.reset_index(inplace=True)
-
                 return df
 
             except Exception as e:
 
                 msg = str(e)
 
-                # Stop retrying on transport/config errors
                 if "curl_cffi" in msg or "session" in msg:
                     raise RuntimeError(
-                        "Yahoo transport error — likely library incompatibility."
+                        "Yahoo transport error — library incompatibility."
                     ) from e
 
                 sleep_time = (
