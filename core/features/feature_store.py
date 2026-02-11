@@ -26,12 +26,14 @@ class FeatureStore:
     - deterministic fingerprints
     - atomic persistence
     - corruption recovery
-    - feature contract enforcement
+    - strict feature validation without destroying dataset lineage
     """
 
     FEATURE_DIR = "data/features"
     META_SUFFIX = ".meta.json"
-    META_VERSION = "3.0"   # bump after hardening
+    META_VERSION = "4.0"
+
+    REQUIRED_DATASET_COLUMNS = {"date"}
 
     def __init__(self):
         os.makedirs(self.FEATURE_DIR, exist_ok=True)
@@ -46,42 +48,43 @@ class FeatureStore:
         return f"{self._feature_path(ticker)}{self.META_SUFFIX}"
 
     # --------------------------------------------------
-    # DATASET FINGERPRINT (DETERMINISTIC)
+    # DATASET FINGERPRINT
     # --------------------------------------------------
+
+    def _stable_hash(self, df: pd.DataFrame):
+
+        df = (
+            df.sort_index(axis=1)
+            .sort_values(by=list(df.columns))
+            .reset_index(drop=True)
+        )
+
+        return pd.util.hash_pandas_object(
+            df,
+            index=False
+        ).values.tobytes()
 
     def _fingerprint(self, price_df, sentiment_df):
 
-        def stable_hash(df):
-            df = (
-                df.sort_index(axis=1)
-                .sort_values(by=list(df.columns))
-                .reset_index(drop=True)
-            )
-
-            return pd.util.hash_pandas_object(
-                df,
-                index=False
-            ).values
-
         hasher = hashlib.sha256()
 
-        hasher.update(stable_hash(price_df))
-        hasher.update(stable_hash(sentiment_df))
+        hasher.update(self._stable_hash(price_df))
+        hasher.update(self._stable_hash(sentiment_df))
         hasher.update(SCHEMA_VERSION.encode())
 
         return hasher.hexdigest()
 
     # --------------------------------------------------
+    # DATASET VALIDATION
+    # --------------------------------------------------
 
-    def _validate_feature_contract(self, df: pd.DataFrame):
+    def _validate_dataset_structure(self, df: pd.DataFrame):
 
-        cols = set(df.columns)
+        missing = self.REQUIRED_DATASET_COLUMNS - set(df.columns)
 
-        if cols != set(MODEL_FEATURES):
+        if missing:
             raise RuntimeError(
-                f"Feature contract violation.\n"
-                f"Expected: {sorted(MODEL_FEATURES)}\n"
-                f"Found: {sorted(cols)}"
+                f"Dataset missing required columns: {missing}"
             )
 
     # --------------------------------------------------
@@ -104,10 +107,9 @@ class FeatureStore:
             if meta.get("metadata_type") != "feature_store":
                 raise RuntimeError("Invalid metadata type.")
 
-            # validate ONLY model features
-            validate_feature_schema(df[list(MODEL_FEATURES)])
+            self._validate_dataset_structure(df)
 
-            self._validate_feature_contract(df)
+            validate_feature_schema(df[list(MODEL_FEATURES)])
 
             return df.sort_values("date"), meta
 
@@ -134,8 +136,9 @@ class FeatureStore:
 
         df = df.sort_values("date").drop_duplicates("date")
 
+        self._validate_dataset_structure(df)
+
         validate_feature_schema(df[list(MODEL_FEATURES)])
-        self._validate_feature_contract(df)
 
         df.to_parquet(tmp_path, index=False)
 
@@ -159,8 +162,8 @@ class FeatureStore:
             "schema_version": SCHEMA_VERSION,
             "schema_signature": get_schema_signature(),
             "dataset_fingerprint": dataset_fp,
-            "feature_count": len(features.columns),
-            "features": list(features.columns),
+            "feature_count": len(MODEL_FEATURES),
+            "features": list(MODEL_FEATURES),
             "row_count": len(features)
         }
 
@@ -193,9 +196,7 @@ class FeatureStore:
 
         stored, meta = self._load_features(path, meta_path)
 
-        # --------------------------------------------------
-        # CASE 1 — No stored features
-        # --------------------------------------------------
+        # CASE 1 — no stored features
 
         if stored is None:
 
@@ -214,9 +215,7 @@ class FeatureStore:
 
             return features
 
-        # --------------------------------------------------
-        # CASE 2 — Lineage match
-        # --------------------------------------------------
+        # CASE 2 — lineage match
 
         if (
             meta.get("dataset_fingerprint") == dataset_fp
@@ -228,9 +227,7 @@ class FeatureStore:
             "Feature rebuild triggered due to lineage change."
         )
 
-        # --------------------------------------------------
-        # CASE 3 — Rebuild
-        # --------------------------------------------------
+        # CASE 3 — rebuild
 
         features = self.engineer.build_feature_pipeline(
             price_df,
