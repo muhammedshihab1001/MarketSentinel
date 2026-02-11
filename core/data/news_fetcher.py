@@ -4,6 +4,7 @@ import requests
 import logging
 import hashlib
 import threading
+import os
 
 from datetime import timedelta
 from typing import Dict, Tuple
@@ -13,16 +14,6 @@ logger = logging.getLogger("marketsentinel.news")
 
 
 class NewsFetcher:
-    """
-    Institutional News Fetcher.
-
-    Guarantees:
-    - single clock domain (UTC-naive)
-    - zero future leakage
-    - deterministic ordering
-    - schema stability
-    - thread-safe caching
-    """
 
     GOOGLE_NEWS_RSS = (
         "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
@@ -31,6 +22,10 @@ class NewsFetcher:
     CACHE_TTL = timedelta(minutes=10)
     MAX_CACHE_KEYS = 500
     MAX_ARTICLE_AGE = timedelta(hours=48)
+
+    MAX_DAILY_NEWS = 50
+
+    RAW_CACHE_DIR = "data/news_raw"
 
     _cache: Dict[str, Tuple[pd.Timestamp, pd.DataFrame]] = {}
     _lock = threading.Lock()
@@ -43,23 +38,47 @@ class NewsFetcher:
         columns=["headline", "published_at", "source", "link"]
     )
 
-    # --------------------------------------------------
+    def __init__(self):
+        os.makedirs(self.RAW_CACHE_DIR, exist_ok=True)
 
     @staticmethod
     def _now():
-        """
-        Single clock domain.
-        Always return UTC-naive timestamp.
-        """
         return pd.Timestamp.utcnow().tz_localize(None)
-
-    # --------------------------------------------------
 
     def _cache_key(self, query: str, max_items: int) -> str:
         raw = f"{query}_{max_items}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-    # --------------------------------------------------
+    def _raw_path(self, key: str):
+        return f"{self.RAW_CACHE_DIR}/{key}.xml"
+
+    def _persist_raw_feed(self, key: str, content: bytes):
+
+        path = self._raw_path(key)
+
+        if os.path.exists(path):
+            return content
+
+        tmp = path + ".tmp"
+
+        with open(tmp, "wb") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp, path)
+
+        return content
+
+    def _load_raw_feed(self, key: str):
+
+        path = self._raw_path(key)
+
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return f.read()
+
+        return None
 
     def _prune_cache(self):
 
@@ -74,13 +93,8 @@ class NewsFetcher:
         for k, _ in oldest:
             self._cache.pop(k, None)
 
-    # --------------------------------------------------
-
     @staticmethod
     def _normalize_timestamp(published):
-        """
-        Normalize provider timestamp into UTC-naive.
-        """
 
         ts = pd.to_datetime(
             published,
@@ -93,8 +107,6 @@ class NewsFetcher:
 
         return ts.tz_convert(None)
 
-    # --------------------------------------------------
-
     @staticmethod
     def _clean_headline(text: str):
 
@@ -105,8 +117,6 @@ class NewsFetcher:
 
         return text.strip()
 
-    # --------------------------------------------------
-
     def fetch(
         self,
         query: str,
@@ -116,10 +126,8 @@ class NewsFetcher:
         key = self._cache_key(query, max_items)
         now = self._now()
 
-        # Fast path
         if key in self._cache:
             expiry, df = self._cache[key]
-
             if now < expiry:
                 return df.copy()
 
@@ -127,31 +135,40 @@ class NewsFetcher:
 
             if key in self._cache:
                 expiry, df = self._cache[key]
-
                 if now < expiry:
                     return df.copy()
 
             try:
 
-                rss_url = self.GOOGLE_NEWS_RSS.format(
-                    query=query.replace(" ", "+")
-                )
+                raw_feed = self._load_raw_feed(key)
 
-                response = requests.get(
-                    rss_url,
-                    headers=self.HEADERS,
-                    timeout=5
-                )
+                if raw_feed is None:
 
-                response.raise_for_status()
+                    rss_url = self.GOOGLE_NEWS_RSS.format(
+                        query=query.replace(" ", "+")
+                    )
 
-                feed = feedparser.parse(response.content)
+                    response = requests.get(
+                        rss_url,
+                        headers=self.HEADERS,
+                        timeout=5
+                    )
+
+                    response.raise_for_status()
+
+                    raw_feed = self._persist_raw_feed(
+                        key,
+                        response.content
+                    )
+
+                feed = feedparser.parse(raw_feed)
 
                 articles = []
 
                 entries = sorted(
                     feed.entries,
-                    key=lambda e: e.get("published_parsed", (0,))
+                    key=lambda e: e.get("published_parsed", (0,)),
+                    reverse=True
                 )
 
                 for entry in entries:
@@ -169,9 +186,6 @@ class NewsFetcher:
                         continue
 
                     if published > now:
-                        logger.warning(
-                            "Future-dated article blocked."
-                        )
                         continue
 
                     if now - published > self.MAX_ARTICLE_AGE:
@@ -206,9 +220,6 @@ class NewsFetcher:
                         break
 
                 if not articles:
-                    logger.warning(
-                        "No fresh news — returning empty schema."
-                    )
                     return self.EMPTY_SCHEMA.copy()
 
                 df = pd.DataFrame(articles)
