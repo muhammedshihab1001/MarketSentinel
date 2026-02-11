@@ -13,14 +13,14 @@ from tensorflow.keras.callbacks import EarlyStopping
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
+from core.monitoring.drift_detector import DriftDetector
 from training.backtesting.walk_forward import WalkForwardValidator
 from models.lstm_model import build_lstm_model
 
 
 MODEL_DIR = "artifacts/lstm"
 
-TEMP_MODEL_PATH = f"{MODEL_DIR}/model.tmp.keras"
-
+TEMP_MODEL_PATH = f"{MODEL_DIR}/model.keras"
 TEMP_SCALER_PATH = f"{MODEL_DIR}/scaler.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
@@ -40,15 +40,31 @@ SEED = 42
 
 def set_seeds():
 
+    os.environ["TF_DETERMINISTIC_OPS"] = "1"
+
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
 
-    # optional GPU disable
     if os.getenv("DISABLE_GPU", "false").lower() == "true":
         tf.config.set_visible_devices([], "GPU")
 
     tf.config.threading.set_intra_op_parallelism_threads(1)
     tf.config.threading.set_inter_op_parallelism_threads(1)
+
+
+# ---------------------------------------------------
+# ATOMIC SAVE
+# ---------------------------------------------------
+
+def save_model_atomic(model, path):
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    tmp_path = path + ".tmp"
+
+    model.save(tmp_path)
+
+    os.replace(tmp_path, path)
 
 
 # ---------------------------------------------------
@@ -76,8 +92,6 @@ def load_data():
 
 
 # ---------------------------------------------------
-# SEQUENCE BUILDER
-# ---------------------------------------------------
 
 def create_sequences(data, lookback):
 
@@ -90,8 +104,6 @@ def create_sequences(data, lookback):
     return np.array(X), np.array(y)
 
 
-# ---------------------------------------------------
-# TRAIN SINGLE WINDOW
 # ---------------------------------------------------
 
 def train_model(train_prices):
@@ -125,8 +137,6 @@ def train_model(train_prices):
 
 
 # ---------------------------------------------------
-# SIGNAL GENERATOR
-# ---------------------------------------------------
 
 def generate_signals(model_scaler_tuple, test_df):
 
@@ -143,25 +153,21 @@ def generate_signals(model_scaler_tuple, test_df):
 
         pred_scaled = model.predict(seq, verbose=0)[0][0]
 
-        # convert prediction back to price
         pred_price = scaler.inverse_transform(
             [[pred_scaled]]
         )[0][0]
 
         current_price = prices[i-1][0]
 
-        if pred_price > current_price:
-            signals.append("BUY")
-        else:
-            signals.append("SELL")
+        signals.append(
+            "BUY" if pred_price > current_price else "SELL"
+        )
 
     signals = ["HOLD"] * LOOKBACK_WINDOW + signals
 
     return signals
 
 
-# ---------------------------------------------------
-# FINAL TRAIN
 # ---------------------------------------------------
 
 def train_full_model(df):
@@ -202,8 +208,6 @@ def train_full_model(df):
 
 
 # ---------------------------------------------------
-# EXECUTION
-# ---------------------------------------------------
 
 if __name__ == "__main__":
 
@@ -214,6 +218,11 @@ if __name__ == "__main__":
     df, end_date = load_data()
 
     dataset_hash = MetadataManager.fingerprint_dataset(df)
+
+    # Drift baseline from price
+    DriftDetector().create_baseline(
+        df[["close"]].rename(columns={"close": "price"})
+    )
 
     wf = WalkForwardValidator(
         model_trainer=lambda d: train_model(d["close"].values),
@@ -230,7 +239,9 @@ if __name__ == "__main__":
 
     model, scaler, val_loss = train_full_model(df)
 
-    model.save(TEMP_MODEL_PATH)
+    save_model_atomic(model, TEMP_MODEL_PATH)
+
+    joblib.dump(scaler, TEMP_SCALER_PATH)
 
     metadata = MetadataManager.create_metadata(
         model_name="lstm_price_forecast",
@@ -241,10 +252,10 @@ if __name__ == "__main__":
         features=["close_sequence"],
         training_start="2018-01-01",
         training_end=end_date,
-        dataset_hash=dataset_hash
+        dataset_hash=dataset_hash,
+        metadata_type="model"   # CRITICAL FIX
     )
 
-    joblib.dump(scaler, TEMP_SCALER_PATH)
     MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
 
     version_dir = ModelRegistry.register_model(
