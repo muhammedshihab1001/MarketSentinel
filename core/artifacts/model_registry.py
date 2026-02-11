@@ -7,15 +7,16 @@ from typing import Dict, Any
 
 class ModelRegistry:
     """
-    Institutional Release-Controlled Model Registry.
+    Institutional Transactional Model Registry.
 
     Guarantees:
-    - zero artifact mutation
     - atomic registration
-    - pointer safety
+    - crash-safe manifests
+    - pointer integrity
     - promotion lineage
     - rollback capability
-    - cross-platform behavior
+    - artifact immutability
+    - schema-bound metadata
     """
 
     MANIFEST_NAME = "manifest.json"
@@ -40,7 +41,8 @@ class ModelRegistry:
         "features",
         "metrics",
         "dataset_hash",
-        "schema_signature"
+        "schema_signature",
+        "metadata_type"
     )
 
     # --------------------------------------------------
@@ -48,6 +50,20 @@ class ModelRegistry:
     @staticmethod
     def _version() -> str:
         return datetime.datetime.utcnow().strftime("v%Y_%m_%d_%H%M%S")
+
+    # --------------------------------------------------
+
+    @staticmethod
+    def _atomic_json_write(path: str, payload: dict):
+
+        tmp = path + ".tmp"
+
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp, path)
 
     # --------------------------------------------------
 
@@ -61,7 +77,7 @@ class ModelRegistry:
             raise RuntimeError(f"Artifact empty: {path}")
 
     # --------------------------------------------------
-    # STRICT METADATA VALIDATION (NO MUTATION)
+    # STRICT METADATA VALIDATION
     # --------------------------------------------------
 
     @staticmethod
@@ -70,7 +86,7 @@ class ModelRegistry:
         with open(metadata_path) as f:
             meta = json.load(f)
 
-        if meta.get("metadata_type", "model") != "model":
+        if meta.get("metadata_type") != "model":
             raise RuntimeError(
                 "Attempted to register non-model metadata."
             )
@@ -94,6 +110,9 @@ class ModelRegistry:
         if not isinstance(meta["dataset_hash"], str):
             raise RuntimeError("dataset_hash must be a string")
 
+        if not isinstance(meta["schema_signature"], str):
+            raise RuntimeError("schema_signature must be a string")
+
     # --------------------------------------------------
     # POINTER
     # --------------------------------------------------
@@ -106,12 +125,10 @@ class ModelRegistry:
             ModelRegistry.LATEST_POINTER
         )
 
-        tmp = pointer_path + ".tmp"
-
-        with open(tmp, "w") as f:
-            json.dump({"version": version}, f)
-
-        os.replace(tmp, pointer_path)
+        ModelRegistry._atomic_json_write(
+            pointer_path,
+            {"version": version}
+        )
 
     # --------------------------------------------------
 
@@ -129,6 +146,7 @@ class ModelRegistry:
             os.replace(tmp_link, link_name)
 
         except Exception:
+            # Windows fallback or restricted FS
             pass
 
     # --------------------------------------------------
@@ -152,12 +170,7 @@ class ModelRegistry:
             ModelRegistry.MANIFEST_NAME
         )
 
-        tmp = path + ".tmp"
-
-        with open(tmp, "w") as f:
-            json.dump(manifest, f, indent=4)
-
-        os.replace(tmp, path)
+        ModelRegistry._atomic_json_write(path, manifest)
 
     # --------------------------------------------------
 
@@ -185,15 +198,10 @@ class ModelRegistry:
             ModelRegistry.MANIFEST_NAME
         )
 
-        tmp = path + ".tmp"
-
-        with open(tmp, "w") as f:
-            json.dump(manifest, f, indent=4)
-
-        os.replace(tmp, path)
+        ModelRegistry._atomic_json_write(path, manifest)
 
     # --------------------------------------------------
-    # REGISTRATION
+    # REGISTRATION (TRANSACTIONAL)
     # --------------------------------------------------
 
     @staticmethod
@@ -227,6 +235,7 @@ class ModelRegistry:
             )
         )
 
+        # atomic directory swap
         os.replace(staging_dir, version_dir)
 
         return version
@@ -285,15 +294,20 @@ class ModelRegistry:
                 "Only approved models may enter production."
             )
 
+        # Validate artifacts again before promotion
+        metadata = manifest["metadata"]
+
+        if metadata.get("metadata_type") != "model":
+            raise RuntimeError("Invalid metadata detected.")
+
         latest_link = os.path.join(base_dir, "latest")
 
         previous = None
 
-        if os.path.exists(ModelRegistry.LATEST_POINTER):
-            try:
-                previous = ModelRegistry.get_latest_version(base_dir)
-            except Exception:
-                pass
+        try:
+            previous = ModelRegistry.get_latest_version(base_dir)
+        except Exception:
+            pass
 
         ModelRegistry._atomic_symlink(version, latest_link)
         ModelRegistry._write_latest_pointer(base_dir, version)
