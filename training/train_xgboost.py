@@ -13,14 +13,10 @@ from core.data.data_fetcher import StockPriceFetcher
 from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_engineering import FeatureEngineer
-from core.schema.feature_schema import (
-    MODEL_FEATURES,
-    validate_feature_schema
-)
+from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
 from core.monitoring.drift_detector import DriftDetector
-
 from training.backtesting.walk_forward import WalkForwardValidator
 
 
@@ -31,7 +27,6 @@ TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 SEED = 42
 np.random.seed(SEED)
-
 
 TRAINING_TICKERS = [
     "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA"
@@ -44,11 +39,7 @@ def save_model_atomic(model, path):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        dir=os.path.dirname(path)
-    ) as tmp:
-
+    with tempfile.NamedTemporaryFile(delete=False, dir=os.path.dirname(path)) as tmp:
         joblib.dump(model, tmp.name)
         temp_name = tmp.name
 
@@ -62,13 +53,19 @@ def ensure_baseline(df, dataset_hash):
 
     detector = DriftDetector()
 
-    if os.path.exists(detector.BASELINE_PATH):
-        return
+    if not os.path.exists(detector.BASELINE_PATH):
+        detector.create_baseline(df, dataset_hash=dataset_hash)
 
-    detector.create_baseline(
-        df,
-        dataset_hash=dataset_hash
-    )
+
+def sanitize_dataframe(df):
+
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.dropna(inplace=True)
+
+    if df.empty:
+        raise RuntimeError("Dataset empty after sanitation.")
+
+    return df
 
 
 def load_training_data():
@@ -109,24 +106,18 @@ def load_training_data():
 
     df = pd.concat(datasets, ignore_index=True)
 
-    df = df.sort_values(
-        ["date","ticker"]
-    ).reset_index(drop=True)
+    df.sort_values(["date", "ticker"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
-    if df.empty:
-        raise RuntimeError("Training dataset empty.")
+    df = sanitize_dataframe(df)
 
     if len(df) < MIN_TRAINING_ROWS:
-        raise RuntimeError(
-            f"Training aborted — dataset too small ({len(df)} rows)"
-        )
+        raise RuntimeError(f"Training aborted — dataset too small ({len(df)} rows)")
 
-    # CRITICAL STEP — SCHEMA VALIDATION
     validated_features = validate_feature_schema(df)
 
-    # attach non-feature columns back safely
     df = pd.concat(
-        [df[["date","ticker","target"]], validated_features],
+        [df[["date", "ticker", "target"]], validated_features],
         axis=1
     )
 
@@ -183,9 +174,7 @@ def train_full_model(df):
         "logloss": float(log_loss(y_val, probs)),
     }
 
-    importance = dict(
-        zip(list(MODEL_FEATURES), model.feature_importances_.tolist())
-    )
+    importance = dict(zip(list(MODEL_FEATURES), model.feature_importances_.tolist()))
 
     return model, metrics, importance
 
@@ -203,8 +192,9 @@ if __name__ == "__main__":
     wf = WalkForwardValidator(
         model_trainer=lambda d: train_full_model(d)[0],
         signal_generator=lambda m, d: np.where(
-            m.predict_proba(d[list(MODEL_FEATURES)])[:,1] > 0.6,
-            "BUY","HOLD"
+            m.predict_proba(d[list(MODEL_FEATURES)])[:, 1] > 0.6,
+            "BUY",
+            "HOLD"
         )
     )
 
@@ -231,10 +221,7 @@ if __name__ == "__main__":
         "feature_count": len(MODEL_FEATURES)
     }
 
-    MetadataManager.save_metadata(
-        enriched_metadata,
-        TEMP_METADATA_PATH
-    )
+    MetadataManager.save_metadata(enriched_metadata, TEMP_METADATA_PATH)
 
     version_dir = ModelRegistry.register_model(
         MODEL_DIR,
@@ -242,4 +229,4 @@ if __name__ == "__main__":
         TEMP_METADATA_PATH
     )
 
-    print(f"XGBoost registered → {version_dir}")
+    print(f"XGBoost registered -> {version_dir}")
