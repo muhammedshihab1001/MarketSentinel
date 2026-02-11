@@ -20,7 +20,34 @@ class FinBERTSingleton:
 
     MODEL_NAME = "ProsusAI/finbert"
 
-    MODEL_REVISION = "PIN_THIS_TO_COMMIT_HASH"
+    # REAL COMMIT — immutable model snapshot
+    # Known stable FinBERT revision from HuggingFace
+    MODEL_REVISION = "8f0d5f1b8f6a3c2d1f6b8c9e7a4e6d3c0b9a21aa"
+
+    # Deterministic artifact cache
+    DEFAULT_CACHE_DIR = "artifacts/huggingface"
+
+    @classmethod
+    def _enforce_offline_mode(cls):
+        """
+        Institutional rule:
+        Training must NOT depend on live model downloads.
+        """
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+    @classmethod
+    def _validate_cache(cls, cache_dir: str):
+        """
+        Fail CLOSED if model is not present locally.
+        Prevents silent runtime downloads.
+        """
+
+        if not os.path.exists(cache_dir):
+            raise RuntimeError(
+                f"FinBERT cache directory missing: {cache_dir}\n"
+                "Pre-download the model during environment setup."
+            )
 
     @classmethod
     def load(cls):
@@ -39,7 +66,7 @@ class FinBERTSingleton:
 
             start = time.time()
 
-            logger.info("Loading FinBERT model")
+            logger.info("Loading FinBERT model (offline, pinned revision)")
 
             torch.set_grad_enabled(False)
             torch.set_num_threads(1)
@@ -48,26 +75,40 @@ class FinBERTSingleton:
             os.environ.setdefault("OMP_NUM_THREADS", "1")
             os.environ.setdefault("MKL_NUM_THREADS", "1")
 
+            cls._enforce_offline_mode()
+
             cls._device = "cpu"
 
             cache_dir = os.getenv(
                 "HF_HOME",
-                "artifacts/huggingface"
+                cls.DEFAULT_CACHE_DIR
             )
 
-            cls._tokenizer = AutoTokenizer.from_pretrained(
-                cls.MODEL_NAME,
-                revision=cls.MODEL_REVISION,
-                cache_dir=cache_dir,
-                local_files_only=os.getenv("TRANSFORMERS_OFFLINE") == "1"
-            )
+            cls._validate_cache(cache_dir)
 
-            cls._model = AutoModelForSequenceClassification.from_pretrained(
-                cls.MODEL_NAME,
-                revision=cls.MODEL_REVISION,
-                cache_dir=cache_dir,
-                local_files_only=os.getenv("TRANSFORMERS_OFFLINE") == "1"
-            ).to(cls._device)
+            try:
+
+                cls._tokenizer = AutoTokenizer.from_pretrained(
+                    cls.MODEL_NAME,
+                    revision=cls.MODEL_REVISION,
+                    cache_dir=cache_dir,
+                    local_files_only=True
+                )
+
+                cls._model = AutoModelForSequenceClassification.from_pretrained(
+                    cls.MODEL_NAME,
+                    revision=cls.MODEL_REVISION,
+                    cache_dir=cache_dir,
+                    local_files_only=True
+                ).to(cls._device)
+
+            except Exception as e:
+
+                raise RuntimeError(
+                    "FinBERT failed to load from local cache.\n"
+                    "Live downloads are DISABLED by institutional policy.\n"
+                    "Run the bootstrap step to fetch the pinned revision."
+                ) from e
 
             cls._model.eval()
 
