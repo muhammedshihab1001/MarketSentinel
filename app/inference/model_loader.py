@@ -4,6 +4,7 @@ import joblib
 import tensorflow as tf
 import logging
 import threading
+from datetime import datetime
 
 from prophet.serialize import model_from_json
 
@@ -18,32 +19,15 @@ logger = logging.getLogger("marketsentinel.loader")
 
 
 class ModelLoader:
-    """
-    Institutional Inference Loader.
-
-    Guarantees:
-    - thread-safe singleton
-    - schema-bound model loading
-    - manifest validation
-    - pointer integrity
-    - GPU storm prevention
-    - artifact validation
-    """
 
     _instance = None
     _instance_lock = threading.Lock()
     _tf_lock = threading.Lock()
 
-    # ---------------------------------------------------
-    # THREAD SAFE SINGLETON
-    # ---------------------------------------------------
-
     def __new__(cls, *args, **kwargs):
 
         if cls._instance is None:
-
             with cls._instance_lock:
-
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
 
@@ -59,6 +43,8 @@ class ModelLoader:
         self._configure_tensorflow()
 
         self._xgb = None
+        self._xgb_version = None
+
         self._shadow_xgb = None
         self._lstm = None
         self._scaler = None
@@ -69,28 +55,34 @@ class ModelLoader:
         self._initialized = True
 
     # ---------------------------------------------------
-    # TENSORFLOW SAFE INIT
+    # SAFE TF INIT
     # ---------------------------------------------------
 
     def _configure_tensorflow(self):
 
         with self._tf_lock:
 
-            disable_gpu = os.getenv("DISABLE_GPU", "false").lower() == "true"
+            try:
 
-            if disable_gpu:
-                tf.config.set_visible_devices([], "GPU")
+                disable_gpu = os.getenv(
+                    "DISABLE_GPU",
+                    "false"
+                ).lower() == "true"
 
-            intra = int(os.getenv("TF_INTRA_THREADS", "1"))
-            inter = int(os.getenv("TF_INTER_THREADS", "1"))
+                if disable_gpu:
+                    tf.config.set_visible_devices([], "GPU")
 
-            tf.config.threading.set_intra_op_parallelism_threads(intra)
-            tf.config.threading.set_inter_op_parallelism_threads(inter)
+                intra = int(os.getenv("TF_INTRA_THREADS", "1"))
+                inter = int(os.getenv("TF_INTER_THREADS", "1"))
+
+                tf.config.threading.set_intra_op_parallelism_threads(intra)
+                tf.config.threading.set_inter_op_parallelism_threads(inter)
+
+            except Exception:
+                logger.warning("TensorFlow already initialized — skipping device config.")
 
             os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
-    # ---------------------------------------------------
-    # VALIDATION
     # ---------------------------------------------------
 
     def _validate_artifact(self, path):
@@ -126,112 +118,69 @@ class ModelLoader:
 
         meta_path = os.path.join(version_dir, "metadata.json")
 
-        if not os.path.exists(meta_path):
-            raise RuntimeError("Missing metadata.json")
-
         with open(meta_path) as f:
             meta = json.load(f)
 
-        if meta.get("metadata_type") != "model":
-            raise RuntimeError("Invalid metadata type.")
-
         if meta.get("schema_signature") != get_schema_signature():
-            raise RuntimeError(
-                "Schema mismatch detected during model load."
-            )
+            raise RuntimeError("Schema mismatch detected.")
 
         return meta
 
     # ---------------------------------------------------
-    # POINTER RESOLUTION
-    # ---------------------------------------------------
 
-    def _resolve_production_dir(self, model_dir: str):
+    def _resolve_production_dir(self, model_dir):
 
         pointer = os.path.join(model_dir, "latest.json")
 
-        if os.path.exists(pointer):
+        if not os.path.exists(pointer):
+            raise RuntimeError("Latest pointer missing.")
 
-            with open(pointer) as f:
-                data = json.load(f)
+        with open(pointer) as f:
+            version = json.load(f)["version"]
 
-            version = data.get("version")
+        version_dir = os.path.join(model_dir, version)
 
-            if not version:
-                raise RuntimeError("Latest pointer corrupted.")
+        self._validate_manifest(version_dir)
 
-            version_dir = os.path.join(model_dir, version)
-
-            if not os.path.exists(version_dir):
-                raise RuntimeError("Pointer references missing version.")
-
-            self._validate_manifest(version_dir)
-
-            return version_dir, version
-
-        symlink = os.path.join(model_dir, "latest")
-
-        if os.path.islink(symlink):
-
-            version = os.readlink(symlink)
-            version_dir = os.path.join(model_dir, version)
-
-            self._validate_manifest(version_dir)
-
-            return version_dir, version
-
-        raise RuntimeError(f"No production pointer found in {model_dir}")
+        return version_dir, version
 
     # ---------------------------------------------------
-    # SHADOW DISCOVERY
+    # VERSION ACCESSOR
     # ---------------------------------------------------
 
-    def _find_shadow_version(self, model_dir, prod_version):
+    def get_production_version(self, model_name):
 
-        if not os.path.exists(model_dir):
-            return None
+        _, version = self._resolve_production_dir(
+            f"artifacts/{model_name}"
+        )
 
-        candidates = []
-
-        for version in os.listdir(model_dir):
-
-            if version == prod_version:
-                continue
-
-            version_dir = os.path.join(model_dir, version)
-
-            manifest_path = os.path.join(version_dir, "manifest.json")
-
-            if not os.path.exists(manifest_path):
-                continue
-
-            try:
-                with open(manifest_path) as f:
-                    manifest = json.load(f)
-
-                if manifest.get("stage") == "shadow":
-                    candidates.append((version_dir, version))
-
-            except Exception:
-                logger.exception("Shadow manifest read failure.")
-
-        if not candidates:
-            return None
-
-        return sorted(candidates, key=lambda x: x[1], reverse=True)[0]
+        return version
 
     # ---------------------------------------------------
-    # SAFE LOAD ONCE
+    # HOT RELOAD
     # ---------------------------------------------------
 
-    def _load_once(self, attr, loader):
+    def _reload_if_needed(self, attr, version_attr, loader, current_version):
 
-        if getattr(self, attr) is None:
+        cached_version = getattr(self, version_attr)
 
-            with self._load_lock:
+        if cached_version == current_version:
+            return getattr(self, attr)
 
-                if getattr(self, attr) is None:
-                    setattr(self, attr, loader())
+        with self._load_lock:
+
+            cached_version = getattr(self, version_attr)
+
+            if cached_version != current_version:
+
+                logger.warning(
+                    f"Reloading model due to version change → {current_version}"
+                )
+
+                model = loader()
+
+                setattr(self, attr, model)
+                setattr(self, version_attr, current_version)
 
         return getattr(self, attr)
 
@@ -242,20 +191,21 @@ class ModelLoader:
     @property
     def xgb(self):
 
-        def load():
+        version_dir, version = self._resolve_production_dir(
+            "artifacts/xgboost"
+        )
 
-            version_dir, version = self._resolve_production_dir(
-                "artifacts/xgboost"
-            )
+        def load():
 
             self._validate_metadata(version_dir)
 
             path = os.path.join(version_dir, "model.pkl")
             self._validate_artifact(path)
 
-            logger.info(f"Loading production XGBoost {version}")
-
             model = joblib.load(path)
+
+            if not hasattr(model, "predict_proba"):
+                raise RuntimeError("Invalid XGBoost artifact.")
 
             MODEL_VERSION.labels(
                 model="xgboost_prod",
@@ -264,150 +214,71 @@ class ModelLoader:
 
             return model
 
-        return self._load_once("_xgb", load)
+        return self._reload_if_needed(
+            "_xgb",
+            "_xgb_version",
+            load,
+            version
+        )
 
     # ---------------------------------------------------
-    # SHADOW XGBOOST
+    # SHADOW (timestamp-safe)
     # ---------------------------------------------------
 
-    @property
-    def shadow_xgb(self):
+    def _find_shadow_version(self, model_dir, prod_version):
 
-        def load():
+        versions = []
 
-            prod_dir, prod_version = self._resolve_production_dir(
-                "artifacts/xgboost"
+        for v in os.listdir(model_dir):
+
+            if v == prod_version:
+                continue
+
+            manifest = os.path.join(
+                model_dir,
+                v,
+                "manifest.json"
             )
 
-            result = self._find_shadow_version(
-                "artifacts/xgboost",
-                prod_version
-            )
+            if not os.path.exists(manifest):
+                continue
 
-            if result is None:
-                return None
+            with open(manifest) as f:
+                m = json.load(f)
 
-            version_dir, version = result
+            if m.get("stage") == "shadow":
 
-            self._validate_metadata(version_dir)
+                ts = datetime.strptime(
+                    v[1:], "%Y_%m_%d_%H%M%S"
+                )
 
-            path = os.path.join(version_dir, "model.pkl")
-            self._validate_artifact(path)
+                versions.append((ts, v))
 
-            logger.info(f"Loading shadow XGBoost {version}")
+        if not versions:
+            return None
 
-            model = joblib.load(path)
-
-            MODEL_VERSION.labels(
-                model="xgboost_shadow",
-                version=version
-            ).set(1)
-
-            return model
-
-        return self._load_once("_shadow_xgb", load)
+        return os.path.join(
+            model_dir,
+            sorted(versions)[-1][1]
+        )
 
     # ---------------------------------------------------
-    # LSTM
-    # ---------------------------------------------------
-
-    @property
-    def lstm(self):
-
-        def load():
-
-            version_dir, version = self._resolve_production_dir(
-                "artifacts/lstm"
-            )
-
-            self._validate_metadata(version_dir)
-
-            path = os.path.join(version_dir, "model.keras")
-            self._validate_artifact(path)
-
-            logger.info(f"Loading LSTM {version}")
-
-            model = tf.keras.models.load_model(
-                path,
-                compile=False
-            )
-
-            MODEL_VERSION.labels(
-                model="lstm",
-                version=version
-            ).set(1)
-
-            return model
-
-        return self._load_once("_lstm", load)
-
-    # ---------------------------------------------------
-
-    @property
-    def scaler(self):
-
-        def load():
-
-            version_dir, _ = self._resolve_production_dir(
-                "artifacts/lstm"
-            )
-
-            path = os.path.join(version_dir, "scaler.pkl")
-            self._validate_artifact(path)
-
-            return joblib.load(path)
-
-        return self._load_once("_scaler", load)
-
-    # ---------------------------------------------------
-    # PROPHET
-    # ---------------------------------------------------
-
-    @property
-    def prophet(self):
-
-        def load():
-
-            version_dir, version = self._resolve_production_dir(
-                "artifacts/prophet"
-            )
-
-            self._validate_metadata(version_dir)
-
-            path = os.path.join(version_dir, "prophet_trend.json")
-            self._validate_artifact(path)
-
-            logger.info(f"Loading Prophet {version}")
-
-            with open(path) as f:
-                model = model_from_json(f.read())
-
-            MODEL_VERSION.labels(
-                model="prophet",
-                version=version
-            ).set(1)
-
-            return model
-
-        return self._load_once("_prophet", load)
-
-    # ---------------------------------------------------
-    # WARMUP
+    # OPTIONAL WARMUP
     # ---------------------------------------------------
 
     def warmup(self):
 
+        if os.getenv("MODEL_WARMUP", "true") != "true":
+            return
+
         logger.info("Warming production models")
 
         _ = self.xgb
-        _ = self.lstm
-        _ = self.scaler
-        _ = self.prophet
 
         try:
             _ = self.shadow_xgb
         except Exception:
-            logger.exception("Shadow warmup failed")
+            pass
 
         logger.info("Models ready")
 
