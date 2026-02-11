@@ -10,7 +10,8 @@ from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import (
     validate_feature_schema,
     get_schema_signature,
-    SCHEMA_VERSION
+    SCHEMA_VERSION,
+    MODEL_FEATURES
 )
 
 logger = logging.getLogger("marketsentinel.feature_store")
@@ -22,15 +23,15 @@ class FeatureStore:
 
     Guarantees:
     - schema lineage
-    - dataset fingerprint
+    - deterministic fingerprints
     - atomic persistence
     - corruption recovery
-    - deterministic rebuilds
+    - feature contract enforcement
     """
 
     FEATURE_DIR = "data/features"
     META_SUFFIX = ".meta.json"
-    META_VERSION = "2.0"
+    META_VERSION = "3.0"   # bump after hardening
 
     def __init__(self):
         os.makedirs(self.FEATURE_DIR, exist_ok=True)
@@ -45,30 +46,43 @@ class FeatureStore:
         return f"{self._feature_path(ticker)}{self.META_SUFFIX}"
 
     # --------------------------------------------------
-    # DATASET FINGERPRINT
+    # DATASET FINGERPRINT (DETERMINISTIC)
     # --------------------------------------------------
 
     def _fingerprint(self, price_df, sentiment_df):
 
+        def stable_hash(df):
+            df = (
+                df.sort_index(axis=1)
+                .sort_values(by=list(df.columns))
+                .reset_index(drop=True)
+            )
+
+            return pd.util.hash_pandas_object(
+                df,
+                index=False
+            ).values
+
         hasher = hashlib.sha256()
 
-        hasher.update(
-            pd.util.hash_pandas_object(
-                price_df.sort_values("date"),
-                index=False
-            ).values
-        )
-
-        hasher.update(
-            pd.util.hash_pandas_object(
-                sentiment_df.sort_values("date"),
-                index=False
-            ).values
-        )
-
+        hasher.update(stable_hash(price_df))
+        hasher.update(stable_hash(sentiment_df))
         hasher.update(SCHEMA_VERSION.encode())
 
         return hasher.hexdigest()
+
+    # --------------------------------------------------
+
+    def _validate_feature_contract(self, df: pd.DataFrame):
+
+        cols = set(df.columns)
+
+        if cols != set(MODEL_FEATURES):
+            raise RuntimeError(
+                f"Feature contract violation.\n"
+                f"Expected: {sorted(MODEL_FEATURES)}\n"
+                f"Found: {sorted(cols)}"
+            )
 
     # --------------------------------------------------
 
@@ -87,11 +101,13 @@ class FeatureStore:
             with open(meta_path, "r") as f:
                 meta = json.load(f)
 
-            # Ensure this is feature metadata
             if meta.get("metadata_type") != "feature_store":
                 raise RuntimeError("Invalid metadata type.")
 
-            validate_feature_schema(df)
+            # validate ONLY model features
+            validate_feature_schema(df[list(MODEL_FEATURES)])
+
+            self._validate_feature_contract(df)
 
             return df.sort_values("date"), meta
 
@@ -118,7 +134,8 @@ class FeatureStore:
 
         df = df.sort_values("date").drop_duplicates("date")
 
-        validate_feature_schema(df)
+        validate_feature_schema(df[list(MODEL_FEATURES)])
+        self._validate_feature_contract(df)
 
         df.to_parquet(tmp_path, index=False)
 
