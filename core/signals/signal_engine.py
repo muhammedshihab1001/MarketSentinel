@@ -13,19 +13,41 @@ from core.risk.position_sizer import PositionSizer
 @dataclass(frozen=True)
 class SignalConfig:
 
-    prob_threshold: float = 0.62
-    sentiment_threshold: float = 0.12
+    prob_threshold: float = float(
+        os.getenv("PROB_THRESHOLD", "0.62")
+    )
 
-    volatility_cap: float = 0.05
-    volatility_throttle: float = 0.035
+    sentiment_threshold: float = float(
+        os.getenv("SENTIMENT_THRESHOLD", "0.12")
+    )
 
-    min_expected_return: float = 0.025
-    min_confidence: float = 0.30
+    volatility_cap: float = float(
+        os.getenv("VOL_CAP", "0.05")
+    )
 
-    portfolio_value: float = 100_000
+    volatility_throttle: float = float(
+        os.getenv("VOL_THROTTLE", "0.035")
+    )
 
-    max_position_pct: float = 0.08
-    max_total_exposure_pct: float = 0.35
+    min_expected_return: float = float(
+        os.getenv("MIN_EXPECTED_RETURN", "0.025")
+    )
+
+    min_confidence: float = float(
+        os.getenv("MIN_CONFIDENCE", "0.30")
+    )
+
+    portfolio_value: float = float(
+        os.getenv("PORTFOLIO_VALUE", "100000")
+    )
+
+    max_position_pct: float = float(
+        os.getenv("MAX_POSITION_PCT", "0.08")
+    )
+
+    max_total_exposure_pct: float = float(
+        os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.35")
+    )
 
     global_kill_switch: bool = (
         os.getenv("GLOBAL_TRADING_DISABLED", "false")
@@ -69,7 +91,6 @@ class ForecastInterpreter:
         rsi = _safe(rsi, 50)
         volatility = _safe(volatility)
 
-        # nonlinear RSI compression
         rsi_component = math.tanh(abs(50 - rsi) / 25)
 
         base_confidence = (
@@ -78,7 +99,6 @@ class ForecastInterpreter:
             rsi_component * 0.15
         )
 
-        # volatility dampening
         vol_penalty = min(volatility / 0.05, 1.0)
         confidence = base_confidence * (1 - 0.4 * vol_penalty)
 
@@ -117,7 +137,6 @@ class RiskGate:
         if volatility > self.config.volatility_cap:
             return False
 
-        # regime firewall
         if regime == "CRISIS":
             return False
 
@@ -190,8 +209,6 @@ class DecisionEngine:
         self.ensemble = EnsembleArbiter()
         self.position_sizer = PositionSizer()
 
-    # ---------------------------------------------------
-
     def generate(
         self,
         predicted_return: float,
@@ -204,7 +221,6 @@ class DecisionEngine:
         regime: str | None = None
     ) -> Dict:
 
-        # GLOBAL KILL SWITCH
         if self.config.global_kill_switch:
             return self._hold(0.0)
 
@@ -237,7 +253,6 @@ class DecisionEngine:
         if final_signal == "HOLD":
             return self._hold(confidence)
 
-        # volatility throttle
         vol_scale = 1.0
         if volatility > self.config.volatility_throttle:
             vol_scale = max(
@@ -252,7 +267,6 @@ class DecisionEngine:
             portfolio_value=self.config.portfolio_value
         )
 
-        # HARD CAPITAL CEILING
         max_position = (
             self.config.portfolio_value *
             self.config.max_position_pct
@@ -268,8 +282,6 @@ class DecisionEngine:
             "allocation": round(allocation, 2),
             "position_pct": round(position_pct, 4)
         }
-
-    # ---------------------------------------------------
 
     def _hold(self, confidence: float) -> Dict:
 
