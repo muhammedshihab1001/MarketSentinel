@@ -3,35 +3,65 @@ import pandas as pd
 import numpy as np
 import os
 
+from cmdstanpy import cmdstan_path, set_cmdstan_path
+
 CHANGEPOINT_PRIOR = 0.02
 INTERVAL_WIDTH = 0.80
 CHANGEPOINT_RANGE = 0.9
 
 
 # ---------------------------------------------------
-# BACKEND SAFETY
+# CMDSTAN RESOLUTION (INSTITUTIONAL)
 # ---------------------------------------------------
 
-def _validate_cmdstan():
+def _resolve_cmdstan():
     """
-    Institutional requirement:
-    Prophet must use CmdStan with a preinstalled toolchain.
+    Institutional CmdStan resolver.
 
-    Fail CLOSED if unavailable.
+    Resolution order:
+    1. CMDSTAN env
+    2. cmdstanpy installed path
+    3. artifacts/cmdstan
     """
 
-    cmdstan_path = os.getenv("CMDSTAN")
+    # 1. Explicit env
+    env_path = os.getenv("CMDSTAN")
 
-    if not cmdstan_path:
-        raise RuntimeError(
-            "CMDSTAN environment variable not set. "
-            "Install CmdStan and export CMDSTAN=<path>."
-        )
+    if env_path:
 
-    if not os.path.exists(cmdstan_path):
-        raise RuntimeError(
-            f"CMDSTAN path does not exist: {cmdstan_path}"
-        )
+        if not os.path.exists(env_path):
+            raise RuntimeError(
+                f"CMDSTAN env path invalid: {env_path}"
+            )
+
+        set_cmdstan_path(env_path)
+        return env_path
+
+    # 2. cmdstanpy default install
+    try:
+
+        default_path = cmdstan_path()
+
+        if default_path and os.path.exists(default_path):
+            set_cmdstan_path(default_path)
+            return default_path
+
+    except Exception:
+        pass
+
+    # 3. Institutional artifact location
+    artifact_path = "artifacts/cmdstan"
+
+    if os.path.exists(artifact_path):
+        set_cmdstan_path(artifact_path)
+        return artifact_path
+
+    # FAIL CLOSED
+    raise RuntimeError(
+        "CmdStan not found.\n"
+        "Install during image build or environment bootstrap.\n"
+        "Runtime downloads are forbidden."
+    )
 
 
 # ---------------------------------------------------
@@ -80,7 +110,7 @@ def prepare_prophet_dataframe(df):
 
 def train_prophet(df, random_seed: int = 42):
 
-    _validate_cmdstan()
+    resolved_path = _resolve_cmdstan()
 
     prophet_df = prepare_prophet_dataframe(df)
 
