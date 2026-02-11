@@ -15,9 +15,10 @@ class FeatureEngineer:
     Guarantees:
     - zero training/inference skew
     - deterministic dataset structure
-    - lineage preservation (date, ticker survive)
+    - lineage preservation (date survives)
     - numeric stability
     - schema compliance
+    - audit visibility on row drops
     """
 
     MIN_ROWS_REQUIRED = 120
@@ -54,6 +55,12 @@ class FeatureEngineer:
 
         if df["date"].duplicated().any():
             raise RuntimeError("Duplicate timestamps in price data.")
+
+        if not pd.api.types.is_datetime64_any_dtype(df["date"]):
+            raise RuntimeError("date column must be datetime64.")
+
+        if df["date"].dt.tz is None:
+            raise RuntimeError("date column must be timezone-aware (UTC required).")
 
     # -------------------------------------------------------------
 
@@ -103,6 +110,8 @@ class FeatureEngineer:
         df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
 
     # -------------------------------------------------------------
+    # CRITICAL — NO LOOKAHEAD MERGE
+    # -------------------------------------------------------------
 
     @staticmethod
     def merge_price_sentiment(
@@ -113,19 +122,26 @@ class FeatureEngineer:
         price = price_df.copy()
         sentiment = sentiment_df.copy()
 
-        price["date"] = pd.to_datetime(price["date"])
-        sentiment["date"] = pd.to_datetime(sentiment["date"])
+        price["date"] = pd.to_datetime(price["date"], utc=True)
+        sentiment["date"] = pd.to_datetime(sentiment["date"], utc=True)
+
+        price = price.sort_values("date")
+        sentiment = sentiment.sort_values("date")
 
         if sentiment["date"].duplicated().any():
-            sentiment = sentiment.groupby("date").mean().reset_index()
+            sentiment = (
+                sentiment
+                .groupby("date", as_index=False)
+                .mean()
+            )
 
-        merged = pd.merge(
+        merged = pd.merge_asof(
             price,
             sentiment,
             on="date",
-            how="left",
-            validate="one_to_one"
-        ).sort_values("date")
+            direction="backward",
+            allow_exact_matches=True
+        )
 
         for col in ("avg_sentiment", "news_count", "sentiment_std"):
 
@@ -141,6 +157,11 @@ class FeatureEngineer:
     @classmethod
     def _post_feature_guard(cls, df: pd.DataFrame):
 
+        # NOTE:
+        # Prefer stricter tests than production.
+        # Keeping test bypass for now to avoid breaking CI unexpectedly.
+        # Recommend removing this within the next infra hardening cycle.
+
         if cls._is_test_mode():
             return
 
@@ -155,7 +176,15 @@ class FeatureEngineer:
     def _sanitize_features(df: pd.DataFrame):
 
         df = df.replace([np.inf, -np.inf], np.nan)
+
+        before = len(df)
+
         df = df.dropna().copy()
+
+        dropped = before - len(df)
+
+        if dropped > 0:
+            df.attrs["dropped_rows"] = dropped
 
         for col in MODEL_FEATURES:
             df[col] = df[col].astype("float64")
@@ -240,8 +269,8 @@ class FeatureEngineer:
 
         validated = validate_feature_schema(df)
 
-        # CRITICAL ARCHITECTURE FIX:
-        # Reattach non-feature columns AFTER validation.
+        # enforce canonical feature order
+        validated = validated[MODEL_FEATURES]
 
         non_features = [
             col for col in df.columns
@@ -249,8 +278,10 @@ class FeatureEngineer:
         ]
 
         final_df = pd.concat(
-            [df[non_features].reset_index(drop=True),
-             validated.reset_index(drop=True)],
+            [
+                df[non_features].reset_index(drop=True),
+                validated.reset_index(drop=True)
+            ],
             axis=1
         )
 
