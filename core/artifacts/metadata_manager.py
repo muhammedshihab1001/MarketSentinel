@@ -3,10 +3,9 @@ import os
 import datetime
 import hashlib
 import pandas as pd
-import tempfile
-import shutil
 import platform
 import sys
+
 
 from core.schema.feature_schema import (
     get_schema_signature,
@@ -16,15 +15,20 @@ from core.schema.feature_schema import (
 
 class MetadataManager:
     """
-    Institutional Metadata Manager.
+    Institutional Metadata Authority.
 
-    STRICTLY handles metadata.
-
-    DOES NOT control model promotion.
+    Guarantees:
+    - deterministic dataset fingerprinting
+    - crash-safe writes
+    - schema-bound metadata
+    - forward migration safety
+    - registry poisoning prevention
+    - audit-grade environment capture
     """
 
     REQUIRED_METADATA_FIELDS = [
         "metadata_type",
+        "metadata_version",
         "model_name",
         "created_at",
         "training_window",
@@ -35,23 +39,44 @@ class MetadataManager:
         "schema_version"
     ]
 
+    METADATA_VERSION = "1.1"
+
     # -----------------------------------------------------
-    # DATASET FINGERPRINT
+    # DATASET FINGERPRINT (DETERMINISTIC)
     # -----------------------------------------------------
 
     @staticmethod
     def fingerprint_dataset(df: pd.DataFrame) -> str:
+        """
+        Produces a stable dataset fingerprint across:
+        - machines
+        - CPU architectures
+        - pandas versions (within reason)
+        """
 
-        df = df.sort_index(axis=1).sort_values(
-            by=list(df.columns)
+        if df is None or df.empty:
+            raise RuntimeError("Cannot fingerprint empty dataset.")
+
+        df_copy = df.copy()
+
+        # stable column ordering
+        df_copy = df_copy.reindex(sorted(df_copy.columns), axis=1)
+
+        # normalize floats to avoid CPU rounding drift
+        float_cols = df_copy.select_dtypes(include=["float32", "float64"]).columns
+        df_copy[float_cols] = df_copy[float_cols].round(10)
+
+        # deterministic row ordering
+        df_copy = df_copy.sort_values(
+            by=list(df_copy.columns)
         ).reset_index(drop=True)
 
-        data_bytes = pd.util.hash_pandas_object(
-            df,
+        hashed = pd.util.hash_pandas_object(
+            df_copy,
             index=False
         ).values.tobytes()
 
-        return hashlib.sha256(data_bytes).hexdigest()
+        return hashlib.sha256(hashed).hexdigest()
 
     # -----------------------------------------------------
 
@@ -63,13 +88,13 @@ class MetadataManager:
         training_start: str,
         training_end: str,
         dataset_hash: str,
-        metadata_type: str = "model"   # <-- FIXED
+        metadata_type: str = "model"
     ) -> dict:
 
         metadata = {
 
-            # 🔥 CRITICAL FOR REGISTRY
             "metadata_type": metadata_type,
+            "metadata_version": MetadataManager.METADATA_VERSION,
 
             "model_name": model_name,
             "created_at": datetime.datetime.utcnow().isoformat(),
@@ -83,14 +108,9 @@ class MetadataManager:
             "features": features,
             "metrics": metrics,
 
-            # GOVERNANCE CRITICAL
             "schema_signature": get_schema_signature(),
             "schema_version": SCHEMA_VERSION,
 
-            # FUTURE MIGRATION SAFETY
-            "metadata_version": "1.0",
-
-            # AUDIT GOLD
             "environment": {
                 "python": sys.version,
                 "platform": platform.platform()
@@ -121,6 +141,16 @@ class MetadataManager:
                 "Only model metadata allowed for registry."
             )
 
+        if metadata["schema_signature"] != get_schema_signature():
+            raise RuntimeError(
+                "Schema signature mismatch detected."
+            )
+
+        if metadata["schema_version"] != SCHEMA_VERSION:
+            raise RuntimeError(
+                "Schema version mismatch detected."
+            )
+
         if not isinstance(metadata["features"], list):
             raise RuntimeError("features must be a list")
 
@@ -130,8 +160,26 @@ class MetadataManager:
         if not isinstance(metadata["dataset_hash"], str):
             raise RuntimeError("dataset_hash must be a string")
 
-        if not isinstance(metadata["schema_signature"], str):
-            raise RuntimeError("schema_signature must be a string")
+    # -----------------------------------------------------
+    # CRASH-SAFE WRITE
+    # -----------------------------------------------------
+
+    @staticmethod
+    def _atomic_json_write(path: str, payload: dict):
+
+        directory = os.path.dirname(path)
+
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        tmp = path + ".tmp"
+
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp, path)
 
     # -----------------------------------------------------
 
@@ -140,18 +188,10 @@ class MetadataManager:
 
         MetadataManager.validate_metadata(metadata)
 
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            delete=False,
-            dir=os.path.dirname(path)
-        ) as tmp:
-
-            json.dump(metadata, tmp, indent=4)
-            temp_name = tmp.name
-
-        shutil.move(temp_name, path)
+        MetadataManager._atomic_json_write(
+            path,
+            metadata
+        )
 
     # -----------------------------------------------------
 
