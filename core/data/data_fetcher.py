@@ -33,29 +33,12 @@ class StockPriceFetcher:
 
     def __init__(self):
         os.makedirs(self.CACHE_DIR, exist_ok=True)
-        self._validate_yfinance_version()
 
-    # -----------------------------------------------------
-
-    def _validate_yfinance_version(self):
-
-        if version.parse(yf.__version__) < version.parse("0.2.36"):
-            logger.warning(
-                "Old yfinance detected. Consider upgrading."
-            )
-
-    # -----------------------------------------------------
-    #  NEW — PROVIDER NORMALIZATION LAYER
     # -----------------------------------------------------
 
     def _flatten_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Normalize Yahoo multi-index columns into flat schema.
-        """
 
         if isinstance(df.columns, pd.MultiIndex):
-
-            # Drop ticker level (we fetch single symbol)
             df.columns = df.columns.get_level_values(0)
 
         df.columns = [c.lower() for c in df.columns]
@@ -68,9 +51,9 @@ class StockPriceFetcher:
 
         df = self._flatten_columns(df)
 
-        if "date" not in df.columns:
-            df.reset_index(inplace=True)
-            df.rename(columns={"index": "date"}, inplace=True)
+        # ⭐ FORCE INDEX → DATE COLUMN (bulletproof)
+        df = df.reset_index()
+        df.rename(columns={df.columns[0]: "date"}, inplace=True)
 
         df["date"] = pd.to_datetime(
             df["date"],
@@ -86,15 +69,12 @@ class StockPriceFetcher:
                     f"Provider schema violation: missing={col}"
                 )
 
-            # Force series conversion
             df[col] = pd.to_numeric(
                 df[col].squeeze(),
                 errors="coerce"
             )
 
         df = df.dropna(subset=numeric)
-
-        df["date"] = df["date"].astype("datetime64[ns]")
 
         return df
 
@@ -254,13 +234,6 @@ class StockPriceFetcher:
                 return df
 
             except Exception as e:
-
-                msg = str(e)
-
-                if "curl_cffi" in msg or "session" in msg:
-                    raise RuntimeError(
-                        "Yahoo transport error — library incompatibility."
-                    ) from e
 
                 sleep_time = (
                     self.BASE_SLEEP * (2 ** attempt)
