@@ -3,7 +3,7 @@ import pandas as pd
 import hashlib
 
 
-SCHEMA_VERSION = "2.2"
+SCHEMA_VERSION = "3.0"
 
 
 MODEL_FEATURES: Tuple[str, ...] = (
@@ -28,16 +28,19 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
     Institutional schema authority.
 
-    Validates ONLY the model feature subset.
+    Validates ONLY model features while allowing
+    non-feature columns such as:
+        date, ticker, target
 
     Guarantees:
     - strict feature presence
     - dtype enforcement
-    - NaN safety (per feature)
+    - inf protection
+    - per-feature NaN limits
     - deterministic ordering
     """
 
-    if df.empty:
+    if df is None or df.empty:
         raise RuntimeError("Feature dataset is empty.")
 
     if df.columns.duplicated().any():
@@ -52,12 +55,11 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             f"Missing required features: {sorted(missing)}"
         )
 
-    # IMPORTANT:
-    # Ignore extra columns — they belong to the dataset, not schema.
-
     feature_df = df.loc[:, MODEL_FEATURES].copy()
 
-    # dtype enforcement
+    # Replace infinities BEFORE dtype conversion
+    feature_df.replace([float("inf"), float("-inf")], pd.NA, inplace=True)
+
     for col in MODEL_FEATURES:
 
         if not pd.api.types.is_numeric_dtype(feature_df[col]):
@@ -67,7 +69,6 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
         feature_df[col] = feature_df[col].astype("float64")
 
-    # per-feature NaN safety
     nan_ratios = feature_df.isna().mean()
 
     unsafe = nan_ratios[nan_ratios > MAX_NAN_RATIO_PER_FEATURE]
@@ -77,12 +78,16 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             f"Unsafe NaN ratio detected: {unsafe.to_dict()}"
         )
 
+    # deterministic ordering guarantee
+    feature_df = feature_df.loc[:, MODEL_FEATURES]
+
     return feature_df
 
 
 def get_schema_signature() -> str:
     """
     Deterministic schema fingerprint.
+    Changing ANYTHING here intentionally invalidates old models.
     """
 
     raw = "|".join(MODEL_FEATURES)
