@@ -1,11 +1,5 @@
 """
 MarketSentinel Institutional Training Orchestrator
-
-Promotion-safe release pipeline.
-Registry-aware.
-Deterministic.
-Crash-safe.
-Audit-grade.
 """
 
 import subprocess
@@ -25,7 +19,6 @@ from core.artifacts.model_registry import ModelRegistry
 
 logger = logging.getLogger("marketsentinel.training")
 
-
 PIPELINE_STEPS = [
     ("xgboost", "training.train_xgboost"),
     ("lstm", "training.train_lstm"),
@@ -38,13 +31,14 @@ MIN_ACCURACY = 0.50
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 
+TRAINING_TIMEOUT = 60 * 60 * 3   # 3 hours hard ceiling
+
 
 # ---------------------------------------------------
 # REPRODUCIBILITY
 # ---------------------------------------------------
 
 def reproducibility_stamp():
-
     return {
         "python_version": sys.version,
         "platform": platform.platform(),
@@ -53,55 +47,24 @@ def reproducibility_stamp():
 
 
 # ---------------------------------------------------
-# DEPENDENCY HASHING (CRITICAL FOR FORENSICS)
-# ---------------------------------------------------
-
-def _hash_requirements(hasher):
-
-    req_files = [
-        "requirements/base.txt",
-        "requirements/training.txt",
-        "requirements/inference.txt",
-        "requirements/ci.txt"
-    ]
-
-    for req in req_files:
-        if os.path.exists(req):
-            with open(req, "rb") as f:
-                hasher.update(f.read())
-
-
-# ---------------------------------------------------
-# TRUE LINEAGE SNAPSHOT
+# LINEAGE
 # ---------------------------------------------------
 
 def snapshot_lineage():
 
     hasher = hashlib.sha256()
 
-    paths = [
-        "core/features",
-        "core/schema",
-        "training",
-        "requirements"
-    ]
-
-    for root in paths:
+    for root in ["core", "training", "requirements"]:
 
         if not os.path.exists(root):
             continue
 
         for path, _, files in os.walk(root):
-
             for f in sorted(files):
 
                 if f.endswith(".py") or f.endswith(".txt"):
-                    full = os.path.join(path, f)
-
-                    with open(full, "rb") as fh:
+                    with open(os.path.join(path, f), "rb") as fh:
                         hasher.update(fh.read())
-
-    _hash_requirements(hasher)
 
     hasher.update(get_schema_signature().encode())
 
@@ -109,21 +72,16 @@ def snapshot_lineage():
 
 
 # ---------------------------------------------------
-# METADATA
+# METADATA LOADER (VERSION-BOUND)
 # ---------------------------------------------------
 
-def load_metadata(model_name: str):
+def load_metadata(model_name: str, version: str):
 
-    base_dir = f"artifacts/{model_name}"
-
-    version = ModelRegistry.get_latest_version(base_dir)
-
-    version_dir = os.path.join(base_dir, version)
-
+    version_dir = os.path.join(f"artifacts/{model_name}", version)
     metadata_path = os.path.join(version_dir, "metadata.json")
 
     if not os.path.exists(metadata_path):
-        raise RuntimeError(f"{model_name} metadata missing.")
+        raise RuntimeError(f"{model_name} metadata missing for {version}")
 
     with open(metadata_path) as f:
         metadata = json.load(f)
@@ -131,11 +89,13 @@ def load_metadata(model_name: str):
     if metadata.get("metadata_type") != "model":
         raise RuntimeError("Invalid metadata type detected.")
 
-    if "metrics" not in metadata:
-        raise RuntimeError(f"{model_name} metadata missing metrics.")
+    if metadata.get("schema_signature") != get_schema_signature():
+        raise RuntimeError(
+            f"{model_name} rejected — schema signature mismatch."
+        )
 
-    if "schema_signature" not in metadata:
-        raise RuntimeError(f"{model_name} missing schema signature.")
+    if "metrics" not in metadata:
+        raise RuntimeError("Metadata missing metrics.")
 
     return metadata
 
@@ -144,23 +104,13 @@ def load_metadata(model_name: str):
 # GOVERNANCE
 # ---------------------------------------------------
 
-def governance_check(model_name: str):
+def governance_check(model_name: str, version: str):
 
-    metadata = load_metadata(model_name)
+    metadata = load_metadata(model_name, version)
     metrics = metadata["metrics"]
 
-    current_signature = get_schema_signature()
-    model_signature = metadata.get("schema_signature")
-
-    if model_signature != current_signature:
-        raise RuntimeError(
-            f"{model_name} rejected — schema signature mismatch."
-        )
-
     if model_name == "xgboost":
-
         acc = metrics.get("accuracy")
-
         if acc is None or acc < MIN_ACCURACY:
             raise RuntimeError(
                 f"{model_name} rejected — accuracy below threshold"
@@ -170,50 +120,31 @@ def governance_check(model_name: str):
     drawdown = metrics.get("max_drawdown")
 
     if sharpe is not None and sharpe < MIN_SHARPE:
-        raise RuntimeError(
-            f"{model_name} rejected — sharpe too low"
-        )
+        raise RuntimeError(f"{model_name} rejected — sharpe too low")
 
     if drawdown is not None and drawdown < MAX_DRAWDOWN:
-        raise RuntimeError(
-            f"{model_name} rejected — drawdown too severe"
-        )
+        raise RuntimeError(f"{model_name} rejected — drawdown too severe")
 
     return metadata
 
 
 # ---------------------------------------------------
-# REGISTRY SAFETY
+# PROMOTION (EXPLICIT)
 # ---------------------------------------------------
 
-def validate_registry(model_name: str):
+def promote_model(model_name: str, version: str):
 
     base_dir = f"artifacts/{model_name}"
 
-    version = ModelRegistry.get_latest_version(base_dir)
+    ModelRegistry.transition_stage(base_dir, version, "shadow")
+    ModelRegistry.transition_stage(base_dir, version, "approved")
+    ModelRegistry.promote_to_production(base_dir, version)
 
-    version_dir = os.path.join(base_dir, version)
-
-    manifest_path = os.path.join(version_dir, "manifest.json")
-    metadata_path = os.path.join(version_dir, "metadata.json")
-
-    if not os.path.exists(manifest_path):
-        raise RuntimeError("Registry manifest missing.")
-
-    if not os.path.exists(metadata_path):
-        raise RuntimeError("Registry metadata missing.")
-
-    with open(manifest_path) as f:
-        manifest = json.load(f)
-
-    if manifest.get("stage") != "production":
-        raise RuntimeError(
-            f"{model_name} not promoted to production."
-        )
+    logger.info(f"{model_name} {version} promoted to production.")
 
 
 # ---------------------------------------------------
-# DRIFT BASELINE
+# DRIFT
 # ---------------------------------------------------
 
 def ensure_drift_baseline():
@@ -237,30 +168,32 @@ def run_step(name: str, module: str):
     start = time.time()
 
     env = os.environ.copy()
-
-    # deterministic hashing across subprocesses
     env["PYTHONHASHSEED"] = "0"
 
     subprocess.run(
         [sys.executable, "-m", module],
         check=True,
+        timeout=TRAINING_TIMEOUT,
         env=env
     )
 
     duration = round(time.time() - start, 2)
 
-    metadata = governance_check(name)
-    validate_registry(name)
+    # CRITICAL — capture EXACT version produced
+    version = ModelRegistry.get_latest_version(f"artifacts/{name}")
+
+    governance_check(name, version)
+    promote_model(name, version)
 
     return {
         "model": name,
-        "metrics": metadata["metrics"],
+        "version": version,
         "duration_sec": duration
     }
 
 
 # ---------------------------------------------------
-# ATOMIC MANIFEST WRITER
+# ATOMIC MANIFEST
 # ---------------------------------------------------
 
 def save_manifest(run_id: str, manifest: dict):
@@ -277,8 +210,6 @@ def save_manifest(run_id: str, manifest: dict):
 
     os.replace(temp_path, final_path)
 
-    logger.info(f"Training manifest saved -> {final_path}")
-
 
 # ---------------------------------------------------
 # MAIN
@@ -291,25 +222,19 @@ def main():
     )
 
     total_start = time.time()
-
     lineage_hash = snapshot_lineage()
-
     results = []
 
     try:
 
         for name, module in PIPELINE_STEPS:
-
-            result = run_step(name, module)
-            results.append(result)
+            results.append(run_step(name, module))
 
         ensure_drift_baseline()
 
     except Exception as e:
 
         logger.exception("Training run failed.")
-
-        total_time = round(time.time() - total_start, 2)
 
         manifest = {
             "run_id": run_id,
@@ -321,17 +246,14 @@ def main():
         }
 
         save_manifest(run_id, manifest)
-
         sys.exit(1)
-
-    total_time = round(time.time() - total_start, 2)
 
     manifest = {
         "run_id": run_id,
         "lineage_hash": lineage_hash,
         "reproducibility": reproducibility_stamp(),
         "status": "success",
-        "total_runtime_sec": total_time,
+        "total_runtime_sec": round(time.time() - total_start, 2),
         "results": results
     }
 
