@@ -10,18 +10,18 @@ class WalkForwardValidator:
     Institutional Walk-Forward Validator.
 
     Guarantees:
-    - strict time ordering
-    - multi-asset portfolio simulation
-    - capital compounding
-    - regime-aware evaluation
-    - promotion-grade statistics
+    - strict chronological integrity
+    - date-aligned windowing
+    - no cross-asset leakage
+    - capital death protection
+    - deterministic simulation
     """
 
     def __init__(
         self,
         model_trainer,
         signal_generator,
-        window_size=252*2,
+        window_size=252 * 2,
         step_size=63
     ):
         self.model_trainer = model_trainer
@@ -44,11 +44,20 @@ class WalkForwardValidator:
                 "Portfolio walk-forward requires 'ticker' column."
             )
 
-        # HARD TIME SORT
-        df = df.sort_values("date").reset_index(drop=True)
+        # HARD SORT — deterministic ordering
+        df = df.sort_values(
+            ["date", "ticker"]
+        ).reset_index(drop=True)
 
-        # Detect regimes once
+        # Detect regimes AFTER sorting
         df = self.regime_detector.detect(df)
+
+        unique_dates = df["date"].drop_duplicates().values
+
+        if len(unique_dates) < self.window_size + self.step_size:
+            raise RuntimeError(
+                "Dataset too small for walk-forward validation."
+            )
 
         results = []
         equity_curve = []
@@ -59,26 +68,28 @@ class WalkForwardValidator:
             "SIDEWAYS": []
         }
 
-        start = self.window_size
         capital = 10_000
 
-        while start < len(df):
+        start_idx = self.window_size
 
-            train_df = df.iloc[start-self.window_size:start]
-            test_df = df.iloc[start:start+self.step_size]
+        while start_idx < len(unique_dates):
 
-            if len(test_df) < 2:
+            train_dates = unique_dates[
+                start_idx - self.window_size:start_idx
+            ]
+
+            test_dates = unique_dates[
+                start_idx:start_idx + self.step_size
+            ]
+
+            if len(test_dates) < 2:
                 break
 
-            # -----------------------------------
+            train_df = df[df["date"].isin(train_dates)]
+            test_df = df[df["date"].isin(test_dates)]
+
             # TRAIN
-            # -----------------------------------
-
             model = self.model_trainer(train_df)
-
-            # -----------------------------------
-            # BUILD PORTFOLIO STRUCTURE
-            # -----------------------------------
 
             grouped_prices = {}
             grouped_signals = {}
@@ -101,24 +112,33 @@ class WalkForwardValidator:
                 grouped_prices[date] = prices
                 grouped_signals[date] = signals
 
-            # -----------------------------------
-            # RUN PORTFOLIO ENGINE
-            # -----------------------------------
-
             metrics = self.engine.run(
                 grouped_prices,
                 grouped_signals,
                 initial_cash=capital
             )
 
+            if not np.isfinite(metrics["final_portfolio"]):
+                raise RuntimeError(
+                    "Portfolio produced invalid capital value."
+                )
+
+            if metrics["final_portfolio"] <= 0:
+                raise RuntimeError(
+                    "Strategy collapsed. Capital depleted."
+                )
+
             capital = metrics["final_portfolio"]
 
-            equity_curve.extend(metrics["equity_curve"])
-            results.append(metrics)
+            curve = np.array(metrics["equity_curve"])
 
-            # -----------------------------------
-            # REGIME TAGGING
-            # -----------------------------------
+            if not np.isfinite(curve).all():
+                raise RuntimeError(
+                    "Equity curve contains invalid values."
+                )
+
+            equity_curve.extend(curve.tolist())
+            results.append(metrics)
 
             dominant_regime = (
                 test_df["regime"]
@@ -129,7 +149,7 @@ class WalkForwardValidator:
             if dominant_regime in regime_buckets:
                 regime_buckets[dominant_regime].append(metrics)
 
-            start += self.step_size
+            start_idx += self.step_size
 
         if len(results) < 8:
             raise RuntimeError(
@@ -154,24 +174,12 @@ class WalkForwardValidator:
         df = pd.DataFrame(results)
         curve = np.array(equity_curve)
 
-        # -------------------------------
-        # MAX DRAWDOWN
-        # -------------------------------
-
         peak = np.maximum.accumulate(curve)
         drawdowns = (curve - peak) / peak
         max_drawdown = float(drawdowns.min())
 
-        # -------------------------------
-        # STABILITY
-        # -------------------------------
-
         return_std = float(df["strategy_return"].std())
         sharpe_std = float(df["sharpe_ratio"].std())
-
-        # -------------------------------
-        # PROFIT FACTOR
-        # -------------------------------
 
         gains = df[df["strategy_return"] > 0]["strategy_return"].sum()
         losses = abs(
@@ -179,10 +187,6 @@ class WalkForwardValidator:
         ) or 1e-6
 
         profit_factor = float(gains / losses)
-
-        # -------------------------------
-        # REGIME METRICS
-        # -------------------------------
 
         regime_summary = {}
 
@@ -199,19 +203,15 @@ class WalkForwardValidator:
                 "windows": len(bucket_df)
             }
 
-        # -------------------------------
-
         return {
             "avg_strategy_return": float(df["strategy_return"].mean()),
             "avg_sharpe": float(df["sharpe_ratio"].mean()),
             "sharpe_std": sharpe_std,
             "profit_factor": profit_factor,
-
             "max_drawdown": max_drawdown,
             "return_volatility": return_std,
             "final_equity": float(curve[-1]),
             "equity_curve": curve.tolist(),
-
             "regime_performance": regime_summary,
             "num_windows": len(df)
         }
