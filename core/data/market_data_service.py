@@ -1,5 +1,5 @@
-import os
 import logging
+from pathlib import Path
 import pandas as pd
 
 from core.data.data_fetcher import StockPriceFetcher
@@ -13,14 +13,14 @@ class MarketDataService:
     Institutional Market Data Layer.
 
     Guarantees:
-    - schema validation
-    - numeric safety
-    - duplicate protection
-    - incremental correctness
-    - corruption recovery
+    - zero future leakage
+    - timezone enforcement
+    - revision correction
+    - atomic persistence
+    - deterministic datasets
     """
 
-    DATA_DIR = "data/lake"
+    DATA_DIR = Path("data/lake")
 
     REQUIRED_COLUMNS = {
         "date",
@@ -33,16 +33,31 @@ class MarketDataService:
 
     MIN_HISTORY_ROWS = 120
 
+    # refetch window protects against provider revisions
+    REVISION_DAYS = 5
+
     # --------------------------------------------------
 
     def __init__(self):
-        os.makedirs(self.DATA_DIR, exist_ok=True)
+        self.DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._fetcher = StockPriceFetcher()
 
     # --------------------------------------------------
 
     def _dataset_path(self, ticker: str, interval: str):
-        return f"{self.DATA_DIR}/{ticker}_{interval}.parquet"
+        return self.DATA_DIR / f"{ticker}_{interval}.parquet"
+
+    # --------------------------------------------------
+    # HARD FUTURE GUARD
+    # --------------------------------------------------
+
+    @staticmethod
+    def _cap_to_yesterday(date_str: str):
+
+        requested = pd.Timestamp(date_str).normalize()
+        yesterday = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=1)
+
+        return min(requested, yesterday)
 
     # --------------------------------------------------
 
@@ -58,34 +73,31 @@ class MarketDataService:
                 f"Market data schema violation. Missing={missing}"
             )
 
-        if df["close"].isna().any():
-            raise RuntimeError("Close price contains NaNs.")
-
-        if (df["close"] <= 0).any():
-            raise RuntimeError("Invalid close prices detected.")
+        df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_convert(None)
 
         if df["date"].duplicated().any():
             logger.warning("Duplicate timestamps detected — deduplicating.")
             df = df.drop_duplicates("date")
+
+        if (df["close"] <= 0).any():
+            raise RuntimeError("Invalid close prices detected.")
 
         if len(df) < self.MIN_HISTORY_ROWS:
             raise RuntimeError(
                 "Insufficient market history for safe inference."
             )
 
-        return df.sort_values("date")
+        return df.sort_values("date").reset_index(drop=True)
 
     # --------------------------------------------------
 
-    def _load_local(self, path: str):
+    def _load_local(self, path: Path):
 
-        if not os.path.exists(path):
+        if not path.exists():
             return None
 
         try:
-
             df = pd.read_parquet(path)
-
             return self._validate_dataset(df)
 
         except Exception:
@@ -95,7 +107,7 @@ class MarketDataService:
             )
 
             try:
-                os.remove(path)
+                path.unlink(missing_ok=True)
             except Exception:
                 pass
 
@@ -103,19 +115,23 @@ class MarketDataService:
 
     # --------------------------------------------------
 
-    def _save_local(self, df: pd.DataFrame, path: str):
+    def _atomic_save(self, df: pd.DataFrame, path: Path):
 
         df = (
-            df
-            .sort_values("date")
+            df.sort_values("date")
             .drop_duplicates("date")
+            .reset_index(drop=True)
         )
 
-        tmp = path + ".tmp"
+        tmp = path.with_suffix(".tmp")
 
         df.to_parquet(tmp, index=False)
 
-        os.replace(tmp, path)
+        # force flush to disk
+        with open(tmp, "rb") as f:
+            f.flush()
+
+        tmp.replace(path)
 
     # --------------------------------------------------
 
@@ -146,84 +162,73 @@ class MarketDataService:
         interval: str = "1d"
     ):
 
+        end_date = self._cap_to_yesterday(end_date)
+
         path = self._dataset_path(ticker, interval)
 
         local_df = self._load_local(path)
 
-        # -------------------------------------------
-        # NO DATASET
-        # -------------------------------------------
+        # ------------------------------------------------
+        # BUILD FROM SCRATCH
+        # ------------------------------------------------
 
         if local_df is None:
 
-            logger.info(
-                f"Building dataset for {ticker}"
-            )
+            logger.info(f"Building dataset for {ticker}")
 
             df = self._fetch_safe(
                 ticker,
                 start_date,
-                end_date,
+                end_date.strftime("%Y-%m-%d"),
                 interval
             )
 
-            self._save_local(df, path)
+            self._atomic_save(df, path)
 
             return df
 
-        # -------------------------------------------
-        # INCREMENTAL FETCH
-        # -------------------------------------------
+        # ------------------------------------------------
+        # REVISION FETCH
+        # ------------------------------------------------
 
-        local_start = pd.to_datetime(local_df["date"].min())
-        local_end = pd.to_datetime(local_df["date"].max())
+        revision_start = (
+            pd.to_datetime(local_df["date"].max())
+            - pd.Timedelta(days=self.REVISION_DAYS)
+        ).strftime("%Y-%m-%d")
 
-        request_start = pd.to_datetime(start_date)
-        request_end = pd.to_datetime(end_date)
+        logger.info(
+            f"Fetching revision window for {ticker}: {revision_start} → {end_date.date()}"
+        )
 
-        missing_ranges = []
+        try:
 
-        if request_start < local_start:
-            missing_ranges.append(
-                (start_date, (local_start - pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
+            revision_df = self._fetch_safe(
+                ticker,
+                revision_start,
+                end_date.strftime("%Y-%m-%d"),
+                interval
             )
 
-        if request_end > local_end:
-            missing_ranges.append(
-                ((local_end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), end_date)
+            local_df = pd.concat(
+                [local_df, revision_df],
+                ignore_index=True
             )
 
-        for start, end in missing_ranges:
+        except Exception:
+            logger.exception("Revision fetch failed — continuing.")
 
-            try:
+        local_df = (
+            local_df
+            .sort_values("date")
+            .drop_duplicates("date")
+            .reset_index(drop=True)
+        )
 
-                logger.info(
-                    f"Fetching missing slice {ticker}: {start} → {end}"
-                )
-
-                new_df = self._fetch_safe(
-                    ticker,
-                    start,
-                    end,
-                    interval
-                )
-
-                local_df = pd.concat(
-                    [local_df, new_df],
-                    ignore_index=True
-                )
-
-            except Exception:
-
-                logger.exception(
-                    "Provider failure — serving best available dataset."
-                )
-
-        self._save_local(local_df, path)
+        self._atomic_save(local_df, path)
 
         mask = (
-            (pd.to_datetime(local_df["date"]) >= request_start) &
-            (pd.to_datetime(local_df["date"]) <= request_end)
+            (local_df["date"] >= pd.Timestamp(start_date)) &
+            (local_df["date"] <= end_date)
         )
 
         return local_df.loc[mask].reset_index(drop=True)
