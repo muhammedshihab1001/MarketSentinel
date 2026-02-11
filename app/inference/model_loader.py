@@ -5,6 +5,8 @@ import tensorflow as tf
 import logging
 import threading
 
+from prophet.serialize import model_from_json
+
 from models.lstm_model import forecast_lstm
 from models.prophet_model import forecast_prophet
 from app.monitoring.metrics import MODEL_VERSION
@@ -14,16 +16,6 @@ logger = logging.getLogger("marketsentinel.loader")
 
 
 class ModelLoader:
-    """
-    Institutional Model Loader.
-
-    Guarantees:
-    - production pointer authority
-    - shadow isolation
-    - metadata validation
-    - deterministic loading
-    - thread-safe lazy init
-    """
 
     _instance = None
     _lock = threading.Lock()
@@ -42,8 +34,26 @@ class ModelLoader:
         if hasattr(self, "_initialized"):
             return
 
-        # 🔥 Make compute configurable
-        tf.config.set_visible_devices([], "GPU")
+        self._configure_tensorflow()
+
+        self._xgb = None
+        self._shadow_xgb = None
+        self._lstm = None
+        self._scaler = None
+        self._prophet = None
+
+        self._initialized = True
+
+    # ---------------------------------------------------
+    # TENSORFLOW CONFIG
+    # ---------------------------------------------------
+
+    def _configure_tensorflow(self):
+
+        disable_gpu = os.getenv("DISABLE_GPU", "false").lower() == "true"
+
+        if disable_gpu:
+            tf.config.set_visible_devices([], "GPU")
 
         intra = int(os.getenv("TF_INTRA_THREADS", "1"))
         inter = int(os.getenv("TF_INTER_THREADS", "1"))
@@ -52,15 +62,6 @@ class ModelLoader:
         tf.config.threading.set_inter_op_parallelism_threads(inter)
 
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-
-        self._xgb = None
-        self._shadow_xgb = None
-
-        self._lstm = None
-        self._scaler = None
-        self._prophet = None
-
-        self._initialized = True
 
     # ---------------------------------------------------
     # VALIDATION
@@ -86,42 +87,51 @@ class ModelLoader:
         with open(meta_path) as f:
             meta = json.load(f)
 
-        schema = meta.get("schema_version")
-
-        if schema is None:
-            raise RuntimeError("Metadata missing schema_version")
-
-        if float(schema.split(".")[0]) < 2:
-            raise RuntimeError("Outdated model schema. Retrain required.")
+        if meta.get("metadata_type", "model") != "model":
+            raise RuntimeError("Invalid metadata type.")
 
         if "schema_signature" not in meta:
             raise RuntimeError("Metadata missing schema_signature")
 
+        if "metrics" not in meta:
+            raise RuntimeError("Metadata missing metrics")
+
     # ---------------------------------------------------
-    # PRODUCTION RESOLUTION
+    # POINTER RESOLUTION
     # ---------------------------------------------------
 
     def _resolve_production_dir(self, model_dir: str):
 
-        latest_link = os.path.join(model_dir, "latest")
+        pointer = os.path.join(model_dir, "latest.json")
 
-        if not os.path.islink(latest_link):
-            raise RuntimeError(f"No production pointer in {model_dir}")
+        if os.path.exists(pointer):
 
-        version = os.readlink(latest_link)
+            with open(pointer) as f:
+                version = json.load(f)["version"]
 
-        version_dir = os.path.join(model_dir, version)
+            version_dir = os.path.join(model_dir, version)
 
-        if not os.path.exists(version_dir):
-            raise RuntimeError("Production pointer corrupted.")
+            if not os.path.exists(version_dir):
+                raise RuntimeError("Latest pointer corrupted.")
 
-        return version_dir, version
+            return version_dir, version
+
+        symlink = os.path.join(model_dir, "latest")
+
+        if os.path.islink(symlink):
+
+            version = os.readlink(symlink)
+            version_dir = os.path.join(model_dir, version)
+
+            return version_dir, version
+
+        raise RuntimeError(f"No production pointer found in {model_dir}")
 
     # ---------------------------------------------------
     # SHADOW DISCOVERY
     # ---------------------------------------------------
 
-    def _find_shadow_version(self, model_dir: str, prod_version: str):
+    def _find_shadow_version(self, model_dir, prod_version):
 
         if not os.path.exists(model_dir):
             return None
@@ -153,24 +163,23 @@ class ModelLoader:
         if not candidates:
             return None
 
-        # deterministic — newest wins
         return sorted(candidates, key=lambda x: x[1], reverse=True)[0]
 
     # ---------------------------------------------------
 
-    def _load_once(self, attr_name, loader_func):
+    def _load_once(self, attr, loader):
 
-        if getattr(self, attr_name) is None:
+        if getattr(self, attr) is None:
 
             with self._lock:
 
-                if getattr(self, attr_name) is None:
-                    setattr(self, attr_name, loader_func())
+                if getattr(self, attr) is None:
+                    setattr(self, attr, loader())
 
-        return getattr(self, attr_name)
+        return getattr(self, attr)
 
     # ---------------------------------------------------
-    # XGBOOST — PRODUCTION
+    # XGBOOST
     # ---------------------------------------------------
 
     @property
@@ -187,7 +196,7 @@ class ModelLoader:
             path = os.path.join(version_dir, "model.pkl")
             self._validate_artifact(path)
 
-            logger.info(f"Loading PRODUCTION XGBoost {version}")
+            logger.info(f"Loading production XGBoost {version}")
 
             model = joblib.load(path)
 
@@ -201,7 +210,7 @@ class ModelLoader:
         return self._load_once("_xgb", load)
 
     # ---------------------------------------------------
-    # XGBOOST — SHADOW
+    # SHADOW XGBOOST
     # ---------------------------------------------------
 
     @property
@@ -219,7 +228,6 @@ class ModelLoader:
             )
 
             if result is None:
-                logger.info("No shadow model discovered.")
                 return None
 
             version_dir, version = result
@@ -229,7 +237,7 @@ class ModelLoader:
             path = os.path.join(version_dir, "model.pkl")
             self._validate_artifact(path)
 
-            logger.info(f"Loading SHADOW XGBoost {version}")
+            logger.info(f"Loading shadow XGBoost {version}")
 
             model = joblib.load(path)
 
@@ -309,12 +317,13 @@ class ModelLoader:
 
             self._validate_metadata(version_dir)
 
-            path = os.path.join(version_dir, "prophet_trend.pkl")
+            path = os.path.join(version_dir, "prophet_trend.json")
             self._validate_artifact(path)
 
             logger.info(f"Loading Prophet {version}")
 
-            model = joblib.load(path)
+            with open(path) as f:
+                model = model_from_json(f.read())
 
             MODEL_VERSION.labels(
                 model="prophet",
@@ -331,7 +340,7 @@ class ModelLoader:
 
     def warmup(self):
 
-        logger.info("Warming production models...")
+        logger.info("Warming production models")
 
         _ = self.xgb
         _ = self.lstm
@@ -341,9 +350,9 @@ class ModelLoader:
         try:
             _ = self.shadow_xgb
         except Exception:
-            logger.exception("Shadow warmup failed.")
+            logger.exception("Shadow warmup failed")
 
-        logger.info("Models ready.")
+        logger.info("Models ready")
 
     # ---------------------------------------------------
 
