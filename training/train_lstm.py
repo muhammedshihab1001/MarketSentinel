@@ -13,6 +13,7 @@ from tensorflow.keras.callbacks import EarlyStopping
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
+from core.monitoring.drift_detector import DriftDetector
 from training.backtesting.walk_forward import WalkForwardValidator
 from models.lstm_model import build_lstm_model
 
@@ -27,23 +28,32 @@ LOOKBACK_WINDOW = 60
 EPOCHS = 30
 BATCH_SIZE = 32
 
+MIN_ROWS = 1500
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 
 SEED = 42
 
 
+TRAINING_TICKERS = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA"
+]
+
+
 # ---------------------------------------------------
-# DETERMINISM
+# DETERMINISM + CPU LOCK
 # ---------------------------------------------------
 
 def set_seeds():
 
     os.environ["TF_DETERMINISTIC_OPS"] = "1"
     os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # FORCE CPU
 
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
+
+    tf.config.set_visible_devices([], "GPU")
 
     tf.config.threading.set_intra_op_parallelism_threads(1)
     tf.config.threading.set_inter_op_parallelism_threads(1)
@@ -72,18 +82,34 @@ def load_data():
 
     end_date = datetime.date.today().isoformat()
 
-    df = fetcher.fetch(
-        ticker="AAPL",
-        start_date="2018-01-01",
-        end_date=end_date
-    )
+    datasets = []
 
-    if df.empty:
-        raise RuntimeError("No price data fetched.")
+    for ticker in TRAINING_TICKERS:
 
-    df["ticker"] = "AAPL"
+        df = fetcher.fetch(
+            ticker=ticker,
+            start_date="2018-01-01",
+            end_date=end_date
+        )
 
-    return df.sort_values("date"), end_date
+        if df.empty:
+            continue
+
+        df["ticker"] = ticker
+        datasets.append(df)
+
+    if not datasets:
+        raise RuntimeError("No datasets fetched for LSTM.")
+
+    df = pd.concat(datasets, ignore_index=True)
+    df = df.sort_values(["ticker", "date"])
+
+    if len(df) < MIN_ROWS:
+        raise RuntimeError(
+            f"LSTM training aborted — insufficient rows ({len(df)})"
+        )
+
+    return df.reset_index(drop=True), end_date
 
 
 # ---------------------------------------------------
@@ -106,7 +132,6 @@ def train_window_model(train_df):
     prices = train_df["close"].values.reshape(-1, 1)
 
     scaler = MinMaxScaler()
-
     scaled = scaler.fit_transform(prices)
 
     X, y = create_sequences(scaled, LOOKBACK_WINDOW)
@@ -129,7 +154,6 @@ def generate_signals(model_scaler, test_df):
     model, scaler = model_scaler
 
     prices = test_df["close"].values.reshape(-1, 1)
-
     scaled = scaler.transform(prices)
 
     signals = []
@@ -139,7 +163,6 @@ def generate_signals(model_scaler, test_df):
         seq = scaled[i-LOOKBACK_WINDOW:i].reshape(1, LOOKBACK_WINDOW, 1)
 
         pred_scaled = model.predict(seq, verbose=0)[0][0]
-
         pred_price = scaler.inverse_transform([[pred_scaled]])[0][0]
 
         current_price = prices[i-1][0]
@@ -192,6 +215,35 @@ def train_full_model(df):
 
 # ---------------------------------------------------
 
+def ensure_baseline(df, dataset_hash):
+
+    detector = DriftDetector()
+
+    if os.path.exists(detector.BASELINE_PATH):
+        return
+
+    # baseline expects feature-like structure
+    baseline_df = pd.DataFrame({
+        "return": df["close"].pct_change().fillna(0),
+        "volatility": df["close"].pct_change().rolling(5).std().fillna(0),
+        "rsi": 50,
+        "macd": 0,
+        "macd_signal": 0,
+        "avg_sentiment": 0,
+        "news_count": 0,
+        "sentiment_std": 0,
+        "return_lag1": 0,
+        "sentiment_lag1": 0
+    })
+
+    detector.create_baseline(
+        baseline_df,
+        dataset_hash=dataset_hash
+    )
+
+
+# ---------------------------------------------------
+
 if __name__ == "__main__":
 
     print("Institutional LSTM Training")
@@ -201,6 +253,8 @@ if __name__ == "__main__":
     df, end_date = load_data()
 
     dataset_hash = MetadataManager.fingerprint_dataset(df)
+
+    ensure_baseline(df, dataset_hash)
 
     wf = WalkForwardValidator(
         model_trainer=train_window_model,
@@ -226,7 +280,8 @@ if __name__ == "__main__":
         features=["close_sequence"],
         training_start="2018-01-01",
         training_end=end_date,
-        dataset_hash=dataset_hash
+        dataset_hash=dataset_hash,
+        metadata_type="model"
     )
 
     MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
@@ -237,14 +292,9 @@ if __name__ == "__main__":
         TEMP_METADATA_PATH
     )
 
-    # Promote immediately
-    ModelRegistry.transition_stage(MODEL_DIR, version, "shadow")
-    ModelRegistry.transition_stage(MODEL_DIR, version, "approved")
-    ModelRegistry.promote_to_production(MODEL_DIR, version)
-
     shutil.move(
         TEMP_SCALER_PATH,
         os.path.join(MODEL_DIR, version, "scaler.pkl")
     )
 
-    print("LSTM promoted to production.")
+    print(f"LSTM registered → {version}")
