@@ -22,18 +22,20 @@ class FeatureStore:
     Institutional Feature Store — Hardened.
 
     Guarantees:
-    ✔ zero training/inference skew
-    ✔ lineage-bound datasets
-    ✔ deterministic fingerprints
-    ✔ crash-safe persistence
-    ✔ schema enforcement
-    ✔ corruption auto-recovery
-    ✔ feature ordering guarantees
+    zero training/inference skew
+    lineage-bound datasets
+    deterministic fingerprints
+    crash-safe persistence
+    schema enforcement
+    corruption auto-recovery
+    feature ordering guarantees
     """
 
     FEATURE_DIR = "data/features"
     META_SUFFIX = ".meta.json"
-    META_VERSION = "6.0"
+
+    # Bumped due to lineage semantic change
+    META_VERSION = "7.0"
 
     REQUIRED_DATASET_COLUMNS = {"date"}
 
@@ -81,14 +83,21 @@ class FeatureStore:
         return hashed
 
     # --------------------------------------------------
-    # PRICE-ONLY FINGERPRINT (CRITICAL FIX)
+    # DUAL DATASET FINGERPRINT (CRITICAL FIX)
     # --------------------------------------------------
 
-    def _fingerprint(self, price_df):
+    def _fingerprint(self, price_df, sentiment_df):
 
         hasher = hashlib.sha256()
 
         hasher.update(self._stable_hash(price_df))
+
+        if sentiment_df is not None and not sentiment_df.empty:
+            hasher.update(self._stable_hash(sentiment_df))
+        else:
+            # Explicitly bind absence of sentiment
+            hasher.update(b"NO_SENTIMENT")
+
         hasher.update(get_schema_signature().encode())
 
         return hasher.hexdigest()
@@ -122,7 +131,7 @@ class FeatureStore:
 
         self._validate_dataset_structure(df)
 
-        feature_block = df[MODEL_FEATURES]
+        feature_block = df.loc[:, MODEL_FEATURES]
 
         if list(feature_block.columns) != MODEL_FEATURES:
             raise RuntimeError(
@@ -160,12 +169,15 @@ class FeatureStore:
             if meta.get("metadata_type") != "feature_store":
                 raise RuntimeError("Invalid metadata type.")
 
+            if meta.get("meta_version") != self.META_VERSION:
+                raise RuntimeError("Metadata version mismatch.")
+
             if meta.get("schema_signature") != get_schema_signature():
                 raise RuntimeError("Schema mismatch.")
 
             self._validate_dataset_structure(df)
 
-            validate_feature_schema(df[MODEL_FEATURES])
+            validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
             return df.sort_values("date"), meta
 
@@ -223,7 +235,7 @@ class FeatureStore:
         path = self._feature_path(ticker, training)
         meta_path = self._meta_path(ticker, training)
 
-        dataset_fp = self._fingerprint(price_df)
+        dataset_fp = self._fingerprint(price_df, sentiment_df)
 
         stored, meta = self._load_features(path, meta_path)
 
