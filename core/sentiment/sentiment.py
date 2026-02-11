@@ -22,7 +22,7 @@ class FinBERTSingleton:
 
     # REAL COMMIT — immutable model snapshot
     # Known stable FinBERT revision from HuggingFace
-    MODEL_REVISION = "8f0d5f1b8f6a3c2d1f6b8c9e7a4e6d3c0b9a21aa"
+    MODEL_REVISION = "4556d13015211d73dccd3fdd39d39232506f3e43"
 
     # Deterministic artifact cache
     DEFAULT_CACHE_DIR = "artifacts/huggingface"
