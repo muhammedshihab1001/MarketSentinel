@@ -1,6 +1,8 @@
 import logging
 from pathlib import Path
 import pandas as pd
+import time
+import os
 
 from core.data.data_fetcher import StockPriceFetcher
 
@@ -10,7 +12,7 @@ logger = logging.getLogger("marketsentinel.market_data")
 
 class MarketDataService:
     """
-    Institutional Market Data Layer.
+    Production market data layer.
 
     Guarantees:
     - zero future leakage
@@ -32,24 +34,14 @@ class MarketDataService:
     }
 
     MIN_HISTORY_ROWS = 120
-
-    # refetch window protects against provider revisions
     REVISION_DAYS = 5
-
-    # --------------------------------------------------
 
     def __init__(self):
         self.DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._fetcher = StockPriceFetcher()
 
-    # --------------------------------------------------
-
     def _dataset_path(self, ticker: str, interval: str):
         return self.DATA_DIR / f"{ticker}_{interval}.parquet"
-
-    # --------------------------------------------------
-    # HARD FUTURE GUARD
-    # --------------------------------------------------
 
     @staticmethod
     def _cap_to_yesterday(date_str: str):
@@ -58,8 +50,6 @@ class MarketDataService:
         yesterday = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=1)
 
         return min(requested, yesterday)
-
-    # --------------------------------------------------
 
     def _validate_dataset(self, df: pd.DataFrame):
 
@@ -89,8 +79,6 @@ class MarketDataService:
 
         return df.sort_values("date").reset_index(drop=True)
 
-    # --------------------------------------------------
-
     def _load_local(self, path: Path):
 
         if not path.exists():
@@ -113,8 +101,6 @@ class MarketDataService:
 
             return None
 
-    # --------------------------------------------------
-
     def _atomic_save(self, df: pd.DataFrame, path: Path):
 
         df = (
@@ -127,32 +113,51 @@ class MarketDataService:
 
         df.to_parquet(tmp, index=False)
 
-        # force flush to disk
-        with open(tmp, "rb") as f:
+        with open(tmp, "rb+") as f:
             f.flush()
+            os.fsync(f.fileno())
 
         tmp.replace(path)
 
-    # --------------------------------------------------
-
-    def _fetch_safe(
+    def _fetch_with_retry(
         self,
         ticker,
         start,
         end,
-        interval
+        interval,
+        retries=3
     ):
 
-        df = self._fetcher.fetch(
-            ticker,
-            start,
-            end,
-            interval
-        )
+        last_error = None
 
-        return self._validate_dataset(df)
+        for attempt in range(retries):
 
-    # --------------------------------------------------
+            try:
+                df = self._fetcher.fetch(
+                    ticker,
+                    start,
+                    end,
+                    interval
+                )
+
+                return self._validate_dataset(df)
+
+            except Exception as e:
+
+                last_error = e
+
+                logger.warning(
+                    "Fetch failed (%s) attempt %d/%d",
+                    ticker,
+                    attempt + 1,
+                    retries
+                )
+
+                time.sleep(1.5)
+
+        raise RuntimeError(
+            f"Market fetch failed after retries: {ticker}"
+        ) from last_error
 
     def get_price_data(
         self,
@@ -168,15 +173,11 @@ class MarketDataService:
 
         local_df = self._load_local(path)
 
-        # ------------------------------------------------
-        # BUILD FROM SCRATCH
-        # ------------------------------------------------
-
         if local_df is None:
 
             logger.info(f"Building dataset for {ticker}")
 
-            df = self._fetch_safe(
+            df = self._fetch_with_retry(
                 ticker,
                 start_date,
                 end_date.strftime("%Y-%m-%d"),
@@ -186,10 +187,6 @@ class MarketDataService:
             self._atomic_save(df, path)
 
             return df
-
-        # ------------------------------------------------
-        # REVISION FETCH
-        # ------------------------------------------------
 
         revision_start = (
             pd.to_datetime(local_df["date"].max())
@@ -202,7 +199,7 @@ class MarketDataService:
 
         try:
 
-            revision_df = self._fetch_safe(
+            revision_df = self._fetch_with_retry(
                 ticker,
                 revision_start,
                 end_date.strftime("%Y-%m-%d"),
@@ -215,7 +212,7 @@ class MarketDataService:
             )
 
         except Exception:
-            logger.exception("Revision fetch failed — continuing.")
+            logger.exception("Revision fetch failed — continuing with cached data.")
 
         local_df = (
             local_df
