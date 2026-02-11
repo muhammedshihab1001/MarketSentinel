@@ -4,6 +4,8 @@ import joblib
 import tensorflow as tf
 import logging
 import threading
+import hashlib
+
 from datetime import datetime
 
 from prophet.serialize import model_from_json
@@ -19,10 +21,23 @@ logger = logging.getLogger("marketsentinel.loader")
 
 
 class ModelLoader:
+    """
+    Institutional Registry-Aware Model Loader.
+
+    Guarantees:
+    - manifest hash verification
+    - schema lock enforcement
+    - lineage validation
+    - pointer crash safety
+    - atomic hot reload
+    - inference boundary protection
+    """
 
     _instance = None
     _instance_lock = threading.Lock()
     _tf_lock = threading.Lock()
+
+    # ---------------------------------------------------
 
     def __new__(cls, *args, **kwargs):
 
@@ -46,6 +61,7 @@ class ModelLoader:
         self._xgb_version = None
 
         self._shadow_xgb = None
+
         self._lstm = None
         self._scaler = None
         self._prophet = None
@@ -79,10 +95,29 @@ class ModelLoader:
                 tf.config.threading.set_inter_op_parallelism_threads(inter)
 
             except Exception:
-                logger.warning("TensorFlow already initialized — skipping device config.")
+                logger.warning(
+                    "TensorFlow already initialized — skipping device config."
+                )
 
             os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
+    # ---------------------------------------------------
+    # HASH
+    # ---------------------------------------------------
+
+    @staticmethod
+    def _sha256(path: str):
+
+        h = hashlib.sha256()
+
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+
+        return h.hexdigest()
+
+    # ---------------------------------------------------
+    # ARTIFACT VALIDATION
     # ---------------------------------------------------
 
     def _validate_artifact(self, path):
@@ -94,8 +129,10 @@ class ModelLoader:
             raise RuntimeError(f"Empty artifact: {path}")
 
     # ---------------------------------------------------
+    # MANIFEST + HASH VERIFICATION
+    # ---------------------------------------------------
 
-    def _validate_manifest(self, version_dir):
+    def _validate_manifest_and_hash(self, version_dir):
 
         manifest_path = os.path.join(version_dir, "manifest.json")
 
@@ -110,8 +147,25 @@ class ModelLoader:
                 "Attempted to load non-production model."
             )
 
+        artifacts = manifest.get("artifacts", {})
+
+        for artifact, expected_hash in artifacts.items():
+
+            path = os.path.join(version_dir, artifact)
+
+            self._validate_artifact(path)
+
+            actual = self._sha256(path)
+
+            if actual != expected_hash:
+                raise RuntimeError(
+                    f"Artifact integrity failure: {artifact}"
+                )
+
         return manifest
 
+    # ---------------------------------------------------
+    # METADATA VALIDATION
     # ---------------------------------------------------
 
     def _validate_metadata(self, version_dir):
@@ -124,8 +178,13 @@ class ModelLoader:
         if meta.get("schema_signature") != get_schema_signature():
             raise RuntimeError("Schema mismatch detected.")
 
+        if "training_code_hash" not in meta:
+            raise RuntimeError("Training lineage missing.")
+
         return meta
 
+    # ---------------------------------------------------
+    # POINTER RESOLUTION (CRASH SAFE)
     # ---------------------------------------------------
 
     def _resolve_production_dir(self, model_dir):
@@ -140,27 +199,26 @@ class ModelLoader:
 
         version_dir = os.path.join(model_dir, version)
 
-        self._validate_manifest(version_dir)
+        if not os.path.exists(version_dir):
+            raise RuntimeError(
+                "Registry pointer corrupted. Version directory missing."
+            )
+
+        self._validate_manifest_and_hash(version_dir)
 
         return version_dir, version
-
-    # ---------------------------------------------------
-    # VERSION ACCESSOR
-    # ---------------------------------------------------
-
-    def get_production_version(self, model_name):
-
-        _, version = self._resolve_production_dir(
-            f"artifacts/{model_name}"
-        )
-
-        return version
 
     # ---------------------------------------------------
     # HOT RELOAD
     # ---------------------------------------------------
 
-    def _reload_if_needed(self, attr, version_attr, loader, current_version):
+    def _reload_if_needed(
+        self,
+        attr,
+        version_attr,
+        loader,
+        current_version
+    ):
 
         cached_version = getattr(self, version_attr)
 
@@ -200,7 +258,6 @@ class ModelLoader:
             self._validate_metadata(version_dir)
 
             path = os.path.join(version_dir, "model.pkl")
-            self._validate_artifact(path)
 
             model = joblib.load(path)
 
@@ -222,12 +279,20 @@ class ModelLoader:
         )
 
     # ---------------------------------------------------
-    # SHADOW (timestamp-safe)
+    # SHADOW MODEL
     # ---------------------------------------------------
 
-    def _find_shadow_version(self, model_dir, prod_version):
+    @property
+    def shadow_xgb(self):
 
-        versions = []
+        prod_dir, prod_version = self._resolve_production_dir(
+            "artifacts/xgboost"
+        )
+
+        model_dir = "artifacts/xgboost"
+
+        shadow = None
+        newest_ts = None
 
         for v in os.listdir(model_dir):
 
@@ -246,21 +311,26 @@ class ModelLoader:
             with open(manifest) as f:
                 m = json.load(f)
 
-            if m.get("stage") == "shadow":
+            if m.get("stage") != "shadow":
+                continue
 
-                ts = datetime.strptime(
-                    v[1:], "%Y_%m_%d_%H%M%S"
-                )
+            ts = datetime.strptime(v[1:16], "%Y_%m_%d_%H%M")
 
-                versions.append((ts, v))
+            if newest_ts is None or ts > newest_ts:
+                newest_ts = ts
+                shadow = v
 
-        if not versions:
-            return None
+        if shadow is None:
+            raise RuntimeError("No shadow model available.")
 
-        return os.path.join(
-            model_dir,
-            sorted(versions)[-1][1]
-        )
+        shadow_dir = os.path.join(model_dir, shadow)
+
+        self._validate_manifest_and_hash(shadow_dir)
+        self._validate_metadata(shadow_dir)
+
+        path = os.path.join(shadow_dir, "model.pkl")
+
+        return joblib.load(path)
 
     # ---------------------------------------------------
     # OPTIONAL WARMUP
@@ -287,11 +357,11 @@ class ModelLoader:
     def lstm_forecast(self, recent_prices):
 
         return forecast_lstm(
-            self.lstm,
-            self.scaler,
+            self._lstm,
+            self._scaler,
             recent_prices
         )
 
     def prophet_forecast(self):
 
-        return forecast_prophet(self.prophet)
+        return forecast_prophet(self._prophet)
