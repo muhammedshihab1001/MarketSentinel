@@ -51,3 +51,8 @@ seaborn==0.13.2
 
 # REMOVE plotly unless dashboards are required
 # plotly pulls heavy JS dependencies
+########################################
+# DATA ENGINEERING
+########################################
+
+pyarrow==15.0.2
