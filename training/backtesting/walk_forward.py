@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 
+from core.schema.feature_schema import MODEL_FEATURES
 from training.backtesting.portfolio_engine import PortfolioBacktestEngine
 from training.backtesting.regime import MarketRegimeDetector
 
@@ -9,13 +10,12 @@ class WalkForwardValidator:
 
     EMBARGO_DAYS = 52
     MIN_TRADES_PER_WINDOW = 5
-    RESET_CAPITAL_EACH_WINDOW = True
 
     def __init__(
         self,
         model_trainer,
         signal_generator,
-        window_size=252 * 2,
+        window_size=504,
         step_size=63
     ):
         self.model_trainer = model_trainer
@@ -40,13 +40,24 @@ class WalkForwardValidator:
 
     def _sanity_check_model(self, model, sample_df):
 
-        preds = model.predict_proba(
-            sample_df.iloc[:50].drop(columns=["date","ticker","target"], errors="ignore")
-        )[:, 1]
+        X = sample_df.loc[:, MODEL_FEATURES].iloc[:50]
+
+        preds = model.predict_proba(X)[:, 1]
 
         if np.std(preds) < 1e-4:
             raise RuntimeError(
                 "Model collapsed. Predictions nearly constant."
+            )
+
+    def _stability_check(self, model, test_df):
+
+        X = test_df.loc[:, MODEL_FEATURES]
+
+        preds = model.predict_proba(X)[:, 1]
+
+        if np.std(preds) < 5e-4:
+            raise RuntimeError(
+                "Model unstable on unseen data."
             )
 
     def run(self, df: pd.DataFrame):
@@ -81,14 +92,16 @@ class WalkForwardValidator:
             "SIDEWAYS": []
         }
 
-        initial_capital = 10_000
-        capital = initial_capital
+        capital = 10_000
 
         start_idx = self.window_size
 
         while start_idx < len(unique_dates):
 
-            embargo_start = start_idx - self.EMBARGO_DAYS
+            embargo_start = max(
+                0,
+                start_idx - self.EMBARGO_DAYS
+            )
 
             train_dates = unique_dates[
                 start_idx - self.window_size:embargo_start
@@ -109,6 +122,7 @@ class WalkForwardValidator:
             model = self.model_trainer(train_df)
 
             self._sanity_check_model(model, train_df)
+            self._stability_check(model, test_df)
 
             grouped_prices = {}
             grouped_signals = {}
@@ -143,16 +157,10 @@ class WalkForwardValidator:
                     "Strategy produced insufficient trades."
                 )
 
-            capital_to_use = (
-                initial_capital
-                if self.RESET_CAPITAL_EACH_WINDOW
-                else capital
-            )
-
             metrics = self.engine.run(
                 grouped_prices,
                 grouped_signals,
-                initial_cash=capital_to_use
+                initial_cash=capital
             )
 
             if not np.isfinite(metrics["final_portfolio"]):
@@ -174,10 +182,7 @@ class WalkForwardValidator:
                     "Equity curve contains invalid values."
                 )
 
-            if equity_curve:
-                equity_curve.extend(curve[1:].tolist())
-            else:
-                equity_curve.extend(curve.tolist())
+            equity_curve.extend(curve.tolist())
 
             results.append(metrics)
 
