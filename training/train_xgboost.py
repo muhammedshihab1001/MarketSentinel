@@ -13,7 +13,10 @@ from core.data.data_fetcher import StockPriceFetcher
 from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_engineering import FeatureEngineer
-from core.schema.feature_schema import MODEL_FEATURES
+from core.schema.feature_schema import (
+    MODEL_FEATURES,
+    validate_feature_schema
+)
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
 from core.monitoring.drift_detector import DriftDetector
@@ -37,10 +40,6 @@ TRAINING_TICKERS = [
 MIN_TRAINING_ROWS = 1500
 
 
-# ---------------------------------------------------
-# ATOMIC SAVE
-# ---------------------------------------------------
-
 def save_model_atomic(model, path):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -59,10 +58,6 @@ def save_model_atomic(model, path):
         raise RuntimeError("Model write failed.")
 
 
-# ---------------------------------------------------
-# SAFE BASELINE
-# ---------------------------------------------------
-
 def ensure_baseline(df, dataset_hash):
 
     detector = DriftDetector()
@@ -75,10 +70,6 @@ def ensure_baseline(df, dataset_hash):
         dataset_hash=dataset_hash
     )
 
-
-# ---------------------------------------------------
-# TRAINING DATA
-# ---------------------------------------------------
 
 def load_training_data():
 
@@ -107,7 +98,6 @@ def load_training_data():
         scored_df = sentiment_analyzer.analyze_dataframe(news_df)
         sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
 
-        # CRITICAL — TRAINING MODE
         dataset = engineer.build_feature_pipeline(
             price_df,
             sentiment_df,
@@ -118,7 +108,10 @@ def load_training_data():
         datasets.append(dataset)
 
     df = pd.concat(datasets, ignore_index=True)
-    df = df.sort_values(["date","ticker"]).reset_index(drop=True)
+
+    df = df.sort_values(
+        ["date","ticker"]
+    ).reset_index(drop=True)
 
     if df.empty:
         raise RuntimeError("Training dataset empty.")
@@ -128,12 +121,17 @@ def load_training_data():
             f"Training aborted — dataset too small ({len(df)} rows)"
         )
 
+    # CRITICAL STEP — SCHEMA VALIDATION
+    validated_features = validate_feature_schema(df)
+
+    # attach non-feature columns back safely
+    df = pd.concat(
+        [df[["date","ticker","target"]], validated_features],
+        axis=1
+    )
+
     return df, end_date
 
-
-# ---------------------------------------------------
-# DATE SPLIT
-# ---------------------------------------------------
 
 def date_split(df):
 
@@ -144,8 +142,6 @@ def date_split(df):
 
     return train, val
 
-
-# ---------------------------------------------------
 
 def train_full_model(df):
 
@@ -194,13 +190,13 @@ def train_full_model(df):
     return model, metrics, importance
 
 
-# ---------------------------------------------------
-
 if __name__ == "__main__":
 
     df, end_date = load_training_data()
 
-    dataset_hash = MetadataManager.fingerprint_dataset(df)
+    dataset_hash = MetadataManager.fingerprint_dataset(
+        df[list(MODEL_FEATURES)]
+    )
 
     ensure_baseline(df, dataset_hash)
 
