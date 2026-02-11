@@ -6,7 +6,7 @@ import joblib
 import pandas as pd
 import numpy as np
 
-from sklearn.metrics import accuracy_score, roc_auc_score, log_loss
+from sklearn.metrics import roc_auc_score, log_loss
 from xgboost import XGBClassifier
 
 from core.data.data_fetcher import StockPriceFetcher
@@ -14,16 +14,10 @@ from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema
-from core.artifacts.metadata_manager import MetadataManager
-from core.artifacts.model_registry import ModelRegistry
-from core.monitoring.drift_detector import DriftDetector
 from training.backtesting.walk_forward import WalkForwardValidator
 
 
-MODEL_DIR = "artifacts/xgboost"
-
-TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
-TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
+MODEL_PATH = "artifacts/xgboost/model.pkl"
 
 SEED = 42
 np.random.seed(SEED)
@@ -33,6 +27,10 @@ TRAINING_TICKERS = [
 ]
 
 MIN_TRAINING_ROWS = 1500
+
+PROB_THRESHOLD = float(
+    os.getenv("SIGNAL_THRESHOLD", "0.58")
+)
 
 
 def save_model_atomic(model, path):
@@ -47,14 +45,6 @@ def save_model_atomic(model, path):
 
     if not os.path.exists(path):
         raise RuntimeError("Model write failed.")
-
-
-def ensure_baseline(df, dataset_hash):
-
-    detector = DriftDetector()
-
-    if not os.path.exists(detector.BASELINE_PATH):
-        detector.create_baseline(df, dataset_hash=dataset_hash)
 
 
 def sanitize_dataframe(df):
@@ -121,15 +111,15 @@ def load_training_data():
         axis=1
     )
 
-    return df, end_date
+    return df
 
 
 def date_split(df):
 
-    cutoff = df["date"].quantile(0.8)
+    cutoff_date = "2023-01-01"
 
-    train = df[df["date"] <= cutoff]
-    val = df[df["date"] > cutoff]
+    train = df[df["date"] < cutoff_date]
+    val = df[df["date"] >= cutoff_date]
 
     return train, val
 
@@ -144,18 +134,20 @@ def train_full_model(df):
     X_val = val[list(MODEL_FEATURES)]
     y_val = val["target"]
 
+    pos_weight = (len(y_train) - y_train.sum()) / y_train.sum()
+
     model = XGBClassifier(
-        n_estimators=1200,
+        n_estimators=900,
         max_depth=5,
-        learning_rate=0.02,
+        learning_rate=0.025,
         subsample=0.85,
         colsample_bytree=0.85,
         eval_metric="logloss",
-        early_stopping_rounds=75,
+        early_stopping_rounds=50,
         random_state=SEED,
         tree_method="hist",
-        predictor="cpu_predictor",
-        n_jobs=1
+        n_jobs=1,
+        scale_pos_weight=pos_weight
     )
 
     model.fit(
@@ -165,68 +157,11 @@ def train_full_model(df):
         verbose=False
     )
 
-    preds = model.predict(X_val)
     probs = model.predict_proba(X_val)[:, 1]
 
     metrics = {
-        "accuracy": float(accuracy_score(y_val, preds)),
         "roc_auc": float(roc_auc_score(y_val, probs)),
         "logloss": float(log_loss(y_val, probs)),
     }
 
-    importance = dict(zip(list(MODEL_FEATURES), model.feature_importances_.tolist()))
-
-    return model, metrics, importance
-
-
-if __name__ == "__main__":
-
-    df, end_date = load_training_data()
-
-    dataset_hash = MetadataManager.fingerprint_dataset(
-        df[list(MODEL_FEATURES)]
-    )
-
-    ensure_baseline(df, dataset_hash)
-
-    wf = WalkForwardValidator(
-        model_trainer=lambda d: train_full_model(d)[0],
-        signal_generator=lambda m, d: np.where(
-            m.predict_proba(d[list(MODEL_FEATURES)])[:, 1] > 0.6,
-            "BUY",
-            "HOLD"
-        )
-    )
-
-    strategy_metrics = wf.run(df)
-
-    model, metrics, importance = train_full_model(df)
-
-    save_model_atomic(model, TEMP_MODEL_PATH)
-
-    metadata = MetadataManager.create_metadata(
-        model_name="xgboost_direction",
-        metrics={**metrics, **strategy_metrics},
-        features=list(MODEL_FEATURES),
-        training_start="2018-01-01",
-        training_end=end_date,
-        dataset_hash=dataset_hash,
-        metadata_type="model"
-    )
-
-    enriched_metadata = {
-        **metadata,
-        "feature_importance": importance,
-        "training_rows": len(df),
-        "feature_count": len(MODEL_FEATURES)
-    }
-
-    MetadataManager.save_metadata(enriched_metadata, TEMP_METADATA_PATH)
-
-    version_dir = ModelRegistry.register_model(
-        MODEL_DIR,
-        TEMP_MODEL_PATH,
-        TEMP_METADATA_PATH
-    )
-
-    print(f"XGBoost registered -> {version_dir}")
+    return model
