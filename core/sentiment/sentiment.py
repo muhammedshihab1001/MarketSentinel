@@ -20,8 +20,7 @@ class FinBERTSingleton:
 
     MODEL_NAME = "ProsusAI/finbert"
 
-    # PIN THIS — change only intentionally
-    MODEL_REVISION = "main"
+    MODEL_REVISION = "PIN_THIS_TO_COMMIT_HASH"
 
     @classmethod
     def load(cls):
@@ -42,11 +41,9 @@ class FinBERTSingleton:
 
             logger.info("Loading FinBERT model")
 
-            # HARD DETERMINISM
             torch.set_grad_enabled(False)
             torch.set_num_threads(1)
             torch.set_num_interop_threads(1)
-            torch.use_deterministic_algorithms(True)
 
             os.environ.setdefault("OMP_NUM_THREADS", "1")
             os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -106,32 +103,14 @@ class SentimentAnalyzer:
         if not self.test_mode:
             self._warmup()
 
-    # ---------------------------------------------------
-
     def _warmup(self):
         try:
             self.analyze_batch(["market is stable"])
         except Exception:
             logger.exception("FinBERT warmup failed")
 
-    # ---------------------------------------------------
-
     def _clamp_text(self, text: str) -> str:
         return text[:self.MAX_HEADLINE_CHARS]
-
-    # ---------------------------------------------------
-
-    def analyze_text(self, text: str):
-
-        if not text:
-            return {"label": "neutral", "score": 0.0}
-
-        if self.test_mode:
-            return self._fake_sentiment(text)
-
-        return self.analyze_batch([text])[0]
-
-    # ---------------------------------------------------
 
     def _fake_sentiment(self, text: str):
 
@@ -145,52 +124,52 @@ class SentimentAnalyzer:
 
         return {"label": "neutral", "score": 0.0}
 
-    # ---------------------------------------------------
-
     def analyze_batch(self, texts):
 
         if self.test_mode:
             return [self._fake_sentiment(t) for t in texts]
 
-        texts = [
-            self._clamp_text(str(t).strip())
-            for t in texts
-        ]
-
-        inputs = self.tokenizer(
-            texts,
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=128
-        )
-
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-
-            logits = self.model(**inputs).logits
-            scores = torch.softmax(logits, dim=1)
-
-        scores = scores.cpu().numpy()
-
         results = []
 
-        for s in scores:
+        for i in range(0, len(texts), self.BATCH_SIZE):
 
-            label_id = int(s.argmax())
-            label = self.label_map[label_id]
+            batch = texts[i:i+self.BATCH_SIZE]
 
-            sentiment_score = float(s[2] - s[0])
+            batch = [
+                self._clamp_text(str(t).strip())
+                for t in batch
+            ]
 
-            results.append({
-                "label": label,
-                "score": round(sentiment_score, 4)
-            })
+            inputs = self.tokenizer(
+                batch,
+                return_tensors="pt",
+                truncation=True,
+                padding=True,
+                max_length=128
+            )
+
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+
+                logits = self.model(**inputs).logits
+                scores = torch.softmax(logits, dim=1)
+
+            scores = scores.cpu().numpy()
+
+            for s in scores:
+
+                label_id = int(s.argmax())
+                label = self.label_map[label_id]
+
+                sentiment_score = float(s[2] - s[0])
+
+                results.append({
+                    "label": label,
+                    "score": round(sentiment_score, 4)
+                })
 
         return results
-
-    # ---------------------------------------------------
 
     def analyze_dataframe(self, df: pd.DataFrame):
 
@@ -216,8 +195,6 @@ class SentimentAnalyzer:
             axis=1
         )
 
-    # ---------------------------------------------------
-
     def aggregate_daily_sentiment(self, df: pd.DataFrame):
 
         if df.empty:
@@ -232,13 +209,17 @@ class SentimentAnalyzer:
 
         temp_df["date"] = pd.to_datetime(
             temp_df.get("published_at"),
-            errors="coerce"
-        )
+            errors="coerce",
+            utc=True
+        ).dt.tz_convert(None)
 
-        # NEVER fabricate timestamps
         temp_df = temp_df.dropna(subset=["date"])
 
-        temp_df["date"] = temp_df["date"].dt.date
+        temp_df["date"] = (
+            temp_df["date"]
+            .dt.floor("D")
+            + pd.Timedelta(days=1)
+        )
 
         aggregated = (
             temp_df
