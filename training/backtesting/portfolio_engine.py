@@ -5,13 +5,15 @@ class PortfolioBacktestEngine:
     """
     Institutional multi-asset portfolio simulator.
 
-    Features:
-    - risk-parity allocation
-    - exposure normalization
-    - portfolio rebalancing
-    - transaction cost modeling
-    - realistic equity curve
+    Guarantees:
+    - delta-based transaction costs
+    - no leverage unless explicitly allowed
+    - volatility-aware allocation
+    - capital protection
+    - numeric stability
     """
+
+    EPSILON = 1e-12
 
     def __init__(
         self,
@@ -39,12 +41,13 @@ class PortfolioBacktestEngine:
 
             if ticker in prev_prices:
 
-                ret = abs(
-                    prices[ticker] /
-                    prev_prices[ticker] - 1
-                )
+                ret = prices[ticker] / prev_prices[ticker] - 1
 
-                vols[ticker] = max(ret, 1e-4)
+                # EWMA-style stabilization
+                vols[ticker] = max(
+                    abs(ret) * 0.7 + self.target_vol * 0.3,
+                    1e-4
+                )
 
             else:
                 vols[ticker] = self.target_vol
@@ -64,7 +67,7 @@ class PortfolioBacktestEngine:
 
             vol = vols.get(ticker, self.target_vol)
 
-            raw[ticker] = 1 / vol
+            raw[ticker] = 1 / max(vol, 1e-4)
 
         if not raw:
             return {}
@@ -76,13 +79,13 @@ class PortfolioBacktestEngine:
             for t, w in raw.items()
         }
 
-        # enforce gross exposure ceiling
-        scale = min(1.0, self.max_gross_exposure)
+        gross = sum(abs(w) for w in weights.values())
 
-        return {
-            t: w * scale
-            for t, w in weights.items()
-        }
+        if gross > self.max_gross_exposure:
+            scale = self.max_gross_exposure / gross
+            weights = {t: w * scale for t, w in weights.items()}
+
+        return weights
 
     # -----------------------------------------------------
 
@@ -93,7 +96,7 @@ class PortfolioBacktestEngine:
         initial_cash=10000
     ):
 
-        cash = initial_cash
+        cash = float(initial_cash)
         positions = {}
 
         equity_curve = []
@@ -107,15 +110,9 @@ class PortfolioBacktestEngine:
             prices = grouped_prices[date]
             signals = grouped_signals[date]
 
-            vols = self._estimate_vol(
-                prev_prices,
-                prices
-            )
+            vols = self._estimate_vol(prev_prices, prices)
 
-            weights = self._compute_weights(
-                signals,
-                vols
-            )
+            weights = self._compute_weights(signals, vols)
 
             portfolio_value = cash + sum(
                 positions.get(t, 0) * prices.get(t, 0)
@@ -124,50 +121,55 @@ class PortfolioBacktestEngine:
 
             target_positions = {}
 
-            # -----------------------------
-            # REBALANCE
-            # -----------------------------
+            # --------------------------------
+            # TARGET SHARES
+            # --------------------------------
 
             for ticker, weight in weights.items():
 
                 allocation = portfolio_value * weight
+                target_positions[ticker] = allocation / prices[ticker]
 
-                shares = (
-                    allocation *
-                    (1 - self.transaction_cost)
-                ) / prices[ticker]
+            # --------------------------------
+            # DELTA TRADING WITH COST
+            # --------------------------------
 
-                target_positions[ticker] = shares
+            for ticker in set(positions) | set(target_positions):
 
-            # close removed positions
-            for ticker in list(positions.keys()):
+                current_shares = positions.get(ticker, 0)
+                target_shares = target_positions.get(ticker, 0)
 
-                if ticker not in target_positions:
+                delta_shares = target_shares - current_shares
 
-                    cash += (
-                        positions[ticker] *
-                        prices[ticker] *
-                        (1 - self.transaction_cost)
+                if abs(delta_shares) < self.EPSILON:
+                    continue
+
+                trade_notional = abs(delta_shares) * prices[ticker]
+                cost = trade_notional * self.transaction_cost
+
+                cash -= delta_shares * prices[ticker]
+                cash -= cost
+
+                if cash < -self.EPSILON:
+                    raise RuntimeError(
+                        "Backtest attempted leverage beyond cash."
                     )
 
-                    del positions[ticker]
-
-            # open / adjust
-            for ticker, shares in target_positions.items():
-
-                cost = shares * prices[ticker]
-
-                current = positions.get(ticker, 0) * prices[ticker]
-
-                delta = cost - current
-
-                cash -= delta
-                positions[ticker] = shares
+                if target_shares == 0:
+                    positions.pop(ticker, None)
+                else:
+                    positions[ticker] = target_shares
 
             equity = cash + sum(
                 positions.get(t, 0) * prices.get(t, 0)
                 for t in positions
             )
+
+            if not np.isfinite(equity):
+                raise RuntimeError("Invalid equity value produced.")
+
+            if equity <= 0:
+                raise RuntimeError("Portfolio capital depleted.")
 
             equity_curve.append(equity)
 
@@ -175,20 +177,27 @@ class PortfolioBacktestEngine:
 
         curve = np.array(equity_curve)
 
-        returns = (
-            np.diff(curve) / curve[:-1]
-            if len(curve) > 1 else [0]
-        )
+        if len(curve) < 2:
+            returns = np.array([0.0])
+        else:
+            returns = np.diff(curve) / np.maximum(
+                curve[:-1],
+                self.EPSILON
+            )
+
+        std = np.std(returns)
 
         sharpe = (
             np.mean(returns) /
-            np.std(returns) *
+            max(std, self.EPSILON) *
             np.sqrt(252)
-            if np.std(returns) > 0 else 0
         )
 
         peak = np.maximum.accumulate(curve)
-        drawdown = (curve - peak) / peak
+        drawdown = (curve - peak) / np.maximum(
+            peak,
+            self.EPSILON
+        )
 
         return {
             "final_portfolio": float(curve[-1]),
