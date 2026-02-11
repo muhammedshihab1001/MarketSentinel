@@ -11,10 +11,12 @@ class PortfolioBacktestEngine:
     def __init__(
         self,
         transaction_cost=0.001,
+        slippage=0.0005,
         target_vol=0.02,
         max_gross_exposure=1.0
     ):
         self.transaction_cost = transaction_cost
+        self.slippage = slippage
         self.target_vol = target_vol
         self.max_gross_exposure = max_gross_exposure
 
@@ -23,15 +25,24 @@ class PortfolioBacktestEngine:
     def _reset_state(self):
         self.return_buffers = defaultdict(list)
 
+    def _safe_price(self, price):
+        if price is None or not np.isfinite(price) or price <= 0:
+            raise RuntimeError("Invalid market price encountered.")
+        return float(price)
+
     def _update_vol_buffers(self, prev_prices, prices):
 
         vols = {}
 
         for ticker in prices:
 
+            price = self._safe_price(prices[ticker])
+
             if prev_prices and ticker in prev_prices:
 
-                ret = prices[ticker] / prev_prices[ticker] - 1
+                prev = self._safe_price(prev_prices[ticker])
+
+                ret = price / prev - 1
                 buf = self.return_buffers[ticker]
 
                 buf.append(ret)
@@ -62,7 +73,7 @@ class PortfolioBacktestEngine:
             raw[ticker] = 1 / max(vol, 1e-4)
 
         if not raw:
-            return current_weights
+            return {}
 
         total = sum(raw.values())
 
@@ -121,7 +132,7 @@ class PortfolioBacktestEngine:
 
             prices = grouped_prices[date]
 
-            if prev_signals is None:
+            if prev_prices is None:
                 prev_prices = prices
                 prev_signals = grouped_signals[date]
                 equity_curve.append(cash)
@@ -132,12 +143,12 @@ class PortfolioBacktestEngine:
             vols = self._update_vol_buffers(prev_prices, prices)
 
             portfolio_value = cash + sum(
-                positions.get(t, 0) * prices.get(t, 0)
+                positions.get(t, 0) * self._safe_price(prices.get(t))
                 for t in positions
             )
 
             current_weights = {
-                t: (positions[t] * prices[t]) / portfolio_value
+                t: (positions[t] * self._safe_price(prices[t])) / portfolio_value
                 for t in positions
                 if portfolio_value > self.EPSILON
             }
@@ -149,7 +160,7 @@ class PortfolioBacktestEngine:
             )
 
             target_positions = {
-                t: (portfolio_value * w) / prices[t]
+                t: (portfolio_value * w) / self._safe_price(prev_prices[t])
                 for t, w in weights.items()
             }
 
@@ -157,12 +168,17 @@ class PortfolioBacktestEngine:
 
             for ticker in set(positions) | set(target_positions):
 
+                trade_price = self._safe_price(prev_prices.get(ticker))
+
                 delta = target_positions.get(ticker, 0) - positions.get(ticker, 0)
 
-                trade_notional = abs(delta) * prices[ticker]
-                cost = trade_notional * self.transaction_cost
+                trade_notional = abs(delta) * trade_price
 
-                simulated_cash -= delta * prices[ticker]
+                cost = trade_notional * (
+                    self.transaction_cost + self.slippage
+                )
+
+                simulated_cash -= delta * trade_price
                 simulated_cash -= cost
 
             if simulated_cash < -self.EPSILON:
@@ -172,6 +188,8 @@ class PortfolioBacktestEngine:
 
             for ticker in set(positions) | set(target_positions):
 
+                trade_price = self._safe_price(prev_prices.get(ticker))
+
                 current = positions.get(ticker, 0)
                 target = target_positions.get(ticker, 0)
 
@@ -180,12 +198,14 @@ class PortfolioBacktestEngine:
                 if abs(delta) < self.EPSILON:
                     continue
 
-                trade_notional = abs(delta) * prices[ticker]
-                cost = trade_notional * self.transaction_cost
+                trade_notional = abs(delta) * trade_price
+                cost = trade_notional * (
+                    self.transaction_cost + self.slippage
+                )
 
                 turnover += trade_notional
 
-                cash -= delta * prices[ticker]
+                cash -= delta * trade_price
                 cash -= cost
 
                 if target == 0:
@@ -194,7 +214,7 @@ class PortfolioBacktestEngine:
                     positions[ticker] = target
 
             equity = cash + sum(
-                positions.get(t, 0) * prices.get(t, 0)
+                positions.get(t, 0) * self._safe_price(prices.get(t))
                 for t in positions
             )
 
