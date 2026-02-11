@@ -4,11 +4,7 @@ import hashlib
 import numpy as np
 
 
-# =====================================================
-# SCHEMA GOVERNANCE
-# =====================================================
-
-SCHEMA_VERSION = "4.0"
+SCHEMA_VERSION = "5.0"
 
 
 MODEL_FEATURES: Tuple[str, ...] = (
@@ -32,11 +28,6 @@ MAX_ROW_NAN_RATIO = 0.10
 DTYPE = "float32"
 
 
-# =====================================================
-# FEATURE GUARDRAILS
-# Prevent statistical absurdities
-# =====================================================
-
 FEATURE_LIMITS: Dict[str, tuple] = {
 
     "return": (-0.5, 0.5),
@@ -58,10 +49,6 @@ FEATURE_LIMITS: Dict[str, tuple] = {
 }
 
 
-# =====================================================
-# VALIDATION
-# =====================================================
-
 def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     if df is None or df.empty:
@@ -79,29 +66,32 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             f"Missing required features: {sorted(missing)}"
         )
 
-    feature_df = df.loc[:, MODEL_FEATURES].copy()
+    # FORCE deterministic ordering immediately
+    feature_df = df.reindex(columns=MODEL_FEATURES).copy()
 
-    # Replace infinities
+    # Replace infinities globally
     feature_df.replace(
         [np.inf, -np.inf],
         np.nan,
         inplace=True
     )
 
-    # dtype enforcement
+    # Safe numeric coercion FIRST
     for col in MODEL_FEATURES:
 
-        if not pd.api.types.is_numeric_dtype(feature_df[col]):
+        feature_df[col] = pd.to_numeric(
+            feature_df[col],
+            errors="coerce"
+        )
+
+        if feature_df[col].isna().all():
             raise RuntimeError(
-                f"Non-numeric feature detected: {col}"
+                f"Feature fully NaN after coercion: {col}"
             )
 
         feature_df[col] = feature_df[col].astype(DTYPE)
 
-    # -------------------------------------------------
     # NaN checks
-    # -------------------------------------------------
-
     per_feature_nan = feature_df.isna().mean()
 
     unsafe = per_feature_nan[
@@ -120,10 +110,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             "Row-level NaN explosion detected."
         )
 
-    # -------------------------------------------------
     # Range enforcement
-    # -------------------------------------------------
-
     for col, (lo, hi) in FEATURE_LIMITS.items():
 
         series = feature_df[col].dropna()
@@ -136,20 +123,19 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
                 f"Feature out of bounds: {col}"
             )
 
-    # deterministic ordering
-    feature_df = feature_df.loc[:, MODEL_FEATURES]
+    # Ensure contiguous memory (important for numpy / xgboost)
+    feature_df = np.ascontiguousarray(feature_df)
+    feature_df = pd.DataFrame(
+        feature_df,
+        columns=MODEL_FEATURES
+    )
 
     return feature_df
 
 
-# =====================================================
-# SCHEMA SIGNATURE
-# =====================================================
-
 def get_schema_signature() -> str:
     """
     Cryptographic schema fingerprint.
-
     ANY governance change invalidates models.
     """
 
