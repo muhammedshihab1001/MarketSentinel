@@ -12,14 +12,8 @@ logger = logging.getLogger("marketsentinel.fetcher")
 
 class StockPriceFetcher:
     """
-    Institutional Market Data Fetcher.
-
-    Guarantees:
-    schema normalization
-    business-day coverage validation
-    atomic cache writes
-    retry with jitter
-    gap detection
+    Market data fetcher with schema normalization,
+    business-day validation, cache safety, and retry logic.
     """
 
     REQUIRED_COLUMNS = {
@@ -34,10 +28,7 @@ class StockPriceFetcher:
     MIN_ROWS = 120
     MAX_RETRIES = 5
     BASE_SLEEP = 1.5
-
     MAX_GAP_DAYS = 10
-
-    # Institutional tolerance
     MIN_COVERAGE_RATIO = 0.85
 
     CACHE_DIR = "data/cache"
@@ -49,76 +40,71 @@ class StockPriceFetcher:
 
     def _flatten_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Normalize Yahoo multi-index columns.
+        Flatten multi-index columns and remove duplicates.
         """
 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        df.columns = [c.lower() for c in df.columns]
+        df.columns = [str(c).lower() for c in df.columns]
+
+        df = df.loc[:, ~df.columns.duplicated()]
 
         return df
 
     # -----------------------------------------------------
 
-    def _normalize_schema(self, df: pd.DataFrame):
+    def _normalize_schema(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Force provider output into institutional schema.
+        Normalize provider output into a stable schema.
+        Must be idempotent.
         """
 
         df = self._flatten_columns(df)
 
-        # Force index → date column safely
-        df = df.reset_index()
-        df.rename(columns={df.columns[0]: "date"}, inplace=True)
+        if "date" not in df.columns:
+            df = df.reset_index()
+            df.rename(columns={df.columns[0]: "date"}, inplace=True)
+
+        df = df.loc[:, ~df.columns.duplicated()]
 
         df["date"] = pd.to_datetime(
             df["date"],
+            errors="coerce",
             utc=True
         ).dt.tz_convert(None)
 
-        numeric = ["open", "high", "low", "close", "volume"]
+        numeric_cols = ["open", "high", "low", "close", "volume"]
 
-        for col in numeric:
-
+        for col in numeric_cols:
             if col not in df.columns:
                 raise RuntimeError(
                     f"Provider schema violation: missing={col}"
                 )
 
             df[col] = pd.to_numeric(
-                df[col].squeeze(),
+                df[col],
                 errors="coerce"
             )
 
-        df = df.dropna(subset=numeric)
+        df = df.dropna(subset=["date"] + numeric_cols)
 
         return df
 
     # -----------------------------------------------------
 
-    def _detect_gaps(self, df):
-        """
-        Detect abnormal missing ranges.
-        """
+    def _detect_gaps(self, df: pd.DataFrame):
 
         diffs = df["date"].diff().dt.days.dropna()
 
         if (diffs > self.MAX_GAP_DAYS).any():
-            raise RuntimeError(
-                "Large gap detected in price history."
-            )
+            raise RuntimeError("Large gap detected in price history.")
 
-    # -----------------------------------------------------
-    # FIXED — BUSINESS DAY COVERAGE 
     # -----------------------------------------------------
 
     def _validate_coverage(self, df, start_date, end_date):
         """
-        Validate dataset coverage using BUSINESS DAYS.
-
-        Stocks do not trade on weekends.
-        Calendar-day validation is incorrect.
+        Validate coverage using business days.
         """
 
         expected_days = len(
@@ -136,8 +122,7 @@ class StockPriceFetcher:
             )
 
         logger.info(
-            f"Coverage OK → {coverage:.2f} "
-            f"({len(df)}/{expected_days})"
+            f"Coverage OK: {coverage:.2f} ({len(df)}/{expected_days})"
         )
 
     # -----------------------------------------------------
@@ -172,7 +157,6 @@ class StockPriceFetcher:
     def _atomic_cache_write(self, df, cache_file):
 
         tmp = cache_file + ".tmp"
-
         df.to_parquet(tmp, index=False)
         os.replace(tmp, cache_file)
 
@@ -185,30 +169,20 @@ class StockPriceFetcher:
 
     # -----------------------------------------------------
 
-    def fetch(
-        self,
-        ticker,
-        start_date,
-        end_date,
-        interval="1d"
-    ):
+    def fetch(self, ticker, start_date, end_date, interval="1d"):
 
         self._validate_dates(start_date, end_date)
 
-        cache_name = self._cache_key(
-            ticker,
-            start_date,
-            end_date,
-            interval
+        cache_file = (
+            f"{self.CACHE_DIR}/"
+            f"{self._cache_key(ticker, start_date, end_date, interval)}.parquet"
         )
-
-        cache_file = f"{self.CACHE_DIR}/{cache_name}.parquet"
 
         if os.path.exists(cache_file):
 
             try:
                 cached = pd.read_parquet(cache_file)
-                logger.info(f"Cache hit → {ticker}")
+                logger.info(f"Cache hit: {ticker}")
 
                 return self._validate_dataset(
                     cached,
@@ -217,7 +191,7 @@ class StockPriceFetcher:
                 )
 
             except Exception:
-                logger.exception("Cache corrupted — rebuilding.")
+                logger.exception("Cache corrupted. Rebuilding.")
                 os.remove(cache_file)
 
         df = self._fetch_yahoo(
@@ -235,7 +209,7 @@ class StockPriceFetcher:
 
         self._atomic_cache_write(df, cache_file)
 
-        logger.info(f"Cached dataset → {ticker}")
+        logger.info(f"Cached dataset: {ticker}")
 
         return df
 
@@ -278,8 +252,8 @@ class StockPriceFetcher:
                 )
 
                 logger.warning(
-                    f"[Yahoo] retry {attempt+1}/{self.MAX_RETRIES} "
-                    f"in {round(sleep_time,2)}s → {e}"
+                    f"Yahoo retry {attempt+1}/{self.MAX_RETRIES} "
+                    f"in {round(sleep_time,2)}s: {e}"
                 )
 
                 time.sleep(sleep_time)
