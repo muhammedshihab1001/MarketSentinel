@@ -1,6 +1,6 @@
 """
 MarketSentinel Institutional Training Orchestrator
-Hardened Version — Production Safe
+Production Hardened — Resilient Execution
 """
 
 import subprocess
@@ -73,24 +73,17 @@ def snapshot_lineage():
 
 
 # ---------------------------------------------------
-# VERSION RESOLUTION (SAFE)
+# VERSION RESOLUTION
 # ---------------------------------------------------
 
 def resolve_latest_version(model_name: str) -> str:
-    """
-    Resolve newest version even if pointer missing.
-    Prevents registry race failures.
-    """
 
     base_dir = f"artifacts/{model_name}"
 
     if not os.path.exists(base_dir):
         raise RuntimeError(f"{model_name} registry missing.")
 
-    versions = [
-        v for v in os.listdir(base_dir)
-        if v.startswith("v")
-    ]
+    versions = [v for v in os.listdir(base_dir) if v.startswith("v")]
 
     if not versions:
         raise RuntimeError(f"No versions found for {model_name}")
@@ -99,7 +92,7 @@ def resolve_latest_version(model_name: str) -> str:
 
 
 # ---------------------------------------------------
-# METADATA LOADER
+# METADATA
 # ---------------------------------------------------
 
 def load_metadata(model_name: str, version: str):
@@ -156,18 +149,14 @@ def governance_check(model_name: str, version: str):
 
 
 # ---------------------------------------------------
-# PROMOTION (SAFE CHAIN)
+# PROMOTION
 # ---------------------------------------------------
 
 def promote_model(model_name: str, version: str):
 
     base_dir = f"artifacts/{model_name}"
 
-    manifest_path = os.path.join(
-        base_dir,
-        version,
-        "manifest.json"
-    )
+    manifest_path = os.path.join(base_dir, version, "manifest.json")
 
     if not os.path.exists(manifest_path):
         raise RuntimeError("Manifest missing — cannot promote.")
@@ -208,18 +197,21 @@ def run_step(name: str, module: str):
 
     process = subprocess.Popen(
         [sys.executable, "-m", module],
-        stdout=sys.stdout,
-        stderr=sys.stderr,
-        env=env
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True
     )
 
     try:
-        process.wait(timeout=TRAINING_TIMEOUT)
+        stdout, stderr = process.communicate(timeout=TRAINING_TIMEOUT)
+
     except subprocess.TimeoutExpired:
         process.kill()
         raise RuntimeError(f"{name} training exceeded timeout.")
 
     if process.returncode != 0:
+        logger.error(stderr)
         raise RuntimeError(f"{name} training failed.")
 
     duration = round(time.time() - start, 2)
@@ -229,6 +221,10 @@ def run_step(name: str, module: str):
     governance_check(name, version)
     promote_model(name, version)
 
+    logger.info(
+        f"{name} training completed in {duration}s → version {version}"
+    )
+
     return {
         "model": name,
         "version": version,
@@ -237,7 +233,7 @@ def run_step(name: str, module: str):
 
 
 # ---------------------------------------------------
-# ATOMIC MANIFEST
+# MANIFEST
 # ---------------------------------------------------
 
 def save_manifest(run_id: str, manifest: dict):
@@ -268,37 +264,46 @@ def main():
     total_start = time.time()
     lineage_hash = snapshot_lineage()
     results = []
+    failures = []
 
-    try:
+    for name, module in PIPELINE_STEPS:
 
-        for name, module in PIPELINE_STEPS:
+        try:
             results.append(run_step(name, module))
 
-        ensure_drift_baseline()
+        except Exception as e:
 
-    except Exception as e:
+            logger.exception(f"{name} failed.")
 
-        logger.exception("Training run failed.")
+            failures.append({
+                "model": name,
+                "error": str(e)
+            })
+
+    if not results:
+        logger.error("All training steps failed.")
 
         manifest = {
             "run_id": run_id,
             "lineage_hash": lineage_hash,
             "reproducibility": reproducibility_stamp(),
             "status": "failed",
-            "error": str(e),
-            "results": results
+            "failures": failures
         }
 
         save_manifest(run_id, manifest)
         sys.exit(1)
 
+    ensure_drift_baseline()
+
     manifest = {
         "run_id": run_id,
         "lineage_hash": lineage_hash,
         "reproducibility": reproducibility_stamp(),
-        "status": "success",
+        "status": "partial_success" if failures else "success",
         "total_runtime_sec": round(time.time() - total_start, 2),
-        "results": results
+        "results": results,
+        "failures": failures
     }
 
     save_manifest(run_id, manifest)
