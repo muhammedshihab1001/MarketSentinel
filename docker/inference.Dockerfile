@@ -2,7 +2,7 @@
 # STAGE 1 — BUILDER
 # -------------------------------------------------
 
-FROM python:3.10-slim@sha256:5c9b4a4f7b6e4d5e6c6f1a1b7c2d9c6c4c5d9a1f2e3b4c5d6e7f8a9b0c1d2e3f AS builder
+FROM python:3.10-slim@sha256:e508a34e5491225a76fbb9e0f43ebde1f691c6a689d096d7510cf7fb17d4ba6f AS builder
 
 WORKDIR /install
 
@@ -31,7 +31,7 @@ RUN pip install \
 # STAGE 2 — RUNTIME
 # -------------------------------------------------
 
-FROM python:3.10-slim@sha256:5c9b4a4f7b6e4d5e6c6f1a1b7c2d9c6c4c5d9a1f2e3b4c5d6e7f8a9b0c1d2e3f
+FROM python:3.10-slim@sha256:e508a34e5491225a76fbb9e0f43ebde1f691c6a689d096d7510cf7fb17d4ba6f
 
 WORKDIR /app
 
@@ -51,7 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tini \
     && rm -rf /var/lib/apt/lists/*
 
-# create non-root user
+# stable UID improves orchestration compatibility
 RUN useradd -m -u 10001 appuser
 
 COPY --from=builder /install/deps /usr/local
