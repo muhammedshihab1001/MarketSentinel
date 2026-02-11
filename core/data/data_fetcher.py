@@ -4,7 +4,7 @@ import time
 import hashlib
 import logging
 import os
-import tempfile
+import random
 import requests
 
 from datetime import datetime
@@ -41,6 +41,15 @@ class StockPriceFetcher:
     MIN_COVERAGE_RATIO = 0.85
 
     CACHE_DIR = "data/cache"
+
+    # NEW — persistent session prevents Yahoo blocking
+    SESSION = requests.Session()
+    SESSION.headers.update({
+        "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        " AppleWebKit/537.36 (KHTML, like Gecko)"
+        " Chrome/120.0 Safari/537.36"
+    })
 
     def __init__(self):
         os.makedirs(self.CACHE_DIR, exist_ok=True)
@@ -164,10 +173,13 @@ class StockPriceFetcher:
 
         cache_file = f"{self.CACHE_DIR}/{cache_name}.parquet"
 
+        # Try cache first
         if os.path.exists(cache_file):
 
             try:
                 cached = pd.read_parquet(cache_file)
+
+                logger.info(f"Cache hit → {ticker}")
 
                 return self._validate_dataset(
                     cached,
@@ -183,12 +195,36 @@ class StockPriceFetcher:
 
                 os.remove(cache_file)
 
-        df = self._fetch_yahoo(
-            ticker,
-            start_date,
-            end_date,
-            interval
-        )
+        # Fetch from Yahoo
+        try:
+
+            df = self._fetch_yahoo(
+                ticker,
+                start_date,
+                end_date,
+                interval
+            )
+
+        except Exception as e:
+
+            # ⭐ FALLBACK — use stale cache if available
+            if os.path.exists(cache_file):
+
+                logger.warning(
+                    f"Yahoo failed — using stale cache for {ticker}"
+                )
+
+                cached = pd.read_parquet(cache_file)
+
+                return self._validate_dataset(
+                    cached,
+                    start_date,
+                    end_date
+                )
+
+            raise RuntimeError(
+                f"Yahoo failed and no cache available: {ticker}"
+            ) from e
 
         df = self._validate_dataset(
             df,
@@ -221,30 +257,37 @@ class StockPriceFetcher:
                     start=start_date,
                     end=end_date,
                     interval=interval,
-                    auto_adjust=True,   # CRITICAL FIX
+                    auto_adjust=True,
                     progress=False,
-                    threads=False
+                    threads=False,
+                    session=self.SESSION  #  anti-block
                 )
 
                 if df.empty:
-                    raise RuntimeError("Yahoo returned empty dataframe")
+                    raise RuntimeError(
+                        "Yahoo returned empty dataframe"
+                    )
 
                 df.reset_index(inplace=True)
 
                 return df
 
-            except Exception:
+            except Exception as e:
 
-                sleep_time = self.BASE_SLEEP * (2 ** attempt)
+                # exponential backoff + jitter
+                sleep_time = (
+                    self.BASE_SLEEP * (2 ** attempt)
+                    + random.uniform(0, 1)
+                )
 
                 logger.warning(
                     f"[Yahoo] retry {attempt+1}/{self.MAX_RETRIES} "
-                    f"in {round(sleep_time,2)}s"
+                    f"in {round(sleep_time,2)}s → {e}"
                 )
 
                 time.sleep(sleep_time)
 
-        raise RuntimeError("Yahoo failed.")
+        raise RuntimeError("Yahoo failed after retries.")
 
     # -----------------------------------------------------
 
