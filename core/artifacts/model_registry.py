@@ -2,6 +2,8 @@ import os
 import json
 import datetime
 import shutil
+import hashlib
+import uuid
 from typing import Dict, Any
 
 
@@ -11,23 +13,17 @@ class ModelRegistry:
 
     Guarantees:
     - atomic registration
-    - crash-safe manifests
-    - pointer integrity
-    - promotion lineage
-    - rollback capability
     - artifact immutability
-    - schema-bound metadata
+    - pointer crash safety
+    - promotion governance
+    - rollback protection
+    - lineage tracking
     """
 
     MANIFEST_NAME = "manifest.json"
     LATEST_POINTER = "latest.json"
 
-    STAGES = (
-        "candidate",
-        "shadow",
-        "approved",
-        "production"
-    )
+    STAGES = ("candidate", "shadow", "approved", "production")
 
     ALLOWED_TRANSITIONS = {
         "candidate": {"shadow"},
@@ -49,7 +45,30 @@ class ModelRegistry:
 
     @staticmethod
     def _version() -> str:
-        return datetime.datetime.utcnow().strftime("v%Y_%m_%d_%H%M%S")
+        ts = datetime.datetime.utcnow().strftime("v%Y_%m_%d_%H%M%S")
+        suffix = uuid.uuid4().hex[:6]
+        return f"{ts}_{suffix}"
+
+    # --------------------------------------------------
+
+    @staticmethod
+    def _sha256(path: str) -> str:
+
+        h = hashlib.sha256()
+
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+
+        return h.hexdigest()
+
+    # --------------------------------------------------
+
+    @staticmethod
+    def _fsync_dir(path: str):
+        fd = os.open(path, os.O_DIRECTORY)
+        os.fsync(fd)
+        os.close(fd)
 
     # --------------------------------------------------
 
@@ -68,28 +87,13 @@ class ModelRegistry:
     # --------------------------------------------------
 
     @staticmethod
-    def _validate_artifact(path: str):
-
-        if not os.path.exists(path):
-            raise RuntimeError(f"Artifact missing: {path}")
-
-        if os.path.getsize(path) == 0:
-            raise RuntimeError(f"Artifact empty: {path}")
-
-    # --------------------------------------------------
-    # STRICT METADATA VALIDATION
-    # --------------------------------------------------
-
-    @staticmethod
     def _validate_metadata(metadata_path: str):
 
         with open(metadata_path) as f:
             meta = json.load(f)
 
         if meta.get("metadata_type") != "model":
-            raise RuntimeError(
-                "Attempted to register non-model metadata."
-            )
+            raise RuntimeError("Attempted to register non-model metadata.")
 
         missing = [
             k for k in ModelRegistry.REQUIRED_METADATA_FIELDS
@@ -101,107 +105,8 @@ class ModelRegistry:
                 f"Metadata missing required fields: {missing}"
             )
 
-        if not isinstance(meta["features"], list):
-            raise RuntimeError("features must be a list")
-
-        if not isinstance(meta["metrics"], dict):
-            raise RuntimeError("metrics must be a dictionary")
-
-        if not isinstance(meta["dataset_hash"], str):
-            raise RuntimeError("dataset_hash must be a string")
-
-        if not isinstance(meta["schema_signature"], str):
-            raise RuntimeError("schema_signature must be a string")
-
     # --------------------------------------------------
-    # POINTER
-    # --------------------------------------------------
-
-    @staticmethod
-    def _write_latest_pointer(base_dir: str, version: str):
-
-        pointer_path = os.path.join(
-            base_dir,
-            ModelRegistry.LATEST_POINTER
-        )
-
-        ModelRegistry._atomic_json_write(
-            pointer_path,
-            {"version": version}
-        )
-
-    # --------------------------------------------------
-
-    @staticmethod
-    def _atomic_symlink(target: str, link_name: str):
-
-        try:
-
-            tmp_link = link_name + ".tmp"
-
-            if os.path.exists(tmp_link):
-                os.remove(tmp_link)
-
-            os.symlink(target, tmp_link)
-            os.replace(tmp_link, link_name)
-
-        except Exception:
-            # Windows fallback or restricted FS
-            pass
-
-    # --------------------------------------------------
-
-    @staticmethod
-    def _write_manifest(version_dir: str, metadata_path: str):
-
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-
-        manifest: Dict[str, Any] = {
-            "version": os.path.basename(version_dir),
-            "created_utc": datetime.datetime.utcnow().isoformat(),
-            "stage": "candidate",
-            "metadata": metadata,
-            "history": []
-        }
-
-        path = os.path.join(
-            version_dir,
-            ModelRegistry.MANIFEST_NAME
-        )
-
-        ModelRegistry._atomic_json_write(path, manifest)
-
-    # --------------------------------------------------
-
-    @staticmethod
-    def _load_manifest(version_dir: str):
-
-        path = os.path.join(
-            version_dir,
-            ModelRegistry.MANIFEST_NAME
-        )
-
-        if not os.path.exists(path):
-            raise RuntimeError("Manifest missing.")
-
-        with open(path) as f:
-            return json.load(f)
-
-    # --------------------------------------------------
-
-    @staticmethod
-    def _save_manifest(version_dir: str, manifest: dict):
-
-        path = os.path.join(
-            version_dir,
-            ModelRegistry.MANIFEST_NAME
-        )
-
-        ModelRegistry._atomic_json_write(path, manifest)
-
-    # --------------------------------------------------
-    # REGISTRATION (TRANSACTIONAL)
+    # REGISTRATION
     # --------------------------------------------------
 
     @staticmethod
@@ -213,117 +118,102 @@ class ModelRegistry:
 
         os.makedirs(base_dir, exist_ok=True)
 
-        ModelRegistry._validate_artifact(model_path)
-        ModelRegistry._validate_artifact(metadata_path)
         ModelRegistry._validate_metadata(metadata_path)
 
         version = ModelRegistry._version()
-        version_dir = os.path.join(base_dir, version)
 
+        version_dir = os.path.join(base_dir, version)
         staging_dir = version_dir + ".staging"
 
         os.makedirs(staging_dir, exist_ok=False)
 
-        shutil.copy2(model_path, staging_dir)
-        shutil.copy2(metadata_path, staging_dir)
+        model_name = os.path.basename(model_path)
+        metadata_name = os.path.basename(metadata_path)
 
-        ModelRegistry._write_manifest(
-            staging_dir,
-            os.path.join(
-                staging_dir,
-                os.path.basename(metadata_path)
-            )
-        )
+        staged_model = os.path.join(staging_dir, model_name)
+        staged_meta = os.path.join(staging_dir, metadata_name)
 
-        # atomic directory swap
+        shutil.copy2(model_path, staged_model)
+        shutil.copy2(metadata_path, staged_meta)
+
+        manifest: Dict[str, Any] = {
+            "version": version,
+            "created_utc": datetime.datetime.utcnow().isoformat(),
+            "stage": "candidate",
+            "artifacts": {
+                model_name: ModelRegistry._sha256(staged_model),
+                metadata_name: ModelRegistry._sha256(staged_meta),
+            },
+            "history": []
+        }
+
+        manifest_path = os.path.join(staging_dir, ModelRegistry.MANIFEST_NAME)
+
+        ModelRegistry._atomic_json_write(manifest_path, manifest)
+
         os.replace(staging_dir, version_dir)
 
+        ModelRegistry._fsync_dir(base_dir)
+
         return version
-
-    # --------------------------------------------------
-    # STAGE TRANSITION
-    # --------------------------------------------------
-
-    @staticmethod
-    def transition_stage(
-        base_dir: str,
-        version: str,
-        new_stage: str
-    ):
-
-        if new_stage not in ModelRegistry.STAGES:
-            raise RuntimeError("Invalid stage.")
-
-        version_dir = os.path.join(base_dir, version)
-
-        manifest = ModelRegistry._load_manifest(version_dir)
-
-        current_stage = manifest["stage"]
-
-        if new_stage not in ModelRegistry.ALLOWED_TRANSITIONS[current_stage]:
-            raise RuntimeError(
-                f"Illegal transition {current_stage} -> {new_stage}"
-            )
-
-        manifest["history"].append({
-            "from": current_stage,
-            "to": new_stage,
-            "timestamp": datetime.datetime.utcnow().isoformat()
-        })
-
-        manifest["stage"] = new_stage
-
-        ModelRegistry._save_manifest(version_dir, manifest)
 
     # --------------------------------------------------
     # PROMOTION
     # --------------------------------------------------
 
     @staticmethod
-    def promote_to_production(
-        base_dir: str,
-        version: str
-    ):
+    def promote_to_production(base_dir: str, version: str):
 
         version_dir = os.path.join(base_dir, version)
 
-        manifest = ModelRegistry._load_manifest(version_dir)
+        manifest_path = os.path.join(
+            version_dir,
+            ModelRegistry.MANIFEST_NAME
+        )
+
+        if not os.path.exists(manifest_path):
+            raise RuntimeError("Manifest missing.")
+
+        with open(manifest_path) as f:
+            manifest = json.load(f)
 
         if manifest["stage"] != "approved":
-            raise RuntimeError(
-                "Only approved models may enter production."
-            )
+            raise RuntimeError("Only approved models may enter production.")
 
-        # Validate artifacts again before promotion
-        metadata = manifest["metadata"]
-
-        if metadata.get("metadata_type") != "model":
-            raise RuntimeError("Invalid metadata detected.")
-
-        latest_link = os.path.join(base_dir, "latest")
+        pointer_path = os.path.join(base_dir, ModelRegistry.LATEST_POINTER)
 
         previous = None
 
+        if os.path.exists(pointer_path):
+            with open(pointer_path) as f:
+                previous = json.load(f).get("version")
+
+        # write pointer FIRST (crash-safe)
+        ModelRegistry._atomic_json_write(
+            pointer_path,
+            {"version": version}
+        )
+
+        latest_link = os.path.join(base_dir, "latest")
+
         try:
-            previous = ModelRegistry.get_latest_version(base_dir)
+            tmp = latest_link + ".tmp"
+            os.symlink(version, tmp)
+            os.replace(tmp, latest_link)
         except Exception:
             pass
 
-        ModelRegistry._atomic_symlink(version, latest_link)
-        ModelRegistry._write_latest_pointer(base_dir, version)
-
+        manifest["stage"] = "production"
         manifest["history"].append({
             "event": "promotion",
             "timestamp": datetime.datetime.utcnow().isoformat(),
-            "previous_production": previous
+            "previous": previous
         })
 
-        manifest["stage"] = "production"
-
-        ModelRegistry._save_manifest(version_dir, manifest)
+        ModelRegistry._atomic_json_write(manifest_path, manifest)
 
     # --------------------------------------------------
-    # ROLLBACK
+    # ROLLBACK (SAFE)
     # --------------------------------------------------
 
     @staticmethod
@@ -331,17 +221,27 @@ class ModelRegistry:
 
         version_dir = os.path.join(base_dir, version)
 
-        if not os.path.exists(version_dir):
-            raise RuntimeError("Rollback failed — version not found.")
-
-        ModelRegistry._atomic_symlink(
-            version,
-            os.path.join(base_dir, "latest")
+        manifest_path = os.path.join(
+            version_dir,
+            ModelRegistry.MANIFEST_NAME
         )
 
-        ModelRegistry._write_latest_pointer(
-            base_dir,
-            version
+        if not os.path.exists(manifest_path):
+            raise RuntimeError("Rollback failed — manifest missing.")
+
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+
+        if manifest["stage"] != "production":
+            raise RuntimeError(
+                "Rollback allowed ONLY to previous production models."
+            )
+
+        pointer_path = os.path.join(base_dir, ModelRegistry.LATEST_POINTER)
+
+        ModelRegistry._atomic_json_write(
+            pointer_path,
+            {"version": version}
         )
 
     # --------------------------------------------------
@@ -349,19 +249,10 @@ class ModelRegistry:
     @staticmethod
     def get_latest_version(base_dir: str) -> str:
 
-        pointer = os.path.join(
-            base_dir,
-            ModelRegistry.LATEST_POINTER
-        )
+        pointer = os.path.join(base_dir, ModelRegistry.LATEST_POINTER)
 
-        if os.path.exists(pointer):
+        if not os.path.exists(pointer):
+            raise RuntimeError("Latest pointer missing.")
 
-            with open(pointer) as f:
-                return json.load(f)["version"]
-
-        latest_link = os.path.join(base_dir, "latest")
-
-        if os.path.islink(latest_link):
-            return os.readlink(latest_link)
-
-        raise RuntimeError("Latest pointer missing.")
+        with open(pointer) as f:
+            return json.load(f)["version"]
