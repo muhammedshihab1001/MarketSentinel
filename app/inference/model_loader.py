@@ -9,6 +9,8 @@ from prophet.serialize import model_from_json
 
 from models.lstm_model import forecast_lstm
 from models.prophet_model import forecast_prophet
+
+from core.schema.feature_schema import get_schema_signature
 from app.monitoring.metrics import MODEL_VERSION
 
 
@@ -16,15 +18,35 @@ logger = logging.getLogger("marketsentinel.loader")
 
 
 class ModelLoader:
+    """
+    Institutional Inference Loader.
+
+    Guarantees:
+    - thread-safe singleton
+    - schema-bound model loading
+    - manifest validation
+    - pointer integrity
+    - GPU storm prevention
+    - artifact validation
+    """
 
     _instance = None
-    _lock = threading.Lock()
+    _instance_lock = threading.Lock()
+    _tf_lock = threading.Lock()
 
+    # ---------------------------------------------------
+    # THREAD SAFE SINGLETON
     # ---------------------------------------------------
 
     def __new__(cls, *args, **kwargs):
+
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
+
+            with cls._instance_lock:
+
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+
         return cls._instance
 
     # ---------------------------------------------------
@@ -42,26 +64,30 @@ class ModelLoader:
         self._scaler = None
         self._prophet = None
 
+        self._load_lock = threading.Lock()
+
         self._initialized = True
 
     # ---------------------------------------------------
-    # TENSORFLOW CONFIG
+    # TENSORFLOW SAFE INIT
     # ---------------------------------------------------
 
     def _configure_tensorflow(self):
 
-        disable_gpu = os.getenv("DISABLE_GPU", "false").lower() == "true"
+        with self._tf_lock:
 
-        if disable_gpu:
-            tf.config.set_visible_devices([], "GPU")
+            disable_gpu = os.getenv("DISABLE_GPU", "false").lower() == "true"
 
-        intra = int(os.getenv("TF_INTRA_THREADS", "1"))
-        inter = int(os.getenv("TF_INTER_THREADS", "1"))
+            if disable_gpu:
+                tf.config.set_visible_devices([], "GPU")
 
-        tf.config.threading.set_intra_op_parallelism_threads(intra)
-        tf.config.threading.set_inter_op_parallelism_threads(inter)
+            intra = int(os.getenv("TF_INTRA_THREADS", "1"))
+            inter = int(os.getenv("TF_INTER_THREADS", "1"))
 
-        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+            tf.config.threading.set_intra_op_parallelism_threads(intra)
+            tf.config.threading.set_inter_op_parallelism_threads(inter)
+
+            os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
     # ---------------------------------------------------
     # VALIDATION
@@ -77,6 +103,25 @@ class ModelLoader:
 
     # ---------------------------------------------------
 
+    def _validate_manifest(self, version_dir):
+
+        manifest_path = os.path.join(version_dir, "manifest.json")
+
+        if not os.path.exists(manifest_path):
+            raise RuntimeError("Manifest missing.")
+
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+
+        if manifest.get("stage") != "production":
+            raise RuntimeError(
+                "Attempted to load non-production model."
+            )
+
+        return manifest
+
+    # ---------------------------------------------------
+
     def _validate_metadata(self, version_dir):
 
         meta_path = os.path.join(version_dir, "metadata.json")
@@ -87,14 +132,15 @@ class ModelLoader:
         with open(meta_path) as f:
             meta = json.load(f)
 
-        if meta.get("metadata_type", "model") != "model":
+        if meta.get("metadata_type") != "model":
             raise RuntimeError("Invalid metadata type.")
 
-        if "schema_signature" not in meta:
-            raise RuntimeError("Metadata missing schema_signature")
+        if meta.get("schema_signature") != get_schema_signature():
+            raise RuntimeError(
+                "Schema mismatch detected during model load."
+            )
 
-        if "metrics" not in meta:
-            raise RuntimeError("Metadata missing metrics")
+        return meta
 
     # ---------------------------------------------------
     # POINTER RESOLUTION
@@ -107,12 +153,19 @@ class ModelLoader:
         if os.path.exists(pointer):
 
             with open(pointer) as f:
-                version = json.load(f)["version"]
+                data = json.load(f)
+
+            version = data.get("version")
+
+            if not version:
+                raise RuntimeError("Latest pointer corrupted.")
 
             version_dir = os.path.join(model_dir, version)
 
             if not os.path.exists(version_dir):
-                raise RuntimeError("Latest pointer corrupted.")
+                raise RuntimeError("Pointer references missing version.")
+
+            self._validate_manifest(version_dir)
 
             return version_dir, version
 
@@ -122,6 +175,8 @@ class ModelLoader:
 
             version = os.readlink(symlink)
             version_dir = os.path.join(model_dir, version)
+
+            self._validate_manifest(version_dir)
 
             return version_dir, version
 
@@ -145,20 +200,20 @@ class ModelLoader:
 
             version_dir = os.path.join(model_dir, version)
 
-            manifest = os.path.join(version_dir, "manifest.json")
+            manifest_path = os.path.join(version_dir, "manifest.json")
 
-            if not os.path.exists(manifest):
+            if not os.path.exists(manifest_path):
                 continue
 
             try:
-                with open(manifest) as f:
-                    data = json.load(f)
+                with open(manifest_path) as f:
+                    manifest = json.load(f)
 
-                if data.get("stage") == "shadow":
+                if manifest.get("stage") == "shadow":
                     candidates.append((version_dir, version))
 
             except Exception:
-                continue
+                logger.exception("Shadow manifest read failure.")
 
         if not candidates:
             return None
@@ -166,12 +221,14 @@ class ModelLoader:
         return sorted(candidates, key=lambda x: x[1], reverse=True)[0]
 
     # ---------------------------------------------------
+    # SAFE LOAD ONCE
+    # ---------------------------------------------------
 
     def _load_once(self, attr, loader):
 
         if getattr(self, attr) is None:
 
-            with self._lock:
+            with self._load_lock:
 
                 if getattr(self, attr) is None:
                     setattr(self, attr, loader())
