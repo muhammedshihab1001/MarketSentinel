@@ -6,12 +6,10 @@ from training.backtesting.regime import MarketRegimeDetector
 
 
 class WalkForwardValidator:
-    """
-    Institutional Walk-Forward Validator.
-    """
 
-    EMBARGO_DAYS = 5
+    EMBARGO_DAYS = 52
     MIN_TRADES_PER_WINDOW = 5
+    RESET_CAPITAL_EACH_WINDOW = True
 
     def __init__(
         self,
@@ -28,7 +26,28 @@ class WalkForwardValidator:
         self.engine = PortfolioBacktestEngine()
         self.regime_detector = MarketRegimeDetector()
 
-    # ---------------------------------------------------
+    def _validate_training_frame(self, df):
+
+        if df["ticker"].nunique() < 3:
+            raise RuntimeError(
+                "Training universe too small. Cross-sectional learning unsafe."
+            )
+
+        if not df["date"].is_monotonic_increasing:
+            raise RuntimeError(
+                "Training dataframe not sorted."
+            )
+
+    def _sanity_check_model(self, model, sample_df):
+
+        preds = model.predict_proba(
+            sample_df.iloc[:50].drop(columns=["date","ticker","target"], errors="ignore")
+        )[:, 1]
+
+        if np.std(preds) < 1e-4:
+            raise RuntimeError(
+                "Model collapsed. Predictions nearly constant."
+            )
 
     def run(self, df: pd.DataFrame):
 
@@ -62,7 +81,9 @@ class WalkForwardValidator:
             "SIDEWAYS": []
         }
 
-        capital = 10_000
+        initial_capital = 10_000
+        capital = initial_capital
+
         start_idx = self.window_size
 
         while start_idx < len(unique_dates):
@@ -80,10 +101,14 @@ class WalkForwardValidator:
             if len(test_dates) < 2:
                 break
 
-            train_df = df[df["date"].isin(train_dates)]
-            test_df = df[df["date"].isin(test_dates)]
+            train_df = df[df["date"].isin(train_dates)].copy()
+            test_df = df[df["date"].isin(test_dates)].copy()
+
+            self._validate_training_frame(train_df)
 
             model = self.model_trainer(train_df)
+
+            self._sanity_check_model(model, train_df)
 
             grouped_prices = {}
             grouped_signals = {}
@@ -118,10 +143,16 @@ class WalkForwardValidator:
                     "Strategy produced insufficient trades."
                 )
 
+            capital_to_use = (
+                initial_capital
+                if self.RESET_CAPITAL_EACH_WINDOW
+                else capital
+            )
+
             metrics = self.engine.run(
                 grouped_prices,
                 grouped_signals,
-                initial_cash=capital
+                initial_cash=capital_to_use
             )
 
             if not np.isfinite(metrics["final_portfolio"]):
@@ -143,7 +174,6 @@ class WalkForwardValidator:
                     "Equity curve contains invalid values."
                 )
 
-            # FIX — prevent boundary duplication
             if equity_curve:
                 equity_curve.extend(curve[1:].tolist())
             else:
@@ -172,8 +202,6 @@ class WalkForwardValidator:
             equity_curve,
             regime_buckets
         )
-
-    # ---------------------------------------------------
 
     def aggregate_results(
         self,
