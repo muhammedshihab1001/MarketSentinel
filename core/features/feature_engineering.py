@@ -14,6 +14,13 @@ class FeatureEngineer:
 
     MIN_ROWS_REQUIRED = 120
 
+    SENTIMENT_COLUMNS = [
+        "date",
+        "avg_sentiment",
+        "news_count",
+        "sentiment_std"
+    ]
+
     @staticmethod
     def _normalize_datetime(df: pd.DataFrame):
 
@@ -93,19 +100,52 @@ class FeatureEngineer:
         df["macd"] = ema_12 - ema_26
         df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
 
-    @staticmethod
-    def merge_price_sentiment(price_df, sentiment_df):
+    @classmethod
+    def _build_zero_sentiment(cls, price_df):
 
-        price = FeatureEngineer._normalize_datetime(price_df.copy())
-        sentiment = FeatureEngineer._normalize_datetime(sentiment_df.copy())
+        logger.warning("Sentiment unavailable — injecting deterministic neutral sentiment.")
 
+        zero = pd.DataFrame({
+            "date": price_df["date"],
+            "avg_sentiment": 0.0,
+            "news_count": 0.0,
+            "sentiment_std": 0.0
+        })
+
+        return zero
+
+    @classmethod
+    def merge_price_sentiment(cls, price_df, sentiment_df):
+
+        price = cls._normalize_datetime(price_df.copy())
         price = price.sort_values("date")
+
+        if sentiment_df is None or sentiment_df.empty:
+            sentiment = cls._build_zero_sentiment(price)
+
+        else:
+
+            sentiment = sentiment_df.copy()
+
+            missing = set(cls.SENTIMENT_COLUMNS) - set(sentiment.columns)
+
+            if missing:
+                logger.warning(
+                    f"Sentiment malformed — missing columns {missing}. Using neutral fallback."
+                )
+                sentiment = cls._build_zero_sentiment(price)
+            else:
+                sentiment = sentiment.loc[:, cls.SENTIMENT_COLUMNS]
+
+        sentiment = cls._normalize_datetime(sentiment)
         sentiment = sentiment.sort_values("date")
 
         if sentiment["date"].duplicated().any():
-            sentiment = sentiment.groupby("date", as_index=False).mean()
+            sentiment = sentiment.groupby(
+                "date",
+                as_index=False
+            )[cls.SENTIMENT_COLUMNS[1:]].mean()
 
-        # CRITICAL: shift sentiment to prevent lookahead
         sentiment["date"] = sentiment["date"] + pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
@@ -213,6 +253,9 @@ class FeatureEngineer:
         validated = validate_feature_schema(
             df.drop(columns=["target"], errors="ignore")
         )
+
+        # Explicit ordering enforcement
+        validated = validated.loc[:, MODEL_FEATURES]
 
         non_features = [
             col for col in df.columns
