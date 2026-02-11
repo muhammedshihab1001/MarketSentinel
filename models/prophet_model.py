@@ -1,67 +1,38 @@
 from prophet import Prophet
 import pandas as pd
 import numpy as np
-import os
 
-from cmdstanpy import cmdstan_path, set_cmdstan_path
+from cmdstanpy import cmdstan_path
 
-CHANGEPOINT_PRIOR = 0.02
-INTERVAL_WIDTH = 0.80
-CHANGEPOINT_RANGE = 0.9
+
+CHANGEPOINT_PRIOR = 0.01
+INTERVAL_WIDTH = 0.70
+CHANGEPOINT_RANGE = 0.80
+UNCERTAINTY_SAMPLES = 200
 
 
 # ---------------------------------------------------
-# CMDSTAN RESOLUTION (INSTITUTIONAL)
+# CMDSTAN SAFETY CHECK
 # ---------------------------------------------------
 
-def _resolve_cmdstan():
+def _validate_cmdstan():
     """
-    Institutional CmdStan resolver.
-
-    Resolution order:
-    1. CMDSTAN env
-    2. cmdstanpy installed path
-    3. artifacts/cmdstan
+    Fail closed if CmdStan is unavailable.
+    No manual path resolution.
+    Let cmdstanpy manage installation paths.
     """
 
-    # 1. Explicit env
-    env_path = os.getenv("CMDSTAN")
-
-    if env_path:
-
-        if not os.path.exists(env_path):
-            raise RuntimeError(
-                f"CMDSTAN env path invalid: {env_path}"
-            )
-
-        set_cmdstan_path(env_path)
-        return env_path
-
-    # 2. cmdstanpy default install
     try:
+        path = cmdstan_path()
 
-        default_path = cmdstan_path()
-
-        if default_path and os.path.exists(default_path):
-            set_cmdstan_path(default_path)
-            return default_path
+        if path is None:
+            raise RuntimeError
 
     except Exception:
-        pass
-
-    # 3. Institutional artifact location
-    artifact_path = "artifacts/cmdstan"
-
-    if os.path.exists(artifact_path):
-        set_cmdstan_path(artifact_path)
-        return artifact_path
-
-    # FAIL CLOSED
-    raise RuntimeError(
-        "CmdStan not found.\n"
-        "Install during image build or environment bootstrap.\n"
-        "Runtime downloads are forbidden."
-    )
+        raise RuntimeError(
+            "CmdStan is not installed. "
+            "Run: python -m cmdstanpy.install_cmdstan"
+        )
 
 
 # ---------------------------------------------------
@@ -91,14 +62,15 @@ def prepare_prophet_dataframe(df):
     prophet_df = prophet_df.sort_values("ds")
     prophet_df = prophet_df.drop_duplicates("ds")
 
-    lower = prophet_df["y"].quantile(0.01)
-    upper = prophet_df["y"].quantile(0.99)
+    # Conservative winsorization
+    lower = prophet_df["y"].quantile(0.02)
+    upper = prophet_df["y"].quantile(0.98)
 
     prophet_df["y"] = prophet_df["y"].clip(lower, upper)
 
-    if len(prophet_df) < 250:
+    if len(prophet_df) < 300:
         raise RuntimeError(
-            "Prophet requires sufficient history for stable trend."
+            "Insufficient history for structural trend detection."
         )
 
     return prophet_df
@@ -110,19 +82,23 @@ def prepare_prophet_dataframe(df):
 
 def train_prophet(df, random_seed: int = 42):
 
-    resolved_path = _resolve_cmdstan()
+    _validate_cmdstan()
 
     prophet_df = prepare_prophet_dataframe(df)
 
     model = Prophet(
         growth="linear",
+
+        # Structural trend only
         daily_seasonality=False,
-        weekly_seasonality=True,
-        yearly_seasonality=True,
+        weekly_seasonality=False,
+        yearly_seasonality=False,
+
         changepoint_prior_scale=CHANGEPOINT_PRIOR,
         changepoint_range=CHANGEPOINT_RANGE,
         interval_width=INTERVAL_WIDTH,
-        uncertainty_samples=1000,
+        uncertainty_samples=UNCERTAINTY_SAMPLES,
+
         stan_backend="CMDSTANPY"
     )
 
@@ -138,7 +114,7 @@ def train_prophet(df, random_seed: int = 42):
 # FORECAST
 # ---------------------------------------------------
 
-def forecast_prophet(model, periods=30):
+def forecast_prophet(model, periods=60):
 
     future = model.make_future_dataframe(
         periods=periods,
@@ -154,19 +130,20 @@ def forecast_prophet(model, periods=30):
             "Forecast contains NaN values."
         )
 
-    yhat = tail["yhat"]
+    yhat = tail["yhat"].values
 
-    trend = (
-        "BULLISH"
-        if yhat.iloc[-1] > yhat.iloc[0]
-        else "BEARISH"
-    )
+    slope = float(yhat[-1] - yhat[0])
+    volatility = float(np.std(yhat))
 
-    volatility = float(np.std(yhat.values))
+    if abs(slope) < volatility * 0.25:
+        trend = "SIDEWAYS"
+    else:
+        trend = "BULLISH" if slope > 0 else "BEARISH"
 
     return {
         "trend": trend,
         "upper": float(tail["yhat_upper"].max()),
         "lower": float(tail["yhat_lower"].min()),
-        "forecast_volatility": volatility
+        "forecast_volatility": volatility,
+        "slope": slope
     }
