@@ -12,7 +12,7 @@ from xgboost import XGBClassifier
 from core.data.data_fetcher import StockPriceFetcher
 from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
-from core.features.feature_store import FeatureStore
+from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import MODEL_FEATURES
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
@@ -33,6 +33,8 @@ np.random.seed(SEED)
 TRAINING_TICKERS = [
     "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA"
 ]
+
+MIN_TRAINING_ROWS = 1500
 
 
 # ---------------------------------------------------
@@ -58,19 +60,24 @@ def save_model_atomic(model, path):
 
 
 # ---------------------------------------------------
-# SAFE BASELINE (WRITE ONCE)
+# SAFE BASELINE
 # ---------------------------------------------------
 
-def ensure_baseline(df):
+def ensure_baseline(df, dataset_hash):
 
     detector = DriftDetector()
 
     if os.path.exists(detector.BASELINE_PATH):
         return
 
-    detector.create_baseline(df[list(MODEL_FEATURES)])
+    detector.create_baseline(
+        df,
+        dataset_hash=dataset_hash
+    )
 
 
+# ---------------------------------------------------
+# TRAINING DATA
 # ---------------------------------------------------
 
 def load_training_data():
@@ -78,7 +85,7 @@ def load_training_data():
     fetcher = StockPriceFetcher()
     news_fetcher = NewsFetcher()
     sentiment_analyzer = SentimentAnalyzer()
-    feature_store = FeatureStore()
+    engineer = FeatureEngineer()
 
     end_date = datetime.date.today().isoformat()
 
@@ -100,10 +107,11 @@ def load_training_data():
         scored_df = sentiment_analyzer.analyze_dataframe(news_df)
         sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
 
-        dataset = feature_store.get_features(
+        # CRITICAL — TRAINING MODE
+        dataset = engineer.build_feature_pipeline(
             price_df,
             sentiment_df,
-            ticker=ticker
+            training=True
         )
 
         dataset["ticker"] = ticker
@@ -115,11 +123,16 @@ def load_training_data():
     if df.empty:
         raise RuntimeError("Training dataset empty.")
 
+    if len(df) < MIN_TRAINING_ROWS:
+        raise RuntimeError(
+            f"Training aborted — dataset too small ({len(df)} rows)"
+        )
+
     return df, end_date
 
 
 # ---------------------------------------------------
-# DATE SPLIT (NO LEAKAGE)
+# DATE SPLIT
 # ---------------------------------------------------
 
 def date_split(df):
@@ -187,9 +200,9 @@ if __name__ == "__main__":
 
     df, end_date = load_training_data()
 
-    ensure_baseline(df)
-
     dataset_hash = MetadataManager.fingerprint_dataset(df)
+
+    ensure_baseline(df, dataset_hash)
 
     wf = WalkForwardValidator(
         model_trainer=lambda d: train_full_model(d)[0],
