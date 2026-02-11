@@ -1,13 +1,11 @@
 import os
 import datetime
-import tempfile
-import shutil
 import numpy as np
+import pandas as pd
 
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
-from core.monitoring.drift_detector import DriftDetector
 from models.prophet_model import train_prophet
 
 from prophet.serialize import model_to_json
@@ -18,12 +16,25 @@ MODEL_DIR = "artifacts/prophet"
 TEMP_MODEL_PATH = f"{MODEL_DIR}/prophet_trend.json"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
+TRAINING_TICKERS = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA"
+]
+
 MIN_DATA_ROWS = 500
 MAX_FORECAST_STD_RATIO = 0.25
 MIN_FORECAST_STD = 0.0005
 
 SEED = 42
 EPSILON = 1e-6
+
+
+# ---------------------------------------------------
+# CPU STABILITY
+# ---------------------------------------------------
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 
 # ---------------------------------------------------
@@ -44,7 +55,7 @@ def validate_forecast(model):
 
     if std < MIN_FORECAST_STD:
         raise RuntimeError(
-            "Prophet rejected: forecast collapsed (near zero variance)"
+            "Prophet rejected: forecast collapsed"
         )
 
     ratio = std / max(abs(mean_val), EPSILON)
@@ -62,6 +73,44 @@ def validate_forecast(model):
 
 
 # ---------------------------------------------------
+# MULTI-ASSET LOADER
+# ---------------------------------------------------
+
+def load_training_data():
+
+    fetcher = StockPriceFetcher()
+    end_date = datetime.date.today().isoformat()
+
+    datasets = []
+
+    for ticker in TRAINING_TICKERS:
+
+        df = fetcher.fetch(
+            ticker=ticker,
+            start_date="2018-01-01",
+            end_date=end_date
+        )
+
+        if df.empty:
+            continue
+
+        df["ticker"] = ticker
+        datasets.append(df)
+
+    if not datasets:
+        raise RuntimeError("No datasets fetched for Prophet.")
+
+    df = pd.concat(datasets, ignore_index=True)
+
+    if len(df) < MIN_DATA_ROWS:
+        raise RuntimeError(
+            f"Prophet rejected — insufficient rows ({len(df)})"
+        )
+
+    return df.sort_values(["ticker", "date"]), end_date
+
+
+# ---------------------------------------------------
 # TRAIN
 # ---------------------------------------------------
 
@@ -69,38 +118,29 @@ def train():
 
     np.random.seed(SEED)
 
-    end_date = datetime.date.today().isoformat()
+    df, end_date = load_training_data()
 
-    fetcher = StockPriceFetcher()
-
-    df = fetcher.fetch(
-        ticker="AAPL",
-        start_date="2018-01-01",
-        end_date=end_date
+    # Prophet expects ds/y
+    prophet_df = (
+        df.groupby("date")["close"]
+        .mean()
+        .reset_index()
     )
 
-    if df.empty:
-        raise ValueError("No price data fetched for Prophet training")
+    prophet_df.rename(
+        columns={"date": "date", "close": "close"},
+        inplace=True
+    )
 
-    if len(df) < MIN_DATA_ROWS:
-        raise RuntimeError(
-            "Prophet rejected: insufficient training history"
-        )
-
-    df = df.sort_values("date")
-
-    model = train_prophet(df)
+    model = train_prophet(prophet_df)
 
     governance_metrics = validate_forecast(model)
 
     dataset_hash = MetadataManager.fingerprint_dataset(df)
 
-    DriftDetector().create_baseline(
-        df[["close"]].rename(columns={"close": "price"})
-    )
-
     metrics = {
         "training_rows": len(df),
+        "asset_count": df["ticker"].nunique(),
         "last_price": float(df["close"].iloc[-1]),
         "data_span_days": int(
             (df["date"].max() - df["date"].min()).days
@@ -154,11 +194,10 @@ if __name__ == "__main__":
         TEMP_METADATA_PATH
     )
 
-    version_dir = ModelRegistry.register_model(
+    version = ModelRegistry.register_model(
         MODEL_DIR,
         TEMP_MODEL_PATH,
         TEMP_METADATA_PATH
     )
 
-    print("Prophet model registered successfully.")
-    print(f"Version directory: {version_dir}")
+    print(f"Prophet registered → {version}")
