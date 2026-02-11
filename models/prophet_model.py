@@ -1,11 +1,37 @@
 from prophet import Prophet
 import pandas as pd
 import numpy as np
-
+import os
 
 CHANGEPOINT_PRIOR = 0.02
 INTERVAL_WIDTH = 0.80
 CHANGEPOINT_RANGE = 0.9
+
+
+# ---------------------------------------------------
+# BACKEND SAFETY
+# ---------------------------------------------------
+
+def _validate_cmdstan():
+    """
+    Institutional requirement:
+    Prophet must use CmdStan with a preinstalled toolchain.
+
+    Fail CLOSED if unavailable.
+    """
+
+    cmdstan_path = os.getenv("CMDSTAN")
+
+    if not cmdstan_path:
+        raise RuntimeError(
+            "CMDSTAN environment variable not set. "
+            "Install CmdStan and export CMDSTAN=<path>."
+        )
+
+    if not os.path.exists(cmdstan_path):
+        raise RuntimeError(
+            f"CMDSTAN path does not exist: {cmdstan_path}"
+        )
 
 
 # ---------------------------------------------------
@@ -35,7 +61,6 @@ def prepare_prophet_dataframe(df):
     prophet_df = prophet_df.sort_values("ds")
     prophet_df = prophet_df.drop_duplicates("ds")
 
-    # Winsorization — numeric-safe
     lower = prophet_df["y"].quantile(0.01)
     upper = prophet_df["y"].quantile(0.99)
 
@@ -55,20 +80,22 @@ def prepare_prophet_dataframe(df):
 
 def train_prophet(df, random_seed: int = 42):
 
+    _validate_cmdstan()
+
     prophet_df = prepare_prophet_dataframe(df)
 
     model = Prophet(
-        growth="linear",                      # explicit
+        growth="linear",
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=True,
         changepoint_prior_scale=CHANGEPOINT_PRIOR,
         changepoint_range=CHANGEPOINT_RANGE,
         interval_width=INTERVAL_WIDTH,
-        uncertainty_samples=1000
+        uncertainty_samples=1000,
+        stan_backend="CMDSTANPY"
     )
 
-    # CRITICAL — deterministic Stan backend
     model.fit(
         prophet_df,
         seed=random_seed
