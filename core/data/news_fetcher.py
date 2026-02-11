@@ -17,9 +17,9 @@ class NewsFetcher:
     Institutional News Fetcher.
 
     Guarantees:
+    - single clock domain (UTC-naive)
     - zero future leakage
     - deterministic ordering
-    - single clock domain
     - schema stability
     - thread-safe caching
     """
@@ -47,8 +47,11 @@ class NewsFetcher:
 
     @staticmethod
     def _now():
-        # SINGLE CLOCK DOMAIN
-        return pd.Timestamp.utcnow()
+        """
+        Single clock domain.
+        Always return UTC-naive timestamp.
+        """
+        return pd.Timestamp.utcnow().tz_localize(None)
 
     # --------------------------------------------------
 
@@ -73,11 +76,21 @@ class NewsFetcher:
 
     # --------------------------------------------------
 
-    def _normalize_timestamp(self, published):
+    @staticmethod
+    def _normalize_timestamp(published):
+        """
+        Normalize provider timestamp into UTC-naive.
+        """
 
-        ts = pd.to_datetime(published, utc=True)
+        ts = pd.to_datetime(
+            published,
+            utc=True,
+            errors="coerce"
+        )
 
-        # convert to UTC-naive AFTER normalization
+        if pd.isna(ts):
+            return None
+
         return ts.tz_convert(None)
 
     # --------------------------------------------------
@@ -103,7 +116,7 @@ class NewsFetcher:
         key = self._cache_key(query, max_items)
         now = self._now()
 
-        # fast path
+        # Fast path
         if key in self._cache:
             expiry, df = self._cache[key]
 
@@ -136,7 +149,6 @@ class NewsFetcher:
 
                 articles = []
 
-                # deterministic ordering BEFORE slicing
                 entries = sorted(
                     feed.entries,
                     key=lambda e: e.get("published_parsed", (0,))
@@ -153,7 +165,9 @@ class NewsFetcher:
                         pd.Timestamp(*parsed[:6])
                     )
 
-                    # 🚨 BLOCK FUTURE NEWS
+                    if published is None:
+                        continue
+
                     if published > now:
                         logger.warning(
                             "Future-dated article blocked."
@@ -172,12 +186,19 @@ class NewsFetcher:
 
                     link = entry.get("link", "")
 
+                    source = entry.get(
+                        "source", {}
+                    )
+
+                    if isinstance(source, dict):
+                        source = source.get("title", "Unknown")
+                    else:
+                        source = "Unknown"
+
                     articles.append({
                         "headline": headline,
                         "published_at": published,
-                        "source": entry.get(
-                            "source", {}
-                        ).get("title", "Unknown"),
+                        "source": source,
                         "link": link
                     })
 
