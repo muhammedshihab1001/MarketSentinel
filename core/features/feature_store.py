@@ -1,16 +1,12 @@
 import os
-import json
-import hashlib
 import logging
-from typing import Dict, Any
+from typing import Optional
 
 import pandas as pd
 
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import (
     validate_feature_schema,
-    get_schema_signature,
-    SCHEMA_VERSION,
     MODEL_FEATURES
 )
 
@@ -19,90 +15,26 @@ logger = logging.getLogger("marketsentinel.feature_store")
 
 class FeatureStore:
     """
-    Institutional Feature Store — Hardened.
+    Deterministic feature cache.
 
     Guarantees:
-    zero training/inference skew
-    lineage-bound datasets
-    deterministic fingerprints
-    crash-safe persistence
-    schema enforcement
-    corruption auto-recovery
-    feature ordering guarantees
+    - rebuild on cache miss
+    - atomic persistence
+    - corruption recovery
+    - schema validation
+    - stable feature ordering
     """
 
     FEATURE_DIR = "data/features"
-    META_SUFFIX = ".meta.json"
-
-    # Bumped due to lineage semantic change
-    META_VERSION = "7.0"
-
     REQUIRED_DATASET_COLUMNS = {"date"}
 
     def __init__(self):
         os.makedirs(self.FEATURE_DIR, exist_ok=True)
         self.engineer = FeatureEngineer()
 
-    # --------------------------------------------------
-
     def _feature_path(self, ticker: str, training: bool):
         suffix = "train" if training else "infer"
         return f"{self.FEATURE_DIR}/{ticker}_{suffix}.parquet"
-
-    def _meta_path(self, ticker: str, training: bool):
-        return f"{self._feature_path(ticker, training)}{self.META_SUFFIX}"
-
-    # --------------------------------------------------
-    # FAST + STABLE HASH
-    # --------------------------------------------------
-
-    def _stable_hash(self, df: pd.DataFrame):
-
-        if df.empty:
-            raise RuntimeError("Cannot hash empty dataframe.")
-
-        df_copy = df.copy()
-
-        df_copy = df_copy.reindex(sorted(df_copy.columns), axis=1)
-
-        float_cols = df_copy.select_dtypes(
-            include=["float32", "float64"]
-        ).columns
-
-        df_copy[float_cols] = df_copy[float_cols].round(8)
-
-        df_copy = df_copy.sort_values(
-            by=list(df_copy.columns)
-        ).reset_index(drop=True)
-
-        hashed = pd.util.hash_pandas_object(
-            df_copy,
-            index=False
-        ).values.tobytes()
-
-        return hashed
-
-    # --------------------------------------------------
-    # DUAL DATASET FINGERPRINT (CRITICAL FIX)
-    # --------------------------------------------------
-
-    def _fingerprint(self, price_df, sentiment_df):
-
-        hasher = hashlib.sha256()
-
-        hasher.update(self._stable_hash(price_df))
-
-        if sentiment_df is not None and not sentiment_df.empty:
-            hasher.update(self._stable_hash(sentiment_df))
-        else:
-            # Explicitly bind absence of sentiment
-            hasher.update(b"NO_SENTIMENT")
-
-        hasher.update(get_schema_signature().encode())
-
-        return hasher.hexdigest()
-
-    # --------------------------------------------------
 
     def _validate_dataset_structure(self, df: pd.DataFrame):
 
@@ -118,14 +50,9 @@ class FeatureStore:
                 "Duplicate timestamps detected."
             )
 
-    # --------------------------------------------------
-    # ATOMIC WRITE
-    # --------------------------------------------------
+    def _atomic_write(self, df: pd.DataFrame, path: str):
 
-    def _atomic_write(self, df, path, meta, meta_path):
-
-        tmp_data = path + ".tmp"
-        tmp_meta = meta_path + ".tmp"
+        tmp_path = path + ".tmp"
 
         df = df.sort_values("date").reset_index(drop=True)
 
@@ -140,46 +67,24 @@ class FeatureStore:
 
         validate_feature_schema(feature_block)
 
-        df.to_parquet(tmp_data, index=False)
+        df.to_parquet(tmp_path, index=False)
 
-        with open(tmp_meta, "w") as f:
-            json.dump(meta, f, indent=4)
-            f.flush()
-            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
 
-        os.replace(tmp_data, path)
-        os.replace(tmp_meta, meta_path)
+    def _load_features(self, path: str) -> Optional[pd.DataFrame]:
 
-    # --------------------------------------------------
-    # LOAD
-    # --------------------------------------------------
-
-    def _load_features(self, path, meta_path):
-
-        if not os.path.exists(path) or not os.path.exists(meta_path):
-            return None, None
+        if not os.path.exists(path):
+            return None
 
         try:
 
             df = pd.read_parquet(path)
 
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-
-            if meta.get("metadata_type") != "feature_store":
-                raise RuntimeError("Invalid metadata type.")
-
-            if meta.get("meta_version") != self.META_VERSION:
-                raise RuntimeError("Metadata version mismatch.")
-
-            if meta.get("schema_signature") != get_schema_signature():
-                raise RuntimeError("Schema mismatch.")
-
             self._validate_dataset_structure(df)
 
             validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
-            return df.sort_values("date"), meta
+            return df.sort_values("date")
 
         except Exception:
 
@@ -189,35 +94,10 @@ class FeatureStore:
 
             try:
                 os.remove(path)
-                os.remove(meta_path)
             except Exception:
                 pass
 
-            return None, None
-
-    # --------------------------------------------------
-
-    def _build_metadata(
-        self,
-        dataset_fp: str,
-        features: pd.DataFrame,
-        training: bool
-    ) -> Dict[str, Any]:
-
-        return {
-            "metadata_type": "feature_store",
-            "meta_version": self.META_VERSION,
-            "schema_version": SCHEMA_VERSION,
-            "schema_signature": get_schema_signature(),
-            "dataset_fingerprint": dataset_fp,
-            "dataset_role": "training" if training else "inference",
-            "feature_count": len(MODEL_FEATURES),
-            "features": list(MODEL_FEATURES),
-            "row_count": len(features),
-            "created_at": pd.Timestamp.utcnow().isoformat()
-        }
-
-    # --------------------------------------------------
+            return None
 
     def get_features(
         self,
@@ -233,21 +113,13 @@ class FeatureStore:
             )
 
         path = self._feature_path(ticker, training)
-        meta_path = self._meta_path(ticker, training)
 
-        dataset_fp = self._fingerprint(price_df, sentiment_df)
-
-        stored, meta = self._load_features(path, meta_path)
+        stored = self._load_features(path)
 
         if stored is not None:
+            return stored
 
-            if (
-                meta.get("dataset_fingerprint") == dataset_fp
-                and meta.get("schema_signature") == get_schema_signature()
-            ):
-                return stored
-
-            logger.info("Feature rebuild triggered due to lineage change.")
+        logger.info("Feature cache miss — rebuilding features.")
 
         features = self.engineer.build_feature_pipeline(
             price_df,
@@ -255,12 +127,6 @@ class FeatureStore:
             training=training
         )
 
-        meta = self._build_metadata(
-            dataset_fp,
-            features,
-            training
-        )
-
-        self._atomic_write(features, path, meta, meta_path)
+        self._atomic_write(features, path)
 
         return features
