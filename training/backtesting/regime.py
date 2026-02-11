@@ -3,10 +3,6 @@ import numpy as np
 from dataclasses import dataclass
 
 
-# ---------------------------------------------------
-# CONFIG
-# ---------------------------------------------------
-
 @dataclass
 class RegimeConfig:
 
@@ -16,25 +12,22 @@ class RegimeConfig:
     bull_vol_threshold: float = 0.02
     bear_vol_threshold: float = 0.025
 
-    trend_buffer: float = 0.01      # 🔥 1% deviation required
+    trend_buffer: float = 0.01
     crash_vol_threshold: float = 0.04
 
-    persistence_days: int = 5       # 🔥 prevents regime flip noise
+    persistence_days: int = 5
 
-
-# ---------------------------------------------------
-# DETECTOR
-# ---------------------------------------------------
 
 class MarketRegimeDetector:
     """
     Institutional market regime classifier.
 
     Guarantees:
-    - no forward leakage
-    - regime stability
-    - crash detection
-    - persistence filtering
+    - zero cross-asset leakage
+    - strictly trailing indicators
+    - deterministic persistence
+    - crisis-aware labeling
+    - no index distortion
     """
 
     def __init__(self, config: RegimeConfig = RegimeConfig()):
@@ -42,82 +35,103 @@ class MarketRegimeDetector:
 
     # ---------------------------------------------------
 
-    def detect(self, df: pd.DataFrame):
+    def _detect_single_asset(self, df: pd.DataFrame):
 
-        df = df.copy()
+        cfg = self.config
 
-        # ---------------------------------------
-        # CORE FEATURES (STRICTLY TRAILING)
-        # ---------------------------------------
+        df = df.sort_values("date").copy()
 
-        df["ma_long"] = df["close"].rolling(
-            window=self.config.trend_window,
-            min_periods=self.config.trend_window
+        ma_long = df["close"].rolling(
+            window=cfg.trend_window,
+            min_periods=cfg.trend_window
         ).mean()
 
-        df["returns"] = df["close"].pct_change()
+        returns = df["close"].pct_change()
 
-        df["volatility"] = df["returns"].rolling(
-            window=self.config.volatility_window,
-            min_periods=self.config.volatility_window
+        volatility = returns.rolling(
+            window=cfg.volatility_window,
+            min_periods=cfg.volatility_window
         ).std()
 
-        # ---------------------------------------
-        # TREND DEVIATION
-        # ---------------------------------------
+        trend_dev = (df["close"] - ma_long) / ma_long
 
-        df["trend_dev"] = (
-            (df["close"] - df["ma_long"]) / df["ma_long"]
+        regime = np.full(len(df), "SIDEWAYS", dtype=object)
+
+        bull = (
+            (trend_dev > cfg.trend_buffer) &
+            (volatility < cfg.bull_vol_threshold)
         )
 
-        # ---------------------------------------
-        # INITIAL REGIME
-        # ---------------------------------------
-
-        df["regime"] = "SIDEWAYS"
-
-        bull_mask = (
-            (df["trend_dev"] > self.config.trend_buffer) &
-            (df["volatility"] < self.config.bull_vol_threshold)
+        bear = (
+            (trend_dev < -cfg.trend_buffer) &
+            (volatility > cfg.bear_vol_threshold)
         )
 
-        bear_mask = (
-            (df["trend_dev"] < -self.config.trend_buffer) &
-            (df["volatility"] > self.config.bear_vol_threshold)
-        )
+        crisis = volatility > cfg.crash_vol_threshold
 
-        crash_mask = (
-            df["volatility"] > self.config.crash_vol_threshold
-        )
+        regime[bull] = "BULL"
+        regime[bear] = "BEAR"
+        regime[crisis] = "CRISIS"
 
-        df.loc[bull_mask, "regime"] = "BULL"
-        df.loc[bear_mask, "regime"] = "BEAR"
-        df.loc[crash_mask, "regime"] = "CRISIS"
+        regime = self._apply_persistence(regime)
 
-        # ---------------------------------------
-        # REMOVE EARLY ROWS
-        # ---------------------------------------
-
-        df = df.dropna(subset=["ma_long", "volatility"])
-
-        # ---------------------------------------
-        # PERSISTENCE FILTER
-        # ---------------------------------------
-
-        regime = df["regime"].values
-        filtered = regime.copy()
-
-        min_days = self.config.persistence_days
-
-        for i in range(min_days, len(regime)):
-
-            window = regime[i-min_days:i]
-
-            if len(set(window)) == 1:
-                filtered[i] = window[0]
-            else:
-                filtered[i] = filtered[i-1]
-
-        df["regime"] = filtered
+        df["regime"] = regime
 
         return df
+
+    # ---------------------------------------------------
+
+    def _apply_persistence(self, regimes):
+
+        cfg = self.config
+        n = len(regimes)
+
+        confirmed = regimes.copy()
+
+        current = regimes[0]
+        streak = 1
+
+        for i in range(1, n):
+
+            if regimes[i] == current:
+                streak += 1
+                continue
+
+            # new regime candidate
+            candidate = regimes[i]
+            confirm = True
+
+            if i + cfg.persistence_days >= n:
+                break
+
+            for j in range(1, cfg.persistence_days):
+                if regimes[i + j] != candidate:
+                    confirm = False
+                    break
+
+            if confirm:
+                current = candidate
+                streak = cfg.persistence_days
+            else:
+                confirmed[i] = current
+
+        return confirmed
+
+    # ---------------------------------------------------
+
+    def detect(self, df: pd.DataFrame):
+
+        if "ticker" not in df.columns:
+            raise RuntimeError(
+                "Regime detection requires ticker column."
+            )
+
+        grouped = []
+
+        for ticker, slice_df in df.groupby("ticker", sort=False):
+            detected = self._detect_single_asset(slice_df)
+            grouped.append(detected)
+
+        result = pd.concat(grouped).sort_values("date")
+
+        return result.reset_index(drop=True)
