@@ -14,16 +14,14 @@ class FeatureEngineer:
 
     Guarantees:
     - zero training/inference skew
-    - no target leakage
-    - deterministic ordering
+    - deterministic dataset structure
+    - lineage preservation (date, ticker survive)
     - numeric stability
     - schema compliance
     """
 
     MIN_ROWS_REQUIRED = 120
 
-    # -------------------------------------------------------------
-    # TEST MODE DETECTOR
     # -------------------------------------------------------------
 
     @staticmethod
@@ -40,7 +38,7 @@ class FeatureEngineer:
     @staticmethod
     def _validate_price_frame(df: pd.DataFrame):
 
-        if df.empty:
+        if df is None or df.empty:
             raise RuntimeError("Price dataframe is empty.")
 
         required = {"date", "close"}
@@ -115,8 +113,8 @@ class FeatureEngineer:
         price = price_df.copy()
         sentiment = sentiment_df.copy()
 
-        price["date"] = pd.to_datetime(price["date"]).dt.date
-        sentiment["date"] = pd.to_datetime(sentiment["date"]).dt.date
+        price["date"] = pd.to_datetime(price["date"])
+        sentiment["date"] = pd.to_datetime(sentiment["date"])
 
         if sentiment["date"].duplicated().any():
             sentiment = sentiment.groupby("date").mean().reset_index()
@@ -159,7 +157,6 @@ class FeatureEngineer:
         df = df.replace([np.inf, -np.inf], np.nan)
         df = df.dropna().copy()
 
-        # CRITICAL: enforce dtype
         for col in MODEL_FEATURES:
             df[col] = df[col].astype("float64")
 
@@ -241,11 +238,20 @@ class FeatureEngineer:
 
         df = cls._sanitize_features(df)
 
-        validated_features = validate_feature_schema(
-            df[list(MODEL_FEATURES)]
-        ).copy()   # CRITICAL FIX
+        validated = validate_feature_schema(df)
 
-        if training:
-            validated_features["target"] = df["target"].values
+        # CRITICAL ARCHITECTURE FIX:
+        # Reattach non-feature columns AFTER validation.
 
-        return validated_features.reset_index(drop=True)
+        non_features = [
+            col for col in df.columns
+            if col not in MODEL_FEATURES
+        ]
+
+        final_df = pd.concat(
+            [df[non_features].reset_index(drop=True),
+             validated.reset_index(drop=True)],
+            axis=1
+        )
+
+        return final_df.reset_index(drop=True)
