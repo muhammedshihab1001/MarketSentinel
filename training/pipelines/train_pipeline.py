@@ -1,5 +1,6 @@
 """
 MarketSentinel Institutional Training Orchestrator
+Hardened Version — Production Safe
 """
 
 import subprocess
@@ -31,7 +32,7 @@ MIN_ACCURACY = 0.50
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 
-TRAINING_TIMEOUT = 60 * 60 * 3   # 3 hours hard ceiling
+TRAINING_TIMEOUT = 60 * 60 * 3   # 3 hours
 
 
 # ---------------------------------------------------
@@ -72,7 +73,33 @@ def snapshot_lineage():
 
 
 # ---------------------------------------------------
-# METADATA LOADER (VERSION-BOUND)
+# VERSION RESOLUTION (SAFE)
+# ---------------------------------------------------
+
+def resolve_latest_version(model_name: str) -> str:
+    """
+    Resolve newest version even if pointer missing.
+    Prevents registry race failures.
+    """
+
+    base_dir = f"artifacts/{model_name}"
+
+    if not os.path.exists(base_dir):
+        raise RuntimeError(f"{model_name} registry missing.")
+
+    versions = [
+        v for v in os.listdir(base_dir)
+        if v.startswith("v")
+    ]
+
+    if not versions:
+        raise RuntimeError(f"No versions found for {model_name}")
+
+    return sorted(versions)[-1]
+
+
+# ---------------------------------------------------
+# METADATA LOADER
 # ---------------------------------------------------
 
 def load_metadata(model_name: str, version: str):
@@ -129,12 +156,21 @@ def governance_check(model_name: str, version: str):
 
 
 # ---------------------------------------------------
-# PROMOTION (EXPLICIT)
+# PROMOTION (SAFE CHAIN)
 # ---------------------------------------------------
 
 def promote_model(model_name: str, version: str):
 
     base_dir = f"artifacts/{model_name}"
+
+    manifest_path = os.path.join(
+        base_dir,
+        version,
+        "manifest.json"
+    )
+
+    if not os.path.exists(manifest_path):
+        raise RuntimeError("Manifest missing — cannot promote.")
 
     ModelRegistry.transition_stage(base_dir, version, "shadow")
     ModelRegistry.transition_stage(base_dir, version, "approved")
@@ -170,17 +206,25 @@ def run_step(name: str, module: str):
     env = os.environ.copy()
     env["PYTHONHASHSEED"] = "0"
 
-    subprocess.run(
+    process = subprocess.Popen(
         [sys.executable, "-m", module],
-        check=True,
-        timeout=TRAINING_TIMEOUT,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
         env=env
     )
 
+    try:
+        process.wait(timeout=TRAINING_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        raise RuntimeError(f"{name} training exceeded timeout.")
+
+    if process.returncode != 0:
+        raise RuntimeError(f"{name} training failed.")
+
     duration = round(time.time() - start, 2)
 
-    # CRITICAL — capture EXACT version produced
-    version = ModelRegistry.get_latest_version(f"artifacts/{name}")
+    version = resolve_latest_version(name)
 
     governance_check(name, version)
     promote_model(name, version)
