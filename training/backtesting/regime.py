@@ -3,7 +3,7 @@ import numpy as np
 from dataclasses import dataclass
 
 
-@dataclass
+@dataclass(frozen=True)
 class RegimeConfig:
 
     trend_window: int = 200
@@ -23,15 +23,14 @@ class MarketRegimeDetector:
     Institutional market regime classifier.
 
     Guarantees:
-    - zero cross-asset leakage
+    - zero lookahead bias
     - strictly trailing indicators
-    - deterministic persistence
-    - crisis-aware labeling
-    - no index distortion
+    - cross-asset isolation
+    - deterministic output
     """
 
-    def __init__(self, config: RegimeConfig = RegimeConfig()):
-        self.config = config
+    def __init__(self, config: RegimeConfig | None = None):
+        self.config = config or RegimeConfig()
 
     # ---------------------------------------------------
 
@@ -41,21 +40,29 @@ class MarketRegimeDetector:
 
         df = df.sort_values("date").copy()
 
-        ma_long = df["close"].rolling(
-            window=cfg.trend_window,
-            min_periods=cfg.trend_window
-        ).mean()
+        # SHIFTED — prevents same-bar leakage
+        ma_long = (
+            df["close"]
+            .rolling(cfg.trend_window, min_periods=cfg.trend_window)
+            .mean()
+            .shift(1)
+        )
 
         returns = df["close"].pct_change()
 
-        volatility = returns.rolling(
-            window=cfg.volatility_window,
-            min_periods=cfg.volatility_window
-        ).std()
+        volatility = (
+            returns
+            .rolling(cfg.volatility_window,
+                     min_periods=cfg.volatility_window)
+            .std()
+            .shift(1)
+        )
 
         trend_dev = (df["close"] - ma_long) / ma_long
 
         regime = np.full(len(df), "SIDEWAYS", dtype=object)
+
+        crisis = volatility > cfg.crash_vol_threshold
 
         bull = (
             (trend_dev > cfg.trend_buffer) &
@@ -67,53 +74,43 @@ class MarketRegimeDetector:
             (volatility > cfg.bear_vol_threshold)
         )
 
-        crisis = volatility > cfg.crash_vol_threshold
-
-        regime[bull] = "BULL"
-        regime[bear] = "BEAR"
         regime[crisis] = "CRISIS"
+        regime[bull & ~crisis] = "BULL"
+        regime[bear & ~crisis] = "BEAR"
 
-        regime = self._apply_persistence(regime)
+        regime = self._apply_persistence_trailing(regime)
 
         df["regime"] = regime
 
         return df
 
     # ---------------------------------------------------
+    # TRAILING PERSISTENCE (NO FUTURE)
+    # ---------------------------------------------------
 
-    def _apply_persistence(self, regimes):
+    def _apply_persistence_trailing(self, regimes):
 
         cfg = self.config
-        n = len(regimes)
 
         confirmed = regimes.copy()
 
         current = regimes[0]
         streak = 1
 
-        for i in range(1, n):
+        for i in range(1, len(regimes)):
 
             if regimes[i] == current:
                 streak += 1
                 continue
 
-            # new regime candidate
-            candidate = regimes[i]
-            confirm = True
+            # new candidate begins
+            if regimes[i] != regimes[i-1]:
+                streak = 1
 
-            if i + cfg.persistence_days >= n:
-                break
+            if streak >= cfg.persistence_days:
+                current = regimes[i]
 
-            for j in range(1, cfg.persistence_days):
-                if regimes[i + j] != candidate:
-                    confirm = False
-                    break
-
-            if confirm:
-                current = candidate
-                streak = cfg.persistence_days
-            else:
-                confirmed[i] = current
+            confirmed[i] = current
 
         return confirmed
 
@@ -132,6 +129,10 @@ class MarketRegimeDetector:
             detected = self._detect_single_asset(slice_df)
             grouped.append(detected)
 
-        result = pd.concat(grouped).sort_values("date")
+        result = (
+            pd.concat(grouped)
+            .sort_values(["date", "ticker"])
+            .reset_index(drop=True)
+        )
 
-        return result.reset_index(drop=True)
+        return result
