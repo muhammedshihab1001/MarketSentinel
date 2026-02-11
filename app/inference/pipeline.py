@@ -4,6 +4,7 @@ import threading
 import numpy as np
 import pandas as pd
 import logging
+import os
 
 from core.data.market_data_service import MarketDataService
 from core.data.news_fetcher import NewsFetcher
@@ -13,6 +14,7 @@ from core.signals.signal_engine import DecisionEngine
 from core.scenario.scenario_engine import ScenarioEngine
 from core.explainability.decision_explainer import DecisionExplainer
 from core.monitoring.drift_detector import DriftDetector
+from core.schema.feature_schema import MODEL_FEATURES
 
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
@@ -36,12 +38,12 @@ logger = logging.getLogger("marketsentinel.pipeline")
 
 
 # =====================================================
-# THREAD SAFE CIRCUIT BREAKER
+# CIRCUIT BREAKER
 # =====================================================
 
 class CircuitBreaker:
 
-    def __init__(self, threshold=5, cooldown=60):
+    def __init__(self, threshold=3, cooldown=120):
         self.threshold = threshold
         self.cooldown = cooldown
         self.failures = 0
@@ -56,9 +58,11 @@ class CircuitBreaker:
                 return True
 
             if (time.time() - self.last_failure) > self.cooldown:
+                logger.warning("Circuit breaker reset.")
                 self.failures = 0
                 return True
 
+            logger.critical("Inference blocked by circuit breaker.")
             return False
 
     def record_failure(self):
@@ -72,7 +76,19 @@ class CircuitBreaker:
 
 class InferencePipeline:
 
-    LATENCY_GUARD_SECONDS = 5.0
+    LATENCY_GUARD_SECONDS = float(
+        os.getenv("HARD_LATENCY_LIMIT_SECONDS", "5.0")
+    )
+
+    MAX_NULL_RATIO = float(
+        os.getenv("MAX_FEATURE_NULL_RATIO", "0.02")
+    )
+
+    FAIL_ON_DRIFT = os.getenv("FAIL_ON_DRIFT", "false").lower() == "true"
+
+    DATA_FRESHNESS_HOURS = int(
+        os.getenv("MAX_DATA_AGE_HOURS", "24")
+    )
 
     def __init__(self):
 
@@ -101,6 +117,29 @@ class InferencePipeline:
 
         if not hasattr(self.models.xgb, "predict_proba"):
             raise RuntimeError("Invalid XGBoost artifact.")
+
+    # ---------------------------------------------------
+    # DATA FRESHNESS GUARD
+    # ---------------------------------------------------
+
+    def _validate_data_freshness(self, df: pd.DataFrame):
+
+        if "date" not in df.columns:
+            return
+
+        latest = pd.to_datetime(df["date"]).max()
+
+        if latest.tzinfo is None:
+            latest = latest.tz_localize("UTC")
+
+        now = pd.Timestamp.utcnow()
+
+        age_hours = (now - latest).total_seconds() / 3600
+
+        if age_hours > self.DATA_FRESHNESS_HOURS:
+            raise RuntimeError(
+                f"Market data stale ({age_hours:.1f}h old)."
+            )
 
     # ---------------------------------------------------
 
@@ -132,20 +171,17 @@ class InferencePipeline:
 
     def _extract_features(self, latest_row):
 
-        required = getattr(
-            self.models.xgb,
-            "feature_names_in_",
-            list(latest_row.index)
-        )
-
-        missing = [f for f in required if f not in latest_row]
+        missing = [
+            f for f in MODEL_FEATURES
+            if f not in latest_row
+        ]
 
         if missing:
             raise RuntimeError(
                 f"Feature mismatch detected. Missing: {missing}"
             )
 
-        return latest_row[required].values.reshape(1, -1)
+        return latest_row[MODEL_FEATURES].values.reshape(1, -1)
 
     # ---------------------------------------------------
 
@@ -154,8 +190,16 @@ class InferencePipeline:
         elapsed = time.time() - start
 
         if elapsed > self.LATENCY_GUARD_SECONDS:
-            logger.warning(f"{model} exceeded latency guard.")
-            PIPELINE_FAILURES.labels(stage=f"{model}_latency").inc()
+
+            logger.critical(f"{model} latency breach.")
+
+            PIPELINE_FAILURES.labels(
+                stage=f"{model}_latency"
+            ).inc()
+
+            raise RuntimeError(
+                f"{model} exceeded latency guard."
+            )
 
         return elapsed
 
@@ -177,7 +221,7 @@ class InferencePipeline:
 
         try:
 
-            today = datetime.date.today()
+            today = pd.Timestamp.utcnow().date()
 
             start_date = start_date or today
             end_date = end_date or (
@@ -203,7 +247,6 @@ class InferencePipeline:
 
             lock = self.cache.get_lock(cache_key)
 
-            # 🔥 FIXED — async lock removed from cache earlier
             with lock:
 
                 cached = self.cache.get(cache_key)
@@ -219,6 +262,8 @@ class InferencePipeline:
                     end_date=today.isoformat()
                 )
 
+                self._validate_data_freshness(price_df)
+
                 sentiment_df = self._safe_sentiment(ticker)
 
                 dataset = self.feature_store.get_features(
@@ -228,16 +273,29 @@ class InferencePipeline:
                 )
 
                 if dataset.empty:
-                    raise RuntimeError("Feature pipeline returned empty dataset.")
+                    raise RuntimeError(
+                        "Feature pipeline returned empty dataset."
+                    )
 
-                MISSING_FEATURE_RATIO.set(
-                    float(dataset.isnull().mean().mean())
-                )
+                null_ratio = float(dataset.isnull().mean().mean())
+
+                MISSING_FEATURE_RATIO.set(null_ratio)
+
+                if null_ratio > self.MAX_NULL_RATIO:
+                    raise RuntimeError(
+                        f"Feature null ratio unsafe: {null_ratio:.3f}"
+                    )
 
                 drift = self.drift_detector.detect(dataset)
 
                 if drift["drift_detected"]:
-                    logger.warning("Feature drift detected.")
+
+                    logger.critical("Feature drift detected.")
+
+                    if self.FAIL_ON_DRIFT:
+                        raise RuntimeError(
+                            "Drift detected — inference halted."
+                        )
 
                 latest = dataset.iloc[-1]
                 features = self._extract_features(latest)
@@ -257,11 +315,11 @@ class InferencePipeline:
                     model="xgboost"
                 ).observe(prob_up)
 
-                # 🔥 SHADOW EXECUTION
-                shadow_prob = None
+                # ---------------- SHADOW ----------------
 
                 if self.models.shadow_xgb is not None:
                     try:
+
                         shadow_prob = self.models.shadow_xgb.predict_proba(features)[0][1]
 
                         delta = abs(prob_up - shadow_prob)
