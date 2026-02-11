@@ -12,8 +12,9 @@ import os
 import hashlib
 import platform
 import logging
+import pandas as pd
 
-from core.schema.feature_schema import get_schema_signature
+from core.schema.feature_schema import get_schema_signature, MODEL_FEATURES
 from core.monitoring.drift_detector import DriftDetector
 from core.artifacts.model_registry import ModelRegistry
 
@@ -32,7 +33,7 @@ MIN_ACCURACY = 0.50
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 
-TRAINING_TIMEOUT = 60 * 60 * 3   # 3 hours
+TRAINING_TIMEOUT = 60 * 60 * 3
 
 
 # ---------------------------------------------------
@@ -169,17 +170,48 @@ def promote_model(model_name: str, version: str):
 
 
 # ---------------------------------------------------
-# DRIFT
+# NEW — BASELINE AUTHORITY
 # ---------------------------------------------------
 
-def ensure_drift_baseline():
+def build_drift_baseline_from_xgboost():
 
     detector = DriftDetector()
 
-    if not os.path.exists(detector.BASELINE_PATH):
+    if os.path.exists(detector.BASELINE_PATH):
+        logger.info("Drift baseline already exists.")
+        return
+
+    logger.info("Creating institutional drift baseline from XGBoost dataset.")
+
+    version = resolve_latest_version("xgboost")
+
+    dataset_path = os.path.join(
+        "artifacts",
+        "xgboost",
+        version,
+        "training_dataset.parquet"
+    )
+
+    if not os.path.exists(dataset_path):
         raise RuntimeError(
-            "Drift baseline missing. Training must generate baseline."
+            "XGBoost training dataset missing. Cannot build drift baseline."
         )
+
+    df = pd.read_parquet(dataset_path)
+
+    missing = set(MODEL_FEATURES) - set(df.columns)
+
+    if missing:
+        raise RuntimeError(
+            f"Baseline creation aborted — dataset missing features: {missing}"
+        )
+
+    df = df.loc[:, MODEL_FEATURES]
+
+    if list(df.columns) != MODEL_FEATURES:
+        raise RuntimeError("Feature ordering violation during baseline creation.")
+
+    detector.create_baseline(df)
 
 
 # ---------------------------------------------------
@@ -294,7 +326,7 @@ def main():
         save_manifest(run_id, manifest)
         sys.exit(1)
 
-    ensure_drift_baseline()
+    build_drift_baseline_from_xgboost()
 
     manifest = {
         "run_id": run_id,
