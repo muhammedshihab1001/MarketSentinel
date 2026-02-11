@@ -28,16 +28,16 @@ class DriftDetector:
     Institutional Drift Sentinel — Hardened.
 
     Guarantees:
-    ✔ schema-bound baseline
-    ✔ lineage enforcement
-    ✔ crash-safe writes
-    ✔ fail-closed detection
-    ✔ feature ordering enforcement
-    ✔ training compatibility
+    schema-bound baseline
+    lineage enforcement
+    crash-safe writes
+    fail-closed detection
+    feature ordering enforcement
+    training compatibility
     """
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "5.0"
+    BASELINE_VERSION = "6.0"
 
     MIN_SAMPLE_BASELINE = 50
     MIN_SAMPLE_INFERENCE = 20
@@ -51,8 +51,6 @@ class DriftDetector:
         self.z_threshold = z_threshold
         os.makedirs("artifacts/drift", exist_ok=True)
 
-    # --------------------------------------------------
-    # ATOMIC WRITE
     # --------------------------------------------------
 
     @staticmethod
@@ -68,10 +66,13 @@ class DriftDetector:
         os.replace(tmp, path)
 
     # --------------------------------------------------
-    # SAFE FEATURE EXTRACTION
+    # SAFE FEATURE EXTRACTION (UPGRADED)
     # --------------------------------------------------
 
     def _safe_feature_block(self, dataset: pd.DataFrame):
+
+        if dataset.columns.duplicated().any():
+            raise RuntimeError("Duplicate columns detected in dataset.")
 
         missing = set(MODEL_FEATURES) - set(dataset.columns)
 
@@ -80,15 +81,15 @@ class DriftDetector:
                 f"Drift detector schema violation. Missing={missing}"
             )
 
-        block = dataset.loc[:, MODEL_FEATURES]
+        # FORCE ORDER
+        block = dataset.reindex(columns=MODEL_FEATURES)
 
+        # Final safety check
         if list(block.columns) != MODEL_FEATURES:
-            raise RuntimeError("Feature ordering corrupted.")
+            raise RuntimeError("Feature ordering enforcement failed.")
 
         return block
 
-    # --------------------------------------------------
-    # BASELINE CREATION
     # --------------------------------------------------
 
     def create_baseline(
@@ -97,16 +98,12 @@ class DriftDetector:
         dataset_hash: str | None = None,
         allow_overwrite: bool = False
     ):
-        """
-        dataset_hash is optional for backward compatibility.
-        """
 
         if dataset.empty:
             raise RuntimeError("Cannot create drift baseline from empty dataset.")
 
         numeric = self._safe_feature_block(dataset)
 
-        # AUTO HASH if not provided (training compatibility)
         if dataset_hash is None:
 
             hashed = pd.util.hash_pandas_object(
@@ -116,7 +113,6 @@ class DriftDetector:
 
             dataset_hash = str(hash(hashed))
 
-        # overwrite policy
         if os.path.exists(self.BASELINE_PATH):
 
             if not allow_overwrite:
@@ -202,8 +198,6 @@ class DriftDetector:
 
         return baseline
 
-    # --------------------------------------------------
-    # DRIFT DETECTION
     # --------------------------------------------------
 
     def detect(self, dataset: pd.DataFrame):
