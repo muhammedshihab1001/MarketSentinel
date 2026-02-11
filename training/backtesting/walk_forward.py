@@ -8,14 +8,10 @@ from training.backtesting.regime import MarketRegimeDetector
 class WalkForwardValidator:
     """
     Institutional Walk-Forward Validator.
-
-    Guarantees:
-    - strict chronological integrity
-    - date-aligned windowing
-    - no cross-asset leakage
-    - capital death protection
-    - deterministic simulation
     """
+
+    EMBARGO_DAYS = 5
+    MIN_TRADES_PER_WINDOW = 5
 
     def __init__(
         self,
@@ -44,12 +40,10 @@ class WalkForwardValidator:
                 "Portfolio walk-forward requires 'ticker' column."
             )
 
-        # HARD SORT — deterministic ordering
         df = df.sort_values(
             ["date", "ticker"]
         ).reset_index(drop=True)
 
-        # Detect regimes AFTER sorting
         df = self.regime_detector.detect(df)
 
         unique_dates = df["date"].drop_duplicates().values
@@ -69,13 +63,14 @@ class WalkForwardValidator:
         }
 
         capital = 10_000
-
         start_idx = self.window_size
 
         while start_idx < len(unique_dates):
 
+            embargo_start = start_idx - self.EMBARGO_DAYS
+
             train_dates = unique_dates[
-                start_idx - self.window_size:start_idx
+                start_idx - self.window_size:embargo_start
             ]
 
             test_dates = unique_dates[
@@ -88,11 +83,12 @@ class WalkForwardValidator:
             train_df = df[df["date"].isin(train_dates)]
             test_df = df[df["date"].isin(test_dates)]
 
-            # TRAIN
             model = self.model_trainer(train_df)
 
             grouped_prices = {}
             grouped_signals = {}
+
+            trade_counter = 0
 
             for date, slice_df in test_df.groupby("date"):
 
@@ -105,12 +101,22 @@ class WalkForwardValidator:
                     slice_df
                 )
 
+                trade_counter += sum(
+                    1 for s in signals_list
+                    if s != "HOLD"
+                )
+
                 signals = dict(
                     zip(slice_df["ticker"], signals_list)
                 )
 
                 grouped_prices[date] = prices
                 grouped_signals[date] = signals
+
+            if trade_counter < self.MIN_TRADES_PER_WINDOW:
+                raise RuntimeError(
+                    "Strategy produced insufficient trades."
+                )
 
             metrics = self.engine.run(
                 grouped_prices,
@@ -128,16 +134,21 @@ class WalkForwardValidator:
                     "Strategy collapsed. Capital depleted."
                 )
 
-            capital = metrics["final_portfolio"]
+            capital = float(metrics["final_portfolio"])
 
-            curve = np.array(metrics["equity_curve"])
+            curve = np.array(metrics["equity_curve"], dtype=float)
 
             if not np.isfinite(curve).all():
                 raise RuntimeError(
                     "Equity curve contains invalid values."
                 )
 
-            equity_curve.extend(curve.tolist())
+            # FIX — prevent boundary duplication
+            if equity_curve:
+                equity_curve.extend(curve[1:].tolist())
+            else:
+                equity_curve.extend(curve.tolist())
+
             results.append(metrics)
 
             dominant_regime = (
@@ -172,14 +183,11 @@ class WalkForwardValidator:
     ):
 
         df = pd.DataFrame(results)
-        curve = np.array(equity_curve)
+        curve = np.array(equity_curve, dtype=float)
 
         peak = np.maximum.accumulate(curve)
         drawdowns = (curve - peak) / peak
         max_drawdown = float(drawdowns.min())
-
-        return_std = float(df["strategy_return"].std())
-        sharpe_std = float(df["sharpe_ratio"].std())
 
         gains = df[df["strategy_return"] > 0]["strategy_return"].sum()
         losses = abs(
@@ -206,10 +214,9 @@ class WalkForwardValidator:
         return {
             "avg_strategy_return": float(df["strategy_return"].mean()),
             "avg_sharpe": float(df["sharpe_ratio"].mean()),
-            "sharpe_std": sharpe_std,
             "profit_factor": profit_factor,
             "max_drawdown": max_drawdown,
-            "return_volatility": return_std,
+            "return_volatility": float(df["strategy_return"].std()),
             "final_equity": float(curve[-1]),
             "equity_curve": curve.tolist(),
             "regime_performance": regime_summary,
