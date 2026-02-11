@@ -2,6 +2,7 @@ import feedparser
 import pandas as pd
 import requests
 import logging
+import hashlib
 
 from datetime import datetime, timedelta
 from typing import Dict, Tuple
@@ -16,10 +17,11 @@ class NewsFetcher:
     Institutional News Fetcher.
 
     Guarantees:
-    - timeout protected
-    - deduplicated
-    - freshness filtered
-    - bounded cache
+    - parameter-aware caching
+    - timezone normalization
+    - deterministic ordering
+    - headline safety
+    - link deduplication
     - inference-safe fallback
     """
 
@@ -35,8 +37,14 @@ class NewsFetcher:
     _lock = threading.Lock()
 
     HEADERS = {
-        "User-Agent": "MarketSentinel/1.0 (institutional research bot)"
+        "User-Agent": "MarketSentinel/1.0"
     }
+
+    # --------------------------------------------------
+
+    def _cache_key(self, query: str, max_items: int) -> str:
+        raw = f"{query}_{max_items}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     # --------------------------------------------------
 
@@ -45,7 +53,6 @@ class NewsFetcher:
         if len(self._cache) < self.MAX_CACHE_KEYS:
             return
 
-        # cheap prune
         oldest = sorted(
             self._cache.items(),
             key=lambda x: x[1][0]
@@ -56,25 +63,45 @@ class NewsFetcher:
 
     # --------------------------------------------------
 
+    def _normalize_timestamp(self, published):
+
+        ts = pd.to_datetime(published, utc=True)
+
+        return ts.tz_convert(None)
+
+    # --------------------------------------------------
+
+    def _clean_headline(self, text: str):
+
+        text = " ".join(text.split())
+
+        if len(text) < 10:
+            return None
+
+        return text.strip()
+
+    # --------------------------------------------------
+
     def fetch(
         self,
         query: str,
         max_items: int = 50
     ) -> pd.DataFrame:
 
+        key = self._cache_key(query, max_items)
         now = datetime.utcnow()
 
-        if query in self._cache:
-            expiry, df = self._cache[query]
+        # fast path
+        if key in self._cache:
+            expiry, df = self._cache[key]
 
             if now < expiry:
                 return df.copy()
 
         with self._lock:
 
-            # double check
-            if query in self._cache:
-                expiry, df = self._cache[query]
+            if key in self._cache:
+                expiry, df = self._cache[key]
 
                 if now < expiry:
                     return df.copy()
@@ -106,17 +133,25 @@ class NewsFetcher:
 
                     published = datetime(*parsed[:6])
 
-                    # freshness filter
+                    published = self._normalize_timestamp(published)
+
                     if now - published > self.MAX_ARTICLE_AGE:
                         continue
 
-                    headline = entry.get("title", "").strip()
+                    headline = entry.get("title", "")
+
+                    headline = self._clean_headline(headline)
+
+                    if not headline:
+                        continue
+
+                    link = entry.get("link", "")
 
                     articles.append({
                         "headline": headline,
                         "published_at": published,
                         "source": entry.get("source", {}).get("title", "Unknown"),
-                        "link": entry.get("link", "")
+                        "link": link
                     })
 
                 if not articles:
@@ -125,17 +160,17 @@ class NewsFetcher:
 
                 df = pd.DataFrame(articles)
 
-                # dedupe headlines
-                df["headline_norm"] = df["headline"].str.lower().str.strip()
+                # Institutional dedupe
+                df = df.drop_duplicates(subset=["headline", "link"])
 
-                df = df.drop_duplicates("headline_norm")
+                df = df.sort_values("published_at")
 
-                df.drop(columns="headline_norm", inplace=True)
+                df.reset_index(drop=True, inplace=True)
 
-                # cache
+                # cache safely
                 self._prune_cache()
 
-                self._cache[query] = (
+                self._cache[key] = (
                     now + self.CACHE_TTL,
                     df
                 )
@@ -144,6 +179,8 @@ class NewsFetcher:
 
             except Exception:
 
-                logger.exception("News fetch failure — returning empty dataframe.")
+                logger.exception(
+                    "News fetch failure — returning empty dataframe."
+                )
 
                 return pd.DataFrame()
