@@ -3,8 +3,10 @@ import joblib
 import tensorflow as tf
 import logging
 import threading
+from typing import Optional
 
 from models.lstm_model import forecast_lstm
+from models.sarimax_model import SarimaxModel
 
 from app.monitoring.metrics import MODEL_VERSION
 
@@ -14,13 +16,15 @@ logger = logging.getLogger("marketsentinel.loader")
 
 class ModelLoader:
     """
-    Lightweight production model loader.
+    Institutional production model loader.
 
     Guarantees:
     - singleton instance
     - thread-safe lazy loading
-    - optional hot reload
-    - inference-safe validation
+    - artifact validation
+    - wrapper enforcement
+    - hot reload
+    - registry-compatible behavior
     """
 
     _instance = None
@@ -43,8 +47,11 @@ class ModelLoader:
 
         self._configure_tensorflow()
 
-        self._xgb = None
-        self._xgb_mtime = None
+        self._xgb: Optional[object] = None
+        self._xgb_mtime: Optional[float] = None
+
+        self._sarimax: Optional[SarimaxModel] = None
+        self._sarimax_mtime: Optional[float] = None
 
         self._lstm = None
         self._scaler = None
@@ -53,7 +60,9 @@ class ModelLoader:
 
         self._initialized = True
 
-    # ---------------------------------------------------
+    ###################################################
+    # TF CONFIG
+    ###################################################
 
     def _configure_tensorflow(self):
 
@@ -82,27 +91,45 @@ class ModelLoader:
 
             os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
-    # ---------------------------------------------------
-    # SIMPLE MODEL PATH
-    # ---------------------------------------------------
+    ###################################################
+    # PATH RESOLUTION
+    ###################################################
 
-    def _model_path(self):
+    def _xgb_model_path(self):
         return os.getenv(
             "XGB_MODEL_PATH",
             "artifacts/xgboost/model.pkl"
         )
 
-    # ---------------------------------------------------
-    # HOT RELOAD VIA MTIME
-    # ---------------------------------------------------
+    def _sarimax_model_path(self):
+        return os.getenv(
+            "SARIMAX_MODEL_PATH",
+            "artifacts/sarimax/model.pkl"
+        )
 
-    def _reload_if_needed(self):
+    ###################################################
+    # SAFE LOAD
+    ###################################################
 
-        path = self._model_path()
+    def _safe_joblib_load(self, path):
 
         if not os.path.exists(path):
             raise RuntimeError(f"Model not found at {path}")
 
+        try:
+            return joblib.load(path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Artifact appears corrupted: {path}"
+            ) from exc
+
+    ###################################################
+    # XGBOOST
+    ###################################################
+
+    def _reload_xgb_if_needed(self):
+
+        path = self._xgb_model_path()
         mtime = os.path.getmtime(path)
 
         if self._xgb is not None and self._xgb_mtime == mtime:
@@ -115,11 +142,11 @@ class ModelLoader:
 
             logger.warning("Loading XGBoost model from disk")
 
-            model = joblib.load(path)
+            model = self._safe_joblib_load(path)
 
             if not hasattr(model, "predict_proba"):
                 raise RuntimeError(
-                    "Loaded model missing predict_proba"
+                    "Loaded XGBoost artifact missing predict_proba"
                 )
 
             self._xgb = model
@@ -132,32 +159,76 @@ class ModelLoader:
 
         return self._xgb
 
-    # ---------------------------------------------------
-    # PUBLIC ACCESSOR
-    # ---------------------------------------------------
+    ###################################################
+    # SARIMAX
+    ###################################################
+
+    def _reload_sarimax_if_needed(self):
+
+        path = self._sarimax_model_path()
+        mtime = os.path.getmtime(path)
+
+        if self._sarimax is not None and self._sarimax_mtime == mtime:
+            return self._sarimax
+
+        with self._load_lock:
+
+            if self._sarimax is not None and self._sarimax_mtime == mtime:
+                return self._sarimax
+
+            logger.warning("Loading SARIMAX model from disk")
+
+            model = self._safe_joblib_load(path)
+
+            if not isinstance(model, SarimaxModel):
+                raise RuntimeError(
+                    "Loaded artifact is not a SarimaxModel wrapper."
+                )
+
+            # verify fitted state
+            _ = model.fitted_model
+
+            self._sarimax = model
+            self._sarimax_mtime = mtime
+
+            MODEL_VERSION.labels(
+                model="sarimax",
+                version=str(int(mtime))
+            ).set(1)
+
+        return self._sarimax
+
+    ###################################################
+    # PUBLIC ACCESSORS
+    ###################################################
 
     @property
     def xgb(self):
-        return self._reload_if_needed()
+        return self._reload_xgb_if_needed()
 
-    # ---------------------------------------------------
-    # OPTIONAL WARMUP
-    # ---------------------------------------------------
+    @property
+    def sarimax(self):
+        return self._reload_sarimax_if_needed()
+
+    ###################################################
+    # WARMUP
+    ###################################################
 
     def warmup(self):
 
         if os.getenv("MODEL_WARMUP", "true") != "true":
             return
 
-        logger.info("Warming model")
+        logger.info("Warming models")
 
         _ = self.xgb
+        _ = self.sarimax
 
-        logger.info("Model ready")
+        logger.info("Models ready")
 
-    # ---------------------------------------------------
-    # OPTIONAL FORECASTS
-    # ---------------------------------------------------
+    ###################################################
+    # LSTM FORECAST
+    ###################################################
 
     def lstm_forecast(self, recent_prices):
 
@@ -171,4 +242,3 @@ class ModelLoader:
             self._scaler,
             recent_prices
         )
-
