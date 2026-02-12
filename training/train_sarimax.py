@@ -1,5 +1,4 @@
 import os
-import datetime
 import uuid
 from typing import Dict, Tuple
 
@@ -12,6 +11,7 @@ from statsmodels.tsa.stattools import adfuller
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
+from core.time.market_time import MarketTime   #  CRITICAL
 
 from models.sarimax_model import SarimaxModel
 
@@ -106,14 +106,15 @@ def assert_stationary(series: pd.Series):
 
 
 ########################################################
-# LOAD DATA
+# LOAD DATA (WINDOW GOVERNED)
 ########################################################
 
-def load_training_data() -> Tuple[Dict[str, object], str]:
+def load_training_data(
+    start_date: str,
+    end_date: str
+) -> Tuple[Dict[str, object], str]:
 
     fetcher = StockPriceFetcher()
-
-    end_date = datetime.date.today().isoformat()
 
     datasets = {}
 
@@ -121,7 +122,7 @@ def load_training_data() -> Tuple[Dict[str, object], str]:
 
         df = fetcher.fetch(
             ticker=ticker,
-            start_date="2014-01-01",
+            start_date=start_date,
             end_date=end_date
         )
 
@@ -168,9 +169,9 @@ def score_model(metrics):
 # TRAIN CHAMPION
 ########################################################
 
-def train_champion():
+def train_champion(start_date, end_date):
 
-    datasets, end_date = load_training_data()
+    datasets, _ = load_training_data(start_date, end_date)
 
     best_model = None
     best_score = -np.inf
@@ -213,8 +214,6 @@ def train_champion():
         datasets[best_ticker]
     )
 
-    training_range = best_model.get_training_range()
-
     metadata = MetadataManager.create_metadata(
         model_name="sarimax_trend",
         metrics={
@@ -223,13 +222,17 @@ def train_champion():
             **best_metrics
         },
         features=["close"],
-        training_start=training_range["start"],
-        training_end=training_range["end"],
+        training_start=start_date,
+        training_end=end_date,
         dataset_hash=dataset_hash,
-        metadata_type="timeseries_manifest_v1",
+        metadata_type="training_manifest_v1",
         extra_fields={
             "model_type": "SARIMAX",
-            "parameters": best_model.get_params()
+            "parameters": best_model.get_params(),
+            "training_window": {
+                "start": start_date,
+                "end": end_date
+            }
         }
     )
 
@@ -237,18 +240,23 @@ def train_champion():
 
 
 ########################################################
-# MAIN
+# MAIN (CLOCK GOVERNED)
 ########################################################
 
-if __name__ == "__main__":
-
-    print("Institutional SARIMAX Training")
+def main(start_date=None, end_date=None):
 
     enforce_determinism()
 
+    if start_date is None or end_date is None:
+        start_date, end_date = MarketTime.training_window()
+
+    print(
+        f"Institutional SARIMAX Training | {start_date} -> {end_date}"
+    )
+
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    model, metadata = train_champion()
+    model, metadata = train_champion(start_date, end_date)
 
     save_model_atomic(model, TEMP_MODEL_PATH)
 
@@ -272,3 +280,7 @@ if __name__ == "__main__":
         f"SARIMAX candidate registered -> {version}\n"
         "Promotion requires governance approval."
     )
+
+
+if __name__ == "__main__":
+    main()
