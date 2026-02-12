@@ -23,6 +23,10 @@ class FeatureEngineer:
 
     RETURN_CLAMP = (-0.5, 0.5)
 
+    # -----------------------------------------------------
+    # DATETIME NORMALIZATION
+    # -----------------------------------------------------
+
     @staticmethod
     def _normalize_datetime(df: pd.DataFrame):
 
@@ -32,6 +36,10 @@ class FeatureEngineer:
         ).dt.tz_convert(None)
 
         return df
+
+    # -----------------------------------------------------
+    # PRICE VALIDATION
+    # -----------------------------------------------------
 
     @staticmethod
     def _validate_price_frame(df: pd.DataFrame):
@@ -58,6 +66,10 @@ class FeatureEngineer:
 
         return df
 
+    # -----------------------------------------------------
+    # FLOAT32 ENFORCEMENT
+    # -----------------------------------------------------
+
     @staticmethod
     def _enforce_float32(df):
 
@@ -67,6 +79,10 @@ class FeatureEngineer:
             df[col] = df[col].astype("float32")
 
         return df
+
+    # -----------------------------------------------------
+    # FEATURE BUILDERS
+    # -----------------------------------------------------
 
     @staticmethod
     def add_returns(df):
@@ -115,6 +131,10 @@ class FeatureEngineer:
 
         df["macd"] = macd.clip(-50, 50)
         df["macd_signal"] = signal.clip(-50, 50)
+
+    # -----------------------------------------------------
+    # SENTIMENT
+    # -----------------------------------------------------
 
     @classmethod
     def _build_zero_sentiment(cls, price_df):
@@ -172,16 +192,24 @@ class FeatureEngineer:
 
         return merged
 
+    # -----------------------------------------------------
+    # POST GUARD
+    # -----------------------------------------------------
+
     @classmethod
     def _post_feature_guard(cls, df):
 
         if len(df) < cls.MIN_ROWS_REQUIRED:
             logger.error(
                 "Feature dataset below minimum rows (%s < %s). "
-                "Continuing to allow inference but signals may degrade.",
+                "Continuing — but signals may degrade.",
                 len(df),
                 cls.MIN_ROWS_REQUIRED
             )
+
+    # -----------------------------------------------------
+    # SANITIZE
+    # -----------------------------------------------------
 
     @staticmethod
     def _sanitize_features(df):
@@ -189,6 +217,10 @@ class FeatureEngineer:
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
         return df.dropna(subset=MODEL_FEATURES).copy()
+
+    # =====================================================
+    #  INSTITUTIONAL TARGET ENGINEERING (NEW)
+    # =====================================================
 
     @classmethod
     def create_training_dataset(cls, df):
@@ -198,16 +230,50 @@ class FeatureEngineer:
         if not np.isfinite(df["return"]).all():
             raise RuntimeError("Non-finite returns detected.")
 
-        df["target"] = (df["return"].shift(-1) > 0).astype(int)
+        # Forward return
+        df["forward_return"] = df["return"].shift(-1)
 
+        # Volatility normalization
+        vol_floor = 1e-4
+        df["volatility_safe"] = df["volatility"].clip(lower=vol_floor)
+
+        df["risk_adj_return"] = (
+            df["forward_return"] / df["volatility_safe"]
+        )
+
+        # DEAD ZONE (removes noise)
+        DEAD_ZONE = 0.20
+
+        df["target"] = np.where(
+            df["risk_adj_return"] > DEAD_ZONE, 1,
+            np.where(df["risk_adj_return"] < -DEAD_ZONE, 0, np.nan)
+        )
+
+        df.dropna(subset=["target"], inplace=True)
+
+        df["target"] = df["target"].astype("int8")
+
+        # Safe lags
         df["return_lag1"] = df["return"].shift(1)
         df["sentiment_lag1"] = df["avg_sentiment"].shift(1)
 
         df.dropna(inplace=True)
 
+        # Remove helper columns
+        df.drop(
+            columns=[
+                "forward_return",
+                "risk_adj_return",
+                "volatility_safe"
+            ],
+            inplace=True
+        )
+
         cls._post_feature_guard(df)
 
         return df
+
+    # -----------------------------------------------------
 
     @classmethod
     def create_inference_dataset(cls, df):
@@ -227,6 +293,10 @@ class FeatureEngineer:
         cls._post_feature_guard(df)
 
         return df
+
+    # -----------------------------------------------------
+    # MASTER PIPELINE
+    # -----------------------------------------------------
 
     @classmethod
     def build_feature_pipeline(
