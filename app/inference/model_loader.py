@@ -3,6 +3,7 @@ import joblib
 import logging
 import threading
 import json
+from dataclasses import dataclass
 
 from core.artifacts.model_registry import ModelRegistry
 from core.schema.feature_schema import (
@@ -19,22 +20,23 @@ from app.monitoring.metrics import MODEL_VERSION
 logger = logging.getLogger("marketsentinel.loader")
 
 
-class ModelLoader:
-    """
-    Institutional production model loader.
+###################################################
+# IMMUTABLE CONTAINER
+###################################################
 
-    Guarantees:
-    - registry integrity verification
-    - schema enforcement
-    - metadata enforcement
-    - artifact hashing validation
-    - thread-safe reload
-    - atomic version swap
-    - fail-closed behavior
-    """
+@dataclass(frozen=True)
+class LoadedModel:
+    model: object
+    version: str
+    dataset_hash: str
+
+
+class ModelLoader:
 
     _instance = None
     _instance_lock = threading.Lock()
+
+    MIN_ARTIFACT_BYTES = 50_000  # prevents zero-byte / truncated loads
 
     ###################################################
 
@@ -54,11 +56,8 @@ class ModelLoader:
         if hasattr(self, "_initialized"):
             return
 
-        self._xgb = None
-        self._xgb_version = None
-
-        self._sarimax = None
-        self._sarimax_version = None
+        self._xgb_container: LoadedModel | None = None
+        self._sarimax_container: LoadedModel | None = None
 
         self._lstm = None
         self._scaler = None
@@ -68,10 +67,23 @@ class ModelLoader:
         self._initialized = True
 
     ###################################################
-    # REGISTRY RESOLUTION + VERIFICATION
+    # REGISTRY PATH SAFETY
+    ###################################################
+
+    def _validate_registry_path(self, base_dir):
+
+        if not os.path.exists(base_dir):
+            raise RuntimeError(
+                f"Registry path does not exist: {base_dir}"
+            )
+
+    ###################################################
+    # REGISTRY RESOLUTION
     ###################################################
 
     def _resolve_latest_verified(self, base_dir: str):
+
+        self._validate_registry_path(base_dir)
 
         version = ModelRegistry.get_latest_version(base_dir)
 
@@ -79,13 +91,21 @@ class ModelLoader:
 
         version_dir = os.path.join(base_dir, version)
 
-        return version, version_dir
+        manifest_path = os.path.join(
+            version_dir,
+            ModelRegistry.MANIFEST_NAME
+        )
+
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+
+        return version, version_dir, manifest
 
     ###################################################
-    # METADATA VALIDATION (STRICT)
+    # METADATA CROSS VALIDATION
     ###################################################
 
-    def _validate_metadata(self, metadata_path: str):
+    def _validate_metadata(self, metadata_path: str, manifest: dict):
 
         with open(metadata_path) as f:
             meta = json.load(f)
@@ -100,15 +120,13 @@ class ModelLoader:
                 "Feature mismatch — runtime and model differ."
             )
 
-        if "dataset_hash" not in meta:
+        if meta.get("dataset_hash") != manifest.get("dataset_hash"):
             raise RuntimeError(
-                "Metadata corrupted — dataset hash missing."
+                "Dataset lineage mismatch between metadata and manifest."
             )
 
         if "training_code_hash" not in meta:
-            raise RuntimeError(
-                "Metadata corrupted — lineage missing."
-            )
+            raise RuntimeError("Training lineage missing.")
 
         return meta
 
@@ -120,6 +138,11 @@ class ModelLoader:
 
         if not os.path.exists(path):
             raise RuntimeError(f"Artifact missing: {path}")
+
+        if os.path.getsize(path) < self.MIN_ARTIFACT_BYTES:
+            raise RuntimeError(
+                f"Artifact too small — likely corrupted: {path}"
+            )
 
         try:
             model = joblib.load(path)
@@ -141,15 +164,20 @@ class ModelLoader:
             "artifacts/xgboost"
         )
 
-        version, version_dir = self._resolve_latest_verified(base_dir)
+        version, version_dir, manifest = \
+            self._resolve_latest_verified(base_dir)
 
-        if self._xgb is not None and self._xgb_version == version:
-            return self._xgb
+        container = self._xgb_container
+
+        if container and container.version == version:
+            return container.model
 
         with self._load_lock:
 
-            if self._xgb is not None and self._xgb_version == version:
-                return self._xgb
+            container = self._xgb_container
+
+            if container and container.version == version:
+                return container.model
 
             logger.warning(
                 "Loading XGBoost model version=%s",
@@ -159,7 +187,7 @@ class ModelLoader:
             model_path = os.path.join(version_dir, "model.pkl")
             metadata_path = os.path.join(version_dir, "metadata.json")
 
-            self._validate_metadata(metadata_path)
+            meta = self._validate_metadata(metadata_path, manifest)
 
             model = self._safe_joblib_load(model_path)
 
@@ -168,15 +196,21 @@ class ModelLoader:
                     "Loaded artifact missing predict_proba"
                 )
 
-            self._xgb = model
-            self._xgb_version = version
+            new_container = LoadedModel(
+                model=model,
+                version=version,
+                dataset_hash=meta["dataset_hash"]
+            )
+
+            # ATOMIC SWAP
+            self._xgb_container = new_container
 
             MODEL_VERSION.labels(
                 model="xgboost",
                 version=version
             ).set(1)
 
-        return self._xgb
+        return self._xgb_container.model
 
     ###################################################
     # SARIMAX
@@ -189,15 +223,20 @@ class ModelLoader:
             "artifacts/sarimax"
         )
 
-        version, version_dir = self._resolve_latest_verified(base_dir)
+        version, version_dir, manifest = \
+            self._resolve_latest_verified(base_dir)
 
-        if self._sarimax is not None and self._sarimax_version == version:
-            return self._sarimax
+        container = self._sarimax_container
+
+        if container and container.version == version:
+            return container.model
 
         with self._load_lock:
 
-            if self._sarimax is not None and self._sarimax_version == version:
-                return self._sarimax
+            container = self._sarimax_container
+
+            if container and container.version == version:
+                return container.model
 
             logger.warning(
                 "Loading SARIMAX model version=%s",
@@ -207,7 +246,7 @@ class ModelLoader:
             model_path = os.path.join(version_dir, "model.pkl")
             metadata_path = os.path.join(version_dir, "metadata.json")
 
-            self._validate_metadata(metadata_path)
+            meta = self._validate_metadata(metadata_path, manifest)
 
             model = self._safe_joblib_load(model_path)
 
@@ -218,15 +257,20 @@ class ModelLoader:
 
             _ = model.fitted_model
 
-            self._sarimax = model
-            self._sarimax_version = version
+            new_container = LoadedModel(
+                model=model,
+                version=version,
+                dataset_hash=meta["dataset_hash"]
+            )
+
+            self._sarimax_container = new_container
 
             MODEL_VERSION.labels(
                 model="sarimax",
                 version=version
             ).set(1)
 
-        return self._sarimax
+        return self._sarimax_container.model
 
     ###################################################
     # PUBLIC ACCESSORS
@@ -241,7 +285,7 @@ class ModelLoader:
         return self._reload_sarimax_if_needed()
 
     ###################################################
-    # SAFE WARMUP
+    # FAIL-CLOSED WARMUP
     ###################################################
 
     def warmup(self):
@@ -251,15 +295,8 @@ class ModelLoader:
 
         logger.info("Warming models")
 
-        try:
-            _ = self.xgb
-        except Exception:
-            logger.exception("XGBoost warmup failed")
-
-        try:
-            _ = self.sarimax
-        except Exception:
-            logger.exception("SARIMAX warmup failed")
+        _ = self.xgb
+        _ = self.sarimax
 
         logger.info("Model warmup complete")
 
