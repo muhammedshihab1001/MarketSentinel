@@ -8,26 +8,32 @@ from cmdstanpy import cmdstan_path
 CHANGEPOINT_PRIOR = 0.05
 INTERVAL_WIDTH = 0.80
 CHANGEPOINT_RANGE = 0.90
-UNCERTAINTY_SAMPLES = 400
+UNCERTAINTY_SAMPLES = 120
 
 MIN_HISTORY = 350
 EPSILON = 1e-9
 
 
+########################################################
+
 def _validate_cmdstan():
 
     try:
+
         path = cmdstan_path()
 
         if path is None:
             raise RuntimeError
 
     except Exception:
+
         raise RuntimeError(
             "CmdStan is not installed. "
             "Run: python -m cmdstanpy.install_cmdstan"
         )
 
+
+########################################################
 
 def prepare_prophet_dataframe(df):
 
@@ -55,15 +61,19 @@ def prepare_prophet_dataframe(df):
     if (prophet_df["y"] <= 0).any():
         raise RuntimeError("Prices must be positive for log transform.")
 
+    # log transform
     prophet_df["y"] = np.log(prophet_df["y"])
 
-    lower = prophet_df["y"].quantile(0.01)
-    upper = prophet_df["y"].quantile(0.99)
+    # soft winsorization (safer than hard clipping)
+    lower = prophet_df["y"].quantile(0.005)
+    upper = prophet_df["y"].quantile(0.995)
 
     prophet_df["y"] = prophet_df["y"].clip(lower, upper)
 
     return prophet_df
 
+
+########################################################
 
 def train_prophet(df, random_seed: int = 42):
 
@@ -71,7 +81,10 @@ def train_prophet(df, random_seed: int = 42):
 
     prophet_df = prepare_prophet_dataframe(df)
 
+    n_changepoints = min(15, len(prophet_df) // 25)
+
     model = Prophet(
+
         growth="linear",
 
         yearly_seasonality=True,
@@ -80,14 +93,27 @@ def train_prophet(df, random_seed: int = 42):
 
         changepoint_prior_scale=CHANGEPOINT_PRIOR,
         changepoint_range=CHANGEPOINT_RANGE,
+        n_changepoints=n_changepoints,
 
         interval_width=INTERVAL_WIDTH,
         uncertainty_samples=UNCERTAINTY_SAMPLES,
 
-        seasonality_mode="additive",
+        seasonality_mode="multiplicative",
 
         stan_backend="CMDSTANPY"
     )
+
+    ####################################################
+    # Add institutional-grade seasonality
+    ####################################################
+
+    model.add_seasonality(
+        name="monthly",
+        period=30.5,
+        fourier_order=5
+    )
+
+    ####################################################
 
     model.fit(
         prophet_df,
@@ -96,6 +122,8 @@ def train_prophet(df, random_seed: int = 42):
 
     return model
 
+
+########################################################
 
 def forecast_prophet(model, periods=60):
 
@@ -112,7 +140,6 @@ def forecast_prophet(model, periods=60):
         raise RuntimeError("Forecast contains NaN values.")
 
     yhat_log = tail["yhat"].values
-
     yhat = np.exp(yhat_log)
 
     slope = float(yhat[-1] - yhat[0])
@@ -120,7 +147,7 @@ def forecast_prophet(model, periods=60):
 
     normalized_slope = slope / max(yhat[0], EPSILON)
 
-    if abs(normalized_slope) < volatility / max(yhat[0], EPSILON) * 0.35:
+    if abs(normalized_slope) < volatility / max(yhat[0], EPSILON) * 0.30:
         trend = "SIDEWAYS"
     else:
         trend = "BULLISH" if normalized_slope > 0 else "BEARISH"
