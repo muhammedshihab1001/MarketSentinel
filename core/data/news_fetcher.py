@@ -26,7 +26,9 @@ class NewsFetcher:
     MAX_CACHE_KEYS = 500
     MAX_ARTICLE_AGE = timedelta(hours=48)
 
-    RAW_SCHEMA_VERSION = "2.0"
+    INGESTION_DELAY = timedelta(minutes=15)
+
+    RAW_SCHEMA_VERSION = "3.0"
 
     RAW_CACHE_DIR = "data/news_raw"
 
@@ -36,8 +38,10 @@ class NewsFetcher:
     _cache: Dict[str, Tuple[pd.Timestamp, pd.DataFrame]] = {}
     _lock = threading.Lock()
 
+    SESSION = requests.Session()
+
     HEADERS = {
-        "User-Agent": "MarketSentinel/2.0"
+        "User-Agent": "MarketSentinel/3.0"
     }
 
     EMPTY_SCHEMA = pd.DataFrame(
@@ -47,13 +51,13 @@ class NewsFetcher:
     def __init__(self):
         os.makedirs(self.RAW_CACHE_DIR, exist_ok=True)
 
-    # -----------------------------------------------------
+    #####################################################
 
     @staticmethod
     def _now():
         return pd.Timestamp.utcnow().tz_localize(None)
 
-    # -----------------------------------------------------
+    #####################################################
 
     def _cache_key(self, query: str, max_items: int) -> str:
 
@@ -64,12 +68,12 @@ class NewsFetcher:
 
         return hashlib.sha256(raw.encode()).hexdigest()[:20]
 
-    # -----------------------------------------------------
+    #####################################################
 
     def _raw_path(self, key: str):
         return f"{self.RAW_CACHE_DIR}/{key}.xml"
 
-    # -----------------------------------------------------
+    #####################################################
 
     def _raw_expired(self, path):
 
@@ -83,9 +87,12 @@ class NewsFetcher:
 
         return self._now() - modified > self.RAW_TTL
 
-    # -----------------------------------------------------
+    #####################################################
 
     def _persist_raw_feed(self, path, content: bytes):
+
+        if len(content) < 5_000:
+            raise RuntimeError("RSS payload suspiciously small.")
 
         tmp = path + ".tmp"
 
@@ -96,7 +103,7 @@ class NewsFetcher:
 
         os.replace(tmp, path)
 
-    # -----------------------------------------------------
+    #####################################################
 
     def _download_feed(self, url):
 
@@ -104,7 +111,7 @@ class NewsFetcher:
 
             try:
 
-                r = requests.get(
+                r = self.SESSION.get(
                     url,
                     headers=self.HEADERS,
                     timeout=6
@@ -128,7 +135,7 @@ class NewsFetcher:
 
         raise RuntimeError("News download failed after retries.")
 
-    # -----------------------------------------------------
+    #####################################################
 
     def _prune_cache(self):
 
@@ -143,7 +150,7 @@ class NewsFetcher:
         for k, _ in oldest:
             self._cache.pop(k, None)
 
-    # -----------------------------------------------------
+    #####################################################
 
     @staticmethod
     def _normalize_timestamp(published):
@@ -159,7 +166,7 @@ class NewsFetcher:
 
         return ts.tz_convert(None)
 
-    # -----------------------------------------------------
+    #####################################################
 
     @staticmethod
     def _clean_headline(text: str):
@@ -171,7 +178,7 @@ class NewsFetcher:
 
         return text.strip()
 
-    # -----------------------------------------------------
+    #####################################################
 
     def fetch(self, query: str, max_items: int = 50) -> pd.DataFrame:
 
@@ -209,6 +216,9 @@ class NewsFetcher:
 
                 feed = feedparser.parse(raw)
 
+                if getattr(feed, "bozo", False):
+                    raise RuntimeError("Malformed RSS feed.")
+
                 articles = []
                 seen_hashes = set()
 
@@ -230,7 +240,7 @@ class NewsFetcher:
                     if published is None:
                         continue
 
-                    if published > now:
+                    if published > now - self.INGESTION_DELAY:
                         continue
 
                     if now - published > self.MAX_ARTICLE_AGE:
@@ -243,15 +253,6 @@ class NewsFetcher:
                     if not headline:
                         continue
 
-                    h = hashlib.sha256(
-                        headline.encode()
-                    ).hexdigest()
-
-                    if h in seen_hashes:
-                        continue
-
-                    seen_hashes.add(h)
-
                     source = entry.get(
                         "source", {}
                     )
@@ -260,6 +261,17 @@ class NewsFetcher:
                         source = source.get("title", "Unknown")
                     else:
                         source = "Unknown"
+
+                    dedup_key = f"{headline}|{source}"
+
+                    h = hashlib.sha256(
+                        dedup_key.encode()
+                    ).hexdigest()
+
+                    if h in seen_hashes:
+                        continue
+
+                    seen_hashes.add(h)
 
                     articles.append({
                         "headline": headline,
