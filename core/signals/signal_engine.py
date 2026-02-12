@@ -6,70 +6,77 @@ import os
 from core.risk.position_sizer import PositionSizer
 
 
-# ---------------------------------------------------
+###################################################
+# SAFE ENV PARSER
+###################################################
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, str(default)))
+    except Exception:
+        return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    val = os.getenv(key, str(default)).lower()
+    return val in ("1", "true", "yes")
+
+
+###################################################
 # CONFIGURATION
-# ---------------------------------------------------
+###################################################
 
 @dataclass(frozen=True)
 class SignalConfig:
 
-    prob_threshold: float = float(
-        os.getenv("PROB_THRESHOLD", "0.60")
-    )
+    prob_threshold: float = _env_float("PROB_THRESHOLD", 0.60)
+    sentiment_threshold: float = _env_float("SENTIMENT_THRESHOLD", 0.10)
 
-    sentiment_threshold: float = float(
-        os.getenv("SENTIMENT_THRESHOLD", "0.10")
-    )
+    volatility_cap: float = _env_float("VOL_CAP", 0.06)
+    volatility_throttle: float = _env_float("VOL_THROTTLE", 0.04)
 
-    volatility_cap: float = float(
-        os.getenv("VOL_CAP", "0.06")
-    )
+    min_risk_adjusted_return: float = _env_float("MIN_RAR", 0.40)
+    min_confidence: float = _env_float("MIN_CONFIDENCE", 0.35)
 
-    volatility_throttle: float = float(
-        os.getenv("VOL_THROTTLE", "0.04")
-    )
+    portfolio_value: float = _env_float("PORTFOLIO_VALUE", 100000)
+    max_position_pct: float = _env_float("MAX_POSITION_PCT", 0.08)
 
-    min_risk_adjusted_return: float = float(
-        os.getenv("MIN_RAR", "0.40")
-    )
-
-    min_confidence: float = float(
-        os.getenv("MIN_CONFIDENCE", "0.35")
-    )
-
-    portfolio_value: float = float(
-        os.getenv("PORTFOLIO_VALUE", "100000")
-    )
-
-    max_position_pct: float = float(
-        os.getenv("MAX_POSITION_PCT", "0.08")
-    )
-
-    global_kill_switch: bool = (
-        os.getenv("GLOBAL_TRADING_DISABLED", "false")
-        .lower() == "true"
+    global_kill_switch: bool = _env_bool(
+        "GLOBAL_TRADING_DISABLED",
+        False
     )
 
 
-# ---------------------------------------------------
+###################################################
 # UTIL
-# ---------------------------------------------------
+###################################################
 
 def _safe(v, fallback=0.0):
-    if v is None or (isinstance(v, float) and math.isnan(v)):
+    if v is None:
         return fallback
-    return float(v)
+
+    try:
+        v = float(v)
+    except Exception:
+        return fallback
+
+    if not math.isfinite(v):
+        return fallback
+
+    return v
 
 
 def _clamp(v, lo, hi):
     return max(lo, min(v, hi))
 
 
-# ---------------------------------------------------
-# FORECAST INTERPRETER (UPGRADED)
-# ---------------------------------------------------
+###################################################
+# FORECAST INTERPRETER
+###################################################
 
 class ForecastInterpreter:
+
+    VALID_SIGNALS = {"BUY", "HOLD"}
 
     def interpret(
         self,
@@ -83,12 +90,11 @@ class ForecastInterpreter:
         predicted_return = _safe(predicted_return)
         sentiment = _safe(sentiment)
         rsi = _safe(rsi, 50)
+
         volatility = max(_safe(volatility, 0.02), 1e-6)
         prob_up = _safe(prob_up, 0.5)
 
-        # 🔥 Risk-adjusted return (Sharpe-lite)
         rar = predicted_return / volatility
-
         rsi_edge = abs(50 - rsi) / 50
 
         confidence = (
@@ -103,15 +109,12 @@ class ForecastInterpreter:
         if rar > 0.4 and prob_up > 0.55:
             return "BUY", round(confidence, 3)
 
-        if rar < -0.4 and prob_up < 0.45:
-            return "SELL", round(confidence, 3)
-
         return "HOLD", round(confidence, 3)
 
 
-# ---------------------------------------------------
+###################################################
 # RISK GATE
-# ---------------------------------------------------
+###################################################
 
 class RiskGate:
 
@@ -127,8 +130,11 @@ class RiskGate:
     ) -> bool:
 
         prob_up = _safe(prob_up, 0.5)
-        volatility = _safe(volatility)
+        volatility = max(_safe(volatility, 0.02), 1e-6)
         regime = (regime or "").upper()
+
+        if signal not in ForecastInterpreter.VALID_SIGNALS:
+            raise RuntimeError(f"Invalid signal emitted: {signal}")
 
         if volatility > self.config.volatility_cap:
             return False
@@ -139,15 +145,12 @@ class RiskGate:
         if signal == "BUY" and prob_up < self.config.prob_threshold:
             return False
 
-        if signal == "SELL" and prob_up > (1 - self.config.prob_threshold):
-            return False
-
         return True
 
 
-# ---------------------------------------------------
-# ENSEMBLE — NOW NON-DESTRUCTIVE
-# ---------------------------------------------------
+###################################################
+# ENSEMBLE — CONFIRMATION ONLY
+###################################################
 
 class EnsembleArbiter:
 
@@ -156,10 +159,13 @@ class EnsembleArbiter:
         base_signal: str,
         prob_up: float,
         lstm_prices: List[float],
+        macro_trend: str,
         config: SignalConfig
     ) -> str:
 
-        # fallback to base signal if secondary models unavailable
+        if base_signal == "HOLD":
+            return "HOLD"
+
         if not lstm_prices or len(lstm_prices) < 2:
             return base_signal
 
@@ -167,27 +173,28 @@ class EnsembleArbiter:
         last = _safe(lstm_prices[-1], first)
 
         expected_return = (last - first) / first
+        macro_trend = (macro_trend or "").upper()
 
-        if (
-            base_signal == "BUY"
-            and trend == "BULLISH"
-            and expected_return > config.min_risk_adjusted_return * 0.02
-        ):
+        # confirmation only — never escalate
+        if base_signal == "BUY":
+
+            if macro_trend not in ("BULLISH", "SIDEWAYS"):
+                return "HOLD"
+
+            if expected_return <= 0:
+                return "HOLD"
+
+            if prob_up < config.prob_threshold:
+                return "HOLD"
+
             return "BUY"
 
-        if (
-            base_signal == "SELL"
-            and trend == "BEARISH"
-            and expected_return < -config.min_risk_adjusted_return * 0.02
-        ):
-            return "SELL"
-
-        return base_signal
+        return "HOLD"
 
 
-# ---------------------------------------------------
+###################################################
 # MASTER ENGINE
-# ---------------------------------------------------
+###################################################
 
 class DecisionEngine:
 
@@ -208,7 +215,7 @@ class DecisionEngine:
         prob_up: float,
         volatility: float,
         lstm_prices: List[float],
-        prophet_trend: str,
+        macro_trend: str,
         regime: str | None = None
     ) -> Dict:
 
@@ -238,7 +245,7 @@ class DecisionEngine:
             base_signal,
             prob_up,
             lstm_prices,
-            prophet_trend,
+            macro_trend,
             self.config
         )
 
