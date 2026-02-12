@@ -1,6 +1,10 @@
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
+import logging
+
+
+logger = logging.getLogger("marketsentinel.regime")
 
 
 @dataclass(frozen=True)
@@ -18,7 +22,6 @@ class RegimeConfig:
     persistence_days: int = 5
 
     EPSILON: float = 1e-8
-
     MAX_DAILY_RETURN: float = 0.60
 
 
@@ -36,48 +39,46 @@ class MarketRegimeDetector:
     def _apply_persistence(self, regimes):
 
         cfg = self.config
-
         regimes = np.asarray(regimes, dtype=object)
 
         confirmed = regimes.copy()
-
         current = regimes[0]
+
         candidate = None
-        candidate_streak = 0
+        streak = 0
 
         for i in range(1, len(regimes)):
 
             new = regimes[i]
 
             if new not in self.VALID_REGIMES:
-                raise RuntimeError(f"Invalid regime detected: {new}")
+                logger.warning("Invalid regime detected: %s", new)
+                new = "SIDEWAYS"
 
+            # Crisis has ABSOLUTE PRIORITY
             if new == "CRISIS":
                 current = "CRISIS"
                 candidate = None
-                candidate_streak = 0
+                streak = 0
                 confirmed[i] = current
                 continue
 
             if new == current:
                 candidate = None
-                candidate_streak = 0
+                streak = 0
                 confirmed[i] = current
                 continue
 
-            if candidate is None:
-                candidate = new
-                candidate_streak = 1
-            elif candidate == new:
-                candidate_streak += 1
+            if candidate == new:
+                streak += 1
             else:
                 candidate = new
-                candidate_streak = 1
+                streak = 1
 
-            if candidate_streak >= cfg.persistence_days:
+            if streak >= cfg.persistence_days:
                 current = candidate
                 candidate = None
-                candidate_streak = 0
+                streak = 0
 
             confirmed[i] = current
 
@@ -91,102 +92,91 @@ class MarketRegimeDetector:
 
         cfg = self.config
 
-        required = {"date", "close"}
+        try:
 
-        missing = required - set(df.columns)
+            df = df.sort_values("date").copy()
 
-        if missing:
-            raise RuntimeError(
-                f"Regime detection missing columns: {missing}"
+            if df["close"].isna().any():
+                raise RuntimeError("NaN close prices")
+
+            if not np.isfinite(df["close"]).all():
+                raise RuntimeError("Non-finite prices")
+
+            if (df["close"] <= 0).any():
+                raise RuntimeError("Non-positive prices")
+
+            shifted = df["close"].shift(1)
+
+            returns = shifted.pct_change()
+
+            # SOFT GUARD — drop ticker instead of crashing
+            if returns.abs().max() > cfg.MAX_DAILY_RETURN:
+                raise RuntimeError("Unrealistic returns")
+
+            ma_long = shifted.rolling(
+                cfg.trend_window,
+                min_periods=cfg.trend_window
+            ).mean()
+
+            volatility = (
+                returns
+                .rolling(cfg.volatility_window,
+                         min_periods=cfg.volatility_window)
+                .std()
+                .clip(lower=cfg.EPSILON)
             )
 
-        df = df.sort_values("date").copy()
+            safe_ma = ma_long.replace(0, np.nan)
 
-        if df["close"].isna().any():
-            raise RuntimeError("NaN close prices detected.")
-
-        if not np.isfinite(df["close"]).all():
-            raise RuntimeError("Non-finite prices detected.")
-
-        if (df["close"] <= 0).any():
-            raise RuntimeError("Non-positive prices detected.")
-
-        shifted_close = df["close"].shift(1)
-
-        ma_long = (
-            shifted_close
-            .rolling(cfg.trend_window, min_periods=cfg.trend_window)
-            .mean()
-        )
-
-        returns = shifted_close.pct_change()
-
-        if returns.abs().max() > cfg.MAX_DAILY_RETURN:
-            raise RuntimeError(
-                "Unrealistic daily return detected. Data likely corrupted."
+            trend_dev = (
+                (shifted - safe_ma) /
+                (safe_ma + cfg.EPSILON)
             )
 
-        volatility = (
-            returns
-            .rolling(
-                cfg.volatility_window,
-                min_periods=cfg.volatility_window
-            )
-            .std()
-            .clip(lower=cfg.EPSILON)
-        )
+            regime = np.full(len(df), "SIDEWAYS", dtype=object)
 
-        safe_ma = ma_long.replace(0, np.nan)
+            ready = ma_long.notna() & volatility.notna()
 
-        trend_dev = (
-            (shifted_close - safe_ma) /
-            (safe_ma + cfg.EPSILON)
-        )
+            # CRISIS FIRST (priority)
+            crisis = ready & (volatility > cfg.crash_vol_threshold)
 
-        regime = np.full(len(df), "SIDEWAYS", dtype=object)
-
-        ready_mask = (
-            ma_long.notna() &
-            volatility.notna()
-        )
-
-        bull = (
-            ready_mask &
-            (trend_dev > cfg.trend_buffer) &
-            (volatility < cfg.bull_vol_threshold)
-        )
-
-        bear = (
-            ready_mask &
-            (trend_dev < -cfg.trend_buffer) &
-            (volatility > cfg.bear_vol_threshold)
-        )
-
-        crisis = (
-            ready_mask &
-            (volatility > cfg.crash_vol_threshold)
-        )
-
-        regime[bull] = "BULL"
-        regime[bear] = "BEAR"
-        regime[crisis] = "CRISIS"
-
-        regime = self._apply_persistence(regime)
-
-        df["regime"] = regime
-
-        warmup_cut = max(cfg.trend_window, cfg.volatility_window)
-
-        if len(df) <= warmup_cut:
-            raise RuntimeError(
-                "Dataset too small for regime detection."
+            bull = (
+                ready &
+                ~crisis &
+                (trend_dev > cfg.trend_buffer) &
+                (volatility < cfg.bull_vol_threshold)
             )
 
-        df = df.iloc[warmup_cut:].copy()
+            bear = (
+                ready &
+                ~crisis &
+                (trend_dev < -cfg.trend_buffer) &
+                (volatility > cfg.bear_vol_threshold)
+            )
 
-        df["date"] = pd.to_datetime(df["date"], utc=True)
+            regime[crisis] = "CRISIS"
+            regime[bull] = "BULL"
+            regime[bear] = "BEAR"
 
-        return df
+            regime = self._apply_persistence(regime)
+
+            df["regime"] = regime
+
+            # DO NOT DELETE WARMUP ROWS
+            df["regime"] = df["regime"].fillna("SIDEWAYS")
+
+            df["date"] = pd.to_datetime(df["date"], utc=True)
+
+            return df
+
+        except Exception as e:
+
+            logger.warning(
+                "Regime detection rejected ticker — %s",
+                str(e)
+            )
+
+            return None
 
     ########################################################
     # MULTI ASSET
@@ -209,18 +199,17 @@ class MarketRegimeDetector:
         ).groupby("ticker"):
 
             if len(slice_df) < 300:
+                logger.info("Skipping small asset: %s", ticker)
                 continue
 
             detected = self._detect_single_asset(slice_df)
 
-            if detected.empty:
-                continue
+            if detected is not None and not detected.empty:
+                grouped.append(detected)
 
-            grouped.append(detected)
-
-        if not grouped:
+        if len(grouped) < 3:
             raise RuntimeError(
-                "All assets rejected during regime detection."
+                "Too few assets survived regime detection."
             )
 
         result = (
