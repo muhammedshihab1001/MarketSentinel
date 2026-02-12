@@ -5,16 +5,14 @@ import hashlib
 import logging
 import os
 import random
-from datetime import datetime
+
+from datetime import datetime, timedelta
+
 
 logger = logging.getLogger("marketsentinel.fetcher")
 
 
 class StockPriceFetcher:
-    """
-    Market data fetcher with schema normalization,
-    business-day validation, cache safety, and retry logic.
-    """
 
     REQUIRED_COLUMNS = {
         "date",
@@ -28,129 +26,37 @@ class StockPriceFetcher:
     MIN_ROWS = 120
     MAX_RETRIES = 5
     BASE_SLEEP = 1.5
-    MAX_GAP_DAYS = 10
-    MIN_COVERAGE_RATIO = 0.85
 
     CACHE_DIR = "data/cache"
+    CACHE_VERSION = "2.0"
 
     def __init__(self):
         os.makedirs(self.CACHE_DIR, exist_ok=True)
 
     # -----------------------------------------------------
 
-    def _flatten_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Flatten multi-index columns and remove duplicates.
-        """
+    @staticmethod
+    def _cap_to_yesterday(date_str):
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        requested = pd.Timestamp(date_str).normalize()
 
-        df.columns = [str(c).lower() for c in df.columns]
-
-        df = df.loc[:, ~df.columns.duplicated()]
-
-        return df
-
-    # -----------------------------------------------------
-
-    def _normalize_schema(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Normalize provider output into a stable schema.
-        Must be idempotent.
-        """
-
-        df = self._flatten_columns(df)
-
-        if "date" not in df.columns:
-            df = df.reset_index()
-            df.rename(columns={df.columns[0]: "date"}, inplace=True)
-
-        df = df.loc[:, ~df.columns.duplicated()]
-
-        df["date"] = pd.to_datetime(
-            df["date"],
-            errors="coerce",
-            utc=True
-        ).dt.tz_convert(None)
-
-        numeric_cols = ["open", "high", "low", "close", "volume"]
-
-        for col in numeric_cols:
-            if col not in df.columns:
-                raise RuntimeError(
-                    f"Provider schema violation: missing={col}"
-                )
-
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
-            )
-
-        df = df.dropna(subset=["date"] + numeric_cols)
-
-        return df
-
-    # -----------------------------------------------------
-
-    def _detect_gaps(self, df: pd.DataFrame):
-
-        diffs = df["date"].diff().dt.days.dropna()
-
-        if (diffs > self.MAX_GAP_DAYS).any():
-            raise RuntimeError("Large gap detected in price history.")
-
-    # -----------------------------------------------------
-
-    def _validate_coverage(self, df, start_date, end_date):
-        """
-        Validate coverage using business days.
-        """
-
-        expected_days = len(
-            pd.bdate_range(start=start_date, end=end_date)
+        yesterday = (
+            pd.Timestamp.utcnow()
+            .normalize() - pd.Timedelta(days=1)
         )
 
-        expected_days = max(expected_days, 1)
-
-        coverage = len(df) / expected_days
-
-        if coverage < self.MIN_COVERAGE_RATIO:
-            raise RuntimeError(
-                f"Dataset coverage too low: {coverage:.2f} | "
-                f"rows={len(df)} expected_business_days={expected_days}"
-            )
-
-        logger.info(
-            f"Coverage OK: {coverage:.2f} ({len(df)}/{expected_days})"
-        )
+        return min(requested, yesterday)
 
     # -----------------------------------------------------
 
-    def _validate_dataset(self, df, start_date, end_date):
+    def _cache_key(self, ticker, start, end, interval):
 
-        if df is None or df.empty:
-            raise RuntimeError("Provider returned empty dataset.")
+        raw = (
+            f"{ticker}|{start}|{end}|{interval}|"
+            f"adj=auto|schema=v2|cache={self.CACHE_VERSION}"
+        )
 
-        df = self._normalize_schema(df)
-
-        if (df["close"] <= 0).any():
-            raise RuntimeError("Invalid close prices detected.")
-
-        if (df["high"] < df["low"]).any():
-            raise RuntimeError("High < Low detected.")
-
-        df = df.drop_duplicates("date").sort_values("date")
-
-        self._detect_gaps(df)
-        self._validate_coverage(df, start_date, end_date)
-
-        if len(df) < self.MIN_ROWS:
-            raise RuntimeError(
-                f"Dataset too small: {len(df)} rows"
-            )
-
-        return df.reset_index(drop=True)
+        return hashlib.sha256(raw.encode()).hexdigest()[:20]
 
     # -----------------------------------------------------
 
@@ -162,16 +68,57 @@ class StockPriceFetcher:
 
     # -----------------------------------------------------
 
-    def _cache_key(self, ticker, start, end, interval):
+    def _normalize_schema(self, df: pd.DataFrame):
 
-        raw = f"{ticker}_{start}_{end}_{interval}"
-        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df.columns = [str(c).lower() for c in df.columns]
+
+        if "date" not in df.columns:
+            df = df.reset_index()
+            df.rename(columns={df.columns[0]: "date"}, inplace=True)
+
+        df["date"] = pd.to_datetime(
+            df["date"],
+            errors="coerce",
+            utc=True
+        ).dt.tz_convert(None)
+
+        numeric_cols = ["open", "high", "low", "close", "volume"]
+
+        for col in numeric_cols:
+
+            if col not in df.columns:
+                raise RuntimeError(f"Provider schema violation: {col}")
+
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df.dropna(subset=["date"] + numeric_cols, inplace=True)
+
+        return df
+
+    # -----------------------------------------------------
+
+    def _validate_dataset(self, df, start_date, end_date):
+
+        df = self._normalize_schema(df)
+
+        df = df.drop_duplicates("date").sort_values("date")
+
+        if (df["close"] <= 0).any():
+            raise RuntimeError("Invalid close prices detected.")
+
+        if len(df) < self.MIN_ROWS:
+            raise RuntimeError(f"Dataset too small: {len(df)} rows")
+
+        return df.reset_index(drop=True)
 
     # -----------------------------------------------------
 
     def fetch(self, ticker, start_date, end_date, interval="1d"):
 
-        self._validate_dates(start_date, end_date)
+        end_date = self._cap_to_yesterday(end_date)
 
         cache_file = (
             f"{self.CACHE_DIR}/"
@@ -197,7 +144,7 @@ class StockPriceFetcher:
         df = self._fetch_yahoo(
             ticker,
             start_date,
-            end_date,
+            end_date.strftime("%Y-%m-%d"),
             interval
         )
 
@@ -238,9 +185,7 @@ class StockPriceFetcher:
                 )
 
                 if df.empty:
-                    raise RuntimeError(
-                        "Yahoo returned empty dataframe"
-                    )
+                    raise RuntimeError("Yahoo returned empty dataframe")
 
                 return df
 
