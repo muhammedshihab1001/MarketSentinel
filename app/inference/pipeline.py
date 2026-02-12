@@ -89,6 +89,8 @@ class InferencePipeline:
         os.getenv("MAX_DATA_AGE_HOURS", "24")
     )
 
+    SHADOW_DIVERGENCE_THRESHOLD = 0.35
+
     def __init__(self):
 
         self.market_data = MarketDataService()
@@ -105,6 +107,8 @@ class InferencePipeline:
 
         self._validate_models_loaded()
 
+    ########################################################
+
     def _validate_models_loaded(self):
 
         if self.models.xgb is None:
@@ -112,6 +116,11 @@ class InferencePipeline:
 
         if not hasattr(self.models.xgb, "predict_proba"):
             raise RuntimeError("Invalid XGBoost artifact.")
+
+        if self.models.sarimax is None:
+            raise RuntimeError("SARIMAX model not loaded.")
+
+    ########################################################
 
     def _validate_data_freshness(self, df: pd.DataFrame):
 
@@ -132,17 +141,9 @@ class InferencePipeline:
                 age_hours
             )
 
+    ########################################################
+
     def _extract_features(self, latest_row):
-
-        missing = [
-            f for f in MODEL_FEATURES
-            if f not in latest_row
-        ]
-
-        if missing:
-            raise RuntimeError(
-                f"Feature mismatch detected. Missing: {missing}"
-            )
 
         vector = latest_row.loc[list(MODEL_FEATURES)].astype("float32")
 
@@ -157,6 +158,27 @@ class InferencePipeline:
             )
 
         return vector.values.reshape(1, -1)
+
+    ########################################################
+
+    def _run_shadow_sarimax(self, price_df):
+
+        try:
+
+            forecast = self.models.sarimax.forecast(steps=30)
+
+            slope = forecast["normalized_slope"]
+
+            prob_like = float(np.tanh(slope * 5) * 0.5 + 0.5)
+
+            return prob_like
+
+        except Exception:
+
+            logger.exception("SARIMAX shadow inference failed.")
+            return None
+
+    ########################################################
 
     def _guard_latency(self, start, model):
 
@@ -176,6 +198,8 @@ class InferencePipeline:
 
         return elapsed
 
+    ########################################################
+
     def run(self, ticker="AAPL"):
 
         if not self.breaker.allow():
@@ -187,9 +211,7 @@ class InferencePipeline:
 
         try:
 
-            payload = {
-                "ticker": ticker
-            }
+            payload = {"ticker": ticker}
 
             cache_key = self.cache.build_key(payload)
 
@@ -246,6 +268,24 @@ class InferencePipeline:
 
                 PREDICTION_CLASS_PROBABILITY.set(float(prob_up))
 
+                ################################################
+                # SHADOW MODEL
+                ################################################
+
+                shadow_prob = self._run_shadow_sarimax(price_df)
+
+                if shadow_prob is not None:
+
+                    divergence = abs(prob_up - shadow_prob)
+
+                    if divergence > self.SHADOW_DIVERGENCE_THRESHOLD:
+                        logger.warning(
+                            "Champion/Challenger divergence detected: %.3f",
+                            divergence
+                        )
+
+                ################################################
+
                 predicted_return = prob_up - 0.5
 
                 decision = self.decision_engine.generate(
@@ -255,6 +295,8 @@ class InferencePipeline:
                     prob_up=prob_up,
                     volatility=latest.get("volatility", 0),
                     lstm_prices=None,
+                    prophet_trend=None,
+                    regime=None
                 )
 
                 SIGNAL_DISTRIBUTION.labels(
