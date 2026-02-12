@@ -25,6 +25,8 @@ class FeatureEngineer:
 
     MERGE_TOLERANCE = pd.Timedelta("3D")
 
+    VOL_FLOOR = 1e-4
+
     ####################################################
     # DATETIME NORMALIZATION
     ####################################################
@@ -41,7 +43,6 @@ class FeatureEngineer:
 
         return df
 
-
     ####################################################
     # PRICE VALIDATION
     ####################################################
@@ -52,11 +53,12 @@ class FeatureEngineer:
         if df is None or df.empty:
             raise RuntimeError("Price dataframe is empty.")
 
-        if not {"date", "close"}.issubset(df.columns):
+        required = {"date", "close"}
+
+        if not required.issubset(df.columns):
             raise RuntimeError("Price dataframe missing required columns.")
 
         df = FeatureEngineer._normalize_datetime(df)
-
         df = df.sort_values("date")
 
         if df["date"].duplicated().any():
@@ -73,7 +75,6 @@ class FeatureEngineer:
 
         return df
 
-
     ####################################################
     # FLOAT32 ENFORCEMENT
     ####################################################
@@ -86,7 +87,6 @@ class FeatureEngineer:
 
         return df
 
-
     ####################################################
     # FEATURE BUILDERS
     ####################################################
@@ -95,11 +95,9 @@ class FeatureEngineer:
     def add_returns(df):
 
         returns = df["close"].pct_change()
-
         lo, hi = FeatureEngineer.RETURN_CLAMP
 
         df["return"] = returns.clip(lo, hi)
-
 
     @staticmethod
     def add_volatility(df, window=5):
@@ -108,9 +106,8 @@ class FeatureEngineer:
             df["return"]
             .rolling(window, min_periods=window)
             .std()
-            .clip(0, 5)
+            .clip(lower=FeatureEngineer.VOL_FLOOR, upper=5)
         )
-
 
     @staticmethod
     def add_rsi(df, window=14):
@@ -127,7 +124,6 @@ class FeatureEngineer:
 
         df["rsi"] = (100 - (100 / (1 + rs))).clip(0, 100)
 
-
     @staticmethod
     def add_macd(df):
 
@@ -140,9 +136,8 @@ class FeatureEngineer:
         df["macd"] = macd.clip(-50, 50)
         df["macd_signal"] = signal.clip(-50, 50)
 
-
     ####################################################
-    # SENTIMENT MERGE (CRITICAL FIX)
+    # SENTIMENT MERGE (LOOKAHEAD SAFE)
     ####################################################
 
     @classmethod
@@ -154,7 +149,6 @@ class FeatureEngineer:
             "news_count": 0.0,
             "sentiment_std": 0.0
         })
-
 
     @classmethod
     def merge_price_sentiment(cls, price_df, sentiment_df):
@@ -183,7 +177,8 @@ class FeatureEngineer:
                 as_index=False
             )[cls.SENTIMENT_COLUMNS[1:]].mean()
 
-        sentiment["date"] = sentiment["date"] + pd.Timedelta(days=1)
+        # SHIFT FOR LOOKAHEAD SAFETY
+        sentiment["date"] += pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
             price,
@@ -199,7 +194,6 @@ class FeatureEngineer:
 
         return merged
 
-
     ####################################################
     # TARGET ENGINEERING
     ####################################################
@@ -213,9 +207,7 @@ class FeatureEngineer:
 
         forward = log_close.shift(-1) - log_close
 
-        vol_floor = 1e-3
-
-        risk_adj = forward / df["volatility"].clip(lower=vol_floor)
+        risk_adj = forward / df["volatility"].clip(lower=cls.VOL_FLOOR)
 
         DEAD_ZONE = 0.06
 
@@ -233,7 +225,6 @@ class FeatureEngineer:
 
         return df
 
-
     @classmethod
     def create_inference_dataset(cls, df):
 
@@ -248,7 +239,6 @@ class FeatureEngineer:
         df.dropna(inplace=True)
 
         return df
-
 
     ####################################################
     # MASTER PIPELINE
@@ -282,15 +272,25 @@ class FeatureEngineer:
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-        df.dropna(subset=MODEL_FEATURES, inplace=True)
+        # 🔥 STRICT FEATURE SELECTION FIRST
+        feature_block = df.loc[:, MODEL_FEATURES]
 
-        validated = validate_feature_schema(
-            df.drop(columns=["target"], errors="ignore")
-        )
+        # HARD LEAKAGE GUARD
+        unexpected = set(feature_block.columns) - set(MODEL_FEATURES)
+
+        if unexpected:
+            raise RuntimeError(
+                f"Feature leakage detected: {sorted(unexpected)}"
+            )
+
+        validated = validate_feature_schema(feature_block)
+
+        # Only allow safe columns outside features
+        allowed_non_features = {"date", "target"}
 
         non_features = [
             col for col in df.columns
-            if col not in MODEL_FEATURES
+            if col in allowed_non_features
         ]
 
         final = pd.concat(
