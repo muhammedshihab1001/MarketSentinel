@@ -14,6 +14,7 @@ class WalkForwardValidator:
 
     EMBARGO_DAYS = 52
     MIN_TRADES_PER_WINDOW = 5
+    MIN_TRAIN_ROWS = 500
 
     def __init__(
         self,
@@ -48,24 +49,42 @@ class WalkForwardValidator:
                 "Training dataframe not sorted by ['date','ticker']."
             )
 
-        validate_feature_schema(df)
+        feature_slice = df.loc[:, MODEL_FEATURES]
+        validate_feature_schema(feature_slice)
 
         if df["target"].nunique() < 2:
             raise RuntimeError(
                 "Training labels collapsed. No class diversity."
             )
 
+        if len(df) < self.MIN_TRAIN_ROWS:
+            raise RuntimeError(
+                "Training window too small after embargo."
+            )
+
     ############################################
     # MODEL CHECKS
     ############################################
 
+    def _validate_classifier_contract(self, model):
+
+        if not hasattr(model, "predict_proba"):
+            raise RuntimeError(
+                "Model lacks predict_proba. Classifier required."
+            )
+
     def _sanity_check_model(self, model, sample_df):
+
+        self._validate_classifier_contract(model)
 
         X = sample_df.loc[:, MODEL_FEATURES].iloc[:50]
 
         preds = model.predict_proba(X)[:, 1]
 
-        if np.std(preds) < 1e-4:
+        if not np.isfinite(preds).all():
+            raise RuntimeError("Model produced non-finite predictions.")
+
+        if np.std(preds) < 5e-5:
             raise RuntimeError(
                 "Model collapsed. Predictions nearly constant."
             )
@@ -76,10 +95,27 @@ class WalkForwardValidator:
 
         preds = model.predict_proba(X)[:, 1]
 
-        if np.std(preds) < 5e-4:
+        if not np.isfinite(preds).all():
+            raise RuntimeError("Model unstable — non-finite outputs.")
+
+        if np.std(preds) < 1e-4:
             raise RuntimeError(
                 "Model unstable on unseen data."
             )
+
+    ############################################
+    # PRICE VALIDATION
+    ############################################
+
+    def _validate_prices(self, prices):
+
+        arr = np.array(list(prices.values()), dtype=float)
+
+        if not np.isfinite(arr).all():
+            raise RuntimeError("Invalid prices detected.")
+
+        if (arr <= 0).any():
+            raise RuntimeError("Non-positive prices detected.")
 
     ############################################
     # RUN
@@ -146,6 +182,11 @@ class WalkForwardValidator:
                 unique_dates < embargo_cutoff
             ].tail(self.window_size)
 
+            if len(train_dates) < self.MIN_TRAIN_ROWS:
+                raise RuntimeError(
+                    "Embargo consumed too much training history."
+                )
+
             test_dates = unique_dates[
                 (unique_dates >= train_end_date) &
                 (unique_dates < train_end_date + pd.Timedelta(days=365))
@@ -186,10 +227,17 @@ class WalkForwardValidator:
                     zip(slice_df["ticker"], slice_df["close"])
                 )
 
+                self._validate_prices(prices)
+
                 signals_list = self.signal_generator(
                     model,
                     slice_df
                 )
+
+                if len(signals_list) != len(slice_df):
+                    raise RuntimeError(
+                        "Signal generator returned mismatched length."
+                    )
 
                 trade_counter += sum(
                     1 for s in signals_list
@@ -224,14 +272,19 @@ class WalkForwardValidator:
                     "Strategy collapsed. Capital depleted."
                 )
 
-            capital = float(metrics["final_portfolio"])
-
             curve = np.array(metrics["equity_curve"], dtype=float)
 
             if not np.isfinite(curve).all():
                 raise RuntimeError(
                     "Equity curve contains invalid values."
                 )
+
+            if (curve <= 0).any():
+                raise RuntimeError(
+                    "Negative equity encountered."
+                )
+
+            capital = float(metrics["final_portfolio"])
 
             if equity_curve:
                 equity_curve.extend(curve[1:].tolist())
