@@ -4,10 +4,14 @@ import requests
 import pandas as pd
 import hashlib
 import time
+import tempfile
 
 from datetime import datetime, timedelta
 from dateutil import parser
 from typing import Optional
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from core.config.env_loader import init_env, get_bool
 
@@ -17,25 +21,6 @@ logger = logging.getLogger("marketsentinel.news")
 
 
 class NewsFetcher:
-    """
-    Institutional Multi-Provider News Engine
-
-    Priority:
-        1. Marketaux
-        2. GNews
-        3. Safe empty dataframe (never crash training)
-
-    Guarantees:
-        ✔ schema normalized
-        ✔ deduplicated
-        ✔ retry protected
-        ✔ rate-limit resilient
-        ✔ ingestion-delay safe
-        ✔ deterministic ordering
-        ✔ variance friendly
-        ✔ provider failover
-        ✔ disk cache
-    """
 
     MARKET_AUX_URL = "https://api.marketaux.com/v1/news/all"
     GNEWS_URL = "https://gnews.io/api/v4/search"
@@ -49,6 +34,8 @@ class NewsFetcher:
 
     CACHE_DIR = "data/news_cache"
     CACHE_TTL_MIN = 20
+
+    CACHE_SCHEMA_VERSION = "v2"
 
     EMPTY_SCHEMA = pd.DataFrame(
         columns=["headline", "published_at", "source", "link"]
@@ -67,19 +54,50 @@ class NewsFetcher:
 
         os.makedirs(self.CACHE_DIR, exist_ok=True)
 
-        self.session = requests.Session()
-        self.session.headers.update(
+        self.session = self._build_session()
+
+    ########################################################
+    # HARDENED SESSION
+    ########################################################
+
+    def _build_session(self):
+
+        session = requests.Session()
+
+        retry = Retry(
+            total=3,
+            backoff_factor=0.6,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"]
+        )
+
+        adapter = HTTPAdapter(
+            pool_connections=20,
+            pool_maxsize=20,
+            max_retries=retry
+        )
+
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
+        session.headers.update(
             {"User-Agent": "MarketSentinel/Institutional"}
         )
 
+        return session
+
     ########################################################
-    # CACHE
+    # VERSIONED CACHE KEY (CRITICAL)
     ########################################################
 
-    def _cache_path(self, query: str):
+    def _cache_path(self, query: str, limit: int):
 
-        key = hashlib.sha256(query.encode()).hexdigest()[:16]
+        raw = f"{self.CACHE_SCHEMA_VERSION}|{query}|{limit}|{self.MAX_AGE_HOURS}"
+        key = hashlib.sha256(raw.encode()).hexdigest()[:20]
+
         return f"{self.CACHE_DIR}/{key}.parquet"
+
+    ########################################################
 
     def _load_cache(self, path: str) -> Optional[pd.DataFrame]:
 
@@ -96,71 +114,39 @@ class NewsFetcher:
             return None
 
         try:
-            df = pd.read_parquet(path)
-
-            if not df.empty:
-                return df
-
+            return pd.read_parquet(path)
         except Exception:
-            pass
+            logger.warning("News cache corrupted — rebuilding.")
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            return None
 
-        return None
+    ########################################################
+    # TRUE ATOMIC WRITE
+    ########################################################
 
     def _write_cache(self, df, path):
 
         try:
-            tmp = path + ".tmp"
-            df.to_parquet(tmp, index=False)
-            os.replace(tmp, path)
+
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                dir=self.CACHE_DIR,
+                suffix=".tmp"
+            ) as tmp:
+
+                df.to_parquet(tmp.name, index=False)
+                temp_name = tmp.name
+
+            os.replace(temp_name, path)
+
         except Exception:
             logger.warning("News cache write failed.")
 
     ########################################################
-    # RETRY WRAPPER
-    ########################################################
-
-    def _request(self, url, params):
-
-        for attempt in range(self.MAX_RETRIES):
-
-            try:
-
-                r = self.session.get(
-                    url,
-                    params=params,
-                    timeout=self.REQUEST_TIMEOUT
-                )
-
-                if r.status_code == 429:
-                    sleep = 1.5 * (attempt + 1)
-                    logger.warning(
-                        "Rate limited — sleeping %.1fs",
-                        sleep
-                    )
-                    time.sleep(sleep)
-                    continue
-
-                r.raise_for_status()
-
-                return r.json()
-
-            except Exception as e:
-
-                if attempt == self.MAX_RETRIES - 1:
-                    raise
-
-                sleep = 1.2 * (attempt + 1)
-                logger.warning(
-                    "News retry %s: %s",
-                    attempt + 1,
-                    str(e)
-                )
-                time.sleep(sleep)
-
-        return {}
-
-    ########################################################
-    # NORMALIZATION
+    # DATE NORMALIZATION
     ########################################################
 
     @staticmethod
@@ -196,7 +182,6 @@ class NewsFetcher:
         ]
 
         df["headline"] = df["headline"].str.strip()
-
         df = df[df["headline"].str.len() > 12]
 
         df["key"] = (
@@ -228,10 +213,15 @@ class NewsFetcher:
             "limit": limit
         }
 
-        data = self._request(
+        r = self.session.get(
             self.MARKET_AUX_URL,
-            params
-        ).get("data", [])
+            params=params,
+            timeout=self.REQUEST_TIMEOUT
+        )
+
+        r.raise_for_status()
+
+        data = r.json().get("data", [])
 
         rows = []
 
@@ -267,10 +257,15 @@ class NewsFetcher:
             "max": limit
         }
 
-        data = self._request(
+        r = self.session.get(
             self.GNEWS_URL,
-            params
-        ).get("articles", [])
+            params=params,
+            timeout=self.REQUEST_TIMEOUT
+        )
+
+        r.raise_for_status()
+
+        data = r.json().get("articles", [])
 
         rows = []
 
@@ -293,12 +288,36 @@ class NewsFetcher:
         return self._post_process(pd.DataFrame(rows))
 
     ########################################################
+    # MERGED PROVIDERS (INSTITUTIONAL FIX)
+    ########################################################
+
+    def _merge_sources(self, primary, fallback):
+
+        if primary.empty:
+            return fallback
+
+        if fallback.empty:
+            return primary
+
+        merged = pd.concat([primary, fallback], ignore_index=True)
+
+        merged["key"] = (
+            merged["headline"].str.lower() +
+            merged["source"].str.lower()
+        )
+
+        merged = merged.drop_duplicates("key")
+        merged = merged.drop(columns="key")
+
+        return merged.sort_values("published_at").reset_index(drop=True)
+
+    ########################################################
     # PUBLIC
     ########################################################
 
     def fetch(self, query: str, max_items=120):
 
-        cache_path = self._cache_path(query)
+        cache_path = self._cache_path(query, max_items)
 
         cached = self._load_cache(cache_path)
 
@@ -308,64 +327,28 @@ class NewsFetcher:
 
         logger.info("Fetching news: %s", query)
 
-        ###############################################
-        # PRIMARY
-        ###############################################
+        primary = pd.DataFrame()
+        fallback = pd.DataFrame()
 
         try:
-
-            df = self._fetch_marketaux(query, max_items)
-
-            if len(df) >= self.MIN_ARTICLES:
-                self._write_cache(df, cache_path)
-
-                logger.info(
-                    "Marketaux OK (%s articles)",
-                    len(df)
-                )
-
-                return df
-
-            logger.warning(
-                "Marketaux sparse (%s)",
-                len(df)
-            )
-
+            primary = self._fetch_marketaux(query, max_items)
         except Exception as e:
+            logger.warning("Marketaux failed: %s", str(e))
 
+        if self.failover_enabled:
+            try:
+                fallback = self._fetch_gnews(query, max_items)
+            except Exception as e:
+                logger.warning("Fallback provider failed: %s", str(e))
+
+        merged = self._merge_sources(primary, fallback)
+
+        if len(merged) < self.MIN_ARTICLES:
             logger.warning(
-                "Marketaux failed: %s",
-                str(e)
+                "Low article count after merge (%s).",
+                len(merged)
             )
 
-        ###############################################
-        # FAILOVER
-        ###############################################
+        self._write_cache(merged, cache_path)
 
-        if not self.failover_enabled:
-            logger.warning("Failover disabled.")
-            return self.EMPTY_SCHEMA.copy()
-
-        try:
-
-            fallback = self._fetch_gnews(query, max_items)
-
-            if not fallback.empty:
-                self._write_cache(fallback, cache_path)
-
-                logger.info(
-                    "GNews OK (%s articles)",
-                    len(fallback)
-                )
-
-                return fallback
-
-        except Exception as e:
-            logger.warning(
-                "Fallback provider failed: %s",
-                str(e)
-            )
-
-        logger.error("All news providers failed.")
-
-        return self.EMPTY_SCHEMA.copy()
+        return merged if not merged.empty else self.EMPTY_SCHEMA.copy()
