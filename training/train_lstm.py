@@ -38,14 +38,13 @@ def configure_runtime():
 
     os.environ["PYTHONHASHSEED"] = str(SEED)
     os.environ["TF_DETERMINISTIC_OPS"] = "1"
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-
-    # CPU-only ensures deterministic results
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
+
+    # CRITICAL — true determinism
+    tf.config.experimental.enable_op_determinism()
 
 
 ############################################################
@@ -91,17 +90,15 @@ def atomic_joblib_dump(obj, path):
 
 
 ############################################################
-# LOAD DATA — CLOCK + UNIVERSE GOVERNED
+# LOAD DATA — GOVERNED
 ############################################################
 
 def load_data(start_date, end_date):
 
     fetcher = StockPriceFetcher()
-
-    datasets = []
     universe = MarketUniverse.get_universe()
 
-    print(f"Training universe size: {len(universe)}")
+    datasets = []
 
     for ticker in universe:
 
@@ -111,34 +108,28 @@ def load_data(start_date, end_date):
             end_date=end_date
         )
 
-        if df is None or df.empty:
-            continue
-
-        if len(df) < MIN_ROWS_PER_TICKER:
+        if df is None or len(df) < MIN_ROWS_PER_TICKER:
             continue
 
         df["ticker"] = ticker
         datasets.append(df)
 
-    # 🚨 Universe collapse protection
     if len(datasets) < 6:
-        raise RuntimeError(
-            "Universe collapse — too few assets survived."
-        )
+        raise RuntimeError("Universe collapse — too few assets survived.")
 
     df = pd.concat(datasets, ignore_index=True)
 
     df["date"] = pd.to_datetime(df["date"])
     df.sort_values(["ticker", "date"], inplace=True)
 
-    return df.reset_index(drop=True)
+    return df.reset_index(drop=True), universe
 
 
 ############################################################
 # SEQUENCE BUILDER
 ############################################################
 
-def build_sequences_with_scalers(df):
+def build_sequences(df):
 
     X_all = []
     y_all = []
@@ -194,15 +185,17 @@ def apply_scalers(df, scalers):
 
 
 ############################################################
+# TIME SAFE VALIDATION
+############################################################
 
 def time_series_validation(df):
 
-    split_date = df["date"].quantile(0.8)
+    split_idx = int(len(df) * 0.8)
 
-    train_df = df[df["date"] <= split_date]
-    test_df = df[df["date"] > split_date]
+    train_df = df.iloc[:split_idx]
+    test_df = df.iloc[split_idx:]
 
-    X_train, y_train, scalers = build_sequences_with_scalers(train_df)
+    X_train, y_train, scalers = build_sequences(train_df)
     X_test, y_test = apply_scalers(test_df, scalers)
 
     model = build_lstm_model((LOOKBACK_WINDOW, 1))
@@ -233,7 +226,7 @@ def time_series_validation(df):
 
 
 ############################################################
-# MAIN — INSTITUTIONAL CLOCK
+# MAIN — GOVERNED CLOCK
 ############################################################
 
 def main(start_date=None, end_date=None):
@@ -241,11 +234,11 @@ def main(start_date=None, end_date=None):
     configure_runtime()
 
     if start_date is None or end_date is None:
-        start_date, end_date = MarketTime.training_window()
+        start_date, end_date = MarketTime.window_for("lstm")
 
     print(f"Institutional LSTM Training | {start_date} -> {end_date}")
 
-    df = load_data(start_date, end_date)
+    df, universe = load_data(start_date, end_date)
 
     dataset_hash = MetadataManager.fingerprint_dataset(
         df[["ticker", "date", "close"]]
@@ -263,13 +256,11 @@ def main(start_date=None, end_date=None):
         training_start=start_date,
         training_end=end_date,
         dataset_hash=dataset_hash,
-        metadata_type="training_manifest_v1",
+        metadata_type="sequence_manifest_v1",
         extra_fields={
-            "training_window": {
-                "start": start_date,
-                "end": end_date
-            },
-            "training_universe": MarketUniverse.get_universe()
+            "training_universe": universe,
+            "universe_hash": MetadataManager.hash_list(universe),
+            "lookback_window": LOOKBACK_WINDOW
         }
     )
 
@@ -284,7 +275,6 @@ def main(start_date=None, end_date=None):
     scaler_target = os.path.join(MODEL_DIR, version, "scalers.pkl")
 
     os.replace(SCALER_PATH, scaler_target)
-
     _fsync_dir(os.path.join(MODEL_DIR, version))
 
     print(f"LSTM registered → {version}")
