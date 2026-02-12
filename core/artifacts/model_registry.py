@@ -4,7 +4,7 @@ import datetime
 import shutil
 import hashlib
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from core.schema.feature_schema import (
     get_schema_signature,
@@ -39,7 +39,7 @@ class ModelRegistry:
         return f"{ts}_{suffix}"
 
     ########################################################
-    # DIRECTORY HASH (DETERMINISTIC)
+    # HASHING
     ########################################################
 
     @staticmethod
@@ -62,10 +62,6 @@ class ModelRegistry:
                         hasher.update(chunk)
 
         return hasher.hexdigest()
-
-    ########################################################
-    # FILE OR DIRECTORY HASH
-    ########################################################
 
     @staticmethod
     def _sha256(path: str) -> str:
@@ -183,7 +179,7 @@ class ModelRegistry:
         with open(manifest_path) as f:
             manifest = json.load(f)
 
-        if not manifest["artifacts"]:
+        if not manifest.get("artifacts"):
             raise RuntimeError("Manifest contains no artifacts.")
 
         for artifact, expected_hash in manifest["artifacts"].items():
@@ -258,7 +254,6 @@ class ModelRegistry:
             os.replace(staging_dir, version_dir)
             ModelRegistry._fsync_dir(base_dir)
 
-            # critical verification step
             ModelRegistry.verify_artifacts(base_dir, version)
 
             return version
@@ -269,7 +264,7 @@ class ModelRegistry:
             raise
 
     ########################################################
-    # PROMOTION (ATOMIC)
+    # PROMOTION
     ########################################################
 
     @staticmethod
@@ -284,6 +279,8 @@ class ModelRegistry:
 
         if not os.path.exists(version_dir):
             raise RuntimeError("Cannot promote missing version.")
+
+        ModelRegistry.verify_artifacts(base_dir, version)
 
         try:
             open(lock_path, "w").close()
@@ -303,3 +300,84 @@ class ModelRegistry:
         finally:
             if os.path.exists(lock_path):
                 os.remove(lock_path)
+
+    ########################################################
+    # REGISTRY INTROSPECTION
+    ########################################################
+
+    @staticmethod
+    def get_latest_version(base_dir: str) -> str:
+
+        pointer_path = os.path.join(
+            base_dir,
+            ModelRegistry.LATEST_POINTER
+        )
+
+        if not os.path.exists(pointer_path):
+            raise RuntimeError(
+                "Latest pointer missing — registry uninitialized."
+            )
+
+        with open(pointer_path) as f:
+            payload = json.load(f)
+
+        version = payload.get("version")
+
+        if not version:
+            raise RuntimeError("Latest pointer corrupted.")
+
+        return version
+
+    ########################################################
+
+    @staticmethod
+    def load_manifest(base_dir: str, version: str) -> Dict[str, Any]:
+
+        manifest_path = os.path.join(
+            base_dir,
+            version,
+            ModelRegistry.MANIFEST_NAME
+        )
+
+        if not os.path.exists(manifest_path):
+            raise RuntimeError(
+                f"Manifest missing for version {version}"
+            )
+
+        with open(manifest_path) as f:
+            return json.load(f)
+
+    ########################################################
+
+    @staticmethod
+    def list_versions(base_dir: str) -> List[str]:
+
+        if not os.path.exists(base_dir):
+            return []
+
+        versions = []
+
+        for name in os.listdir(base_dir):
+
+            path = os.path.join(base_dir, name)
+
+            if not os.path.isdir(path):
+                continue
+
+            if name.endswith(".staging"):
+                continue
+
+            if name.startswith("."):
+                continue
+
+            manifest = os.path.join(
+                path,
+                ModelRegistry.MANIFEST_NAME
+            )
+
+            if os.path.exists(manifest):
+                versions.append(name)
+
+        versions.sort()
+
+        return versions
