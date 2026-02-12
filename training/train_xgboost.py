@@ -57,7 +57,7 @@ def save_model_atomic(model, path):
 
 
 ########################################################
-# DATA LOADER (FIXED)
+# DATA LOADER — FINAL FIX
 ########################################################
 
 def load_training_data():
@@ -82,9 +82,6 @@ def load_training_data():
         if price_df is None or price_df.empty:
             continue
 
-        # Preserve close BEFORE pipeline
-        close_map = price_df[["date", "close"]].copy()
-
         news_df = news_fetcher.fetch(
             f"{ticker} stock",
             max_items=100
@@ -103,18 +100,18 @@ def load_training_data():
             continue
 
         ####################################################
-        # REATTACH CLOSE SAFELY
+        # HARD CONTRACT — CLOSE MUST EXIST
         ####################################################
 
-        dataset = dataset.merge(
-            close_map,
-            on="date",
-            how="left",
-            validate="one_to_one"
-        )
+        if "close" not in dataset.columns:
+            raise RuntimeError(
+                "CRITICAL: Feature pipeline dropped 'close'."
+            )
 
         if dataset["close"].isna().any():
-            raise RuntimeError("Close price merge failure detected.")
+            raise RuntimeError(
+                "NaN close detected after feature pipeline."
+            )
 
         dataset["ticker"] = ticker
 
@@ -152,12 +149,6 @@ def load_training_data():
         ],
         axis=1
     )
-
-    # Safety assertion
-    missing = set(MODEL_FEATURES) - set(final.columns)
-
-    if missing:
-        raise RuntimeError(f"Training dataset missing features: {missing}")
 
     return final, end_date
 
