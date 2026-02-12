@@ -7,13 +7,45 @@ class BacktestEngine:
 
     Guarantees:
     - no lookahead execution
+    - leverage guard
     - slippage modeling
-    - partial capital deployment
-    - forced position flattening counted as trade
-    - no unintended pyramiding
+    - bankruptcy termination
+    - signal validation
     - exposure tracking
-    - turnover visibility
+    - true turnover
     """
+
+    VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
+
+    MIN_CAPITAL = 1e-6
+
+    def _validate_inputs(self, prices, signals, position_size):
+
+        if position_size <= 0 or position_size > 1.0:
+            raise RuntimeError(
+                "position_size must be within (0, 1]. "
+                "Leverage requires explicit margin modeling."
+            )
+
+        if len(prices) != len(signals):
+            raise RuntimeError("Prices and signals length mismatch.")
+
+        if len(prices) < 2:
+            return
+
+        prices = np.asarray(prices, dtype=float)
+
+        if not np.isfinite(prices).all():
+            raise RuntimeError("Non-finite prices detected.")
+
+        if (prices <= 0).any():
+            raise RuntimeError("Invalid non-positive prices detected.")
+
+        unknown = set(signals) - self.VALID_SIGNALS
+        if unknown:
+            raise RuntimeError(f"Unknown signals detected: {unknown}")
+
+    ############################################################
 
     def run(
         self,
@@ -25,19 +57,22 @@ class BacktestEngine:
         position_size=1.0
     ):
 
-        if len(prices) != len(signals):
-            raise ValueError("Prices and signals must have same length")
+        self._validate_inputs(prices, signals, position_size)
+
+        prices = np.asarray(prices, dtype=float)
+        signals = list(signals)
 
         if len(prices) < 2:
             return self._empty_result(initial_cash)
 
-        cash = initial_cash
+        cash = float(initial_cash)
         position = 0.0
 
         portfolio_values = []
 
         trade_count = 0
         time_in_market = 0
+        capital_rotated = 0.0
 
         prev_signal = "HOLD"
 
@@ -45,16 +80,20 @@ class BacktestEngine:
 
             price = prices[i]
 
-            # --------------------------------------------
-            # EXECUTE PREVIOUS SIGNAL (NO LOOKAHEAD)
-            # --------------------------------------------
+            ####################################################
+            # EXECUTE PREVIOUS SIGNAL
+            ####################################################
 
-            # BUY only if flat
-            if prev_signal == "BUY" and cash > 0 and position == 0:
+            if prev_signal == "BUY" and cash > self.MIN_CAPITAL and position == 0:
 
                 execution_price = price * (1 + slippage)
 
                 deploy_cash = cash * position_size
+
+                if deploy_cash <= self.MIN_CAPITAL:
+                    prev_signal = signals[i]
+                    portfolio_values.append(cash)
+                    continue
 
                 shares = (
                     deploy_cash * (1 - transaction_cost)
@@ -63,9 +102,9 @@ class BacktestEngine:
                 position = shares
                 cash -= deploy_cash
 
+                capital_rotated += deploy_cash
                 trade_count += 1
 
-            # SELL only if holding
             elif prev_signal == "SELL" and position > 0:
 
                 execution_price = price * (1 - slippage)
@@ -76,35 +115,48 @@ class BacktestEngine:
                     * (1 - transaction_cost)
                 )
 
+                capital_rotated += proceeds
+
                 cash += proceeds
                 position = 0
 
                 trade_count += 1
 
+            ####################################################
+            # BANKRUPTCY GUARD
+            ####################################################
+
+            portfolio_value = cash + position * price
+
+            if portfolio_value <= self.MIN_CAPITAL:
+                portfolio_values.append(self.MIN_CAPITAL)
+                break
+
             if position > 0:
                 time_in_market += 1
 
-            portfolio_value = cash + position * price
             portfolio_values.append(portfolio_value)
 
             prev_signal = signals[i]
 
-        # --------------------------------------------
-        # FORCE LIQUIDATION (COUNT AS TRADE)
-        # --------------------------------------------
+        ####################################################
+        # FORCE LIQUIDATION
+        ####################################################
 
         if position > 0:
 
-            final_price = prices[-1] * (1 - slippage)
+            final_price = prices[len(portfolio_values) - 1] * (1 - slippage)
 
             cash += position * final_price * (1 - transaction_cost)
             position = 0
 
             portfolio_values[-1] = cash
 
-            trade_count += 1   # CRITICAL FIX
+            trade_count += 1
 
-        portfolio_values = np.array(portfolio_values)
+        portfolio_values = np.array(portfolio_values, dtype=float)
+
+        portfolio_values = np.maximum(portfolio_values, self.MIN_CAPITAL)
 
         strategy_return = portfolio_values[-1] / initial_cash - 1
         buy_hold_return = prices[-1] / prices[0] - 1
@@ -112,8 +164,12 @@ class BacktestEngine:
 
         returns = np.diff(portfolio_values) / portfolio_values[:-1]
 
+        returns = returns[np.isfinite(returns)]
+
         if len(returns) > 1:
+
             std = np.std(returns)
+
             sharpe = (
                 np.mean(returns) / std * np.sqrt(252)
                 if std > 0 else 0.0
@@ -121,8 +177,12 @@ class BacktestEngine:
         else:
             sharpe = 0.0
 
-        exposure = time_in_market / len(prices)
-        turnover = trade_count / len(prices)
+        exposure = time_in_market / len(portfolio_values)
+
+        turnover = (
+            capital_rotated / initial_cash
+            if initial_cash > 0 else 0.0
+        )
 
         return {
             "final_portfolio": float(portfolio_values[-1]),
@@ -132,8 +192,11 @@ class BacktestEngine:
             "sharpe_ratio": float(sharpe),
             "trade_count": trade_count,
             "exposure": float(exposure),
-            "turnover": float(turnover)
+            "turnover": float(turnover),
+            "equity_curve": portfolio_values.tolist()
         }
+
+    ############################################################
 
     def _empty_result(self, initial_cash):
 
@@ -145,26 +208,32 @@ class BacktestEngine:
             "sharpe_ratio": 0.0,
             "trade_count": 0,
             "exposure": 0.0,
-            "turnover": 0.0
+            "turnover": 0.0,
+            "equity_curve": [initial_cash]
         }
 
 
-# -------------------------------------------------
-# Compatibility Wrapper Functions
-# -------------------------------------------------
+############################################################
+# SAFE WRAPPERS
+############################################################
 
 def backtest_strategy(df, signal_column="signal"):
 
     engine = BacktestEngine()
 
     prices = df["close"].values
-    signals = df[signal_column].values
+    signals = df[signal_column].fillna("HOLD").values
 
     results = engine.run(prices, signals)
 
+    curve = np.array(results["equity_curve"])
+
+    peak = np.maximum.accumulate(curve)
+    drawdown = (curve - peak) / peak
+
     return {
         "total_return": results["strategy_return"],
-        "max_drawdown": 0,
+        "max_drawdown": float(drawdown.min()),
         "sharpe_ratio": results["sharpe_ratio"]
     }
 
@@ -175,13 +244,15 @@ def signal_hit_rate(df, signal_column="signal"):
 
     df["future_return"] = df["close"].shift(-1) / df["close"] - 1
 
+    valid = df[signal_column].isin(["BUY", "SELL"])
+
     hits = df[
         ((df[signal_column] == "BUY") & (df["future_return"] > 0)) |
         ((df[signal_column] == "SELL") & (df["future_return"] < 0))
     ]
 
-    total_signals = df[signal_column].isin(["BUY", "SELL"]).sum()
+    total = valid.sum()
 
     return {
-        "hit_rate": len(hits) / total_signals if total_signals > 0 else 0
+        "hit_rate": len(hits) / total if total > 0 else 0.0
     }
