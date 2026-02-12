@@ -27,7 +27,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "7.0"   # 🔥 bump version
+    BASELINE_VERSION = "8.0"
 
     MIN_SAMPLE_BASELINE = 50
     MIN_SAMPLE_INFERENCE = 20
@@ -38,7 +38,9 @@ class DriftDetector:
     MAX_INFERENCE_ROWS = 500
 
     EPSILON = 1e-6
-    SOFT_VARIANCE_FLOOR = 1e-5   # 🔥 institutional tolerance
+    SOFT_VARIANCE_FLOOR = 1e-5
+
+    MIN_ACTIVE_FEATURE_RATIO = 0.60
 
     def __init__(self, z_threshold: float = 3.0):
         self.z_threshold = z_threshold
@@ -80,8 +82,18 @@ class DriftDetector:
         incoming = set(dataset.columns)
         expected = set(MODEL_FEATURES)
 
-        if expected - incoming:
-            raise RuntimeError("Drift schema violation.")
+        missing = expected - incoming
+        unknown = incoming - expected
+
+        if missing:
+            raise RuntimeError(
+                f"Drift schema violation. Missing={missing}"
+            )
+
+        if unknown:
+            raise RuntimeError(
+                f"Unknown features detected: {unknown}"
+            )
 
         block = dataset.loc[:, MODEL_FEATURES].copy()
 
@@ -92,7 +104,6 @@ class DriftDetector:
                 errors="coerce"
             )
 
-            # ✅ pandas 3 safe
             block[col] = block[col].replace(
                 [np.inf, -np.inf],
                 np.nan
@@ -105,6 +116,9 @@ class DriftDetector:
                     f"No finite values in feature '{col}'."
                 )
 
+        if list(block.columns) != list(MODEL_FEATURES):
+            raise RuntimeError("Feature ordering enforcement failed.")
+
         return block
 
     ########################################################
@@ -115,7 +129,7 @@ class DriftDetector:
     def _dataset_sha256(df: pd.DataFrame) -> str:
 
         ordered = df.reindex(columns=sorted(df.columns)).copy()
-        ordered = ordered.round(8)
+        ordered = ordered.round(6)
 
         hasher = hashlib.sha256()
         hasher.update(",".join(ordered.columns).encode())
@@ -129,6 +143,8 @@ class DriftDetector:
 
         return hasher.hexdigest()
 
+    ########################################################
+    # BASELINE CREATION
     ########################################################
 
     def create_baseline(
@@ -145,6 +161,24 @@ class DriftDetector:
 
         if dataset_hash is None:
             dataset_hash = self._dataset_sha256(numeric)
+
+        ####################################################
+        # OVERWRITE PROTECTION
+        ####################################################
+
+        if os.path.exists(self.BASELINE_PATH) and not allow_overwrite:
+
+            with open(self.BASELINE_PATH) as f:
+                existing = json.load(f)
+
+            if existing["meta"]["dataset_hash"] == dataset_hash:
+                logger.info("Baseline already matches dataset.")
+                return
+
+            raise RuntimeError(
+                "Baseline exists with different lineage. "
+                "Use allow_overwrite=True only after retraining."
+            )
 
         baseline: Dict[str, Any] = {
             "meta": {
@@ -165,27 +199,12 @@ class DriftDetector:
             series = numeric[col].dropna()
 
             if len(series) < self.MIN_SAMPLE_BASELINE:
-                logger.warning(
-                    "Skipping baseline feature '%s' — insufficient samples.",
-                    col
-                )
                 skipped_features.append(col)
                 continue
 
             std = series.std()
 
-            ####################################################
-            # 🔥 SOFT VARIANCE GUARD
-            ####################################################
-
             if std < self.SOFT_VARIANCE_FLOOR:
-
-                logger.warning(
-                    "Skipping baseline feature '%s' — low variance (%.8f).",
-                    col,
-                    std
-                )
-
                 skipped_features.append(col)
                 continue
 
@@ -198,7 +217,9 @@ class DriftDetector:
                 "count": int(len(series))
             }
 
-        if len(baseline["features"]) < len(MODEL_FEATURES) * 0.6:
+        active_ratio = len(baseline["features"]) / len(MODEL_FEATURES)
+
+        if active_ratio < self.MIN_ACTIVE_FEATURE_RATIO:
             raise RuntimeError(
                 "Too many unstable features — training unsafe."
             )
@@ -208,11 +229,13 @@ class DriftDetector:
         self._atomic_write(self.BASELINE_PATH, baseline)
 
         logger.info(
-            "Drift baseline created. Active=%d Skipped=%d",
+            "Drift baseline created | active=%d skipped=%d",
             len(baseline["features"]),
             len(skipped_features)
         )
 
+    ########################################################
+    # DETECT
     ########################################################
 
     def detect(self, dataset: pd.DataFrame):
@@ -227,6 +250,15 @@ class DriftDetector:
 
             with open(self.BASELINE_PATH) as f:
                 baseline = json.load(f)
+
+            ####################################################
+            # SCHEMA VALIDATION
+            ####################################################
+
+            if baseline["meta"]["schema_signature"] != get_schema_signature():
+                raise RuntimeError(
+                    "Baseline schema mismatch. Retraining required."
+                )
 
             numeric = self._safe_feature_block(
                 dataset.tail(self.MAX_INFERENCE_ROWS)
@@ -244,20 +276,26 @@ class DriftDetector:
 
                 var_now = max(current.var(), self.EPSILON)
 
-                z_score = abs(
-                    current.mean() - stats["mean"]
-                ) / max(stats["std"], self.EPSILON)
+                mean_now = current.mean()
+
+                z_score = abs(mean_now - stats["mean"]) / max(
+                    stats["std"], self.EPSILON
+                )
 
                 variance_ratio = var_now / max(
-                    stats["variance"],
-                    self.EPSILON
+                    stats["variance"], self.EPSILON
                 )
 
-                drift = (
-                    z_score > self.z_threshold
-                    or variance_ratio > self.VARIANCE_RATIO_UPPER
-                    or variance_ratio < self.VARIANCE_RATIO_LOWER
-                )
+                min_breach = current.min() < stats["min"]
+                max_breach = current.max() > stats["max"]
+
+                drift = any([
+                    z_score > self.z_threshold,
+                    variance_ratio > self.VARIANCE_RATIO_UPPER,
+                    variance_ratio < self.VARIANCE_RATIO_LOWER,
+                    min_breach,
+                    max_breach
+                ])
 
                 if drift:
                     drift_detected = True
@@ -265,6 +303,8 @@ class DriftDetector:
                 report[col] = {
                     "z_score": float(z_score),
                     "variance_ratio": float(variance_ratio),
+                    "min_breach": bool(min_breach),
+                    "max_breach": bool(max_breach),
                     "drift": drift
                 }
 
