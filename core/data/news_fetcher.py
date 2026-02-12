@@ -5,6 +5,7 @@ import logging
 import hashlib
 import threading
 import os
+import time
 
 from datetime import timedelta
 from typing import Dict, Tuple
@@ -20,18 +21,23 @@ class NewsFetcher:
     )
 
     CACHE_TTL = timedelta(minutes=10)
+    RAW_TTL = timedelta(hours=6)
+
     MAX_CACHE_KEYS = 500
     MAX_ARTICLE_AGE = timedelta(hours=48)
 
-    MAX_DAILY_NEWS = 50
+    RAW_SCHEMA_VERSION = "2.0"
 
     RAW_CACHE_DIR = "data/news_raw"
+
+    MAX_RETRIES = 4
+    BASE_SLEEP = 1.2
 
     _cache: Dict[str, Tuple[pd.Timestamp, pd.DataFrame]] = {}
     _lock = threading.Lock()
 
     HEADERS = {
-        "User-Agent": "MarketSentinel/1.0"
+        "User-Agent": "MarketSentinel/2.0"
     }
 
     EMPTY_SCHEMA = pd.DataFrame(
@@ -41,23 +47,45 @@ class NewsFetcher:
     def __init__(self):
         os.makedirs(self.RAW_CACHE_DIR, exist_ok=True)
 
+    # -----------------------------------------------------
+
     @staticmethod
     def _now():
         return pd.Timestamp.utcnow().tz_localize(None)
 
+    # -----------------------------------------------------
+
     def _cache_key(self, query: str, max_items: int) -> str:
-        raw = f"{query}_{max_items}"
-        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+        raw = (
+            f"{query}|{max_items}|"
+            f"schema={self.RAW_SCHEMA_VERSION}"
+        )
+
+        return hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+    # -----------------------------------------------------
 
     def _raw_path(self, key: str):
         return f"{self.RAW_CACHE_DIR}/{key}.xml"
 
-    def _persist_raw_feed(self, key: str, content: bytes):
+    # -----------------------------------------------------
 
-        path = self._raw_path(key)
+    def _raw_expired(self, path):
 
-        if os.path.exists(path):
-            return content
+        if not os.path.exists(path):
+            return True
+
+        modified = pd.Timestamp(
+            os.path.getmtime(path),
+            unit="s"
+        )
+
+        return self._now() - modified > self.RAW_TTL
+
+    # -----------------------------------------------------
+
+    def _persist_raw_feed(self, path, content: bytes):
 
         tmp = path + ".tmp"
 
@@ -68,17 +96,39 @@ class NewsFetcher:
 
         os.replace(tmp, path)
 
-        return content
+    # -----------------------------------------------------
 
-    def _load_raw_feed(self, key: str):
+    def _download_feed(self, url):
 
-        path = self._raw_path(key)
+        for attempt in range(self.MAX_RETRIES):
 
-        if os.path.exists(path):
-            with open(path, "rb") as f:
-                return f.read()
+            try:
 
-        return None
+                r = requests.get(
+                    url,
+                    headers=self.HEADERS,
+                    timeout=6
+                )
+
+                r.raise_for_status()
+
+                return r.content
+
+            except Exception as e:
+
+                sleep = (
+                    self.BASE_SLEEP * (2 ** attempt)
+                )
+
+                logger.warning(
+                    f"News retry {attempt+1}: {e}"
+                )
+
+                time.sleep(sleep)
+
+        raise RuntimeError("News download failed after retries.")
+
+    # -----------------------------------------------------
 
     def _prune_cache(self):
 
@@ -92,6 +142,8 @@ class NewsFetcher:
 
         for k, _ in oldest:
             self._cache.pop(k, None)
+
+    # -----------------------------------------------------
 
     @staticmethod
     def _normalize_timestamp(published):
@@ -107,6 +159,8 @@ class NewsFetcher:
 
         return ts.tz_convert(None)
 
+    # -----------------------------------------------------
+
     @staticmethod
     def _clean_headline(text: str):
 
@@ -117,11 +171,9 @@ class NewsFetcher:
 
         return text.strip()
 
-    def fetch(
-        self,
-        query: str,
-        max_items: int = 50
-    ) -> pd.DataFrame:
+    # -----------------------------------------------------
+
+    def fetch(self, query: str, max_items: int = 50) -> pd.DataFrame:
 
         key = self._cache_key(query, max_items)
         now = self._now()
@@ -140,38 +192,31 @@ class NewsFetcher:
 
             try:
 
-                raw_feed = self._load_raw_feed(key)
+                rss_url = self.GOOGLE_NEWS_RSS.format(
+                    query=query.replace(" ", "+")
+                )
 
-                if raw_feed is None:
+                path = self._raw_path(key)
 
-                    rss_url = self.GOOGLE_NEWS_RSS.format(
-                        query=query.replace(" ", "+")
-                    )
+                if self._raw_expired(path):
 
-                    response = requests.get(
-                        rss_url,
-                        headers=self.HEADERS,
-                        timeout=5
-                    )
+                    raw = self._download_feed(rss_url)
+                    self._persist_raw_feed(path, raw)
 
-                    response.raise_for_status()
+                else:
+                    with open(path, "rb") as f:
+                        raw = f.read()
 
-                    raw_feed = self._persist_raw_feed(
-                        key,
-                        response.content
-                    )
-
-                feed = feedparser.parse(raw_feed)
+                feed = feedparser.parse(raw)
 
                 articles = []
+                seen_hashes = set()
 
-                entries = sorted(
+                for entry in sorted(
                     feed.entries,
                     key=lambda e: e.get("published_parsed", (0,)),
                     reverse=True
-                )
-
-                for entry in entries:
+                ):
 
                     parsed = entry.get("published_parsed")
 
@@ -198,7 +243,14 @@ class NewsFetcher:
                     if not headline:
                         continue
 
-                    link = entry.get("link", "")
+                    h = hashlib.sha256(
+                        headline.encode()
+                    ).hexdigest()
+
+                    if h in seen_hashes:
+                        continue
+
+                    seen_hashes.add(h)
 
                     source = entry.get(
                         "source", {}
@@ -213,7 +265,7 @@ class NewsFetcher:
                         "headline": headline,
                         "published_at": published,
                         "source": source,
-                        "link": link
+                        "link": entry.get("link", "")
                     })
 
                     if len(articles) >= max_items:
@@ -223,13 +275,7 @@ class NewsFetcher:
                     return self.EMPTY_SCHEMA.copy()
 
                 df = pd.DataFrame(articles)
-
-                df = df.drop_duplicates(
-                    subset=["headline", "link"]
-                )
-
                 df = df.sort_values("published_at")
-
                 df.reset_index(drop=True, inplace=True)
 
                 self._prune_cache()
