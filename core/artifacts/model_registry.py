@@ -39,7 +39,7 @@ class ModelRegistry:
         return f"{ts}_{suffix}"
 
     ########################################################
-    # DIRECTORY HASH (NEW)
+    # DIRECTORY HASH
     ########################################################
 
     @staticmethod
@@ -48,12 +48,13 @@ class ModelRegistry:
         hasher = hashlib.sha256()
 
         for root, _, files in os.walk(path):
-
             for f in sorted(files):
 
                 file_path = os.path.join(root, f)
 
-                hasher.update(file_path.encode())
+                # include relative path for deterministic hashing
+                rel = os.path.relpath(file_path, path)
+                hasher.update(rel.encode())
 
                 with open(file_path, "rb") as fh:
                     for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -80,10 +81,13 @@ class ModelRegistry:
         return h.hexdigest()
 
     ########################################################
+    # FSYNC (LINUX ONLY)
+    ########################################################
 
     @staticmethod
     def _fsync_dir(path: str):
 
+        # Windows does not support O_DIRECTORY
         if os.name == "nt":
             return
 
@@ -91,6 +95,8 @@ class ModelRegistry:
         os.fsync(fd)
         os.close(fd)
 
+    ########################################################
+    # ATOMIC JSON
     ########################################################
 
     @staticmethod
@@ -109,6 +115,8 @@ class ModelRegistry:
         ModelRegistry._fsync_dir(parent)
 
     ########################################################
+    # MANIFEST VALIDATION
+    ########################################################
 
     @staticmethod
     def _validate_manifest(manifest: dict):
@@ -125,6 +133,8 @@ class ModelRegistry:
         if not manifest["artifacts"]:
             raise RuntimeError("Manifest contains no artifacts.")
 
+    ########################################################
+    # METADATA VALIDATION (FIXED)
     ########################################################
 
     @staticmethod
@@ -146,11 +156,16 @@ class ModelRegistry:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Schema mismatch detected.")
 
-        if meta["features"] != list(MODEL_FEATURES):
-            raise RuntimeError("Feature ordering mismatch.")
+        metadata_type = meta.get("metadata_type")
+
+        # ONLY enforce strict feature ordering for tabular models
+        if metadata_type == "tabular":
+
+            if meta["features"] != list(MODEL_FEATURES):
+                raise RuntimeError("Feature ordering mismatch.")
 
     ########################################################
-    # COPY SAFE (NEW)
+    # SAFE COPY
     ########################################################
 
     @staticmethod
@@ -161,6 +176,8 @@ class ModelRegistry:
         else:
             shutil.copy2(src, dst)
 
+    ########################################################
+    # VERIFY
     ########################################################
 
     @staticmethod
@@ -195,6 +212,8 @@ class ModelRegistry:
                     f"Artifact integrity failure: {artifact}"
                 )
 
+    ########################################################
+    # REGISTER
     ########################################################
 
     @staticmethod
