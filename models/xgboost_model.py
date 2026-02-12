@@ -4,23 +4,42 @@ import xgboost as xgb
 
 
 SEED = 42
-
 MAX_CLASS_WEIGHT = 50.0
 
 
 ###################################################
-# GPU DETECTION
+# SAFE GPU DETECTION (Institutional)
 ###################################################
 
 def get_tree_method():
+    """
+    Production-safe GPU detection.
+
+    Never uses private APIs.
+    Works across:
+    ✔ docker
+    ✔ CI
+    ✔ Windows
+    ✔ Linux
+    """
 
     try:
-        if xgb.core._has_cuda_support():
-            return "gpu_hist"
-    except Exception:
-        pass
+        # attempt tiny GPU training
+        X = np.random.rand(10, 3)
+        y = np.random.randint(0, 2, 10)
 
-    return "hist"
+        test = XGBClassifier(
+            tree_method="gpu_hist",
+            n_estimators=1,
+            max_depth=1
+        )
+
+        test.fit(X, y)
+
+        return "gpu_hist"
+
+    except Exception:
+        return "hist"
 
 
 TREE_METHOD = get_tree_method()
@@ -52,6 +71,48 @@ def compute_class_weight(y):
 
 
 ###################################################
+# BASE PARAMS (shared)
+###################################################
+
+def _base_params(pos_weight):
+
+    return dict(
+
+        # trees
+        max_depth=5,
+        learning_rate=0.03,
+
+        subsample=0.85,
+        colsample_bytree=0.85,
+
+        min_child_weight=2,
+        gamma=0.1,
+
+        reg_alpha=0.5,
+        reg_lambda=1.0,
+
+        # stability
+        eval_metric="logloss",
+        random_state=SEED,
+        n_jobs=-1,
+
+        # CRITICAL
+        tree_method=TREE_METHOD,
+        predictor="gpu_predictor" if TREE_METHOD == "gpu_hist" else "auto",
+
+        # histogram quality
+        max_bin=256,
+        deterministic_histogram=True,
+
+        # modern xgboost
+        use_label_encoder=False,
+
+        # imbalance
+        scale_pos_weight=pos_weight
+    )
+
+
+###################################################
 # TRAIN MODEL
 ###################################################
 
@@ -59,33 +120,11 @@ def build_xgboost_model(y):
 
     pos_weight = compute_class_weight(y)
 
-    model = XGBClassifier(
+    params = _base_params(pos_weight)
 
-        n_estimators=700,
-        max_depth=5,
-        learning_rate=0.03,
+    params["n_estimators"] = 700
 
-        subsample=0.85,
-        colsample_bytree=0.85,
-
-        eval_metric="logloss",
-
-        random_state=SEED,
-
-        tree_method=TREE_METHOD,
-
-        n_jobs=-1,
-
-        scale_pos_weight=pos_weight,
-
-        reg_alpha=0.5,
-        reg_lambda=1.0,
-
-        min_child_weight=2,
-        gamma=0.1
-    )
-
-    return model
+    return XGBClassifier(**params)
 
 
 ###################################################
@@ -96,30 +135,14 @@ def build_final_xgboost_model(y):
 
     pos_weight = compute_class_weight(y)
 
-    model = XGBClassifier(
+    params = _base_params(pos_weight)
 
-        n_estimators=900,
-        max_depth=5,
-        learning_rate=0.025,
+    params.update({
+        "n_estimators": 900,
+        "learning_rate": 0.025,
+        "reg_alpha": 0.7,
+        "reg_lambda": 1.2,
+        "gamma": 0.15
+    })
 
-        subsample=0.85,
-        colsample_bytree=0.85,
-
-        eval_metric="logloss",
-
-        random_state=SEED,
-
-        tree_method=TREE_METHOD,
-
-        n_jobs=-1,
-
-        scale_pos_weight=pos_weight,
-
-        reg_alpha=0.7,
-        reg_lambda=1.2,
-
-        min_child_weight=2,
-        gamma=0.15
-    )
-
-    return model
+    return XGBClassifier(**params)
