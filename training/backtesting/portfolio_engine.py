@@ -7,6 +7,8 @@ class PortfolioBacktestEngine:
     EPSILON = 1e-12
     VOL_WINDOW = 20
     REBALANCE_THRESHOLD = 0.02
+    CASH_BUFFER = 0.02
+    MAX_INV_VOL = 5.0
 
     def __init__(
         self,
@@ -50,10 +52,8 @@ class PortfolioBacktestEngine:
                 if len(buf) > self.VOL_WINDOW:
                     buf.pop(0)
 
-                vols[ticker] = max(
-                    np.std(buf) if len(buf) > 2 else self.target_vol,
-                    1e-4
-                )
+                vol = np.std(buf) if len(buf) > 2 else self.target_vol
+                vols[ticker] = max(vol, 1e-4)
 
             else:
                 vols[ticker] = self.target_vol
@@ -70,7 +70,10 @@ class PortfolioBacktestEngine:
                 continue
 
             vol = vols.get(ticker, self.target_vol)
-            raw[ticker] = 1 / max(vol, 1e-4)
+
+            inv_vol = min(1 / max(vol, 1e-4), self.MAX_INV_VOL)
+
+            raw[ticker] = inv_vol
 
         if not raw:
             return {}
@@ -147,6 +150,8 @@ class PortfolioBacktestEngine:
                 for t in positions
             )
 
+            deployable_capital = portfolio_value * (1 - self.CASH_BUFFER)
+
             current_weights = {
                 t: (positions[t] * self._safe_price(prices[t])) / portfolio_value
                 for t in positions
@@ -160,7 +165,7 @@ class PortfolioBacktestEngine:
             )
 
             target_positions = {
-                t: (portfolio_value * w) / self._safe_price(prev_prices[t])
+                t: (deployable_capital * w) / self._safe_price(prices[t])
                 for t, w in weights.items()
             }
 
@@ -168,7 +173,7 @@ class PortfolioBacktestEngine:
 
             for ticker in set(positions) | set(target_positions):
 
-                trade_price = self._safe_price(prev_prices.get(ticker))
+                trade_price = self._safe_price(prices.get(ticker))
 
                 delta = target_positions.get(ticker, 0) - positions.get(ticker, 0)
 
@@ -188,7 +193,7 @@ class PortfolioBacktestEngine:
 
             for ticker in set(positions) | set(target_positions):
 
-                trade_price = self._safe_price(prev_prices.get(ticker))
+                trade_price = self._safe_price(prices.get(ticker))
 
                 current = positions.get(ticker, 0)
                 target = target_positions.get(ticker, 0)
@@ -236,10 +241,12 @@ class PortfolioBacktestEngine:
             np.maximum(curve[:-1], self.EPSILON)
         ) if len(curve) > 1 else np.array([0.0])
 
+        periods_per_year = min(252, len(curve))
+
         sharpe = (
             np.mean(returns) /
             max(np.std(returns), self.EPSILON) *
-            np.sqrt(252)
+            np.sqrt(periods_per_year)
         )
 
         peak = np.maximum.accumulate(curve)
