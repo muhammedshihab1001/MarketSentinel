@@ -2,6 +2,8 @@ import os
 import logging
 import hashlib
 import re
+import inspect
+import sys
 from typing import Optional
 
 import pandas as pd
@@ -18,15 +20,12 @@ logger = logging.getLogger("marketsentinel.feature_store")
 
 
 class FeatureStore:
-    """
-    Institutional Feature Store — Production Safe
-    """
 
     FEATURE_DIR = "data/features"
 
     REQUIRED_COLUMNS = {"date", "close"}
 
-    CACHE_VERSION = "v3"
+    CACHE_VERSION = "v4"
     MAX_CACHE_FILES_PER_TICKER = 6
 
     ##################################################
@@ -39,9 +38,11 @@ class FeatureStore:
 
         self.schema_hash = hashlib.sha256(
             get_schema_signature().encode()
-        ).hexdigest()[:10]
+        ).hexdigest()[:12]
 
-        self.engineer_hash = self._fingerprint_engineer()[:10]
+        self.engineer_hash = self._fingerprint_engineer()[:12]
+
+        self.env_hash = self._environment_fingerprint()[:8]
 
     ##################################################
     # SAFE TICKER
@@ -51,20 +52,36 @@ class FeatureStore:
         return re.sub(r"[^A-Za-z0-9_]", "_", ticker)
 
     ##################################################
-    # BYTECODE FINGERPRINT
+    # ENGINEER FINGERPRINT — FULL SOURCE
     ##################################################
 
     def _fingerprint_engineer(self) -> str:
 
-        code_bytes = (
-            FeatureEngineer.build_feature_pipeline
-            .__code__.co_code
-        )
+        try:
+            source = inspect.getsource(FeatureEngineer)
+        except Exception:
+            raise RuntimeError(
+                "Unable to fingerprint FeatureEngineer source."
+            )
 
-        return hashlib.sha256(code_bytes).hexdigest()
+        return hashlib.sha256(source.encode()).hexdigest()
 
     ##################################################
-    #  STRONG DATASET HASH (PRICE + SENTIMENT)
+    # ENVIRONMENT FINGERPRINT
+    ##################################################
+
+    def _environment_fingerprint(self) -> str:
+
+        payload = (
+            sys.version +
+            pd.__version__ +
+            np.__version__
+        )
+
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    ##################################################
+    # FULL DATASET HASH
     ##################################################
 
     def _dataset_hash(
@@ -73,53 +90,29 @@ class FeatureStore:
         sentiment_df: Optional[pd.DataFrame]
     ) -> str:
 
-        price_df = price_df.sort_values("date")
-
-        head = price_df.head(25)
-        tail = price_df.tail(25)
-
-        sample = pd.concat([head, tail])
-
         h = hashlib.sha256()
 
+        price_df = price_df.sort_values("date")
+
         price_arr = pd.util.hash_pandas_object(
-            sample[["date", "close"]],
-            index=False
+            price_df,
+            index=True
         ).values
 
         h.update(price_arr.tobytes())
-        h.update(str(len(price_df)).encode())
-
-        ##################################################
-        # SENTIMENT INCLUDED (CRITICAL)
-        ##################################################
 
         if sentiment_df is not None and not sentiment_df.empty:
 
             sentiment_df = sentiment_df.sort_values("date")
 
-            s_head = sentiment_df.head(15)
-            s_tail = sentiment_df.tail(15)
+            sent_arr = pd.util.hash_pandas_object(
+                sentiment_df,
+                index=True
+            ).values
 
-            s_sample = pd.concat([s_head, s_tail])
+            h.update(sent_arr.tobytes())
 
-            cols = [
-                c for c in
-                ["date", "avg_sentiment", "news_count"]
-                if c in s_sample.columns
-            ]
-
-            if cols:
-
-                sent_arr = pd.util.hash_pandas_object(
-                    s_sample[cols],
-                    index=False
-                ).values
-
-                h.update(sent_arr.tobytes())
-                h.update(str(len(sentiment_df)).encode())
-
-        return h.hexdigest()[:16]
+        return h.hexdigest()[:20]
 
     ##################################################
 
@@ -139,11 +132,12 @@ class FeatureStore:
             f"{ticker}_{suffix}_"
             f"{dataset_hash}_"
             f"{self.schema_hash}_"
-            f"{self.engineer_hash}.parquet"
+            f"{self.engineer_hash}_"
+            f"{self.env_hash}.parquet"
         )
 
     ##################################################
-    # CACHE PRUNING — SAFER
+    # CACHE PRUNING
     ##################################################
 
     def _prune_cache(self, ticker):
@@ -172,12 +166,12 @@ class FeatureStore:
     # FSYNC
     ##################################################
 
-    def _fsync_dir(self, directory):
+    def _fsync_file(self, path):
 
         if os.name == "nt":
             return
 
-        fd = os.open(directory, os.O_DIRECTORY)
+        fd = os.open(path, os.O_RDONLY)
         try:
             os.fsync(fd)
         finally:
@@ -199,6 +193,9 @@ class FeatureStore:
         if df["date"].duplicated().any():
             raise RuntimeError("Duplicate timestamps detected.")
 
+        if not df["date"].is_monotonic_increasing:
+            raise RuntimeError("Non-monotonic timestamps detected.")
+
     ##################################################
     # ATOMIC WRITE
     ##################################################
@@ -218,13 +215,23 @@ class FeatureStore:
 
         validate_feature_schema(feature_block)
 
-        if not np.isfinite(feature_block.to_numpy()).all():
+        arr = feature_block.to_numpy(dtype=float)
+
+        if not np.isfinite(arr).all():
             raise RuntimeError("Non-finite feature values.")
+
+        if np.isnan(arr[0]).any():
+            raise RuntimeError(
+                "Feature warmup NaNs detected — pipeline unsafe."
+            )
 
         df.to_parquet(tmp_path, index=False)
 
+        self._fsync_file(tmp_path)
+
         os.replace(tmp_path, path)
-        self._fsync_dir(os.path.dirname(path))
+
+        self._fsync_file(path)
 
     ##################################################
     # SAFE LOAD
