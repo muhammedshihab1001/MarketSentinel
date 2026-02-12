@@ -1,10 +1,14 @@
 import os
 import datetime
 import uuid
+import hashlib
 from typing import Dict, Tuple
 
 import numpy as np
 import joblib
+import pandas as pd
+
+from statsmodels.tsa.stattools import adfuller
 
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
@@ -23,22 +27,34 @@ TRAINING_TICKERS = [
     "META","TSLA","JPM","XOM","AVGO","AMD"
 ]
 
-MIN_DATA_ROWS = 600
+MIN_DATA_ROWS = 700
+VOL_FLOOR = 1e-4
 SEED = 42
 
-np.random.seed(SEED)
+
+########################################################
+# STRICT DETERMINISM
+########################################################
+
+def enforce_determinism():
+
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+    np.random.seed(SEED)
 
 
 ########################################################
-# DIRECTORY FSYNC
+# FSYNC FILE
 ########################################################
 
-def _fsync_dir(directory):
+def _fsync_file(path):
 
     if os.name == "nt":
         return
 
-    fd = os.open(directory, os.O_DIRECTORY)
+    fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
     finally:
@@ -58,12 +74,52 @@ def save_model_atomic(model: SarimaxModel, path: str) -> None:
 
     joblib.dump(model, tmp_path)
 
+    _fsync_file(tmp_path)
+
     os.replace(tmp_path, path)
 
-    _fsync_dir(directory)
+    _fsync_file(path)
 
     if not os.path.exists(path):
         raise RuntimeError("Model write failed.")
+
+
+########################################################
+# CANONICAL UNIVERSE HASH
+########################################################
+
+def universe_hash(datasets: Dict[str, pd.DataFrame]):
+
+    hasher = hashlib.sha256()
+
+    for ticker in sorted(datasets.keys()):
+
+        df = datasets[ticker].sort_values("date")
+
+        arr = pd.util.hash_pandas_object(
+            df,
+            index=False
+        ).values
+
+        hasher.update(arr.tobytes())
+
+    return hasher.hexdigest()
+
+
+########################################################
+# STATIONARITY CHECK
+########################################################
+
+def assert_stationary(series: pd.Series):
+
+    result = adfuller(series.dropna())
+
+    p_value = result[1]
+
+    if p_value > 0.05:
+        raise RuntimeError(
+            f"Non-stationary series detected (p={p_value})."
+        )
 
 
 ########################################################
@@ -89,7 +145,11 @@ def load_training_data() -> Tuple[Dict[str, object], str]:
         if df is None or df.empty or len(df) < MIN_DATA_ROWS:
             continue
 
-        datasets[ticker] = df[["date", "close"]].copy()
+        df = df[["date", "close"]].copy()
+
+        assert_stationary(np.log(df["close"]).diff().dropna())
+
+        datasets[ticker] = df
 
     if not datasets:
         raise RuntimeError("No datasets available for SARIMAX.")
@@ -103,11 +163,17 @@ def load_training_data() -> Tuple[Dict[str, object], str]:
 
 def score_model(metrics):
 
-    slope = abs(metrics["normalized_slope"])
-    vol = max(metrics["forecast_volatility"], 1e-6)
+    slope = metrics["normalized_slope"]
 
-    # Sharpe-lite
-    return slope / vol
+    if not np.isfinite(slope):
+        raise RuntimeError("Invalid slope produced.")
+
+    vol = max(metrics["forecast_volatility"], VOL_FLOOR)
+
+    if not np.isfinite(vol):
+        raise RuntimeError("Invalid volatility produced.")
+
+    return abs(slope) / vol
 
 
 ########################################################
@@ -155,9 +221,7 @@ def train_champion():
             + "\n".join(rejection_log)
         )
 
-    dataset_hash = MetadataManager.fingerprint_dataset(
-        datasets[best_ticker]
-    )
+    u_hash = universe_hash(datasets)
 
     training_range = best_model.get_training_range()
 
@@ -171,8 +235,8 @@ def train_champion():
         features=["date", "close"],
         training_start=training_range["start"],
         training_end=training_range["end"],
-        dataset_hash=dataset_hash,
-        metadata_type="sequence",
+        dataset_hash=u_hash,
+        metadata_type="training_manifest_v1",
         extra_fields={
             "model_type": "SARIMAX",
             "parameters": best_model.get_params()
@@ -189,6 +253,8 @@ def train_champion():
 if __name__ == "__main__":
 
     print("Institutional SARIMAX Training")
+
+    enforce_determinism()
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -207,16 +273,12 @@ if __name__ == "__main__":
         TEMP_METADATA_PATH
     )
 
-    # CRITICAL — verify before promotion
     ModelRegistry.verify_artifacts(
         MODEL_DIR,
         version
     )
 
-    # promote pointer
-    ModelRegistry.promote_to_latest(
-        MODEL_DIR,
-        version
+    print(
+        f"SARIMAX candidate registered -> {version}\n"
+        "Promotion requires governance approval."
     )
-
-    print(f"SARIMAX champion registered -> {version}")
