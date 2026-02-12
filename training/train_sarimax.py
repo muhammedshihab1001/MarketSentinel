@@ -1,15 +1,17 @@
 import os
 import datetime
+import tempfile
+import shutil
+from typing import Dict, Tuple
+
 import numpy as np
+import joblib
 
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
 
-from models.sarimax_model import (
-    train_sarimax,
-    forecast_sarimax
-)
+from models.sarimax_model import SarimaxModel
 
 
 MODEL_DIR = "artifacts/sarimax"
@@ -33,11 +35,7 @@ np.random.seed(SEED)
 # ATOMIC SAVE
 ########################################################
 
-def save_model_atomic(model, path):
-
-    import joblib
-    import tempfile
-    import shutil
+def save_model_atomic(model: SarimaxModel, path: str) -> None:
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -59,7 +57,7 @@ def save_model_atomic(model, path):
 # LOAD DATA
 ########################################################
 
-def load_training_data():
+def load_training_data() -> Tuple[Dict[str, object], str]:
 
     fetcher = StockPriceFetcher()
 
@@ -75,10 +73,10 @@ def load_training_data():
             end_date=end_date
         )
 
-        if df.empty or len(df) < MIN_DATA_ROWS:
+        if df is None or df.empty or len(df) < MIN_DATA_ROWS:
             continue
 
-        datasets[ticker] = df[["date","close"]]
+        datasets[ticker] = df[["date", "close"]].copy()
 
     if not datasets:
         raise RuntimeError("No datasets available for SARIMAX.")
@@ -99,13 +97,16 @@ def train_champion():
     best_ticker = None
     best_metrics = None
 
+    rejection_log = []
+
     for ticker, df in datasets.items():
 
         try:
 
-            model = train_sarimax(df)
+            model = SarimaxModel()
+            model.fit(df)
 
-            metrics = forecast_sarimax(model)
+            metrics = model.forecast()
 
             score = abs(metrics["normalized_slope"])
 
@@ -115,17 +116,20 @@ def train_champion():
                 best_ticker = ticker
                 best_metrics = metrics
 
-        except Exception as e:
-
-            print(f"SARIMAX rejected for {ticker}: {e}")
-            continue
+        except Exception as exc:
+            rejection_log.append(f"{ticker}: {str(exc)}")
 
     if best_model is None:
-        raise RuntimeError("All SARIMAX models rejected.")
+        raise RuntimeError(
+            "All SARIMAX models rejected.\n"
+            + "\n".join(rejection_log)
+        )
 
     dataset_hash = MetadataManager.fingerprint_dataset(
         datasets[best_ticker]
     )
+
+    training_range = best_model.get_training_range()
 
     metadata = MetadataManager.create_metadata(
         model_name="sarimax_trend",
@@ -134,11 +138,15 @@ def train_champion():
             "score": float(best_score),
             **best_metrics
         },
-        features=["date","close"],
-        training_start="2014-01-01",
-        training_end=end_date,
+        features=["date", "close"],
+        training_start=training_range["start"],
+        training_end=training_range["end"],
         dataset_hash=dataset_hash,
-        metadata_type="sequence"
+        metadata_type="sequence",
+        extra_fields={
+            "model_type": "SARIMAX",
+            "parameters": best_model.get_params()
+        }
     )
 
     return best_model, metadata
@@ -169,4 +177,4 @@ if __name__ == "__main__":
         TEMP_METADATA_PATH
     )
 
-    print(f"SARIMAX champion registered → {version}")
+    print(f"SARIMAX champion registered -> {version}")
