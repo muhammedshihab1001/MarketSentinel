@@ -199,37 +199,133 @@ Observability is treated as a **first-class system component**, not an afterthou
 
 # 🏗️ System Architecture
 
-MarketSentinel follows a **domain-driven architecture**, isolating core intelligence from infrastructure.
+MarketSentinel is organized using a **domain-driven production architecture**, separating inference, research pipelines, governance layers, and infrastructure.
+
+This structure mirrors real-world ML platforms where **traceability, modularity, and operational safety** are mandatory.
 
 ```
 MarketSentinel/
 │
-├── app/ ← FastAPI inference control plane
-│ ├── api/routes/ ← Prediction & health endpoints
-│ ├── inference/ ← Model loader, cache, pipeline
-│ └── monitoring/ ← Metrics + Prometheus config
+├── app/                         ← FastAPI inference control plane
+│   ├── api/
+│   │   ├── routes/
+│   │   │   ├── health.py        ← Liveness & readiness probes
+│   │   │   └── predict.py       ← Primary prediction endpoint
+│   │   └── schemas.py          ← Request / response contracts
+│   │
+│   ├── inference/
+│   │   ├── cache.py            ← Model & feature caching
+│   │   ├── model_loader.py     ← Registry-driven model loading
+│   │   └── pipeline.py         ← End-to-end inference orchestration
+│   │
+│   ├── monitoring/
+│   │   ├── metrics.py          ← Prometheus metrics exporters
+│   │   └── prometheus.yml      ← Metrics configuration
+│   │
+│   └── main.py                 ← FastAPI application entrypoint
 │
-├── core/ ← Domain backbone
-│ ├── artifacts/ ← Metadata + model registry
-│ ├── data/ ← Market & news ingestion
-│ ├── sentiment/ ← NLP analysis
-│ ├── features/ ← Feature engineering + store
-│ ├── forecasting/ ← Probabilistic modeling
-│ ├── signals/ ← Decision intelligence
-│ ├── scenario/ ← Scenario simulation
-│ ├── explainability/ ← Human-readable reasoning
-│ ├── monitoring/ ← Drift enforcement
-│ └── schema/ ← Feature contracts
+├── core/                        ← Domain backbone (system intelligence)
+│   │
+│   ├── artifacts/
+│   │   ├── metadata_manager.py ← Dataset fingerprinting & lineage
+│   │   └── model_registry.py   ← Versioned artifact governance
+│   │
+│   ├── config/
+│   │   └── env_loader.py       ← Safe environment initialization
+│   │
+│   ├── data/
+│   │   ├── data_fetcher.py     ← Historical market retrieval
+│   │   ├── market_data_service.py
+│   │   └── news_fetcher.py     ← Financial news ingestion
+│   │
+│   ├── explainability/
+│   │   └── decision_explainer.py ← Human-readable signal reasoning
+│   │
+│   ├── features/
+│   │   ├── feature_engineering.py ← Canonical feature pipeline
+│   │   └── feature_store.py       ← Offline feature persistence
+│   │
+│   ├── forecasting/
+│   │   └── probabilistic.py    ← Probabilistic forecast utilities
+│   │
+│   ├── market/
+│   │   └── universe.py         ← Institutional asset universe control
+│   │
+│   ├── monitoring/
+│   │   └── drift_detector.py   ← Feature drift enforcement
+│   │
+│   ├── risk/
+│   │   ├── position_sizer.py   ← Volatility-aware capital allocation
+│   │   └── risk_engine.py      ← Composite trade risk scoring
+│   │
+│   ├── scenario/
+│   │   └── scenario_engine.py  ← Alternative future simulations
+│   │
+│   ├── schema/
+│   │   └── feature_schema.py   ← Hard feature contract + signature
+│   │
+│   ├── sentiment/
+│   │   └── sentiment.py        ← FinBERT-style sentiment analysis
+│   │
+│   ├── signals/
+│   │   └── signal_engine.py    ← Decision intelligence engine
+│   │
+│   └── time/
+│       └── market_time.py      ← Deterministic training windows
 │
-├── training/ ← Offline research pipelines
-│ ├── pipelines/ ← Orchestrated training
-│ ├── backtesting/ ← Strategy validation
-│ └── indicators/ ← Technical signals
+├── training/                    ← Offline research & model pipelines
+│   │
+│   ├── backtesting/
+│   │   ├── backtest_engine.py
+│   │   ├── portfolio_engine.py
+│   │   ├── regime.py
+│   │   ├── strategy_runner.py
+│   │   └── walk_forward.py     ← Walk-forward validator
+│   │
+│   ├── indicators/
+│   │   └── technical.py        ← Technical indicator library
+│   │
+│   ├── pipelines/
+│   │   └── train_pipeline.py   ← Institutional training orchestrator
+│   │
+│   ├── evaluate.py             ← Model quality checks
+│   ├── run_evaluation.py       ← Promotion gate executor
+│   ├── market_refresher.py     ← Dataset refresh tooling
+│   │
+│   ├── train_xgboost.py
+│   ├── train_lstm.py
+│   └── train_sarimax.py        ← Model-specific trainers
 │
-├── models/ ← Model definitions
-├── docker/ ← Training & inference containers
-├── tests/ ← System validation
-└── requirements/ ← Environment segmentation
+├── models/                     ← Model definitions
+│   ├── xgboost_model.py
+│   ├── lstm_model.py
+│   └── sarimax_model.py
+│
+├── docker/
+│   ├── inference.Dockerfile    ← Slim production image
+│   └── training.Dockerfile     ← Heavy ML build image
+│
+├── requirements/
+│   ├── base.txt
+│   ├── training.txt
+│   ├── inference.txt
+│   └── ci.txt                 ← Environment segmentation
+│
+├── tests/                      ← System-level validation
+│   ├── test_feature_engineering.py
+│   ├── test_walk_forward.py
+│   ├── test_model_registry.py
+│   ├── test_position_sizer.py
+│   ├── test_drift_detector.py
+│   └── ...                    ← Additional safety tests
+│
+├── .github/workflows/ci.yml   ← CI pipeline
+├── docker-compose.yml        ← Local orchestration
+├── .env.example              ← Environment template
+├── .dockerignore
+├── .gitignore
+└── README.md
+
 ```
 
 This structure mirrors high-maturity ML platforms.
