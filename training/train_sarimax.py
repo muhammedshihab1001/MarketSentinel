@@ -1,7 +1,6 @@
 import os
 import datetime
-import tempfile
-import shutil
+import uuid
 from typing import Dict, Tuple
 
 import numpy as np
@@ -19,7 +18,6 @@ MODEL_DIR = "artifacts/sarimax"
 TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
-
 TRAINING_TICKERS = [
     "AAPL","MSFT","NVDA","AMZN","GOOGL",
     "META","TSLA","JPM","XOM","AVGO","AMD"
@@ -32,22 +30,37 @@ np.random.seed(SEED)
 
 
 ########################################################
+# DIRECTORY FSYNC
+########################################################
+
+def _fsync_dir(directory):
+
+    if os.name == "nt":
+        return
+
+    fd = os.open(directory, os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+########################################################
 # ATOMIC SAVE
 ########################################################
 
 def save_model_atomic(model: SarimaxModel, path: str) -> None:
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
 
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        dir=os.path.dirname(path)
-    ) as tmp:
+    tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
 
-        joblib.dump(model, tmp.name)
-        temp_name = tmp.name
+    joblib.dump(model, tmp_path)
 
-    shutil.move(temp_name, path)
+    os.replace(tmp_path, path)
+
+    _fsync_dir(directory)
 
     if not os.path.exists(path):
         raise RuntimeError("Model write failed.")
@@ -85,6 +98,19 @@ def load_training_data() -> Tuple[Dict[str, object], str]:
 
 
 ########################################################
+# RISK-ADJUSTED SCORING
+########################################################
+
+def score_model(metrics):
+
+    slope = abs(metrics["normalized_slope"])
+    vol = max(metrics["forecast_volatility"], 1e-6)
+
+    # Sharpe-lite
+    return slope / vol
+
+
+########################################################
 # TRAIN CHAMPION
 ########################################################
 
@@ -108,7 +134,9 @@ def train_champion():
 
             metrics = model.forecast()
 
-            score = abs(metrics["normalized_slope"])
+            score = score_model(metrics)
+
+            print(f"SARIMAX {ticker} score={round(score,4)}")
 
             if score > best_score:
                 best_model = model
@@ -117,7 +145,9 @@ def train_champion():
                 best_metrics = metrics
 
         except Exception as exc:
-            rejection_log.append(f"{ticker}: {str(exc)}")
+            msg = f"{ticker} rejected: {str(exc)}"
+            rejection_log.append(msg)
+            print(msg)
 
     if best_model is None:
         raise RuntimeError(
@@ -135,7 +165,7 @@ def train_champion():
         model_name="sarimax_trend",
         metrics={
             "champion_asset": best_ticker,
-            "score": float(best_score),
+            "risk_adjusted_score": float(best_score),
             **best_metrics
         },
         features=["date", "close"],
@@ -175,6 +205,18 @@ if __name__ == "__main__":
         MODEL_DIR,
         TEMP_MODEL_PATH,
         TEMP_METADATA_PATH
+    )
+
+    # CRITICAL — verify before promotion
+    ModelRegistry.verify_artifacts(
+        MODEL_DIR,
+        version
+    )
+
+    # promote pointer
+    ModelRegistry.promote_to_latest(
+        MODEL_DIR,
+        version
     )
 
     print(f"SARIMAX champion registered -> {version}")
