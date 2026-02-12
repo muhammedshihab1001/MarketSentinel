@@ -5,7 +5,7 @@ import numpy as np
 import json
 
 
-SCHEMA_VERSION = "7.1"
+SCHEMA_VERSION = "8.0"
 
 
 MODEL_FEATURES: Tuple[str, ...] = (
@@ -29,6 +29,7 @@ MAX_ROW_NAN_RATIO = 0.10
 DTYPE = "float32"
 
 ABSOLUTE_FEATURE_LIMIT = 1e6
+MIN_VARIANCE = 1e-8
 
 
 FEATURE_LIMITS: Dict[str, tuple] = {
@@ -90,25 +91,18 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     if df.columns.duplicated().any():
         raise RuntimeError("Duplicate columns detected.")
 
+    ####################################################
+    # HARD ORDER CHECK
+    ####################################################
+
+    if tuple(df.columns) != MODEL_FEATURES:
+        raise RuntimeError(
+            "Feature order drift detected."
+        )
+
     _check_forbidden_columns(df)
 
-    incoming = set(df.columns)
-    expected = set(MODEL_FEATURES)
-
-    missing = expected - incoming
-    unknown = incoming - expected
-
-    if missing:
-        raise RuntimeError(
-            f"Missing required features: {sorted(missing)}"
-        )
-
-    if unknown:
-        raise RuntimeError(
-            f"Unknown features detected: {sorted(unknown)}"
-        )
-
-    feature_df = df.loc[:, MODEL_FEATURES].copy(deep=True)
+    feature_df = df.copy(deep=True)
 
     feature_df.replace(
         [np.inf, -np.inf],
@@ -116,9 +110,9 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         inplace=True
     )
 
-    ########################################################
-    # TYPE ENFORCEMENT
-    ########################################################
+    ####################################################
+    # TYPE + NUMERIC ENFORCEMENT
+    ####################################################
 
     for col in MODEL_FEATURES:
 
@@ -141,14 +135,32 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
                 f"No finite values present in feature: {col}"
             )
 
+        ################################################
+        # CONSTANT FEATURE GUARD
+        ################################################
+
+        if finite_vals.nunique() <= 1:
+            raise RuntimeError(
+                f"Constant feature detected: {col}"
+            )
+
+        ################################################
+        # VARIANCE FLOOR
+        ################################################
+
+        if finite_vals.var() < MIN_VARIANCE:
+            raise RuntimeError(
+                f"Near-zero variance feature detected: {col}"
+            )
+
         if np.abs(finite_vals).max() > ABSOLUTE_FEATURE_LIMIT:
             raise RuntimeError(
                 f"Feature explosion detected: {col}"
             )
 
-    ########################################################
+    ####################################################
     # NAN GUARDS
-    ########################################################
+    ####################################################
 
     per_feature_nan = feature_df.isna().mean()
 
@@ -168,9 +180,9 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             "Row-level NaN explosion detected."
         )
 
-    ########################################################
+    ####################################################
     # RANGE GUARDS
-    ########################################################
+    ####################################################
 
     for col, (lo, hi) in FEATURE_LIMITS.items():
 
@@ -185,13 +197,16 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
                 f"Feature out of plausible bounds: {col}"
             )
 
-    ########################################################
-    # CONTIGUOUS MEMORY
-    ########################################################
+    ####################################################
+    # CONTIGUOUS FLOAT32 MEMORY
+    ####################################################
 
     arr = np.ascontiguousarray(
         feature_df.to_numpy(dtype=DTYPE)
     )
+
+    if arr.dtype != np.float32:
+        raise RuntimeError("Feature block not float32.")
 
     return pd.DataFrame(
         arr.copy(),
@@ -217,7 +232,9 @@ def get_schema_signature() -> str:
         f"nan_row={MAX_ROW_NAN_RATIO}",
         f"limits={canonical_limits}",
         f"abs_limit={ABSOLUTE_FEATURE_LIMIT}",
+        f"variance_floor={MIN_VARIANCE}",
         f"count={len(MODEL_FEATURES)}",
+        f"numeric_hash={hashlib.sha256(str(sorted(NUMERIC_FEATURES)).encode()).hexdigest()}",
         f"forbidden={','.join(sorted(FORBIDDEN_PATTERNS))}",
         f"version={SCHEMA_VERSION}"
     ]
