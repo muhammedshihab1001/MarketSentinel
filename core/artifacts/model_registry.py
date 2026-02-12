@@ -4,6 +4,7 @@ import datetime
 import shutil
 import hashlib
 import uuid
+import time
 from typing import Dict, Any, List
 
 from core.schema.feature_schema import (
@@ -25,8 +26,13 @@ class ModelRegistry:
         "dataset_hash",
         "schema_signature",
         "metadata_type",
-        "training_code_hash"
+        "training_code_hash",
+        "metadata_integrity_hash"
     )
+
+    REQUIRED_METADATA_TYPE = "training_manifest_v1"
+
+    LOCK_TIMEOUT_SECONDS = 600  # 10 minutes
 
     ########################################################
     # VERSION
@@ -44,7 +50,6 @@ class ModelRegistry:
 
     @staticmethod
     def _sha256(path: str) -> str:
-
         h = hashlib.sha256()
 
         with open(path, "rb") as f:
@@ -59,7 +64,6 @@ class ModelRegistry:
 
     @staticmethod
     def _fsync_dir(path: str):
-
         if os.name == "nt":
             return
 
@@ -79,7 +83,7 @@ class ModelRegistry:
         tmp = path + ".tmp"
 
         with open(tmp, "w") as f:
-            json.dump(payload, f, indent=4)
+            json.dump(payload, f, indent=4, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
 
@@ -89,23 +93,29 @@ class ModelRegistry:
         ModelRegistry._fsync_dir(parent)
 
     ########################################################
-    # LOCK (TRUE ATOMIC)
+    # LOCK WITH STALE DETECTION
     ########################################################
 
     @staticmethod
     def _acquire_lock(lock_path: str):
 
-        try:
-            fd = os.open(
-                lock_path,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY
-            )
-            os.close(fd)
+        if os.path.exists(lock_path):
 
-        except FileExistsError:
-            raise RuntimeError(
-                "Registry promotion already in progress."
-            )
+            age = time.time() - os.path.getmtime(lock_path)
+
+            if age > ModelRegistry.LOCK_TIMEOUT_SECONDS:
+                # stale lock recovery
+                os.remove(lock_path)
+            else:
+                raise RuntimeError(
+                    "Registry promotion already in progress."
+                )
+
+        fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        )
+        os.close(fd)
 
     ########################################################
 
@@ -116,14 +126,14 @@ class ModelRegistry:
             os.remove(lock_path)
 
     ########################################################
-    # MANIFEST HASH
+    # METADATA HASH
     ########################################################
 
     @staticmethod
-    def _manifest_hash(manifest: dict) -> str:
+    def _metadata_hash(meta: dict) -> str:
 
-        clone = dict(manifest)
-        clone.pop("manifest_integrity_hash", None)
+        clone = dict(meta)
+        clone.pop("metadata_integrity_hash", None)
 
         canonical = json.dumps(
             clone,
@@ -151,6 +161,17 @@ class ModelRegistry:
             raise RuntimeError(
                 f"Metadata missing required fields: {missing}"
             )
+
+        if meta["metadata_type"] != ModelRegistry.REQUIRED_METADATA_TYPE:
+            raise RuntimeError(
+                "Invalid metadata_type — refusing registry write."
+            )
+
+        expected_hash = meta["metadata_integrity_hash"]
+        actual_hash = ModelRegistry._metadata_hash(meta)
+
+        if expected_hash != actual_hash:
+            raise RuntimeError("Metadata integrity failure.")
 
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Schema mismatch detected.")
@@ -180,9 +201,14 @@ class ModelRegistry:
         with open(manifest_path) as f:
             manifest = json.load(f)
 
-        if manifest["manifest_integrity_hash"] != (
-            ModelRegistry._manifest_hash(manifest)
-        ):
+        clone = dict(manifest)
+        expected_hash = clone.pop("manifest_integrity_hash")
+
+        actual_hash = hashlib.sha256(
+            json.dumps(clone, sort_keys=True).encode()
+        ).hexdigest()
+
+        if expected_hash != actual_hash:
             raise RuntimeError("Manifest integrity failure.")
 
         for artifact, expected_hash in manifest["artifacts"].items():
@@ -240,6 +266,7 @@ class ModelRegistry:
                 "parent": parent_version,
                 "dataset_hash": meta["dataset_hash"],
                 "schema_signature": meta["schema_signature"],
+                "training_code_hash": meta["training_code_hash"],
                 "artifacts": {
                     model_name: ModelRegistry._sha256(staged_model),
                     metadata_name: ModelRegistry._sha256(staged_meta),
@@ -247,9 +274,10 @@ class ModelRegistry:
                 "history": []
             }
 
-            manifest["manifest_integrity_hash"] = (
-                ModelRegistry._manifest_hash(manifest)
-            )
+            clone = dict(manifest)
+            manifest["manifest_integrity_hash"] = hashlib.sha256(
+                json.dumps(clone, sort_keys=True).encode()
+            ).hexdigest()
 
             manifest_path = os.path.join(
                 staging_dir,
@@ -278,39 +306,6 @@ class ModelRegistry:
             raise
 
     ########################################################
-    # SELF HEAL POINTER
-    ########################################################
-
-    @staticmethod
-    def _self_heal_pointer(base_dir: str) -> str:
-
-        versions = ModelRegistry.list_versions(base_dir)
-
-        if not versions:
-            raise RuntimeError("Registry empty.")
-
-        latest = versions[-1]
-
-        pointer = {
-            "version": latest,
-            "healed": True,
-            "timestamp": datetime.datetime.utcnow().isoformat()
-        }
-
-        pointer["pointer_hash"] = hashlib.sha256(
-            json.dumps(pointer, sort_keys=True).encode()
-        ).hexdigest()
-
-        pointer_path = os.path.join(
-            base_dir,
-            ModelRegistry.LATEST_POINTER
-        )
-
-        ModelRegistry._atomic_json_write(pointer_path, pointer)
-
-        return latest
-
-    ########################################################
     # PROMOTION
     ########################################################
 
@@ -335,8 +330,10 @@ class ModelRegistry:
                 "promoted_utc": datetime.datetime.utcnow().isoformat()
             }
 
+            clone = dict(pointer)
+
             pointer["pointer_hash"] = hashlib.sha256(
-                json.dumps(pointer, sort_keys=True).encode()
+                json.dumps(clone, sort_keys=True).encode()
             ).hexdigest()
 
             pointer_path = os.path.join(
@@ -350,7 +347,7 @@ class ModelRegistry:
             ModelRegistry._release_lock(lock_path)
 
     ########################################################
-    # GET LATEST (SELF HEALING)
+    # GET LATEST (FAIL CLOSED)
     ########################################################
 
     @staticmethod
@@ -362,33 +359,31 @@ class ModelRegistry:
         )
 
         if not os.path.exists(pointer_path):
-            return ModelRegistry._self_heal_pointer(base_dir)
+            raise RuntimeError(
+                "Latest pointer missing. Refusing auto-heal."
+            )
 
-        try:
+        with open(pointer_path) as f:
+            payload = json.load(f)
 
-            with open(pointer_path) as f:
-                payload = json.load(f)
+        expected = payload.get("pointer_hash")
 
-            expected = payload.get("pointer_hash")
+        clone = dict(payload)
+        clone.pop("pointer_hash", None)
 
-            clone = dict(payload)
-            clone.pop("pointer_hash", None)
+        actual = hashlib.sha256(
+            json.dumps(clone, sort_keys=True).encode()
+        ).hexdigest()
 
-            actual = hashlib.sha256(
-                json.dumps(clone, sort_keys=True).encode()
-            ).hexdigest()
+        if expected != actual:
+            raise RuntimeError(
+                "Pointer corrupted. Manual intervention required."
+            )
 
-            if expected != actual:
-                raise RuntimeError("Pointer corrupted.")
-
-            return payload["version"]
-
-        except Exception:
-
-            return ModelRegistry._self_heal_pointer(base_dir)
+        return payload["version"]
 
     ########################################################
-    # LIST
+    # LIST (TIMESTAMP SAFE)
     ########################################################
 
     @staticmethod
@@ -417,9 +412,20 @@ class ModelRegistry:
                 ModelRegistry.MANIFEST_NAME
             )
 
-            if os.path.exists(manifest):
-                versions.append(name)
+            if not os.path.exists(manifest):
+                continue
 
-        versions.sort()
+            try:
+                with open(manifest) as f:
+                    data = json.load(f)
 
-        return versions
+                versions.append(
+                    (name, data["created_utc"])
+                )
+
+            except Exception:
+                continue
+
+        versions.sort(key=lambda x: x[1])
+
+        return [v[0] for v in versions]
