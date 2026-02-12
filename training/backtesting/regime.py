@@ -19,8 +19,12 @@ class RegimeConfig:
 
     EPSILON: float = 1e-8
 
+    MAX_DAILY_RETURN: float = 0.60
+
 
 class MarketRegimeDetector:
+
+    VALID_REGIMES = {"BULL", "BEAR", "SIDEWAYS", "CRISIS"}
 
     def __init__(self, config: RegimeConfig | None = None):
         self.config = config or RegimeConfig()
@@ -33,7 +37,7 @@ class MarketRegimeDetector:
 
         cfg = self.config
 
-        regimes = regimes.astype(object)
+        regimes = np.asarray(regimes, dtype=object)
 
         confirmed = regimes.copy()
 
@@ -44,6 +48,9 @@ class MarketRegimeDetector:
         for i in range(1, len(regimes)):
 
             new = regimes[i]
+
+            if new not in self.VALID_REGIMES:
+                raise RuntimeError(f"Invalid regime detected: {new}")
 
             if new == "CRISIS":
                 current = "CRISIS"
@@ -98,6 +105,12 @@ class MarketRegimeDetector:
         if df["close"].isna().any():
             raise RuntimeError("NaN close prices detected.")
 
+        if not np.isfinite(df["close"]).all():
+            raise RuntimeError("Non-finite prices detected.")
+
+        if (df["close"] <= 0).any():
+            raise RuntimeError("Non-positive prices detected.")
+
         shifted_close = df["close"].shift(1)
 
         ma_long = (
@@ -107,6 +120,11 @@ class MarketRegimeDetector:
         )
 
         returns = shifted_close.pct_change()
+
+        if returns.abs().max() > cfg.MAX_DAILY_RETURN:
+            raise RuntimeError(
+                "Unrealistic daily return detected. Data likely corrupted."
+            )
 
         volatility = (
             returns
@@ -157,7 +175,6 @@ class MarketRegimeDetector:
 
         df["regime"] = regime
 
-        # Drop warmup rows where MA is unavailable
         warmup_cut = max(cfg.trend_window, cfg.volatility_window)
 
         if len(df) <= warmup_cut:
@@ -165,7 +182,9 @@ class MarketRegimeDetector:
                 "Dataset too small for regime detection."
             )
 
-        df = df.iloc[warmup_cut:].reset_index(drop=True)
+        df = df.iloc[warmup_cut:].copy()
+
+        df["date"] = pd.to_datetime(df["date"], utc=True)
 
         return df
 
@@ -185,7 +204,9 @@ class MarketRegimeDetector:
 
         grouped = []
 
-        for ticker, slice_df in df.groupby("ticker", sort=False):
+        for ticker, slice_df in df.sort_values(
+            ["ticker", "date"]
+        ).groupby("ticker"):
 
             if len(slice_df) < 300:
                 continue
