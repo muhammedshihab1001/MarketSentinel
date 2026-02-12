@@ -23,15 +23,14 @@ class FeatureEngineer:
 
     RETURN_CLAMP = (-0.5, 0.5)
 
-    # Institutional safe window
     MERGE_TOLERANCE = pd.Timedelta("2D")
 
     VOL_FLOOR = 1e-4
     SENTIMENT_STD_FLOOR = 0.02
 
-    ###############################################
+    ###################################################
     # DATETIME
-    ###############################################
+    ###################################################
 
     @staticmethod
     def _normalize_datetime(df: pd.DataFrame):
@@ -45,9 +44,9 @@ class FeatureEngineer:
 
         return df
 
-    ###############################################
+    ###################################################
     # PRICE VALIDATION
-    ###############################################
+    ###################################################
 
     @staticmethod
     def _validate_price_frame(df: pd.DataFrame):
@@ -82,9 +81,9 @@ class FeatureEngineer:
 
         return df
 
-    ###############################################
+    ###################################################
     # FLOAT32 ENFORCEMENT
-    ###############################################
+    ###################################################
 
     @staticmethod
     def _enforce_float32(df):
@@ -94,9 +93,9 @@ class FeatureEngineer:
 
         return df
 
-    ###############################################
+    ###################################################
     # FEATURES
-    ###############################################
+    ###################################################
 
     @staticmethod
     def add_returns(df):
@@ -144,9 +143,82 @@ class FeatureEngineer:
         df["macd"] = macd.clip(-50, 50)
         df["macd_signal"] = signal.clip(-50, 50)
 
-    ###############################################
+    ###################################################
+    # INSTITUTIONAL FEATURES
+    ###################################################
+
+    @staticmethod
+    def add_vol_regime(df, window=50):
+
+        long_vol = (
+            df["return"]
+            .rolling(window, min_periods=window)
+            .std()
+        )
+
+        short_vol = df["volatility"]
+
+        df["vol_regime"] = (
+            short_vol / long_vol.clip(lower=1e-4)
+        ).clip(0.2, 5)
+
+    @staticmethod
+    def add_drawdown_feature(df, window=60):
+
+        rolling_max = df["close"].rolling(window).max()
+
+        df["drawdown"] = (
+            df["close"] / rolling_max - 1
+        ).clip(-0.8, 0)
+
+    @staticmethod
+    def add_dollar_volume(df, window=20):
+
+        if "volume" not in df.columns:
+            return
+
+        dv = df["close"] * df["volume"]
+
+        df["dollar_volume"] = (
+            dv.rolling(window, min_periods=window)
+            .mean()
+            .clip(lower=1e6)
+        )
+
+    ###################################################
+    # 🚨 CRITICAL — FEATURE TIME ALIGNMENT
+    ###################################################
+
+    @staticmethod
+    def align_features_to_prediction_time(df):
+        """
+        Prevent bar-close leakage.
+        Model only sees information available BEFORE prediction.
+        """
+
+        leak_prone = [
+            "return",
+            "volatility",
+            "rsi",
+            "macd",
+            "macd_signal",
+            "avg_sentiment",
+            "news_count",
+            "sentiment_std",
+            "vol_regime",
+            "drawdown",
+            "dollar_volume"
+        ]
+
+        for col in leak_prone:
+            if col in df.columns:
+                df[col] = df[col].shift(1)
+
+        return df
+
+    ###################################################
     # SENTIMENT MERGE — FAIL CLOSED
-    ###############################################
+    ###################################################
 
     @classmethod
     def merge_price_sentiment(cls, price_df, sentiment_df):
@@ -176,9 +248,9 @@ class FeatureEngineer:
                 as_index=False
             )[cls.SENTIMENT_COLUMNS[1:]].mean()
 
-        ###########################################
+        ###################################
         # LOOKAHEAD SAFE SHIFT
-        ###########################################
+        ###################################
 
         sentiment["date"] += pd.Timedelta(days=1)
 
@@ -190,10 +262,6 @@ class FeatureEngineer:
             tolerance=cls.MERGE_TOLERANCE,
             allow_exact_matches=False
         )
-
-        ###########################################
-        # DECAY WITH FLOOR
-        ###########################################
 
         merged["avg_sentiment"] = merged["avg_sentiment"].ffill(limit=3)
         merged["news_count"] = merged["news_count"].ffill(limit=3)
@@ -217,9 +285,9 @@ class FeatureEngineer:
 
         return merged
 
-    ###############################################
+    ###################################################
     # TARGET
-    ###############################################
+    ###################################################
 
     @classmethod
     def create_training_dataset(cls, df):
@@ -239,9 +307,6 @@ class FeatureEngineer:
             np.where(risk_adj < -DEAD_ZONE, 0, np.nan)
         )
 
-        df["return_lag1"] = df["return"].shift(1)
-        df["sentiment_lag1"] = df["avg_sentiment"].shift(1)
-
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df.dropna(inplace=True)
 
@@ -254,25 +319,9 @@ class FeatureEngineer:
 
         return df
 
-    @classmethod
-    def create_inference_dataset(cls, df):
-
-        if "target" in df.columns:
-            raise RuntimeError("Target detected in inference pipeline.")
-
-        df = df.sort_values("date").copy()
-
-        df["return_lag1"] = df["return"].shift(1)
-        df["sentiment_lag1"] = df["avg_sentiment"].shift(1)
-
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df.dropna(inplace=True)
-
-        return df
-
-    ###############################################
+    ###################################################
     # MASTER PIPELINE
-    ###############################################
+    ###################################################
 
     @classmethod
     def build_feature_pipeline(
@@ -291,20 +340,30 @@ class FeatureEngineer:
         cls.add_rsi(df)
         cls.add_macd(df)
 
+        # Institutional additions
+        cls.add_vol_regime(df)
+        cls.add_drawdown_feature(df)
+        cls.add_dollar_volume(df)
+
         df = cls.merge_price_sentiment(df, sentiment_df)
+
+        # 🚨 CRITICAL
+        df = cls.align_features_to_prediction_time(df)
 
         df = cls._enforce_float32(df)
 
         if training:
             df = cls.create_training_dataset(df)
         else:
-            df = cls.create_inference_dataset(df)
+            raise RuntimeError(
+                "Inference pipeline should be built separately."
+            )
 
         feature_block = df.loc[:, MODEL_FEATURES]
 
         validated = validate_feature_schema(feature_block)
 
-        allowed_non_features = {"date", "close", "target"}
+        allowed_non_features = {"date", "close", "target", "ticker"}
 
         non_features = [
             col for col in df.columns
