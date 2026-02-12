@@ -6,7 +6,6 @@ import logging
 import socket
 import platform
 import random
-import hashlib
 import subprocess
 
 import numpy as np
@@ -22,17 +21,25 @@ RUNS_DIR = "artifacts/training_runs"
 
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
+MAX_REASONABLE_SHARPE = 8.0   # institutional sanity guard
 
 GLOBAL_SEED = 42
 
 
 ########################################################
-# DETERMINISM
+# TRUE DETERMINISM
 ########################################################
 
 def enforce_determinism():
 
     os.environ["PYTHONHASHSEED"] = str(GLOBAL_SEED)
+
+    #  BLAS / OpenMP stability
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+
+    # future-safe
+    os.environ["TF_DETERMINISTIC_OPS"] = "1"
 
     random.seed(GLOBAL_SEED)
     np.random.seed(GLOBAL_SEED)
@@ -108,6 +115,11 @@ def validate_metrics(metrics: dict):
     if not np.isfinite(sharpe):
         raise RuntimeError("Invalid sharpe produced.")
 
+    if sharpe > MAX_REASONABLE_SHARPE:
+        raise RuntimeError(
+            "Sharpe unrealistically high — likely leakage."
+        )
+
     if drawdown is not None and not np.isfinite(drawdown):
         raise RuntimeError("Invalid drawdown produced.")
 
@@ -141,8 +153,9 @@ def main():
 
     enforce_determinism()
 
+    #  microsecond-safe run id
     run_id = datetime.datetime.utcnow().strftime(
-        "run_%Y_%m_%d_%H%M%S"
+        "run_%Y_%m_%d_%H%M%S_%f"
     )
 
     start = time.time()
