@@ -14,17 +14,6 @@ from core.schema.feature_schema import (
 
 
 class MetadataManager:
-    """
-    Institutional Metadata Authority — Hardened.
-
-    Guarantees:
-    ✔ deterministic dataset fingerprinting
-    ✔ training code lineage
-    ✔ audit-grade environment capture
-    ✔ schema-bound metadata
-    ✔ crash-safe writes
-    ✔ registry poisoning prevention
-    """
 
     REQUIRED_METADATA_FIELDS = [
         "metadata_type",
@@ -40,10 +29,10 @@ class MetadataManager:
         "training_code_hash"
     ]
 
-    METADATA_VERSION = "2.0"
+    METADATA_VERSION = "2.1"
 
     # -----------------------------------------------------
-    # DATASET FINGERPRINT (AUDIT SAFE)
+    # DATASET FINGERPRINT — INSTITUTION SAFE
     # -----------------------------------------------------
 
     @staticmethod
@@ -54,32 +43,42 @@ class MetadataManager:
 
         df_copy = df.copy()
 
-        # Normalize dtypes
+        # normalize floats deterministically
         for col in df_copy.columns:
 
             if pd.api.types.is_float_dtype(df_copy[col]):
-                df_copy[col] = df_copy[col].astype("float64").round(10)
+                df_copy[col] = (
+                    df_copy[col]
+                    .astype("float64")
+                    .round(10)
+                )
 
             elif pd.api.types.is_integer_dtype(df_copy[col]):
                 df_copy[col] = df_copy[col].astype("int64")
 
-        # stable column ordering
-        df_copy = df_copy.reindex(sorted(df_copy.columns), axis=1)
+        # stable ordering — NEVER sort by floats
+        sort_cols = []
 
-        # deterministic row ordering
-        df_copy = df_copy.sort_values(
-            by=list(df_copy.columns)
-        ).reset_index(drop=True)
+        if "date" in df_copy.columns:
+            sort_cols.append("date")
 
-        hashed = pd.util.hash_pandas_object(
-            df_copy,
-            index=False
-        ).values.tobytes()
+        if "ticker" in df_copy.columns:
+            sort_cols.append("ticker")
 
-        return hashlib.sha256(hashed).hexdigest()
+        if sort_cols:
+            df_copy = df_copy.sort_values(sort_cols)
+
+        df_copy = df_copy.reset_index(drop=True)
+
+        # contiguous memory
+        arr = np.ascontiguousarray(
+            df_copy.to_numpy()
+        )
+
+        return hashlib.sha256(arr.tobytes()).hexdigest()
 
     # -----------------------------------------------------
-    # TRAINING CODE HASH
+    # TRAINING CODE HASH — LINEAGE SAFE
     # -----------------------------------------------------
 
     @staticmethod
@@ -87,7 +86,14 @@ class MetadataManager:
 
         hasher = hashlib.sha256()
 
-        for root in ["core", "models", "training"]:
+        CRITICAL_DIRS = [
+            "training",
+            "models",
+            "core/features",
+            "core/schema"
+        ]
+
+        for root in CRITICAL_DIRS:
 
             if not os.path.exists(root):
                 continue
@@ -109,8 +115,6 @@ class MetadataManager:
         return hasher.hexdigest()
 
     # -----------------------------------------------------
-    # ENVIRONMENT CAPTURE (AUDIT GRADE)
-    # -----------------------------------------------------
 
     @staticmethod
     def capture_environment():
@@ -122,7 +126,6 @@ class MetadataManager:
             "pandas": pd.__version__,
         }
 
-        # optional libs
         try:
             import sklearn
             env["sklearn"] = sklearn.__version__
@@ -176,7 +179,6 @@ class MetadataManager:
             "schema_signature": get_schema_signature(),
             "schema_version": SCHEMA_VERSION,
 
-            # NEW — critical
             "training_code_hash":
                 MetadataManager.fingerprint_training_code(),
 
