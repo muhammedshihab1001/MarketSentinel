@@ -1,62 +1,66 @@
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import (
-    LSTM,
-    Dense,
-    Dropout,
-    LayerNormalization
-)
+from tensorflow.keras.layers import LSTM, Dense, Dropout, LayerNormalization
 from tensorflow.keras.optimizers import Adam
 import numpy as np
 
 
-# ---------------------------------------------------
-# MODEL
-# ---------------------------------------------------
+def _configure_runtime():
+
+    gpus = tf.config.list_physical_devices("GPU")
+
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+
+            tf.keras.mixed_precision.set_global_policy("mixed_float16")
+
+        except Exception:
+            pass
+
+
+_configure_runtime()
+
 
 def build_lstm_model(input_shape):
-    """
-    Institutional-grade LSTM.
-
-    Guarantees:
-    - CuDNN-compatible kernels
-    - stabilized gradients
-    - deterministic-friendly
-    - low inference latency
-    """
 
     model = Sequential([
 
         LSTM(
-            128,
+            64,
             return_sequences=True,
+            activation="tanh",
+            recurrent_activation="sigmoid",
             kernel_initializer="glorot_uniform",
             recurrent_initializer="orthogonal"
         ),
 
         LayerNormalization(),
-        Dropout(0.2),
+        Dropout(0.15),
 
         LSTM(
-            64,
+            32,
+            activation="tanh",
+            recurrent_activation="sigmoid",
             kernel_initializer="glorot_uniform",
             recurrent_initializer="orthogonal"
         ),
 
         LayerNormalization(),
-        Dropout(0.2),
+        Dropout(0.15),
 
         Dense(
-            32,
+            16,
             activation="gelu",
             kernel_initializer="glorot_uniform"
         ),
 
-        Dense(1)
+        Dense(1, dtype="float32")
     ])
 
     optimizer = Adam(
-        learning_rate=3e-4,     # safer than 1e-3
+        learning_rate=3e-4,
         clipnorm=1.0
     )
 
@@ -68,10 +72,6 @@ def build_lstm_model(input_shape):
     return model
 
 
-# ---------------------------------------------------
-# FORECAST
-# ---------------------------------------------------
-
 def forecast_lstm(
     model,
     scaler,
@@ -79,14 +79,6 @@ def forecast_lstm(
     lookback=60,
     horizon=7
 ):
-    """
-    Rolling autoregressive forecast.
-
-    Guarantees:
-    - dtype enforcement
-    - finite predictions
-    - scaler consistency
-    """
 
     if len(recent_prices) < lookback:
         raise ValueError(
