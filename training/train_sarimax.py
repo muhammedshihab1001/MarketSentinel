@@ -1,7 +1,6 @@
 import os
 import datetime
 import uuid
-import hashlib
 from typing import Dict, Tuple
 
 import numpy as np
@@ -41,20 +40,22 @@ def enforce_determinism():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 
     np.random.seed(SEED)
 
 
 ########################################################
-# FSYNC FILE
+# FSYNC DIRECTORY
 ########################################################
 
-def _fsync_file(path):
+def _fsync_dir(directory):
 
     if os.name == "nt":
         return
 
-    fd = os.open(path, os.O_RDONLY)
+    fd = os.open(directory, os.O_DIRECTORY)
     try:
         os.fsync(fd)
     finally:
@@ -74,47 +75,29 @@ def save_model_atomic(model: SarimaxModel, path: str) -> None:
 
     joblib.dump(model, tmp_path)
 
-    _fsync_file(tmp_path)
-
     os.replace(tmp_path, path)
 
-    _fsync_file(path)
+    _fsync_dir(directory)
 
     if not os.path.exists(path):
         raise RuntimeError("Model write failed.")
 
 
 ########################################################
-# CANONICAL UNIVERSE HASH
-########################################################
-
-def universe_hash(datasets: Dict[str, pd.DataFrame]):
-
-    hasher = hashlib.sha256()
-
-    for ticker in sorted(datasets.keys()):
-
-        df = datasets[ticker].sort_values("date")
-
-        arr = pd.util.hash_pandas_object(
-            df,
-            index=False
-        ).values
-
-        hasher.update(arr.tobytes())
-
-    return hasher.hexdigest()
-
-
-########################################################
-# STATIONARITY CHECK
+# SAFE STATIONARITY CHECK
 ########################################################
 
 def assert_stationary(series: pd.Series):
 
+    if not np.isfinite(series).all():
+        raise RuntimeError("Non-finite values detected before ADF test.")
+
     result = adfuller(series.dropna())
 
     p_value = result[1]
+
+    if not np.isfinite(p_value):
+        raise RuntimeError("ADF produced invalid p-value.")
 
     if p_value > 0.05:
         raise RuntimeError(
@@ -147,7 +130,12 @@ def load_training_data() -> Tuple[Dict[str, object], str]:
 
         df = df[["date", "close"]].copy()
 
-        assert_stationary(np.log(df["close"]).diff().dropna())
+        if (df["close"] <= 0).any():
+            raise RuntimeError(f"{ticker} contains non-positive prices.")
+
+        log_returns = np.log(df["close"]).diff().dropna()
+
+        assert_stationary(log_returns)
 
         datasets[ticker] = df
 
@@ -221,7 +209,9 @@ def train_champion():
             + "\n".join(rejection_log)
         )
 
-    u_hash = universe_hash(datasets)
+    dataset_hash = MetadataManager.fingerprint_dataset(
+        datasets[best_ticker]
+    )
 
     training_range = best_model.get_training_range()
 
@@ -232,11 +222,11 @@ def train_champion():
             "risk_adjusted_score": float(best_score),
             **best_metrics
         },
-        features=["date", "close"],
+        features=["close"],
         training_start=training_range["start"],
         training_end=training_range["end"],
-        dataset_hash=u_hash,
-        metadata_type="training_manifest_v1",
+        dataset_hash=dataset_hash,
+        metadata_type="timeseries_manifest_v1",
         extra_fields={
             "model_type": "SARIMAX",
             "parameters": best_model.get_params()
