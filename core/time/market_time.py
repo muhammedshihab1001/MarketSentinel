@@ -1,4 +1,6 @@
 import datetime
+import json
+import os
 
 
 class MarketTime:
@@ -7,41 +9,92 @@ class MarketTime:
 
     Guarantees:
     ✔ deterministic windows
-    ✔ model-specific horizons
-    ✔ audit-safe lineage
-    ✔ prevents temporal leakage
     ✔ restart-safe freeze
-    ✔ no ENV drift
+    ✔ audit lineage
+    ✔ timezone neutrality
+    ✔ prevents future leakage
+    ✔ model-governed horizons
     """
 
     ########################################################
-    # MODEL-SPECIFIC HORIZONS (VERY IMPORTANT)
+    # MODEL WINDOWS
     ########################################################
 
     MODEL_WINDOWS = {
-        "xgboost": 3,     # regime aware
-        "lstm": 5,        # sequence depth
-        "sarimax": 7      # macro structure
+        "xgboost": 3,
+        "lstm": 5,
+        "sarimax": 7
     }
 
     WALK_FORWARD_MONTHS = 3
 
+    FREEZE_FILE = "artifacts/time_freeze.json"
+
     _frozen_today = None
 
     ########################################################
-    # FREEZE (PIPELINE LEVEL)
+    # TRUE UTC TODAY
+    ########################################################
+
+    @staticmethod
+    def _utc_today():
+        return datetime.datetime.utcnow().date()
+
+    ########################################################
+    # FREEZE (PERSISTENT)
     ########################################################
 
     @classmethod
     def freeze_today(cls, date_str: str):
         """
-        Freeze time across the entire process.
+        Freeze globally and persist.
 
-        Example:
-            MarketTime.freeze_today("2026-02-12")
+        NEVER silently changes across restarts.
         """
 
-        cls._frozen_today = datetime.date.fromisoformat(date_str)
+        frozen = datetime.date.fromisoformat(date_str)
+
+        if frozen > cls._utc_today():
+            raise RuntimeError(
+                "Cannot freeze time in the future."
+            )
+
+        cls._frozen_today = frozen
+
+        os.makedirs("artifacts", exist_ok=True)
+
+        with open(cls.FREEZE_FILE, "w") as f:
+            json.dump({"frozen_today": date_str}, f)
+
+    ########################################################
+    # LOAD FREEZE (AUTO)
+    ########################################################
+
+    @classmethod
+    def _load_freeze(cls):
+
+        if not os.path.exists(cls.FREEZE_FILE):
+            return None
+
+        try:
+            with open(cls.FREEZE_FILE) as f:
+                payload = json.load(f)
+
+            frozen = datetime.date.fromisoformat(
+                payload["frozen_today"]
+            )
+
+            if frozen > cls._utc_today():
+                raise RuntimeError(
+                    "Freeze file contains future date."
+                )
+
+            return frozen
+
+        except Exception:
+            raise RuntimeError(
+                "Time freeze file corrupted — refusing to run."
+            )
 
     ########################################################
     # SAFE TODAY
@@ -49,17 +102,17 @@ class MarketTime:
 
     @classmethod
     def today(cls):
-        """
-        Priority:
-
-        1️⃣ Explicit freeze
-        2️⃣ System clock
-        """
 
         if cls._frozen_today:
             return cls._frozen_today
 
-        return datetime.date.today()
+        persisted = cls._load_freeze()
+
+        if persisted:
+            cls._frozen_today = persisted
+            return persisted
+
+        return cls._utc_today()
 
     ########################################################
     # GENERIC WINDOW
@@ -68,15 +121,24 @@ class MarketTime:
     @classmethod
     def training_window(cls, years: int):
 
+        if years <= 0:
+            raise RuntimeError("Training years must be > 0.")
+
         end = cls.today()
 
-        # Leap-safe
-        start = end - datetime.timedelta(days=int(365.25 * years))
+        start = end - datetime.timedelta(
+            days=int(365.25 * years)
+        )
+
+        if start >= end:
+            raise RuntimeError(
+                "Invalid training window generated."
+            )
 
         return start.isoformat(), end.isoformat()
 
     ########################################################
-    # MODEL WINDOW (NEW — CRITICAL)
+    # MODEL WINDOW
     ########################################################
 
     @classmethod
@@ -92,7 +154,7 @@ class MarketTime:
         return cls.training_window(years)
 
     ########################################################
-    # WALK FORWARD ANCHOR
+    # WALK FORWARD
     ########################################################
 
     @classmethod
@@ -107,7 +169,7 @@ class MarketTime:
         return anchor.isoformat()
 
     ########################################################
-    # AUDIT SNAPSHOT (ELITE FEATURE)
+    # SNAPSHOT (EXTREMELY IMPORTANT)
     ########################################################
 
     @classmethod
