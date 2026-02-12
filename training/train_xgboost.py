@@ -84,11 +84,36 @@ def save_model_atomic(model, path):
 
 
 ########################################################
-# SMART QUERY
+# INSTITUTIONAL ENTITY QUERY (CRITICAL FIX)
 ########################################################
 
 def build_news_query(ticker: str) -> str:
-    return f"{ticker} earnings revenue guidance forecast upgrade downgrade"
+    """
+    Entity-first retrieval strategy.
+
+    We maximize article recall and allow FinBERT
+    to filter semantic relevance.
+    """
+
+    COMPANY_MAP = {
+        "AAPL": "Apple",
+        "MSFT": "Microsoft",
+        "NVDA": "Nvidia",
+        "AMZN": "Amazon",
+        "GOOGL": "Google",
+        "META": "Meta",
+        "TSLA": "Tesla",
+        "JPM": "JPMorgan",
+        "GS": "Goldman Sachs",
+        "BAC": "Bank of America",
+        "AMD": "Advanced Micro Devices",
+        "AVGO": "Broadcom"
+    }
+
+    name = COMPANY_MAP.get(ticker, ticker)
+
+    # Wide recall query
+    return f'"{name}" OR "{ticker}" stock'
 
 
 ########################################################
@@ -103,6 +128,13 @@ def validate_sentiment_signal(sentiment_df, ticker):
 
     std = sentiment_df["avg_sentiment"].std()
     news_rate = sentiment_df["news_count"].mean()
+
+    logger.info(
+        "%s sentiment | std=%.4f | avg_news=%.2f",
+        ticker,
+        std,
+        news_rate
+    )
 
     if std < MIN_SENTIMENT_STD:
         sentiment_df["avg_sentiment"] *= 0.25
@@ -142,23 +174,44 @@ def load_training_data():
             if price_df is None or price_df.empty:
                 continue
 
-            for attempt in range(3):
+            ################################################
+            # NEWS WITH EXPONENTIAL RETRY
+            ################################################
+
+            news_df = None
+
+            for attempt in range(4):
                 try:
                     news_df = news_fetcher.fetch(
                         build_news_query(ticker),
-                        max_items=200
+                        max_items=400
                     )
-                    break
+
+                    if news_df is not None and not news_df.empty:
+                        break
+
                 except Exception:
-                    time.sleep(2 ** attempt)
-            else:
+                    pass
+
+                time.sleep(2 ** attempt)
+
+            if news_df is None or news_df.empty:
+                logger.warning("%s news empty.", ticker)
                 continue
+
+            ################################################
+            # SENTIMENT
+            ################################################
 
             scored_df = sentiment_analyzer.analyze_dataframe(news_df)
             sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
 
             if not validate_sentiment_signal(sentiment_df, ticker):
                 continue
+
+            ################################################
+            # FEATURES
+            ################################################
 
             dataset = engineer.build_feature_pipeline(
                 price_df,
