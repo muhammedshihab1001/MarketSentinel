@@ -4,6 +4,7 @@ import logging
 import time
 import os
 import threading
+import hashlib
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
@@ -37,6 +38,7 @@ class FinBERTSingleton:
             logger.info("Loading FinBERT model")
 
             torch.set_grad_enabled(False)
+            torch.set_num_threads(1)
 
             os.makedirs(cls.CACHE_DIR, exist_ok=True)
 
@@ -55,7 +57,7 @@ class FinBERTSingleton:
             except Exception as e:
 
                 raise RuntimeError(
-                    "Failed to load FinBERT. Ensure internet is available on first run."
+                    "Failed to load FinBERT. Internet required on first run."
                 ) from e
 
             cls._model.eval()
@@ -79,6 +81,10 @@ class SentimentAnalyzer:
     BATCH_SIZE = 16
     MAX_HEADLINE_CHARS = 512
 
+    MIN_CONFIDENCE = 0.55
+
+    MAX_FAILURE_RATE = 0.40
+
     def __init__(self):
 
         self.tokenizer, self.model, self.device = FinBERTSingleton.load()
@@ -94,21 +100,10 @@ class SentimentAnalyzer:
     def _clamp_text(self, text: str) -> str:
         return text[:self.MAX_HEADLINE_CHARS]
 
-    def _fake_sentiment(self, text: str):
-
-        text = text.lower()
-
-        if any(word in text for word in ["record", "profit", "growth", "beat"]):
-            return {"label": "positive", "score": 0.6}
-
-        if any(word in text for word in ["fall", "loss", "weak", "drop"]):
-            return {"label": "negative", "score": -0.6}
-
-        return {"label": "neutral", "score": 0.0}
-
     def analyze_batch(self, texts):
 
         results = []
+        failures = 0
 
         for i in range(0, len(texts), self.BATCH_SIZE):
 
@@ -133,16 +128,27 @@ class SentimentAnalyzer:
 
                 with torch.no_grad():
                     logits = self.model(**inputs).logits
-                    scores = torch.softmax(logits, dim=1)
+                    probs = torch.softmax(logits, dim=1)
 
-                scores = scores.cpu().numpy()
+                probs = probs.cpu().numpy()
 
-                for s in scores:
+                for p in probs:
 
-                    label_id = int(s.argmax())
+                    confidence = float(p.max())
+
+                    if confidence < self.MIN_CONFIDENCE:
+
+                        results.append({
+                            "label": "neutral",
+                            "score": 0.0
+                        })
+
+                        continue
+
+                    label_id = int(p.argmax())
                     label = self.label_map[label_id]
 
-                    sentiment_score = float(s[2] - s[0])
+                    sentiment_score = float(p[2] - p[0])
 
                     results.append({
                         "label": label,
@@ -150,8 +156,21 @@ class SentimentAnalyzer:
                     })
 
             except Exception:
-                logger.exception("FinBERT inference failed — using fallback.")
-                results.extend(self._fake_sentiment(t) for t in batch)
+
+                failures += len(batch)
+
+                logger.exception("FinBERT inference failure")
+
+                results.extend({
+                    "label": "neutral",
+                    "score": 0.0
+                } for _ in batch)
+
+        if failures / max(len(texts), 1) > self.MAX_FAILURE_RATE:
+
+            raise RuntimeError(
+                "FinBERT failure rate exceeded safety threshold."
+            )
 
         return results
 
@@ -162,6 +181,16 @@ class SentimentAnalyzer:
 
         if "headline" not in df.columns:
             raise ValueError("Missing headline column")
+
+        df = df.copy()
+
+        df["hash"] = df["headline"].apply(
+            lambda x: hashlib.sha256(
+                str(x).encode()
+            ).hexdigest()
+        )
+
+        df = df.drop_duplicates("hash")
 
         headlines = (
             df["headline"]
@@ -174,8 +203,10 @@ class SentimentAnalyzer:
 
         sentiment_df = pd.DataFrame(results)
 
+        df = df.reset_index(drop=True)
+
         return pd.concat(
-            [df.reset_index(drop=True), sentiment_df],
+            [df.drop(columns=["hash"]), sentiment_df],
             axis=1
         )
 
