@@ -4,11 +4,9 @@ import os
 import json
 import logging
 import hashlib
-from typing import Dict, Any
 
 from core.schema.feature_schema import (
     get_schema_signature,
-    SCHEMA_VERSION,
     MODEL_FEATURES,
     DTYPE
 )
@@ -29,31 +27,60 @@ except Exception:
 class DriftDetector:
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "9.0"
+    BASELINE_VERSION = "10.0"
 
-    MIN_SAMPLE_BASELINE = 50
-    MIN_SAMPLE_INFERENCE = 20
+    MIN_SAMPLE_BASELINE = 100
+    MIN_SAMPLE_INFERENCE = 30
 
     VARIANCE_RATIO_UPPER = 3.0
     VARIANCE_RATIO_LOWER = 0.30
 
+    PSI_ALERT = 0.25
+    PSI_CRITICAL = 0.40
+
     MAX_INFERENCE_ROWS = 500
 
     EPSILON = 1e-6
-    SOFT_VARIANCE_FLOOR = 1e-5
-
     MIN_ACTIVE_FEATURE_RATIO = 0.60
 
     ########################################################
 
     def __init__(self, z_threshold: float = 3.0):
+
         self.z_threshold = z_threshold
+
         os.makedirs("artifacts/drift", exist_ok=True)
 
         self.hard_fail = os.getenv(
             "DRIFT_HARD_FAIL",
             "true"
         ).lower() == "true"
+
+    ########################################################
+    # PSI
+    ########################################################
+
+    def _psi(self, expected, actual, bins=10):
+
+        expected = np.asarray(expected)
+        actual = np.asarray(actual)
+
+        breakpoints = np.linspace(0, 100, bins + 1)
+        quantiles = np.percentile(expected, breakpoints)
+
+        expected_counts = np.histogram(expected, bins=quantiles)[0]
+        actual_counts = np.histogram(actual, bins=quantiles)[0]
+
+        expected_perc = expected_counts / max(len(expected), self.EPSILON)
+        actual_perc = actual_counts / max(len(actual), self.EPSILON)
+
+        psi = np.sum(
+            (actual_perc - expected_perc) *
+            np.log((actual_perc + self.EPSILON) /
+                   (expected_perc + self.EPSILON))
+        )
+
+        return float(psi)
 
     ########################################################
     # BASELINE HASH
@@ -73,33 +100,7 @@ class DriftDetector:
         return hashlib.sha256(canonical).hexdigest()
 
     ########################################################
-    # ATOMIC WRITE
-    ########################################################
-
-    @staticmethod
-    def _atomic_write(path: str, payload: dict):
-
-        directory = os.path.dirname(path) or "."
-        os.makedirs(directory, exist_ok=True)
-
-        payload["integrity_hash"] = DriftDetector._baseline_hash(payload)
-
-        tmp = path + ".tmp"
-
-        with open(tmp, "w") as f:
-            json.dump(payload, f, indent=4, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-
-        os.replace(tmp, path)
-
-        if os.name != "nt":
-            fd = os.open(directory, os.O_DIRECTORY)
-            os.fsync(fd)
-            os.close(fd)
-
-    ########################################################
-    # VERIFY BASELINE
+    # LOAD VERIFIED BASELINE
     ########################################################
 
     def _load_verified_baseline(self):
@@ -110,15 +111,11 @@ class DriftDetector:
         with open(self.BASELINE_PATH) as f:
             baseline = json.load(f)
 
-        expected = baseline.get("integrity_hash")
-
-        actual = self._baseline_hash(baseline)
-
-        if expected != actual:
+        if baseline["integrity_hash"] != self._baseline_hash(baseline):
             raise RuntimeError("Baseline integrity failure.")
 
         if baseline["meta"]["baseline_version"] != self.BASELINE_VERSION:
-            raise RuntimeError("Baseline version incompatible.")
+            raise RuntimeError("Baseline version mismatch.")
 
         if baseline["meta"]["schema_signature"] != get_schema_signature():
             raise RuntimeError("Baseline schema mismatch.")
@@ -126,30 +123,24 @@ class DriftDetector:
         return baseline
 
     ########################################################
-    # ACTIVE MODEL LINEAGE CHECK
+    # ACTIVE MODEL LINEAGE CHECK (UPGRADED)
     ########################################################
 
     def _validate_against_active_model(self, baseline):
 
-        try:
-            loader = ModelLoader()
-            container = loader._xgb_container
+        loader = ModelLoader()
+        container = loader._xgb_container
 
-            if container is None:
-                raise RuntimeError("Model not loaded.")
+        if container is None:
+            raise RuntimeError("Active model not loaded.")
 
-            active_hash = container.dataset_hash
-            baseline_hash = baseline["meta"]["dataset_hash"]
-
-            if active_hash != baseline_hash:
-                raise RuntimeError(
-                    "Baseline dataset does not match active model."
-                )
-
-        except Exception as e:
+        if container.dataset_hash != baseline["meta"]["dataset_hash"]:
             raise RuntimeError(
-                f"Active model lineage validation failed: {e}"
+                "Baseline dataset mismatch with active model."
             )
+
+        if container.schema_signature != get_schema_signature():
+            raise RuntimeError("Active schema mismatch.")
 
     ########################################################
     # SAFE FEATURE BLOCK
@@ -160,14 +151,8 @@ class DriftDetector:
         incoming = set(dataset.columns)
         expected = set(MODEL_FEATURES)
 
-        missing = expected - incoming
-        unknown = incoming - expected
-
-        if missing:
-            raise RuntimeError(f"Missing features: {missing}")
-
-        if unknown:
-            raise RuntimeError(f"Unknown features detected: {unknown}")
+        if incoming != expected:
+            raise RuntimeError("Feature contract violated.")
 
         block = dataset.loc[:, MODEL_FEATURES].copy()
 
@@ -200,7 +185,6 @@ class DriftDetector:
                 raise RuntimeError("Empty dataset supplied.")
 
             baseline = self._load_verified_baseline()
-
             self._validate_against_active_model(baseline)
 
             numeric = self._safe_feature_block(
@@ -221,24 +205,24 @@ class DriftDetector:
 
                 active_features += 1
 
-                var_now = max(current.var(), self.EPSILON)
-
-                mean_now = current.mean()
-
-                z_score = abs(mean_now - stats["mean"]) / max(
+                z_score = abs(current.mean() - stats["mean"]) / max(
                     stats["std"], self.EPSILON
                 )
 
-                variance_ratio = var_now / max(
+                variance_ratio = current.var() / max(
                     stats["variance"], self.EPSILON
+                )
+
+                psi = self._psi(
+                    stats["distribution"],
+                    current.values
                 )
 
                 drift = any([
                     z_score > self.z_threshold,
                     variance_ratio > self.VARIANCE_RATIO_UPPER,
                     variance_ratio < self.VARIANCE_RATIO_LOWER,
-                    current.min() < stats["min"],
-                    current.max() > stats["max"]
+                    psi > self.PSI_ALERT
                 ])
 
                 if drift:
@@ -247,6 +231,7 @@ class DriftDetector:
                 report[col] = {
                     "z_score": float(z_score),
                     "variance_ratio": float(variance_ratio),
+                    "psi": psi,
                     "drift": drift
                 }
 
