@@ -16,7 +16,7 @@ from core.schema.feature_schema import get_schema_signature
 from core.artifacts.metadata_manager import MetadataManager
 from core.config.env_loader import init_env
 from core.time.market_time import MarketTime
-from core.market.universe import MarketUniverse  # VERY IMPORTANT
+from core.market.universe import MarketUniverse
 
 
 ########################################################
@@ -51,22 +51,9 @@ def enforce_determinism():
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
-    os.environ["TF_DETERMINISTIC_OPS"] = "1"
 
     random.seed(GLOBAL_SEED)
     np.random.seed(GLOBAL_SEED)
-
-    try:
-        import torch
-
-        torch.manual_seed(GLOBAL_SEED)
-        torch.cuda.manual_seed_all(GLOBAL_SEED)
-
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-    except Exception:
-        pass
 
 
 ########################################################
@@ -86,20 +73,30 @@ def _fsync_dir(directory):
 
 
 ########################################################
-# GIT HASH (FAIL CLOSED)
+# HARD GIT CHECK
 ########################################################
 
 def get_git_commit():
 
+    if not os.path.exists(".git"):
+        raise RuntimeError(
+            "Training must run inside a FULL git repository."
+        )
+
     try:
-        return subprocess.check_output(
+        commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             stderr=subprocess.DEVNULL
         ).decode().strip()
 
+        if len(commit) != 40:
+            raise RuntimeError("Invalid git commit hash.")
+
+        return commit
+
     except Exception:
         raise RuntimeError(
-            "Training must run inside a git repository."
+            "Unable to resolve git commit — refusing training."
         )
 
 
@@ -135,9 +132,6 @@ def _assert_finite(value, name):
 
 def validate_metrics(metrics: dict):
 
-    if not isinstance(metrics, dict) or not metrics:
-        raise RuntimeError("Training returned invalid metrics.")
-
     required = [
         "avg_sharpe",
         "max_drawdown",
@@ -165,31 +159,31 @@ def validate_metrics(metrics: dict):
 
 
 ########################################################
-# LINEAGE SNAPSHOT (VERY HIGH LEVEL)
+# LINEAGE SNAPSHOT
 ########################################################
 
-def build_lineage(start_date, end_date):
+def build_lineage(start_date, end_date, universe):
 
     return {
         "schema_signature": get_schema_signature(),
         "training_code_hash": MetadataManager.fingerprint_training_code(),
         "git_commit": get_git_commit(),
+
         "python_version": platform.python_version(),
         "numpy_version": np.__version__,
         "pandas_version": pd.__version__,
         "platform": platform.platform(),
         "hostname": socket.gethostname(),
-        "cpu": platform.processor(),
 
-        # Institutional additions
         "training_window": {
             "start": start_date,
             "end": end_date
         },
 
-        "market_time": MarketTime.snapshot(),
+        "market_time_snapshot": MarketTime.snapshot_for("xgboost"),
 
-        "universe": MarketUniverse.get_universe()
+        "training_universe": universe,
+        "universe_hash": MetadataManager.hash_list(universe)
     }
 
 
@@ -203,19 +197,21 @@ def main():
     enforce_determinism()
 
     ####################################################
-    # FREEZE CLOCK (EXTREMELY IMPORTANT)
+    # FREEZE CLOCK ONCE (PIPELINE GOVERNANCE)
     ####################################################
 
-    MarketTime.freeze_today(
-        datetime.date.today().isoformat()
-    )
+    today = datetime.date.today().isoformat()
+    MarketTime.freeze_today(today)
 
-    start_date, end_date = MarketTime.training_window()
+    start_date, end_date = MarketTime.window_for("xgboost")
+
+    universe = MarketUniverse.get_universe()
 
     logger.info(
-        "Pipeline training window | start=%s end=%s",
+        "Pipeline training window | %s -> %s | universe=%s",
         start_date,
-        end_date
+        end_date,
+        len(universe)
     )
 
     run_id = datetime.datetime.utcnow().strftime(
@@ -226,7 +222,7 @@ def main():
 
     try:
 
-        logger.info("Starting XGBoost training...")
+        logger.info("Starting institutional XGBoost training...")
 
         metrics = train_xgb(
             start_date=start_date,
@@ -245,7 +241,11 @@ def main():
             "status": "success",
             "metrics": metrics,
             "runtime_sec": round(runtime, 2),
-            "lineage": build_lineage(start_date, end_date),
+            "lineage": build_lineage(
+                start_date,
+                end_date,
+                universe
+            ),
             "created_utc": datetime.datetime.utcnow().isoformat()
         }
 
@@ -263,7 +263,11 @@ def main():
             "error": str(exc),
             "error_type": type(exc).__name__,
             "runtime_sec": round(time.time() - start, 2),
-            "lineage": build_lineage(start_date, end_date),
+            "lineage": build_lineage(
+                start_date,
+                end_date,
+                universe
+            ),
             "created_utc": datetime.datetime.utcnow().isoformat()
         }
 
