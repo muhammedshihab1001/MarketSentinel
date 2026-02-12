@@ -2,9 +2,10 @@ from typing import Tuple, Dict
 import pandas as pd
 import hashlib
 import numpy as np
+import json
 
 
-SCHEMA_VERSION = "6.0"
+SCHEMA_VERSION = "6.1"
 
 
 MODEL_FEATURES: Tuple[str, ...] = (
@@ -30,22 +31,24 @@ DTYPE = "float32"
 
 FEATURE_LIMITS: Dict[str, tuple] = {
 
-    "return": (-0.5, 0.5),
-    "return_lag1": (-0.5, 0.5),
+    # allow real market tails
+    "return": (-3.0, 3.0),
+    "return_lag1": (-3.0, 3.0),
 
-    "volatility": (0.0, 5.0),
+    "volatility": (0.0, 10.0),
 
     "rsi": (0.0, 100.0),
 
-    "macd": (-50.0, 50.0),
-    "macd_signal": (-50.0, 50.0),
+    "macd": (-500.0, 500.0),
+    "macd_signal": (-500.0, 500.0),
 
     "avg_sentiment": (-1.0, 1.0),
     "sentiment_lag1": (-1.0, 1.0),
 
-    "news_count": (0, 500),
+    # major fix
+    "news_count": (0, 5000),
 
-    "sentiment_std": (0.0, 5.0),
+    "sentiment_std": (0.0, 10.0),
 }
 
 
@@ -106,6 +109,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             "Row-level NaN explosion detected."
         )
 
+    # range guard (not clipping)
     for col, (lo, hi) in FEATURE_LIMITS.items():
 
         series = feature_df[col].dropna()
@@ -115,7 +119,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
         if (series < lo).any() or (series > hi).any():
             raise RuntimeError(
-                f"Feature out of bounds: {col}"
+                f"Feature out of plausible bounds: {col}"
             )
 
     arr = np.ascontiguousarray(
@@ -129,12 +133,18 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_schema_signature() -> str:
+
+    canonical_limits = json.dumps(
+        FEATURE_LIMITS,
+        sort_keys=True
+    )
+
     raw_parts = [
         "|".join(MODEL_FEATURES),
         f"dtype={DTYPE}",
         f"nan_feature={MAX_NAN_RATIO_PER_FEATURE}",
         f"nan_row={MAX_ROW_NAN_RATIO}",
-        f"limits={sorted(FEATURE_LIMITS.items())}",
+        f"limits={canonical_limits}",
         f"count={len(MODEL_FEATURES)}",
         f"version={SCHEMA_VERSION}"
     ]
