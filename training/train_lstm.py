@@ -4,7 +4,6 @@ import joblib
 import numpy as np
 import tensorflow as tf
 import pandas as pd
-import hashlib
 
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.callbacks import EarlyStopping
@@ -46,11 +45,7 @@ def configure_runtime():
     os.environ["TF_DETERMINISTIC_OPS"] = "1"
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
-
-    force_cpu = os.getenv("LSTM_FORCE_CPU", "true").lower() == "true"
-
-    if force_cpu:
-        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # force CPU determinism
 
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
@@ -60,12 +55,12 @@ def configure_runtime():
 # FSYNC
 ############################################################
 
-def _fsync_file(path):
+def _fsync_dir(directory):
 
     if os.name == "nt":
         return
 
-    fd = os.open(path, os.O_RDONLY)
+    fd = os.open(directory, os.O_DIRECTORY)
     try:
         os.fsync(fd)
     finally:
@@ -84,43 +79,22 @@ def atomic_save_model(model, path):
 
     model.save(tmp_path)
 
-    _fsync_file(tmp_path)
-
     os.replace(tmp_path, path)
 
-    _fsync_file(path)
+    _fsync_dir(os.path.dirname(path))
 
 
 def atomic_joblib_dump(obj, path):
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
     tmp = path + ".tmp"
 
     joblib.dump(obj, tmp)
 
-    _fsync_file(tmp)
-
     os.replace(tmp, path)
 
-    _fsync_file(path)
-
-
-############################################################
-# CANONICAL DATASET HASH
-############################################################
-
-def dataset_hash(df):
-
-    ordered = df.sort_values(["ticker", "date"]).copy()
-
-    arr = pd.util.hash_pandas_object(
-        ordered,
-        index=False
-    ).values
-
-    h = hashlib.sha256()
-    h.update(arr.tobytes())
-
-    return h.hexdigest()
+    _fsync_dir(os.path.dirname(path))
 
 
 ############################################################
@@ -158,7 +132,7 @@ def load_data():
 
 
 ############################################################
-# SEQUENCE BUILDER WITH TRAIN-ONLY SCALERS
+# SEQUENCE BUILDER
 ############################################################
 
 def build_sequences_with_scalers(df):
@@ -210,6 +184,9 @@ def apply_scalers(df, scalers):
         for i in range(len(scaled) - LOOKBACK_WINDOW):
             X_all.append(scaled[i:i+LOOKBACK_WINDOW])
             y_all.append(scaled[i+LOOKBACK_WINDOW])
+
+    if not X_all:
+        raise RuntimeError("Validation produced zero sequences.")
 
     return (
         np.asarray(X_all, dtype=np.float32),
@@ -266,7 +243,9 @@ if __name__ == "__main__":
 
     df, end_date = load_data()
 
-    d_hash = dataset_hash(df[["ticker", "date", "close"]])
+    dataset_hash = MetadataManager.fingerprint_dataset(
+        df[["ticker", "date", "close"]]
+    )
 
     model, scalers, val_loss = time_series_validation(df)
 
@@ -279,8 +258,8 @@ if __name__ == "__main__":
         features=["close_sequence"],
         training_start="2012-01-01",
         training_end=end_date,
-        dataset_hash=d_hash,
-        metadata_type="training_manifest_v1"
+        dataset_hash=dataset_hash,
+        metadata_type="sequence_manifest_v1"
     )
 
     MetadataManager.save_metadata(metadata, METADATA_PATH)
@@ -291,9 +270,13 @@ if __name__ == "__main__":
         METADATA_PATH
     )
 
-    os.replace(
-        SCALER_PATH,
-        os.path.join(MODEL_DIR, version, "scalers.pkl")
-    )
+    scaler_target = os.path.join(MODEL_DIR, version, "scalers.pkl")
+
+    os.replace(SCALER_PATH, scaler_target)
+
+    if not os.path.exists(scaler_target):
+        raise RuntimeError("Scaler promotion failed.")
+
+    _fsync_dir(os.path.join(MODEL_DIR, version))
 
     print(f"LSTM registered → {version}")
