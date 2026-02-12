@@ -29,7 +29,6 @@ from app.monitoring.metrics import (
     INFERENCE_IN_PROGRESS
 )
 
-
 logger = logging.getLogger("marketsentinel.pipeline")
 
 
@@ -103,6 +102,8 @@ class InferencePipeline:
 
     SHADOW_DIVERGENCE_THRESHOLD = 0.35
 
+    LOCK_TIMEOUT = 3
+
     ########################################################
 
     def __init__(self):
@@ -120,6 +121,11 @@ class InferencePipeline:
         self.breaker = CircuitBreaker()
 
         self._validate_models_loaded()
+
+    ########################################################
+
+    def _deadline(self, start):
+        return self.HARD_PIPELINE_TIMEOUT - (time.time() - start)
 
     ########################################################
 
@@ -163,18 +169,21 @@ class InferencePipeline:
 
         MISSING_FEATURE_RATIO.set(null_ratio)
 
-        if null_ratio > self.MAX_NULL_RATIO:
-            logger.warning(
-                "High null feature ratio detected: %.3f",
-                null_ratio
-            )
-
         arr = vector.astype("float32").values.reshape(1, -1)
 
         if not np.isfinite(arr).all():
             raise RuntimeError("Non-finite feature vector detected.")
 
         return arr
+
+    ########################################################
+
+    def _safe_probability(self, prob):
+
+        if not np.isfinite(prob):
+            raise RuntimeError("Model produced invalid probability.")
+
+        return float(np.clip(prob, 0.0001, 0.9999))
 
     ########################################################
 
@@ -194,42 +203,6 @@ class InferencePipeline:
             )
 
             return pd.DataFrame()
-
-    ########################################################
-
-    def _run_shadow_sarimax(self, price_df):
-
-        try:
-
-            forecast = self.models.sarimax.forecast(steps=30)
-
-            slope = forecast["normalized_slope"]
-
-            return float(np.tanh(slope * 5) * 0.5 + 0.5)
-
-        except Exception:
-            logger.exception("SARIMAX shadow inference failed.")
-            return None
-
-    ########################################################
-
-    def _guard_latency(self, start, model):
-
-        elapsed = time.time() - start
-
-        if elapsed > self.LATENCY_GUARD_SECONDS:
-
-            PIPELINE_FAILURES.labels(
-                stage=f"{model}_latency"
-            ).inc()
-
-            logger.warning(
-                "%s exceeded latency guard (%.2fs)",
-                model,
-                elapsed
-            )
-
-        return elapsed
 
     ########################################################
 
@@ -255,21 +228,24 @@ class InferencePipeline:
 
             CACHE_MISSES.inc()
 
-            lock = self.cache.get_lock(cache_key, timeout=10)
+            lock = self.cache.get_lock(
+                cache_key,
+                timeout=self.LOCK_TIMEOUT
+            )
 
-            with lock:
+            if not lock.acquire(blocking=False):
+                logger.warning("Lock busy — serving stale if available.")
 
-                # SECOND CACHE CHECK (CRITICAL)
                 cached = self.cache.get(cache_key)
+
                 if cached:
-                    CACHE_HITS.inc()
                     return cached
 
-                ################################################
-                # HARD TIME GUARD
-                ################################################
+                raise RuntimeError("Inference contention detected.")
 
-                if (time.time() - start_pipeline) > self.HARD_PIPELINE_TIMEOUT:
+            try:
+
+                if self._deadline(start_pipeline) <= 0:
                     raise RuntimeError("Pipeline timeout exceeded.")
 
                 price_df = self.market_data.get_price_data(
@@ -288,9 +264,8 @@ class InferencePipeline:
                     ticker=ticker
                 )
 
-                ################################################
-                # DRIFT SAFE MODE
-                ################################################
+                if dataset.empty:
+                    raise RuntimeError("Feature pipeline returned empty dataset.")
 
                 try:
                     drift = self.drift_detector.detect(
@@ -314,28 +289,14 @@ class InferencePipeline:
 
                 prob_up = self.models.xgb.predict_proba(features)[0][1]
 
-                latency = self._guard_latency(t0, "xgboost")
+                prob_up = self._safe_probability(prob_up)
+
+                latency = time.time() - t0
 
                 MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
                 MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
 
-                PREDICTION_CLASS_PROBABILITY.set(float(prob_up))
-
-                ################################################
-                # SHADOW MODEL
-                ################################################
-
-                shadow_prob = self._run_shadow_sarimax(price_df)
-
-                if shadow_prob is not None:
-
-                    divergence = abs(prob_up - shadow_prob)
-
-                    if divergence > self.SHADOW_DIVERGENCE_THRESHOLD:
-                        logger.warning(
-                            "Champion/Challenger divergence detected: %.3f",
-                            divergence
-                        )
+                PREDICTION_CLASS_PROBABILITY.set(prob_up)
 
                 predicted_return = prob_up - 0.5
 
@@ -360,7 +321,7 @@ class InferencePipeline:
                     "ticker": ticker,
                     "signal_today": decision["signal"],
                     "confidence": float(decision["confidence"]),
-                    "probability_up": float(prob_up),
+                    "probability_up": prob_up,
                     "recommended_allocation": decision["allocation"],
                     "position_size_pct": decision["position_pct"]
                 }
@@ -371,11 +332,15 @@ class InferencePipeline:
 
                 return response
 
-        except Exception:
+            finally:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
 
+        except RuntimeError:
             self.breaker.record_failure()
             PIPELINE_FAILURES.labels(stage="inference").inc()
-
             raise
 
         finally:
