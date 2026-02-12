@@ -7,7 +7,7 @@ from core.risk.position_sizer import PositionSizer
 
 
 ###################################################
-# SAFE ENV PARSERS
+# SAFE ENV
 ###################################################
 
 def _env_float(key: str, default: float) -> float:
@@ -26,7 +26,7 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 ###################################################
-# CONFIGURATION
+# CONFIG
 ###################################################
 
 @dataclass(frozen=True)
@@ -36,6 +36,7 @@ class SignalConfig:
     sentiment_threshold: float
 
     volatility_cap: float
+    crisis_volatility: float
     volatility_throttle: float
 
     min_risk_adjusted_return: float
@@ -53,13 +54,18 @@ class SignalConfig:
 
         return SignalConfig(
             prob_threshold=_env_float("PROB_THRESHOLD", 0.60),
-            sentiment_threshold=_env_float("SENTIMENT_THRESHOLD", 0.10),
-            volatility_cap=_env_float("VOL_CAP", 0.06),
-            volatility_throttle=_env_float("VOL_THROTTLE", 0.04),
-            min_risk_adjusted_return=_env_float("MIN_RAR", 0.40),
-            min_confidence=_env_float("MIN_CONFIDENCE", 0.35),
+            sentiment_threshold=_env_float("SENTIMENT_THRESHOLD", 0.08),
+
+            volatility_cap=_env_float("VOL_CAP", 0.07),
+            crisis_volatility=_env_float("CRISIS_VOL", 0.12),
+            volatility_throttle=_env_float("VOL_THROTTLE", 0.045),
+
+            min_risk_adjusted_return=_env_float("MIN_RAR", 0.35),
+            min_confidence=_env_float("MIN_CONFIDENCE", 0.40),
+
             portfolio_value=_env_float("PORTFOLIO_VALUE", 100000),
-            max_position_pct=_env_float("MAX_POSITION_PCT", 0.08),
+            max_position_pct=_env_float("MAX_POSITION_PCT", 0.06),
+
             global_kill_switch=_env_bool(
                 "GLOBAL_TRADING_DISABLED",
                 False
@@ -92,22 +98,12 @@ def _clamp(v, lo, hi):
 
 
 ###################################################
-# FORECAST INTERPRETER
+# FORECAST INTERPRETER (REGIME ADAPTIVE)
 ###################################################
 
 class ForecastInterpreter:
 
-    VALID_SIGNALS = {"BUY", "HOLD"}
-
-    BUY_THRESHOLD_HIGH = 0.62
-    BUY_THRESHOLD_LOW = 0.57
-
-    RAR_STRONG = 0.65
-    RAR_WEAK = 0.35
-
     VOL_FLOOR = 1e-6
-
-    ###################################################
 
     def interpret(
         self,
@@ -115,7 +111,8 @@ class ForecastInterpreter:
         sentiment: float,
         rsi: float,
         volatility: float,
-        prob_up: float
+        prob_up: float,
+        config: SignalConfig
     ) -> Tuple[str, float]:
 
         predicted_return = _safe(predicted_return)
@@ -125,29 +122,49 @@ class ForecastInterpreter:
 
         volatility = max(_safe(volatility, 0.02), self.VOL_FLOOR)
 
+        ###################################################
+        # VOL NORMALIZED EDGE
+        ###################################################
+
         rar = predicted_return / volatility
-        rsi_edge = abs(50.0 - rsi) / 50.0
+
+        ###################################################
+        # REGIME ADAPTIVE THRESHOLD
+        ###################################################
+
+        prob_threshold = config.prob_threshold
+
+        if volatility > config.volatility_throttle:
+            prob_threshold += 0.03   # demand stronger signal
+
+        if volatility > config.crisis_volatility:
+            prob_threshold += 0.05
+
+        ###################################################
+        # CONFIDENCE
+        ###################################################
+
+        rsi_edge = abs(50 - rsi) / 50
 
         confidence = (
-            prob_up * 0.50 +
-            math.tanh(abs(rar)) * 0.30 +
+            prob_up * 0.45 +
+            math.tanh(rar) * 0.35 +
             abs(sentiment) * 0.10 +
             rsi_edge * 0.10
         )
 
         confidence = _clamp(confidence, 0.0, 1.0)
 
-        if prob_up >= self.BUY_THRESHOLD_HIGH and rar > self.RAR_WEAK:
-            return "BUY", round(confidence, 3)
+        ###################################################
 
-        if prob_up >= self.BUY_THRESHOLD_LOW and rar > self.RAR_STRONG:
+        if prob_up >= prob_threshold and rar > config.min_risk_adjusted_return:
             return "BUY", round(confidence, 3)
 
         return "HOLD", round(confidence, 3)
 
 
 ###################################################
-# RISK GATE
+# RISK GATE (PORTFOLIO HEAT CONTROL)
 ###################################################
 
 class RiskGate:
@@ -163,14 +180,15 @@ class RiskGate:
         regime: str | None
     ) -> bool:
 
-        if signal not in ForecastInterpreter.VALID_SIGNALS:
-            raise RuntimeError(f"Invalid signal emitted: {signal}")
-
         prob_up = _safe(prob_up, 0.5)
         volatility = max(_safe(volatility, 0.02), 1e-6)
         regime = (regime or "").upper()
 
-        if volatility > self.config.volatility_cap:
+        ###################################################
+        # HARD BLOCKS
+        ###################################################
+
+        if volatility > self.config.crisis_volatility:
             return False
 
         if regime == "CRISIS":
@@ -222,7 +240,7 @@ class EnsembleArbiter:
 
 
 ###################################################
-# MASTER ENGINE
+# DECISION ENGINE (WITH VOL THROTTLE)
 ###################################################
 
 class DecisionEngine:
@@ -237,6 +255,21 @@ class DecisionEngine:
         self.position_sizer = PositionSizer()
 
         self._last_signal = "HOLD"
+
+    ###################################################
+
+    def _volatility_scale(self, allocation, volatility):
+
+        """
+        Institutional exposure throttle.
+        """
+
+        if volatility <= self.config.volatility_throttle:
+            return allocation
+
+        scale = self.config.volatility_throttle / volatility
+
+        return allocation * _clamp(scale, 0.25, 1.0)
 
     ###################################################
 
@@ -260,7 +293,8 @@ class DecisionEngine:
             sentiment,
             rsi,
             volatility,
-            prob_up
+            prob_up,
+            self.config
         )
 
         if confidence < self.config.min_confidence:
@@ -282,10 +316,6 @@ class DecisionEngine:
             self.config
         )
 
-        # prevent flip-flop instability
-        if self._last_signal == "BUY" and final_signal == "HOLD":
-            return self._hold(confidence * 0.8)
-
         if final_signal == "HOLD":
             self._last_signal = "HOLD"
             return self._hold(confidence)
@@ -295,6 +325,15 @@ class DecisionEngine:
             confidence=confidence,
             volatility=max(volatility, 1e-6),
             portfolio_value=self.config.portfolio_value
+        )
+
+        ###################################################
+        # VOL THROTTLE
+        ###################################################
+
+        allocation = self._volatility_scale(
+            allocation,
+            volatility
         )
 
         max_position = (
