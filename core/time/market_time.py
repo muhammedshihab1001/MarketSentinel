@@ -12,25 +12,22 @@ class MarketTime:
     ✔ audit-safe reproducibility
     ✔ override support for backfills
     ✔ prevents temporal drift across models
+    ✔ restart-safe freeze via ENV
     """
 
     DEFAULT_TRAINING_YEARS = 6
     WALK_FORWARD_MONTHS = 3
 
-    # Pipeline can freeze this
     _frozen_today = None
 
     ########################################################
-    # TIME FREEZE (CRITICAL)
+    # FREEZE (PIPELINE LEVEL)
     ########################################################
 
     @classmethod
     def freeze_today(cls, date_str: str):
         """
-        Freeze time across the entire training pipeline.
-
-        Example:
-            MarketTime.freeze_today("2026-02-12")
+        Freeze time across the entire process.
         """
 
         cls._frozen_today = datetime.date.fromisoformat(date_str)
@@ -44,14 +41,16 @@ class MarketTime:
         """
         Priority:
 
-        1️ Frozen pipeline date
-        2️ ENV override (for backfills)
-        3️ System clock
+        1️⃣ Explicit freeze
+        2️⃣ ENV freeze
+        3️⃣ System clock
         """
 
+        # Highest priority
         if cls._frozen_today:
             return cls._frozen_today
 
+        # Restart-safe freeze
         env_override = os.getenv("MARKETSENTINEL_TODAY")
 
         if env_override:
@@ -89,3 +88,22 @@ class MarketTime:
         )
 
         return anchor.isoformat()
+
+    ########################################################
+    # AUDIT HELPER (VERY POWERFUL)
+    ########################################################
+
+    @classmethod
+    def snapshot(cls):
+        """
+        Returns time lineage for metadata.
+        """
+
+        start, end = cls.training_window()
+
+        return {
+            "today": cls.today().isoformat(),
+            "training_start": start,
+            "training_end": end,
+            "walk_forward_anchor": cls.walk_forward_anchor()
+        }
