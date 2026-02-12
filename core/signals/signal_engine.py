@@ -156,7 +156,6 @@ class EnsembleArbiter:
         base_signal: str,
         prob_up: float,
         lstm_prices: List[float],
-        prophet_trend: str,
         config: SignalConfig
     ) -> str:
 
@@ -168,7 +167,6 @@ class EnsembleArbiter:
         last = _safe(lstm_prices[-1], first)
 
         expected_return = (last - first) / first
-        trend = str(prophet_trend).upper()
 
         if (
             base_signal == "BUY"

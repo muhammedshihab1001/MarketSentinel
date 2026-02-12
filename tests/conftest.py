@@ -102,4 +102,3 @@ def silence_logs():
 
     logging.getLogger("tensorflow").setLevel(logging.ERROR)
     logging.getLogger("transformers").setLevel(logging.ERROR)
-    logging.getLogger("prophet").setLevel(logging.ERROR)

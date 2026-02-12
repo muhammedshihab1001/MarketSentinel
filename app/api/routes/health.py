@@ -44,7 +44,6 @@ def readiness():
         # Basic checks
         assert models.xgb is not None
         assert models.lstm is not None
-        assert models.prophet is not None
 
         return {
             "status": "ready",

@@ -1,29 +1,48 @@
 version: "3.9"
 
+networks:
+  marketsentinel-net:
+
+volumes:
+  redis-data:
+  grafana-data:
+
 services:
 
   redis:
     image: redis:7-alpine
-    container_name: marketsentinel-redis
-    expose:
-      - "6379"
-    restart: always
+    restart: unless-stopped
+    networks:
+      - marketsentinel-net
+
+    volumes:
+      - redis-data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
 
 
   market-refresher:
     build:
       context: .
-      dockerfile: docker/refresher.Dockerfile   # create tiny image
-    container_name: marketsentinel-refresher
+      dockerfile: docker/refresher.Dockerfile
+
+    restart: unless-stopped
+    networks:
+      - marketsentinel-net
 
     volumes:
       - ./data:/app/data
       - ./artifacts:/app/artifacts
 
-    restart: always
-
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+
 
 
   api:
@@ -31,7 +50,9 @@ services:
       context: .
       dockerfile: docker/inference.Dockerfile
 
-    container_name: marketsentinel-api
+    restart: unless-stopped
+    networks:
+      - marketsentinel-net
 
     ports:
       - "8000:8000"
@@ -40,18 +61,20 @@ services:
       - ./artifacts:/app/artifacts
       - ./data:/app/data
 
-    depends_on:
-      - redis
-
-    restart: always
-
     environment:
       REDIS_HOST: redis
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
 
 
   prometheus:
     image: prom/prometheus
-    container_name: prometheus
+    restart: unless-stopped
+    networks:
+      - marketsentinel-net
 
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -66,12 +89,22 @@ services:
       - api
 
 
+
   grafana:
     image: grafana/grafana
-    container_name: grafana
+    restart: unless-stopped
+    networks:
+      - marketsentinel-net
 
     ports:
       - "3000:3000"
+
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: strongpassword123
 
     depends_on:
       - prometheus

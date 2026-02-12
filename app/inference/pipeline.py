@@ -255,7 +255,6 @@ class InferencePipeline:
                     prob_up=prob_up,
                     volatility=latest.get("volatility", 0),
                     lstm_prices=None,
-                    prophet_trend=None
                 )
 
                 SIGNAL_DISTRIBUTION.labels(

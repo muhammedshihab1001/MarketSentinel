@@ -5,7 +5,6 @@ import logging
 import threading
 
 from models.lstm_model import forecast_lstm
-from models.prophet_model import forecast_prophet
 
 from app.monitoring.metrics import MODEL_VERSION
 
@@ -49,7 +48,6 @@ class ModelLoader:
 
         self._lstm = None
         self._scaler = None
-        self._prophet = None
 
         self._load_lock = threading.Lock()
 
@@ -174,11 +172,3 @@ class ModelLoader:
             recent_prices
         )
 
-    def prophet_forecast(self):
-
-        if self._prophet is None:
-            raise RuntimeError(
-                "Prophet model not initialized."
-            )
-
-        return forecast_prophet(self._prophet)
