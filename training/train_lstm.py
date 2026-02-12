@@ -22,11 +22,8 @@ TEMP_SCALER_PATH = f"{MODEL_DIR}/scalers.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 LOOKBACK_WINDOW = 60
-EPOCHS = 12
-BATCH_SIZE = 32
-
+EPOCHS = 50
 MIN_ROWS_PER_TICKER = 800
-
 SEED = 42
 
 
@@ -43,6 +40,8 @@ TRAINING_TICKERS = [
 
 def configure_runtime():
 
+    os.environ["TF_DETERMINISTIC_OPS"] = "1"
+
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
 
@@ -53,15 +52,25 @@ def configure_runtime():
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
 
-            tf.keras.mixed_precision.set_global_policy("mixed_float16")
+            print(f"GPU detected: {gpus[0].name}")
 
-            print("GPU detected — mixed precision enabled.")
-
-        except Exception:
-            print("GPU detected but configuration failed. Using default settings.")
+        except RuntimeError as e:
+            print(f"GPU configuration failed. Falling back to CPU: {e}")
 
     else:
         print("Running on CPU.")
+
+        tf.config.threading.set_intra_op_parallelism_threads(4)
+        tf.config.threading.set_inter_op_parallelism_threads(4)
+
+
+############################################
+
+def get_batch_size():
+
+    if tf.config.list_physical_devices("GPU"):
+        return 128
+    return 32
 
 
 ############################################
@@ -135,6 +144,7 @@ def build_sequences(df):
         scalers[ticker] = scaler
 
         for i in range(len(scaled) - LOOKBACK_WINDOW):
+
             X_all.append(scaled[i:i+LOOKBACK_WINDOW])
             y_all.append(scaled[i+LOOKBACK_WINDOW])
 
@@ -160,7 +170,8 @@ def time_series_validation(df):
 
     early = EarlyStopping(
         monitor="val_loss",
-        patience=3,
+        patience=7,
+        min_delta=1e-5,
         restore_best_weights=True
     )
 
@@ -169,7 +180,7 @@ def time_series_validation(df):
         y_train,
         validation_data=(X_test,y_test),
         epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
+        batch_size=get_batch_size(),
         callbacks=[early],
         verbose=1
     )
