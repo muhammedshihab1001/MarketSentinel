@@ -15,7 +15,8 @@ from training.train_xgboost import main as train_xgb
 from core.schema.feature_schema import get_schema_signature
 from core.artifacts.metadata_manager import MetadataManager
 from core.config.env_loader import init_env
-from core.time.market_time import MarketTime   #  NEW
+from core.time.market_time import MarketTime
+from core.universe.market_universe import MarketUniverse  # VERY IMPORTANT
 
 
 ########################################################
@@ -34,7 +35,7 @@ RUNS_DIR = "artifacts/training_runs"
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 MAX_REASONABLE_SHARPE = 8.0
-MAX_TRAINING_SECONDS = 7200  # 2 hours
+MAX_TRAINING_SECONDS = 7200
 
 GLOBAL_SEED = 42
 
@@ -50,7 +51,6 @@ def enforce_determinism():
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
-    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
     os.environ["TF_DETERMINISTIC_OPS"] = "1"
 
     random.seed(GLOBAL_SEED)
@@ -138,26 +138,24 @@ def validate_metrics(metrics: dict):
     if not isinstance(metrics, dict) or not metrics:
         raise RuntimeError("Training returned invalid metrics.")
 
-    required_numeric = [
+    required = [
         "avg_sharpe",
         "max_drawdown",
         "profit_factor",
         "final_equity"
     ]
 
-    for key in required_numeric:
+    for key in required:
         _assert_finite(metrics.get(key), key)
 
     sharpe = metrics["avg_sharpe"]
     drawdown = metrics["max_drawdown"]
 
     if sharpe > MAX_REASONABLE_SHARPE:
-        raise RuntimeError(
-            "Sharpe unrealistically high — likely leakage."
-        )
+        raise RuntimeError("Sharpe unrealistically high — leakage suspected.")
 
     if sharpe < MIN_SHARPE:
-        raise RuntimeError("Model rejected — sharpe too low.")
+        raise RuntimeError("Model rejected — Sharpe too low.")
 
     if drawdown < MAX_DRAWDOWN:
         raise RuntimeError("Model rejected — drawdown too severe.")
@@ -167,7 +165,7 @@ def validate_metrics(metrics: dict):
 
 
 ########################################################
-# LINEAGE SNAPSHOT
+# LINEAGE SNAPSHOT (VERY HIGH LEVEL)
 ########################################################
 
 def build_lineage(start_date, end_date):
@@ -183,11 +181,15 @@ def build_lineage(start_date, end_date):
         "hostname": socket.gethostname(),
         "cpu": platform.processor(),
 
-        #  CRITICAL ADDITION
+        # Institutional additions
         "training_window": {
             "start": start_date,
             "end": end_date
-        }
+        },
+
+        "market_time": MarketTime.snapshot(),
+
+        "universe": MarketUniverse.get_universe()
     }
 
 
@@ -200,7 +202,14 @@ def main():
     init_env()
     enforce_determinism()
 
-    #  GLOBAL TIME FREEZE
+    ####################################################
+    # FREEZE CLOCK (EXTREMELY IMPORTANT)
+    ####################################################
+
+    MarketTime.freeze_today(
+        datetime.date.today().isoformat()
+    )
+
     start_date, end_date = MarketTime.training_window()
 
     logger.info(
@@ -224,13 +233,10 @@ def main():
             end_date=end_date
         )
 
-        if metrics is None:
-            raise RuntimeError("Training returned None.")
+        runtime = time.time() - start
 
-        if (time.time() - start) > MAX_TRAINING_SECONDS:
-            raise RuntimeError(
-                "Training exceeded maximum allowed duration."
-            )
+        if runtime > MAX_TRAINING_SECONDS:
+            raise RuntimeError("Training exceeded allowed duration.")
 
         validate_metrics(metrics)
 
@@ -238,7 +244,7 @@ def main():
             "run_id": run_id,
             "status": "success",
             "metrics": metrics,
-            "runtime_sec": round(time.time() - start, 2),
+            "runtime_sec": round(runtime, 2),
             "lineage": build_lineage(start_date, end_date),
             "created_utc": datetime.datetime.utcnow().isoformat()
         }
