@@ -1,7 +1,11 @@
 import numpy as np
 import pandas as pd
 
-from core.schema.feature_schema import MODEL_FEATURES
+from core.schema.feature_schema import (
+    MODEL_FEATURES,
+    validate_feature_schema
+)
+
 from training.backtesting.portfolio_engine import PortfolioBacktestEngine
 from training.backtesting.regime import MarketRegimeDetector
 
@@ -37,6 +41,8 @@ class WalkForwardValidator:
             raise RuntimeError(
                 "Training dataframe not sorted."
             )
+
+        validate_feature_schema(df)
 
     def _sanity_check_model(self, model, sample_df):
 
@@ -76,7 +82,9 @@ class WalkForwardValidator:
 
         df = self.regime_detector.detect(df)
 
-        unique_dates = df["date"].drop_duplicates().values
+        unique_dates = pd.to_datetime(
+            df["date"].drop_duplicates()
+        ).sort_values()
 
         if len(unique_dates) < self.window_size + self.step_size:
             raise RuntimeError(
@@ -98,18 +106,20 @@ class WalkForwardValidator:
 
         while start_idx < len(unique_dates):
 
-            embargo_start = max(
-                0,
-                start_idx - self.EMBARGO_DAYS
+            train_end_date = unique_dates.iloc[start_idx]
+
+            embargo_cutoff = train_end_date - pd.Timedelta(
+                days=self.EMBARGO_DAYS
             )
 
             train_dates = unique_dates[
-                start_idx - self.window_size:embargo_start
-            ]
+                unique_dates < embargo_cutoff
+            ].tail(self.window_size)
 
             test_dates = unique_dates[
-                start_idx:start_idx + self.step_size
-            ]
+                (unique_dates >= train_end_date) &
+                (unique_dates < train_end_date + pd.Timedelta(days=365))
+            ][:self.step_size]
 
             if len(test_dates) < 2:
                 break
@@ -182,7 +192,10 @@ class WalkForwardValidator:
                     "Equity curve contains invalid values."
                 )
 
-            equity_curve.extend(curve.tolist())
+            if equity_curve:
+                equity_curve.extend(curve[1:].tolist())
+            else:
+                equity_curve.extend(curve.tolist())
 
             results.append(metrics)
 
