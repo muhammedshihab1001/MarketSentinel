@@ -8,59 +8,91 @@ _ENV_INITIALIZED = False
 
 
 ########################################################
-# SAFE BOOL PARSER
+# INTERNAL HELPERS
 ########################################################
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
+
     if value is None:
         return default
 
-    return value.lower() in {"1", "true", "yes", "on"}
+    value = value.strip().lower()
+
+    return value in {"1", "true", "yes", "on"}
+
+
+def _validate_not_empty(key: str):
+
+    val = os.getenv(key)
+
+    if val is None:
+        return False
+
+    if not val.strip():
+        return False
+
+    return True
 
 
 ########################################################
-# INIT ENV (FAIL FAST)
+# INIT ENV
 ########################################################
 
 def init_env() -> None:
-    """
-    Institutional environment bootstrap.
-
-    Guarantees:
-    - single execution
-    - fail-fast secrets validation
-    - docker-safe
-    - CI-safe
-    - test-safe
-    """
 
     global _ENV_INITIALIZED
 
     if _ENV_INITIALIZED:
         return
 
-    # Only load .env if NOT inside docker
-    # Docker should inject env vars directly.
-    if os.getenv("DOTENV_ENABLED", "1") == "1":
+    ####################################################
+    # LOAD .env (only outside docker)
+    ####################################################
+
+    if _as_bool(os.getenv("DOTENV_ENABLED", "1")):
         load_dotenv(override=False)
+
+    ####################################################
+    # SAFE DEFAULTS
+    ####################################################
+
+    defaults = {
+
+        # news system
+        "NEWS_MAX_ITEMS": "250",
+        "NEWS_LOOKBACK_DAYS": "3",
+
+        # provider controls
+        "NEWS_PROVIDER_FAILOVER": "1",
+        "ALLOW_OFFLINE_MODE": "0",
+
+        # dotenv behavior
+        "DOTENV_ENABLED": "1",
+
+        # huggingface stability
+        "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+
+        # training stability
+        "PYTHONHASHSEED": "42",
+    }
+
+    for k, v in defaults.items():
+        os.environ.setdefault(k, v)
+
+    ####################################################
+    # REQUIRED SECRETS
+    ####################################################
 
     required = [
         "MARKETAUX_API_KEY",
         "GNEWS_API_KEY",
     ]
 
-    optional_defaults = {
-        "NEWS_MAX_ITEMS": "250",
-        "NEWS_LOOKBACK_DAYS": "3",
-        "DOTENV_ENABLED": "1",
-        "NEWS_PROVIDER_FAILOVER": "1",
-    }
-
-    # Apply defaults safely
-    for key, value in optional_defaults.items():
-        os.environ.setdefault(key, value)
-
-    missing = [k for k in required if not os.getenv(k)]
+    missing = [
+        k for k in required
+        if not _validate_not_empty(k)
+    ]
 
     ####################################################
     # CI / TEST BYPASS
@@ -70,15 +102,25 @@ def init_env() -> None:
 
         if _as_bool(os.getenv("CI")):
             logger.warning(
-                "Missing secrets in CI — bypassing external news providers."
+                "Missing secrets in CI — external providers disabled."
             )
             os.environ["NEWS_PROVIDER_FAILOVER"] = "0"
+            os.environ["ALLOW_OFFLINE_MODE"] = "1"
             _ENV_INITIALIZED = True
             return
 
         if "PYTEST_CURRENT_TEST" in os.environ:
             logger.warning(
-                "Missing secrets in tests — external APIs disabled."
+                "Missing secrets in tests — APIs disabled."
+            )
+            os.environ["NEWS_PROVIDER_FAILOVER"] = "0"
+            os.environ["ALLOW_OFFLINE_MODE"] = "1"
+            _ENV_INITIALIZED = True
+            return
+
+        if _as_bool(os.getenv("ALLOW_OFFLINE_MODE")):
+            logger.warning(
+                "Running in OFFLINE_MODE — news providers disabled."
             )
             os.environ["NEWS_PROVIDER_FAILOVER"] = "0"
             _ENV_INITIALIZED = True
@@ -89,37 +131,76 @@ def init_env() -> None:
         )
 
     ####################################################
-    # HARD VALIDATION
+    # HARD SECRET VALIDATION
     ####################################################
 
-    if len(os.getenv("MARKETAUX_API_KEY", "")) < 10:
+    if len(os.getenv("MARKETAUX_API_KEY")) < 10:
         raise RuntimeError("MARKETAUX_API_KEY appears invalid.")
 
-    if len(os.getenv("GNEWS_API_KEY", "")) < 10:
+    if len(os.getenv("GNEWS_API_KEY")) < 10:
         raise RuntimeError("GNEWS_API_KEY appears invalid.")
 
-    logger.info("Environment initialized successfully.")
+    ####################################################
+    # LOG FINAL MODE
+    ####################################################
+
+    logger.info(
+        "Environment initialized | failover=%s | offline=%s",
+        os.getenv("NEWS_PROVIDER_FAILOVER"),
+        os.getenv("ALLOW_OFFLINE_MODE"),
+    )
 
     _ENV_INITIALIZED = True
 
 
 ########################################################
-# SAFE ACCESSORS (VERY IMPORTANT)
+# ACCESSORS
 ########################################################
 
-def get_env(key: str, default=None, required: bool = False):
+def get_env(
+    key: str,
+    default=None,
+    required: bool = False
+):
 
-    value = os.getenv(key, default)
+    val = os.getenv(key, default)
 
-    if required and value is None:
+    if required and val is None:
         raise RuntimeError(f"Required env missing: {key}")
 
-    return value
+    return val
 
 
 def get_int(key: str, default: int) -> int:
-    return int(os.getenv(key, default))
+
+    val = os.getenv(key)
+
+    if val is None:
+        return default
+
+    try:
+        return int(val)
+    except Exception:
+        raise RuntimeError(
+            f"Invalid integer for env '{key}'"
+        )
+
+
+def get_float(key: str, default: float) -> float:
+
+    val = os.getenv(key)
+
+    if val is None:
+        return default
+
+    try:
+        return float(val)
+    except Exception:
+        raise RuntimeError(
+            f"Invalid float for env '{key}'"
+        )
 
 
 def get_bool(key: str, default: bool = False) -> bool:
+
     return _as_bool(os.getenv(key), default)
