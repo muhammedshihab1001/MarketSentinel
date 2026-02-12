@@ -6,23 +6,31 @@ class PortfolioBacktestEngine:
 
     EPSILON = 1e-12
     VOL_WINDOW = 20
-    REBALANCE_THRESHOLD = 0.02
     CASH_BUFFER = 0.02
     MAX_INV_VOL = 5.0
 
     MAX_SINGLE_STEP_RETURN = 0.40
+
+    ############################################
+    # ⭐ NEW — INSTITUTIONAL LIMITS
+    ############################################
+
+    MAX_POSITION_WEIGHT = 0.12        # never >12% in one asset
+    MAX_TURNOVER_RATIO = 1.8         # >180% turnover = unstable
+    MIN_EQUITY_FLOOR = 0.35         # kill if -65% drawdown
+    SLIPPAGE_IMPACT = 0.08          # trade-size multiplier
 
     VALID_SIGNALS = {"BUY", "HOLD"}
 
     def __init__(
         self,
         transaction_cost=0.001,
-        slippage=0.0005,
+        base_slippage=0.0005,
         target_vol=0.02,
         max_gross_exposure=1.0
     ):
         self.transaction_cost = transaction_cost
-        self.slippage = slippage
+        self.base_slippage = base_slippage
         self.target_vol = target_vol
         self.max_gross_exposure = max_gross_exposure
 
@@ -36,29 +44,23 @@ class PortfolioBacktestEngine:
         self.return_buffers = defaultdict(list)
 
     ###################################################
-    # SAFE PRICE (SOFT — INSTITUTIONAL FIX)
+    # SAFE PRICE
     ###################################################
 
     def _safe_price(self, price):
-
-        if price is None:
-            return None
 
         try:
             price = float(price)
         except Exception:
             return None
 
-        if not np.isfinite(price):
-            return None
-
-        if price <= 0:
+        if not np.isfinite(price) or price <= 0:
             return None
 
         return price
 
     ###################################################
-    # CLEAN UNIVERSE
+    # CLEAN
     ###################################################
 
     def _clean_prices_and_signals(self, prices, signals):
@@ -76,13 +78,16 @@ class PortfolioBacktestEngine:
             if ticker not in signals:
                 continue
 
+            if signals[ticker] not in self.VALID_SIGNALS:
+                continue
+
             clean_prices[ticker] = safe
             clean_signals[ticker] = signals[ticker]
 
         return clean_prices, clean_signals
 
     ###################################################
-    # VOL ESTIMATION
+    # VOL
     ###################################################
 
     def _update_vol_buffers(self, prev_prices, prices):
@@ -91,13 +96,9 @@ class PortfolioBacktestEngine:
 
         for ticker in prices:
 
-            price = prices[ticker]
-
             if prev_prices and ticker in prev_prices:
 
-                prev = prev_prices[ticker]
-
-                ret = price / prev - 1
+                ret = prices[ticker] / prev_prices[ticker] - 1
                 buf = self.return_buffers[ticker]
 
                 buf.append(ret)
@@ -117,7 +118,7 @@ class PortfolioBacktestEngine:
     # WEIGHTS
     ###################################################
 
-    def _compute_weights(self, signals, vols, current_weights):
+    def _compute_weights(self, signals, vols):
 
         raw = {}
 
@@ -141,7 +142,7 @@ class PortfolioBacktestEngine:
         total = sum(raw.values())
 
         weights = {
-            t: w / total
+            t: min(w / total, self.MAX_POSITION_WEIGHT)
             for t, w in raw.items()
         }
 
@@ -152,6 +153,18 @@ class PortfolioBacktestEngine:
             weights = {t: w * scale for t, w in weights.items()}
 
         return weights
+
+    ###################################################
+    # EXECUTION SLIPPAGE (SIZE AWARE)
+    ###################################################
+
+    def _trade_slippage(self, notional, portfolio_value):
+
+        size_ratio = min(notional / max(portfolio_value, 1), 0.25)
+
+        impact = size_ratio * self.SLIPPAGE_IMPACT
+
+        return self.base_slippage + impact
 
     ###################################################
     # RUN
@@ -185,7 +198,6 @@ class PortfolioBacktestEngine:
                 signals_raw
             )
 
-            # if entire day is corrupt → skip
             if not prices:
                 continue
 
@@ -196,7 +208,6 @@ class PortfolioBacktestEngine:
                 continue
 
             signals = prev_signals
-
             vols = self._update_vol_buffers(prev_prices, prices)
 
             portfolio_value = cash + sum(
@@ -205,18 +216,20 @@ class PortfolioBacktestEngine:
                 if t in prices
             )
 
-            deployable_capital = portfolio_value * (1 - self.CASH_BUFFER)
+            ############################################
+            # ⭐ KILL SWITCH
+            ############################################
 
-            current_weights = {
-                t: (positions[t] * prices[t]) / portfolio_value
-                for t in positions
-                if t in prices
-            }
+            if portfolio_value < initial_cash * self.MIN_EQUITY_FLOOR:
+                raise RuntimeError(
+                    "Equity breached institutional floor."
+                )
+
+            deployable_capital = portfolio_value * (1 - self.CASH_BUFFER)
 
             weights = self._compute_weights(
                 signals,
-                vols,
-                current_weights
+                vols
             )
 
             target_positions = {
@@ -244,8 +257,14 @@ class PortfolioBacktestEngine:
                     continue
 
                 trade_notional = abs(delta) * trade_price
+
+                slippage = self._trade_slippage(
+                    trade_notional,
+                    portfolio_value
+                )
+
                 cost = trade_notional * (
-                    self.transaction_cost + self.slippage
+                    self.transaction_cost + slippage
                 )
 
                 turnover += trade_notional
@@ -267,17 +286,29 @@ class PortfolioBacktestEngine:
             )
 
             if equity_curve:
+
                 step_return = equity / equity_curve[-1] - 1
 
                 if abs(step_return) > self.MAX_SINGLE_STEP_RETURN:
                     raise RuntimeError(
-                        "Unrealistic single-step portfolio move detected."
+                        "Unrealistic portfolio jump detected."
                     )
 
             equity_curve.append(float(equity))
 
             prev_prices = prices
             prev_signals = signals_today
+
+        ############################################
+        # TURNOVER GUARD
+        ############################################
+
+        avg_turnover = turnover / max(np.mean(equity_curve), 1.0)
+
+        if avg_turnover > self.MAX_TURNOVER_RATIO:
+            raise RuntimeError(
+                "Turnover exceeds institutional threshold."
+            )
 
         curve = np.array(equity_curve, dtype=float)
 
@@ -296,8 +327,6 @@ class PortfolioBacktestEngine:
 
         peak = np.maximum.accumulate(curve)
         drawdown = (curve - peak) / np.maximum(peak, self.EPSILON)
-
-        avg_turnover = turnover / max(curve.mean(), 1.0)
 
         return {
             "final_portfolio": float(curve[-1]),
