@@ -13,15 +13,16 @@ from training.backtesting.regime import MarketRegimeDetector
 class WalkForwardValidator:
 
     MIN_TRADES_PER_WINDOW = 5
-    MIN_TRAIN_RATIO = 0.75   #  institutional standard
-    MIN_WINDOWS = 6         # avoid false abort
+    MIN_TRAIN_RATIO = 0.75
+    MIN_WINDOWS = 6
+    MIN_ASSETS_PER_DAY = 3
 
     def __init__(
         self,
         model_trainer,
         signal_generator,
-        window_size=252,     #  CHANGED (1 year)
-        step_size=63,        #  quarterly rebalance
+        window_size=252,
+        step_size=63,
         embargo_days=None
     ):
         self.model_trainer = model_trainer
@@ -29,7 +30,7 @@ class WalkForwardValidator:
         self.window_size = window_size
         self.step_size = step_size
 
-        #  adaptive embargo
+        # Adaptive embargo
         self.EMBARGO_DAYS = embargo_days or max(10, window_size // 12)
 
         self.engine = PortfolioBacktestEngine()
@@ -42,25 +43,18 @@ class WalkForwardValidator:
     def _validate_training_frame(self, df):
 
         if df["ticker"].nunique() < 3:
-            raise RuntimeError(
-                "Training universe too small."
-            )
+            raise RuntimeError("Training universe too small.")
 
-        expected = df.sort_values(["date", "ticker"]).index
-
-        if not expected.equals(df.index):
-            raise RuntimeError(
-                "Training dataframe not sorted."
-            )
+        if not df.index.equals(
+            df.sort_values(["date", "ticker"]).index
+        ):
+            raise RuntimeError("Training dataframe not sorted.")
 
         validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
         if df["target"].nunique() < 2:
-            raise RuntimeError(
-                "Training labels collapsed."
-            )
+            raise RuntimeError("Training labels collapsed.")
 
-        #  Ratio check instead of hard count
         if len(df) < self.window_size * self.MIN_TRAIN_RATIO:
             raise RuntimeError(
                 "Training window too small after embargo."
@@ -76,6 +70,7 @@ class WalkForwardValidator:
             raise RuntimeError("Classifier required.")
 
         X = sample_df.loc[:, MODEL_FEATURES].iloc[:50]
+
         preds = model.predict_proba(X)[:, 1]
 
         if not np.isfinite(preds).all():
@@ -83,6 +78,20 @@ class WalkForwardValidator:
 
         if np.std(preds) < 5e-5:
             raise RuntimeError("Model collapsed.")
+
+    ############################################
+    # PRICE FILTER (CRITICAL FIX)
+    ############################################
+
+    def _build_price_dict(self, slice_df):
+
+        prices = {
+            t: float(p)
+            for t, p in zip(slice_df["ticker"], slice_df["close"])
+            if pd.notna(p) and np.isfinite(p) and p > 0
+        }
+
+        return prices
 
     ############################################
     # RUN
@@ -125,7 +134,7 @@ class WalkForwardValidator:
                 unique_dates < embargo_cutoff
             ].tail(self.window_size)
 
-            #  SOFT skip instead of hard crash
+            # Soft skip
             if len(train_dates) < self.window_size * self.MIN_TRAIN_RATIO:
                 start_idx += self.step_size
                 continue
@@ -162,29 +171,45 @@ class WalkForwardValidator:
 
             trade_counter = 0
 
+            ############################################
+            # DAILY LOOP
+            ############################################
+
             for date, slice_df in test_df.groupby("date"):
 
-                prices = dict(
-                    zip(slice_df["ticker"], slice_df["close"])
-                )
+                prices = self._build_price_dict(slice_df)
+
+                # Skip bad cross-sections
+                if len(prices) < self.MIN_ASSETS_PER_DAY:
+                    continue
 
                 signals_list = self.signal_generator(
                     model,
                     slice_df
                 )
 
+                # Filter signals to valid prices ONLY
+                valid_signals = {
+                    t: s
+                    for t, s in zip(slice_df["ticker"], signals_list)
+                    if t in prices
+                }
+
                 trade_counter += sum(
-                    1 for s in signals_list if s != "HOLD"
+                    1 for s in valid_signals.values()
+                    if s != "HOLD"
                 )
 
                 grouped_prices[date] = prices
-                grouped_signals[date] = dict(
-                    zip(slice_df["ticker"], signals_list)
-                )
+                grouped_signals[date] = valid_signals
 
             if trade_counter < self.MIN_TRADES_PER_WINDOW:
                 start_idx += self.step_size
                 continue
+
+            ############################################
+            # RUN PORTFOLIO
+            ############################################
 
             metrics = self.engine.run(
                 grouped_prices,
@@ -194,7 +219,13 @@ class WalkForwardValidator:
 
             capital = float(metrics["final_portfolio"])
 
+            if capital <= 0:
+                raise RuntimeError("Strategy blew up.")
+
             curve = np.array(metrics["equity_curve"], dtype=float)
+
+            if not np.isfinite(curve).all():
+                raise RuntimeError("Invalid equity curve.")
 
             if equity_curve:
                 equity_curve.extend(curve[1:].tolist())
@@ -212,7 +243,10 @@ class WalkForwardValidator:
 
             start_idx += self.step_size
 
-        #  softer requirement
+        ############################################
+        # FINAL VALIDATION
+        ############################################
+
         if len(results) < self.MIN_WINDOWS:
             raise RuntimeError(
                 "Walk-forward produced insufficient windows."
