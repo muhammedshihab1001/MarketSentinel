@@ -44,6 +44,8 @@ class DriftDetector:
         os.makedirs("artifacts/drift", exist_ok=True)
 
     ########################################################
+    # ATOMIC WRITE
+    ########################################################
 
     @staticmethod
     def _atomic_write(path: str, payload: dict):
@@ -94,10 +96,20 @@ class DriftDetector:
 
         for col in MODEL_FEATURES:
 
+            # coercion first
             block[col] = pd.to_numeric(
                 block[col],
                 errors="coerce"
-            ).astype(DTYPE)
+            )
+
+            # 🔥 NEW — kill infinities before dtype cast
+            block[col].replace(
+                [np.inf, -np.inf],
+                np.nan,
+                inplace=True
+            )
+
+            block[col] = block[col].astype(DTYPE)
 
             finite = np.isfinite(block[col])
 
@@ -122,7 +134,6 @@ class DriftDetector:
         ordered = ordered.round(8)
 
         hasher = hashlib.sha256()
-
         hasher.update(",".join(ordered.columns).encode())
 
         hashed = pd.util.hash_pandas_object(
