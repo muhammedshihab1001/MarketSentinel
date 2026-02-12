@@ -16,7 +16,7 @@ from core.schema.feature_schema import get_schema_signature
 from core.artifacts.metadata_manager import MetadataManager
 from core.config.env_loader import init_env
 from core.time.market_time import MarketTime
-from core.universe.market_universe import MarketUniverse  # VERY IMPORTANT
+from core.market.universe import MarketUniverse  # VERY IMPORTANT
 
 
 ########################################################
