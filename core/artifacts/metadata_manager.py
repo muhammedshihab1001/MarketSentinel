@@ -29,21 +29,14 @@ class MetadataManager:
         "training_code_hash"
     ]
 
-    METADATA_VERSION = "2.1"
+    METADATA_VERSION = "2.2"
 
     ########################################################
-    # SAFE DIRECTORY FSYNC (CROSS PLATFORM)
+    # SAFE DIRECTORY FSYNC
     ########################################################
 
     @staticmethod
     def _fsync_dir_safe(directory: str):
-        """
-        Linux/macOS:
-            fsync directory for durability.
-
-        Windows:
-            Not supported — skip safely.
-        """
 
         if os.name == "nt":
             return
@@ -56,7 +49,7 @@ class MetadataManager:
             pass
 
     ########################################################
-    # DATASET FINGERPRINT
+    # DATASET FINGERPRINT (STRUCTURALLY DETERMINISTIC)
     ########################################################
 
     @staticmethod
@@ -66,6 +59,9 @@ class MetadataManager:
             raise RuntimeError("Cannot fingerprint empty dataset.")
 
         df_copy = df.copy()
+
+        # enforce deterministic column ordering
+        df_copy = df_copy.reindex(sorted(df_copy.columns), axis=1)
 
         for col in df_copy.columns:
 
@@ -92,14 +88,21 @@ class MetadataManager:
 
         df_copy = df_copy.reset_index(drop=True)
 
+        hasher = hashlib.sha256()
+
+        # include column structure
+        hasher.update(",".join(df_copy.columns).encode())
+
         arr = np.ascontiguousarray(
             df_copy.to_numpy()
         )
 
-        return hashlib.sha256(arr.tobytes()).hexdigest()
+        hasher.update(arr.tobytes())
+
+        return hasher.hexdigest()
 
     ########################################################
-    # TRAINING CODE HASH
+    # TRAINING CODE HASH (PATH + CONTENT)
     ########################################################
 
     @staticmethod
@@ -114,22 +117,28 @@ class MetadataManager:
             "core/schema"
         ]
 
-        for root in CRITICAL_DIRS:
+        for root in sorted(CRITICAL_DIRS):
 
             if not os.path.exists(root):
                 continue
 
-            for path, _, files in os.walk(root):
+            for path, dirs, files in os.walk(root):
 
-                for f in sorted(files):
+                dirs.sort()
+                files.sort()
 
-                    if f.endswith(".py"):
+                for f in files:
 
-                        with open(
-                            os.path.join(path, f),
-                            "rb"
-                        ) as fh:
-                            hasher.update(fh.read())
+                    if not f.endswith(".py"):
+                        continue
+
+                    full_path = os.path.join(path, f)
+                    rel_path = os.path.relpath(full_path)
+
+                    hasher.update(rel_path.encode())
+
+                    with open(full_path, "rb") as fh:
+                        hasher.update(fh.read())
 
         hasher.update(get_schema_signature().encode())
 
@@ -150,19 +159,19 @@ class MetadataManager:
         try:
             import sklearn
             env["sklearn"] = sklearn.__version__
-        except:
+        except Exception:
             pass
 
         try:
             import tensorflow as tf
             env["tensorflow"] = tf.__version__
-        except:
+        except Exception:
             pass
 
         try:
             import xgboost
             env["xgboost"] = xgboost.__version__
-        except:
+        except Exception:
             pass
 
         return env
@@ -177,7 +186,8 @@ class MetadataManager:
         training_start: str,
         training_end: str,
         dataset_hash: str,
-        metadata_type: str = "model"
+        metadata_type: str = "model",
+        extra_fields: dict | None = None
     ) -> dict:
 
         metadata = {
@@ -207,6 +217,9 @@ class MetadataManager:
                 MetadataManager.capture_environment()
         }
 
+        if extra_fields:
+            metadata.update(extra_fields)
+
         MetadataManager.validate_metadata(metadata)
 
         return metadata
@@ -226,6 +239,15 @@ class MetadataManager:
                 f"Metadata missing required fields: {missing}"
             )
 
+        if not isinstance(metadata["features"], list):
+            raise RuntimeError("Metadata features must be a list.")
+
+        if not isinstance(metadata["metrics"], dict):
+            raise RuntimeError("Metadata metrics must be a dict.")
+
+        if not isinstance(metadata["dataset_hash"], str):
+            raise RuntimeError("Dataset hash must be a string.")
+
         if metadata["schema_signature"] != get_schema_signature():
             raise RuntimeError(
                 "Schema signature mismatch detected."
@@ -237,7 +259,7 @@ class MetadataManager:
             )
 
     ########################################################
-    # ATOMIC WRITE (FIXED)
+    # ATOMIC WRITE
     ########################################################
 
     @staticmethod
