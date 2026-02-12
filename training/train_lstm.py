@@ -26,7 +26,7 @@ LOOKBACK_WINDOW = 60
 EPOCHS = 30
 BATCH_SIZE = 32
 
-MIN_ROWS = 1500
+MIN_ROWS = 4000
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 
@@ -34,32 +34,24 @@ SEED = 42
 
 
 TRAINING_TICKERS = [
-    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA"
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA",
+    "JPM","GS","BAC","LLY","XOM","AVGO","AMD",
+    "SPY","QQQ","IWM"
 ]
 
-
-# ---------------------------------------------------
-# DETERMINISM
-# ---------------------------------------------------
 
 def set_seeds():
 
     os.environ["TF_DETERMINISTIC_OPS"] = "1"
-    os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
 
     tf.config.set_visible_devices([], "GPU")
-
     tf.config.threading.set_intra_op_parallelism_threads(1)
     tf.config.threading.set_inter_op_parallelism_threads(1)
 
-
-# ---------------------------------------------------
-# CRASH-SAFE MODEL SAVE
-# ---------------------------------------------------
 
 def atomic_save_model(model, path):
 
@@ -78,10 +70,6 @@ def atomic_save_model(model, path):
     os.replace(tmp_dir, path)
 
 
-# ---------------------------------------------------
-# DATA
-# ---------------------------------------------------
-
 def load_data():
 
     fetcher = StockPriceFetcher()
@@ -93,7 +81,7 @@ def load_data():
 
         df = fetcher.fetch(
             ticker=ticker,
-            start_date="2018-01-01",
+            start_date="2012-01-01",
             end_date=end_date
         )
 
@@ -107,7 +95,8 @@ def load_data():
         raise RuntimeError("No datasets fetched for LSTM.")
 
     df = pd.concat(datasets, ignore_index=True)
-    df = df.sort_values(["ticker", "date"])
+
+    df = df.sort_values(["ticker","date"])
 
     if len(df) < MIN_ROWS:
         raise RuntimeError(
@@ -117,103 +106,95 @@ def load_data():
     return df.reset_index(drop=True), end_date
 
 
-# ---------------------------------------------------
+def create_sequences_per_ticker(df):
 
-def create_sequences(data, lookback):
+    X_all = []
+    y_all = []
 
-    X, y = [], []
+    scaler = MinMaxScaler()
 
-    for i in range(len(data) - lookback):
-        X.append(data[i:i+lookback])
-        y.append(data[i+lookback])
+    for ticker, tdf in df.groupby("ticker"):
 
-    return np.array(X), np.array(y)
+        prices = tdf["close"].astype("float32").values.reshape(-1,1)
 
+        if len(prices) <= LOOKBACK_WINDOW:
+            continue
 
-# ---------------------------------------------------
-# WINDOW TRAINER (Walk Forward)
-# ---------------------------------------------------
+        scaled = scaler.fit_transform(prices)
+
+        for i in range(len(scaled) - LOOKBACK_WINDOW):
+            X_all.append(scaled[i:i+LOOKBACK_WINDOW])
+            y_all.append(scaled[i+LOOKBACK_WINDOW])
+
+    if not X_all:
+        raise RuntimeError("No sequences generated for LSTM.")
+
+    return np.array(X_all), np.array(y_all), scaler
+
 
 def train_window_model(train_df):
 
-    prices = train_df["close"].astype("float32").values.reshape(-1, 1)
-
-    if not np.isfinite(prices).all():
-        raise RuntimeError("Non-finite values detected in price series.")
-
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(prices)
-
-    X, y = create_sequences(scaled, LOOKBACK_WINDOW)
+    X, y, scaler = create_sequences_per_ticker(train_df)
 
     model = build_lstm_model((LOOKBACK_WINDOW, 1))
 
     model.fit(
         X,
         y,
-        epochs=6,
+        epochs=5,
         batch_size=BATCH_SIZE,
         verbose=0
     )
 
-    return model, scaler
+    return (model, scaler)
 
-
-# ---------------------------------------------------
-# SIGNAL GENERATION
-# ---------------------------------------------------
 
 def generate_signals(model_scaler, test_df):
 
     model, scaler = model_scaler
 
-    prices = test_df["close"].astype("float32").values.reshape(-1, 1)
-
-    if not np.isfinite(prices).all():
-        raise RuntimeError("Non-finite values detected in price series.")
-
-    scaled = scaler.transform(prices)
-
     signals = []
 
-    for i in range(LOOKBACK_WINDOW, len(scaled)):
+    for ticker, tdf in test_df.groupby("ticker"):
 
-        seq = scaled[i-LOOKBACK_WINDOW:i].reshape(1, LOOKBACK_WINDOW, 1)
+        prices = tdf["close"].astype("float32").values.reshape(-1,1)
 
-        pred_scaled = model.predict(seq, verbose=0)[0][0]
-        pred_price = scaler.inverse_transform([[pred_scaled]])[0][0]
+        if len(prices) <= LOOKBACK_WINDOW:
+            signals.extend(["HOLD"] * len(prices))
+            continue
 
-        current_price = prices[i-1][0]
+        scaled = scaler.transform(prices)
 
-        signals.append(
-            "BUY" if pred_price > current_price else "SELL"
-        )
+        ticker_signals = ["HOLD"] * LOOKBACK_WINDOW
 
-    return ["HOLD"] * LOOKBACK_WINDOW + signals
+        for i in range(LOOKBACK_WINDOW, len(scaled)):
 
+            seq = scaled[i-LOOKBACK_WINDOW:i].reshape(1,LOOKBACK_WINDOW,1)
 
-# ---------------------------------------------------
-# FULL TRAIN
-# ---------------------------------------------------
+            pred_scaled = model.predict(seq, verbose=0)[0][0]
+            pred_price = scaler.inverse_transform([[pred_scaled]])[0][0]
+
+            current_price = prices[i-1][0]
+
+            ticker_signals.append(
+                "BUY" if pred_price > current_price else "SELL"
+            )
+
+        signals.extend(ticker_signals)
+
+    return signals
+
 
 def train_full_model(df):
 
-    prices = df["close"].astype("float32").values.reshape(-1, 1)
+    X, y, scaler = create_sequences_per_ticker(df)
 
-    if not np.isfinite(prices).all():
-        raise RuntimeError("Non-finite values detected in price series.")
+    split = int(len(X)*0.8)
 
-    split = int(len(prices) * 0.8)
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
 
-    scaler = MinMaxScaler()
-
-    train_scaled = scaler.fit_transform(prices[:split])
-    test_scaled = scaler.transform(prices[split:])
-
-    X_train, y_train = create_sequences(train_scaled, LOOKBACK_WINDOW)
-    X_test, y_test = create_sequences(test_scaled, LOOKBACK_WINDOW)
-
-    model = build_lstm_model((LOOKBACK_WINDOW, 1))
+    model = build_lstm_model((LOOKBACK_WINDOW,1))
 
     early = EarlyStopping(
         monitor="val_loss",
@@ -224,7 +205,7 @@ def train_full_model(df):
     history = model.fit(
         X_train,
         y_train,
-        validation_data=(X_test, y_test),
+        validation_data=(X_test,y_test),
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         callbacks=[early],
@@ -236,10 +217,6 @@ def train_full_model(df):
     return model, scaler, val_loss
 
 
-# ---------------------------------------------------
-# EXECUTION
-# ---------------------------------------------------
-
 if __name__ == "__main__":
 
     print("Institutional LSTM Training")
@@ -248,7 +225,6 @@ if __name__ == "__main__":
 
     df, end_date = load_data()
 
-    # HASH ONLY WHAT MODEL LEARNS FROM
     dataset_hash = MetadataManager.fingerprint_dataset(
         df[["close"]]
     )
@@ -275,7 +251,7 @@ if __name__ == "__main__":
         model_name="lstm_price_forecast",
         metrics={"val_loss": val_loss, **strategy_metrics},
         features=["close_sequence"],
-        training_start="2018-01-01",
+        training_start="2012-01-01",
         training_end=end_date,
         dataset_hash=dataset_hash,
         metadata_type="model"
