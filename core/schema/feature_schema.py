@@ -5,7 +5,7 @@ import numpy as np
 import json
 
 
-SCHEMA_VERSION = "6.1"
+SCHEMA_VERSION = "7.0"
 
 
 MODEL_FEATURES: Tuple[str, ...] = (
@@ -28,10 +28,11 @@ MAX_ROW_NAN_RATIO = 0.10
 
 DTYPE = "float32"
 
+ABSOLUTE_FEATURE_LIMIT = 1e6
+
 
 FEATURE_LIMITS: Dict[str, tuple] = {
 
-    # allow real market tails
     "return": (-3.0, 3.0),
     "return_lag1": (-3.0, 3.0),
 
@@ -45,12 +46,41 @@ FEATURE_LIMITS: Dict[str, tuple] = {
     "avg_sentiment": (-1.0, 1.0),
     "sentiment_lag1": (-1.0, 1.0),
 
-    # major fix
     "news_count": (0, 5000),
 
     "sentiment_std": (0.0, 10.0),
 }
 
+
+########################################################
+# LOOKAHEAD GUARD
+########################################################
+
+FORBIDDEN_PATTERNS = (
+    "future",
+    "next",
+    "tomorrow",
+    "target",
+    "label",
+    "t+",
+)
+
+
+def _check_forbidden_columns(df: pd.DataFrame):
+
+    lowered = [c.lower() for c in df.columns]
+
+    for col in lowered:
+        for bad in FORBIDDEN_PATTERNS:
+            if bad in col:
+                raise RuntimeError(
+                    f"Potential lookahead column detected: {col}"
+                )
+
+
+########################################################
+# VALIDATOR
+########################################################
 
 def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
@@ -59,6 +89,8 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     if df.columns.duplicated().any():
         raise RuntimeError("Duplicate columns detected.")
+
+    _check_forbidden_columns(df)
 
     incoming = set(df.columns)
 
@@ -77,6 +109,10 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         inplace=True
     )
 
+    ########################################################
+    # TYPE ENFORCEMENT
+    ########################################################
+
     for col in MODEL_FEATURES:
 
         feature_df[col] = pd.to_numeric(
@@ -90,6 +126,15 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             )
 
         feature_df[col] = feature_df[col].astype(DTYPE)
+
+        if np.abs(feature_df[col]).max() > ABSOLUTE_FEATURE_LIMIT:
+            raise RuntimeError(
+                f"Feature explosion detected: {col}"
+            )
+
+    ########################################################
+    # NAN GUARDS
+    ########################################################
 
     per_feature_nan = feature_df.isna().mean()
 
@@ -109,7 +154,10 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             "Row-level NaN explosion detected."
         )
 
-    # range guard (not clipping)
+    ########################################################
+    # RANGE GUARDS
+    ########################################################
+
     for col, (lo, hi) in FEATURE_LIMITS.items():
 
         series = feature_df[col].dropna()
@@ -122,6 +170,10 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
                 f"Feature out of plausible bounds: {col}"
             )
 
+    ########################################################
+    # CONTIGUOUS MEMORY (VERY IMPORTANT FOR XGBOOST)
+    ########################################################
+
     arr = np.ascontiguousarray(
         feature_df.to_numpy(dtype=DTYPE)
     )
@@ -131,6 +183,10 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         columns=MODEL_FEATURES
     )
 
+
+########################################################
+# SCHEMA SIGNATURE
+########################################################
 
 def get_schema_signature() -> str:
 
@@ -145,6 +201,7 @@ def get_schema_signature() -> str:
         f"nan_feature={MAX_NAN_RATIO_PER_FEATURE}",
         f"nan_row={MAX_ROW_NAN_RATIO}",
         f"limits={canonical_limits}",
+        f"abs_limit={ABSOLUTE_FEATURE_LIMIT}",
         f"count={len(MODEL_FEATURES)}",
         f"version={SCHEMA_VERSION}"
     ]
