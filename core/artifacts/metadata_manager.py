@@ -16,6 +16,10 @@ from core.schema.feature_schema import (
 
 class MetadataManager:
 
+    ########################################################
+    # REQUIRED FIELDS (UPGRADED)
+    ########################################################
+
     REQUIRED_METADATA_FIELDS = [
         "metadata_type",
         "metadata_version",
@@ -28,13 +32,17 @@ class MetadataManager:
         "schema_signature",
         "schema_version",
         "training_code_hash",
-        "metadata_integrity_hash"
+        "metadata_integrity_hash",
+
+        # NEW — institutional
+        "environment",
     ]
 
-    METADATA_VERSION = "4.0"
+    METADATA_VERSION = "5.0"   # ← bump version
+
 
     ########################################################
-    # SAFE DIRECTORY FSYNC
+    # FSYNC SAFE
     ########################################################
 
     @staticmethod
@@ -50,15 +58,13 @@ class MetadataManager:
         except Exception:
             pass
 
+
     ########################################################
-    # FEATURE CONTRACT ENFORCEMENT
+    # FEATURE CONTRACT
     ########################################################
 
     @staticmethod
-    def _validate_feature_contract(
-        features: list,
-        metadata_type: str
-    ):
+    def _validate_feature_contract(features, metadata_type):
 
         if metadata_type == "training_manifest_v1":
 
@@ -86,6 +92,18 @@ class MetadataManager:
                 f"Unknown metadata_type: {metadata_type}"
             )
 
+
+    ########################################################
+    # HASH LIST (⭐ NEW — VERY IMPORTANT)
+    ########################################################
+
+    @staticmethod
+    def hash_list(items):
+
+        payload = json.dumps(sorted(items))
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+
     ########################################################
     # DATASET FINGERPRINT
     ########################################################
@@ -97,7 +115,6 @@ class MetadataManager:
             raise RuntimeError("Cannot fingerprint empty dataset.")
 
         df_copy = df.copy(deep=True)
-
         df_copy = df_copy.reindex(sorted(df_copy.columns), axis=1)
 
         for col in df_copy.columns:
@@ -128,19 +145,16 @@ class MetadataManager:
 
         df_copy = df_copy.reset_index(drop=True)
 
-        hasher = hashlib.sha256()
-
         canonical = json.dumps(
             df_copy.to_dict(orient="records"),
             sort_keys=True
         ).encode()
 
-        hasher.update(canonical)
+        return hashlib.sha256(canonical).hexdigest()
 
-        return hasher.hexdigest()
 
     ########################################################
-    # TRAINING CODE HASH
+    # TRAINING CODE HASH (UPGRADED)
     ########################################################
 
     @staticmethod
@@ -153,7 +167,11 @@ class MetadataManager:
             "models",
             "core/features",
             "core/schema",
-            "core/data"
+            "core/data",
+
+            # ⭐ NEW
+            "core/time",
+            "core/market",
         ]
 
         for root in sorted(CRITICAL_DIRS):
@@ -184,6 +202,9 @@ class MetadataManager:
 
         return hasher.hexdigest()
 
+
+    ########################################################
+    # ENV CAPTURE
     ########################################################
 
     @staticmethod
@@ -208,14 +229,21 @@ class MetadataManager:
         except Exception:
             pass
 
+        try:
+            import tensorflow
+            env["tensorflow"] = tensorflow.__version__
+        except Exception:
+            pass
+
         return env
 
+
     ########################################################
-    # METADATA INTEGRITY HASH
+    # METADATA HASH
     ########################################################
 
     @staticmethod
-    def _compute_metadata_hash(metadata: dict) -> str:
+    def _compute_metadata_hash(metadata: dict):
 
         clone = dict(metadata)
         clone.pop("metadata_integrity_hash", None)
@@ -227,19 +255,22 @@ class MetadataManager:
 
         return hashlib.sha256(canonical).hexdigest()
 
+
+    ########################################################
+    # CREATE METADATA (UPGRADED)
     ########################################################
 
     @staticmethod
     def create_metadata(
-        model_name: str,
-        metrics: dict,
-        features: list,
-        training_start: str,
-        training_end: str,
-        dataset_hash: str,
-        metadata_type: str,
-        extra_fields: dict | None = None
-    ) -> dict:
+        model_name,
+        metrics,
+        features,
+        training_start,
+        training_end,
+        dataset_hash,
+        metadata_type,
+        extra_fields=None
+    ):
 
         MetadataManager._validate_feature_contract(
             features,
@@ -284,14 +315,17 @@ class MetadataManager:
 
         return metadata
 
+
+    ########################################################
+    # VALIDATE
     ########################################################
 
     @staticmethod
-    def validate_metadata(metadata: dict):
+    def validate_metadata(metadata):
 
         missing = [
-            field for field in MetadataManager.REQUIRED_METADATA_FIELDS
-            if field not in metadata
+            f for f in MetadataManager.REQUIRED_METADATA_FIELDS
+            if f not in metadata
         ]
 
         if missing:
@@ -316,12 +350,13 @@ class MetadataManager:
                 "Schema version mismatch detected."
             )
 
+
     ########################################################
     # ATOMIC WRITE
     ########################################################
 
     @staticmethod
-    def _atomic_json_write(path: str, payload: dict):
+    def _atomic_json_write(path, payload):
 
         directory = os.path.dirname(path)
 
@@ -339,22 +374,20 @@ class MetadataManager:
 
         MetadataManager._fsync_dir_safe(directory or ".")
 
+
     ########################################################
 
     @staticmethod
-    def save_metadata(metadata: dict, path: str):
+    def save_metadata(metadata, path):
 
         MetadataManager.validate_metadata(metadata)
+        MetadataManager._atomic_json_write(path, metadata)
 
-        MetadataManager._atomic_json_write(
-            path,
-            metadata
-        )
 
     ########################################################
 
     @staticmethod
-    def load_metadata(path: str) -> dict:
+    def load_metadata(path):
 
         if not os.path.exists(path):
             raise RuntimeError(f"Metadata not found: {path}")
