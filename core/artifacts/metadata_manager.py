@@ -13,11 +13,13 @@ from core.schema.feature_schema import (
     MODEL_FEATURES
 )
 
+from core.market.universe import MarketUniverse   # ⭐ NEW
+
 
 class MetadataManager:
 
     ########################################################
-    # REQUIRED FIELDS (UPGRADED)
+    # REQUIRED FIELDS (INSTITUTIONAL)
     ########################################################
 
     REQUIRED_METADATA_FIELDS = [
@@ -33,12 +35,13 @@ class MetadataManager:
         "schema_version",
         "training_code_hash",
         "metadata_integrity_hash",
-
-        # NEW — institutional
         "environment",
+
+        # ⭐ NEW (CRITICAL)
+        "training_universe"
     ]
 
-    METADATA_VERSION = "5.0"   # ← bump version
+    METADATA_VERSION = "6.0"   # ← bump again
 
 
     ########################################################
@@ -94,17 +97,6 @@ class MetadataManager:
 
 
     ########################################################
-    # HASH LIST (⭐ NEW — VERY IMPORTANT)
-    ########################################################
-
-    @staticmethod
-    def hash_list(items):
-
-        payload = json.dumps(sorted(items))
-        return hashlib.sha256(payload.encode()).hexdigest()
-
-
-    ########################################################
     # DATASET FINGERPRINT
     ########################################################
 
@@ -154,7 +146,7 @@ class MetadataManager:
 
 
     ########################################################
-    # TRAINING CODE HASH (UPGRADED)
+    # TRAINING CODE HASH
     ########################################################
 
     @staticmethod
@@ -168,10 +160,8 @@ class MetadataManager:
             "core/features",
             "core/schema",
             "core/data",
-
-            # ⭐ NEW
             "core/time",
-            "core/market",
+            "core/market",   # ⭐ ensures universe changes trigger hash
         ]
 
         for root in sorted(CRITICAL_DIRS):
@@ -257,7 +247,7 @@ class MetadataManager:
 
 
     ########################################################
-    # CREATE METADATA (UPGRADED)
+    # CREATE METADATA (INSTITUTIONAL)
     ########################################################
 
     @staticmethod
@@ -301,7 +291,13 @@ class MetadataManager:
                 MetadataManager.fingerprint_training_code(),
 
             "environment":
-                MetadataManager.capture_environment()
+                MetadataManager.capture_environment(),
+
+            ##################################################
+            # ⭐ CRITICAL — UNIVERSE LINEAGE
+            ##################################################
+            "training_universe":
+                MarketUniverse.snapshot()
         }
 
         if extra_fields:
