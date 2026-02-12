@@ -1,21 +1,29 @@
 import datetime
-import os
 
 
 class MarketTime:
     """
-    Institutional time controller.
+    Institutional time governor.
 
     Guarantees:
-    ✔ deterministic training windows
-    ✔ pipeline-level time freeze
-    ✔ audit-safe reproducibility
-    ✔ override support for backfills
-    ✔ prevents temporal drift across models
-    ✔ restart-safe freeze via ENV
+    ✔ deterministic windows
+    ✔ model-specific horizons
+    ✔ audit-safe lineage
+    ✔ prevents temporal leakage
+    ✔ restart-safe freeze
+    ✔ no ENV drift
     """
 
-    DEFAULT_TRAINING_YEARS = 6
+    ########################################################
+    # MODEL-SPECIFIC HORIZONS (VERY IMPORTANT)
+    ########################################################
+
+    MODEL_WINDOWS = {
+        "xgboost": 3,     # regime aware
+        "lstm": 5,        # sequence depth
+        "sarimax": 7      # macro structure
+    }
+
     WALK_FORWARD_MONTHS = 3
 
     _frozen_today = None
@@ -28,6 +36,9 @@ class MarketTime:
     def freeze_today(cls, date_str: str):
         """
         Freeze time across the entire process.
+
+        Example:
+            MarketTime.freeze_today("2026-02-12")
         """
 
         cls._frozen_today = datetime.date.fromisoformat(date_str)
@@ -42,30 +53,20 @@ class MarketTime:
         Priority:
 
         1️⃣ Explicit freeze
-        2️⃣ ENV freeze
-        3️⃣ System clock
+        2️⃣ System clock
         """
 
-        # Highest priority
         if cls._frozen_today:
             return cls._frozen_today
-
-        # Restart-safe freeze
-        env_override = os.getenv("MARKETSENTINEL_TODAY")
-
-        if env_override:
-            return datetime.date.fromisoformat(env_override)
 
         return datetime.date.today()
 
     ########################################################
-    # TRAINING WINDOW
+    # GENERIC WINDOW
     ########################################################
 
     @classmethod
-    def training_window(cls, years: int | None = None):
-
-        years = years or cls.DEFAULT_TRAINING_YEARS
+    def training_window(cls, years: int):
 
         end = cls.today()
 
@@ -73,6 +74,22 @@ class MarketTime:
         start = end - datetime.timedelta(days=int(365.25 * years))
 
         return start.isoformat(), end.isoformat()
+
+    ########################################################
+    # MODEL WINDOW (NEW — CRITICAL)
+    ########################################################
+
+    @classmethod
+    def window_for(cls, model_name: str):
+
+        if model_name not in cls.MODEL_WINDOWS:
+            raise RuntimeError(
+                f"No training window configured for model: {model_name}"
+            )
+
+        years = cls.MODEL_WINDOWS[model_name]
+
+        return cls.training_window(years)
 
     ########################################################
     # WALK FORWARD ANCHOR
@@ -90,18 +107,16 @@ class MarketTime:
         return anchor.isoformat()
 
     ########################################################
-    # AUDIT HELPER (VERY POWERFUL)
+    # AUDIT SNAPSHOT (ELITE FEATURE)
     ########################################################
 
     @classmethod
-    def snapshot(cls):
-        """
-        Returns time lineage for metadata.
-        """
+    def snapshot_for(cls, model_name: str):
 
-        start, end = cls.training_window()
+        start, end = cls.window_for(model_name)
 
         return {
+            "model": model_name,
             "today": cls.today().isoformat(),
             "training_start": start,
             "training_end": end,
