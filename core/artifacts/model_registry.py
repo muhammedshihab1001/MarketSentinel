@@ -19,6 +19,16 @@ class ModelRegistry:
     LATEST_POINTER = "latest.json"
     PROMOTION_LOCK = ".promotion.lock"
 
+    ########################################################
+    # MULTI-MANIFEST GOVERNANCE (FAIL CLOSED)
+    ########################################################
+
+    ALLOWED_METADATA_TYPES = {
+        "training_manifest_v1",
+        "timeseries_manifest_v1",
+        "sequence_manifest_v1"
+    }
+
     REQUIRED_METADATA_FIELDS = (
         "model_name",
         "features",
@@ -30,9 +40,7 @@ class ModelRegistry:
         "metadata_integrity_hash"
     )
 
-    REQUIRED_METADATA_TYPE = "training_manifest_v1"
-
-    LOCK_TIMEOUT_SECONDS = 600  # 10 minutes
+    LOCK_TIMEOUT_SECONDS = 600
 
     ########################################################
     # VERSION
@@ -49,7 +57,7 @@ class ModelRegistry:
     ########################################################
 
     @staticmethod
-    def _sha256(path: str) -> str:
+    def _sha256(path: str):
         h = hashlib.sha256()
 
         with open(path, "rb") as f:
@@ -93,44 +101,45 @@ class ModelRegistry:
         ModelRegistry._fsync_dir(parent)
 
     ########################################################
-    # LOCK WITH STALE DETECTION
+    # FEATURE CONTRACT
     ########################################################
 
     @staticmethod
-    def _acquire_lock(lock_path: str):
+    def _validate_feature_contract(meta):
 
-        if os.path.exists(lock_path):
+        features = meta["features"]
+        mtype = meta["metadata_type"]
 
-            age = time.time() - os.path.getmtime(lock_path)
+        if mtype == "training_manifest_v1":
 
-            if age > ModelRegistry.LOCK_TIMEOUT_SECONDS:
-                # stale lock recovery
-                os.remove(lock_path)
-            else:
+            if list(features) != list(MODEL_FEATURES):
+                raise RuntimeError("Feature ordering mismatch.")
+
+        elif mtype == "timeseries_manifest_v1":
+
+            if features != ["close"]:
                 raise RuntimeError(
-                    "Registry promotion already in progress."
+                    "Timeseries models must declare ['close']."
                 )
 
-        fd = os.open(
-            lock_path,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        )
-        os.close(fd)
+        elif mtype == "sequence_manifest_v1":
 
+            if features != ["close_sequence"]:
+                raise RuntimeError(
+                    "Sequence models must declare ['close_sequence']."
+                )
+
+        else:
+            raise RuntimeError(
+                "Unknown metadata_type — refusing registry write."
+            )
+
+    ########################################################
+    # METADATA VALIDATION
     ########################################################
 
     @staticmethod
-    def _release_lock(lock_path: str):
-
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
-
-    ########################################################
-    # METADATA HASH
-    ########################################################
-
-    @staticmethod
-    def _metadata_hash(meta: dict) -> str:
+    def _metadata_hash(meta: dict):
 
         clone = dict(meta)
         clone.pop("metadata_integrity_hash", None)
@@ -141,10 +150,6 @@ class ModelRegistry:
         ).encode()
 
         return hashlib.sha256(canonical).hexdigest()
-
-    ########################################################
-    # METADATA VALIDATION
-    ########################################################
 
     @staticmethod
     def _validate_metadata(metadata_path: str):
@@ -162,24 +167,67 @@ class ModelRegistry:
                 f"Metadata missing required fields: {missing}"
             )
 
-        if meta["metadata_type"] != ModelRegistry.REQUIRED_METADATA_TYPE:
+        if meta["metadata_type"] not in ModelRegistry.ALLOWED_METADATA_TYPES:
             raise RuntimeError(
                 "Invalid metadata_type — refusing registry write."
             )
 
-        expected_hash = meta["metadata_integrity_hash"]
-        actual_hash = ModelRegistry._metadata_hash(meta)
-
-        if expected_hash != actual_hash:
+        if meta["metadata_integrity_hash"] != ModelRegistry._metadata_hash(meta):
             raise RuntimeError("Metadata integrity failure.")
 
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Schema mismatch detected.")
 
-        if meta["features"] != list(MODEL_FEATURES):
-            raise RuntimeError("Feature ordering mismatch.")
+        ModelRegistry._validate_feature_contract(meta)
 
         return meta
+
+    ########################################################
+    # LOCK WITH DURABILITY
+    ########################################################
+
+    @staticmethod
+    def _acquire_lock(lock_path: str):
+
+        directory = os.path.dirname(lock_path) or "."
+
+        if os.path.exists(lock_path):
+
+            age = time.time() - os.path.getmtime(lock_path)
+
+            if age > ModelRegistry.LOCK_TIMEOUT_SECONDS:
+                try:
+                    os.remove(lock_path)
+                except FileNotFoundError:
+                    pass
+
+                if os.path.exists(lock_path):
+                    raise RuntimeError(
+                        "Failed to clear stale promotion lock."
+                    )
+            else:
+                raise RuntimeError(
+                    "Registry promotion already in progress."
+                )
+
+        fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        )
+        os.close(fd)
+
+        ModelRegistry._fsync_dir(directory)
+
+    ########################################################
+
+    @staticmethod
+    def _release_lock(lock_path: str):
+
+        directory = os.path.dirname(lock_path) or "."
+
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+            ModelRegistry._fsync_dir(directory)
 
     ########################################################
     # VERIFY ARTIFACTS
@@ -267,6 +315,7 @@ class ModelRegistry:
                 "dataset_hash": meta["dataset_hash"],
                 "schema_signature": meta["schema_signature"],
                 "training_code_hash": meta["training_code_hash"],
+                "metadata_type": meta["metadata_type"],
                 "artifacts": {
                     model_name: ModelRegistry._sha256(staged_model),
                     metadata_name: ModelRegistry._sha256(staged_meta),
@@ -275,6 +324,7 @@ class ModelRegistry:
             }
 
             clone = dict(manifest)
+
             manifest["manifest_integrity_hash"] = hashlib.sha256(
                 json.dumps(clone, sort_keys=True).encode()
             ).hexdigest()
@@ -304,128 +354,3 @@ class ModelRegistry:
                 shutil.rmtree(staging_dir, ignore_errors=True)
 
             raise
-
-    ########################################################
-    # PROMOTION
-    ########################################################
-
-    @staticmethod
-    def promote_to_latest(base_dir: str, version: str):
-
-        lock_path = os.path.join(base_dir, ModelRegistry.PROMOTION_LOCK)
-
-        ModelRegistry._acquire_lock(lock_path)
-
-        try:
-
-            version_dir = os.path.join(base_dir, version)
-
-            if not os.path.exists(version_dir):
-                raise RuntimeError("Cannot promote missing version.")
-
-            ModelRegistry.verify_artifacts(base_dir, version)
-
-            pointer = {
-                "version": version,
-                "promoted_utc": datetime.datetime.utcnow().isoformat()
-            }
-
-            clone = dict(pointer)
-
-            pointer["pointer_hash"] = hashlib.sha256(
-                json.dumps(clone, sort_keys=True).encode()
-            ).hexdigest()
-
-            pointer_path = os.path.join(
-                base_dir,
-                ModelRegistry.LATEST_POINTER
-            )
-
-            ModelRegistry._atomic_json_write(pointer_path, pointer)
-
-        finally:
-            ModelRegistry._release_lock(lock_path)
-
-    ########################################################
-    # GET LATEST (FAIL CLOSED)
-    ########################################################
-
-    @staticmethod
-    def get_latest_version(base_dir: str) -> str:
-
-        pointer_path = os.path.join(
-            base_dir,
-            ModelRegistry.LATEST_POINTER
-        )
-
-        if not os.path.exists(pointer_path):
-            raise RuntimeError(
-                "Latest pointer missing. Refusing auto-heal."
-            )
-
-        with open(pointer_path) as f:
-            payload = json.load(f)
-
-        expected = payload.get("pointer_hash")
-
-        clone = dict(payload)
-        clone.pop("pointer_hash", None)
-
-        actual = hashlib.sha256(
-            json.dumps(clone, sort_keys=True).encode()
-        ).hexdigest()
-
-        if expected != actual:
-            raise RuntimeError(
-                "Pointer corrupted. Manual intervention required."
-            )
-
-        return payload["version"]
-
-    ########################################################
-    # LIST (TIMESTAMP SAFE)
-    ########################################################
-
-    @staticmethod
-    def list_versions(base_dir: str) -> List[str]:
-
-        if not os.path.exists(base_dir):
-            return []
-
-        versions = []
-
-        for name in os.listdir(base_dir):
-
-            path = os.path.join(base_dir, name)
-
-            if not os.path.isdir(path):
-                continue
-
-            if name.endswith(".staging"):
-                continue
-
-            if name.startswith("."):
-                continue
-
-            manifest = os.path.join(
-                path,
-                ModelRegistry.MANIFEST_NAME
-            )
-
-            if not os.path.exists(manifest):
-                continue
-
-            try:
-                with open(manifest) as f:
-                    data = json.load(f)
-
-                versions.append(
-                    (name, data["created_utc"])
-                )
-
-            except Exception:
-                continue
-
-        versions.sort(key=lambda x: x[1])
-
-        return [v[0] for v in versions]
