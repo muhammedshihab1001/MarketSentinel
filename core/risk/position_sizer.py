@@ -24,10 +24,6 @@ def _env_float(key: str, default: float) -> float:
 
 @dataclass(frozen=True)
 class RiskConfig:
-    """
-    Immutable production risk parameters.
-    Loaded safely from environment at runtime.
-    """
 
     max_position_size: float
     min_position_size: float
@@ -37,6 +33,11 @@ class RiskConfig:
 
     max_gross_exposure_pct: float
     max_single_trade_dollars: float
+
+    # ⭐ NEW
+    fractional_kelly: float
+    volatility_shock_level: float
+    correlation_heat_cap: float
 
     ###################################################
 
@@ -50,6 +51,11 @@ class RiskConfig:
             confidence_boost=_env_float("CONFIDENCE_BOOST", 1.35),
             max_gross_exposure_pct=_env_float("MAX_GROSS_EXPOSURE", 0.40),
             max_single_trade_dollars=_env_float("MAX_SINGLE_TRADE", 25_000),
+
+            # ⭐ Institutional additions
+            fractional_kelly=_env_float("FRACTIONAL_KELLY", 0.25),
+            volatility_shock_level=_env_float("VOL_SHOCK_LEVEL", 0.08),
+            correlation_heat_cap=_env_float("HEAT_CAP", 0.22),
         )
 
 
@@ -58,16 +64,6 @@ class RiskConfig:
 ###################################################
 
 class PositionSizer:
-    """
-    Institutional volatility-aware capital allocator.
-
-    Guarantees:
-    - no leverage
-    - bounded inverse-vol scaling
-    - portfolio exposure enforcement
-    - numeric stability
-    - drawdown-aware sizing
-    """
 
     ABSOLUTE_MAX_POSITION = 0.15
     MIN_DEPLOYABLE_CAPITAL = 10_000
@@ -81,8 +77,6 @@ class PositionSizer:
     def __init__(self, config: RiskConfig | None = None):
         self.config = config or RiskConfig.load()
 
-    ###################################################
-    # NUMERIC SAFETY
     ###################################################
 
     @staticmethod
@@ -111,10 +105,6 @@ class PositionSizer:
         except Exception:
             return 1.0
 
-        if not math.isfinite(drawdown):
-            return 1.0
-
-        # normalize "5" -> 0.05
         if drawdown > 1:
             drawdown /= 100.0
 
@@ -124,11 +114,45 @@ class PositionSizer:
         if drawdown < 0.05:
             return 1.0
         if drawdown < 0.10:
-            return 0.75
+            return 0.70
         if drawdown < 0.20:
-            return 0.50
+            return 0.45
 
-        return 0.25
+        return 0.20
+
+    ###################################################
+    # VOL SHOCK SCALAR (⭐ VERY IMPORTANT)
+    ###################################################
+
+    def _volatility_shock_scalar(self, volatility):
+
+        if volatility <= self.config.volatility_shock_level:
+            return 1.0
+
+        # nonlinear cut
+        ratio = self.config.volatility_shock_level / volatility
+
+        return max(0.25, ratio)
+
+    ###################################################
+    # FRACTIONAL KELLY LIMITER
+    ###################################################
+
+    def _kelly_cap(self, confidence, volatility, portfolio_value):
+
+        edge = confidence - 0.5
+        edge = max(edge, 0)
+
+        if edge <= 0:
+            return 0
+
+        kelly_fraction = (edge / max(volatility, 1e-6))
+
+        kelly_fraction *= self.config.fractional_kelly
+
+        kelly_fraction = min(kelly_fraction, 0.10)
+
+        return portfolio_value * kelly_fraction
 
     ###################################################
     # POSITION SIZING
@@ -140,31 +164,22 @@ class PositionSizer:
         confidence: float,
         volatility: float | None,
         portfolio_value: float,
-        current_gross_exposure: float | None = None
+        current_gross_exposure: float | None = None,
+        current_heat: float | None = None   # ⭐ NEW
     ) -> float:
-
-        ###############################################
-        # HARD CONTRACT
-        ###############################################
 
         if signal != "BUY":
             return 0.0
 
         portfolio_value = self._safe(portfolio_value, 0)
 
-        if portfolio_value <= 0:
-            raise ValueError("Portfolio value must be positive")
-
         if portfolio_value < self.MIN_DEPLOYABLE_CAPITAL:
             return 0.0
 
-        ###############################################
-        # SANITIZE INPUTS
-        ###############################################
-
-        confidence = self._safe(confidence, 0.5)
-        confidence = max(0.0, min(confidence, 1.0))
-        confidence = max(confidence, self.MIN_CONFIDENCE_FLOOR)
+        confidence = max(
+            self._safe(confidence, 0.5),
+            self.MIN_CONFIDENCE_FLOOR
+        )
 
         volatility = self._safe(
             volatility,
@@ -176,18 +191,20 @@ class PositionSizer:
             min(volatility, self.VOL_CEILING)
         )
 
-        ###############################################
-        # EXPOSURE PRE-GUARD
-        ###############################################
+        ###################################################
+        # HEAT LIMIT
+        ###################################################
+
+        if current_heat is not None:
+
+            if current_heat >= self.config.correlation_heat_cap:
+                return 0.0
+
+        ###################################################
+        # EXPOSURE LIMIT
+        ###################################################
 
         if current_gross_exposure is not None:
-
-            current_gross_exposure = self._safe(
-                current_gross_exposure,
-                0.0
-            )
-
-            current_gross_exposure = max(current_gross_exposure, 0)
 
             max_allowed = (
                 portfolio_value *
@@ -197,15 +214,13 @@ class PositionSizer:
             if current_gross_exposure >= max_allowed:
                 return 0.0
 
-        ###############################################
+        ###################################################
         # SCALARS
-        ###############################################
+        ###################################################
 
         confidence_scalar = math.tanh(
             confidence * self.config.confidence_boost
         )
-
-        confidence_scalar = max(confidence_scalar, 0.25)
 
         vol_scalar = math.sqrt(
             self.config.volatility_target / volatility
@@ -214,22 +229,37 @@ class PositionSizer:
         vol_scalar = min(vol_scalar, self.MAX_VOL_SCALAR)
 
         dd_scalar = self._drawdown_scalar()
+        shock_scalar = self._volatility_shock_scalar(volatility)
 
-        ###############################################
+        ###################################################
         # RAW SIZE
-        ###############################################
+        ###################################################
 
         raw_size = (
             portfolio_value *
             self.config.max_position_size *
-            vol_scalar *
             confidence_scalar *
-            dd_scalar
+            vol_scalar *
+            dd_scalar *
+            shock_scalar
         )
 
-        ###############################################
+        ###################################################
+        # KELLY CAP
+        ###################################################
+
+        kelly_cap = self._kelly_cap(
+            confidence,
+            volatility,
+            portfolio_value
+        )
+
+        if kelly_cap > 0:
+            raw_size = min(raw_size, kelly_cap)
+
+        ###################################################
         # CAPS
-        ###############################################
+        ###################################################
 
         config_cap = portfolio_value * self.config.max_position_size
         absolute_cap = portfolio_value * self.ABSOLUTE_MAX_POSITION
@@ -242,24 +272,22 @@ class PositionSizer:
             trade_cap
         )
 
-        ###############################################
-        # GROSS EXPOSURE FINAL
-        ###############################################
+        ###################################################
+        # GROSS FINAL
+        ###################################################
 
         if current_gross_exposure is not None:
 
-            remaining_capacity = (
+            remaining = (
                 portfolio_value *
                 self.config.max_gross_exposure_pct
             ) - current_gross_exposure
 
-            remaining_capacity = max(remaining_capacity, 0)
+            capped_size = min(capped_size, max(remaining, 0))
 
-            capped_size = min(capped_size, remaining_capacity)
-
-        ###############################################
-        # MIN SIZE FILTER
-        ###############################################
+        ###################################################
+        # MIN FILTER
+        ###################################################
 
         if capped_size < portfolio_value * self.config.min_position_size:
             return 0.0
