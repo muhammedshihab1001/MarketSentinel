@@ -177,6 +177,7 @@ class FeatureEngineer:
                 as_index=False
             )[cls.SENTIMENT_COLUMNS[1:]].mean()
 
+        # Shift forward so today's prediction only sees yesterday's news
         sentiment["date"] = sentiment["date"] + pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
@@ -200,9 +201,9 @@ class FeatureEngineer:
     def _post_feature_guard(cls, df):
 
         if len(df) < cls.MIN_ROWS_REQUIRED:
-            logger.error(
+            logger.warning(
                 "Feature dataset below minimum rows (%s < %s). "
-                "Continuing — but signals may degrade.",
+                "Signals may degrade.",
                 len(df),
                 cls.MIN_ROWS_REQUIRED
             )
@@ -219,7 +220,7 @@ class FeatureEngineer:
         return df.dropna(subset=MODEL_FEATURES).copy()
 
     # =====================================================
-    #  INSTITUTIONAL TARGET ENGINEERING (NEW)
+    # INSTITUTIONAL TARGET ENGINEERING
     # =====================================================
 
     @classmethod
@@ -227,22 +228,30 @@ class FeatureEngineer:
 
         df = df.sort_values("date").copy()
 
-        if not np.isfinite(df["return"]).all():
-            raise RuntimeError("Non-finite returns detected.")
+        # -------------------------------
+        # LOG RETURN TARGET (industry)
+        # -------------------------------
 
-        # Forward return
-        df["forward_return"] = df["return"].shift(-1)
+        log_close = np.log(df["close"])
 
-        # Volatility normalization
-        vol_floor = 1e-4
-        df["volatility_safe"] = df["volatility"].clip(lower=vol_floor)
-
-        df["risk_adj_return"] = (
-            df["forward_return"] / df["volatility_safe"]
+        df["forward_log_return"] = (
+            log_close.shift(-1) - log_close
         )
 
-        # DEAD ZONE (removes noise)
-        DEAD_ZONE = 0.20
+        # Stabilize volatility
+        vol_floor = 1e-3
+
+        df["volatility_safe"] = (
+            df["volatility"].clip(lower=vol_floor)
+        )
+
+        df["risk_adj_return"] = (
+            df["forward_log_return"] /
+            df["volatility_safe"]
+        )
+
+        # Dead-zone removes noise
+        DEAD_ZONE = 0.06
 
         df["target"] = np.where(
             df["risk_adj_return"] > DEAD_ZONE, 1,
@@ -259,10 +268,10 @@ class FeatureEngineer:
 
         df.dropna(inplace=True)
 
-        # Remove helper columns
+        # Remove helpers
         df.drop(
             columns=[
-                "forward_return",
+                "forward_log_return",
                 "risk_adj_return",
                 "volatility_safe"
             ],
