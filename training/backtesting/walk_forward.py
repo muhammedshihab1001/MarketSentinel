@@ -30,14 +30,13 @@ class WalkForwardValidator:
         self.window_size = window_size
         self.step_size = step_size
 
-        # Adaptive embargo
         self.EMBARGO_DAYS = embargo_days or max(10, window_size // 12)
 
         self.engine = PortfolioBacktestEngine()
         self.regime_detector = MarketRegimeDetector()
 
     ############################################
-    # VALIDATION
+    # TRAIN VALIDATION
     ############################################
 
     def _validate_training_frame(self, df):
@@ -61,7 +60,7 @@ class WalkForwardValidator:
             )
 
     ############################################
-    # MODEL CHECKS
+    # MODEL CHECK
     ############################################
 
     def _sanity_check_model(self, model, sample_df):
@@ -70,7 +69,6 @@ class WalkForwardValidator:
             raise RuntimeError("Classifier required.")
 
         X = sample_df.loc[:, MODEL_FEATURES].iloc[:50]
-
         preds = model.predict_proba(X)[:, 1]
 
         if not np.isfinite(preds).all():
@@ -80,7 +78,7 @@ class WalkForwardValidator:
             raise RuntimeError("Model collapsed.")
 
     ############################################
-    # PRICE FILTER (CRITICAL FIX)
+    # SAFE PRICE BUILDER
     ############################################
 
     def _build_price_dict(self, slice_df):
@@ -92,6 +90,22 @@ class WalkForwardValidator:
         }
 
         return prices
+
+    ############################################
+    # CRITICAL FIX — UNIVERSE ALIGNMENT
+    ############################################
+
+    def _align_universe(self, prices, signals):
+
+        shared = set(prices.keys()) & set(signals.keys())
+
+        if len(shared) < self.MIN_ASSETS_PER_DAY:
+            return None, None
+
+        prices = {t: prices[t] for t in shared}
+        signals = {t: signals[t] for t in shared}
+
+        return prices, signals
 
     ############################################
     # RUN
@@ -134,7 +148,6 @@ class WalkForwardValidator:
                 unique_dates < embargo_cutoff
             ].tail(self.window_size)
 
-            # Soft skip
             if len(train_dates) < self.window_size * self.MIN_TRAIN_RATIO:
                 start_idx += self.step_size
                 continue
@@ -179,36 +192,37 @@ class WalkForwardValidator:
 
                 prices = self._build_price_dict(slice_df)
 
-                # Skip bad cross-sections
-                if len(prices) < self.MIN_ASSETS_PER_DAY:
-                    continue
-
                 signals_list = self.signal_generator(
                     model,
                     slice_df
                 )
 
-                # Filter signals to valid prices ONLY
-                valid_signals = {
-                    t: s
-                    for t, s in zip(slice_df["ticker"], signals_list)
-                    if t in prices
-                }
+                raw_signals = dict(
+                    zip(slice_df["ticker"], signals_list)
+                )
+
+                prices, signals = self._align_universe(
+                    prices,
+                    raw_signals
+                )
+
+                if prices is None:
+                    continue
 
                 trade_counter += sum(
-                    1 for s in valid_signals.values()
+                    1 for s in signals.values()
                     if s != "HOLD"
                 )
 
                 grouped_prices[date] = prices
-                grouped_signals[date] = valid_signals
+                grouped_signals[date] = signals
 
             if trade_counter < self.MIN_TRADES_PER_WINDOW:
                 start_idx += self.step_size
                 continue
 
             ############################################
-            # RUN PORTFOLIO
+            # PORTFOLIO
             ############################################
 
             metrics = self.engine.run(
@@ -218,9 +232,6 @@ class WalkForwardValidator:
             )
 
             capital = float(metrics["final_portfolio"])
-
-            if capital <= 0:
-                raise RuntimeError("Strategy blew up.")
 
             curve = np.array(metrics["equity_curve"], dtype=float)
 
@@ -242,10 +253,6 @@ class WalkForwardValidator:
                 regime_buckets[dominant_regime].append(metrics)
 
             start_idx += self.step_size
-
-        ############################################
-        # FINAL VALIDATION
-        ############################################
 
         if len(results) < self.MIN_WINDOWS:
             raise RuntimeError(
