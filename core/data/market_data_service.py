@@ -4,6 +4,8 @@ import pandas as pd
 import time
 import os
 import numpy as np
+import hashlib
+import re
 
 from core.data.data_fetcher import StockPriceFetcher
 
@@ -17,11 +19,12 @@ class MarketDataService:
 
     Guarantees:
     ✔ zero lookahead bias
-    ✔ dtype enforcement
-    ✔ numeric safety
+    ✔ schema drift detection
+    ✔ concurrent write protection
+    ✔ corruption recovery
+    ✔ ticker sanitization
+    ✔ memory safety
     ✔ atomic durability
-    ✔ revision protection
-    ✔ disk control
     """
 
     DATA_DIR = Path("data/lake")
@@ -37,9 +40,10 @@ class MarketDataService:
 
     MIN_HISTORY_ROWS = 120
     REVISION_DAYS = 5
+    SAFE_LAG_DAYS = 2
+    MAX_FILES = 400
 
-    SAFE_LAG_DAYS = 2     # 🔥 CRITICAL
-    MAX_FILES = 400       # disk protection
+    MAX_ROWS = 15000   # prevents runaway merges
 
     ########################################################
 
@@ -47,10 +51,57 @@ class MarketDataService:
         self.DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._fetcher = StockPriceFetcher()
 
+        self.SCHEMA_HASH = hashlib.sha256(
+            ",".join(sorted(self.REQUIRED_COLUMNS)).encode()
+        ).hexdigest()[:10]
+
+    ########################################################
+    # TICKER SAFETY
+    ########################################################
+
+    @staticmethod
+    def _sanitize_ticker(ticker: str):
+
+        if not re.fullmatch(r"[A-Z0-9._-]{1,12}", ticker):
+            raise RuntimeError(f"Unsafe ticker: {ticker}")
+
+        return ticker
+
     ########################################################
 
     def _dataset_path(self, ticker: str, interval: str):
-        return self.DATA_DIR / f"{ticker}_{interval}.parquet"
+
+        ticker = self._sanitize_ticker(ticker)
+
+        name = f"{ticker}_{interval}_{self.SCHEMA_HASH}.parquet"
+
+        return self.DATA_DIR / name
+
+    ########################################################
+    # LOCKING
+    ########################################################
+
+    def _acquire_lock(self, path: Path):
+
+        lock = path.with_suffix(".lock")
+
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return lock
+
+        except FileExistsError:
+            raise RuntimeError(
+                f"Concurrent write detected for {path.name}"
+            )
+
+    @staticmethod
+    def _release_lock(lock: Path):
+
+        try:
+            lock.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     ########################################################
     # LOOKAHEAD PROTECTION
@@ -81,7 +132,7 @@ class MarketDataService:
 
         if missing:
             raise RuntimeError(
-                f"Market data schema violation. Missing={missing}"
+                f"Schema violation. Missing={missing}"
             )
 
         df = df.copy()
@@ -95,11 +146,7 @@ class MarketDataService:
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
         for col in numeric_cols:
-
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
-            )
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df = df.dropna(subset=["date"] + numeric_cols)
 
@@ -107,41 +154,55 @@ class MarketDataService:
             raise RuntimeError("Non-finite prices detected.")
 
         if (df["close"] <= 0).any():
-            raise RuntimeError("Invalid close prices detected.")
+            raise RuntimeError("Invalid close prices.")
 
         if (df["high"] < df["low"]).any():
             raise RuntimeError("High < Low detected.")
 
-        df = df.sort_values("date").drop_duplicates("date")
+        if df["date"].duplicated().any():
+            raise RuntimeError("Duplicate timestamps.")
+
+        if not df["date"].is_monotonic_increasing:
+            df = df.sort_values("date")
 
         if len(df) < self.MIN_HISTORY_ROWS:
-            raise RuntimeError(
-                "Insufficient market history."
+            raise RuntimeError("Insufficient market history.")
+
+        if len(df) > self.MAX_ROWS:
+            logger.warning(
+                "Dataset too large — trimming oldest rows."
             )
+            df = df.tail(self.MAX_ROWS)
 
         return df.reset_index(drop=True)
 
     ########################################################
-    # ATOMIC WRITE (FULLY DURABLE)
+    # ATOMIC WRITE
     ########################################################
 
     def _atomic_save(self, df: pd.DataFrame, path: Path):
 
-        tmp = path.with_suffix(".tmp")
+        lock = self._acquire_lock(path)
 
-        df.to_parquet(tmp, index=False)
+        try:
 
-        with open(tmp, "rb+") as f:
-            f.flush()
-            os.fsync(f.fileno())
+            tmp = path.with_suffix(".tmp")
 
-        tmp.replace(path)
+            df.to_parquet(tmp, index=False)
 
-        # directory fsync
-        if os.name != "nt":
-            fd = os.open(str(path.parent), os.O_DIRECTORY)
-            os.fsync(fd)
-            os.close(fd)
+            with open(tmp, "rb+") as f:
+                f.flush()
+                os.fsync(f.fileno())
+
+            tmp.replace(path)
+
+            if os.name != "nt":
+                fd = os.open(str(path.parent), os.O_DIRECTORY)
+                os.fsync(fd)
+                os.close(fd)
+
+        finally:
+            self._release_lock(lock)
 
     ########################################################
     # DISK CONTROL
@@ -240,6 +301,8 @@ class MarketDataService:
         interval: str = "1d"
     ):
 
+        ticker = self._sanitize_ticker(ticker)
+
         end_date = self._cap_to_safe_date(end_date)
 
         path = self._dataset_path(ticker, interval)
@@ -252,7 +315,7 @@ class MarketDataService:
 
         if local_df is None:
 
-            logger.info(f"Building dataset for {ticker}")
+            logger.info("Building dataset for %s", ticker)
 
             df = self._fetch_with_retry(
                 ticker,
@@ -283,9 +346,6 @@ class MarketDataService:
                 end_date.strftime("%Y-%m-%d"),
                 interval
             )
-
-            # validate BEFORE merge
-            revision_df = self._validate_dataset(revision_df)
 
             local_df = pd.concat(
                 [local_df, revision_df],
