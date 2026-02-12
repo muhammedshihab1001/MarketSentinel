@@ -9,7 +9,8 @@ import numpy as np
 
 from core.schema.feature_schema import (
     get_schema_signature,
-    SCHEMA_VERSION
+    SCHEMA_VERSION,
+    MODEL_FEATURES
 )
 
 
@@ -26,10 +27,11 @@ class MetadataManager:
         "metrics",
         "schema_signature",
         "schema_version",
-        "training_code_hash"
+        "training_code_hash",
+        "metadata_integrity_hash"
     ]
 
-    METADATA_VERSION = "2.2"
+    METADATA_VERSION = "3.0"
 
     ########################################################
     # SAFE DIRECTORY FSYNC
@@ -49,7 +51,7 @@ class MetadataManager:
             pass
 
     ########################################################
-    # DATASET FINGERPRINT (STRUCTURALLY DETERMINISTIC)
+    # DATASET FINGERPRINT (CROSS-PLATFORM STABLE)
     ########################################################
 
     @staticmethod
@@ -58,14 +60,15 @@ class MetadataManager:
         if df is None or df.empty:
             raise RuntimeError("Cannot fingerprint empty dataset.")
 
-        df_copy = df.copy()
+        df_copy = df.copy(deep=True)
 
-        # enforce deterministic column ordering
+        # deterministic column ordering
         df_copy = df_copy.reindex(sorted(df_copy.columns), axis=1)
 
         for col in df_copy.columns:
 
             if pd.api.types.is_float_dtype(df_copy[col]):
+
                 df_copy[col] = (
                     df_copy[col]
                     .astype("float64")
@@ -74,6 +77,9 @@ class MetadataManager:
 
             elif pd.api.types.is_integer_dtype(df_copy[col]):
                 df_copy[col] = df_copy[col].astype("int64")
+
+            else:
+                df_copy[col] = df_copy[col].astype(str)
 
         sort_cols = []
 
@@ -90,11 +96,10 @@ class MetadataManager:
 
         hasher = hashlib.sha256()
 
-        # include column structure
         hasher.update(",".join(df_copy.columns).encode())
 
         arr = np.ascontiguousarray(
-            df_copy.to_numpy()
+            df_copy.to_numpy(dtype="object")
         )
 
         hasher.update(arr.tobytes())
@@ -102,7 +107,7 @@ class MetadataManager:
         return hasher.hexdigest()
 
     ########################################################
-    # TRAINING CODE HASH (PATH + CONTENT)
+    # TRAINING CODE HASH (ELITE LINEAGE)
     ########################################################
 
     @staticmethod
@@ -114,7 +119,8 @@ class MetadataManager:
             "training",
             "models",
             "core/features",
-            "core/schema"
+            "core/schema",
+            "core/data"
         ]
 
         for root in sorted(CRITICAL_DIRS):
@@ -141,6 +147,7 @@ class MetadataManager:
                         hasher.update(fh.read())
 
         hasher.update(get_schema_signature().encode())
+        hasher.update(platform.python_version().encode())
 
         return hasher.hexdigest()
 
@@ -163,18 +170,30 @@ class MetadataManager:
             pass
 
         try:
-            import tensorflow as tf
-            env["tensorflow"] = tf.__version__
-        except Exception:
-            pass
-
-        try:
             import xgboost
             env["xgboost"] = xgboost.__version__
         except Exception:
             pass
 
         return env
+
+    ########################################################
+    # METADATA INTEGRITY HASH
+    ########################################################
+
+    @staticmethod
+    def _compute_metadata_hash(metadata: dict) -> str:
+
+        clone = dict(metadata)
+
+        clone.pop("metadata_integrity_hash", None)
+
+        canonical = json.dumps(
+            clone,
+            sort_keys=True
+        ).encode()
+
+        return hashlib.sha256(canonical).hexdigest()
 
     ########################################################
 
@@ -189,6 +208,11 @@ class MetadataManager:
         metadata_type: str = "model",
         extra_fields: dict | None = None
     ) -> dict:
+
+        if tuple(features) != MODEL_FEATURES:
+            raise RuntimeError(
+                "Feature list mismatch — possible schema drift."
+            )
 
         metadata = {
 
@@ -220,6 +244,10 @@ class MetadataManager:
         if extra_fields:
             metadata.update(extra_fields)
 
+        metadata["metadata_integrity_hash"] = (
+            MetadataManager._compute_metadata_hash(metadata)
+        )
+
         MetadataManager.validate_metadata(metadata)
 
         return metadata
@@ -239,14 +267,12 @@ class MetadataManager:
                 f"Metadata missing required fields: {missing}"
             )
 
-        if not isinstance(metadata["features"], list):
-            raise RuntimeError("Metadata features must be a list.")
-
-        if not isinstance(metadata["metrics"], dict):
-            raise RuntimeError("Metadata metrics must be a dict.")
-
-        if not isinstance(metadata["dataset_hash"], str):
-            raise RuntimeError("Dataset hash must be a string.")
+        if metadata["metadata_integrity_hash"] != (
+            MetadataManager._compute_metadata_hash(metadata)
+        ):
+            raise RuntimeError(
+                "Metadata integrity failure detected."
+            )
 
         if metadata["schema_signature"] != get_schema_signature():
             raise RuntimeError(
