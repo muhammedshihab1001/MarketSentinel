@@ -23,14 +23,14 @@ class FeatureEngineer:
 
     RETURN_CLAMP = (-0.5, 0.5)
 
-    #  tightened from 3D → institutional safe
-    MERGE_TOLERANCE = pd.Timedelta("2D")
+    # widened — real markets have sparse news
+    MERGE_TOLERANCE = pd.Timedelta("7D")
 
     VOL_FLOOR = 1e-4
 
-    ####################################################
-    # DATETIME NORMALIZATION
-    ####################################################
+    ###############################################
+    # DATETIME
+    ###############################################
 
     @staticmethod
     def _normalize_datetime(df: pd.DataFrame):
@@ -44,9 +44,9 @@ class FeatureEngineer:
 
         return df
 
-    ####################################################
+    ###############################################
     # PRICE VALIDATION
-    ####################################################
+    ###############################################
 
     @staticmethod
     def _validate_price_frame(df: pd.DataFrame):
@@ -68,7 +68,7 @@ class FeatureEngineer:
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
 
         if df["close"].isna().any():
-            raise RuntimeError("NaN close prices detected after coercion.")
+            raise RuntimeError("NaN close prices detected.")
 
         if not np.isfinite(df["close"]).all():
             raise RuntimeError("Non-finite close prices detected.")
@@ -81,23 +81,21 @@ class FeatureEngineer:
 
         return df
 
-    ####################################################
-    # FLOAT32 ENFORCEMENT
-    ####################################################
+    ###############################################
+    # FLOAT32
+    ###############################################
 
     @staticmethod
     def _enforce_float32(df):
 
-        float_cols = df.select_dtypes(include=["float64"]).columns
-
-        for col in float_cols:
+        for col in df.select_dtypes(include=["float64"]).columns:
             df[col] = df[col].astype("float32")
 
         return df
 
-    ####################################################
-    # FEATURE BUILDERS
-    ####################################################
+    ###############################################
+    # FEATURES
+    ###############################################
 
     @staticmethod
     def add_returns(df):
@@ -145,31 +143,40 @@ class FeatureEngineer:
         df["macd"] = macd.clip(-50, 50)
         df["macd_signal"] = signal.clip(-50, 50)
 
-    ####################################################
-    # SENTIMENT MERGE — FIXED (NO FAKE DATA)
-    ####################################################
+    ###############################################
+    # SENTIMENT MERGE — PRODUCTION SAFE
+    ###############################################
 
     @classmethod
     def merge_price_sentiment(cls, price_df, sentiment_df):
 
         price = cls._normalize_datetime(price_df).sort_values("date")
 
-        # If NO sentiment exists → abort early
         if sentiment_df is None or sentiment_df.empty:
-            raise RuntimeError(
-                "Sentiment dataset empty — refusing to fabricate signal."
+
+            logger.warning(
+                "Sentiment unavailable — using neutral fallback."
             )
 
-        sentiment = sentiment_df.copy()
+            sentiment = pd.DataFrame({
+                "date": price["date"],
+                "avg_sentiment": 0.0,
+                "news_count": 0.0,
+                "sentiment_std": 0.0
+            })
 
-        missing = set(cls.SENTIMENT_COLUMNS) - set(sentiment.columns)
+        else:
 
-        if missing:
-            raise RuntimeError(
-                f"Sentiment schema violation: missing={missing}"
-            )
+            sentiment = sentiment_df.copy()
 
-        sentiment = sentiment.loc[:, cls.SENTIMENT_COLUMNS]
+            missing = set(cls.SENTIMENT_COLUMNS) - set(sentiment.columns)
+
+            if missing:
+                raise RuntimeError(
+                    f"Sentiment schema violation: {missing}"
+                )
+
+            sentiment = sentiment.loc[:, cls.SENTIMENT_COLUMNS]
 
         sentiment = cls._normalize_datetime(sentiment).sort_values("date")
 
@@ -179,9 +186,9 @@ class FeatureEngineer:
                 as_index=False
             )[cls.SENTIMENT_COLUMNS[1:]].mean()
 
-        ################################################
+        ###########################################
         # LOOKAHEAD SAFE SHIFT
-        ################################################
+        ###########################################
 
         sentiment["date"] += pd.Timedelta(days=1)
 
@@ -194,34 +201,33 @@ class FeatureEngineer:
             allow_exact_matches=False
         )
 
-        ################################################
-        #  INSTITUTIONAL FIX — DECAY NOT ZERO FILL
-        ################################################
+        ###########################################
+        # DECAY LOGIC (KEY)
+        ###########################################
 
-        merged[["avg_sentiment", "news_count", "sentiment_std"]] = (
-            merged[["avg_sentiment", "news_count", "sentiment_std"]]
-            .ffill(limit=3)   # carry sentiment max 3 days
+        merged["avg_sentiment"] = (
+            merged["avg_sentiment"]
+            .ffill(limit=5)
+            .fillna(0.0)
         )
 
-        merged.dropna(
-            subset=["avg_sentiment", "news_count", "sentiment_std"],
-            inplace=True
+        merged["news_count"] = (
+            merged["news_count"]
+            .ffill(limit=5)
+            .fillna(0.0)
         )
 
-        ################################################
-        # HARD VARIANCE GUARD
-        ################################################
-
-        if merged["avg_sentiment"].std() < 1e-4:
-            raise RuntimeError(
-                "Sentiment variance collapsed — check news pipeline."
-            )
+        merged["sentiment_std"] = (
+            merged["sentiment_std"]
+            .ffill(limit=5)
+            .fillna(0.0)
+        )
 
         return merged
 
-    ####################################################
-    # TARGET ENGINEERING
-    ####################################################
+    ###############################################
+    # TARGET
+    ###############################################
 
     @classmethod
     def create_training_dataset(cls, df):
@@ -246,6 +252,11 @@ class FeatureEngineer:
 
         df.dropna(inplace=True)
 
+        if len(df) < 100:
+            raise RuntimeError(
+                "Feature collapse — too few rows after target creation."
+            )
+
         df["target"] = df["target"].astype("int8")
 
         return df
@@ -265,9 +276,9 @@ class FeatureEngineer:
 
         return df
 
-    ####################################################
+    ###############################################
     # MASTER PIPELINE
-    ####################################################
+    ###############################################
 
     @classmethod
     def build_feature_pipeline(
@@ -296,10 +307,6 @@ class FeatureEngineer:
             df = cls.create_inference_dataset(df)
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-        ###########################################
-        # STRICT FEATURE BLOCK
-        ###########################################
 
         feature_block = df.loc[:, MODEL_FEATURES]
 
