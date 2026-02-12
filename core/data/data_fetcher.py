@@ -101,10 +101,27 @@ class StockPriceFetcher:
         return df.loc[:, ~df.columns.duplicated()]
 
     ##################################################
+    # 🔥 INSTITUTIONAL SCHEMA NORMALIZATION
+    ##################################################
 
     def _normalize_schema(self, df: pd.DataFrame):
 
         df = self._flatten_columns(df)
+
+        ################################################
+        # HARD YAHOO NORMALIZATION
+        ################################################
+
+        # If ONLY adj close exists → rename
+        if "close" not in df.columns and "adj close" in df.columns:
+            df.rename(columns={"adj close": "close"}, inplace=True)
+
+        # If BOTH exist → ALWAYS prefer adjusted
+        if "adj close" in df.columns:
+            df["close"] = df["adj close"]
+            df.drop(columns=["adj close"], inplace=True)
+
+        ################################################
 
         if "date" not in df.columns:
             df = df.reset_index()
@@ -121,19 +138,23 @@ class StockPriceFetcher:
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
-        for col in numeric_cols:
+        missing = [c for c in numeric_cols if c not in df.columns]
 
-            if col not in df.columns:
-                raise RuntimeError(
-                    f"Provider schema violation: missing={col}"
-                )
-
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
+        if missing:
+            raise RuntimeError(
+                f"Provider schema violation after normalization: {missing}"
             )
 
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
         df = df.dropna(subset=["date"] + numeric_cols)
+
+        ################################################
+        # HARD COLUMN SELECTION (VERY IMPORTANT)
+        ################################################
+
+        df = df.loc[:, ["date", "open", "high", "low", "close", "volume"]]
 
         return df
 
@@ -203,22 +224,17 @@ class StockPriceFetcher:
         return df.reset_index(drop=True)
 
     ##################################################
-    # ATOMIC CACHE WRITE — INSTITUTIONAL SAFE
+    # ATOMIC CACHE WRITE
     ##################################################
 
     def _atomic_cache_write(self, df, cache_file):
 
         directory = os.path.dirname(cache_file) or "."
-
         tmp = f"{cache_file}.{uuid.uuid4().hex}.tmp"
 
-        # write directly — do NOT open manually
         df.to_parquet(tmp, index=False)
 
-        # atomic rename
         os.replace(tmp, cache_file)
-
-        # durability
         self._fsync_dir(directory)
 
     ##################################################
@@ -233,7 +249,6 @@ class StockPriceFetcher:
     def fetch(self, ticker, start_date, end_date, interval="1d"):
 
         self._validate_dates(start_date, end_date)
-
         end_date = self._cap_to_yesterday(end_date)
 
         cache_file = (
@@ -241,10 +256,17 @@ class StockPriceFetcher:
             f"{self._cache_key(ticker, start_date, end_date, interval)}.parquet"
         )
 
+        ################################################
+        # TRY CACHE
+        ################################################
+
         if os.path.exists(cache_file):
 
             try:
                 cached = pd.read_parquet(cache_file)
+
+                # 🔥 RE-NORMALIZE cached data
+                cached = self._normalize_schema(cached)
 
                 return self._validate_dataset(
                     cached,
@@ -258,6 +280,10 @@ class StockPriceFetcher:
                     os.remove(cache_file)
                 except Exception:
                     pass
+
+        ################################################
+        # FETCH FRESH
+        ################################################
 
         df = self._fetch_yahoo(
             ticker,
