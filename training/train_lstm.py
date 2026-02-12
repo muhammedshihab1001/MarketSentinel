@@ -10,7 +10,8 @@ from tensorflow.keras.callbacks import EarlyStopping
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
-from core.time.market_time import MarketTime   #  CRITICAL
+from core.time.market_time import MarketTime
+from core.market.universe import MarketUniverse
 
 from models.lstm_model import build_lstm_model
 
@@ -29,13 +30,6 @@ MIN_SEQUENCES = 400
 SEED = 42
 
 
-TRAINING_TICKERS = [
-    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA",
-    "JPM","GS","BAC","LLY","XOM","AVGO","AMD",
-    "SPY","QQQ","IWM"
-]
-
-
 ############################################################
 # STRICT DETERMINISM
 ############################################################
@@ -46,6 +40,8 @@ def configure_runtime():
     os.environ["TF_DETERMINISTIC_OPS"] = "1"
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
+
+    # CPU-only ensures deterministic results
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
     np.random.seed(SEED)
@@ -95,7 +91,7 @@ def atomic_joblib_dump(obj, path):
 
 
 ############################################################
-# LOAD DATA (WINDOW GOVERNED)
+# LOAD DATA — CLOCK + UNIVERSE GOVERNED
 ############################################################
 
 def load_data(start_date, end_date):
@@ -103,8 +99,11 @@ def load_data(start_date, end_date):
     fetcher = StockPriceFetcher()
 
     datasets = []
+    universe = MarketUniverse.get_universe()
 
-    for ticker in TRAINING_TICKERS:
+    print(f"Training universe size: {len(universe)}")
+
+    for ticker in universe:
 
         df = fetcher.fetch(
             ticker=ticker,
@@ -112,14 +111,20 @@ def load_data(start_date, end_date):
             end_date=end_date
         )
 
-        if df.empty or len(df) < MIN_ROWS_PER_TICKER:
+        if df is None or df.empty:
+            continue
+
+        if len(df) < MIN_ROWS_PER_TICKER:
             continue
 
         df["ticker"] = ticker
         datasets.append(df)
 
-    if not datasets:
-        raise RuntimeError("No datasets fetched for LSTM.")
+    # 🚨 Universe collapse protection
+    if len(datasets) < 6:
+        raise RuntimeError(
+            "Universe collapse — too few assets survived."
+        )
 
     df = pd.concat(datasets, ignore_index=True)
 
@@ -228,7 +233,7 @@ def time_series_validation(df):
 
 
 ############################################################
-# MAIN (CLOCK GOVERNED)
+# MAIN — INSTITUTIONAL CLOCK
 ############################################################
 
 def main(start_date=None, end_date=None):
@@ -258,12 +263,13 @@ def main(start_date=None, end_date=None):
         training_start=start_date,
         training_end=end_date,
         dataset_hash=dataset_hash,
-        metadata_type="training_manifest_v1",   #  FIXED
+        metadata_type="training_manifest_v1",
         extra_fields={
             "training_window": {
                 "start": start_date,
                 "end": end_date
-            }
+            },
+            "training_universe": MarketUniverse.get_universe()
         }
     )
 
