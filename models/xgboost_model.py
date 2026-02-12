@@ -8,41 +8,30 @@ MAX_CLASS_WEIGHT = 50.0
 
 
 ###################################################
-# SAFE GPU DETECTION (Institutional)
+# SAFE GPU DETECTION (PRODUCTION GRADE)
 ###################################################
 
-def get_tree_method():
+def get_device():
     """
-    Production-safe GPU detection.
+    Institutional GPU detection.
 
-    Never uses private APIs.
-    Works across:
-    ✔ docker
-    ✔ CI
-    ✔ Windows
-    ✔ Linux
+    No fake training.
+    No private APIs.
+    Docker-safe.
+    CI-safe.
     """
 
     try:
-        # attempt tiny GPU training
-        X = np.random.rand(10, 3)
-        y = np.random.randint(0, 2, 10)
-
-        test = XGBClassifier(
-            tree_method="gpu_hist",
-            n_estimators=1,
-            max_depth=1
-        )
-
-        test.fit(X, y)
-
-        return "gpu_hist"
-
+        if hasattr(xgb, "cuda_is_available"):
+            if xgb.cuda_is_available():
+                return "cuda"
     except Exception:
-        return "hist"
+        pass
+
+    return "cpu"
 
 
-TREE_METHOD = get_tree_method()
+DEVICE = get_device()
 
 
 ###################################################
@@ -53,6 +42,8 @@ def compute_class_weight(y):
 
     if y is None or len(y) == 0:
         raise RuntimeError("Empty labels provided to XGBoost.")
+
+    y = np.asarray(y)
 
     if np.isnan(y).any():
         raise RuntimeError("NaN labels detected.")
@@ -67,18 +58,18 @@ def compute_class_weight(y):
 
     weight = neg / pos
 
-    return min(weight, MAX_CLASS_WEIGHT)
+    return float(min(weight, MAX_CLASS_WEIGHT))
 
 
 ###################################################
-# BASE PARAMS (shared)
+# BASE PARAMS
 ###################################################
 
 def _base_params(pos_weight):
 
-    return dict(
+    params = dict(
 
-        # trees
+        # tree structure
         max_depth=5,
         learning_rate=0.03,
 
@@ -96,20 +87,24 @@ def _base_params(pos_weight):
         random_state=SEED,
         n_jobs=-1,
 
-        # CRITICAL
-        tree_method=TREE_METHOD,
-        predictor="gpu_predictor" if TREE_METHOD == "gpu_hist" else "auto",
-
-        # histogram quality
-        max_bin=256,
-        deterministic_histogram=True,
-
         # modern xgboost
+        tree_method="hist",
+        device=DEVICE,
+
         use_label_encoder=False,
 
         # imbalance
-        scale_pos_weight=pos_weight
+        scale_pos_weight=pos_weight,
+
+        # prevents pathological trees
+        max_delta_step=1,
+
+        # memory + stability
+        grow_policy="depthwise",
+        max_bin=256
     )
+
+    return params
 
 
 ###################################################
@@ -122,7 +117,7 @@ def build_xgboost_model(y):
 
     params = _base_params(pos_weight)
 
-    params["n_estimators"] = 700
+    params["n_estimators"] = 650
 
     return XGBClassifier(**params)
 
@@ -138,7 +133,7 @@ def build_final_xgboost_model(y):
     params = _base_params(pos_weight)
 
     params.update({
-        "n_estimators": 900,
+        "n_estimators": 850,
         "learning_rate": 0.025,
         "reg_alpha": 0.7,
         "reg_lambda": 1.2,
