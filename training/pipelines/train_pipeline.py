@@ -7,7 +7,6 @@ import socket
 import platform
 import random
 import subprocess
-import sys
 
 import numpy as np
 import pandas as pd
@@ -16,6 +15,7 @@ from training.train_xgboost import main as train_xgb
 from core.schema.feature_schema import get_schema_signature
 from core.artifacts.metadata_manager import MetadataManager
 from core.config.env_loader import init_env
+from core.time.market_time import MarketTime   #  NEW
 
 
 ########################################################
@@ -121,7 +121,6 @@ def save_manifest(run_id: str, manifest: dict):
         os.fsync(f.fileno())
 
     os.replace(temp_path, final_path)
-
     _fsync_dir(RUNS_DIR)
 
 
@@ -171,7 +170,7 @@ def validate_metrics(metrics: dict):
 # LINEAGE SNAPSHOT
 ########################################################
 
-def build_lineage():
+def build_lineage(start_date, end_date):
 
     return {
         "schema_signature": get_schema_signature(),
@@ -183,6 +182,12 @@ def build_lineage():
         "platform": platform.platform(),
         "hostname": socket.gethostname(),
         "cpu": platform.processor(),
+
+        #  CRITICAL ADDITION
+        "training_window": {
+            "start": start_date,
+            "end": end_date
+        }
     }
 
 
@@ -195,6 +200,15 @@ def main():
     init_env()
     enforce_determinism()
 
+    #  GLOBAL TIME FREEZE
+    start_date, end_date = MarketTime.training_window()
+
+    logger.info(
+        "Pipeline training window | start=%s end=%s",
+        start_date,
+        end_date
+    )
+
     run_id = datetime.datetime.utcnow().strftime(
         "run_%Y_%m_%d_%H%M%S_%f"
     )
@@ -205,7 +219,10 @@ def main():
 
         logger.info("Starting XGBoost training...")
 
-        metrics = train_xgb()
+        metrics = train_xgb(
+            start_date=start_date,
+            end_date=end_date
+        )
 
         if metrics is None:
             raise RuntimeError("Training returned None.")
@@ -222,7 +239,7 @@ def main():
             "status": "success",
             "metrics": metrics,
             "runtime_sec": round(time.time() - start, 2),
-            "lineage": build_lineage(),
+            "lineage": build_lineage(start_date, end_date),
             "created_utc": datetime.datetime.utcnow().isoformat()
         }
 
@@ -240,7 +257,7 @@ def main():
             "error": str(exc),
             "error_type": type(exc).__name__,
             "runtime_sec": round(time.time() - start, 2),
-            "lineage": build_lineage(),
+            "lineage": build_lineage(start_date, end_date),
             "created_utc": datetime.datetime.utcnow().isoformat()
         }
 
