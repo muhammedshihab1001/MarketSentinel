@@ -19,23 +19,17 @@ logger = logging.getLogger("marketsentinel.feature_store")
 
 class FeatureStore:
     """
-    Institutional Feature Store — Hardened.
-
-    Guarantees:
-    ✔ schema binding
-    ✔ dataset lineage
-    ✔ feature-code invalidation
-    ✔ atomic writes
-    ✔ corruption recovery
-    ✔ deterministic ordering
-    ✔ SAFE fingerprinting
-    ✔ automatic cache pruning
+    Institutional Feature Store — Production Safe
     """
 
     FEATURE_DIR = "data/features"
-    REQUIRED_DATASET_COLUMNS = {"date"}
 
-    MAX_CACHE_FILES_PER_TICKER = 6   #  institutional pruning
+    REQUIRED_COLUMNS = {"date", "close"}
+
+    CACHE_VERSION = "v3"
+    MAX_CACHE_FILES_PER_TICKER = 6
+
+    ##################################################
 
     def __init__(self):
 
@@ -57,47 +51,75 @@ class FeatureStore:
         return re.sub(r"[^A-Za-z0-9_]", "_", ticker)
 
     ##################################################
-    # SAFE ENGINEER FINGERPRINT
+    # BYTECODE FINGERPRINT
     ##################################################
 
     def _fingerprint_engineer(self) -> str:
-        """
-        Uses class bytecode — NOT filesystem path.
 
-        Works inside:
-        ✔ docker
-        ✔ packaged wheels
-        ✔ zip apps
-        ✔ serverless
-        """
-
-        code_bytes = FeatureEngineer.build_feature_pipeline.__code__.co_code
+        code_bytes = (
+            FeatureEngineer.build_feature_pipeline
+            .__code__.co_code
+        )
 
         return hashlib.sha256(code_bytes).hexdigest()
 
     ##################################################
-    # FAST DATASET FINGERPRINT
+    # 🔥 STRONG DATASET HASH (PRICE + SENTIMENT)
     ##################################################
 
-    def _dataset_hash(self, df: pd.DataFrame) -> str:
-        """
-        Institutional fingerprint.
+    def _dataset_hash(
+        self,
+        price_df: pd.DataFrame,
+        sentiment_df: Optional[pd.DataFrame]
+    ) -> str:
 
-        Instead of hashing entire dataset,
-        hash structural identity.
+        price_df = price_df.sort_values("date")
 
-        100x faster.
-        """
+        head = price_df.head(25)
+        tail = price_df.tail(25)
 
-        df = df.sort_values("date")
+        sample = pd.concat([head, tail])
 
-        first = df["date"].iloc[0]
-        last = df["date"].iloc[-1]
-        rows = len(df)
+        h = hashlib.sha256()
 
-        payload = f"{first}|{last}|{rows}"
+        price_arr = pd.util.hash_pandas_object(
+            sample[["date", "close"]],
+            index=False
+        ).values
 
-        return hashlib.sha256(payload.encode()).hexdigest()[:12]
+        h.update(price_arr.tobytes())
+        h.update(str(len(price_df)).encode())
+
+        ##################################################
+        # SENTIMENT INCLUDED (CRITICAL)
+        ##################################################
+
+        if sentiment_df is not None and not sentiment_df.empty:
+
+            sentiment_df = sentiment_df.sort_values("date")
+
+            s_head = sentiment_df.head(15)
+            s_tail = sentiment_df.tail(15)
+
+            s_sample = pd.concat([s_head, s_tail])
+
+            cols = [
+                c for c in
+                ["date", "avg_sentiment", "news_count"]
+                if c in s_sample.columns
+            ]
+
+            if cols:
+
+                sent_arr = pd.util.hash_pandas_object(
+                    s_sample[cols],
+                    index=False
+                ).values
+
+                h.update(sent_arr.tobytes())
+                h.update(str(len(sentiment_df)).encode())
+
+        return h.hexdigest()[:16]
 
     ##################################################
 
@@ -113,6 +135,7 @@ class FeatureStore:
 
         return (
             f"{self.FEATURE_DIR}/"
+            f"{self.CACHE_VERSION}_"
             f"{ticker}_{suffix}_"
             f"{dataset_hash}_"
             f"{self.schema_hash}_"
@@ -120,7 +143,7 @@ class FeatureStore:
         )
 
     ##################################################
-    # CACHE PRUNING (VERY IMPORTANT)
+    # CACHE PRUNING — SAFER
     ##################################################
 
     def _prune_cache(self, ticker):
@@ -130,32 +153,47 @@ class FeatureStore:
         files = sorted(
             [
                 f for f in os.listdir(self.FEATURE_DIR)
-                if f.startswith(ticker)
+                if f"_{ticker}_" in f
             ],
+            key=lambda x: os.path.getmtime(
+                os.path.join(self.FEATURE_DIR, x)
+            ),
             reverse=True
         )
-
-        if len(files) <= self.MAX_CACHE_FILES_PER_TICKER:
-            return
 
         for old in files[self.MAX_CACHE_FILES_PER_TICKER:]:
 
             try:
-                os.remove(
-                    os.path.join(self.FEATURE_DIR, old)
-                )
+                os.remove(os.path.join(self.FEATURE_DIR, old))
             except Exception:
                 logger.warning("Failed pruning cache file: %s", old)
 
     ##################################################
+    # FSYNC
+    ##################################################
+
+    def _fsync_dir(self, directory):
+
+        if os.name == "nt":
+            return
+
+        fd = os.open(directory, os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    ##################################################
+    # VALIDATION
+    ##################################################
 
     def _validate_dataset_structure(self, df: pd.DataFrame):
 
-        missing = self.REQUIRED_DATASET_COLUMNS - set(df.columns)
+        missing = self.REQUIRED_COLUMNS - set(df.columns)
 
         if missing:
             raise RuntimeError(
-                f"Dataset missing required columns: {missing}"
+                f"Feature file missing required columns: {missing}"
             )
 
         if df["date"].duplicated().any():
@@ -176,16 +214,17 @@ class FeatureStore:
         feature_block = df.loc[:, MODEL_FEATURES]
 
         if list(feature_block.columns) != list(MODEL_FEATURES):
-            raise RuntimeError("Feature ordering violation detected.")
+            raise RuntimeError("Feature ordering violation.")
 
         validate_feature_schema(feature_block)
 
         if not np.isfinite(feature_block.to_numpy()).all():
-            raise RuntimeError("Non-finite values detected in feature block.")
+            raise RuntimeError("Non-finite feature values.")
 
         df.to_parquet(tmp_path, index=False)
 
         os.replace(tmp_path, path)
+        self._fsync_dir(os.path.dirname(path))
 
     ##################################################
     # SAFE LOAD
@@ -212,7 +251,7 @@ class FeatureStore:
             if not np.isfinite(
                 df.loc[:, MODEL_FEATURES].to_numpy()
             ).all():
-                raise RuntimeError("Corrupted feature file detected.")
+                raise RuntimeError("Corrupted feature file.")
 
             return df.sort_values("date")
 
@@ -246,7 +285,10 @@ class FeatureStore:
                 "FeatureStore received empty price dataframe."
             )
 
-        dataset_hash = self._dataset_hash(price_df)
+        dataset_hash = self._dataset_hash(
+            price_df,
+            sentiment_df
+        )
 
         path = self._feature_path(
             ticker,
@@ -271,7 +313,6 @@ class FeatureStore:
 
         self._atomic_write(features, path)
 
-        #  prune AFTER write
         self._prune_cache(ticker)
 
         return features
