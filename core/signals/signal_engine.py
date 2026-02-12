@@ -71,12 +71,18 @@ def _clamp(v, lo, hi):
 
 
 ###################################################
-# FORECAST INTERPRETER
+# FORECAST INTERPRETER WITH HYSTERESIS
 ###################################################
 
 class ForecastInterpreter:
 
     VALID_SIGNALS = {"BUY", "HOLD"}
+
+    BUY_THRESHOLD_HIGH = 0.62
+    BUY_THRESHOLD_LOW = 0.57
+
+    RAR_STRONG = 0.65
+    RAR_WEAK = 0.35
 
     def interpret(
         self,
@@ -98,15 +104,21 @@ class ForecastInterpreter:
         rsi_edge = abs(50 - rsi) / 50
 
         confidence = (
-            prob_up * 0.55 +
-            math.tanh(abs(rar)) * 0.25 +
+            prob_up * 0.50 +
+            math.tanh(abs(rar)) * 0.30 +
             abs(sentiment) * 0.10 +
             rsi_edge * 0.10
         )
 
         confidence = _clamp(confidence, 0.0, 1.0)
 
-        if rar > 0.4 and prob_up > 0.55:
+        if prob_up >= self.BUY_THRESHOLD_HIGH and rar > self.RAR_WEAK:
+            return "BUY", round(confidence, 3)
+
+        if (
+            prob_up >= self.BUY_THRESHOLD_LOW
+            and rar > self.RAR_STRONG
+        ):
             return "BUY", round(confidence, 3)
 
         return "HOLD", round(confidence, 3)
@@ -149,7 +161,7 @@ class RiskGate:
 
 
 ###################################################
-# ENSEMBLE — CONFIRMATION ONLY
+# ENSEMBLE CONFIRMATION
 ###################################################
 
 class EnsembleArbiter:
@@ -175,7 +187,6 @@ class EnsembleArbiter:
         expected_return = (last - first) / first
         macro_trend = (macro_trend or "").upper()
 
-        # confirmation only — never escalate
         if base_signal == "BUY":
 
             if macro_trend not in ("BULLISH", "SIDEWAYS"):
@@ -193,7 +204,7 @@ class EnsembleArbiter:
 
 
 ###################################################
-# MASTER ENGINE
+# MASTER ENGINE WITH SIGNAL MEMORY
 ###################################################
 
 class DecisionEngine:
@@ -206,6 +217,8 @@ class DecisionEngine:
         self.risk_gate = RiskGate(self.config)
         self.ensemble = EnsembleArbiter()
         self.position_sizer = PositionSizer()
+
+        self._last_signal = "HOLD"
 
     def generate(
         self,
@@ -249,7 +262,11 @@ class DecisionEngine:
             self.config
         )
 
+        if self._last_signal == "BUY" and final_signal == "HOLD":
+            return self._hold(confidence * 0.8)
+
         if final_signal == "HOLD":
+            self._last_signal = "HOLD"
             return self._hold(confidence)
 
         allocation = self.position_sizer.size_position(
@@ -267,6 +284,8 @@ class DecisionEngine:
         allocation = min(allocation, max_position)
 
         position_pct = allocation / self.config.portfolio_value
+
+        self._last_signal = final_signal
 
         return {
             "signal": final_signal,
