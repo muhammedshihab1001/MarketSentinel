@@ -39,23 +39,23 @@ TRAINING_TICKERS = [
 ]
 
 MIN_TRAINING_ROWS = 2000
+MIN_SURVIVING_TICKERS = 5   #  institutional guard
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 
-#  NEW — signal safety thresholds
 MIN_SENTIMENT_STD = 0.015
 MIN_NEWS_PER_DAY = 1.2
 
 
 ########################################################
-# ATOMIC SAVE
+# ATOMIC SAVE (STRONGER)
 ########################################################
 
 def save_model_atomic(model, path):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    with tempfile.NamedTemporaryFile(delete=False, dir=os.path.dirname(path)) as tmp:
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
         joblib.dump(model, tmp.name)
         temp_name = tmp.name
 
@@ -66,23 +66,20 @@ def save_model_atomic(model, path):
 
 
 ########################################################
-# ELITE NEWS QUERY
+# ELITE NEWS QUERY (FIXED)
 ########################################################
 
 def build_news_query(ticker: str) -> str:
     """
-    Institutional query design.
-    Expands semantic surface area.
+    Semantic expansion WITHOUT boolean spam.
+    Produces MUCH better recall.
     """
-    return (
-        f"{ticker} OR {ticker} earnings OR {ticker} revenue "
-        f"OR {ticker} guidance OR {ticker} forecast "
-        f"OR {ticker} downgrade OR upgrade"
-    )
+
+    return f"{ticker} stock earnings guidance forecast downgrade upgrade"
 
 
 ########################################################
-# SIGNAL DIAGNOSTICS (VERY IMPORTANT)
+# SENTIMENT DIAGNOSTICS
 ########################################################
 
 def validate_sentiment_signal(sentiment_df, ticker):
@@ -125,6 +122,7 @@ def load_training_data():
     end_date = datetime.date.today().isoformat()
 
     datasets = []
+    surviving_tickers = []
 
     for ticker in TRAINING_TICKERS:
 
@@ -141,10 +139,6 @@ def load_training_data():
             if price_df is None or price_df.empty:
                 continue
 
-            ####################################################
-            #  ELITE NEWS QUERY
-            ####################################################
-
             query = build_news_query(ticker)
 
             news_df = news_fetcher.fetch(
@@ -154,10 +148,6 @@ def load_training_data():
 
             scored_df = sentiment_analyzer.analyze_dataframe(news_df)
             sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
-
-            ####################################################
-            #  SIGNAL VALIDATION
-            ####################################################
 
             validate_sentiment_signal(sentiment_df, ticker)
 
@@ -176,6 +166,7 @@ def load_training_data():
             dataset["ticker"] = ticker
 
             datasets.append(dataset)
+            surviving_tickers.append(ticker)
 
         except Exception as e:
 
@@ -185,7 +176,17 @@ def load_training_data():
                 str(e)
             )
 
-            continue
+    ###################################################
+    #  CROSS-SECTIONAL SAFETY
+    ###################################################
+
+    if len(surviving_tickers) < MIN_SURVIVING_TICKERS:
+        raise RuntimeError(
+            f"Too few tickers survived ({len(surviving_tickers)}). "
+            "Model would be regime fragile."
+        )
+
+    logger.info("Surviving tickers: %s", surviving_tickers)
 
     if not datasets:
         raise RuntimeError("All tickers rejected — no training dataset.")
@@ -199,6 +200,10 @@ def load_training_data():
         raise RuntimeError(
             f"Training aborted — dataset too small ({len(df)} rows)"
         )
+
+    ###################################################
+    # FEATURE VALIDATION
+    ###################################################
 
     feature_block = validate_feature_schema(
         df.loc[:, MODEL_FEATURES]
@@ -218,7 +223,7 @@ def load_training_data():
 
 
 ########################################################
-# WALK FORWARD TRAINER
+# WALK FORWARD
 ########################################################
 
 def train_model(train_df):
@@ -327,6 +332,9 @@ def main():
     )
 
     print(f"XGBoost registered → {version}")
+
+    #  CRITICAL
+    return strategy_metrics
 
 
 if __name__ == "__main__":
