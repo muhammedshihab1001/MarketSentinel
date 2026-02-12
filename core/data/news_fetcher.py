@@ -2,56 +2,166 @@ import os
 import logging
 import requests
 import pandas as pd
+import hashlib
+import time
+
 from datetime import datetime, timedelta
 from dateutil import parser
-from typing import List, Dict
+from typing import Optional
+
+from core.config.env_loader import init_env, get_bool
+
+init_env()
 
 logger = logging.getLogger("marketsentinel.news")
 
 
 class NewsFetcher:
     """
-    INSTITUTIONAL MULTI-SOURCE NEWS FETCHER
+    Institutional Multi-Provider News Engine
 
     Priority:
-        1️⃣ Marketaux (structured financial news)
-        2️⃣ GNews fallback
+        1. Marketaux
+        2. GNews
+        3. Safe empty dataframe (never crash training)
 
     Guarantees:
-        ✔ normalized schema
-        ✔ deduplicated headlines
-        ✔ timezone safe
+        ✔ schema normalized
+        ✔ deduplicated
+        ✔ retry protected
+        ✔ rate-limit resilient
+        ✔ ingestion-delay safe
+        ✔ deterministic ordering
         ✔ variance friendly
-        ✔ sentiment-ready
+        ✔ provider failover
+        ✔ disk cache
     """
 
     MARKET_AUX_URL = "https://api.marketaux.com/v1/news/all"
     GNEWS_URL = "https://gnews.io/api/v4/search"
 
     MAX_AGE_HOURS = 72
-    MIN_ARTICLES = 15   # ensures variance
+    INGESTION_DELAY_MIN = 10
+    MIN_ARTICLES = 12
+
+    REQUEST_TIMEOUT = (4, 12)
+    MAX_RETRIES = 3
+
+    CACHE_DIR = "data/news_cache"
+    CACHE_TTL_MIN = 20
+
+    EMPTY_SCHEMA = pd.DataFrame(
+        columns=["headline", "published_at", "source", "link"]
+    )
+
+    ########################################################
 
     def __init__(self):
 
         self.marketaux_key = os.getenv("MARKETAUX_API_KEY")
         self.gnews_key = os.getenv("GNEWS_API_KEY")
 
-        if not self.marketaux_key:
-            raise RuntimeError(
-                "MARKETAUX_API_KEY not found in environment."
-            )
+        self.failover_enabled = get_bool(
+            "NEWS_PROVIDER_FAILOVER", True
+        )
 
-        if not self.gnews_key:
-            logger.warning(
-                "GNEWS_API_KEY missing — fallback disabled."
-            )
+        os.makedirs(self.CACHE_DIR, exist_ok=True)
 
         self.session = requests.Session()
         self.session.headers.update(
             {"User-Agent": "MarketSentinel/Institutional"}
         )
 
-    ############################################################
+    ########################################################
+    # CACHE
+    ########################################################
+
+    def _cache_path(self, query: str):
+
+        key = hashlib.sha256(query.encode()).hexdigest()[:16]
+        return f"{self.CACHE_DIR}/{key}.parquet"
+
+    def _load_cache(self, path: str) -> Optional[pd.DataFrame]:
+
+        if not os.path.exists(path):
+            return None
+
+        modified = datetime.utcfromtimestamp(
+            os.path.getmtime(path)
+        )
+
+        if datetime.utcnow() - modified > timedelta(
+            minutes=self.CACHE_TTL_MIN
+        ):
+            return None
+
+        try:
+            df = pd.read_parquet(path)
+
+            if not df.empty:
+                return df
+
+        except Exception:
+            pass
+
+        return None
+
+    def _write_cache(self, df, path):
+
+        try:
+            tmp = path + ".tmp"
+            df.to_parquet(tmp, index=False)
+            os.replace(tmp, path)
+        except Exception:
+            logger.warning("News cache write failed.")
+
+    ########################################################
+    # RETRY WRAPPER
+    ########################################################
+
+    def _request(self, url, params):
+
+        for attempt in range(self.MAX_RETRIES):
+
+            try:
+
+                r = self.session.get(
+                    url,
+                    params=params,
+                    timeout=self.REQUEST_TIMEOUT
+                )
+
+                if r.status_code == 429:
+                    sleep = 1.5 * (attempt + 1)
+                    logger.warning(
+                        "Rate limited — sleeping %.1fs",
+                        sleep
+                    )
+                    time.sleep(sleep)
+                    continue
+
+                r.raise_for_status()
+
+                return r.json()
+
+            except Exception as e:
+
+                if attempt == self.MAX_RETRIES - 1:
+                    raise
+
+                sleep = 1.2 * (attempt + 1)
+                logger.warning(
+                    "News retry %s: %s",
+                    attempt + 1,
+                    str(e)
+                )
+                time.sleep(sleep)
+
+        return {}
+
+    ########################################################
+    # NORMALIZATION
+    ########################################################
 
     @staticmethod
     def _normalize_date(dt):
@@ -65,33 +175,51 @@ class NewsFetcher:
         except Exception:
             return None
 
-    ############################################################
+    ########################################################
 
-    def _filter_age(self, df: pd.DataFrame):
+    def _post_process(self, df):
 
-        cutoff = datetime.utcnow() - timedelta(hours=self.MAX_AGE_HOURS)
+        if df.empty:
+            return df
 
-        return df[df["published_at"] >= cutoff]
+        cutoff = datetime.utcnow() - timedelta(
+            hours=self.MAX_AGE_HOURS
+        )
 
-    ############################################################
+        ingest_guard = datetime.utcnow() - timedelta(
+            minutes=self.INGESTION_DELAY_MIN
+        )
 
-    @staticmethod
-    def _dedup(df):
+        df = df[
+            (df["published_at"] >= cutoff) &
+            (df["published_at"] <= ingest_guard)
+        ]
+
+        df["headline"] = df["headline"].str.strip()
+
+        df = df[df["headline"].str.len() > 12]
 
         df["key"] = (
-            df["headline"].str.lower()
-            + df["source"].str.lower()
+            df["headline"].str.lower() +
+            df["source"].str.lower()
         )
 
         df = df.drop_duplicates("key")
+        df = df.drop(columns="key")
 
-        return df.drop(columns="key")
+        df = df.sort_values("published_at")
+        df.reset_index(drop=True, inplace=True)
 
-    ############################################################
-    # PRIMARY — MARKETAUX
-    ############################################################
+        return df
 
-    def _fetch_marketaux(self, query, limit=100) -> pd.DataFrame:
+    ########################################################
+    # PROVIDERS
+    ########################################################
+
+    def _fetch_marketaux(self, query, limit):
+
+        if not self.marketaux_key:
+            return self.EMPTY_SCHEMA.copy()
 
         params = {
             "api_token": self.marketaux_key,
@@ -100,55 +228,37 @@ class NewsFetcher:
             "limit": limit
         }
 
-        r = self.session.get(
+        data = self._request(
             self.MARKET_AUX_URL,
-            params=params,
-            timeout=10
-        )
-
-        r.raise_for_status()
-
-        data = r.json().get("data", [])
-
-        if not data:
-            return pd.DataFrame()
+            params
+        ).get("data", [])
 
         rows = []
 
-        for article in data:
+        for a in data:
 
             published = self._normalize_date(
-                article.get("published_at")
+                a.get("published_at")
             )
 
             if not published:
                 continue
 
             rows.append({
-                "headline": article.get("title"),
+                "headline": a.get("title", ""),
                 "published_at": published,
-                "source": article.get("source", "unknown"),
-                "link": article.get("url", "")
+                "source": a.get("source", "unknown"),
+                "link": a.get("url", "")
             })
 
-        df = pd.DataFrame(rows)
+        return self._post_process(pd.DataFrame(rows))
 
-        if df.empty:
-            return df
+    ########################################################
 
-        df = self._filter_age(df)
-        df = self._dedup(df)
-
-        return df
-
-    ############################################################
-    # FALLBACK — GNEWS
-    ############################################################
-
-    def _fetch_gnews(self, query, limit=100) -> pd.DataFrame:
+    def _fetch_gnews(self, query, limit):
 
         if not self.gnews_key:
-            return pd.DataFrame()
+            return self.EMPTY_SCHEMA.copy()
 
         params = {
             "q": query,
@@ -157,19 +267,14 @@ class NewsFetcher:
             "max": limit
         }
 
-        r = self.session.get(
+        data = self._request(
             self.GNEWS_URL,
-            params=params,
-            timeout=10
-        )
-
-        r.raise_for_status()
-
-        articles = r.json().get("articles", [])
+            params
+        ).get("articles", [])
 
         rows = []
 
-        for a in articles:
+        for a in data:
 
             published = self._normalize_date(
                 a.get("publishedAt")
@@ -179,60 +284,88 @@ class NewsFetcher:
                 continue
 
             rows.append({
-                "headline": a.get("title"),
+                "headline": a.get("title", ""),
                 "published_at": published,
                 "source": a.get("source", {}).get("name", "unknown"),
                 "link": a.get("url", "")
             })
 
-        df = pd.DataFrame(rows)
+        return self._post_process(pd.DataFrame(rows))
 
-        if df.empty:
-            return df
-
-        df = self._filter_age(df)
-        df = self._dedup(df)
-
-        return df
-
-    ############################################################
+    ########################################################
     # PUBLIC
-    ############################################################
+    ########################################################
 
-    def fetch(self, query: str, max_items=150) -> pd.DataFrame:
+    def fetch(self, query: str, max_items=120):
 
-        logger.info("Fetching news for: %s", query)
+        cache_path = self._cache_path(query)
+
+        cached = self._load_cache(cache_path)
+
+        if cached is not None:
+            logger.info("News cache hit.")
+            return cached.copy()
+
+        logger.info("Fetching news: %s", query)
+
+        ###############################################
+        # PRIMARY
+        ###############################################
 
         try:
 
             df = self._fetch_marketaux(query, max_items)
 
             if len(df) >= self.MIN_ARTICLES:
+                self._write_cache(df, cache_path)
+
                 logger.info(
-                    "Marketaux returned %s articles",
+                    "Marketaux OK (%s articles)",
                     len(df)
                 )
-                return df.sort_values("published_at")
+
+                return df
 
             logger.warning(
-                "Marketaux sparse (%s). Using fallback.",
+                "Marketaux sparse (%s)",
                 len(df)
             )
 
         except Exception as e:
-            logger.warning("Marketaux failed: %s", e)
 
-        ########################################################
-
-        fallback = self._fetch_gnews(query, max_items)
-
-        if fallback.empty:
-            logger.warning("Fallback returned zero articles.")
-
-        else:
-            logger.info(
-                "Fallback returned %s articles",
-                len(fallback)
+            logger.warning(
+                "Marketaux failed: %s",
+                str(e)
             )
 
-        return fallback.sort_values("published_at")
+        ###############################################
+        # FAILOVER
+        ###############################################
+
+        if not self.failover_enabled:
+            logger.warning("Failover disabled.")
+            return self.EMPTY_SCHEMA.copy()
+
+        try:
+
+            fallback = self._fetch_gnews(query, max_items)
+
+            if not fallback.empty:
+                self._write_cache(fallback, cache_path)
+
+                logger.info(
+                    "GNews OK (%s articles)",
+                    len(fallback)
+                )
+
+                return fallback
+
+        except Exception as e:
+            logger.warning(
+                "Fallback provider failed: %s",
+                str(e)
+            )
+
+        logger.error("All news providers failed.")
+
+        return self.EMPTY_SCHEMA.copy()
