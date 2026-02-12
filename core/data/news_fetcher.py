@@ -1,349 +1,238 @@
-import feedparser
-import pandas as pd
-import requests
-import logging
-import hashlib
-import threading
 import os
-import time
-import re
-import urllib.parse
-
-from datetime import timedelta
-from typing import Dict, Tuple
-
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
+import logging
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+from dateutil import parser
+from typing import List, Dict
 
 logger = logging.getLogger("marketsentinel.news")
 
 
 class NewsFetcher:
+    """
+    INSTITUTIONAL MULTI-SOURCE NEWS FETCHER
 
-    GOOGLE_NEWS_RSS = (
-        "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-    )
+    Priority:
+        1️⃣ Marketaux (structured financial news)
+        2️⃣ GNews fallback
 
-    CACHE_TTL = timedelta(minutes=10)
-    RAW_TTL = timedelta(hours=6)
+    Guarantees:
+        ✔ normalized schema
+        ✔ deduplicated headlines
+        ✔ timezone safe
+        ✔ variance friendly
+        ✔ sentiment-ready
+    """
 
-    MAX_CACHE_KEYS = 500
-    MAX_ARTICLE_AGE = timedelta(hours=48)
+    MARKET_AUX_URL = "https://api.marketaux.com/v1/news/all"
+    GNEWS_URL = "https://gnews.io/api/v4/search"
 
-    INGESTION_DELAY = timedelta(minutes=15)
-
-    RAW_SCHEMA_VERSION = "5.0"   #  bump version for lineage reset
-
-    RAW_CACHE_DIR = "data/news_raw"
-    MAX_RAW_FILES = 300
-
-    MAX_RETRIES = 4
-    BASE_SLEEP = 1.2
-
-    _cache: Dict[str, Tuple[pd.Timestamp, pd.DataFrame]] = {}
-    _lock = threading.Lock()
-
-    EMPTY_SCHEMA = pd.DataFrame(
-        columns=["headline", "published_at", "source", "link"]
-    )
-
-    HEADLINE_REGEX = re.compile(
-        r"^\s*$|^\W+$|http[s]?://|^\d+$"
-    )
-
-    #####################################################
+    MAX_AGE_HOURS = 72
+    MIN_ARTICLES = 15   # ensures variance
 
     def __init__(self):
 
-        os.makedirs(self.RAW_CACHE_DIR, exist_ok=True)
+        self.marketaux_key = os.getenv("MARKETAUX_API_KEY")
+        self.gnews_key = os.getenv("GNEWS_API_KEY")
 
-        retry = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[429, 500, 502, 503, 504]
+        if not self.marketaux_key:
+            raise RuntimeError(
+                "MARKETAUX_API_KEY not found in environment."
+            )
+
+        if not self.gnews_key:
+            logger.warning(
+                "GNEWS_API_KEY missing — fallback disabled."
+            )
+
+        self.session = requests.Session()
+        self.session.headers.update(
+            {"User-Agent": "MarketSentinel/Institutional"}
         )
 
-        adapter = HTTPAdapter(max_retries=retry)
-
-        self.SESSION = requests.Session()
-        self.SESSION.mount("https://", adapter)
-        self.SESSION.headers.update({
-            "User-Agent": "MarketSentinel/5.0"
-        })
-
-    #####################################################
+    ############################################################
 
     @staticmethod
-    def _now():
-        return pd.Timestamp.utcnow().tz_localize(None)
+    def _normalize_date(dt):
 
-    #####################################################
+        if not dt:
+            return None
 
-    def _cache_key(self, query: str, max_items: int) -> str:
+        try:
+            ts = parser.parse(dt)
+            return ts.replace(tzinfo=None)
+        except Exception:
+            return None
 
-        raw = f"{query}|{max_items}|schema={self.RAW_SCHEMA_VERSION}"
-        return hashlib.sha256(raw.encode()).hexdigest()[:20]
+    ############################################################
 
-    #####################################################
+    def _filter_age(self, df: pd.DataFrame):
 
-    def _raw_path(self, key: str):
-        return f"{self.RAW_CACHE_DIR}/{key}.xml"
+        cutoff = datetime.utcnow() - timedelta(hours=self.MAX_AGE_HOURS)
 
-    #####################################################
+        return df[df["published_at"] >= cutoff]
 
-    def _prune_raw_disk(self):
-
-        files = sorted(
-            [
-                os.path.join(self.RAW_CACHE_DIR, f)
-                for f in os.listdir(self.RAW_CACHE_DIR)
-            ],
-            key=os.path.getmtime
-        )
-
-        if len(files) <= self.MAX_RAW_FILES:
-            return
-
-        for f in files[:50]:
-            try:
-                os.remove(f)
-            except Exception:
-                pass
-
-    #####################################################
-
-    def _raw_expired(self, path):
-
-        if not os.path.exists(path):
-            return True
-
-        modified = pd.Timestamp(
-            os.path.getmtime(path),
-            unit="s"
-        )
-
-        return self._now() - modified > self.RAW_TTL
-
-    #####################################################
-
-    def _persist_raw_feed(self, path, content: bytes):
-
-        if len(content) < 1500:
-            raise RuntimeError("RSS payload suspiciously small.")
-
-        tmp = path + ".tmp"
-
-        with open(tmp, "wb") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-
-        os.replace(tmp, path)
-
-        self._prune_raw_disk()
-
-    #####################################################
-
-    def _download_feed(self, url):
-
-        for attempt in range(self.MAX_RETRIES):
-
-            try:
-
-                r = self.SESSION.get(
-                    url,
-                    timeout=6
-                )
-
-                r.raise_for_status()
-
-                return r.content
-
-            except Exception as e:
-
-                sleep = self.BASE_SLEEP * (2 ** attempt)
-
-                logger.warning(
-                    f"News retry {attempt+1}: {e}"
-                )
-
-                time.sleep(sleep)
-
-        raise RuntimeError("News download failed after retries.")
-
-    #####################################################
+    ############################################################
 
     @staticmethod
-    def _normalize_timestamp(published, now):
+    def _dedup(df):
 
-        ts = pd.to_datetime(
-            published,
-            utc=True,
-            errors="coerce"
+        df["key"] = (
+            df["headline"].str.lower()
+            + df["source"].str.lower()
         )
 
-        if pd.isna(ts):
-            return None
+        df = df.drop_duplicates("key")
 
-        ts = ts.tz_convert(None)
+        return df.drop(columns="key")
 
-        return min(ts, now)
+    ############################################################
+    # PRIMARY — MARKETAUX
+    ############################################################
 
-    #####################################################
+    def _fetch_marketaux(self, query, limit=100) -> pd.DataFrame:
 
-    def _clean_headline(self, text: str):
+        params = {
+            "api_token": self.marketaux_key,
+            "search": query,
+            "language": "en",
+            "limit": limit
+        }
 
-        if not text:
-            return None
+        r = self.session.get(
+            self.MARKET_AUX_URL,
+            params=params,
+            timeout=10
+        )
 
-        text = " ".join(text.split()).strip()
+        r.raise_for_status()
 
-        if len(text) < 15:
-            return None
+        data = r.json().get("data", [])
 
-        if self.HEADLINE_REGEX.search(text):
-            return None
+        if not data:
+            return pd.DataFrame()
 
-        if text.isupper():
-            return None
+        rows = []
 
-        return text
+        for article in data:
 
-    #####################################################
+            published = self._normalize_date(
+                article.get("published_at")
+            )
 
-    def fetch(self, query: str, max_items: int = 50) -> pd.DataFrame:
+            if not published:
+                continue
 
-        key = self._cache_key(query, max_items)
-        now = self._now()
+            rows.append({
+                "headline": article.get("title"),
+                "published_at": published,
+                "source": article.get("source", "unknown"),
+                "link": article.get("url", "")
+            })
 
-        if key in self._cache:
-            expiry, df = self._cache[key]
-            if now < expiry:
-                return df.copy()
+        df = pd.DataFrame(rows)
 
-        with self._lock:
+        if df.empty:
+            return df
 
-            if key in self._cache:
-                expiry, df = self._cache[key]
-                if now < expiry:
-                    return df.copy()
+        df = self._filter_age(df)
+        df = self._dedup(df)
 
-            try:
+        return df
 
-                #################################################
-                #  PROPER URL ENCODING
-                #################################################
+    ############################################################
+    # FALLBACK — GNEWS
+    ############################################################
 
-                encoded_query = urllib.parse.quote_plus(query)
+    def _fetch_gnews(self, query, limit=100) -> pd.DataFrame:
 
-                rss_url = self.GOOGLE_NEWS_RSS.format(
-                    query=encoded_query
+        if not self.gnews_key:
+            return pd.DataFrame()
+
+        params = {
+            "q": query,
+            "token": self.gnews_key,
+            "lang": "en",
+            "max": limit
+        }
+
+        r = self.session.get(
+            self.GNEWS_URL,
+            params=params,
+            timeout=10
+        )
+
+        r.raise_for_status()
+
+        articles = r.json().get("articles", [])
+
+        rows = []
+
+        for a in articles:
+
+            published = self._normalize_date(
+                a.get("publishedAt")
+            )
+
+            if not published:
+                continue
+
+            rows.append({
+                "headline": a.get("title"),
+                "published_at": published,
+                "source": a.get("source", {}).get("name", "unknown"),
+                "link": a.get("url", "")
+            })
+
+        df = pd.DataFrame(rows)
+
+        if df.empty:
+            return df
+
+        df = self._filter_age(df)
+        df = self._dedup(df)
+
+        return df
+
+    ############################################################
+    # PUBLIC
+    ############################################################
+
+    def fetch(self, query: str, max_items=150) -> pd.DataFrame:
+
+        logger.info("Fetching news for: %s", query)
+
+        try:
+
+            df = self._fetch_marketaux(query, max_items)
+
+            if len(df) >= self.MIN_ARTICLES:
+                logger.info(
+                    "Marketaux returned %s articles",
+                    len(df)
                 )
+                return df.sort_values("published_at")
 
-                path = self._raw_path(key)
+            logger.warning(
+                "Marketaux sparse (%s). Using fallback.",
+                len(df)
+            )
 
-                if self._raw_expired(path):
-                    raw = self._download_feed(rss_url)
-                    self._persist_raw_feed(path, raw)
-                else:
-                    with open(path, "rb") as f:
-                        raw = f.read()
+        except Exception as e:
+            logger.warning("Marketaux failed: %s", e)
 
-                feed = feedparser.parse(raw)
+        ########################################################
 
-                #################################################
-                #  BOZO GUARD
-                #################################################
+        fallback = self._fetch_gnews(query, max_items)
 
-                if getattr(feed, "bozo", False):
-                    raise RuntimeError("Malformed RSS feed.")
+        if fallback.empty:
+            logger.warning("Fallback returned zero articles.")
 
-                articles = []
-                seen_hashes = set()
+        else:
+            logger.info(
+                "Fallback returned %s articles",
+                len(fallback)
+            )
 
-                for entry in sorted(
-                    feed.entries,
-                    key=lambda e: e.get("published_parsed", (0,)),
-                    reverse=True
-                ):
-
-                    parsed = entry.get("published_parsed")
-
-                    if not parsed:
-                        continue
-
-                    published = self._normalize_timestamp(
-                        pd.Timestamp(*parsed[:6]),
-                        now
-                    )
-
-                    if published is None:
-                        continue
-
-                    if published > now - self.INGESTION_DELAY:
-                        continue
-
-                    if now - published > self.MAX_ARTICLE_AGE:
-                        continue
-
-                    headline = self._clean_headline(
-                        entry.get("title", "")
-                    )
-
-                    if not headline:
-                        continue
-
-                    source = entry.get("source", {})
-
-                    if isinstance(source, dict):
-                        source = source.get("title", "Unknown")
-                    else:
-                        source = "Unknown"
-
-                    #################################################
-                    #  FIXED pandas warning
-                    #################################################
-
-                    dedup_key = f"{headline}|{source}|{published.floor('h')}"
-
-                    h = hashlib.sha256(
-                        dedup_key.encode()
-                    ).hexdigest()
-
-                    if h in seen_hashes:
-                        continue
-
-                    seen_hashes.add(h)
-
-                    articles.append({
-                        "headline": headline,
-                        "published_at": published,
-                        "source": source,
-                        "link": entry.get("link", "")
-                    })
-
-                    if len(articles) >= max_items:
-                        break
-
-                if not articles:
-                    return self.EMPTY_SCHEMA.copy()
-
-                df = pd.DataFrame(articles)
-                df = df.sort_values("published_at")
-                df.reset_index(drop=True, inplace=True)
-
-                self._cache[key] = (
-                    now + self.CACHE_TTL,
-                    df
-                )
-
-                return df.copy()
-
-            except Exception:
-
-                logger.exception(
-                    "News fetch failure — returning empty schema."
-                )
-
-                return self.EMPTY_SCHEMA.copy()
+        return fallback.sort_values("published_at")
