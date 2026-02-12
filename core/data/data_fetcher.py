@@ -6,6 +6,7 @@ import logging
 import os
 import random
 from datetime import timedelta
+import uuid
 
 
 logger = logging.getLogger("marketsentinel.fetcher")
@@ -27,7 +28,6 @@ class StockPriceFetcher:
     BASE_SLEEP = 1.5
     MAX_GAP_DAYS = 10
 
-    # relaxed — realistic for Yahoo
     CRITICAL_COVERAGE = 0.55
     WARNING_COVERAGE = 0.70
 
@@ -35,6 +35,22 @@ class StockPriceFetcher:
 
     def __init__(self):
         os.makedirs(self.CACHE_DIR, exist_ok=True)
+
+    ##################################################
+    # DIRECTORY FSYNC
+    ##################################################
+
+    @staticmethod
+    def _fsync_dir(directory):
+
+        if os.name == "nt":
+            return
+
+        fd = os.open(directory, os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     ##################################################
     # TIME SAFETY
@@ -131,8 +147,6 @@ class StockPriceFetcher:
             raise RuntimeError("Large gap detected in price history.")
 
     ##################################################
-    # ✅ FIXED COVERAGE
-    ##################################################
 
     def _validate_coverage(self, df, start_date, end_date):
 
@@ -147,13 +161,11 @@ class StockPriceFetcher:
 
         coverage = len(df) / expected_sessions
 
-        # HARD FAIL only for garbage datasets
         if coverage < self.CRITICAL_COVERAGE:
             raise RuntimeError(
                 f"Dataset coverage critically low: {coverage:.2f}"
             )
 
-        # warn but allow
         if coverage < self.WARNING_COVERAGE:
             logger.warning(
                 f"Low dataset coverage ({coverage:.2f}). "
@@ -168,6 +180,9 @@ class StockPriceFetcher:
             raise RuntimeError("Provider returned empty dataset.")
 
         df = self._normalize_schema(df)
+
+        if not pd.api.types.is_datetime64_any_dtype(df["date"]):
+            raise RuntimeError("Date column corrupted.")
 
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices detected.")
@@ -188,17 +203,23 @@ class StockPriceFetcher:
         return df.reset_index(drop=True)
 
     ##################################################
+    # ATOMIC CACHE WRITE — INSTITUTIONAL SAFE
+    ##################################################
 
     def _atomic_cache_write(self, df, cache_file):
 
-        tmp = cache_file + ".tmp"
+        directory = os.path.dirname(cache_file) or "."
 
+        tmp = f"{cache_file}.{uuid.uuid4().hex}.tmp"
+
+        # write directly — do NOT open manually
         df.to_parquet(tmp, index=False)
 
-        with open(tmp, "rb") as f:
-            os.fsync(f.fileno())
-
+        # atomic rename
         os.replace(tmp, cache_file)
+
+        # durability
+        self._fsync_dir(directory)
 
     ##################################################
 
@@ -233,7 +254,10 @@ class StockPriceFetcher:
 
             except Exception:
                 logger.exception("Cache corrupted. Rebuilding.")
-                os.remove(cache_file)
+                try:
+                    os.remove(cache_file)
+                except Exception:
+                    pass
 
         df = self._fetch_yahoo(
             ticker,
