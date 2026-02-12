@@ -5,7 +5,7 @@ import numpy as np
 import json
 
 
-SCHEMA_VERSION = "7.0"
+SCHEMA_VERSION = "7.1"
 
 
 MODEL_FEATURES: Tuple[str, ...] = (
@@ -93,15 +93,22 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     _check_forbidden_columns(df)
 
     incoming = set(df.columns)
+    expected = set(MODEL_FEATURES)
 
-    missing = set(MODEL_FEATURES) - incoming
+    missing = expected - incoming
+    unknown = incoming - expected
 
     if missing:
         raise RuntimeError(
             f"Missing required features: {sorted(missing)}"
         )
 
-    feature_df = df.reindex(columns=MODEL_FEATURES).copy()
+    if unknown:
+        raise RuntimeError(
+            f"Unknown features detected: {sorted(unknown)}"
+        )
+
+    feature_df = df.loc[:, MODEL_FEATURES].copy(deep=True)
 
     feature_df.replace(
         [np.inf, -np.inf],
@@ -127,7 +134,14 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
         feature_df[col] = feature_df[col].astype(DTYPE)
 
-        if np.abs(feature_df[col]).max() > ABSOLUTE_FEATURE_LIMIT:
+        finite_vals = feature_df[col][np.isfinite(feature_df[col])]
+
+        if finite_vals.empty:
+            raise RuntimeError(
+                f"No finite values present in feature: {col}"
+            )
+
+        if np.abs(finite_vals).max() > ABSOLUTE_FEATURE_LIMIT:
             raise RuntimeError(
                 f"Feature explosion detected: {col}"
             )
@@ -160,18 +174,19 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     for col, (lo, hi) in FEATURE_LIMITS.items():
 
-        series = feature_df[col].dropna()
+        series = feature_df[col]
+        finite = series[np.isfinite(series)]
 
-        if series.empty:
+        if finite.empty:
             continue
 
-        if (series < lo).any() or (series > hi).any():
+        if (finite < lo).any() or (finite > hi).any():
             raise RuntimeError(
                 f"Feature out of plausible bounds: {col}"
             )
 
     ########################################################
-    # CONTIGUOUS MEMORY (VERY IMPORTANT FOR XGBOOST)
+    # CONTIGUOUS MEMORY
     ########################################################
 
     arr = np.ascontiguousarray(
@@ -179,7 +194,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     return pd.DataFrame(
-        arr,
+        arr.copy(),
         columns=MODEL_FEATURES
     )
 
@@ -203,6 +218,7 @@ def get_schema_signature() -> str:
         f"limits={canonical_limits}",
         f"abs_limit={ABSOLUTE_FEATURE_LIMIT}",
         f"count={len(MODEL_FEATURES)}",
+        f"forbidden={','.join(sorted(FORBIDDEN_PATTERNS))}",
         f"version={SCHEMA_VERSION}"
     ]
 
