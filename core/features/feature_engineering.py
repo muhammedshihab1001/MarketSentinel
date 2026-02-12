@@ -22,9 +22,7 @@ class FeatureEngineer:
     ]
 
     RETURN_CLAMP = (-0.5, 0.5)
-
     MERGE_TOLERANCE = pd.Timedelta("3D")
-
     VOL_FLOOR = 1e-4
 
     ####################################################
@@ -157,7 +155,6 @@ class FeatureEngineer:
 
         if sentiment_df is None or sentiment_df.empty:
             sentiment = cls._build_zero_sentiment(price)
-
         else:
 
             sentiment = sentiment_df.copy()
@@ -177,7 +174,7 @@ class FeatureEngineer:
                 as_index=False
             )[cls.SENTIMENT_COLUMNS[1:]].mean()
 
-        # SHIFT FOR LOOKAHEAD SAFETY
+        # LOOKAHEAD SAFE SHIFT
         sentiment["date"] += pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
@@ -272,21 +269,19 @@ class FeatureEngineer:
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-        # 🔥 STRICT FEATURE SELECTION FIRST
+        ###########################################
+        # STRICT FEATURE BLOCK
+        ###########################################
+
         feature_block = df.loc[:, MODEL_FEATURES]
-
-        # HARD LEAKAGE GUARD
-        unexpected = set(feature_block.columns) - set(MODEL_FEATURES)
-
-        if unexpected:
-            raise RuntimeError(
-                f"Feature leakage detected: {sorted(unexpected)}"
-            )
 
         validated = validate_feature_schema(feature_block)
 
-        # Only allow safe columns outside features
-        allowed_non_features = {"date", "target"}
+        ###########################################
+        # KEEP CRITICAL MARKET COLUMNS
+        ###########################################
+
+        allowed_non_features = {"date", "close", "target"}
 
         non_features = [
             col for col in df.columns
