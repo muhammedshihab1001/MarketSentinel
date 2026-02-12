@@ -1,5 +1,6 @@
 import os
 import logging
+import hashlib
 from typing import Optional
 
 import pandas as pd
@@ -7,7 +8,8 @@ import pandas as pd
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import (
     validate_feature_schema,
-    MODEL_FEATURES
+    MODEL_FEATURES,
+    get_schema_signature
 )
 
 logger = logging.getLogger("marketsentinel.feature_store")
@@ -15,14 +17,15 @@ logger = logging.getLogger("marketsentinel.feature_store")
 
 class FeatureStore:
     """
-    Deterministic feature cache.
+    Institutional Feature Store.
 
     Guarantees:
-    - rebuild on cache miss
+    - schema-aware cache
+    - automatic invalidation
     - atomic persistence
     - corruption recovery
-    - schema validation
-    - stable feature ordering
+    - deterministic ordering
+    - inference/training parity
     """
 
     FEATURE_DIR = "data/features"
@@ -32,9 +35,23 @@ class FeatureStore:
         os.makedirs(self.FEATURE_DIR, exist_ok=True)
         self.engineer = FeatureEngineer()
 
+        # CRITICAL — binds cache to schema
+        self.schema_hash = hashlib.sha256(
+            get_schema_signature().encode()
+        ).hexdigest()[:10]
+
+    # --------------------------------------------------
+
     def _feature_path(self, ticker: str, training: bool):
+
         suffix = "train" if training else "infer"
-        return f"{self.FEATURE_DIR}/{ticker}_{suffix}.parquet"
+
+        return (
+            f"{self.FEATURE_DIR}/"
+            f"{ticker}_{suffix}_{self.schema_hash}.parquet"
+        )
+
+    # --------------------------------------------------
 
     def _validate_dataset_structure(self, df: pd.DataFrame):
 
@@ -50,6 +67,8 @@ class FeatureStore:
                 "Duplicate timestamps detected."
             )
 
+    # --------------------------------------------------
+
     def _atomic_write(self, df: pd.DataFrame, path: str):
 
         tmp_path = path + ".tmp"
@@ -60,7 +79,7 @@ class FeatureStore:
 
         feature_block = df.loc[:, MODEL_FEATURES]
 
-        if list(feature_block.columns) != MODEL_FEATURES:
+        if list(feature_block.columns) != list(MODEL_FEATURES):
             raise RuntimeError(
                 "Feature ordering violation detected."
             )
@@ -70,6 +89,8 @@ class FeatureStore:
         df.to_parquet(tmp_path, index=False)
 
         os.replace(tmp_path, path)
+
+    # --------------------------------------------------
 
     def _load_features(self, path: str) -> Optional[pd.DataFrame]:
 
@@ -82,7 +103,9 @@ class FeatureStore:
 
             self._validate_dataset_structure(df)
 
-            validate_feature_schema(df.loc[:, MODEL_FEATURES])
+            validate_feature_schema(
+                df.loc[:, MODEL_FEATURES]
+            )
 
             return df.sort_values("date")
 
@@ -98,6 +121,8 @@ class FeatureStore:
                 pass
 
             return None
+
+    # --------------------------------------------------
 
     def get_features(
         self,
@@ -119,7 +144,9 @@ class FeatureStore:
         if stored is not None:
             return stored
 
-        logger.info("Feature cache miss — rebuilding features.")
+        logger.info(
+            "Feature cache miss or schema changed — rebuilding."
+        )
 
         features = self.engineer.build_feature_pipeline(
             price_df,
