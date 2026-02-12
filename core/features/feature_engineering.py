@@ -22,7 +22,10 @@ class FeatureEngineer:
     ]
 
     RETURN_CLAMP = (-0.5, 0.5)
-    MERGE_TOLERANCE = pd.Timedelta("3D")
+
+    #  tightened from 3D → institutional safe
+    MERGE_TOLERANCE = pd.Timedelta("2D")
+
     VOL_FLOOR = 1e-4
 
     ####################################################
@@ -62,7 +65,6 @@ class FeatureEngineer:
         if df["date"].duplicated().any():
             raise RuntimeError("Duplicate timestamps in price data.")
 
-        # 🔥 CRITICAL FIX — force numeric conversion
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
 
         if df["close"].isna().any():
@@ -144,36 +146,30 @@ class FeatureEngineer:
         df["macd_signal"] = signal.clip(-50, 50)
 
     ####################################################
-    # SENTIMENT MERGE (LOOKAHEAD SAFE)
+    # SENTIMENT MERGE — FIXED (NO FAKE DATA)
     ####################################################
-
-    @classmethod
-    def _build_zero_sentiment(cls, price_df):
-
-        return pd.DataFrame({
-            "date": price_df["date"],
-            "avg_sentiment": 0.0,
-            "news_count": 0.0,
-            "sentiment_std": 0.0
-        })
 
     @classmethod
     def merge_price_sentiment(cls, price_df, sentiment_df):
 
         price = cls._normalize_datetime(price_df).sort_values("date")
 
+        # If NO sentiment exists → abort early
         if sentiment_df is None or sentiment_df.empty:
-            sentiment = cls._build_zero_sentiment(price)
-        else:
+            raise RuntimeError(
+                "Sentiment dataset empty — refusing to fabricate signal."
+            )
 
-            sentiment = sentiment_df.copy()
+        sentiment = sentiment_df.copy()
 
-            missing = set(cls.SENTIMENT_COLUMNS) - set(sentiment.columns)
+        missing = set(cls.SENTIMENT_COLUMNS) - set(sentiment.columns)
 
-            if missing:
-                sentiment = cls._build_zero_sentiment(price)
-            else:
-                sentiment = sentiment.loc[:, cls.SENTIMENT_COLUMNS]
+        if missing:
+            raise RuntimeError(
+                f"Sentiment schema violation: missing={missing}"
+            )
+
+        sentiment = sentiment.loc[:, cls.SENTIMENT_COLUMNS]
 
         sentiment = cls._normalize_datetime(sentiment).sort_values("date")
 
@@ -183,7 +179,10 @@ class FeatureEngineer:
                 as_index=False
             )[cls.SENTIMENT_COLUMNS[1:]].mean()
 
-        # 🔥 LOOKAHEAD SAFE SHIFT
+        ################################################
+        # LOOKAHEAD SAFE SHIFT
+        ################################################
+
         sentiment["date"] += pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
@@ -195,8 +194,28 @@ class FeatureEngineer:
             allow_exact_matches=False
         )
 
-        for col in ("avg_sentiment", "news_count", "sentiment_std"):
-            merged[col] = merged[col].fillna(0.0)
+        ################################################
+        #  INSTITUTIONAL FIX — DECAY NOT ZERO FILL
+        ################################################
+
+        merged[["avg_sentiment", "news_count", "sentiment_std"]] = (
+            merged[["avg_sentiment", "news_count", "sentiment_std"]]
+            .ffill(limit=3)   # carry sentiment max 3 days
+        )
+
+        merged.dropna(
+            subset=["avg_sentiment", "news_count", "sentiment_std"],
+            inplace=True
+        )
+
+        ################################################
+        # HARD VARIANCE GUARD
+        ################################################
+
+        if merged["avg_sentiment"].std() < 1e-4:
+            raise RuntimeError(
+                "Sentiment variance collapsed — check news pipeline."
+            )
 
         return merged
 
@@ -285,10 +304,6 @@ class FeatureEngineer:
         feature_block = df.loc[:, MODEL_FEATURES]
 
         validated = validate_feature_schema(feature_block)
-
-        ###########################################
-        # KEEP CRITICAL MARKET COLUMNS
-        ###########################################
 
         allowed_non_features = {"date", "close", "target"}
 
