@@ -4,7 +4,6 @@ import joblib
 import numpy as np
 import tensorflow as tf
 import pandas as pd
-import shutil
 
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.callbacks import EarlyStopping
@@ -17,9 +16,9 @@ from models.lstm_model import build_lstm_model
 
 MODEL_DIR = "artifacts/lstm"
 
-TEMP_MODEL_PATH = f"{MODEL_DIR}/model.keras"
-TEMP_SCALER_PATH = f"{MODEL_DIR}/scalers.pkl"
-TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
+MODEL_PATH = f"{MODEL_DIR}/model.keras"
+SCALER_PATH = f"{MODEL_DIR}/scalers.pkl"
+METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 LOOKBACK_WINDOW = 60
 EPOCHS = 50
@@ -38,14 +37,21 @@ TRAINING_TICKERS = [
 # RUNTIME CONFIG
 ############################################
 
+GPU_AVAILABLE = False
+
+
 def configure_runtime():
+
+    global GPU_AVAILABLE
 
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
 
     gpus = tf.config.list_physical_devices("GPU")
 
-    if gpus:
+    GPU_AVAILABLE = len(gpus) > 0
+
+    if GPU_AVAILABLE:
         try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
@@ -54,7 +60,7 @@ def configure_runtime():
 
         except RuntimeError as e:
             print(f"GPU configuration failed. Falling back to CPU: {e}")
-
+            GPU_AVAILABLE = False
     else:
         print("Running on CPU.")
 
@@ -62,29 +68,22 @@ def configure_runtime():
 ############################################
 
 def get_batch_size():
-
-    if tf.config.list_physical_devices("GPU"):
-        return 128
-    return 32
+    return 128 if GPU_AVAILABLE else 32
 
 
+############################################
+# TRUE ATOMIC SAVE
 ############################################
 
 def atomic_save_model(model, path):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    tmp_dir = path + "_tmp"
+    tmp_path = path + ".tmp.keras"
 
-    if os.path.exists(tmp_dir):
-        shutil.rmtree(tmp_dir)
+    model.save(tmp_path)
 
-    model.save(tmp_dir, save_format="keras")
-
-    if os.path.exists(path):
-        shutil.rmtree(path)
-
-    os.replace(tmp_dir, path)
+    os.replace(tmp_path, path)
 
 
 ############################################
@@ -131,7 +130,7 @@ def build_sequences(df):
 
     for ticker, tdf in df.groupby("ticker"):
 
-        prices = tdf["close"].astype("float32").values.reshape(-1,1)
+        prices = tdf["close"].astype("float32").values.reshape(-1, 1)
 
         scaler = MinMaxScaler()
         scaled = scaler.fit_transform(prices)
@@ -139,14 +138,17 @@ def build_sequences(df):
         scalers[ticker] = scaler
 
         for i in range(len(scaled) - LOOKBACK_WINDOW):
-
             X_all.append(scaled[i:i+LOOKBACK_WINDOW])
             y_all.append(scaled[i+LOOKBACK_WINDOW])
 
     if not X_all:
         raise RuntimeError("No sequences generated.")
 
-    return np.array(X_all), np.array(y_all), scalers
+    return (
+        np.asarray(X_all, dtype=np.float32),
+        np.asarray(y_all, dtype=np.float32),
+        scalers
+    )
 
 
 ############################################
@@ -161,7 +163,7 @@ def time_series_validation(df):
     X_train, y_train, scalers = build_sequences(train_df)
     X_test, y_test, _ = build_sequences(test_df)
 
-    model = build_lstm_model((LOOKBACK_WINDOW,1))
+    model = build_lstm_model((LOOKBACK_WINDOW, 1))
 
     early = EarlyStopping(
         monitor="val_loss",
@@ -173,7 +175,7 @@ def time_series_validation(df):
     history = model.fit(
         X_train,
         y_train,
-        validation_data=(X_test,y_test),
+        validation_data=(X_test, y_test),
         epochs=EPOCHS,
         batch_size=get_batch_size(),
         callbacks=[early],
@@ -196,13 +198,13 @@ if __name__ == "__main__":
     df, end_date = load_data()
 
     dataset_hash = MetadataManager.fingerprint_dataset(
-        df[["close"]]
+        df[["ticker", "date", "close"]]
     )
 
     model, scalers, val_loss = time_series_validation(df)
 
-    atomic_save_model(model, TEMP_MODEL_PATH)
-    joblib.dump(scalers, TEMP_SCALER_PATH)
+    atomic_save_model(model, MODEL_PATH)
+    joblib.dump(scalers, SCALER_PATH)
 
     metadata = MetadataManager.create_metadata(
         model_name="lstm_price_forecast",
@@ -214,16 +216,16 @@ if __name__ == "__main__":
         metadata_type="sequence"
     )
 
-    MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
+    MetadataManager.save_metadata(metadata, METADATA_PATH)
 
     version = ModelRegistry.register_model(
         MODEL_DIR,
-        TEMP_MODEL_PATH,
-        TEMP_METADATA_PATH
+        MODEL_PATH,
+        METADATA_PATH
     )
 
-    shutil.move(
-        TEMP_SCALER_PATH,
+    os.replace(
+        SCALER_PATH,
         os.path.join(MODEL_DIR, version, "scalers.pkl")
     )
 
