@@ -1,5 +1,4 @@
 import os
-import datetime
 import tempfile
 import joblib
 import pandas as pd
@@ -19,14 +18,13 @@ from core.artifacts.model_registry import ModelRegistry
 from core.monitoring.drift_detector import DriftDetector
 
 from training.backtesting.walk_forward import WalkForwardValidator
-
 from models.xgboost_model import (
     build_xgboost_model,
     build_final_xgboost_model
 )
 
-#  NEW
 from core.time.market_time import MarketTime
+from core.market.universe import MarketUniverse   # ⭐ CRITICAL
 
 logger = logging.getLogger("marketsentinel.training")
 
@@ -39,18 +37,10 @@ TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 SEED = 42
 np.random.seed(SEED)
 
-TRAINING_TICKERS = [
-    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA",
-    "JPM","GS","BAC","AMD","AVGO"
-]
-
 MIN_TRAINING_ROWS = 2000
-MIN_SURVIVING_TICKERS = 4
+MIN_SURVIVING_TICKERS = 5
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
-
-MIN_SENTIMENT_STD = 0.01
-MIN_NEWS_PER_DAY = 0.6
 
 
 ########################################################
@@ -112,7 +102,7 @@ def build_news_query(ticker: str):
 
 
 ########################################################
-# DATA LOADER (TIME SAFE)
+# DATA LOADER — CLOCK + UNIVERSE GOVERNED
 ########################################################
 
 def load_training_data(start_date, end_date):
@@ -122,16 +112,19 @@ def load_training_data(start_date, end_date):
     sentiment_analyzer = SentimentAnalyzer()
     engineer = FeatureEngineer()
 
-    datasets = []
-    surviving_tickers = []
+    universe = MarketUniverse.get_universe()
 
     logger.info(
-        "Training window | start=%s end=%s",
+        "Training window | %s -> %s | universe=%s",
         start_date,
-        end_date
+        end_date,
+        len(universe)
     )
 
-    for ticker in TRAINING_TICKERS:
+    datasets = []
+    surviving = []
+
+    for ticker in universe:
 
         try:
 
@@ -144,9 +137,9 @@ def load_training_data(start_date, end_date):
             if price_df is None or price_df.empty:
                 continue
 
-            ################################################
-            # NEWS
-            ################################################
+            ###########################################
+            # NEWS RETRY
+            ###########################################
 
             news_df = None
 
@@ -177,31 +170,34 @@ def load_training_data(start_date, end_date):
                 training=True
             )
 
-            if dataset is None or dataset.empty:
-                continue
-
             dataset["ticker"] = ticker
 
             datasets.append(dataset)
-            surviving_tickers.append(ticker)
+            surviving.append(ticker)
 
         except Exception as e:
             logger.warning("Ticker rejected: %s | %s", ticker, str(e))
 
-    if len(surviving_tickers) < MIN_SURVIVING_TICKERS:
-        raise RuntimeError("Too few tickers survived.")
+    ###################################################
+    # COLLAPSE PROTECTION
+    ###################################################
+
+    if len(surviving) < MIN_SURVIVING_TICKERS:
+        raise RuntimeError(
+            "Universe collapse — too few tickers survived."
+        )
 
     df = pd.concat(datasets, ignore_index=True)
-
-    df.sort_values(["date", "ticker"], inplace=True)
-    df.reset_index(drop=True, inplace=True)
 
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError("Training aborted — dataset too small.")
 
+    df.sort_values(["date", "ticker"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
-    return df
+    return df, surviving
 
 
 ########################################################
@@ -212,11 +208,10 @@ def main(start_date=None, end_date=None):
 
     logger.info("Institutional XGBoost Training")
 
-    #  GLOBAL TIME FREEZE
     if not start_date or not end_date:
         start_date, end_date = MarketTime.training_window()
 
-    df = load_training_data(start_date, end_date)
+    df, surviving = load_training_data(start_date, end_date)
 
     dataset_hash = MetadataManager.fingerprint_dataset(
         df[["ticker","date","target", *MODEL_FEATURES]]
@@ -230,13 +225,25 @@ def main(start_date=None, end_date=None):
         allow_overwrite=False
     )
 
+    ###################################################
+    # WALK FORWARD
+    ###################################################
+
+    def trainer(d):
+        model = build_xgboost_model(d["target"])
+        model.fit(d.loc[:, MODEL_FEATURES], d["target"])
+        return model
+
+    def signal(model, test):
+        probs = model.predict_proba(
+            test.loc[:, MODEL_FEATURES]
+        )[:, 1]
+
+        return ["BUY" if p > 0.58 else "HOLD" for p in probs]
+
     wf = WalkForwardValidator(
-        model_trainer=lambda d: build_xgboost_model(d["target"]).fit(
-            d.loc[:, MODEL_FEATURES], d["target"]
-        ),
-        signal_generator=lambda m, t:
-            ["BUY" if p > 0.58 else "HOLD"
-             for p in m.predict_proba(t.loc[:, MODEL_FEATURES])[:,1]]
+        model_trainer=trainer,
+        signal_generator=signal
     )
 
     strategy_metrics = wf.run(df)
@@ -252,6 +259,10 @@ def main(start_date=None, end_date=None):
     if strategy_metrics["max_drawdown"] < MAX_DRAWDOWN:
         raise RuntimeError("XGBoost rejected — drawdown too severe")
 
+    ###################################################
+    # FINAL TRAIN
+    ###################################################
+
     model = build_final_xgboost_model(df["target"])
     model.fit(df.loc[:, MODEL_FEATURES], df["target"])
 
@@ -264,7 +275,10 @@ def main(start_date=None, end_date=None):
         training_start=start_date,
         training_end=end_date,
         dataset_hash=dataset_hash,
-        metadata_type="training_manifest_v1"
+        metadata_type="training_manifest_v1",
+        extra_fields={
+            "training_universe": surviving
+        }
     )
 
     MetadataManager.save_metadata(
