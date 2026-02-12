@@ -5,8 +5,16 @@ import numpy as np
 import json
 
 
-SCHEMA_VERSION = "8.0"
+########################################################
+# VERSION
+########################################################
 
+SCHEMA_VERSION = "9.0"   # ← bump
+
+
+########################################################
+# FEATURES
+########################################################
 
 MODEL_FEATURES: Tuple[str, ...] = (
     "return",
@@ -21,12 +29,19 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "sentiment_lag1"
 )
 
+FEATURE_COUNT = len(MODEL_FEATURES)
+
 NUMERIC_FEATURES = frozenset(MODEL_FEATURES)
+
+DTYPE = "float32"
+
+
+########################################################
+# SAFETY LIMITS
+########################################################
 
 MAX_NAN_RATIO_PER_FEATURE = 0.05
 MAX_ROW_NAN_RATIO = 0.10
-
-DTYPE = "float32"
 
 ABSOLUTE_FEATURE_LIMIT = 1e6
 MIN_VARIANCE = 1e-8
@@ -54,7 +69,7 @@ FEATURE_LIMITS: Dict[str, tuple] = {
 
 
 ########################################################
-# LOOKAHEAD GUARD
+# LOOKAHEAD GUARD (UPGRADED)
 ########################################################
 
 FORBIDDEN_PATTERNS = (
@@ -64,6 +79,10 @@ FORBIDDEN_PATTERNS = (
     "target",
     "label",
     "t+",
+    "t1",
+    "lead",
+    "forward",
+    "shift"
 )
 
 
@@ -80,6 +99,23 @@ def _check_forbidden_columns(df: pd.DataFrame):
 
 
 ########################################################
+# FEATURE LOCK (VERY IMPORTANT)
+########################################################
+
+def _feature_lock_hash():
+
+    canonical = json.dumps(
+        MODEL_FEATURES,
+        separators=(",", ":")
+    )
+
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+FEATURE_LOCK_HASH = _feature_lock_hash()
+
+
+########################################################
 # VALIDATOR
 ########################################################
 
@@ -92,13 +128,14 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         raise RuntimeError("Duplicate columns detected.")
 
     ####################################################
-    # HARD ORDER CHECK
+    # HARD ORDER + COUNT CHECK
     ####################################################
 
     if tuple(df.columns) != MODEL_FEATURES:
-        raise RuntimeError(
-            "Feature order drift detected."
-        )
+        raise RuntimeError("Feature order drift detected.")
+
+    if len(df.columns) != FEATURE_COUNT:
+        raise RuntimeError("Feature count mismatch detected.")
 
     _check_forbidden_columns(df)
 
@@ -215,7 +252,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 
 ########################################################
-# SCHEMA SIGNATURE
+# SCHEMA SIGNATURE (UPGRADED)
 ########################################################
 
 def get_schema_signature() -> str:
@@ -226,6 +263,7 @@ def get_schema_signature() -> str:
     )
 
     raw_parts = [
+        FEATURE_LOCK_HASH,   # ⭐ strongest anchor
         "|".join(MODEL_FEATURES),
         f"dtype={DTYPE}",
         f"nan_feature={MAX_NAN_RATIO_PER_FEATURE}",
@@ -233,8 +271,7 @@ def get_schema_signature() -> str:
         f"limits={canonical_limits}",
         f"abs_limit={ABSOLUTE_FEATURE_LIMIT}",
         f"variance_floor={MIN_VARIANCE}",
-        f"count={len(MODEL_FEATURES)}",
-        f"numeric_hash={hashlib.sha256(str(sorted(NUMERIC_FEATURES)).encode()).hexdigest()}",
+        f"count={FEATURE_COUNT}",
         f"forbidden={','.join(sorted(FORBIDDEN_PATTERNS))}",
         f"version={SCHEMA_VERSION}"
     ]
