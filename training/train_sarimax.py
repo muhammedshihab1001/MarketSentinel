@@ -12,7 +12,7 @@ from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
 from core.time.market_time import MarketTime
-from core.market.universe import MarketUniverse   # ⭐ CRITICAL
+from core.market.universe import MarketUniverse
 
 from models.sarimax_model import SarimaxModel
 
@@ -23,7 +23,10 @@ TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 MIN_DATA_ROWS = 700
+MIN_UNIVERSE = 5
 VOL_FLOOR = 1e-4
+VAR_FLOOR = 1e-8
+
 SEED = 42
 
 
@@ -37,13 +40,12 @@ def enforce_determinism():
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
-    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 
     np.random.seed(SEED)
 
 
 ########################################################
-# FSYNC DIRECTORY
+# FSYNC
 ########################################################
 
 def _fsync_dir(directory):
@@ -62,7 +64,7 @@ def _fsync_dir(directory):
 # ATOMIC SAVE
 ########################################################
 
-def save_model_atomic(model: SarimaxModel, path: str) -> None:
+def save_model_atomic(model: SarimaxModel, path: str):
 
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
@@ -72,7 +74,6 @@ def save_model_atomic(model: SarimaxModel, path: str) -> None:
     joblib.dump(model, tmp_path)
 
     os.replace(tmp_path, path)
-
     _fsync_dir(directory)
 
     if not os.path.exists(path):
@@ -80,15 +81,20 @@ def save_model_atomic(model: SarimaxModel, path: str) -> None:
 
 
 ########################################################
-# SAFE STATIONARITY CHECK
+# HARD STATIONARITY CHECK
 ########################################################
 
 def assert_stationary(series: pd.Series):
 
-    if not np.isfinite(series).all():
-        raise RuntimeError("Non-finite values detected before ADF test.")
+    series = series.dropna()
 
-    result = adfuller(series.dropna())
+    if len(series) < 200:
+        raise RuntimeError("Series too short for stationarity test.")
+
+    if series.var() < VAR_FLOOR:
+        raise RuntimeError("Variance collapsed — unusable series.")
+
+    result = adfuller(series)
 
     p_value = result[1]
 
@@ -102,21 +108,21 @@ def assert_stationary(series: pd.Series):
 
 
 ########################################################
-# LOAD DATA — CLOCK + UNIVERSE GOVERNED
+# LOAD DATA — GOVERNED
 ########################################################
 
 def load_training_data(
     start_date: str,
     end_date: str
-) -> Tuple[Dict[str, object], str]:
+) -> Tuple[Dict[str, pd.DataFrame], list]:
 
     fetcher = StockPriceFetcher()
-
     universe = MarketUniverse.get_universe()
 
-    print(f"SARIMAX training universe size: {len(universe)}")
+    print(f"SARIMAX universe size: {len(universe)}")
 
     datasets = {}
+    surviving = []
 
     for ticker in universe:
 
@@ -126,27 +132,32 @@ def load_training_data(
             end_date=end_date
         )
 
-        if df is None or df.empty or len(df) < MIN_DATA_ROWS:
+        if df is None or len(df) < MIN_DATA_ROWS:
             continue
 
         df = df[["date", "close"]].copy()
 
-        if (df["close"] <= 0).any():
-            raise RuntimeError(f"{ticker} contains non-positive prices.")
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
 
-        log_returns = np.log(df["close"]).diff().dropna()
+        if df["close"].isna().any():
+            continue
+
+        if (df["close"] <= 0).any():
+            continue
+
+        log_returns = np.log(df["close"]).diff()
 
         assert_stationary(log_returns)
 
         datasets[ticker] = df
+        surviving.append(ticker)
 
-    # 🚨 collapse protection
-    if len(datasets) < 5:
+    if len(datasets) < MIN_UNIVERSE:
         raise RuntimeError(
             "Universe collapse — too few assets survived."
         )
 
-    return datasets, end_date
+    return datasets, surviving
 
 
 ########################################################
@@ -155,15 +166,11 @@ def load_training_data(
 
 def score_model(metrics):
 
-    slope = metrics["normalized_slope"]
+    slope = float(metrics["normalized_slope"])
+    vol = max(float(metrics["forecast_volatility"]), VOL_FLOOR)
 
-    if not np.isfinite(slope):
-        raise RuntimeError("Invalid slope produced.")
-
-    vol = max(metrics["forecast_volatility"], VOL_FLOOR)
-
-    if not np.isfinite(vol):
-        raise RuntimeError("Invalid volatility produced.")
+    if not np.isfinite(slope) or not np.isfinite(vol):
+        raise RuntimeError("Invalid forecast metrics.")
 
     return abs(slope) / vol
 
@@ -174,7 +181,7 @@ def score_model(metrics):
 
 def train_champion(start_date, end_date):
 
-    datasets, _ = load_training_data(start_date, end_date)
+    datasets, surviving = load_training_data(start_date, end_date)
 
     best_model = None
     best_score = -np.inf
@@ -203,6 +210,7 @@ def train_champion(start_date, end_date):
                 best_metrics = metrics
 
         except Exception as exc:
+
             msg = f"{ticker} rejected: {str(exc)}"
             rejection_log.append(msg)
             print(msg)
@@ -228,15 +236,12 @@ def train_champion(start_date, end_date):
         training_start=start_date,
         training_end=end_date,
         dataset_hash=dataset_hash,
-        metadata_type="training_manifest_v1",
+        metadata_type="timeseries_manifest_v1",
         extra_fields={
             "model_type": "SARIMAX",
             "parameters": best_model.get_params(),
-            "training_window": {
-                "start": start_date,
-                "end": end_date
-            },
-            "training_universe": MarketUniverse.get_universe()
+            "training_universe": surviving,
+            "universe_hash": MetadataManager.hash_list(surviving)
         }
     )
 
@@ -244,7 +249,7 @@ def train_champion(start_date, end_date):
 
 
 ########################################################
-# MAIN — INSTITUTIONAL CLOCK
+# MAIN — MODEL GOVERNED CLOCK
 ########################################################
 
 def main(start_date=None, end_date=None):
@@ -252,7 +257,7 @@ def main(start_date=None, end_date=None):
     enforce_determinism()
 
     if start_date is None or end_date is None:
-        start_date, end_date = MarketTime.training_window()
+        start_date, end_date = MarketTime.window_for("sarimax")
 
     print(
         f"Institutional SARIMAX Training | {start_date} -> {end_date}"
