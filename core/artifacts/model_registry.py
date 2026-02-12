@@ -43,31 +43,7 @@ class ModelRegistry:
     ########################################################
 
     @staticmethod
-    def _hash_directory(path: str) -> str:
-
-        hasher = hashlib.sha256()
-
-        for root, dirs, files in os.walk(path):
-            dirs.sort()
-            files.sort()
-
-            for f in files:
-                file_path = os.path.join(root, f)
-
-                rel = os.path.relpath(file_path, path)
-                hasher.update(rel.encode())
-
-                with open(file_path, "rb") as fh:
-                    for chunk in iter(lambda: fh.read(1 << 20), b""):
-                        hasher.update(chunk)
-
-        return hasher.hexdigest()
-
-    @staticmethod
     def _sha256(path: str) -> str:
-
-        if os.path.isdir(path):
-            return ModelRegistry._hash_directory(path)
 
         h = hashlib.sha256()
 
@@ -94,7 +70,7 @@ class ModelRegistry:
             os.close(fd)
 
     ########################################################
-    # ATOMIC JSON WRITE
+    # ATOMIC JSON
     ########################################################
 
     @staticmethod
@@ -111,6 +87,50 @@ class ModelRegistry:
 
         parent = os.path.dirname(path) or "."
         ModelRegistry._fsync_dir(parent)
+
+    ########################################################
+    # LOCK (TRUE ATOMIC)
+    ########################################################
+
+    @staticmethod
+    def _acquire_lock(lock_path: str):
+
+        try:
+            fd = os.open(
+                lock_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            )
+            os.close(fd)
+
+        except FileExistsError:
+            raise RuntimeError(
+                "Registry promotion already in progress."
+            )
+
+    ########################################################
+
+    @staticmethod
+    def _release_lock(lock_path: str):
+
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+
+    ########################################################
+    # MANIFEST HASH
+    ########################################################
+
+    @staticmethod
+    def _manifest_hash(manifest: dict) -> str:
+
+        clone = dict(manifest)
+        clone.pop("manifest_integrity_hash", None)
+
+        canonical = json.dumps(
+            clone,
+            sort_keys=True
+        ).encode()
+
+        return hashlib.sha256(canonical).hexdigest()
 
     ########################################################
     # METADATA VALIDATION
@@ -135,29 +155,10 @@ class ModelRegistry:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Schema mismatch detected.")
 
-        metadata_type = meta.get("metadata_type")
-
-        if metadata_type in ("tabular", "tabular_model"):
-
-            if meta["features"] != list(MODEL_FEATURES):
-                raise RuntimeError("Feature ordering mismatch.")
+        if meta["features"] != list(MODEL_FEATURES):
+            raise RuntimeError("Feature ordering mismatch.")
 
         return meta
-
-    ########################################################
-    # SAFE COPY
-    ########################################################
-
-    @staticmethod
-    def _copy_artifact(src: str, dst: str):
-
-        if not os.path.exists(src):
-            raise RuntimeError(f"Artifact missing before copy: {src}")
-
-        if os.path.isdir(src):
-            shutil.copytree(src, dst)
-        else:
-            shutil.copy2(src, dst)
 
     ########################################################
     # VERIFY ARTIFACTS
@@ -174,13 +175,15 @@ class ModelRegistry:
         )
 
         if not os.path.exists(manifest_path):
-            raise RuntimeError("Manifest missing during verification.")
+            raise RuntimeError("Manifest missing.")
 
         with open(manifest_path) as f:
             manifest = json.load(f)
 
-        if not manifest.get("artifacts"):
-            raise RuntimeError("Manifest contains no artifacts.")
+        if manifest["manifest_integrity_hash"] != (
+            ModelRegistry._manifest_hash(manifest)
+        ):
+            raise RuntimeError("Manifest integrity failure.")
 
         for artifact, expected_hash in manifest["artifacts"].items():
 
@@ -227,8 +230,8 @@ class ModelRegistry:
             staged_model = os.path.join(staging_dir, model_name)
             staged_meta = os.path.join(staging_dir, metadata_name)
 
-            ModelRegistry._copy_artifact(model_path, staged_model)
-            ModelRegistry._copy_artifact(metadata_path, staged_meta)
+            shutil.copy2(model_path, staged_model)
+            shutil.copy2(metadata_path, staged_meta)
 
             manifest: Dict[str, Any] = {
                 "version": version,
@@ -244,24 +247,68 @@ class ModelRegistry:
                 "history": []
             }
 
+            manifest["manifest_integrity_hash"] = (
+                ModelRegistry._manifest_hash(manifest)
+            )
+
             manifest_path = os.path.join(
                 staging_dir,
                 ModelRegistry.MANIFEST_NAME
             )
 
-            ModelRegistry._atomic_json_write(manifest_path, manifest)
+            ModelRegistry._atomic_json_write(
+                manifest_path,
+                manifest
+            )
 
             os.replace(staging_dir, version_dir)
+
             ModelRegistry._fsync_dir(base_dir)
+            ModelRegistry._fsync_dir(version_dir)
 
             ModelRegistry.verify_artifacts(base_dir, version)
 
             return version
 
         except Exception:
+
             if os.path.exists(staging_dir):
                 shutil.rmtree(staging_dir, ignore_errors=True)
+
             raise
+
+    ########################################################
+    # SELF HEAL POINTER
+    ########################################################
+
+    @staticmethod
+    def _self_heal_pointer(base_dir: str) -> str:
+
+        versions = ModelRegistry.list_versions(base_dir)
+
+        if not versions:
+            raise RuntimeError("Registry empty.")
+
+        latest = versions[-1]
+
+        pointer = {
+            "version": latest,
+            "healed": True,
+            "timestamp": datetime.datetime.utcnow().isoformat()
+        }
+
+        pointer["pointer_hash"] = hashlib.sha256(
+            json.dumps(pointer, sort_keys=True).encode()
+        ).hexdigest()
+
+        pointer_path = os.path.join(
+            base_dir,
+            ModelRegistry.LATEST_POINTER
+        )
+
+        ModelRegistry._atomic_json_write(pointer_path, pointer)
+
+        return latest
 
     ########################################################
     # PROMOTION
@@ -272,23 +319,25 @@ class ModelRegistry:
 
         lock_path = os.path.join(base_dir, ModelRegistry.PROMOTION_LOCK)
 
-        if os.path.exists(lock_path):
-            raise RuntimeError("Registry promotion already in progress.")
-
-        version_dir = os.path.join(base_dir, version)
-
-        if not os.path.exists(version_dir):
-            raise RuntimeError("Cannot promote missing version.")
-
-        ModelRegistry.verify_artifacts(base_dir, version)
+        ModelRegistry._acquire_lock(lock_path)
 
         try:
-            open(lock_path, "w").close()
+
+            version_dir = os.path.join(base_dir, version)
+
+            if not os.path.exists(version_dir):
+                raise RuntimeError("Cannot promote missing version.")
+
+            ModelRegistry.verify_artifacts(base_dir, version)
 
             pointer = {
                 "version": version,
                 "promoted_utc": datetime.datetime.utcnow().isoformat()
             }
+
+            pointer["pointer_hash"] = hashlib.sha256(
+                json.dumps(pointer, sort_keys=True).encode()
+            ).hexdigest()
 
             pointer_path = os.path.join(
                 base_dir,
@@ -298,11 +347,10 @@ class ModelRegistry:
             ModelRegistry._atomic_json_write(pointer_path, pointer)
 
         finally:
-            if os.path.exists(lock_path):
-                os.remove(lock_path)
+            ModelRegistry._release_lock(lock_path)
 
     ########################################################
-    # REGISTRY INTROSPECTION
+    # GET LATEST (SELF HEALING)
     ########################################################
 
     @staticmethod
@@ -314,39 +362,33 @@ class ModelRegistry:
         )
 
         if not os.path.exists(pointer_path):
-            raise RuntimeError(
-                "Latest pointer missing — registry uninitialized."
-            )
+            return ModelRegistry._self_heal_pointer(base_dir)
 
-        with open(pointer_path) as f:
-            payload = json.load(f)
+        try:
 
-        version = payload.get("version")
+            with open(pointer_path) as f:
+                payload = json.load(f)
 
-        if not version:
-            raise RuntimeError("Latest pointer corrupted.")
+            expected = payload.get("pointer_hash")
 
-        return version
+            clone = dict(payload)
+            clone.pop("pointer_hash", None)
+
+            actual = hashlib.sha256(
+                json.dumps(clone, sort_keys=True).encode()
+            ).hexdigest()
+
+            if expected != actual:
+                raise RuntimeError("Pointer corrupted.")
+
+            return payload["version"]
+
+        except Exception:
+
+            return ModelRegistry._self_heal_pointer(base_dir)
 
     ########################################################
-
-    @staticmethod
-    def load_manifest(base_dir: str, version: str) -> Dict[str, Any]:
-
-        manifest_path = os.path.join(
-            base_dir,
-            version,
-            ModelRegistry.MANIFEST_NAME
-        )
-
-        if not os.path.exists(manifest_path):
-            raise RuntimeError(
-                f"Manifest missing for version {version}"
-            )
-
-        with open(manifest_path) as f:
-            return json.load(f)
-
+    # LIST
     ########################################################
 
     @staticmethod
