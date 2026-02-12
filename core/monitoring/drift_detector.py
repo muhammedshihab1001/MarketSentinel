@@ -15,7 +15,6 @@ from core.schema.feature_schema import (
 
 logger = logging.getLogger("marketsentinel.drift")
 
-
 try:
     from app.monitoring.metrics import DRIFT_DETECTED
 except Exception:
@@ -36,6 +35,8 @@ class DriftDetector:
     VARIANCE_RATIO_UPPER = 2.5
     VARIANCE_RATIO_LOWER = 0.4
 
+    MAX_INFERENCE_ROWS = 500
+
     EPSILON = 1e-6
 
     def __init__(self, z_threshold: float = 3.0):
@@ -53,6 +54,10 @@ class DriftDetector:
             os.fsync(f.fileno())
 
         os.replace(tmp, path)
+
+        dir_fd = os.open(os.path.dirname(path), os.O_DIRECTORY)
+        os.fsync(dir_fd)
+        os.close(dir_fd)
 
     def _safe_feature_block(self, dataset: pd.DataFrame):
 
@@ -213,7 +218,13 @@ class DriftDetector:
                 logger.warning("Drift skipped — empty dataset.")
                 return {"drift_detected": False, "details": {}}
 
+            if get_schema_signature() is None:
+                raise RuntimeError("Schema signature unavailable.")
+
             baseline = self._load_baseline()
+
+            dataset = dataset.tail(self.MAX_INFERENCE_ROWS)
+
             numeric = self._safe_feature_block(dataset)
 
             drift_detected = False
@@ -267,7 +278,6 @@ class DriftDetector:
                     "variance_shift": bool(variance_shift),
                     "min_breach": bool(min_breach),
                     "max_breach": bool(max_breach),
-                    "range_violation": bool(min_breach or max_breach),
                     "z_score": float(z_score),
                     "variance_ratio": float(variance_ratio)
                 }
