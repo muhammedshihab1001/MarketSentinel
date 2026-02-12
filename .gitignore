@@ -16,37 +16,44 @@ Include/
 Scripts/
 site-packages/
 
-.env
 .python-version
 
 
 ########################################################
-# JUPYTER / NOTEBOOKS
+# ENV — NEVER COMMIT SECRETS
+########################################################
+
+.env*
+!.env.example
+
+
+########################################################
+# JUPYTER
 ########################################################
 
 .ipynb_checkpoints/
 
 
 ########################################################
-# DATA (CRITICAL FOR ML PROJECTS)
+# DATA — NEVER COMMIT MARKET DATA
 ########################################################
 
-# Raw / processed datasets
 data/raw/
 data/processed/
-
-# VERY IMPORTANT — market cache
 data/cache/
-
-# Feature store cache
 data/features/
+data/news_cache/
+data/sentiment_cache/
 
-# News raw feeds
-data/news_raw/
+# Block datasets ANYWHERE in repo
+**/*.csv
+**/*.parquet
+**/*.feather
+**/*.hdf5
 
 
 ########################################################
-# MODEL ARTIFACTS
+# MODEL BINARIES (GLOBAL BLOCK)
 ########################################################
 
 *.pkl
@@ -54,11 +61,30 @@ data/news_raw/
 *.h5
 *.pt
 *.onnx
+*.keras
 
-# Ignore ALL registry artifacts
-artifacts/**
 
-# Keep directory tree
+########################################################
+# ARTIFACT GOVERNANCE
+########################################################
+
+# Block ALL heavy artifacts
+artifacts/**/model*
+artifacts/**/*.pkl
+artifacts/**/*.joblib
+artifacts/**/*.keras
+artifacts/**/*.pt
+artifacts/**/*.onnx
+
+# Feature store + training runs
+artifacts/feature_store/
+artifacts/training_runs/
+
+# Allow governance files ONLY
+!artifacts/**/manifest.json
+!artifacts/latest.json
+
+# Keep directory structure
 !artifacts/.keep
 !artifacts/**/.keep
 
@@ -81,6 +107,24 @@ logs/
 
 
 ########################################################
+# TORCH / TENSORFLOW
+########################################################
+
+runs/
+wandb/
+lightning_logs/
+
+
+########################################################
+# TESTING
+########################################################
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+
+########################################################
 # OS / EDITOR
 ########################################################
 
@@ -91,12 +135,17 @@ Thumbs.db
 
 
 ########################################################
-# BUILD / DOCKER
+# BUILD
 ########################################################
 
 dist/
 build/
 *.egg-info/
+
+
+########################################################
+# DOCKER
+########################################################
 
 docker-compose.override.yml
 
