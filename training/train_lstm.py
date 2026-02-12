@@ -22,7 +22,7 @@ TEMP_SCALER_PATH = f"{MODEL_DIR}/scalers.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 LOOKBACK_WINDOW = 60
-EPOCHS = 30
+EPOCHS = 12
 BATCH_SIZE = 32
 
 MIN_ROWS_PER_TICKER = 800
@@ -38,18 +38,30 @@ TRAINING_TICKERS = [
 
 
 ############################################
+# RUNTIME CONFIG
+############################################
 
-def set_seeds():
-
-    os.environ["TF_DETERMINISTIC_OPS"] = "1"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+def configure_runtime():
 
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
 
-    tf.config.set_visible_devices([], "GPU")
-    tf.config.threading.set_intra_op_parallelism_threads(1)
-    tf.config.threading.set_inter_op_parallelism_threads(1)
+    gpus = tf.config.list_physical_devices("GPU")
+
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+
+            tf.keras.mixed_precision.set_global_policy("mixed_float16")
+
+            print("GPU detected — mixed precision enabled.")
+
+        except Exception:
+            print("GPU detected but configuration failed. Using default settings.")
+
+    else:
+        print("Running on CPU.")
 
 
 ############################################
@@ -106,8 +118,6 @@ def load_data():
 
 
 ############################################
-# SAFE SEQUENCE BUILDER
-############################################
 
 def build_sequences(df):
 
@@ -125,7 +135,6 @@ def build_sequences(df):
         scalers[ticker] = scaler
 
         for i in range(len(scaled) - LOOKBACK_WINDOW):
-
             X_all.append(scaled[i:i+LOOKBACK_WINDOW])
             y_all.append(scaled[i+LOOKBACK_WINDOW])
 
@@ -135,8 +144,6 @@ def build_sequences(df):
     return np.array(X_all), np.array(y_all), scalers
 
 
-############################################
-# SIMPLE TIME SERIES VALIDATION
 ############################################
 
 def time_series_validation(df):
@@ -153,7 +160,7 @@ def time_series_validation(df):
 
     early = EarlyStopping(
         monitor="val_loss",
-        patience=5,
+        patience=3,
         restore_best_weights=True
     )
 
@@ -178,7 +185,7 @@ if __name__ == "__main__":
 
     print("Institutional LSTM Training")
 
-    set_seeds()
+    configure_runtime()
 
     df, end_date = load_data()
 
