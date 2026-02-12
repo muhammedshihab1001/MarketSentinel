@@ -14,27 +14,27 @@ from core.risk.position_sizer import PositionSizer
 class SignalConfig:
 
     prob_threshold: float = float(
-        os.getenv("PROB_THRESHOLD", "0.62")
+        os.getenv("PROB_THRESHOLD", "0.60")
     )
 
     sentiment_threshold: float = float(
-        os.getenv("SENTIMENT_THRESHOLD", "0.12")
+        os.getenv("SENTIMENT_THRESHOLD", "0.10")
     )
 
     volatility_cap: float = float(
-        os.getenv("VOL_CAP", "0.05")
+        os.getenv("VOL_CAP", "0.06")
     )
 
     volatility_throttle: float = float(
-        os.getenv("VOL_THROTTLE", "0.035")
+        os.getenv("VOL_THROTTLE", "0.04")
     )
 
-    min_expected_return: float = float(
-        os.getenv("MIN_EXPECTED_RETURN", "0.025")
+    min_risk_adjusted_return: float = float(
+        os.getenv("MIN_RAR", "0.40")
     )
 
     min_confidence: float = float(
-        os.getenv("MIN_CONFIDENCE", "0.30")
+        os.getenv("MIN_CONFIDENCE", "0.35")
     )
 
     portfolio_value: float = float(
@@ -43,10 +43,6 @@ class SignalConfig:
 
     max_position_pct: float = float(
         os.getenv("MAX_POSITION_PCT", "0.08")
-    )
-
-    max_total_exposure_pct: float = float(
-        os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.35")
     )
 
     global_kill_switch: bool = (
@@ -70,44 +66,44 @@ def _clamp(v, lo, hi):
 
 
 # ---------------------------------------------------
-# FORECAST INTERPRETER
+# FORECAST INTERPRETER (UPGRADED)
 # ---------------------------------------------------
 
 class ForecastInterpreter:
-    """
-    Converts model output into normalized conviction.
-    """
 
     def interpret(
         self,
         predicted_return: float,
         sentiment: float,
         rsi: float,
-        volatility: float
+        volatility: float,
+        prob_up: float
     ) -> Tuple[str, float]:
 
         predicted_return = _safe(predicted_return)
         sentiment = _safe(sentiment)
         rsi = _safe(rsi, 50)
-        volatility = _safe(volatility)
+        volatility = max(_safe(volatility, 0.02), 1e-6)
+        prob_up = _safe(prob_up, 0.5)
 
-        rsi_component = math.tanh(abs(50 - rsi) / 25)
+        # 🔥 Risk-adjusted return (Sharpe-lite)
+        rar = predicted_return / volatility
 
-        base_confidence = (
-            abs(predicted_return) * 0.45 +
-            abs(sentiment) * 0.25 +
-            rsi_component * 0.15
+        rsi_edge = abs(50 - rsi) / 50
+
+        confidence = (
+            prob_up * 0.55 +
+            math.tanh(abs(rar)) * 0.25 +
+            abs(sentiment) * 0.10 +
+            rsi_edge * 0.10
         )
-
-        vol_penalty = min(volatility / 0.05, 1.0)
-        confidence = base_confidence * (1 - 0.4 * vol_penalty)
 
         confidence = _clamp(confidence, 0.0, 1.0)
 
-        if predicted_return > 0.025 and sentiment > 0 and rsi < 72:
+        if rar > 0.4 and prob_up > 0.55:
             return "BUY", round(confidence, 3)
 
-        if predicted_return < -0.025 and sentiment < 0:
+        if rar < -0.4 and prob_up < 0.45:
             return "SELL", round(confidence, 3)
 
         return "HOLD", round(confidence, 3)
@@ -150,7 +146,7 @@ class RiskGate:
 
 
 # ---------------------------------------------------
-# ENSEMBLE ARBITER
+# ENSEMBLE — NOW NON-DESTRUCTIVE
 # ---------------------------------------------------
 
 class EnsembleArbiter:
@@ -164,10 +160,9 @@ class EnsembleArbiter:
         config: SignalConfig
     ) -> str:
 
-        prob_up = _safe(prob_up, 0.5)
-
+        # fallback to base signal if secondary models unavailable
         if not lstm_prices or len(lstm_prices) < 2:
-            return "HOLD"
+            return base_signal
 
         first = max(_safe(lstm_prices[0], 1e-6), 1e-6)
         last = _safe(lstm_prices[-1], first)
@@ -178,24 +173,22 @@ class EnsembleArbiter:
         if (
             base_signal == "BUY"
             and trend == "BULLISH"
-            and expected_return > config.min_expected_return
-            and prob_up >= config.prob_threshold
+            and expected_return > config.min_risk_adjusted_return * 0.02
         ):
             return "BUY"
 
         if (
             base_signal == "SELL"
             and trend == "BEARISH"
-            and expected_return < -config.min_expected_return
-            and prob_up <= (1 - config.prob_threshold)
+            and expected_return < -config.min_risk_adjusted_return * 0.02
         ):
             return "SELL"
 
-        return "HOLD"
+        return base_signal
 
 
 # ---------------------------------------------------
-# MASTER DECISION ENGINE
+# MASTER ENGINE
 # ---------------------------------------------------
 
 class DecisionEngine:
@@ -228,7 +221,8 @@ class DecisionEngine:
             predicted_return,
             sentiment,
             rsi,
-            volatility
+            volatility,
+            prob_up
         )
 
         if confidence < self.config.min_confidence:
@@ -253,16 +247,9 @@ class DecisionEngine:
         if final_signal == "HOLD":
             return self._hold(confidence)
 
-        vol_scale = 1.0
-        if volatility > self.config.volatility_throttle:
-            vol_scale = max(
-                0.25,
-                1 - (volatility / 0.10)
-            )
-
         allocation = self.position_sizer.size_position(
             signal=final_signal,
-            confidence=confidence * vol_scale,
+            confidence=confidence,
             volatility=volatility,
             portfolio_value=self.config.portfolio_value
         )
@@ -291,52 +278,3 @@ class DecisionEngine:
             "allocation": 0.0,
             "position_pct": 0.0
         }
-
-
-# ===================================================
-# STRATEGY ENGINE
-# ===================================================
-
-class StrategyEngine:
-
-    def top_opportunities(
-        self,
-        predictions: List[Dict],
-        top_k: int = 5
-    ):
-
-        buys = [
-            p for p in predictions
-            if p.get("signal_today") == "BUY"
-        ]
-
-        buys.sort(
-            key=lambda x: x.get("confidence", 0),
-            reverse=True
-        )
-
-        return buys[:top_k]
-
-    def sell_alerts(
-        self,
-        predictions: List[Dict]
-    ):
-
-        return [
-            p for p in predictions
-            if p.get("signal_today") == "SELL"
-            and p.get("confidence", 0) > 0.65
-        ]
-
-    def signal_distribution(
-        self,
-        predictions: List[Dict]
-    ):
-
-        dist = {"BUY": 0, "SELL": 0, "HOLD": 0}
-
-        for p in predictions:
-            signal = p.get("signal_today", "HOLD")
-            dist[signal] += 1
-
-        return dist
