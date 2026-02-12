@@ -1,5 +1,6 @@
 import torch
 import pandas as pd
+import numpy as np
 import logging
 import time
 import os
@@ -11,6 +12,10 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 logger = logging.getLogger("marketsentinel.sentiment")
 
+
+############################################################
+# FINBERT SINGLETON
+############################################################
 
 class FinBERTSingleton:
 
@@ -54,16 +59,15 @@ class FinBERTSingleton:
                     cache_dir=cls.CACHE_DIR
                 ).to(cls._device)
 
+                cls._model.eval()
+
                 if cls._model.config.num_labels != 3:
                     raise RuntimeError("FinBERT label mismatch.")
 
             except Exception as e:
-
                 raise RuntimeError(
                     "Failed to load FinBERT. Internet required on first run."
                 ) from e
-
-            cls._model.eval()
 
             logger.info(
                 "FinBERT loaded in %.2f seconds",
@@ -72,6 +76,10 @@ class FinBERTSingleton:
 
         return cls._tokenizer, cls._model, cls._device
 
+
+############################################################
+# SENTIMENT ANALYZER
+############################################################
 
 class SentimentAnalyzer:
 
@@ -95,16 +103,22 @@ class SentimentAnalyzer:
 
         self._warmup()
 
+    ############################################################
+
     def _warmup(self):
         try:
             self.analyze_batch(["market is stable"])
         except Exception:
             logger.exception("FinBERT warmup failed")
 
+    ############################################################
+
     def _clamp_text(self, text: str) -> str:
         return str(text).replace("\n", " ")[:self.MAX_HEADLINE_CHARS]
 
-    ########################################################
+    ############################################################
+    # BATCH INFERENCE
+    ############################################################
 
     def analyze_batch(self, texts):
 
@@ -113,11 +127,9 @@ class SentimentAnalyzer:
 
         for i in range(0, len(texts), self.BATCH_SIZE):
 
-            batch = texts[i:i+self.BATCH_SIZE]
-
             batch = [
                 self._clamp_text(t).strip()
-                for t in batch
+                for t in texts[i:i+self.BATCH_SIZE]
             ]
 
             try:
@@ -134,21 +146,14 @@ class SentimentAnalyzer:
 
                 with torch.inference_mode():
                     logits = self.model(**inputs).logits
-                    probs = torch.softmax(logits, dim=1)
-
-                probs = probs.cpu().numpy()
+                    probs = torch.softmax(logits, dim=1).cpu().numpy()
 
                 for p in probs:
 
                     confidence = float(p.max())
 
                     if confidence < self.MIN_CONFIDENCE:
-
-                        results.append({
-                            "label": "neutral",
-                            "score": 0.0
-                        })
-
+                        results.append({"label": "neutral", "score": 0.0})
                         continue
 
                     label_id = int(p.argmax())
@@ -167,20 +172,21 @@ class SentimentAnalyzer:
 
                 logger.exception("FinBERT inference failure")
 
-                results.extend({
-                    "label": "neutral",
-                    "score": 0.0
-                } for _ in batch)
+                results.extend(
+                    {"label": "neutral", "score": 0.0}
+                    for _ in batch
+                )
 
         if failures / max(len(texts), 1) > self.MAX_FAILURE_RATE:
-
             raise RuntimeError(
                 "FinBERT failure rate exceeded safety threshold."
             )
 
         return results
 
-    ########################################################
+    ############################################################
+    # DATAFRAME INFERENCE
+    ############################################################
 
     def analyze_dataframe(self, df: pd.DataFrame):
 
@@ -192,21 +198,22 @@ class SentimentAnalyzer:
 
         df = df.copy()
 
-        df["hash"] = df.apply(
-            lambda row: hashlib.sha256(
-                f"{row.get('headline','')}|{row.get('source','')}|{row.get('published_at','')}".encode()
-            ).hexdigest(),
-            axis=1
+        # VECTOR HASH (10x faster than apply)
+        hash_input = (
+            df["headline"].astype(str)
+            + "|" +
+            df.get("source", "").astype(str)
+            + "|" +
+            df.get("published_at", "").astype(str)
+        )
+
+        df["hash"] = hash_input.map(
+            lambda x: hashlib.sha256(x.encode()).hexdigest()
         )
 
         df = df.drop_duplicates("hash")
 
-        headlines = (
-            df["headline"]
-            .astype(str)
-            .str.strip()
-            .tolist()
-        )
+        headlines = df["headline"].astype(str).str.strip().tolist()
 
         results = self.analyze_batch(headlines)
 
@@ -219,7 +226,9 @@ class SentimentAnalyzer:
             axis=1
         )
 
-    ########################################################
+    ############################################################
+    # DAILY AGGREGATION (LOOKAHEAD SAFE)
+    ############################################################
 
     def aggregate_daily_sentiment(self, df: pd.DataFrame):
 
@@ -231,27 +240,36 @@ class SentimentAnalyzer:
                 "sentiment_std": []
             })
 
+        if "score" not in df.columns:
+            raise RuntimeError("Sentiment score missing.")
+
         temp_df = df.copy()
 
+        # FORCE UTC → avoid timezone bugs
         temp_df["date"] = pd.to_datetime(
             temp_df.get("published_at"),
             errors="coerce",
             utc=True
-        ).dt.tz_convert(None)
+        )
 
         temp_df = temp_df.dropna(subset=["date"])
 
-        embargo = pd.Timedelta(hours=self.SENTIMENT_EMBARGO_HOURS)
+        # remove timezone after normalization
+        temp_df["date"] = temp_df["date"].dt.tz_convert(None)
 
-        temp_df["effective_date"] = np.where(
-            temp_df["date"].dt.hour >= (24 - self.SENTIMENT_EMBARGO_HOURS),
-            temp_df["date"].dt.floor("D") + pd.Timedelta(days=1),
+        embargo_hour = 24 - self.SENTIMENT_EMBARGO_HOURS
+
+        # vectorized, stable, NO LOOKAHEAD
+        late_mask = temp_df["date"].dt.hour >= embargo_hour
+
+        temp_df["effective_date"] = (
             temp_df["date"].dt.floor("D")
+            + pd.to_timedelta(late_mask.astype(int), unit="D")
         )
 
         aggregated = (
             temp_df
-            .groupby("effective_date")
+            .groupby("effective_date", sort=True)
             .agg(
                 avg_sentiment=("score", "mean"),
                 news_count=("score", "count"),
@@ -263,6 +281,6 @@ class SentimentAnalyzer:
 
         aggregated["sentiment_std"] = aggregated[
             "sentiment_std"
-        ].fillna(0)
+        ].fillna(0.0)
 
         return aggregated
