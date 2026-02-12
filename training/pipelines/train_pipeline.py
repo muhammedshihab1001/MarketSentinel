@@ -13,7 +13,17 @@ import numpy as np
 from training.train_xgboost import main as train_xgb
 from core.schema.feature_schema import get_schema_signature
 from core.artifacts.metadata_manager import MetadataManager
+from core.config.env_loader import init_env
 
+
+########################################################
+# LOGGING (VERY IMPORTANT)
+########################################################
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
 
 logger = logging.getLogger("marketsentinel.training")
 
@@ -21,7 +31,7 @@ RUNS_DIR = "artifacts/training_runs"
 
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
-MAX_REASONABLE_SHARPE = 8.0   # institutional sanity guard
+MAX_REASONABLE_SHARPE = 8.0
 
 GLOBAL_SEED = 42
 
@@ -33,16 +43,25 @@ GLOBAL_SEED = 42
 def enforce_determinism():
 
     os.environ["PYTHONHASHSEED"] = str(GLOBAL_SEED)
-
-    #  BLAS / OpenMP stability
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
-
-    # future-safe
     os.environ["TF_DETERMINISTIC_OPS"] = "1"
 
     random.seed(GLOBAL_SEED)
     np.random.seed(GLOBAL_SEED)
+
+    # Optional torch determinism
+    try:
+        import torch
+
+        torch.manual_seed(GLOBAL_SEED)
+        torch.cuda.manual_seed_all(GLOBAL_SEED)
+
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    except Exception:
+        pass
 
 
 ########################################################
@@ -62,7 +81,7 @@ def _fsync_dir(directory):
 
 
 ########################################################
-# GIT HASH (BEST EFFORT)
+# GIT HASH
 ########################################################
 
 def get_git_commit():
@@ -103,7 +122,7 @@ def save_manifest(run_id: str, manifest: dict):
 
 def validate_metrics(metrics: dict):
 
-    if not isinstance(metrics, dict):
+    if not isinstance(metrics, dict) or not metrics:
         raise RuntimeError("Training returned invalid metrics.")
 
     sharpe = metrics.get("avg_sharpe")
@@ -151,9 +170,10 @@ def build_lineage():
 
 def main():
 
+    # SAFE BOOTSTRAP ORDER
+    init_env()
     enforce_determinism()
 
-    #  microsecond-safe run id
     run_id = datetime.datetime.utcnow().strftime(
         "run_%Y_%m_%d_%H%M%S_%f"
     )
@@ -165,6 +185,9 @@ def main():
         logger.info("Starting XGBoost training...")
 
         metrics = train_xgb()
+
+        if metrics is None:
+            raise RuntimeError("Training returned None.")
 
         validate_metrics(metrics)
 
