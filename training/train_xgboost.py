@@ -25,6 +25,9 @@ from models.xgboost_model import (
     build_final_xgboost_model
 )
 
+#  NEW
+from core.time.market_time import MarketTime
+
 logger = logging.getLogger("marketsentinel.training")
 
 init_env()
@@ -51,7 +54,7 @@ MIN_NEWS_PER_DAY = 0.6
 
 
 ########################################################
-# ATOMIC SAVE (FSYNC SAFE)
+# ATOMIC SAVE
 ########################################################
 
 def _fsync_dir(directory):
@@ -76,7 +79,6 @@ def save_model_atomic(model, path):
         temp_name = tmp.name
 
     os.replace(temp_name, path)
-
     _fsync_dir(directory)
 
     if not os.path.exists(path):
@@ -84,16 +86,10 @@ def save_model_atomic(model, path):
 
 
 ########################################################
-# INSTITUTIONAL ENTITY QUERY (CRITICAL FIX)
+# NEWS QUERY
 ########################################################
 
-def build_news_query(ticker: str) -> str:
-    """
-    Entity-first retrieval strategy.
-
-    We maximize article recall and allow FinBERT
-    to filter semantic relevance.
-    """
+def build_news_query(ticker: str):
 
     COMPANY_MAP = {
         "AAPL": "Apple",
@@ -112,54 +108,28 @@ def build_news_query(ticker: str) -> str:
 
     name = COMPANY_MAP.get(ticker, ticker)
 
-    # Wide recall query
     return f'"{name}" OR "{ticker}" stock'
 
 
 ########################################################
-# SENTIMENT VALIDATION
+# DATA LOADER (TIME SAFE)
 ########################################################
 
-def validate_sentiment_signal(sentiment_df, ticker):
-
-    if sentiment_df.empty:
-        logger.warning("%s has no sentiment — skipping ticker.", ticker)
-        return False
-
-    std = sentiment_df["avg_sentiment"].std()
-    news_rate = sentiment_df["news_count"].mean()
-
-    logger.info(
-        "%s sentiment | std=%.4f | avg_news=%.2f",
-        ticker,
-        std,
-        news_rate
-    )
-
-    if std < MIN_SENTIMENT_STD:
-        sentiment_df["avg_sentiment"] *= 0.25
-
-    if news_rate < MIN_NEWS_PER_DAY:
-        sentiment_df["avg_sentiment"] *= 0.5
-
-    return True
-
-
-########################################################
-# DATA LOADER
-########################################################
-
-def load_training_data():
+def load_training_data(start_date, end_date):
 
     fetcher = StockPriceFetcher()
     news_fetcher = NewsFetcher()
     sentiment_analyzer = SentimentAnalyzer()
     engineer = FeatureEngineer()
 
-    end_date = datetime.date.today().isoformat()
-
     datasets = []
     surviving_tickers = []
+
+    logger.info(
+        "Training window | start=%s end=%s",
+        start_date,
+        end_date
+    )
 
     for ticker in TRAINING_TICKERS:
 
@@ -167,7 +137,7 @@ def load_training_data():
 
             price_df = fetcher.fetch(
                 ticker=ticker,
-                start_date="2016-01-01",
+                start_date=start_date,
                 end_date=end_date
             )
 
@@ -175,7 +145,7 @@ def load_training_data():
                 continue
 
             ################################################
-            # NEWS WITH EXPONENTIAL RETRY
+            # NEWS
             ################################################
 
             news_df = None
@@ -196,22 +166,10 @@ def load_training_data():
                 time.sleep(2 ** attempt)
 
             if news_df is None or news_df.empty:
-                logger.warning("%s news empty.", ticker)
                 continue
-
-            ################################################
-            # SENTIMENT
-            ################################################
 
             scored_df = sentiment_analyzer.analyze_dataframe(news_df)
             sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
-
-            if not validate_sentiment_signal(sentiment_df, ticker):
-                continue
-
-            ################################################
-            # FEATURES
-            ################################################
 
             dataset = engineer.build_feature_pipeline(
                 price_df,
@@ -243,64 +201,22 @@ def load_training_data():
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
-    return df, end_date
-
-
-########################################################
-# WALK FORWARD
-########################################################
-
-def train_model(train_df):
-
-    X = train_df.loc[:, MODEL_FEATURES]
-    y = train_df["target"]
-
-    model = build_xgboost_model(y)
-    model.fit(X, y)
-
-    return model
-
-
-def generate_signals(model, test_df):
-
-    probs = model.predict_proba(
-        test_df.loc[:, MODEL_FEATURES]
-    )[:, 1]
-
-    return ["BUY" if p > 0.58 else "HOLD" for p in probs]
-
-
-########################################################
-# FINAL TRAIN
-########################################################
-
-def train_full_model(df):
-
-    X = df.loc[:, MODEL_FEATURES]
-    y = df["target"]
-
-    model = build_final_xgboost_model(y)
-    model.fit(X, y)
-
-    importance = dict(
-        zip(MODEL_FEATURES, model.feature_importances_.tolist())
-    )
-
-    if len(importance) != len(MODEL_FEATURES):
-        raise RuntimeError("Feature importance mismatch.")
-
-    return model, importance
+    return df
 
 
 ########################################################
 # MAIN
 ########################################################
 
-def main():
+def main(start_date=None, end_date=None):
 
     logger.info("Institutional XGBoost Training")
 
-    df, end_date = load_training_data()
+    #  GLOBAL TIME FREEZE
+    if not start_date or not end_date:
+        start_date, end_date = MarketTime.training_window()
+
+    df = load_training_data(start_date, end_date)
 
     dataset_hash = MetadataManager.fingerprint_dataset(
         df[["ticker","date","target", *MODEL_FEATURES]]
@@ -315,8 +231,12 @@ def main():
     )
 
     wf = WalkForwardValidator(
-        model_trainer=train_model,
-        signal_generator=generate_signals
+        model_trainer=lambda d: build_xgboost_model(d["target"]).fit(
+            d.loc[:, MODEL_FEATURES], d["target"]
+        ),
+        signal_generator=lambda m, t:
+            ["BUY" if p > 0.58 else "HOLD"
+             for p in m.predict_proba(t.loc[:, MODEL_FEATURES])[:,1]]
     )
 
     strategy_metrics = wf.run(df)
@@ -332,7 +252,8 @@ def main():
     if strategy_metrics["max_drawdown"] < MAX_DRAWDOWN:
         raise RuntimeError("XGBoost rejected — drawdown too severe")
 
-    model, importance = train_full_model(df)
+    model = build_final_xgboost_model(df["target"])
+    model.fit(df.loc[:, MODEL_FEATURES], df["target"])
 
     save_model_atomic(model, TEMP_MODEL_PATH)
 
@@ -340,14 +261,11 @@ def main():
         model_name="xgboost_direction",
         metrics={**strategy_metrics},
         features=list(MODEL_FEATURES),
-        training_start="2016-01-01",
+        training_start=start_date,
         training_end=end_date,
         dataset_hash=dataset_hash,
         metadata_type="training_manifest_v1"
     )
-
-    metadata["feature_importance"] = importance
-    metadata["training_rows"] = len(df)
 
     MetadataManager.save_metadata(
         metadata,
