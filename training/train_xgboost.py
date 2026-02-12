@@ -37,10 +37,6 @@ MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 
 
-# ---------------------------------------------------
-# ATOMIC SAVE
-# ---------------------------------------------------
-
 def save_model_atomic(model, path):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -54,10 +50,6 @@ def save_model_atomic(model, path):
     if not os.path.exists(path):
         raise RuntimeError("Model write failed.")
 
-
-# ---------------------------------------------------
-# DATA LOADER
-# ---------------------------------------------------
 
 def load_training_data():
 
@@ -103,19 +95,19 @@ def load_training_data():
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError(f"Training aborted — dataset too small ({len(df)} rows)")
 
-    validated_features = validate_feature_schema(df)
+    feature_block = validate_feature_schema(df)
 
+    # KEEP close column for regime detector
     df = pd.concat(
-        [df[["date", "ticker", "target"]], validated_features],
+        [
+            df[["date", "ticker", "close", "target"]],
+            feature_block
+        ],
         axis=1
     )
 
     return df, end_date
 
-
-# ---------------------------------------------------
-# MODEL TRAINER (USED BY WALK FORWARD)
-# ---------------------------------------------------
 
 def train_model(train_df):
 
@@ -154,10 +146,6 @@ def generate_signals(model, test_df):
     ]
 
 
-# ---------------------------------------------------
-# FULL TRAIN
-# ---------------------------------------------------
-
 def train_full_model(df):
 
     X = df[list(MODEL_FEATURES)]
@@ -186,10 +174,6 @@ def train_full_model(df):
 
     return model, importance
 
-
-# ---------------------------------------------------
-# EXECUTION
-# ---------------------------------------------------
 
 if __name__ == "__main__":
 
@@ -225,7 +209,7 @@ if __name__ == "__main__":
         training_start="2016-01-01",
         training_end=end_date,
         dataset_hash=dataset_hash,
-        metadata_type="model"
+        metadata_type="tabular"
     )
 
     metadata["feature_importance"] = importance
