@@ -82,7 +82,7 @@ class ModelRegistry:
         return h.hexdigest()
 
     ########################################################
-    # FSYNC (SAFE ON LINUX, NO-OP ON WINDOWS)
+    # FSYNC
     ########################################################
 
     @staticmethod
@@ -117,25 +117,6 @@ class ModelRegistry:
         ModelRegistry._fsync_dir(parent)
 
     ########################################################
-    # MANIFEST VALIDATION
-    ########################################################
-
-    @staticmethod
-    def _validate_manifest(manifest: dict):
-
-        required = ["version", "stage", "artifacts", "history"]
-
-        for r in required:
-            if r not in manifest:
-                raise RuntimeError("Manifest corrupted.")
-
-        if not isinstance(manifest["artifacts"], dict):
-            raise RuntimeError("Manifest artifacts invalid.")
-
-        if not manifest["artifacts"]:
-            raise RuntimeError("Manifest contains no artifacts.")
-
-    ########################################################
     # METADATA VALIDATION
     ########################################################
 
@@ -160,11 +141,12 @@ class ModelRegistry:
 
         metadata_type = meta.get("metadata_type")
 
-        # Strict ordering ONLY for tabular models
         if metadata_type in ("tabular", "tabular_model"):
 
             if meta["features"] != list(MODEL_FEATURES):
                 raise RuntimeError("Feature ordering mismatch.")
+
+        return meta
 
     ########################################################
     # SAFE COPY
@@ -201,7 +183,8 @@ class ModelRegistry:
         with open(manifest_path) as f:
             manifest = json.load(f)
 
-        ModelRegistry._validate_manifest(manifest)
+        if not manifest["artifacts"]:
+            raise RuntimeError("Manifest contains no artifacts.")
 
         for artifact, expected_hash in manifest["artifacts"].items():
 
@@ -231,7 +214,7 @@ class ModelRegistry:
 
         os.makedirs(base_dir, exist_ok=True)
 
-        ModelRegistry._validate_metadata(metadata_path)
+        meta = ModelRegistry._validate_metadata(metadata_path)
 
         version = ModelRegistry._version()
 
@@ -256,6 +239,8 @@ class ModelRegistry:
                 "created_utc": datetime.datetime.utcnow().isoformat(),
                 "stage": "candidate",
                 "parent": parent_version,
+                "dataset_hash": meta["dataset_hash"],
+                "schema_signature": meta["schema_signature"],
                 "artifacts": {
                     model_name: ModelRegistry._sha256(staged_model),
                     metadata_name: ModelRegistry._sha256(staged_meta),
@@ -273,10 +258,48 @@ class ModelRegistry:
             os.replace(staging_dir, version_dir)
             ModelRegistry._fsync_dir(base_dir)
 
+            # critical verification step
+            ModelRegistry.verify_artifacts(base_dir, version)
+
             return version
 
         except Exception:
-            # Clean failed staging
             if os.path.exists(staging_dir):
                 shutil.rmtree(staging_dir, ignore_errors=True)
             raise
+
+    ########################################################
+    # PROMOTION (ATOMIC)
+    ########################################################
+
+    @staticmethod
+    def promote_to_latest(base_dir: str, version: str):
+
+        lock_path = os.path.join(base_dir, ModelRegistry.PROMOTION_LOCK)
+
+        if os.path.exists(lock_path):
+            raise RuntimeError("Registry promotion already in progress.")
+
+        version_dir = os.path.join(base_dir, version)
+
+        if not os.path.exists(version_dir):
+            raise RuntimeError("Cannot promote missing version.")
+
+        try:
+            open(lock_path, "w").close()
+
+            pointer = {
+                "version": version,
+                "promoted_utc": datetime.datetime.utcnow().isoformat()
+            }
+
+            pointer_path = os.path.join(
+                base_dir,
+                ModelRegistry.LATEST_POINTER
+            )
+
+            ModelRegistry._atomic_json_write(pointer_path, pointer)
+
+        finally:
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
