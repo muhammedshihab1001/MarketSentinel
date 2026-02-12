@@ -39,7 +39,7 @@ class ModelRegistry:
         return f"{ts}_{suffix}"
 
     ########################################################
-    # DIRECTORY HASH
+    # DIRECTORY HASH (DETERMINISTIC)
     ########################################################
 
     @staticmethod
@@ -47,12 +47,13 @@ class ModelRegistry:
 
         hasher = hashlib.sha256()
 
-        for root, _, files in os.walk(path):
-            for f in sorted(files):
+        for root, dirs, files in os.walk(path):
+            dirs.sort()
+            files.sort()
 
+            for f in files:
                 file_path = os.path.join(root, f)
 
-                # include relative path for deterministic hashing
                 rel = os.path.relpath(file_path, path)
                 hasher.update(rel.encode())
 
@@ -63,7 +64,7 @@ class ModelRegistry:
         return hasher.hexdigest()
 
     ########################################################
-    # FILE OR DIR HASH
+    # FILE OR DIRECTORY HASH
     ########################################################
 
     @staticmethod
@@ -81,22 +82,23 @@ class ModelRegistry:
         return h.hexdigest()
 
     ########################################################
-    # FSYNC (LINUX ONLY)
+    # FSYNC (SAFE ON LINUX, NO-OP ON WINDOWS)
     ########################################################
 
     @staticmethod
     def _fsync_dir(path: str):
 
-        # Windows does not support O_DIRECTORY
         if os.name == "nt":
             return
 
         fd = os.open(path, os.O_DIRECTORY)
-        os.fsync(fd)
-        os.close(fd)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     ########################################################
-    # ATOMIC JSON
+    # ATOMIC JSON WRITE
     ########################################################
 
     @staticmethod
@@ -134,7 +136,7 @@ class ModelRegistry:
             raise RuntimeError("Manifest contains no artifacts.")
 
     ########################################################
-    # METADATA VALIDATION (FIXED)
+    # METADATA VALIDATION
     ########################################################
 
     @staticmethod
@@ -158,8 +160,8 @@ class ModelRegistry:
 
         metadata_type = meta.get("metadata_type")
 
-        # ONLY enforce strict feature ordering for tabular models
-        if metadata_type == "tabular":
+        # Strict ordering ONLY for tabular models
+        if metadata_type in ("tabular", "tabular_model"):
 
             if meta["features"] != list(MODEL_FEATURES):
                 raise RuntimeError("Feature ordering mismatch.")
@@ -171,13 +173,16 @@ class ModelRegistry:
     @staticmethod
     def _copy_artifact(src: str, dst: str):
 
+        if not os.path.exists(src):
+            raise RuntimeError(f"Artifact missing before copy: {src}")
+
         if os.path.isdir(src):
             shutil.copytree(src, dst)
         else:
             shutil.copy2(src, dst)
 
     ########################################################
-    # VERIFY
+    # VERIFY ARTIFACTS
     ########################################################
 
     @staticmethod
@@ -213,7 +218,7 @@ class ModelRegistry:
                 )
 
     ########################################################
-    # REGISTER
+    # REGISTER MODEL
     ########################################################
 
     @staticmethod
@@ -235,35 +240,43 @@ class ModelRegistry:
 
         os.makedirs(staging_dir, exist_ok=False)
 
-        model_name = os.path.basename(model_path)
-        metadata_name = os.path.basename(metadata_path)
+        try:
 
-        staged_model = os.path.join(staging_dir, model_name)
-        staged_meta = os.path.join(staging_dir, metadata_name)
+            model_name = os.path.basename(model_path)
+            metadata_name = os.path.basename(metadata_path)
 
-        ModelRegistry._copy_artifact(model_path, staged_model)
-        ModelRegistry._copy_artifact(metadata_path, staged_meta)
+            staged_model = os.path.join(staging_dir, model_name)
+            staged_meta = os.path.join(staging_dir, metadata_name)
 
-        manifest: Dict[str, Any] = {
-            "version": version,
-            "created_utc": datetime.datetime.utcnow().isoformat(),
-            "stage": "candidate",
-            "parent": parent_version,
-            "artifacts": {
-                model_name: ModelRegistry._sha256(staged_model),
-                metadata_name: ModelRegistry._sha256(staged_meta),
-            },
-            "history": []
-        }
+            ModelRegistry._copy_artifact(model_path, staged_model)
+            ModelRegistry._copy_artifact(metadata_path, staged_meta)
 
-        manifest_path = os.path.join(
-            staging_dir,
-            ModelRegistry.MANIFEST_NAME
-        )
+            manifest: Dict[str, Any] = {
+                "version": version,
+                "created_utc": datetime.datetime.utcnow().isoformat(),
+                "stage": "candidate",
+                "parent": parent_version,
+                "artifacts": {
+                    model_name: ModelRegistry._sha256(staged_model),
+                    metadata_name: ModelRegistry._sha256(staged_meta),
+                },
+                "history": []
+            }
 
-        ModelRegistry._atomic_json_write(manifest_path, manifest)
+            manifest_path = os.path.join(
+                staging_dir,
+                ModelRegistry.MANIFEST_NAME
+            )
 
-        os.replace(staging_dir, version_dir)
-        ModelRegistry._fsync_dir(base_dir)
+            ModelRegistry._atomic_json_write(manifest_path, manifest)
 
-        return version
+            os.replace(staging_dir, version_dir)
+            ModelRegistry._fsync_dir(base_dir)
+
+            return version
+
+        except Exception:
+            # Clean failed staging
+            if os.path.exists(staging_dir):
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
