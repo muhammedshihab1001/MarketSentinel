@@ -27,7 +27,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "6.2"
+    BASELINE_VERSION = "6.3"
 
     MIN_SAMPLE_BASELINE = 50
     MIN_SAMPLE_INFERENCE = 20
@@ -43,8 +43,13 @@ class DriftDetector:
         self.z_threshold = z_threshold
         os.makedirs("artifacts/drift", exist_ok=True)
 
+    ########################################################
+
     @staticmethod
     def _atomic_write(path: str, payload: dict):
+
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
 
         tmp = path + ".tmp"
 
@@ -55,31 +60,60 @@ class DriftDetector:
 
         os.replace(tmp, path)
 
-        dir_fd = os.open(os.path.dirname(path), os.O_DIRECTORY)
-        os.fsync(dir_fd)
-        os.close(dir_fd)
+        if os.name != "nt":
+            fd = os.open(directory, os.O_DIRECTORY)
+            os.fsync(fd)
+            os.close(fd)
+
+    ########################################################
+    # STRICT FEATURE BLOCK
+    ########################################################
 
     def _safe_feature_block(self, dataset: pd.DataFrame):
 
         if dataset.columns.duplicated().any():
             raise RuntimeError("Duplicate columns detected in dataset.")
 
-        missing = set(MODEL_FEATURES) - set(dataset.columns)
+        incoming = set(dataset.columns)
+        expected = set(MODEL_FEATURES)
+
+        missing = expected - incoming
+        unknown = incoming - expected
 
         if missing:
             raise RuntimeError(
                 f"Drift detector schema violation. Missing={missing}"
             )
 
-        block = dataset.reindex(columns=MODEL_FEATURES).copy()
+        if unknown:
+            raise RuntimeError(
+                f"Unknown features detected in inference data: {unknown}"
+            )
+
+        block = dataset.loc[:, MODEL_FEATURES].copy(deep=True)
 
         for col in MODEL_FEATURES:
-            block[col] = pd.to_numeric(block[col], errors="coerce").astype(DTYPE)
 
-        if list(block.columns) != MODEL_FEATURES:
+            block[col] = pd.to_numeric(
+                block[col],
+                errors="coerce"
+            ).astype(DTYPE)
+
+            finite = np.isfinite(block[col])
+
+            if not finite.any():
+                raise RuntimeError(
+                    f"No finite values in feature '{col}'."
+                )
+
+        if list(block.columns) != list(MODEL_FEATURES):
             raise RuntimeError("Feature ordering enforcement failed.")
 
         return block
+
+    ########################################################
+    # STRUCTURAL HASH
+    ########################################################
 
     @staticmethod
     def _dataset_sha256(df: pd.DataFrame) -> str:
@@ -87,12 +121,20 @@ class DriftDetector:
         ordered = df.reindex(columns=sorted(df.columns)).copy()
         ordered = ordered.round(8)
 
+        hasher = hashlib.sha256()
+
+        hasher.update(",".join(ordered.columns).encode())
+
         hashed = pd.util.hash_pandas_object(
             ordered,
             index=False
         ).values
 
-        return hashlib.sha256(hashed.tobytes()).hexdigest()
+        hasher.update(hashed.tobytes())
+
+        return hasher.hexdigest()
+
+    ########################################################
 
     def _validate_baseline_structure(self, baseline: dict):
 
@@ -107,6 +149,8 @@ class DriftDetector:
                 raise RuntimeError(
                     f"Baseline missing feature stats: {feature}"
                 )
+
+    ########################################################
 
     def create_baseline(
         self,
@@ -186,6 +230,8 @@ class DriftDetector:
 
         logger.info("Drift baseline created.")
 
+    ########################################################
+
     def _load_baseline(self):
 
         if not os.path.exists(self.BASELINE_PATH):
@@ -210,6 +256,8 @@ class DriftDetector:
 
         return baseline
 
+    ########################################################
+
     def detect(self, dataset: pd.DataFrame):
 
         try:
@@ -217,9 +265,6 @@ class DriftDetector:
             if dataset.empty:
                 logger.warning("Drift skipped — empty dataset.")
                 return {"drift_detected": False, "details": {}}
-
-            if get_schema_signature() is None:
-                raise RuntimeError("Schema signature unavailable.")
 
             baseline = self._load_baseline()
 
@@ -289,10 +334,10 @@ class DriftDetector:
                 "details": drift_report
             }
 
-        except Exception:
+        except Exception as exc:
 
             logger.exception(
-                "Drift detector failure — forcing alert."
+                f"Drift detector failure — forcing alert. Root cause: {exc}"
             )
 
             DRIFT_DETECTED.set(1)
