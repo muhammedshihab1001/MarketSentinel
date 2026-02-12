@@ -30,6 +30,10 @@ class WalkForwardValidator:
         self.engine = PortfolioBacktestEngine()
         self.regime_detector = MarketRegimeDetector()
 
+    ############################################
+    # VALIDATION
+    ############################################
+
     def _validate_training_frame(self, df):
 
         if df["ticker"].nunique() < 3:
@@ -37,12 +41,23 @@ class WalkForwardValidator:
                 "Training universe too small. Cross-sectional learning unsafe."
             )
 
-        if not df["date"].is_monotonic_increasing:
+        expected = df.sort_values(["date", "ticker"]).index
+
+        if not expected.equals(df.index):
             raise RuntimeError(
-                "Training dataframe not sorted."
+                "Training dataframe not sorted by ['date','ticker']."
             )
 
         validate_feature_schema(df)
+
+        if df["target"].nunique() < 2:
+            raise RuntimeError(
+                "Training labels collapsed. No class diversity."
+            )
+
+    ############################################
+    # MODEL CHECKS
+    ############################################
 
     def _sanity_check_model(self, model, sample_df):
 
@@ -66,6 +81,10 @@ class WalkForwardValidator:
                 "Model unstable on unseen data."
             )
 
+    ############################################
+    # RUN
+    ############################################
+
     def run(self, df: pd.DataFrame):
 
         if "date" not in df.columns:
@@ -80,7 +99,19 @@ class WalkForwardValidator:
             ["date", "ticker"]
         ).reset_index(drop=True)
 
+        original_rows = len(df)
+
         df = self.regime_detector.detect(df)
+
+        if df.empty:
+            raise RuntimeError(
+                "All rows removed during regime detection."
+            )
+
+        if len(df) < original_rows * 0.6:
+            raise RuntimeError(
+                "Excessive data loss during regime detection."
+            )
 
         unique_dates = pd.to_datetime(
             df["date"].drop_duplicates()
@@ -101,7 +132,6 @@ class WalkForwardValidator:
         }
 
         capital = 10_000
-
         start_idx = self.window_size
 
         while start_idx < len(unique_dates):
@@ -124,8 +154,19 @@ class WalkForwardValidator:
             if len(test_dates) < 2:
                 break
 
-            train_df = df[df["date"].isin(train_dates)].copy()
-            test_df = df[df["date"].isin(test_dates)].copy()
+            train_df = df.loc[
+                df["date"].between(
+                    train_dates.iloc[0],
+                    train_dates.iloc[-1]
+                )
+            ].copy()
+
+            test_df = df.loc[
+                df["date"].between(
+                    test_dates.iloc[0],
+                    test_dates.iloc[-1]
+                )
+            ].copy()
 
             self._validate_training_frame(train_df)
 
@@ -220,6 +261,10 @@ class WalkForwardValidator:
             equity_curve,
             regime_buckets
         )
+
+    ############################################
+    # AGGREGATION
+    ############################################
 
     def aggregate_results(
         self,
