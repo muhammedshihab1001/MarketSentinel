@@ -36,12 +36,25 @@ TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 SEED = 42
-np.random.seed(SEED)
-
 MIN_TRAINING_ROWS = 2000
 MIN_SURVIVING_TICKERS = 5
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
+
+
+########################################################
+# STRICT DETERMINISM (CRITICAL FOR AUDIT)
+########################################################
+
+def enforce_determinism():
+
+    os.environ["PYTHONHASHSEED"] = str(SEED)
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+    np.random.seed(SEED)
 
 
 ########################################################
@@ -141,7 +154,7 @@ def load_training_data(start_date, end_date):
                 continue
 
             ###########################################
-            # NEWS RETRY
+            # NEWS RETRY WITH EXP BACKOFF
             ###########################################
 
             news_df = None
@@ -209,6 +222,8 @@ def load_training_data(start_date, end_date):
 
 def main(start_date=None, end_date=None):
 
+    enforce_determinism()
+
     logger.info("Institutional XGBoost Training")
 
     ###################################################
@@ -218,6 +233,9 @@ def main(start_date=None, end_date=None):
     if not start_date or not end_date:
         start_date, end_date = MarketTime.window_for("xgboost")
 
+    # 🔥 Freeze time for audit reproducibility
+    MarketTime.freeze_today(end_date)
+
     df, surviving = load_training_data(start_date, end_date)
 
     ###################################################
@@ -225,29 +243,31 @@ def main(start_date=None, end_date=None):
     ###################################################
 
     dataset_hash = MetadataManager.fingerprint_dataset(
-        df[["ticker","date","target", *MODEL_FEATURES]]
+        df[["ticker", "date", "target", *MODEL_FEATURES]]
     )
 
     universe_hash = MetadataManager.hash_list(surviving)
 
     ###################################################
-    # DRIFT BASELINE
+    # DRIFT BASELINE (CREATE ONLY ONCE)
     ###################################################
 
     drift = DriftDetector()
 
-    drift.create_baseline(
-        df.loc[:, MODEL_FEATURES],
-        dataset_hash=dataset_hash,
-        allow_overwrite=False
-    )
+    if not os.path.exists(DriftDetector.BASELINE_PATH):
+
+        drift.create_baseline(
+            df.loc[:, MODEL_FEATURES],
+            dataset_hash=dataset_hash,
+            allow_overwrite=False
+        )
 
     ###################################################
     # WALK FORWARD
     ###################################################
 
     def trainer(d):
-        model = build_xgboost_model(d["target"])
+        model = build_xgboost_model()
         model.fit(d.loc[:, MODEL_FEATURES], d["target"])
         return model
 
@@ -280,13 +300,13 @@ def main(start_date=None, end_date=None):
     # FINAL TRAIN
     ###################################################
 
-    model = build_final_xgboost_model(df["target"])
+    model = build_final_xgboost_model()
     model.fit(df.loc[:, MODEL_FEATURES], df["target"])
 
     save_model_atomic(model, TEMP_MODEL_PATH)
 
     ###################################################
-    # METADATA (INSTITUTIONAL)
+    # METADATA
     ###################################################
 
     metadata = MetadataManager.create_metadata(
@@ -314,6 +334,9 @@ def main(start_date=None, end_date=None):
         TEMP_MODEL_PATH,
         TEMP_METADATA_PATH
     )
+
+    # 🔥 durability guarantee
+    _fsync_dir(MODEL_DIR)
 
     logger.info("XGBoost registered → %s", version)
 
