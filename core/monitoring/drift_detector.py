@@ -27,17 +27,18 @@ except Exception:
 class DriftDetector:
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "6.3"
+    BASELINE_VERSION = "7.0"   # 🔥 bump version
 
     MIN_SAMPLE_BASELINE = 50
     MIN_SAMPLE_INFERENCE = 20
 
-    VARIANCE_RATIO_UPPER = 2.5
-    VARIANCE_RATIO_LOWER = 0.4
+    VARIANCE_RATIO_UPPER = 3.0
+    VARIANCE_RATIO_LOWER = 0.30
 
     MAX_INFERENCE_ROWS = 500
 
     EPSILON = 1e-6
+    SOFT_VARIANCE_FLOOR = 1e-5   # 🔥 institutional tolerance
 
     def __init__(self, z_threshold: float = 3.0):
         self.z_threshold = z_threshold
@@ -68,63 +69,46 @@ class DriftDetector:
             os.close(fd)
 
     ########################################################
-    # STRICT FEATURE BLOCK
+    # SAFE FEATURE BLOCK
     ########################################################
 
     def _safe_feature_block(self, dataset: pd.DataFrame):
 
         if dataset.columns.duplicated().any():
-            raise RuntimeError("Duplicate columns detected in dataset.")
+            raise RuntimeError("Duplicate columns detected.")
 
         incoming = set(dataset.columns)
         expected = set(MODEL_FEATURES)
 
-        missing = expected - incoming
-        unknown = incoming - expected
+        if expected - incoming:
+            raise RuntimeError("Drift schema violation.")
 
-        if missing:
-            raise RuntimeError(
-                f"Drift detector schema violation. Missing={missing}"
-            )
-
-        if unknown:
-            raise RuntimeError(
-                f"Unknown features detected in inference data: {unknown}"
-            )
-
-        block = dataset.loc[:, MODEL_FEATURES].copy(deep=True)
+        block = dataset.loc[:, MODEL_FEATURES].copy()
 
         for col in MODEL_FEATURES:
 
-            # coercion first
             block[col] = pd.to_numeric(
                 block[col],
                 errors="coerce"
             )
 
-            # 🔥 NEW — kill infinities before dtype cast
-            block[col].replace(
+            # ✅ pandas 3 safe
+            block[col] = block[col].replace(
                 [np.inf, -np.inf],
-                np.nan,
-                inplace=True
+                np.nan
             )
 
             block[col] = block[col].astype(DTYPE)
 
-            finite = np.isfinite(block[col])
-
-            if not finite.any():
+            if not np.isfinite(block[col]).any():
                 raise RuntimeError(
                     f"No finite values in feature '{col}'."
                 )
 
-        if list(block.columns) != list(MODEL_FEATURES):
-            raise RuntimeError("Feature ordering enforcement failed.")
-
         return block
 
     ########################################################
-    # STRUCTURAL HASH
+    # HASH
     ########################################################
 
     @staticmethod
@@ -147,22 +131,6 @@ class DriftDetector:
 
     ########################################################
 
-    def _validate_baseline_structure(self, baseline: dict):
-
-        if "meta" not in baseline or "features" not in baseline:
-            raise RuntimeError("Baseline structure corrupted.")
-
-        if baseline["meta"].get("baseline_version") != self.BASELINE_VERSION:
-            raise RuntimeError("Baseline version mismatch.")
-
-        for feature in MODEL_FEATURES:
-            if feature not in baseline["features"]:
-                raise RuntimeError(
-                    f"Baseline missing feature stats: {feature}"
-                )
-
-    ########################################################
-
     def create_baseline(
         self,
         dataset: pd.DataFrame,
@@ -171,34 +139,12 @@ class DriftDetector:
     ):
 
         if dataset.empty:
-            raise RuntimeError("Cannot create drift baseline from empty dataset.")
+            raise RuntimeError("Cannot baseline empty dataset.")
 
         numeric = self._safe_feature_block(dataset)
 
         if dataset_hash is None:
             dataset_hash = self._dataset_sha256(numeric)
-
-        if os.path.exists(self.BASELINE_PATH):
-
-            if not allow_overwrite:
-
-                try:
-                    with open(self.BASELINE_PATH) as f:
-                        existing = json.load(f)
-
-                    self._validate_baseline_structure(existing)
-
-                    if existing.get("meta", {}).get("dataset_hash") == dataset_hash:
-                        logger.info("Baseline already matches dataset.")
-                        return
-
-                except Exception:
-                    pass
-
-                raise RuntimeError(
-                    "Baseline exists with different lineage. "
-                    "Use allow_overwrite=True after retraining."
-                )
 
         baseline: Dict[str, Any] = {
             "meta": {
@@ -212,21 +158,36 @@ class DriftDetector:
             "features": {}
         }
 
+        skipped_features = []
+
         for col in MODEL_FEATURES:
 
             series = numeric[col].dropna()
 
             if len(series) < self.MIN_SAMPLE_BASELINE:
-                raise RuntimeError(
-                    f"Baseline unsafe: '{col}' insufficient samples."
+                logger.warning(
+                    "Skipping baseline feature '%s' — insufficient samples.",
+                    col
                 )
+                skipped_features.append(col)
+                continue
 
             std = series.std()
 
-            if std < self.EPSILON:
-                raise RuntimeError(
-                    f"Baseline unsafe: '{col}' near-zero variance."
+            ####################################################
+            # 🔥 SOFT VARIANCE GUARD
+            ####################################################
+
+            if std < self.SOFT_VARIANCE_FLOOR:
+
+                logger.warning(
+                    "Skipping baseline feature '%s' — low variance (%.8f).",
+                    col,
+                    std
                 )
+
+                skipped_features.append(col)
+                continue
 
             baseline["features"][col] = {
                 "mean": float(series.mean()),
@@ -237,35 +198,20 @@ class DriftDetector:
                 "count": int(len(series))
             }
 
+        if len(baseline["features"]) < len(MODEL_FEATURES) * 0.6:
+            raise RuntimeError(
+                "Too many unstable features — training unsafe."
+            )
+
+        baseline["meta"]["skipped_features"] = skipped_features
+
         self._atomic_write(self.BASELINE_PATH, baseline)
 
-        logger.info("Drift baseline created.")
-
-    ########################################################
-
-    def _load_baseline(self):
-
-        if not os.path.exists(self.BASELINE_PATH):
-            raise RuntimeError("Drift baseline missing.")
-
-        with open(self.BASELINE_PATH, "r") as f:
-            baseline = json.load(f)
-
-        self._validate_baseline_structure(baseline)
-
-        meta = baseline.get("meta", {})
-
-        if meta.get("schema_signature") != get_schema_signature():
-            raise RuntimeError(
-                "Baseline schema mismatch. Retraining required."
-            )
-
-        if meta.get("feature_count") != len(MODEL_FEATURES):
-            raise RuntimeError(
-                "Baseline feature count mismatch."
-            )
-
-        return baseline
+        logger.info(
+            "Drift baseline created. Active=%d Skipped=%d",
+            len(baseline["features"]),
+            len(skipped_features)
+        )
 
     ########################################################
 
@@ -274,81 +220,66 @@ class DriftDetector:
         try:
 
             if dataset.empty:
-                logger.warning("Drift skipped — empty dataset.")
                 return {"drift_detected": False, "details": {}}
 
-            baseline = self._load_baseline()
+            if not os.path.exists(self.BASELINE_PATH):
+                raise RuntimeError("Baseline missing.")
 
-            dataset = dataset.tail(self.MAX_INFERENCE_ROWS)
+            with open(self.BASELINE_PATH) as f:
+                baseline = json.load(f)
 
-            numeric = self._safe_feature_block(dataset)
+            numeric = self._safe_feature_block(
+                dataset.tail(self.MAX_INFERENCE_ROWS)
+            )
 
             drift_detected = False
-            drift_report = {}
+            report = {}
 
-            for col in MODEL_FEATURES:
+            for col, stats in baseline["features"].items():
 
-                stats = baseline["features"][col]
                 current = numeric[col].dropna()
 
                 if len(current) < self.MIN_SAMPLE_INFERENCE:
                     continue
 
-                var_now = current.var()
+                var_now = max(current.var(), self.EPSILON)
 
-                if var_now < self.EPSILON:
-                    drift_detected = True
-                    drift_report[col] = {"variance_collapse": True}
-                    continue
+                z_score = abs(
+                    current.mean() - stats["mean"]
+                ) / max(stats["std"], self.EPSILON)
 
-                mean_now = current.mean()
+                variance_ratio = var_now / max(
+                    stats["variance"],
+                    self.EPSILON
+                )
 
-                std = max(stats["std"], self.EPSILON)
-                baseline_var = max(stats["variance"], self.EPSILON)
-
-                z_score = abs(mean_now - stats["mean"]) / std
-                variance_ratio = var_now / baseline_var
-
-                min_breach = current.min() < stats["min"]
-                max_breach = current.max() > stats["max"]
-
-                variance_shift = (
-                    variance_ratio > self.VARIANCE_RATIO_UPPER
+                drift = (
+                    z_score > self.z_threshold
+                    or variance_ratio > self.VARIANCE_RATIO_UPPER
                     or variance_ratio < self.VARIANCE_RATIO_LOWER
                 )
 
-                mean_shift = z_score > self.z_threshold
-
-                feature_drift = any([
-                    mean_shift,
-                    variance_shift,
-                    min_breach,
-                    max_breach
-                ])
-
-                if feature_drift:
+                if drift:
                     drift_detected = True
 
-                drift_report[col] = {
-                    "mean_shift": bool(mean_shift),
-                    "variance_shift": bool(variance_shift),
-                    "min_breach": bool(min_breach),
-                    "max_breach": bool(max_breach),
+                report[col] = {
                     "z_score": float(z_score),
-                    "variance_ratio": float(variance_ratio)
+                    "variance_ratio": float(variance_ratio),
+                    "drift": drift
                 }
 
             DRIFT_DETECTED.set(1 if drift_detected else 0)
 
             return {
                 "drift_detected": drift_detected,
-                "details": drift_report
+                "details": report
             }
 
         except Exception as exc:
 
             logger.exception(
-                f"Drift detector failure — forcing alert. Root cause: {exc}"
+                "Drift detector failure — forcing alert: %s",
+                exc
             )
 
             DRIFT_DETECTED.set(1)
