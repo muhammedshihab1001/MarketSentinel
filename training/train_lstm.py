@@ -40,8 +40,6 @@ TRAINING_TICKERS = [
 
 def configure_runtime():
 
-    os.environ["TF_DETERMINISTIC_OPS"] = "1"
-
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
 
@@ -59,9 +57,6 @@ def configure_runtime():
 
     else:
         print("Running on CPU.")
-
-        tf.config.threading.set_intra_op_parallelism_threads(4)
-        tf.config.threading.set_inter_op_parallelism_threads(4)
 
 
 ############################################
@@ -84,7 +79,7 @@ def atomic_save_model(model, path):
     if os.path.exists(tmp_dir):
         shutil.rmtree(tmp_dir)
 
-    model.save(tmp_dir)
+    model.save(tmp_dir, save_format="keras")
 
     if os.path.exists(path):
         shutil.rmtree(path)
@@ -216,7 +211,7 @@ if __name__ == "__main__":
         training_start="2012-01-01",
         training_end=end_date,
         dataset_hash=dataset_hash,
-        metadata_type="model"
+        metadata_type="sequence"
     )
 
     MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
