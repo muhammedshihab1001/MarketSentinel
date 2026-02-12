@@ -6,9 +6,13 @@ import hashlib
 import threading
 import os
 import time
+import re
 
 from datetime import timedelta
 from typing import Dict, Tuple
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 logger = logging.getLogger("marketsentinel.news")
@@ -28,9 +32,10 @@ class NewsFetcher:
 
     INGESTION_DELAY = timedelta(minutes=15)
 
-    RAW_SCHEMA_VERSION = "3.0"
+    RAW_SCHEMA_VERSION = "4.0"
 
     RAW_CACHE_DIR = "data/news_raw"
+    MAX_RAW_FILES = 300   #  prevent disk fill
 
     MAX_RETRIES = 4
     BASE_SLEEP = 1.2
@@ -38,18 +43,33 @@ class NewsFetcher:
     _cache: Dict[str, Tuple[pd.Timestamp, pd.DataFrame]] = {}
     _lock = threading.Lock()
 
-    SESSION = requests.Session()
-
-    HEADERS = {
-        "User-Agent": "MarketSentinel/3.0"
-    }
-
     EMPTY_SCHEMA = pd.DataFrame(
         columns=["headline", "published_at", "source", "link"]
     )
 
+    HEADLINE_REGEX = re.compile(
+        r"^\s*$|^\W+$|http[s]?://|^\d+$"
+    )
+
+    #####################################################
+
     def __init__(self):
+
         os.makedirs(self.RAW_CACHE_DIR, exist_ok=True)
+
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+
+        adapter = HTTPAdapter(max_retries=retry)
+
+        self.SESSION = requests.Session()
+        self.SESSION.mount("https://", adapter)
+        self.SESSION.headers.update({
+            "User-Agent": "MarketSentinel/4.0"
+        })
 
     #####################################################
 
@@ -61,17 +81,34 @@ class NewsFetcher:
 
     def _cache_key(self, query: str, max_items: int) -> str:
 
-        raw = (
-            f"{query}|{max_items}|"
-            f"schema={self.RAW_SCHEMA_VERSION}"
-        )
-
+        raw = f"{query}|{max_items}|schema={self.RAW_SCHEMA_VERSION}"
         return hashlib.sha256(raw.encode()).hexdigest()[:20]
 
     #####################################################
 
     def _raw_path(self, key: str):
         return f"{self.RAW_CACHE_DIR}/{key}.xml"
+
+    #####################################################
+
+    def _prune_raw_disk(self):
+
+        files = sorted(
+            [
+                os.path.join(self.RAW_CACHE_DIR, f)
+                for f in os.listdir(self.RAW_CACHE_DIR)
+            ],
+            key=os.path.getmtime
+        )
+
+        if len(files) <= self.MAX_RAW_FILES:
+            return
+
+        for f in files[:50]:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
     #####################################################
 
@@ -91,7 +128,7 @@ class NewsFetcher:
 
     def _persist_raw_feed(self, path, content: bytes):
 
-        if len(content) < 5_000:
+        if len(content) < 1500:
             raise RuntimeError("RSS payload suspiciously small.")
 
         tmp = path + ".tmp"
@@ -103,6 +140,8 @@ class NewsFetcher:
 
         os.replace(tmp, path)
 
+        self._prune_raw_disk()
+
     #####################################################
 
     def _download_feed(self, url):
@@ -113,7 +152,6 @@ class NewsFetcher:
 
                 r = self.SESSION.get(
                     url,
-                    headers=self.HEADERS,
                     timeout=6
                 )
 
@@ -123,9 +161,7 @@ class NewsFetcher:
 
             except Exception as e:
 
-                sleep = (
-                    self.BASE_SLEEP * (2 ** attempt)
-                )
+                sleep = self.BASE_SLEEP * (2 ** attempt)
 
                 logger.warning(
                     f"News retry {attempt+1}: {e}"
@@ -137,23 +173,8 @@ class NewsFetcher:
 
     #####################################################
 
-    def _prune_cache(self):
-
-        if len(self._cache) < self.MAX_CACHE_KEYS:
-            return
-
-        oldest = sorted(
-            self._cache.items(),
-            key=lambda x: x[1][0]
-        )[:100]
-
-        for k, _ in oldest:
-            self._cache.pop(k, None)
-
-    #####################################################
-
     @staticmethod
-    def _normalize_timestamp(published):
+    def _normalize_timestamp(published, now):
 
         ts = pd.to_datetime(
             published,
@@ -164,19 +185,32 @@ class NewsFetcher:
         if pd.isna(ts):
             return None
 
-        return ts.tz_convert(None)
+        ts = ts.tz_convert(None)
+
+        #  HARD FUTURE GUARD
+        ts = min(ts, now)
+
+        return ts
 
     #####################################################
 
-    @staticmethod
-    def _clean_headline(text: str):
+    def _clean_headline(self, text: str):
 
-        text = " ".join(text.split())
-
-        if len(text) < 10:
+        if not text:
             return None
 
-        return text.strip()
+        text = " ".join(text.split()).strip()
+
+        if len(text) < 15:
+            return None
+
+        if self.HEADLINE_REGEX.search(text):
+            return None
+
+        if text.isupper():
+            return None
+
+        return text
 
     #####################################################
 
@@ -206,18 +240,13 @@ class NewsFetcher:
                 path = self._raw_path(key)
 
                 if self._raw_expired(path):
-
                     raw = self._download_feed(rss_url)
                     self._persist_raw_feed(path, raw)
-
                 else:
                     with open(path, "rb") as f:
                         raw = f.read()
 
                 feed = feedparser.parse(raw)
-
-                if getattr(feed, "bozo", False):
-                    raise RuntimeError("Malformed RSS feed.")
 
                 articles = []
                 seen_hashes = set()
@@ -234,7 +263,8 @@ class NewsFetcher:
                         continue
 
                     published = self._normalize_timestamp(
-                        pd.Timestamp(*parsed[:6])
+                        pd.Timestamp(*parsed[:6]),
+                        now
                     )
 
                     if published is None:
@@ -253,16 +283,15 @@ class NewsFetcher:
                     if not headline:
                         continue
 
-                    source = entry.get(
-                        "source", {}
-                    )
+                    source = entry.get("source", {})
 
                     if isinstance(source, dict):
                         source = source.get("title", "Unknown")
                     else:
                         source = "Unknown"
 
-                    dedup_key = f"{headline}|{source}"
+                    #  STRONG DEDUP
+                    dedup_key = f"{headline}|{source}|{published.floor('H')}"
 
                     h = hashlib.sha256(
                         dedup_key.encode()
@@ -289,8 +318,6 @@ class NewsFetcher:
                 df = pd.DataFrame(articles)
                 df = df.sort_values("published_at")
                 df.reset_index(drop=True, inplace=True)
-
-                self._prune_cache()
 
                 self._cache[key] = (
                     now + self.CACHE_TTL,
