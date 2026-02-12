@@ -24,7 +24,8 @@ from models.xgboost_model import (
 )
 
 from core.time.market_time import MarketTime
-from core.market.universe import MarketUniverse   # ⭐ CRITICAL
+from core.market.universe import MarketUniverse
+
 
 logger = logging.getLogger("marketsentinel.training")
 
@@ -93,7 +94,9 @@ def build_news_query(ticker: str):
         "GS": "Goldman Sachs",
         "BAC": "Bank of America",
         "AMD": "Advanced Micro Devices",
-        "AVGO": "Broadcom"
+        "AVGO": "Broadcom",
+        "SPY": "S&P 500 ETF",
+        "QQQ": "Nasdaq 100 ETF"
     }
 
     name = COMPANY_MAP.get(ticker, ticker)
@@ -208,14 +211,28 @@ def main(start_date=None, end_date=None):
 
     logger.info("Institutional XGBoost Training")
 
+    ###################################################
+    # MODEL-SPECIFIC CLOCK
+    ###################################################
+
     if not start_date or not end_date:
-        start_date, end_date = MarketTime.training_window()
+        start_date, end_date = MarketTime.window_for("xgboost")
 
     df, surviving = load_training_data(start_date, end_date)
+
+    ###################################################
+    # GOVERNANCE HASHES
+    ###################################################
 
     dataset_hash = MetadataManager.fingerprint_dataset(
         df[["ticker","date","target", *MODEL_FEATURES]]
     )
+
+    universe_hash = MetadataManager.hash_list(surviving)
+
+    ###################################################
+    # DRIFT BASELINE
+    ###################################################
 
     drift = DriftDetector()
 
@@ -268,6 +285,10 @@ def main(start_date=None, end_date=None):
 
     save_model_atomic(model, TEMP_MODEL_PATH)
 
+    ###################################################
+    # METADATA (INSTITUTIONAL)
+    ###################################################
+
     metadata = MetadataManager.create_metadata(
         model_name="xgboost_direction",
         metrics={**strategy_metrics},
@@ -277,7 +298,9 @@ def main(start_date=None, end_date=None):
         dataset_hash=dataset_hash,
         metadata_type="training_manifest_v1",
         extra_fields={
-            "training_universe": surviving
+            "training_universe": surviving,
+            "universe_hash": universe_hash,
+            "time_snapshot": MarketTime.snapshot_for("xgboost")
         }
     )
 
