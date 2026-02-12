@@ -26,7 +26,10 @@ class StockPriceFetcher:
     MAX_RETRIES = 5
     BASE_SLEEP = 1.5
     MAX_GAP_DAYS = 10
-    MIN_COVERAGE_RATIO = 0.75
+
+    # relaxed — realistic for Yahoo
+    CRITICAL_COVERAGE = 0.55
+    WARNING_COVERAGE = 0.70
 
     CACHE_DIR = "data/cache"
 
@@ -128,19 +131,33 @@ class StockPriceFetcher:
             raise RuntimeError("Large gap detected in price history.")
 
     ##################################################
+    # ✅ FIXED COVERAGE
+    ##################################################
 
     def _validate_coverage(self, df, start_date, end_date):
 
         start = self._to_naive_utc(start_date)
         end = self._to_naive_utc(end_date)
 
-        total_days = max((end - start).days, 1)
+        expected_sessions = len(
+            pd.bdate_range(start=start, end=end)
+        )
 
-        coverage = len(df) / total_days
+        expected_sessions = max(expected_sessions, 1)
 
-        if coverage < self.MIN_COVERAGE_RATIO:
+        coverage = len(df) / expected_sessions
+
+        # HARD FAIL only for garbage datasets
+        if coverage < self.CRITICAL_COVERAGE:
             raise RuntimeError(
-                f"Dataset coverage too low: {coverage:.2f}"
+                f"Dataset coverage critically low: {coverage:.2f}"
+            )
+
+        # warn but allow
+        if coverage < self.WARNING_COVERAGE:
+            logger.warning(
+                f"Low dataset coverage ({coverage:.2f}). "
+                "Yahoo gaps are common — continuing."
             )
 
     ##################################################
@@ -254,7 +271,7 @@ class StockPriceFetcher:
                     start=start_date,
                     end=end_date,
                     interval=interval,
-                    auto_adjust=False,   # CRITICAL FIX
+                    auto_adjust=False,
                     progress=False,
                     threads=False
                 )
