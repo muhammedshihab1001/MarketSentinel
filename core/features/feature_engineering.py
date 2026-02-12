@@ -62,6 +62,12 @@ class FeatureEngineer:
         if df["date"].duplicated().any():
             raise RuntimeError("Duplicate timestamps in price data.")
 
+        # 🔥 CRITICAL FIX — force numeric conversion
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+
+        if df["close"].isna().any():
+            raise RuntimeError("NaN close prices detected after coercion.")
+
         if not np.isfinite(df["close"]).all():
             raise RuntimeError("Non-finite close prices detected.")
 
@@ -80,7 +86,9 @@ class FeatureEngineer:
     @staticmethod
     def _enforce_float32(df):
 
-        for col in df.select_dtypes(include=["float64"]).columns:
+        float_cols = df.select_dtypes(include=["float64"]).columns
+
+        for col in float_cols:
             df[col] = df[col].astype("float32")
 
         return df
@@ -93,6 +101,7 @@ class FeatureEngineer:
     def add_returns(df):
 
         returns = df["close"].pct_change()
+
         lo, hi = FeatureEngineer.RETURN_CLAMP
 
         df["return"] = returns.clip(lo, hi)
@@ -174,7 +183,7 @@ class FeatureEngineer:
                 as_index=False
             )[cls.SENTIMENT_COLUMNS[1:]].mean()
 
-        # LOOKAHEAD SAFE SHIFT
+        # 🔥 LOOKAHEAD SAFE SHIFT
         sentiment["date"] += pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
