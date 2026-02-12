@@ -23,6 +23,8 @@ class StockPriceFetcher:
         "volume"
     }
 
+    CACHE_VERSION = "2.0"
+
     MIN_ROWS = 120
     MAX_RETRIES = 5
     BASE_SLEEP = 1.5
@@ -31,13 +33,16 @@ class StockPriceFetcher:
     CRITICAL_COVERAGE = 0.55
     WARNING_COVERAGE = 0.70
 
+    MAX_ZERO_VOLUME_RATIO = 0.05
+    MAX_DAILY_RETURN = 0.60
+
     CACHE_DIR = "data/cache"
 
     def __init__(self):
         os.makedirs(self.CACHE_DIR, exist_ok=True)
 
     ##################################################
-    # DIRECTORY FSYNC
+    # FSYNC
     ##################################################
 
     @staticmethod
@@ -101,38 +106,26 @@ class StockPriceFetcher:
         return df.loc[:, ~df.columns.duplicated()]
 
     ##################################################
-    # 🔥 INSTITUTIONAL SCHEMA NORMALIZATION
+    # NORMALIZE
     ##################################################
 
     def _normalize_schema(self, df: pd.DataFrame):
 
         df = self._flatten_columns(df)
 
-        ################################################
-        # HARD YAHOO NORMALIZATION
-        ################################################
-
-        # If ONLY adj close exists → rename
         if "close" not in df.columns and "adj close" in df.columns:
             df.rename(columns={"adj close": "close"}, inplace=True)
 
-        # If BOTH exist → ALWAYS prefer adjusted
         if "adj close" in df.columns:
             df["close"] = df["adj close"]
             df.drop(columns=["adj close"], inplace=True)
-
-        ################################################
 
         if "date" not in df.columns:
             df = df.reset_index()
             df.rename(columns={df.columns[0]: "date"}, inplace=True)
 
         df["date"] = (
-            pd.to_datetime(
-                df["date"],
-                errors="coerce",
-                utc=True
-            )
+            pd.to_datetime(df["date"], errors="coerce", utc=True)
             .dt.tz_convert(None)
         )
 
@@ -150,14 +143,12 @@ class StockPriceFetcher:
 
         df = df.dropna(subset=["date"] + numeric_cols)
 
-        ################################################
-        # HARD COLUMN SELECTION (VERY IMPORTANT)
-        ################################################
-
         df = df.loc[:, ["date", "open", "high", "low", "close", "volume"]]
 
         return df
 
+    ##################################################
+    # HARD VALIDATION
     ##################################################
 
     def _detect_gaps(self, df: pd.DataFrame):
@@ -167,7 +158,28 @@ class StockPriceFetcher:
         if (diffs > self.MAX_GAP_DAYS).any():
             raise RuntimeError("Large gap detected in price history.")
 
-    ##################################################
+    def _validate_monotonic(self, df):
+
+        if not df["date"].is_monotonic_increasing:
+            raise RuntimeError("Non-monotonic timestamps detected.")
+
+    def _validate_returns(self, df):
+
+        returns = df["close"].pct_change().abs()
+
+        if (returns > self.MAX_DAILY_RETURN).any():
+            raise RuntimeError(
+                "Extreme price spike detected — possible bad data."
+            )
+
+    def _validate_volume(self, df):
+
+        zero_ratio = (df["volume"] == 0).mean()
+
+        if zero_ratio > self.MAX_ZERO_VOLUME_RATIO:
+            raise RuntimeError(
+                "Too many zero-volume rows — provider unreliable."
+            )
 
     def _validate_coverage(self, df, start_date, end_date):
 
@@ -189,8 +201,7 @@ class StockPriceFetcher:
 
         if coverage < self.WARNING_COVERAGE:
             logger.warning(
-                f"Low dataset coverage ({coverage:.2f}). "
-                "Yahoo gaps are common — continuing."
+                f"Low dataset coverage ({coverage:.2f}). Continuing."
             )
 
     ##################################################
@@ -213,7 +224,10 @@ class StockPriceFetcher:
 
         df = df.drop_duplicates("date").sort_values("date")
 
+        self._validate_monotonic(df)
         self._detect_gaps(df)
+        self._validate_returns(df)
+        self._validate_volume(df)
         self._validate_coverage(df, start_date, end_date)
 
         if len(df) < self.MIN_ROWS:
@@ -224,7 +238,7 @@ class StockPriceFetcher:
         return df.reset_index(drop=True)
 
     ##################################################
-    # ATOMIC CACHE WRITE
+    # CACHE
     ##################################################
 
     def _atomic_cache_write(self, df, cache_file):
@@ -237,13 +251,13 @@ class StockPriceFetcher:
         os.replace(tmp, cache_file)
         self._fsync_dir(directory)
 
-    ##################################################
-
     def _cache_key(self, ticker, start, end, interval):
 
-        raw = f"{ticker}_{start}_{end}_{interval}"
+        raw = f"{self.CACHE_VERSION}_{ticker}_{start}_{end}_{interval}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
+    ##################################################
+    # PUBLIC FETCH
     ##################################################
 
     def fetch(self, ticker, start_date, end_date, interval="1d"):
@@ -256,16 +270,10 @@ class StockPriceFetcher:
             f"{self._cache_key(ticker, start_date, end_date, interval)}.parquet"
         )
 
-        ################################################
-        # TRY CACHE
-        ################################################
-
         if os.path.exists(cache_file):
 
             try:
                 cached = pd.read_parquet(cache_file)
-
-                # 🔥 RE-NORMALIZE cached data
                 cached = self._normalize_schema(cached)
 
                 return self._validate_dataset(
@@ -280,10 +288,6 @@ class StockPriceFetcher:
                     os.remove(cache_file)
                 except Exception:
                     pass
-
-        ################################################
-        # FETCH FRESH
-        ################################################
 
         df = self._fetch_yahoo(
             ticker,
