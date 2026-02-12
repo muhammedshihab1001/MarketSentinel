@@ -5,7 +5,7 @@ import hashlib
 import logging
 import os
 import random
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 
 logger = logging.getLogger("marketsentinel.fetcher")
@@ -26,7 +26,7 @@ class StockPriceFetcher:
     MAX_RETRIES = 5
     BASE_SLEEP = 1.5
     MAX_GAP_DAYS = 10
-    MIN_COVERAGE_RATIO = 0.85
+    MIN_COVERAGE_RATIO = 0.75
 
     CACHE_DIR = "data/cache"
 
@@ -39,9 +39,7 @@ class StockPriceFetcher:
 
     @staticmethod
     def _to_naive_utc(ts):
-        """
-        Convert anything into tz-naive UTC.
-        """
+
         ts = pd.Timestamp(ts)
 
         if ts.tzinfo is not None:
@@ -60,6 +58,17 @@ class StockPriceFetcher:
         )
 
         return min(requested, yesterday)
+
+    ##################################################
+
+    @staticmethod
+    def _validate_dates(start_date, end_date):
+
+        start = pd.Timestamp(start_date)
+        end = pd.Timestamp(end_date)
+
+        if start >= end:
+            raise ValueError("start_date must be before end_date")
 
     ##################################################
 
@@ -125,13 +134,9 @@ class StockPriceFetcher:
         start = self._to_naive_utc(start_date)
         end = self._to_naive_utc(end_date)
 
-        expected_days = len(
-            pd.bdate_range(start=start, end=end)
-        )
+        total_days = max((end - start).days, 1)
 
-        expected_days = max(expected_days, 1)
-
-        coverage = len(df) / expected_days
+        coverage = len(df) / total_days
 
         if coverage < self.MIN_COVERAGE_RATIO:
             raise RuntimeError(
@@ -170,7 +175,12 @@ class StockPriceFetcher:
     def _atomic_cache_write(self, df, cache_file):
 
         tmp = cache_file + ".tmp"
+
         df.to_parquet(tmp, index=False)
+
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())
+
         os.replace(tmp, cache_file)
 
     ##################################################
@@ -183,6 +193,8 @@ class StockPriceFetcher:
     ##################################################
 
     def fetch(self, ticker, start_date, end_date, interval="1d"):
+
+        self._validate_dates(start_date, end_date)
 
         end_date = self._cap_to_yesterday(end_date)
 
@@ -242,7 +254,7 @@ class StockPriceFetcher:
                     start=start_date,
                     end=end_date,
                     interval=interval,
-                    auto_adjust=True,
+                    auto_adjust=False,   # CRITICAL FIX
                     progress=False,
                     threads=False
                 )
@@ -267,14 +279,3 @@ class StockPriceFetcher:
                 time.sleep(sleep_time)
 
         raise RuntimeError("Yahoo failed after retries.")
-
-    ##################################################
-
-    @staticmethod
-    def _validate_dates(start_date, end_date):
-
-        start = pd.Timestamp(start_date)
-        end = pd.Timestamp(end_date)
-
-        if start >= end:
-            raise ValueError("start_date must be before end_date")
