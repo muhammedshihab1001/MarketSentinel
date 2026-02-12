@@ -7,6 +7,7 @@ import threading
 import os
 import time
 import re
+import urllib.parse
 
 from datetime import timedelta
 from typing import Dict, Tuple
@@ -32,10 +33,10 @@ class NewsFetcher:
 
     INGESTION_DELAY = timedelta(minutes=15)
 
-    RAW_SCHEMA_VERSION = "4.0"
+    RAW_SCHEMA_VERSION = "5.0"   #  bump version for lineage reset
 
     RAW_CACHE_DIR = "data/news_raw"
-    MAX_RAW_FILES = 300   #  prevent disk fill
+    MAX_RAW_FILES = 300
 
     MAX_RETRIES = 4
     BASE_SLEEP = 1.2
@@ -68,7 +69,7 @@ class NewsFetcher:
         self.SESSION = requests.Session()
         self.SESSION.mount("https://", adapter)
         self.SESSION.headers.update({
-            "User-Agent": "MarketSentinel/4.0"
+            "User-Agent": "MarketSentinel/5.0"
         })
 
     #####################################################
@@ -187,10 +188,7 @@ class NewsFetcher:
 
         ts = ts.tz_convert(None)
 
-        #  HARD FUTURE GUARD
-        ts = min(ts, now)
-
-        return ts
+        return min(ts, now)
 
     #####################################################
 
@@ -233,8 +231,14 @@ class NewsFetcher:
 
             try:
 
+                #################################################
+                #  PROPER URL ENCODING
+                #################################################
+
+                encoded_query = urllib.parse.quote_plus(query)
+
                 rss_url = self.GOOGLE_NEWS_RSS.format(
-                    query=query.replace(" ", "+")
+                    query=encoded_query
                 )
 
                 path = self._raw_path(key)
@@ -247,6 +251,13 @@ class NewsFetcher:
                         raw = f.read()
 
                 feed = feedparser.parse(raw)
+
+                #################################################
+                #  BOZO GUARD
+                #################################################
+
+                if getattr(feed, "bozo", False):
+                    raise RuntimeError("Malformed RSS feed.")
 
                 articles = []
                 seen_hashes = set()
@@ -290,8 +301,11 @@ class NewsFetcher:
                     else:
                         source = "Unknown"
 
-                    #  STRONG DEDUP
-                    dedup_key = f"{headline}|{source}|{published.floor('H')}"
+                    #################################################
+                    #  FIXED pandas warning
+                    #################################################
+
+                    dedup_key = f"{headline}|{source}|{published.floor('h')}"
 
                     h = hashlib.sha256(
                         dedup_key.encode()

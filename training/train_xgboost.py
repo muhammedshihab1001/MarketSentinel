@@ -5,6 +5,7 @@ import shutil
 import joblib
 import pandas as pd
 import numpy as np
+import logging
 
 from core.data.data_fetcher import StockPriceFetcher
 from core.data.news_fetcher import NewsFetcher
@@ -23,6 +24,8 @@ from models.xgboost_model import (
     build_final_xgboost_model
 )
 
+logger = logging.getLogger("marketsentinel.training")
+
 MODEL_DIR = "artifacts/xgboost"
 TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
@@ -38,6 +41,10 @@ TRAINING_TICKERS = [
 MIN_TRAINING_ROWS = 2000
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
+
+#  NEW — signal safety thresholds
+MIN_SENTIMENT_STD = 0.015
+MIN_NEWS_PER_DAY = 1.2
 
 
 ########################################################
@@ -59,6 +66,52 @@ def save_model_atomic(model, path):
 
 
 ########################################################
+# ELITE NEWS QUERY
+########################################################
+
+def build_news_query(ticker: str) -> str:
+    """
+    Institutional query design.
+    Expands semantic surface area.
+    """
+    return (
+        f"{ticker} OR {ticker} earnings OR {ticker} revenue "
+        f"OR {ticker} guidance OR {ticker} forecast "
+        f"OR {ticker} downgrade OR upgrade"
+    )
+
+
+########################################################
+# SIGNAL DIAGNOSTICS (VERY IMPORTANT)
+########################################################
+
+def validate_sentiment_signal(sentiment_df, ticker):
+
+    if sentiment_df.empty:
+        raise RuntimeError(f"{ticker}: no sentiment data.")
+
+    std = sentiment_df["avg_sentiment"].std()
+    news_rate = sentiment_df["news_count"].mean()
+
+    logger.info(
+        "%s sentiment | std=%.4f | avg_news=%.2f",
+        ticker,
+        std,
+        news_rate
+    )
+
+    if std < MIN_SENTIMENT_STD:
+        raise RuntimeError(
+            f"{ticker}: sentiment variance collapsed ({std:.5f})"
+        )
+
+    if news_rate < MIN_NEWS_PER_DAY:
+        raise RuntimeError(
+            f"{ticker}: insufficient news flow ({news_rate:.2f}/day)"
+        )
+
+
+########################################################
 # DATA LOADER
 ########################################################
 
@@ -75,52 +128,67 @@ def load_training_data():
 
     for ticker in TRAINING_TICKERS:
 
-        price_df = fetcher.fetch(
-            ticker=ticker,
-            start_date="2016-01-01",
-            end_date=end_date
-        )
+        logger.info("Building dataset for %s", ticker)
 
-        if price_df is None or price_df.empty:
-            continue
+        try:
 
-        news_df = news_fetcher.fetch(
-            f"{ticker} stock",
-            max_items=100
-        )
-
-        scored_df = sentiment_analyzer.analyze_dataframe(news_df)
-        sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
-
-        dataset = engineer.build_feature_pipeline(
-            price_df,
-            sentiment_df,
-            training=True
-        )
-
-        if dataset is None or dataset.empty:
-            continue
-
-        ####################################################
-        # HARD CONTRACT — CLOSE MUST EXIST
-        ####################################################
-
-        if "close" not in dataset.columns:
-            raise RuntimeError(
-                "CRITICAL: Feature pipeline dropped 'close'."
+            price_df = fetcher.fetch(
+                ticker=ticker,
+                start_date="2016-01-01",
+                end_date=end_date
             )
 
-        if dataset["close"].isna().any():
-            raise RuntimeError(
-                "NaN close detected after feature pipeline."
+            if price_df is None or price_df.empty:
+                continue
+
+            ####################################################
+            #  ELITE NEWS QUERY
+            ####################################################
+
+            query = build_news_query(ticker)
+
+            news_df = news_fetcher.fetch(
+                query,
+                max_items=250
             )
 
-        dataset["ticker"] = ticker
+            scored_df = sentiment_analyzer.analyze_dataframe(news_df)
+            sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
 
-        datasets.append(dataset)
+            ####################################################
+            #  SIGNAL VALIDATION
+            ####################################################
+
+            validate_sentiment_signal(sentiment_df, ticker)
+
+            dataset = engineer.build_feature_pipeline(
+                price_df,
+                sentiment_df,
+                training=True
+            )
+
+            if dataset is None or dataset.empty:
+                continue
+
+            if dataset["close"].isna().any():
+                raise RuntimeError("NaN close detected.")
+
+            dataset["ticker"] = ticker
+
+            datasets.append(dataset)
+
+        except Exception as e:
+
+            logger.warning(
+                "Ticker rejected: %s | reason=%s",
+                ticker,
+                str(e)
+            )
+
+            continue
 
     if not datasets:
-        raise RuntimeError("No datasets built for XGBoost.")
+        raise RuntimeError("All tickers rejected — no training dataset.")
 
     df = pd.concat(datasets, ignore_index=True)
 
@@ -131,10 +199,6 @@ def load_training_data():
         raise RuntimeError(
             f"Training aborted — dataset too small ({len(df)} rows)"
         )
-
-    ####################################################
-    # STRICT FEATURE VALIDATION
-    ####################################################
 
     feature_block = validate_feature_schema(
         df.loc[:, MODEL_FEATURES]
@@ -147,6 +211,8 @@ def load_training_data():
         ],
         axis=1
     )
+
+    logger.info("FINAL DATASET SIZE: %s rows", len(final))
 
     return final, end_date
 
@@ -198,7 +264,7 @@ def train_full_model(df):
 
 
 ########################################################
-# MAIN ENTRYPOINT (CRITICAL FOR PIPELINES)
+# MAIN
 ########################################################
 
 def main():
@@ -206,10 +272,6 @@ def main():
     print("Institutional XGBoost Training")
 
     df, end_date = load_training_data()
-
-    ####################################################
-    # CREATE / VALIDATE DRIFT BASELINE
-    ####################################################
 
     drift = DriftDetector()
 
@@ -223,10 +285,6 @@ def main():
         allow_overwrite=True
     )
 
-    ####################################################
-    # WALK FORWARD
-    ####################################################
-
     wf = WalkForwardValidator(
         model_trainer=train_model,
         signal_generator=generate_signals
@@ -239,10 +297,6 @@ def main():
 
     if strategy_metrics["max_drawdown"] < MAX_DRAWDOWN:
         raise RuntimeError("XGBoost rejected — drawdown too severe")
-
-    ####################################################
-    # FINAL MODEL
-    ####################################################
 
     model, importance = train_full_model(df)
 
@@ -274,8 +328,6 @@ def main():
 
     print(f"XGBoost registered → {version}")
 
-
-########################################################
 
 if __name__ == "__main__":
     main()
