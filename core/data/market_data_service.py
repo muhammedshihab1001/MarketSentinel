@@ -3,6 +3,7 @@ from pathlib import Path
 import pandas as pd
 import time
 import os
+import numpy as np
 
 from core.data.data_fetcher import StockPriceFetcher
 
@@ -12,14 +13,15 @@ logger = logging.getLogger("marketsentinel.market_data")
 
 class MarketDataService:
     """
-    Production market data layer.
+    Institutional Market Data Layer.
 
     Guarantees:
-    - zero future leakage
-    - timezone enforcement
-    - revision correction
-    - atomic persistence
-    - deterministic datasets
+    ✔ zero lookahead bias
+    ✔ dtype enforcement
+    ✔ numeric safety
+    ✔ atomic durability
+    ✔ revision protection
+    ✔ disk control
     """
 
     DATA_DIR = Path("data/lake")
@@ -36,20 +38,39 @@ class MarketDataService:
     MIN_HISTORY_ROWS = 120
     REVISION_DAYS = 5
 
+    SAFE_LAG_DAYS = 2     # 🔥 CRITICAL
+    MAX_FILES = 400       # disk protection
+
+    ########################################################
+
     def __init__(self):
         self.DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._fetcher = StockPriceFetcher()
 
+    ########################################################
+
     def _dataset_path(self, ticker: str, interval: str):
         return self.DATA_DIR / f"{ticker}_{interval}.parquet"
 
-    @staticmethod
-    def _cap_to_yesterday(date_str: str):
+    ########################################################
+    # LOOKAHEAD PROTECTION
+    ########################################################
+
+    @classmethod
+    def _cap_to_safe_date(cls, date_str: str):
 
         requested = pd.Timestamp(date_str).normalize()
-        yesterday = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=1)
 
-        return min(requested, yesterday)
+        safe_cutoff = (
+            pd.Timestamp.utcnow().normalize()
+            - pd.Timedelta(days=cls.SAFE_LAG_DAYS)
+        )
+
+        return min(requested, safe_cutoff)
+
+    ########################################################
+    # HARD VALIDATOR
+    ########################################################
 
     def _validate_dataset(self, df: pd.DataFrame):
 
@@ -63,21 +84,86 @@ class MarketDataService:
                 f"Market data schema violation. Missing={missing}"
             )
 
-        df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_convert(None)
+        df = df.copy()
 
-        if df["date"].duplicated().any():
-            logger.warning("Duplicate timestamps detected — deduplicating.")
-            df = df.drop_duplicates("date")
+        df["date"] = pd.to_datetime(
+            df["date"],
+            utc=True,
+            errors="coerce"
+        ).dt.tz_convert(None)
+
+        numeric_cols = ["open", "high", "low", "close", "volume"]
+
+        for col in numeric_cols:
+
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            )
+
+        df = df.dropna(subset=["date"] + numeric_cols)
+
+        if not np.isfinite(df[numeric_cols].to_numpy()).all():
+            raise RuntimeError("Non-finite prices detected.")
 
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices detected.")
 
+        if (df["high"] < df["low"]).any():
+            raise RuntimeError("High < Low detected.")
+
+        df = df.sort_values("date").drop_duplicates("date")
+
         if len(df) < self.MIN_HISTORY_ROWS:
             raise RuntimeError(
-                "Insufficient market history for safe inference."
+                "Insufficient market history."
             )
 
-        return df.sort_values("date").reset_index(drop=True)
+        return df.reset_index(drop=True)
+
+    ########################################################
+    # ATOMIC WRITE (FULLY DURABLE)
+    ########################################################
+
+    def _atomic_save(self, df: pd.DataFrame, path: Path):
+
+        tmp = path.with_suffix(".tmp")
+
+        df.to_parquet(tmp, index=False)
+
+        with open(tmp, "rb+") as f:
+            f.flush()
+            os.fsync(f.fileno())
+
+        tmp.replace(path)
+
+        # directory fsync
+        if os.name != "nt":
+            fd = os.open(str(path.parent), os.O_DIRECTORY)
+            os.fsync(fd)
+            os.close(fd)
+
+    ########################################################
+    # DISK CONTROL
+    ########################################################
+
+    def _prune_disk(self):
+
+        files = sorted(
+            self.DATA_DIR.glob("*.parquet"),
+            key=lambda x: x.stat().st_mtime
+        )
+
+        if len(files) <= self.MAX_FILES:
+            return
+
+        for f in files[:50]:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+    ########################################################
 
     def _load_local(self, path: Path):
 
@@ -101,23 +187,7 @@ class MarketDataService:
 
             return None
 
-    def _atomic_save(self, df: pd.DataFrame, path: Path):
-
-        df = (
-            df.sort_values("date")
-            .drop_duplicates("date")
-            .reset_index(drop=True)
-        )
-
-        tmp = path.with_suffix(".tmp")
-
-        df.to_parquet(tmp, index=False)
-
-        with open(tmp, "rb+") as f:
-            f.flush()
-            os.fsync(f.fileno())
-
-        tmp.replace(path)
+    ########################################################
 
     def _fetch_with_retry(
         self,
@@ -133,6 +203,7 @@ class MarketDataService:
         for attempt in range(retries):
 
             try:
+
                 df = self._fetcher.fetch(
                     ticker,
                     start,
@@ -159,6 +230,8 @@ class MarketDataService:
             f"Market fetch failed after retries: {ticker}"
         ) from last_error
 
+    ########################################################
+
     def get_price_data(
         self,
         ticker: str,
@@ -167,11 +240,15 @@ class MarketDataService:
         interval: str = "1d"
     ):
 
-        end_date = self._cap_to_yesterday(end_date)
+        end_date = self._cap_to_safe_date(end_date)
 
         path = self._dataset_path(ticker, interval)
 
         local_df = self._load_local(path)
+
+        ####################################################
+        # FIRST BUILD
+        ####################################################
 
         if local_df is None:
 
@@ -185,17 +262,18 @@ class MarketDataService:
             )
 
             self._atomic_save(df, path)
+            self._prune_disk()
 
             return df
+
+        ####################################################
+        # REVISION WINDOW
+        ####################################################
 
         revision_start = (
             pd.to_datetime(local_df["date"].max())
             - pd.Timedelta(days=self.REVISION_DAYS)
         ).strftime("%Y-%m-%d")
-
-        logger.info(
-            f"Fetching revision window for {ticker}: {revision_start} → {end_date.date()}"
-        )
 
         try:
 
@@ -206,13 +284,18 @@ class MarketDataService:
                 interval
             )
 
+            # validate BEFORE merge
+            revision_df = self._validate_dataset(revision_df)
+
             local_df = pd.concat(
                 [local_df, revision_df],
                 ignore_index=True
             )
 
         except Exception:
-            logger.exception("Revision fetch failed — continuing with cached data.")
+            logger.exception(
+                "Revision fetch failed — using cached data."
+            )
 
         local_df = (
             local_df
@@ -222,6 +305,7 @@ class MarketDataService:
         )
 
         self._atomic_save(local_df, path)
+        self._prune_disk()
 
         mask = (
             (local_df["date"] >= pd.Timestamp(start_date)) &
