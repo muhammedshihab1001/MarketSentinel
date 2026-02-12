@@ -64,7 +64,7 @@ class FeatureStore:
         return hashlib.sha256(code_bytes).hexdigest()
 
     ##################################################
-    # 🔥 STRONG DATASET HASH (PRICE + SENTIMENT)
+    #  STRONG DATASET HASH (PRICE + SENTIMENT)
     ##################################################
 
     def _dataset_hash(
