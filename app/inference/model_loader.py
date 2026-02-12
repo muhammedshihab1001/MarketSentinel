@@ -3,10 +3,13 @@ import joblib
 import logging
 import threading
 import json
-from typing import Optional
 
 from core.artifacts.model_registry import ModelRegistry
-from core.schema.feature_schema import get_schema_signature
+from core.schema.feature_schema import (
+    get_schema_signature,
+    MODEL_FEATURES
+)
+
 from models.lstm_model import forecast_lstm
 from models.sarimax_model import SarimaxModel
 
@@ -21,16 +24,19 @@ class ModelLoader:
     Institutional production model loader.
 
     Guarantees:
-    - registry-only loading
-    - metadata validation
+    - registry integrity verification
     - schema enforcement
-    - wrapper verification
-    - thread-safe lazy loading
+    - metadata enforcement
+    - artifact hashing validation
+    - thread-safe reload
+    - atomic version swap
     - fail-closed behavior
     """
 
     _instance = None
     _instance_lock = threading.Lock()
+
+    ###################################################
 
     def __new__(cls, *args, **kwargs):
 
@@ -62,46 +68,24 @@ class ModelLoader:
         self._initialized = True
 
     ###################################################
-    # REGISTRY RESOLUTION
+    # REGISTRY RESOLUTION + VERIFICATION
     ###################################################
 
-    def _resolve_latest(self, base_dir: str):
+    def _resolve_latest_verified(self, base_dir: str):
 
-        latest_path = os.path.join(
-            base_dir,
-            ModelRegistry.LATEST_POINTER
-        )
+        version = ModelRegistry.get_latest_version(base_dir)
 
-        if not os.path.exists(latest_path):
-            raise RuntimeError(
-                f"Registry pointer missing: {latest_path}"
-            )
-
-        with open(latest_path) as f:
-            payload = json.load(f)
-
-        version = payload.get("version")
-
-        if not version:
-            raise RuntimeError("Registry pointer corrupted.")
+        ModelRegistry.verify_artifacts(base_dir, version)
 
         version_dir = os.path.join(base_dir, version)
-
-        if not os.path.exists(version_dir):
-            raise RuntimeError(
-                "Registry version directory missing."
-            )
 
         return version, version_dir
 
     ###################################################
-    # METADATA VALIDATION
+    # METADATA VALIDATION (STRICT)
     ###################################################
 
     def _validate_metadata(self, metadata_path: str):
-
-        if not os.path.exists(metadata_path):
-            raise RuntimeError("Model metadata missing.")
 
         with open(metadata_path) as f:
             meta = json.load(f)
@@ -109,6 +93,21 @@ class ModelLoader:
         if meta.get("schema_signature") != get_schema_signature():
             raise RuntimeError(
                 "Schema mismatch — model incompatible with runtime."
+            )
+
+        if meta.get("features") != list(MODEL_FEATURES):
+            raise RuntimeError(
+                "Feature mismatch — runtime and model differ."
+            )
+
+        if "dataset_hash" not in meta:
+            raise RuntimeError(
+                "Metadata corrupted — dataset hash missing."
+            )
+
+        if "training_code_hash" not in meta:
+            raise RuntimeError(
+                "Metadata corrupted — lineage missing."
             )
 
         return meta
@@ -123,11 +122,13 @@ class ModelLoader:
             raise RuntimeError(f"Artifact missing: {path}")
 
         try:
-            return joblib.load(path)
+            model = joblib.load(path)
         except Exception as exc:
             raise RuntimeError(
                 f"Artifact appears corrupted: {path}"
             ) from exc
+
+        return model
 
     ###################################################
     # XGBOOST
@@ -140,7 +141,7 @@ class ModelLoader:
             "artifacts/xgboost"
         )
 
-        version, version_dir = self._resolve_latest(base_dir)
+        version, version_dir = self._resolve_latest_verified(base_dir)
 
         if self._xgb is not None and self._xgb_version == version:
             return self._xgb
@@ -151,7 +152,8 @@ class ModelLoader:
                 return self._xgb
 
             logger.warning(
-                f"Loading XGBoost model from registry version={version}"
+                "Loading XGBoost model version=%s",
+                version
             )
 
             model_path = os.path.join(version_dir, "model.pkl")
@@ -187,7 +189,7 @@ class ModelLoader:
             "artifacts/sarimax"
         )
 
-        version, version_dir = self._resolve_latest(base_dir)
+        version, version_dir = self._resolve_latest_verified(base_dir)
 
         if self._sarimax is not None and self._sarimax_version == version:
             return self._sarimax
@@ -198,7 +200,8 @@ class ModelLoader:
                 return self._sarimax
 
             logger.warning(
-                f"Loading SARIMAX model from registry version={version}"
+                "Loading SARIMAX model version=%s",
+                version
             )
 
             model_path = os.path.join(version_dir, "model.pkl")
@@ -238,20 +241,27 @@ class ModelLoader:
         return self._reload_sarimax_if_needed()
 
     ###################################################
-    # WARMUP
+    # SAFE WARMUP
     ###################################################
 
     def warmup(self):
 
-        if os.getenv("MODEL_WARMUP", "true") != "true":
+        if os.getenv("MODEL_WARMUP", "true").lower() != "true":
             return
 
         logger.info("Warming models")
 
-        _ = self.xgb
-        _ = self.sarimax
+        try:
+            _ = self.xgb
+        except Exception:
+            logger.exception("XGBoost warmup failed")
 
-        logger.info("Models ready")
+        try:
+            _ = self.sarimax
+        except Exception:
+            logger.exception("SARIMAX warmup failed")
+
+        logger.info("Model warmup complete")
 
     ###################################################
     # LSTM
