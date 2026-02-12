@@ -33,6 +33,10 @@ from app.monitoring.metrics import (
 logger = logging.getLogger("marketsentinel.pipeline")
 
 
+############################################################
+# CIRCUIT BREAKER
+############################################################
+
 class CircuitBreaker:
 
     def __init__(self, threshold=3, cooldown=120):
@@ -69,6 +73,10 @@ class CircuitBreaker:
             self.failures = 0
 
 
+############################################################
+# PIPELINE
+############################################################
+
 class InferencePipeline:
 
     HARD_PIPELINE_TIMEOUT = float(
@@ -85,11 +93,17 @@ class InferencePipeline:
 
     FAIL_ON_DRIFT = os.getenv("FAIL_ON_DRIFT", "false").lower() == "true"
 
+    CACHE_TTL = int(
+        os.getenv("INFERENCE_CACHE_TTL_SECONDS", "900")
+    )
+
     DATA_FRESHNESS_HOURS = int(
         os.getenv("MAX_DATA_AGE_HOURS", "24")
     )
 
     SHADOW_DIVERGENCE_THRESHOLD = 0.35
+
+    ########################################################
 
     def __init__(self):
 
@@ -124,15 +138,10 @@ class InferencePipeline:
 
     def _validate_data_freshness(self, df: pd.DataFrame):
 
-        latest = pd.to_datetime(df["date"]).max()
-
-        if latest.tzinfo is None:
-            latest = latest.tz_localize("UTC")
-        else:
-            latest = latest.tz_convert("UTC")
+        latest = pd.to_datetime(df["date"], utc=True)
 
         age_hours = (
-            pd.Timestamp.utcnow() - latest
+            pd.Timestamp.utcnow() - latest.max()
         ).total_seconds() / 3600
 
         if age_hours > self.DATA_FRESHNESS_HOURS:
@@ -145,7 +154,10 @@ class InferencePipeline:
 
     def _extract_features(self, latest_row):
 
-        vector = latest_row.loc[list(MODEL_FEATURES)].astype("float32")
+        vector = latest_row.loc[list(MODEL_FEATURES)]
+
+        if vector.isna().all():
+            raise RuntimeError("All features are NaN.")
 
         null_ratio = float(np.isnan(vector).mean())
 
@@ -157,7 +169,31 @@ class InferencePipeline:
                 null_ratio
             )
 
-        return vector.values.reshape(1, -1)
+        arr = vector.astype("float32").values.reshape(1, -1)
+
+        if not np.isfinite(arr).all():
+            raise RuntimeError("Non-finite feature vector detected.")
+
+        return arr
+
+    ########################################################
+
+    def _safe_sentiment_fetch(self, ticker):
+
+        try:
+
+            news = self.news_fetcher.fetch(f"{ticker} stock")
+
+            scored = self.sentiment.analyze_dataframe(news)
+
+            return self.sentiment.aggregate_daily_sentiment(scored)
+
+        except Exception:
+            logger.exception(
+                "Sentiment pipeline failed — using neutral fallback."
+            )
+
+            return pd.DataFrame()
 
     ########################################################
 
@@ -169,12 +205,9 @@ class InferencePipeline:
 
             slope = forecast["normalized_slope"]
 
-            prob_like = float(np.tanh(slope * 5) * 0.5 + 0.5)
-
-            return prob_like
+            return float(np.tanh(slope * 5) * 0.5 + 0.5)
 
         except Exception:
-
             logger.exception("SARIMAX shadow inference failed.")
             return None
 
@@ -212,7 +245,6 @@ class InferencePipeline:
         try:
 
             payload = {"ticker": ticker}
-
             cache_key = self.cache.build_key(payload)
 
             cached = self.cache.get(cache_key)
@@ -227,6 +259,19 @@ class InferencePipeline:
 
             with lock:
 
+                # SECOND CACHE CHECK (CRITICAL)
+                cached = self.cache.get(cache_key)
+                if cached:
+                    CACHE_HITS.inc()
+                    return cached
+
+                ################################################
+                # HARD TIME GUARD
+                ################################################
+
+                if (time.time() - start_pipeline) > self.HARD_PIPELINE_TIMEOUT:
+                    raise RuntimeError("Pipeline timeout exceeded.")
+
                 price_df = self.market_data.get_price_data(
                     ticker=ticker,
                     start_date="2018-01-01",
@@ -235,11 +280,7 @@ class InferencePipeline:
 
                 self._validate_data_freshness(price_df)
 
-                sentiment_df = self.sentiment.aggregate_daily_sentiment(
-                    self.sentiment.analyze_dataframe(
-                        self.news_fetcher.fetch(f"{ticker} stock")
-                    )
-                )
+                sentiment_df = self._safe_sentiment_fetch(ticker)
 
                 dataset = self.feature_store.get_features(
                     price_df,
@@ -247,12 +288,24 @@ class InferencePipeline:
                     ticker=ticker
                 )
 
-                drift = self.drift_detector.detect(
-                    dataset[MODEL_FEATURES]
-                )
+                ################################################
+                # DRIFT SAFE MODE
+                ################################################
 
-                if drift["drift_detected"] and self.FAIL_ON_DRIFT:
-                    raise RuntimeError("Drift detected — inference halted.")
+                try:
+                    drift = self.drift_detector.detect(
+                        dataset[MODEL_FEATURES]
+                    )
+
+                    if drift["drift_detected"] and self.FAIL_ON_DRIFT:
+                        raise RuntimeError(
+                            "Drift detected — inference halted."
+                        )
+
+                except Exception:
+                    logger.exception(
+                        "Drift detector failure — continuing inference."
+                    )
 
                 latest = dataset.iloc[-1]
                 features = self._extract_features(latest)
@@ -284,8 +337,6 @@ class InferencePipeline:
                             divergence
                         )
 
-                ################################################
-
                 predicted_return = prob_up - 0.5
 
                 decision = self.decision_engine.generate(
@@ -314,10 +365,7 @@ class InferencePipeline:
                     "position_size_pct": decision["position_pct"]
                 }
 
-                self.cache.set(cache_key, response, ttl=900)
-
-                if (time.time() - start_pipeline) > self.HARD_PIPELINE_TIMEOUT:
-                    logger.warning("Pipeline exceeded hard timeout.")
+                self.cache.set(cache_key, response, ttl=self.CACHE_TTL)
 
                 self.breaker.record_success()
 
