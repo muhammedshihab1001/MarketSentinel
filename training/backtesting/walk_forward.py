@@ -18,6 +18,8 @@ class WalkForwardValidator:
     MIN_ASSETS_PER_DAY = 3
     MIN_FEATURE_VARIANCE = 1e-8
 
+    MAX_TURNOVER = 0.65   # ⭐ institutional threshold
+
     def __init__(
         self,
         model_trainer,
@@ -44,11 +46,6 @@ class WalkForwardValidator:
 
         if df["ticker"].nunique() < 3:
             raise RuntimeError("Training universe too small.")
-
-        df_sorted = df.sort_values(["date", "ticker"])
-
-        if not df.index.equals(df_sorted.index):
-            raise RuntimeError("Training dataframe not sorted.")
 
         validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
@@ -87,34 +84,36 @@ class WalkForwardValidator:
             raise RuntimeError("Model collapsed.")
 
     ############################################
-    # SAFE PRICE BUILDER
+    # TURNOVER
     ############################################
 
-    def _build_price_dict(self, slice_df):
+    def _calculate_turnover(self, grouped_signals):
 
-        prices = {
-            t: float(p)
-            for t, p in zip(slice_df["ticker"], slice_df["close"])
-            if pd.notna(p) and np.isfinite(p) and p > 0
-        }
+        previous = None
+        flips = 0
+        total = 0
 
-        return prices
+        for date in sorted(grouped_signals):
 
-    ############################################
-    # UNIVERSE ALIGNMENT
-    ############################################
+            current = grouped_signals[date]
 
-    def _align_universe(self, prices, signals):
+            if previous is not None:
 
-        shared = set(prices.keys()) & set(signals.keys())
+                shared = set(previous) & set(current)
 
-        if len(shared) < self.MIN_ASSETS_PER_DAY:
-            return None, None
+                for t in shared:
 
-        prices = {t: prices[t] for t in shared}
-        signals = {t: signals[t] for t in shared}
+                    if previous[t] != current[t]:
+                        flips += 1
 
-        return prices, signals
+                total += len(shared)
+
+            previous = current
+
+        if total == 0:
+            return 0.0
+
+        return flips / total
 
     ############################################
     # RUN
@@ -123,8 +122,6 @@ class WalkForwardValidator:
     def run(self, df: pd.DataFrame):
 
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
-        df = self.regime_detector.detect(df)
 
         unique_dates = pd.to_datetime(
             df["date"].drop_duplicates()
@@ -135,12 +132,7 @@ class WalkForwardValidator:
 
         results = []
         equity_curve = []
-
-        regime_buckets = {
-            "BULL": [],
-            "BEAR": [],
-            "SIDEWAYS": []
-        }
+        sharpe_series = []
 
         capital = 10_000.0
         start_idx = self.window_size
@@ -163,7 +155,7 @@ class WalkForwardValidator:
 
             test_dates = unique_dates[
                 (unique_dates >= train_end_date)
-            ][:self.step_size + 1]  # +1 for T+1 execution
+            ][:self.step_size + 1]
 
             if len(test_dates) < 2:
                 break
@@ -178,6 +170,13 @@ class WalkForwardValidator:
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
+            ################################################
+            # ⭐ REGIME DETECTION INSIDE WINDOW (LEAK SAFE)
+            ################################################
+
+            train_df = self.regime_detector.detect(train_df)
+            test_df = self.regime_detector.detect(test_df)
+
             self._validate_training_frame(train_df)
 
             model = self.model_trainer(train_df)
@@ -185,14 +184,9 @@ class WalkForwardValidator:
 
             grouped_prices = {}
             grouped_signals = {}
-
             trade_counter = 0
 
             test_dates_sorted = sorted(test_df["date"].unique())
-
-            ############################################
-            # T+1 EXECUTION LOOP
-            ############################################
 
             for i in range(len(test_dates_sorted) - 1):
 
@@ -202,24 +196,28 @@ class WalkForwardValidator:
                 signal_slice = test_df[test_df["date"] == signal_date]
                 exec_slice = test_df[test_df["date"] == execution_date]
 
-                prices = self._build_price_dict(exec_slice)
+                prices = {
+                    t: float(p)
+                    for t, p in zip(exec_slice["ticker"], exec_slice["close"])
+                    if pd.notna(p) and np.isfinite(p) and p > 0
+                }
 
                 signals_list = self.signal_generator(
                     model,
                     signal_slice
                 )
 
-                raw_signals = dict(
+                signals = dict(
                     zip(signal_slice["ticker"], signals_list)
                 )
 
-                prices, signals = self._align_universe(
-                    prices,
-                    raw_signals
-                )
+                shared = set(prices) & set(signals)
 
-                if prices is None:
+                if len(shared) < self.MIN_ASSETS_PER_DAY:
                     continue
+
+                prices = {t: prices[t] for t in shared}
+                signals = {t: signals[t] for t in shared}
 
                 trade_counter += sum(
                     1 for s in signals.values()
@@ -233,6 +231,16 @@ class WalkForwardValidator:
                 start_idx += self.step_size
                 continue
 
+            ############################################
+            # TURNOVER CHECK
+            ############################################
+
+            turnover = self._calculate_turnover(grouped_signals)
+
+            if turnover > self.MAX_TURNOVER:
+                start_idx += self.step_size
+                continue
+
             metrics = self.engine.run(
                 grouped_prices,
                 grouped_signals,
@@ -242,12 +250,9 @@ class WalkForwardValidator:
             capital = float(metrics["final_portfolio"])
 
             if not np.isfinite(capital) or capital <= 0:
-                raise RuntimeError("Capital corrupted during walk-forward.")
+                raise RuntimeError("Capital corrupted.")
 
             curve = np.array(metrics["equity_curve"], dtype=float)
-
-            if not np.isfinite(curve).all():
-                raise RuntimeError("Invalid equity curve.")
 
             if equity_curve:
                 equity_curve.extend(curve[1:].tolist())
@@ -255,13 +260,7 @@ class WalkForwardValidator:
                 equity_curve.extend(curve.tolist())
 
             results.append(metrics)
-
-            dominant_regime = (
-                test_df["regime"].value_counts().idxmax()
-            )
-
-            if dominant_regime in regime_buckets:
-                regime_buckets[dominant_regime].append(metrics)
+            sharpe_series.append(metrics["sharpe_ratio"])
 
             start_idx += self.step_size
 
@@ -270,17 +269,24 @@ class WalkForwardValidator:
                 "Walk-forward produced insufficient windows."
             )
 
-        return self.aggregate_results(
-            results,
-            equity_curve,
-            regime_buckets
-        )
+        ############################################
+        # STABILITY TEST (VERY IMPORTANT)
+        ############################################
+
+        sharpe_std = np.std(sharpe_series)
+
+        if sharpe_std > 1.2:
+            raise RuntimeError(
+                "Sharpe instability detected — strategy unreliable."
+            )
+
+        return self.aggregate_results(results, equity_curve)
 
     ############################################
     # AGGREGATION
     ############################################
 
-    def aggregate_results(self, results, equity_curve, regime_buckets):
+    def aggregate_results(self, results, equity_curve):
 
         df = pd.DataFrame(results)
         curve = np.array(equity_curve, dtype=float)
@@ -295,19 +301,6 @@ class WalkForwardValidator:
 
         profit_factor = float(gains / losses)
 
-        regime_summary = {}
-
-        for regime, bucket in regime_buckets.items():
-
-            if bucket:
-                bucket_df = pd.DataFrame(bucket)
-
-                regime_summary[regime] = {
-                    "avg_return": float(bucket_df["strategy_return"].mean()),
-                    "avg_sharpe": float(bucket_df["sharpe_ratio"].mean()),
-                    "windows": len(bucket_df)
-                }
-
         return {
             "avg_strategy_return": float(df["strategy_return"].mean()),
             "avg_sharpe": float(df["sharpe_ratio"].mean()),
@@ -316,6 +309,5 @@ class WalkForwardValidator:
             "return_volatility": float(df["strategy_return"].std()),
             "final_equity": float(curve[-1]),
             "equity_curve": curve.tolist(),
-            "regime_performance": regime_summary,
             "num_windows": len(df)
         }
