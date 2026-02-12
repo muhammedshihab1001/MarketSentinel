@@ -1,5 +1,4 @@
 import os
-import datetime
 import joblib
 import numpy as np
 import tensorflow as tf
@@ -11,6 +10,8 @@ from tensorflow.keras.callbacks import EarlyStopping
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
+from core.time.market_time import MarketTime   #  CRITICAL
+
 from models.lstm_model import build_lstm_model
 
 
@@ -45,7 +46,7 @@ def configure_runtime():
     os.environ["TF_DETERMINISTIC_OPS"] = "1"
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # force CPU determinism
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
@@ -76,11 +77,9 @@ def atomic_save_model(model, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     tmp_path = path + ".tmp.keras"
-
     model.save(tmp_path)
 
     os.replace(tmp_path, path)
-
     _fsync_dir(os.path.dirname(path))
 
 
@@ -89,20 +88,19 @@ def atomic_joblib_dump(obj, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     tmp = path + ".tmp"
-
     joblib.dump(obj, tmp)
 
     os.replace(tmp, path)
-
     _fsync_dir(os.path.dirname(path))
 
 
 ############################################################
+# LOAD DATA (WINDOW GOVERNED)
+############################################################
 
-def load_data():
+def load_data(start_date, end_date):
 
     fetcher = StockPriceFetcher()
-    end_date = datetime.date.today().isoformat()
 
     datasets = []
 
@@ -110,7 +108,7 @@ def load_data():
 
         df = fetcher.fetch(
             ticker=ticker,
-            start_date="2012-01-01",
+            start_date=start_date,
             end_date=end_date
         )
 
@@ -128,7 +126,7 @@ def load_data():
     df["date"] = pd.to_datetime(df["date"])
     df.sort_values(["ticker", "date"], inplace=True)
 
-    return df.reset_index(drop=True), end_date
+    return df.reset_index(drop=True)
 
 
 ############################################################
@@ -144,9 +142,6 @@ def build_sequences_with_scalers(df):
     for ticker, tdf in df.groupby("ticker"):
 
         prices = tdf["close"].astype("float32").values.reshape(-1, 1)
-
-        if len(prices) < MIN_ROWS_PER_TICKER:
-            continue
 
         scaler = MinMaxScaler()
         scaled = scaler.fit_transform(prices)
@@ -178,7 +173,6 @@ def apply_scalers(df, scalers):
             continue
 
         prices = tdf["close"].astype("float32").values.reshape(-1, 1)
-
         scaled = scalers[ticker].transform(prices)
 
         for i in range(len(scaled) - LOOKBACK_WINDOW):
@@ -234,14 +228,19 @@ def time_series_validation(df):
 
 
 ############################################################
+# MAIN (CLOCK GOVERNED)
+############################################################
 
-if __name__ == "__main__":
-
-    print("Institutional LSTM Training")
+def main(start_date=None, end_date=None):
 
     configure_runtime()
 
-    df, end_date = load_data()
+    if start_date is None or end_date is None:
+        start_date, end_date = MarketTime.training_window()
+
+    print(f"Institutional LSTM Training | {start_date} -> {end_date}")
+
+    df = load_data(start_date, end_date)
 
     dataset_hash = MetadataManager.fingerprint_dataset(
         df[["ticker", "date", "close"]]
@@ -256,10 +255,16 @@ if __name__ == "__main__":
         model_name="lstm_price_forecast",
         metrics={"val_loss": val_loss},
         features=["close_sequence"],
-        training_start="2012-01-01",
+        training_start=start_date,
         training_end=end_date,
         dataset_hash=dataset_hash,
-        metadata_type="sequence_manifest_v1"
+        metadata_type="training_manifest_v1",   #  FIXED
+        extra_fields={
+            "training_window": {
+                "start": start_date,
+                "end": end_date
+            }
+        }
     )
 
     MetadataManager.save_metadata(metadata, METADATA_PATH)
@@ -274,9 +279,10 @@ if __name__ == "__main__":
 
     os.replace(SCALER_PATH, scaler_target)
 
-    if not os.path.exists(scaler_target):
-        raise RuntimeError("Scaler promotion failed.")
-
     _fsync_dir(os.path.join(MODEL_DIR, version))
 
     print(f"LSTM registered → {version}")
+
+
+if __name__ == "__main__":
+    main()
