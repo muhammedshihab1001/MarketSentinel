@@ -12,6 +12,8 @@ class PortfolioBacktestEngine:
 
     MAX_SINGLE_STEP_RETURN = 0.40
 
+    VALID_SIGNALS = {"BUY", "HOLD"}
+
     def __init__(
         self,
         transaction_cost=0.001,
@@ -41,6 +43,25 @@ class PortfolioBacktestEngine:
         if price is None or not np.isfinite(price) or price <= 0:
             raise RuntimeError("Invalid market price encountered.")
         return float(price)
+
+    def _validate_signals(self, signals):
+
+        invalid = [
+            s for s in signals.values()
+            if s not in self.VALID_SIGNALS
+        ]
+
+        if invalid:
+            raise RuntimeError(
+                f"Invalid trading signals detected: {set(invalid)}"
+            )
+
+    def _validate_price_signal_alignment(self, prices, signals):
+
+        if set(prices.keys()) != set(signals.keys()):
+            raise RuntimeError(
+                "Price/signal universe mismatch detected."
+            )
 
     ###################################################
     # VOL ESTIMATION
@@ -161,10 +182,14 @@ class PortfolioBacktestEngine:
         for date in sorted(grouped_prices.keys()):
 
             prices = grouped_prices[date]
+            signals_today = grouped_signals[date]
+
+            self._validate_signals(signals_today)
+            self._validate_price_signal_alignment(prices, signals_today)
 
             if prev_prices is None:
                 prev_prices = prices
-                prev_signals = grouped_signals[date]
+                prev_signals = signals_today
                 equity_curve.append(cash)
                 continue
 
@@ -176,6 +201,12 @@ class PortfolioBacktestEngine:
                 positions.get(t, 0) * self._safe_price(prices.get(t))
                 for t in positions
             )
+
+            if not np.isfinite(portfolio_value):
+                raise RuntimeError("Non-finite portfolio value detected.")
+
+            if portfolio_value <= 0:
+                raise RuntimeError("Portfolio value collapsed.")
 
             deployable_capital = portfolio_value * (1 - self.CASH_BUFFER)
 
@@ -208,6 +239,10 @@ class PortfolioBacktestEngine:
 
                 delta = target_positions.get(ticker, 0) - positions.get(ticker, 0)
 
+                # prevent shorting
+                if positions.get(ticker, 0) + delta < -self.EPSILON:
+                    raise RuntimeError("Short exposure detected.")
+
                 trade_notional = abs(delta) * trade_price
 
                 cost = trade_notional * (
@@ -217,7 +252,7 @@ class PortfolioBacktestEngine:
                 simulated_cash -= delta * trade_price
                 simulated_cash -= cost
 
-            if simulated_cash < -1e-6:
+            if simulated_cash < -self.EPSILON:
                 raise RuntimeError("Backtest attempted leverage.")
 
             ###################################################
@@ -250,10 +285,13 @@ class PortfolioBacktestEngine:
                 cash -= delta * trade_price
                 cash -= cost
 
-                if target == 0:
+                if target <= self.EPSILON:
                     positions.pop(ticker, None)
                 else:
                     positions[ticker] = target
+
+            # clamp floating drift
+            cash = max(cash, 0.0)
 
             equity = cash + sum(
                 positions.get(t, 0) * self._safe_price(prices.get(t))
@@ -277,7 +315,7 @@ class PortfolioBacktestEngine:
             equity_curve.append(float(equity))
 
             prev_prices = prices
-            prev_signals = grouped_signals[date]
+            prev_signals = signals_today
 
         curve = np.array(equity_curve, dtype=float)
 
@@ -286,16 +324,18 @@ class PortfolioBacktestEngine:
             np.maximum(curve[:-1], self.EPSILON)
         ) if len(curve) > 1 else np.array([0.0])
 
-        sharpe = (
-            np.mean(returns) /
-            max(np.std(returns), self.EPSILON) *
-            np.sqrt(252)
+        vol = max(np.std(returns), 1e-6)
+
+        sharpe = np.clip(
+            np.mean(returns) / vol * np.sqrt(252),
+            -10,
+            10
         )
 
         peak = np.maximum.accumulate(curve)
         drawdown = (curve - peak) / np.maximum(peak, self.EPSILON)
 
-        avg_turnover = turnover / max(curve.mean(), self.EPSILON)
+        avg_turnover = turnover / max(curve.mean(), 1.0)
 
         return {
             "final_portfolio": float(curve[-1]),
