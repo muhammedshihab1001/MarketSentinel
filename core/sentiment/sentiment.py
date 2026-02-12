@@ -7,14 +7,17 @@ import os
 import threading
 import hashlib
 import re
+import tempfile
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-from core.config.env_loader import init_env, get_bool
+from core.config.env_loader import init_env
 
 init_env()
 
 logger = logging.getLogger("marketsentinel.sentiment")
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 ############################################################
@@ -31,7 +34,7 @@ class FinBERTSingleton:
     MODEL_NAME = "ProsusAI/finbert"
     CACHE_DIR = "artifacts/huggingface"
 
-    MAX_LOAD_RETRIES = 3
+    USE_FP16 = torch.cuda.is_available()
 
     @classmethod
     def load(cls):
@@ -46,65 +49,41 @@ class FinBERTSingleton:
 
             os.makedirs(cls.CACHE_DIR, exist_ok=True)
 
-            for attempt in range(cls.MAX_LOAD_RETRIES):
+            start = time.time()
 
-                try:
+            logger.info("Loading FinBERT on %s", cls._device)
 
-                    start = time.time()
+            torch.set_grad_enabled(False)
+            torch.set_num_threads(min(4, os.cpu_count()))
 
-                    logger.info(
-                        "Loading FinBERT on %s",
-                        cls._device
-                    )
+            cls._tokenizer = AutoTokenizer.from_pretrained(
+                cls.MODEL_NAME,
+                cache_dir=cls.CACHE_DIR
+            )
 
-                    torch.set_grad_enabled(False)
-                    torch.set_num_threads(
-                        min(4, os.cpu_count())
-                    )
+            model = AutoModelForSequenceClassification.from_pretrained(
+                cls.MODEL_NAME,
+                cache_dir=cls.CACHE_DIR
+            )
 
-                    cls._tokenizer = AutoTokenizer.from_pretrained(
-                        cls.MODEL_NAME,
-                        cache_dir=cls.CACHE_DIR
-                    )
+            model = model.to(cls._device)
 
-                    cls._model = (
-                        AutoModelForSequenceClassification
-                        .from_pretrained(
-                            cls.MODEL_NAME,
-                            cache_dir=cls.CACHE_DIR
-                        )
-                        .to(cls._device)
-                    )
+            if cls.USE_FP16:
+                model = model.half()
 
-                    cls._model.eval()
+            model.eval()
 
-                    if cls._model.config.num_labels != 3:
-                        raise RuntimeError(
-                            "FinBERT label mismatch."
-                        )
+            if model.config.num_labels != 3:
+                raise RuntimeError("FinBERT label mismatch.")
 
-                    logger.info(
-                        "FinBERT loaded in %.2fs",
-                        time.time() - start
-                    )
+            cls._model = model
 
-                    return cls._tokenizer, cls._model, cls._device
+            logger.info(
+                "FinBERT loaded in %.2fs",
+                time.time() - start
+            )
 
-                except Exception as e:
-
-                    if attempt == cls.MAX_LOAD_RETRIES - 1:
-                        raise RuntimeError(
-                            "FinBERT failed to load."
-                        ) from e
-
-                    sleep = 2 * (attempt + 1)
-
-                    logger.warning(
-                        "FinBERT load retry %s",
-                        attempt + 1
-                    )
-
-                    time.sleep(sleep)
+            return cls._tokenizer, cls._model, cls._device
 
 
 ############################################################
@@ -113,13 +92,15 @@ class FinBERTSingleton:
 
 class SentimentAnalyzer:
 
+    CACHE_SCHEMA_VERSION = "v2"
+
     label_map = {
         0: "negative",
         1: "neutral",
         2: "positive"
     }
 
-    BATCH_SIZE = 16
+    BATCH_SIZE = 32 if torch.cuda.is_available() else 16
     MAX_HEADLINE_CHARS = 300
 
     MIN_CONFIDENCE = 0.55
@@ -127,7 +108,6 @@ class SentimentAnalyzer:
 
     MIN_NEWS_PER_DAY = 3
     STD_FLOOR = 0.05
-
     SENTIMENT_EMBARGO_HOURS = 2
 
     CACHE_DIR = "data/sentiment_cache"
@@ -150,10 +130,14 @@ class SentimentAnalyzer:
         self._warmup()
 
     ############################################################
+    # STRONG GPU WARMUP
+    ############################################################
 
     def _warmup(self):
+
         try:
-            self.analyze_batch(["market stable"])
+            dummy = ["market stable"] * self.BATCH_SIZE
+            self.analyze_batch(dummy)
         except Exception:
             logger.exception("FinBERT warmup failed")
 
@@ -163,7 +147,9 @@ class SentimentAnalyzer:
 
     def _cache_path(self, key):
 
-        h = hashlib.sha256(key.encode()).hexdigest()[:16]
+        raw = f"{self.CACHE_SCHEMA_VERSION}|{key}|{self.MIN_CONFIDENCE}"
+        h = hashlib.sha256(raw.encode()).hexdigest()[:20]
+
         return f"{self.CACHE_DIR}/{h}.parquet"
 
     def _load_cache(self, path):
@@ -189,9 +175,17 @@ class SentimentAnalyzer:
     def _write_cache(self, df, path):
 
         try:
-            tmp = path + ".tmp"
-            df.to_parquet(tmp, index=False)
-            os.replace(tmp, path)
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                dir=self.CACHE_DIR,
+                suffix=".tmp"
+            ) as tmp:
+
+                df.to_parquet(tmp.name, index=False)
+                temp_name = tmp.name
+
+            os.replace(temp_name, path)
+
         except Exception:
             logger.warning("Sentiment cache write failed.")
 
@@ -264,7 +258,7 @@ class SentimentAnalyzer:
                     probs = torch.softmax(
                         logits,
                         dim=1
-                    ).cpu().numpy()
+                    ).float().cpu().numpy()
 
                 idx = 0
 
@@ -315,11 +309,6 @@ class SentimentAnalyzer:
                     for _ in raw_batch
                 )
 
-            finally:
-
-                if self.device == "cuda":
-                    torch.cuda.empty_cache()
-
         if failures / max(len(texts), 1) > self.MAX_FAILURE_RATE:
             raise RuntimeError(
                 "FinBERT failure rate exceeded threshold."
@@ -327,8 +316,6 @@ class SentimentAnalyzer:
 
         return results
 
-    ############################################################
-    # DATAFRAME
     ############################################################
 
     def analyze_dataframe(self, df):
@@ -383,73 +370,3 @@ class SentimentAnalyzer:
         self._write_cache(final, cache_path)
 
         return final
-
-    ############################################################
-    # DAILY AGGREGATION
-    ############################################################
-
-    def aggregate_daily_sentiment(self, df):
-
-        if df.empty:
-            return pd.DataFrame({
-                "date": [],
-                "avg_sentiment": [],
-                "news_count": [],
-                "sentiment_std": []
-            })
-
-        temp_df = df.copy()
-
-        temp_df["date"] = pd.to_datetime(
-            temp_df["published_at"],
-            errors="coerce",
-            utc=True
-        )
-
-        temp_df = temp_df.dropna(subset=["date"])
-
-        temp_df["date"] = temp_df["date"].dt.tz_convert(None)
-
-        embargo_hour = 24 - self.SENTIMENT_EMBARGO_HOURS
-
-        late_mask = temp_df["date"].dt.hour >= embargo_hour
-
-        temp_df["effective_date"] = (
-            temp_df["date"].dt.floor("D")
-            + pd.to_timedelta(
-                late_mask.astype(int),
-                unit="D"
-            )
-        )
-
-        aggregated = (
-            temp_df
-            .groupby("effective_date", sort=True)
-            .agg(
-                avg_sentiment=("score", "mean"),
-                news_count=("score", "count"),
-                sentiment_std=("score", "std")
-            )
-            .reset_index()
-            .rename(columns={"effective_date": "date"})
-        )
-
-        low_news = aggregated["news_count"] < self.MIN_NEWS_PER_DAY
-
-        aggregated.loc[
-            low_news,
-            "avg_sentiment"
-        ] *= 0.5
-
-        aggregated["sentiment_std"] = (
-            aggregated["sentiment_std"]
-            .fillna(self.STD_FLOOR)
-            .clip(lower=self.STD_FLOOR)
-        )
-
-        aggregated["avg_sentiment"] = (
-            aggregated["avg_sentiment"]
-            .clip(-1, 1)
-        )
-
-        return aggregated
