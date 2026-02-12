@@ -23,10 +23,11 @@ class FeatureEngineer:
 
     RETURN_CLAMP = (-0.5, 0.5)
 
-    # widened — real markets have sparse news
-    MERGE_TOLERANCE = pd.Timedelta("7D")
+    # Institutional safe window
+    MERGE_TOLERANCE = pd.Timedelta("2D")
 
     VOL_FLOOR = 1e-4
+    SENTIMENT_STD_FLOOR = 0.02
 
     ###############################################
     # DATETIME
@@ -82,7 +83,7 @@ class FeatureEngineer:
         return df
 
     ###############################################
-    # FLOAT32
+    # FLOAT32 ENFORCEMENT
     ###############################################
 
     @staticmethod
@@ -144,40 +145,29 @@ class FeatureEngineer:
         df["macd_signal"] = signal.clip(-50, 50)
 
     ###############################################
-    # SENTIMENT MERGE — PRODUCTION SAFE
+    # SENTIMENT MERGE — FAIL CLOSED
     ###############################################
 
     @classmethod
     def merge_price_sentiment(cls, price_df, sentiment_df):
 
-        price = cls._normalize_datetime(price_df).sort_values("date")
-
         if sentiment_df is None or sentiment_df.empty:
-
-            logger.warning(
-                "Sentiment unavailable — using neutral fallback."
+            raise RuntimeError(
+                "Sentiment dataset empty — refusing to fabricate signal."
             )
 
-            sentiment = pd.DataFrame({
-                "date": price["date"],
-                "avg_sentiment": 0.0,
-                "news_count": 0.0,
-                "sentiment_std": 0.0
-            })
+        price = cls._normalize_datetime(price_df).sort_values("date")
 
-        else:
+        sentiment = sentiment_df.copy()
 
-            sentiment = sentiment_df.copy()
+        missing = set(cls.SENTIMENT_COLUMNS) - set(sentiment.columns)
 
-            missing = set(cls.SENTIMENT_COLUMNS) - set(sentiment.columns)
+        if missing:
+            raise RuntimeError(
+                f"Sentiment schema violation: {missing}"
+            )
 
-            if missing:
-                raise RuntimeError(
-                    f"Sentiment schema violation: {missing}"
-                )
-
-            sentiment = sentiment.loc[:, cls.SENTIMENT_COLUMNS]
-
+        sentiment = sentiment.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment).sort_values("date")
 
         if sentiment["date"].duplicated().any():
@@ -202,26 +192,28 @@ class FeatureEngineer:
         )
 
         ###########################################
-        # DECAY LOGIC (KEY)
+        # DECAY WITH FLOOR
         ###########################################
 
-        merged["avg_sentiment"] = (
-            merged["avg_sentiment"]
-            .ffill(limit=5)
-            .fillna(0.0)
-        )
-
-        merged["news_count"] = (
-            merged["news_count"]
-            .ffill(limit=5)
-            .fillna(0.0)
-        )
+        merged["avg_sentiment"] = merged["avg_sentiment"].ffill(limit=3)
+        merged["news_count"] = merged["news_count"].ffill(limit=3)
+        merged["sentiment_std"] = merged["sentiment_std"].ffill(limit=3)
 
         merged["sentiment_std"] = (
             merged["sentiment_std"]
-            .ffill(limit=5)
-            .fillna(0.0)
+            .fillna(cls.SENTIMENT_STD_FLOOR)
+            .clip(lower=cls.SENTIMENT_STD_FLOOR)
         )
+
+        merged.dropna(
+            subset=["avg_sentiment", "news_count"],
+            inplace=True
+        )
+
+        if merged["avg_sentiment"].std() < 1e-4:
+            raise RuntimeError(
+                "Sentiment variance collapsed — check news pipeline."
+            )
 
         return merged
 
@@ -250,6 +242,7 @@ class FeatureEngineer:
         df["return_lag1"] = df["return"].shift(1)
         df["sentiment_lag1"] = df["avg_sentiment"].shift(1)
 
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df.dropna(inplace=True)
 
         if len(df) < 100:
@@ -272,6 +265,7 @@ class FeatureEngineer:
         df["return_lag1"] = df["return"].shift(1)
         df["sentiment_lag1"] = df["avg_sentiment"].shift(1)
 
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df.dropna(inplace=True)
 
         return df
@@ -305,8 +299,6 @@ class FeatureEngineer:
             df = cls.create_training_dataset(df)
         else:
             df = cls.create_inference_dataset(df)
-
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
         feature_block = df.loc[:, MODEL_FEATURES]
 
