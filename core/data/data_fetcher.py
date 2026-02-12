@@ -5,7 +5,6 @@ import hashlib
 import logging
 import os
 import random
-
 from datetime import datetime, timedelta
 
 
@@ -26,39 +25,147 @@ class StockPriceFetcher:
     MIN_ROWS = 120
     MAX_RETRIES = 5
     BASE_SLEEP = 1.5
+    MAX_GAP_DAYS = 10
+    MIN_COVERAGE_RATIO = 0.85
 
     CACHE_DIR = "data/cache"
-    CACHE_VERSION = "2.0"
 
     def __init__(self):
         os.makedirs(self.CACHE_DIR, exist_ok=True)
 
-    # -----------------------------------------------------
+    ##################################################
+    # TIME SAFETY
+    ##################################################
 
     @staticmethod
-    def _cap_to_yesterday(date_str):
+    def _to_naive_utc(ts):
+        """
+        Convert anything into tz-naive UTC.
+        """
+        ts = pd.Timestamp(ts)
 
-        requested = pd.Timestamp(date_str).normalize()
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("UTC").tz_localize(None)
+
+        return ts
+
+    def _cap_to_yesterday(self, end_date: str):
+
+        requested = self._to_naive_utc(end_date)
 
         yesterday = (
             pd.Timestamp.utcnow()
-            .normalize() - pd.Timedelta(days=1)
+            .tz_localize(None)
+            - timedelta(days=1)
         )
 
         return min(requested, yesterday)
 
-    # -----------------------------------------------------
+    ##################################################
 
-    def _cache_key(self, ticker, start, end, interval):
+    def _flatten_columns(self, df: pd.DataFrame):
 
-        raw = (
-            f"{ticker}|{start}|{end}|{interval}|"
-            f"adj=auto|schema=v2|cache={self.CACHE_VERSION}"
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df.columns = [str(c).lower() for c in df.columns]
+
+        return df.loc[:, ~df.columns.duplicated()]
+
+    ##################################################
+
+    def _normalize_schema(self, df: pd.DataFrame):
+
+        df = self._flatten_columns(df)
+
+        if "date" not in df.columns:
+            df = df.reset_index()
+            df.rename(columns={df.columns[0]: "date"}, inplace=True)
+
+        df["date"] = (
+            pd.to_datetime(
+                df["date"],
+                errors="coerce",
+                utc=True
+            )
+            .dt.tz_convert(None)
         )
 
-        return hashlib.sha256(raw.encode()).hexdigest()[:20]
+        numeric_cols = ["open", "high", "low", "close", "volume"]
 
-    # -----------------------------------------------------
+        for col in numeric_cols:
+
+            if col not in df.columns:
+                raise RuntimeError(
+                    f"Provider schema violation: missing={col}"
+                )
+
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            )
+
+        df = df.dropna(subset=["date"] + numeric_cols)
+
+        return df
+
+    ##################################################
+
+    def _detect_gaps(self, df: pd.DataFrame):
+
+        diffs = df["date"].diff().dt.days.dropna()
+
+        if (diffs > self.MAX_GAP_DAYS).any():
+            raise RuntimeError("Large gap detected in price history.")
+
+    ##################################################
+
+    def _validate_coverage(self, df, start_date, end_date):
+
+        start = self._to_naive_utc(start_date)
+        end = self._to_naive_utc(end_date)
+
+        expected_days = len(
+            pd.bdate_range(start=start, end=end)
+        )
+
+        expected_days = max(expected_days, 1)
+
+        coverage = len(df) / expected_days
+
+        if coverage < self.MIN_COVERAGE_RATIO:
+            raise RuntimeError(
+                f"Dataset coverage too low: {coverage:.2f}"
+            )
+
+    ##################################################
+
+    def _validate_dataset(self, df, start_date, end_date):
+
+        if df is None or df.empty:
+            raise RuntimeError("Provider returned empty dataset.")
+
+        df = self._normalize_schema(df)
+
+        if (df["close"] <= 0).any():
+            raise RuntimeError("Invalid close prices detected.")
+
+        if (df["high"] < df["low"]).any():
+            raise RuntimeError("High < Low detected.")
+
+        df = df.drop_duplicates("date").sort_values("date")
+
+        self._detect_gaps(df)
+        self._validate_coverage(df, start_date, end_date)
+
+        if len(df) < self.MIN_ROWS:
+            raise RuntimeError(
+                f"Dataset too small: {len(df)} rows"
+            )
+
+        return df.reset_index(drop=True)
+
+    ##################################################
 
     def _atomic_cache_write(self, df, cache_file):
 
@@ -66,55 +173,14 @@ class StockPriceFetcher:
         df.to_parquet(tmp, index=False)
         os.replace(tmp, cache_file)
 
-    # -----------------------------------------------------
+    ##################################################
 
-    def _normalize_schema(self, df: pd.DataFrame):
+    def _cache_key(self, ticker, start, end, interval):
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        raw = f"{ticker}_{start}_{end}_{interval}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-        df.columns = [str(c).lower() for c in df.columns]
-
-        if "date" not in df.columns:
-            df = df.reset_index()
-            df.rename(columns={df.columns[0]: "date"}, inplace=True)
-
-        df["date"] = pd.to_datetime(
-            df["date"],
-            errors="coerce",
-            utc=True
-        ).dt.tz_convert(None)
-
-        numeric_cols = ["open", "high", "low", "close", "volume"]
-
-        for col in numeric_cols:
-
-            if col not in df.columns:
-                raise RuntimeError(f"Provider schema violation: {col}")
-
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df.dropna(subset=["date"] + numeric_cols, inplace=True)
-
-        return df
-
-    # -----------------------------------------------------
-
-    def _validate_dataset(self, df, start_date, end_date):
-
-        df = self._normalize_schema(df)
-
-        df = df.drop_duplicates("date").sort_values("date")
-
-        if (df["close"] <= 0).any():
-            raise RuntimeError("Invalid close prices detected.")
-
-        if len(df) < self.MIN_ROWS:
-            raise RuntimeError(f"Dataset too small: {len(df)} rows")
-
-        return df.reset_index(drop=True)
-
-    # -----------------------------------------------------
+    ##################################################
 
     def fetch(self, ticker, start_date, end_date, interval="1d"):
 
@@ -129,7 +195,6 @@ class StockPriceFetcher:
 
             try:
                 cached = pd.read_parquet(cache_file)
-                logger.info(f"Cache hit: {ticker}")
 
                 return self._validate_dataset(
                     cached,
@@ -144,7 +209,7 @@ class StockPriceFetcher:
         df = self._fetch_yahoo(
             ticker,
             start_date,
-            end_date.strftime("%Y-%m-%d"),
+            end_date,
             interval
         )
 
@@ -156,11 +221,9 @@ class StockPriceFetcher:
 
         self._atomic_cache_write(df, cache_file)
 
-        logger.info(f"Cached dataset: {ticker}")
-
         return df
 
-    # -----------------------------------------------------
+    ##################################################
 
     def _fetch_yahoo(
         self,
@@ -205,13 +268,13 @@ class StockPriceFetcher:
 
         raise RuntimeError("Yahoo failed after retries.")
 
-    # -----------------------------------------------------
+    ##################################################
 
     @staticmethod
     def _validate_dates(start_date, end_date):
 
-        start = datetime.strptime(start_date, "%Y-%m-%d")
-        end = datetime.strptime(end_date, "%Y-%m-%d")
+        start = pd.Timestamp(start_date)
+        end = pd.Timestamp(end_date)
 
         if start >= end:
             raise ValueError("start_date must be before end_date")
