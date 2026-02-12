@@ -9,7 +9,8 @@ import numpy as np
 
 from core.schema.feature_schema import (
     get_schema_signature,
-    SCHEMA_VERSION
+    SCHEMA_VERSION,
+    MODEL_FEATURES
 )
 
 
@@ -24,16 +25,20 @@ class MetadataManager:
         "dataset_hash",
         "features",
         "metrics",
-        "schema_signature",
-        "schema_version",
         "training_code_hash"
     ]
 
-    METADATA_VERSION = "2.1"
+    TABULAR_TYPES = {
+        "tabular",
+        "classification",
+        "regression"
+    }
 
-    # -----------------------------------------------------
-    # DATASET FINGERPRINT — INSTITUTION SAFE
-    # -----------------------------------------------------
+    METADATA_VERSION = "2.2"
+
+    #####################################################
+    # DATASET FINGERPRINT
+    #####################################################
 
     @staticmethod
     def fingerprint_dataset(df: pd.DataFrame) -> str:
@@ -43,7 +48,6 @@ class MetadataManager:
 
         df_copy = df.copy()
 
-        # normalize floats deterministically
         for col in df_copy.columns:
 
             if pd.api.types.is_float_dtype(df_copy[col]):
@@ -56,7 +60,6 @@ class MetadataManager:
             elif pd.api.types.is_integer_dtype(df_copy[col]):
                 df_copy[col] = df_copy[col].astype("int64")
 
-        # stable ordering — NEVER sort by floats
         sort_cols = []
 
         if "date" in df_copy.columns:
@@ -70,16 +73,15 @@ class MetadataManager:
 
         df_copy = df_copy.reset_index(drop=True)
 
-        # contiguous memory
         arr = np.ascontiguousarray(
             df_copy.to_numpy()
         )
 
         return hashlib.sha256(arr.tobytes()).hexdigest()
 
-    # -----------------------------------------------------
-    # TRAINING CODE HASH — LINEAGE SAFE
-    # -----------------------------------------------------
+    #####################################################
+    # TRAINING CODE HASH
+    #####################################################
 
     @staticmethod
     def fingerprint_training_code():
@@ -114,7 +116,7 @@ class MetadataManager:
 
         return hasher.hexdigest()
 
-    # -----------------------------------------------------
+    #####################################################
 
     @staticmethod
     def capture_environment():
@@ -146,7 +148,7 @@ class MetadataManager:
 
         return env
 
-    # -----------------------------------------------------
+    #####################################################
 
     @staticmethod
     def create_metadata(
@@ -156,8 +158,17 @@ class MetadataManager:
         training_start: str,
         training_end: str,
         dataset_hash: str,
-        metadata_type: str = "model"
+        metadata_type: str = "tabular"
     ) -> dict:
+
+        if not isinstance(metrics, dict):
+            raise RuntimeError("metrics must be a dictionary.")
+
+        if not isinstance(dataset_hash, str):
+            raise RuntimeError("dataset_hash must be a string.")
+
+        if not features:
+            raise RuntimeError("features list cannot be empty.")
 
         metadata = {
 
@@ -176,9 +187,6 @@ class MetadataManager:
             "features": features,
             "metrics": metrics,
 
-            "schema_signature": get_schema_signature(),
-            "schema_version": SCHEMA_VERSION,
-
             "training_code_hash":
                 MetadataManager.fingerprint_training_code(),
 
@@ -186,11 +194,16 @@ class MetadataManager:
                 MetadataManager.capture_environment()
         }
 
+        if metadata_type in MetadataManager.TABULAR_TYPES:
+
+            metadata["schema_signature"] = get_schema_signature()
+            metadata["schema_version"] = SCHEMA_VERSION
+
         MetadataManager.validate_metadata(metadata)
 
         return metadata
 
-    # -----------------------------------------------------
+    #####################################################
 
     @staticmethod
     def validate_metadata(metadata: dict):
@@ -205,17 +218,26 @@ class MetadataManager:
                 f"Metadata missing required fields: {missing}"
             )
 
-        if metadata["schema_signature"] != get_schema_signature():
-            raise RuntimeError(
-                "Schema signature mismatch detected."
-            )
+        metadata_type = metadata.get("metadata_type", "").lower()
 
-        if metadata["schema_version"] != SCHEMA_VERSION:
-            raise RuntimeError(
-                "Schema version mismatch detected."
-            )
+        if metadata_type in MetadataManager.TABULAR_TYPES:
 
-    # -----------------------------------------------------
+            if metadata.get("schema_signature") != get_schema_signature():
+                raise RuntimeError(
+                    "Schema signature mismatch detected."
+                )
+
+            if metadata.get("schema_version") != SCHEMA_VERSION:
+                raise RuntimeError(
+                    "Schema version mismatch detected."
+                )
+
+            if metadata.get("features") != list(MODEL_FEATURES):
+                raise RuntimeError(
+                    "Tabular feature ordering mismatch."
+                )
+
+    #####################################################
 
     @staticmethod
     def _atomic_json_write(path: str, payload: dict):
@@ -234,7 +256,11 @@ class MetadataManager:
 
         os.replace(tmp, path)
 
-    # -----------------------------------------------------
+        fd = os.open(directory or ".", os.O_DIRECTORY)
+        os.fsync(fd)
+        os.close(fd)
+
+    #####################################################
 
     @staticmethod
     def save_metadata(metadata: dict, path: str):
@@ -246,7 +272,7 @@ class MetadataManager:
             metadata
         )
 
-    # -----------------------------------------------------
+    #####################################################
 
     @staticmethod
     def load_metadata(path: str) -> dict:
