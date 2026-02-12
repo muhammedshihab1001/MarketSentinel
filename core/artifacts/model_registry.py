@@ -28,11 +28,9 @@ class ModelRegistry:
         "training_code_hash"
     )
 
-    TABULAR_TYPES = {
-        "tabular",
-        "classification",
-        "regression"
-    }
+    ########################################################
+    # VERSION
+    ########################################################
 
     @staticmethod
     def _version() -> str:
@@ -40,8 +38,38 @@ class ModelRegistry:
         suffix = uuid.uuid4().hex[:6]
         return f"{ts}_{suffix}"
 
+    ########################################################
+    # DIRECTORY HASH (NEW)
+    ########################################################
+
+    @staticmethod
+    def _hash_directory(path: str) -> str:
+
+        hasher = hashlib.sha256()
+
+        for root, _, files in os.walk(path):
+
+            for f in sorted(files):
+
+                file_path = os.path.join(root, f)
+
+                hasher.update(file_path.encode())
+
+                with open(file_path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        hasher.update(chunk)
+
+        return hasher.hexdigest()
+
+    ########################################################
+    # FILE OR DIR HASH
+    ########################################################
+
     @staticmethod
     def _sha256(path: str) -> str:
+
+        if os.path.isdir(path):
+            return ModelRegistry._hash_directory(path)
 
         h = hashlib.sha256()
 
@@ -51,11 +79,19 @@ class ModelRegistry:
 
         return h.hexdigest()
 
+    ########################################################
+
     @staticmethod
     def _fsync_dir(path: str):
+
+        if os.name == "nt":
+            return
+
         fd = os.open(path, os.O_DIRECTORY)
         os.fsync(fd)
         os.close(fd)
+
+    ########################################################
 
     @staticmethod
     def _atomic_json_write(path: str, payload: dict):
@@ -72,6 +108,8 @@ class ModelRegistry:
         parent = os.path.dirname(path) or "."
         ModelRegistry._fsync_dir(parent)
 
+    ########################################################
+
     @staticmethod
     def _validate_manifest(manifest: dict):
 
@@ -86,6 +124,8 @@ class ModelRegistry:
 
         if not manifest["artifacts"]:
             raise RuntimeError("Manifest contains no artifacts.")
+
+    ########################################################
 
     @staticmethod
     def _validate_metadata(metadata_path: str):
@@ -106,18 +146,22 @@ class ModelRegistry:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Schema mismatch detected.")
 
-        metadata_type = meta.get("metadata_type", "").lower()
+        if meta["features"] != list(MODEL_FEATURES):
+            raise RuntimeError("Feature ordering mismatch.")
 
-        if metadata_type in ModelRegistry.TABULAR_TYPES:
+    ########################################################
+    # COPY SAFE (NEW)
+    ########################################################
 
-            if meta["features"] != list(MODEL_FEATURES):
-                raise RuntimeError("Feature ordering mismatch.")
+    @staticmethod
+    def _copy_artifact(src: str, dst: str):
 
+        if os.path.isdir(src):
+            shutil.copytree(src, dst)
         else:
-            if not meta["features"]:
-                raise RuntimeError(
-                    "Non-tabular model must declare features."
-                )
+            shutil.copy2(src, dst)
+
+    ########################################################
 
     @staticmethod
     def verify_artifacts(base_dir: str, version: str):
@@ -151,23 +195,7 @@ class ModelRegistry:
                     f"Artifact integrity failure: {artifact}"
                 )
 
-    @staticmethod
-    def _acquire_lock(lock_path: str):
-
-        try:
-            fd = os.open(
-                lock_path,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY
-            )
-            os.close(fd)
-
-        except FileExistsError:
-            raise RuntimeError("Another promotion is in progress.")
-
-    @staticmethod
-    def _release_lock(lock_path: str):
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
+    ########################################################
 
     @staticmethod
     def register_model(
@@ -194,8 +222,8 @@ class ModelRegistry:
         staged_model = os.path.join(staging_dir, model_name)
         staged_meta = os.path.join(staging_dir, metadata_name)
 
-        shutil.copy2(model_path, staged_model)
-        shutil.copy2(metadata_path, staged_meta)
+        ModelRegistry._copy_artifact(model_path, staged_model)
+        ModelRegistry._copy_artifact(metadata_path, staged_meta)
 
         manifest: Dict[str, Any] = {
             "version": version,
@@ -218,106 +246,5 @@ class ModelRegistry:
 
         os.replace(staging_dir, version_dir)
         ModelRegistry._fsync_dir(base_dir)
-
-        return version
-
-    @staticmethod
-    def promote_to_production(base_dir: str, version: str):
-
-        lock_path = os.path.join(base_dir, ModelRegistry.PROMOTION_LOCK)
-
-        ModelRegistry._acquire_lock(lock_path)
-
-        try:
-
-            ModelRegistry.verify_artifacts(base_dir, version)
-
-            version_dir = os.path.join(base_dir, version)
-
-            manifest_path = os.path.join(
-                version_dir,
-                ModelRegistry.MANIFEST_NAME
-            )
-
-            with open(manifest_path) as f:
-                manifest = json.load(f)
-
-            ModelRegistry._validate_manifest(manifest)
-
-            if manifest["stage"] != "approved":
-                raise RuntimeError(
-                    "Only approved models may enter production."
-                )
-
-            pointer_path = os.path.join(
-                base_dir,
-                ModelRegistry.LATEST_POINTER
-            )
-
-            previous = None
-
-            if os.path.exists(pointer_path):
-                with open(pointer_path) as f:
-                    previous = json.load(f).get("version")
-
-            ModelRegistry._atomic_json_write(
-                pointer_path,
-                {"version": version}
-            )
-
-            ModelRegistry._fsync_dir(base_dir)
-
-            manifest["stage"] = "production"
-            manifest["history"].append({
-                "event": "promotion",
-                "timestamp": datetime.datetime.utcnow().isoformat(),
-                "previous": previous
-            })
-
-            ModelRegistry._atomic_json_write(
-                manifest_path,
-                manifest
-            )
-
-        finally:
-            ModelRegistry._release_lock(lock_path)
-
-    @staticmethod
-    def rollback(base_dir: str, version: str):
-
-        ModelRegistry.verify_artifacts(base_dir, version)
-
-        pointer_path = os.path.join(
-            base_dir,
-            ModelRegistry.LATEST_POINTER
-        )
-
-        ModelRegistry._atomic_json_write(
-            pointer_path,
-            {"version": version}
-        )
-
-        ModelRegistry._fsync_dir(base_dir)
-
-    @staticmethod
-    def get_latest_version(base_dir: str) -> str:
-
-        pointer = os.path.join(
-            base_dir,
-            ModelRegistry.LATEST_POINTER
-        )
-
-        if not os.path.exists(pointer):
-            raise RuntimeError("Latest pointer missing.")
-
-        with open(pointer) as f:
-            version = json.load(f)["version"]
-
-        version_dir = os.path.join(base_dir, version)
-
-        if not os.path.exists(version_dir):
-            raise RuntimeError(
-                "Registry pointer corrupted."
-            )
 
         return version
