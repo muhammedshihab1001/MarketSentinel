@@ -7,12 +7,15 @@ from core.risk.position_sizer import PositionSizer
 
 
 ###################################################
-# SAFE ENV PARSER
+# SAFE ENV PARSERS
 ###################################################
 
 def _env_float(key: str, default: float) -> float:
     try:
-        return float(os.getenv(key, str(default)))
+        v = float(os.getenv(key, str(default)))
+        if not math.isfinite(v):
+            return default
+        return v
     except Exception:
         return default
 
@@ -29,22 +32,39 @@ def _env_bool(key: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class SignalConfig:
 
-    prob_threshold: float = _env_float("PROB_THRESHOLD", 0.60)
-    sentiment_threshold: float = _env_float("SENTIMENT_THRESHOLD", 0.10)
+    prob_threshold: float
+    sentiment_threshold: float
 
-    volatility_cap: float = _env_float("VOL_CAP", 0.06)
-    volatility_throttle: float = _env_float("VOL_THROTTLE", 0.04)
+    volatility_cap: float
+    volatility_throttle: float
 
-    min_risk_adjusted_return: float = _env_float("MIN_RAR", 0.40)
-    min_confidence: float = _env_float("MIN_CONFIDENCE", 0.35)
+    min_risk_adjusted_return: float
+    min_confidence: float
 
-    portfolio_value: float = _env_float("PORTFOLIO_VALUE", 100000)
-    max_position_pct: float = _env_float("MAX_POSITION_PCT", 0.08)
+    portfolio_value: float
+    max_position_pct: float
 
-    global_kill_switch: bool = _env_bool(
-        "GLOBAL_TRADING_DISABLED",
-        False
-    )
+    global_kill_switch: bool
+
+    ###################################################
+
+    @staticmethod
+    def load():
+
+        return SignalConfig(
+            prob_threshold=_env_float("PROB_THRESHOLD", 0.60),
+            sentiment_threshold=_env_float("SENTIMENT_THRESHOLD", 0.10),
+            volatility_cap=_env_float("VOL_CAP", 0.06),
+            volatility_throttle=_env_float("VOL_THROTTLE", 0.04),
+            min_risk_adjusted_return=_env_float("MIN_RAR", 0.40),
+            min_confidence=_env_float("MIN_CONFIDENCE", 0.35),
+            portfolio_value=_env_float("PORTFOLIO_VALUE", 100000),
+            max_position_pct=_env_float("MAX_POSITION_PCT", 0.08),
+            global_kill_switch=_env_bool(
+                "GLOBAL_TRADING_DISABLED",
+                False
+            )
+        )
 
 
 ###################################################
@@ -52,6 +72,7 @@ class SignalConfig:
 ###################################################
 
 def _safe(v, fallback=0.0):
+
     if v is None:
         return fallback
 
@@ -71,7 +92,7 @@ def _clamp(v, lo, hi):
 
 
 ###################################################
-# FORECAST INTERPRETER WITH HYSTERESIS
+# FORECAST INTERPRETER
 ###################################################
 
 class ForecastInterpreter:
@@ -84,6 +105,10 @@ class ForecastInterpreter:
     RAR_STRONG = 0.65
     RAR_WEAK = 0.35
 
+    VOL_FLOOR = 1e-6
+
+    ###################################################
+
     def interpret(
         self,
         predicted_return: float,
@@ -95,13 +120,13 @@ class ForecastInterpreter:
 
         predicted_return = _safe(predicted_return)
         sentiment = _safe(sentiment)
-        rsi = _safe(rsi, 50)
-
-        volatility = max(_safe(volatility, 0.02), 1e-6)
+        rsi = _safe(rsi, 50.0)
         prob_up = _safe(prob_up, 0.5)
 
+        volatility = max(_safe(volatility, 0.02), self.VOL_FLOOR)
+
         rar = predicted_return / volatility
-        rsi_edge = abs(50 - rsi) / 50
+        rsi_edge = abs(50.0 - rsi) / 50.0
 
         confidence = (
             prob_up * 0.50 +
@@ -115,10 +140,7 @@ class ForecastInterpreter:
         if prob_up >= self.BUY_THRESHOLD_HIGH and rar > self.RAR_WEAK:
             return "BUY", round(confidence, 3)
 
-        if (
-            prob_up >= self.BUY_THRESHOLD_LOW
-            and rar > self.RAR_STRONG
-        ):
+        if prob_up >= self.BUY_THRESHOLD_LOW and rar > self.RAR_STRONG:
             return "BUY", round(confidence, 3)
 
         return "HOLD", round(confidence, 3)
@@ -141,12 +163,12 @@ class RiskGate:
         regime: str | None
     ) -> bool:
 
+        if signal not in ForecastInterpreter.VALID_SIGNALS:
+            raise RuntimeError(f"Invalid signal emitted: {signal}")
+
         prob_up = _safe(prob_up, 0.5)
         volatility = max(_safe(volatility, 0.02), 1e-6)
         regime = (regime or "").upper()
-
-        if signal not in ForecastInterpreter.VALID_SIGNALS:
-            raise RuntimeError(f"Invalid signal emitted: {signal}")
 
         if volatility > self.config.volatility_cap:
             return False
@@ -170,8 +192,8 @@ class EnsembleArbiter:
         self,
         base_signal: str,
         prob_up: float,
-        lstm_prices: List[float],
-        macro_trend: str,
+        lstm_prices: List[float] | None,
+        macro_trend: str | None,
         config: SignalConfig
     ) -> str:
 
@@ -187,31 +209,27 @@ class EnsembleArbiter:
         expected_return = (last - first) / first
         macro_trend = (macro_trend or "").upper()
 
-        if base_signal == "BUY":
+        if macro_trend not in ("BULLISH", "SIDEWAYS"):
+            return "HOLD"
 
-            if macro_trend not in ("BULLISH", "SIDEWAYS"):
-                return "HOLD"
+        if expected_return <= 0:
+            return "HOLD"
 
-            if expected_return <= 0:
-                return "HOLD"
+        if prob_up < config.prob_threshold:
+            return "HOLD"
 
-            if prob_up < config.prob_threshold:
-                return "HOLD"
-
-            return "BUY"
-
-        return "HOLD"
+        return "BUY"
 
 
 ###################################################
-# MASTER ENGINE WITH SIGNAL MEMORY
+# MASTER ENGINE
 ###################################################
 
 class DecisionEngine:
 
     def __init__(self, config: SignalConfig | None = None):
 
-        self.config = config or SignalConfig()
+        self.config = config or SignalConfig.load()
 
         self.interpreter = ForecastInterpreter()
         self.risk_gate = RiskGate(self.config)
@@ -220,6 +238,8 @@ class DecisionEngine:
 
         self._last_signal = "HOLD"
 
+    ###################################################
+
     def generate(
         self,
         predicted_return: float,
@@ -227,8 +247,8 @@ class DecisionEngine:
         rsi: float,
         prob_up: float,
         volatility: float,
-        lstm_prices: List[float],
-        macro_trend: str,
+        lstm_prices: List[float] | None,
+        macro_trend: str | None,
         regime: str | None = None
     ) -> Dict:
 
@@ -262,6 +282,7 @@ class DecisionEngine:
             self.config
         )
 
+        # prevent flip-flop instability
         if self._last_signal == "BUY" and final_signal == "HOLD":
             return self._hold(confidence * 0.8)
 
@@ -272,7 +293,7 @@ class DecisionEngine:
         allocation = self.position_sizer.size_position(
             signal=final_signal,
             confidence=confidence,
-            volatility=volatility,
+            volatility=max(volatility, 1e-6),
             portfolio_value=self.config.portfolio_value
         )
 
@@ -293,6 +314,8 @@ class DecisionEngine:
             "allocation": round(allocation, 2),
             "position_pct": round(position_pct, 4)
         }
+
+    ###################################################
 
     def _hold(self, confidence: float) -> Dict:
 
