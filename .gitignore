@@ -1,38 +1,117 @@
-# Python
+########################################################
+# PYTHON
+########################################################
+
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.env
-.venv
+*.py[cod]
+*$py.class
+
+.venv/
 venv/
+env/
+ENV/
+
 Lib/
 Include/
 Scripts/
 site-packages/
 
-# Data
+.env
+.python-version
+
+
+########################################################
+# JUPYTER / NOTEBOOKS
+########################################################
+
+.ipynb_checkpoints/
+
+
+########################################################
+# DATA (CRITICAL FOR ML PROJECTS)
+########################################################
+
+# Raw / processed datasets
 data/raw/
 data/processed/
 
-# Models
-*.pkl
-*.h5
-*.pt
+# VERY IMPORTANT — market cache
+data/cache/
 
-# OS
-.DS_Store
-# Model artifacts
+# Feature store cache
+data/features/
+
+# News raw feeds
+data/news_raw/
+
+
+########################################################
+# MODEL ARTIFACTS
+########################################################
+
 *.pkl
 *.joblib
-# Ignore ALL runtime artifacts
+*.h5
+*.pt
+*.onnx
+
+# Ignore ALL registry artifacts
 artifacts/**
 
-# Keep directory structure
+# Keep directory tree
 !artifacts/.keep
 !artifacts/**/.keep
 
-# HuggingFace cache
+
+########################################################
+# HUGGINGFACE / TRANSFORMERS
+########################################################
+
 .cache/
 .huggingface/
+artifacts/huggingface/
+
+
+########################################################
+# LOGS
+########################################################
+
+*.log
+logs/
+
+
+########################################################
+# OS / EDITOR
+########################################################
+
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+
+########################################################
+# BUILD / DOCKER
+########################################################
+
+dist/
+build/
+*.egg-info/
+
+docker-compose.override.yml
+
+
+########################################################
+# TEMP FILES
+########################################################
+
+*.tmp
+*.temp
+*.swp
+
+
+########################################################
+# PROJECT FILES
+########################################################
+
 project_structure.txt
