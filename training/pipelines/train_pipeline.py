@@ -7,8 +7,10 @@ import socket
 import platform
 import random
 import subprocess
+import sys
 
 import numpy as np
+import pandas as pd
 
 from training.train_xgboost import main as train_xgb
 from core.schema.feature_schema import get_schema_signature
@@ -17,7 +19,7 @@ from core.config.env_loader import init_env
 
 
 ########################################################
-# LOGGING (VERY IMPORTANT)
+# LOGGING
 ########################################################
 
 logging.basicConfig(
@@ -32,6 +34,7 @@ RUNS_DIR = "artifacts/training_runs"
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 MAX_REASONABLE_SHARPE = 8.0
+MAX_TRAINING_SECONDS = 7200  # 2 hours
 
 GLOBAL_SEED = 42
 
@@ -45,12 +48,14 @@ def enforce_determinism():
     os.environ["PYTHONHASHSEED"] = str(GLOBAL_SEED)
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
     os.environ["TF_DETERMINISTIC_OPS"] = "1"
 
     random.seed(GLOBAL_SEED)
     np.random.seed(GLOBAL_SEED)
 
-    # Optional torch determinism
     try:
         import torch
 
@@ -81,7 +86,7 @@ def _fsync_dir(directory):
 
 
 ########################################################
-# GIT HASH
+# GIT HASH (FAIL CLOSED)
 ########################################################
 
 def get_git_commit():
@@ -91,8 +96,11 @@ def get_git_commit():
             ["git", "rev-parse", "HEAD"],
             stderr=subprocess.DEVNULL
         ).decode().strip()
+
     except Exception:
-        return "unknown"
+        raise RuntimeError(
+            "Training must run inside a git repository."
+        )
 
 
 ########################################################
@@ -102,12 +110,13 @@ def get_git_commit():
 def save_manifest(run_id: str, manifest: dict):
 
     os.makedirs(RUNS_DIR, exist_ok=True)
+    _fsync_dir(RUNS_DIR)
 
     final_path = os.path.join(RUNS_DIR, f"{run_id}.json")
     temp_path = final_path + ".tmp"
 
     with open(temp_path, "w") as f:
-        json.dump(manifest, f, indent=4)
+        json.dump(manifest, f, indent=4, sort_keys=True)
         f.flush()
         os.fsync(f.fileno())
 
@@ -120,33 +129,42 @@ def save_manifest(run_id: str, manifest: dict):
 # METRIC VALIDATION
 ########################################################
 
+def _assert_finite(value, name):
+    if value is None or not np.isfinite(value):
+        raise RuntimeError(f"Invalid metric produced: {name}")
+
+
 def validate_metrics(metrics: dict):
 
     if not isinstance(metrics, dict) or not metrics:
         raise RuntimeError("Training returned invalid metrics.")
 
-    sharpe = metrics.get("avg_sharpe")
-    drawdown = metrics.get("max_drawdown")
+    required_numeric = [
+        "avg_sharpe",
+        "max_drawdown",
+        "profit_factor",
+        "final_equity"
+    ]
 
-    if sharpe is None:
-        raise RuntimeError("Training failed — missing sharpe.")
+    for key in required_numeric:
+        _assert_finite(metrics.get(key), key)
 
-    if not np.isfinite(sharpe):
-        raise RuntimeError("Invalid sharpe produced.")
+    sharpe = metrics["avg_sharpe"]
+    drawdown = metrics["max_drawdown"]
 
     if sharpe > MAX_REASONABLE_SHARPE:
         raise RuntimeError(
             "Sharpe unrealistically high — likely leakage."
         )
 
-    if drawdown is not None and not np.isfinite(drawdown):
-        raise RuntimeError("Invalid drawdown produced.")
-
     if sharpe < MIN_SHARPE:
         raise RuntimeError("Model rejected — sharpe too low.")
 
-    if drawdown is not None and drawdown < MAX_DRAWDOWN:
+    if drawdown < MAX_DRAWDOWN:
         raise RuntimeError("Model rejected — drawdown too severe.")
+
+    if metrics["final_equity"] <= 0:
+        raise RuntimeError("Backtest produced non-positive equity.")
 
 
 ########################################################
@@ -160,7 +178,11 @@ def build_lineage():
         "training_code_hash": MetadataManager.fingerprint_training_code(),
         "git_commit": get_git_commit(),
         "python_version": platform.python_version(),
+        "numpy_version": np.__version__,
+        "pandas_version": pd.__version__,
+        "platform": platform.platform(),
         "hostname": socket.gethostname(),
+        "cpu": platform.processor(),
     }
 
 
@@ -170,7 +192,6 @@ def build_lineage():
 
 def main():
 
-    # SAFE BOOTSTRAP ORDER
     init_env()
     enforce_determinism()
 
@@ -188,6 +209,11 @@ def main():
 
         if metrics is None:
             raise RuntimeError("Training returned None.")
+
+        if (time.time() - start) > MAX_TRAINING_SECONDS:
+            raise RuntimeError(
+                "Training exceeded maximum allowed duration."
+            )
 
         validate_metrics(metrics)
 
