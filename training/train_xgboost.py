@@ -6,9 +6,6 @@ import joblib
 import pandas as pd
 import numpy as np
 
-from sklearn.metrics import roc_auc_score, log_loss
-from xgboost import XGBClassifier
-
 from core.data.data_fetcher import StockPriceFetcher
 from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
@@ -18,6 +15,11 @@ from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
 from training.backtesting.walk_forward import WalkForwardValidator
+
+from models.xgboost_model import (
+    build_xgboost_model,
+    build_final_xgboost_model
+)
 
 
 MODEL_DIR = "artifacts/xgboost"
@@ -37,6 +39,10 @@ MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 
 
+########################################################
+# ATOMIC SAVE
+########################################################
+
 def save_model_atomic(model, path):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -50,6 +56,10 @@ def save_model_atomic(model, path):
     if not os.path.exists(path):
         raise RuntimeError("Model write failed.")
 
+
+########################################################
+# DATA LOADER
+########################################################
 
 def load_training_data():
 
@@ -70,6 +80,9 @@ def load_training_data():
             end_date=end_date
         )
 
+        if price_df is None or price_df.empty:
+            continue
+
         news_df = news_fetcher.fetch(
             f"{ticker} stock",
             max_items=100
@@ -84,8 +97,14 @@ def load_training_data():
             training=True
         )
 
+        if dataset is None or dataset.empty:
+            continue
+
         dataset["ticker"] = ticker
         datasets.append(dataset)
+
+    if not datasets:
+        raise RuntimeError("No datasets built for XGBoost.")
 
     df = pd.concat(datasets, ignore_index=True)
 
@@ -93,11 +112,22 @@ def load_training_data():
     df.reset_index(drop=True, inplace=True)
 
     if len(df) < MIN_TRAINING_ROWS:
-        raise RuntimeError(f"Training aborted — dataset too small ({len(df)} rows)")
+        raise RuntimeError(
+            f"Training aborted — dataset too small ({len(df)} rows)"
+        )
 
-    feature_block = validate_feature_schema(df)
+    ####################################################
+    # VALIDATE FEATURES ONLY
+    ####################################################
 
-    # KEEP close column for regime detector
+    feature_block = validate_feature_schema(
+        df.loc[:, MODEL_FEATURES]
+    )
+
+    ####################################################
+    # KEEP CLOSE FOR REGIME DETECTOR
+    ####################################################
+
     df = pd.concat(
         [
             df[["date", "ticker", "close", "target"]],
@@ -109,25 +139,16 @@ def load_training_data():
     return df, end_date
 
 
+########################################################
+# WALK FORWARD TRAINER
+########################################################
+
 def train_model(train_df):
 
-    X = train_df[list(MODEL_FEATURES)]
+    X = train_df.loc[:, MODEL_FEATURES]
     y = train_df["target"]
 
-    pos_weight = (len(y) - y.sum()) / max(y.sum(), 1)
-
-    model = XGBClassifier(
-        n_estimators=700,
-        max_depth=5,
-        learning_rate=0.03,
-        subsample=0.85,
-        colsample_bytree=0.85,
-        eval_metric="logloss",
-        random_state=SEED,
-        tree_method="hist",
-        n_jobs=1,
-        scale_pos_weight=pos_weight
-    )
+    model = build_xgboost_model(y)
 
     model.fit(X, y)
 
@@ -137,7 +158,7 @@ def train_model(train_df):
 def generate_signals(model, test_df):
 
     probs = model.predict_proba(
-        test_df[list(MODEL_FEATURES)]
+        test_df.loc[:, MODEL_FEATURES]
     )[:, 1]
 
     return [
@@ -146,25 +167,16 @@ def generate_signals(model, test_df):
     ]
 
 
+########################################################
+# FINAL TRAIN
+########################################################
+
 def train_full_model(df):
 
-    X = df[list(MODEL_FEATURES)]
+    X = df.loc[:, MODEL_FEATURES]
     y = df["target"]
 
-    pos_weight = (len(y) - y.sum()) / max(y.sum(), 1)
-
-    model = XGBClassifier(
-        n_estimators=900,
-        max_depth=5,
-        learning_rate=0.025,
-        subsample=0.85,
-        colsample_bytree=0.85,
-        eval_metric="logloss",
-        random_state=SEED,
-        tree_method="hist",
-        n_jobs=1,
-        scale_pos_weight=pos_weight
-    )
+    model = build_final_xgboost_model(y)
 
     model.fit(X, y)
 
@@ -175,6 +187,10 @@ def train_full_model(df):
     return model, importance
 
 
+########################################################
+# EXECUTION
+########################################################
+
 if __name__ == "__main__":
 
     print("Institutional XGBoost Training")
@@ -182,7 +198,7 @@ if __name__ == "__main__":
     df, end_date = load_training_data()
 
     dataset_hash = MetadataManager.fingerprint_dataset(
-        df[list(MODEL_FEATURES)]
+        df.loc[:, MODEL_FEATURES]
     )
 
     wf = WalkForwardValidator(
