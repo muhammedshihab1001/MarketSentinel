@@ -28,6 +28,12 @@ class ModelRegistry:
         "training_code_hash"
     )
 
+    TABULAR_TYPES = {
+        "tabular",
+        "classification",
+        "regression"
+    }
+
     @staticmethod
     def _version() -> str:
         ts = datetime.datetime.utcnow().strftime("v%Y_%m_%d_%H%M%S")
@@ -100,8 +106,18 @@ class ModelRegistry:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Schema mismatch detected.")
 
-        if meta["features"] != list(MODEL_FEATURES):
-            raise RuntimeError("Feature ordering mismatch.")
+        metadata_type = meta.get("metadata_type", "").lower()
+
+        if metadata_type in ModelRegistry.TABULAR_TYPES:
+
+            if meta["features"] != list(MODEL_FEATURES):
+                raise RuntimeError("Feature ordering mismatch.")
+
+        else:
+            if not meta["features"]:
+                raise RuntimeError(
+                    "Non-tabular model must declare features."
+                )
 
     @staticmethod
     def verify_artifacts(base_dir: str, version: str):
