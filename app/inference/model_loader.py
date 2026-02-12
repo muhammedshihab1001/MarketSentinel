@@ -1,10 +1,12 @@
 import os
 import joblib
-import tensorflow as tf
 import logging
 import threading
+import json
 from typing import Optional
 
+from core.artifacts.model_registry import ModelRegistry
+from core.schema.feature_schema import get_schema_signature
 from models.lstm_model import forecast_lstm
 from models.sarimax_model import SarimaxModel
 
@@ -19,17 +21,16 @@ class ModelLoader:
     Institutional production model loader.
 
     Guarantees:
-    - singleton instance
+    - registry-only loading
+    - metadata validation
+    - schema enforcement
+    - wrapper verification
     - thread-safe lazy loading
-    - artifact validation
-    - wrapper enforcement
-    - hot reload
-    - registry-compatible behavior
+    - fail-closed behavior
     """
 
     _instance = None
     _instance_lock = threading.Lock()
-    _tf_lock = threading.Lock()
 
     def __new__(cls, *args, **kwargs):
 
@@ -40,18 +41,18 @@ class ModelLoader:
 
         return cls._instance
 
+    ###################################################
+
     def __init__(self):
 
         if hasattr(self, "_initialized"):
             return
 
-        self._configure_tensorflow()
+        self._xgb = None
+        self._xgb_version = None
 
-        self._xgb: Optional[object] = None
-        self._xgb_mtime: Optional[float] = None
-
-        self._sarimax: Optional[SarimaxModel] = None
-        self._sarimax_mtime: Optional[float] = None
+        self._sarimax = None
+        self._sarimax_version = None
 
         self._lstm = None
         self._scaler = None
@@ -61,51 +62,56 @@ class ModelLoader:
         self._initialized = True
 
     ###################################################
-    # TF CONFIG
+    # REGISTRY RESOLUTION
     ###################################################
 
-    def _configure_tensorflow(self):
+    def _resolve_latest(self, base_dir: str):
 
-        with self._tf_lock:
-
-            try:
-
-                disable_gpu = os.getenv(
-                    "DISABLE_GPU",
-                    "false"
-                ).lower() == "true"
-
-                if disable_gpu:
-                    tf.config.set_visible_devices([], "GPU")
-
-                intra = int(os.getenv("TF_INTRA_THREADS", "1"))
-                inter = int(os.getenv("TF_INTER_THREADS", "1"))
-
-                tf.config.threading.set_intra_op_parallelism_threads(intra)
-                tf.config.threading.set_inter_op_parallelism_threads(inter)
-
-            except Exception:
-                logger.warning(
-                    "TensorFlow already initialized — skipping device config."
-                )
-
-            os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-
-    ###################################################
-    # PATH RESOLUTION
-    ###################################################
-
-    def _xgb_model_path(self):
-        return os.getenv(
-            "XGB_MODEL_PATH",
-            "artifacts/xgboost/model.pkl"
+        latest_path = os.path.join(
+            base_dir,
+            ModelRegistry.LATEST_POINTER
         )
 
-    def _sarimax_model_path(self):
-        return os.getenv(
-            "SARIMAX_MODEL_PATH",
-            "artifacts/sarimax/model.pkl"
-        )
+        if not os.path.exists(latest_path):
+            raise RuntimeError(
+                f"Registry pointer missing: {latest_path}"
+            )
+
+        with open(latest_path) as f:
+            payload = json.load(f)
+
+        version = payload.get("version")
+
+        if not version:
+            raise RuntimeError("Registry pointer corrupted.")
+
+        version_dir = os.path.join(base_dir, version)
+
+        if not os.path.exists(version_dir):
+            raise RuntimeError(
+                "Registry version directory missing."
+            )
+
+        return version, version_dir
+
+    ###################################################
+    # METADATA VALIDATION
+    ###################################################
+
+    def _validate_metadata(self, metadata_path: str):
+
+        if not os.path.exists(metadata_path):
+            raise RuntimeError("Model metadata missing.")
+
+        with open(metadata_path) as f:
+            meta = json.load(f)
+
+        if meta.get("schema_signature") != get_schema_signature():
+            raise RuntimeError(
+                "Schema mismatch — model incompatible with runtime."
+            )
+
+        return meta
 
     ###################################################
     # SAFE LOAD
@@ -114,7 +120,7 @@ class ModelLoader:
     def _safe_joblib_load(self, path):
 
         if not os.path.exists(path):
-            raise RuntimeError(f"Model not found at {path}")
+            raise RuntimeError(f"Artifact missing: {path}")
 
         try:
             return joblib.load(path)
@@ -129,32 +135,43 @@ class ModelLoader:
 
     def _reload_xgb_if_needed(self):
 
-        path = self._xgb_model_path()
-        mtime = os.path.getmtime(path)
+        base_dir = os.getenv(
+            "XGB_REGISTRY_DIR",
+            "artifacts/xgboost"
+        )
 
-        if self._xgb is not None and self._xgb_mtime == mtime:
+        version, version_dir = self._resolve_latest(base_dir)
+
+        if self._xgb is not None and self._xgb_version == version:
             return self._xgb
 
         with self._load_lock:
 
-            if self._xgb is not None and self._xgb_mtime == mtime:
+            if self._xgb is not None and self._xgb_version == version:
                 return self._xgb
 
-            logger.warning("Loading XGBoost model from disk")
+            logger.warning(
+                f"Loading XGBoost model from registry version={version}"
+            )
 
-            model = self._safe_joblib_load(path)
+            model_path = os.path.join(version_dir, "model.pkl")
+            metadata_path = os.path.join(version_dir, "metadata.json")
+
+            self._validate_metadata(metadata_path)
+
+            model = self._safe_joblib_load(model_path)
 
             if not hasattr(model, "predict_proba"):
                 raise RuntimeError(
-                    "Loaded XGBoost artifact missing predict_proba"
+                    "Loaded artifact missing predict_proba"
                 )
 
             self._xgb = model
-            self._xgb_mtime = mtime
+            self._xgb_version = version
 
             MODEL_VERSION.labels(
                 model="xgboost",
-                version=str(int(mtime))
+                version=version
             ).set(1)
 
         return self._xgb
@@ -165,35 +182,45 @@ class ModelLoader:
 
     def _reload_sarimax_if_needed(self):
 
-        path = self._sarimax_model_path()
-        mtime = os.path.getmtime(path)
+        base_dir = os.getenv(
+            "SARIMAX_REGISTRY_DIR",
+            "artifacts/sarimax"
+        )
 
-        if self._sarimax is not None and self._sarimax_mtime == mtime:
+        version, version_dir = self._resolve_latest(base_dir)
+
+        if self._sarimax is not None and self._sarimax_version == version:
             return self._sarimax
 
         with self._load_lock:
 
-            if self._sarimax is not None and self._sarimax_mtime == mtime:
+            if self._sarimax is not None and self._sarimax_version == version:
                 return self._sarimax
 
-            logger.warning("Loading SARIMAX model from disk")
+            logger.warning(
+                f"Loading SARIMAX model from registry version={version}"
+            )
 
-            model = self._safe_joblib_load(path)
+            model_path = os.path.join(version_dir, "model.pkl")
+            metadata_path = os.path.join(version_dir, "metadata.json")
+
+            self._validate_metadata(metadata_path)
+
+            model = self._safe_joblib_load(model_path)
 
             if not isinstance(model, SarimaxModel):
                 raise RuntimeError(
                     "Loaded artifact is not a SarimaxModel wrapper."
                 )
 
-            # verify fitted state
             _ = model.fitted_model
 
             self._sarimax = model
-            self._sarimax_mtime = mtime
+            self._sarimax_version = version
 
             MODEL_VERSION.labels(
                 model="sarimax",
-                version=str(int(mtime))
+                version=version
             ).set(1)
 
         return self._sarimax
@@ -227,7 +254,7 @@ class ModelLoader:
         logger.info("Models ready")
 
     ###################################################
-    # LSTM FORECAST
+    # LSTM
     ###################################################
 
     def lstm_forecast(self, recent_prices):
