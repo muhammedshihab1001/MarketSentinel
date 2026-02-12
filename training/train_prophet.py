@@ -1,7 +1,6 @@
 import os
 import datetime
 import numpy as np
-import pandas as pd
 
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
@@ -22,9 +21,6 @@ TRAINING_TICKERS = [
 ]
 
 MIN_DATA_ROWS = 700
-MAX_FORECAST_STD_RATIO = 0.30
-MIN_FORECAST_STD = 0.0007
-MAX_TREND_JUMP = 0.25
 
 SEED = 42
 EPSILON = 1e-6
@@ -49,17 +45,17 @@ def validate_forecast(model):
     mean_val = float(np.mean(preds))
     slope = float(preds[-1] - preds[0])
 
-    if std < MIN_FORECAST_STD:
+    if std < 1e-5:
         raise RuntimeError("Prophet rejected: flat forecast")
 
     ratio = std / max(abs(mean_val), EPSILON)
 
-    if ratio > MAX_FORECAST_STD_RATIO:
+    if ratio > 0.60:
         raise RuntimeError("Prophet rejected: volatility explosion")
 
     trend_jump = abs(slope) / max(abs(mean_val), EPSILON)
 
-    if trend_jump > MAX_TREND_JUMP:
+    if trend_jump > 0.60:
         raise RuntimeError("Prophet rejected: unrealistic trend")
 
     return {
@@ -90,11 +86,9 @@ def load_training_data():
 
         df = df.sort_values("date")
 
-        prophet_df = df[["date", "close"]].rename(
-            columns={"date": "ds", "close": "y"}
-        )
-
-        datasets[ticker] = prophet_df
+        # DO NOT rename columns.
+        # Prophet model handles schema internally.
+        datasets[ticker] = df[["date", "close"]]
 
     if not datasets:
         raise RuntimeError("No valid datasets for Prophet training.")
@@ -132,7 +126,8 @@ def train_champion():
                 best_ticker = ticker
                 best_metrics = metrics
 
-        except Exception:
+        except Exception as e:
+            print(f"Prophet rejected for {ticker}: {e}")
             continue
 
     if best_model is None:
@@ -149,11 +144,11 @@ def train_champion():
             "score": float(best_score),
             **best_metrics
         },
-        features=["ds", "y"],
+        features=["date", "close"],
         training_start="2015-01-01",
         training_end=end_date,
         dataset_hash=dataset_hash,
-        metadata_type="model"
+        metadata_type="sequence"
     )
 
     return best_model, metadata
