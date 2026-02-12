@@ -14,24 +14,32 @@ from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema
+
+from core.artifacts.metadata_manager import MetadataManager
+from core.artifacts.model_registry import ModelRegistry
 from training.backtesting.walk_forward import WalkForwardValidator
 
 
-MODEL_PATH = "artifacts/xgboost/model.pkl"
+MODEL_DIR = "artifacts/xgboost"
+TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
+TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 SEED = 42
 np.random.seed(SEED)
 
 TRAINING_TICKERS = [
-    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA"
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA",
+    "JPM","GS","BAC","AMD","AVGO"
 ]
 
-MIN_TRAINING_ROWS = 1500
+MIN_TRAINING_ROWS = 2000
+MIN_SHARPE = 0.25
+MAX_DRAWDOWN = -0.40
 
-PROB_THRESHOLD = float(
-    os.getenv("SIGNAL_THRESHOLD", "0.58")
-)
 
+# ---------------------------------------------------
+# ATOMIC SAVE
+# ---------------------------------------------------
 
 def save_model_atomic(model, path):
 
@@ -47,16 +55,9 @@ def save_model_atomic(model, path):
         raise RuntimeError("Model write failed.")
 
 
-def sanitize_dataframe(df):
-
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(inplace=True)
-
-    if df.empty:
-        raise RuntimeError("Dataset empty after sanitation.")
-
-    return df
-
+# ---------------------------------------------------
+# DATA LOADER
+# ---------------------------------------------------
 
 def load_training_data():
 
@@ -73,7 +74,7 @@ def load_training_data():
 
         price_df = fetcher.fetch(
             ticker=ticker,
-            start_date="2018-01-01",
+            start_date="2016-01-01",
             end_date=end_date
         )
 
@@ -99,8 +100,6 @@ def load_training_data():
     df.sort_values(["date", "ticker"], inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    df = sanitize_dataframe(df)
-
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError(f"Training aborted — dataset too small ({len(df)} rows)")
 
@@ -111,30 +110,60 @@ def load_training_data():
         axis=1
     )
 
-    return df
+    return df, end_date
 
 
-def date_split(df):
+# ---------------------------------------------------
+# MODEL TRAINER (USED BY WALK FORWARD)
+# ---------------------------------------------------
 
-    cutoff_date = "2023-01-01"
+def train_model(train_df):
 
-    train = df[df["date"] < cutoff_date]
-    val = df[df["date"] >= cutoff_date]
+    X = train_df[list(MODEL_FEATURES)]
+    y = train_df["target"]
 
-    return train, val
+    pos_weight = (len(y) - y.sum()) / max(y.sum(), 1)
 
+    model = XGBClassifier(
+        n_estimators=700,
+        max_depth=5,
+        learning_rate=0.03,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        eval_metric="logloss",
+        random_state=SEED,
+        tree_method="hist",
+        n_jobs=1,
+        scale_pos_weight=pos_weight
+    )
+
+    model.fit(X, y)
+
+    return model
+
+
+def generate_signals(model, test_df):
+
+    probs = model.predict_proba(
+        test_df[list(MODEL_FEATURES)]
+    )[:, 1]
+
+    return [
+        "BUY" if p > 0.58 else "HOLD"
+        for p in probs
+    ]
+
+
+# ---------------------------------------------------
+# FULL TRAIN
+# ---------------------------------------------------
 
 def train_full_model(df):
 
-    train, val = date_split(df)
+    X = df[list(MODEL_FEATURES)]
+    y = df["target"]
 
-    X_train = train[list(MODEL_FEATURES)]
-    y_train = train["target"]
-
-    X_val = val[list(MODEL_FEATURES)]
-    y_val = val["target"]
-
-    pos_weight = (len(y_train) - y_train.sum()) / y_train.sum()
+    pos_weight = (len(y) - y.sum()) / max(y.sum(), 1)
 
     model = XGBClassifier(
         n_estimators=900,
@@ -143,25 +172,74 @@ def train_full_model(df):
         subsample=0.85,
         colsample_bytree=0.85,
         eval_metric="logloss",
-        early_stopping_rounds=50,
         random_state=SEED,
         tree_method="hist",
         n_jobs=1,
         scale_pos_weight=pos_weight
     )
 
-    model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_val, y_val)],
-        verbose=False
+    model.fit(X, y)
+
+    importance = dict(
+        zip(MODEL_FEATURES, model.feature_importances_.tolist())
     )
 
-    probs = model.predict_proba(X_val)[:, 1]
+    return model, importance
 
-    metrics = {
-        "roc_auc": float(roc_auc_score(y_val, probs)),
-        "logloss": float(log_loss(y_val, probs)),
-    }
 
-    return model
+# ---------------------------------------------------
+# EXECUTION
+# ---------------------------------------------------
+
+if __name__ == "__main__":
+
+    print("Institutional XGBoost Training")
+
+    df, end_date = load_training_data()
+
+    dataset_hash = MetadataManager.fingerprint_dataset(
+        df[list(MODEL_FEATURES)]
+    )
+
+    wf = WalkForwardValidator(
+        model_trainer=train_model,
+        signal_generator=generate_signals
+    )
+
+    strategy_metrics = wf.run(df)
+
+    if strategy_metrics["avg_sharpe"] < MIN_SHARPE:
+        raise RuntimeError("XGBoost rejected — Sharpe too low")
+
+    if strategy_metrics["max_drawdown"] < MAX_DRAWDOWN:
+        raise RuntimeError("XGBoost rejected — drawdown too severe")
+
+    model, importance = train_full_model(df)
+
+    save_model_atomic(model, TEMP_MODEL_PATH)
+
+    metadata = MetadataManager.create_metadata(
+        model_name="xgboost_direction",
+        metrics={**strategy_metrics},
+        features=list(MODEL_FEATURES),
+        training_start="2016-01-01",
+        training_end=end_date,
+        dataset_hash=dataset_hash,
+        metadata_type="model"
+    )
+
+    metadata["feature_importance"] = importance
+    metadata["training_rows"] = len(df)
+
+    MetadataManager.save_metadata(
+        metadata,
+        TEMP_METADATA_PATH
+    )
+
+    version = ModelRegistry.register_model(
+        MODEL_DIR,
+        TEMP_MODEL_PATH,
+        TEMP_METADATA_PATH
+    )
+
+    print(f"XGBoost registered → {version}")
