@@ -21,7 +21,6 @@ from models.xgboost_model import (
     build_final_xgboost_model
 )
 
-
 MODEL_DIR = "artifacts/xgboost"
 TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
@@ -58,7 +57,7 @@ def save_model_atomic(model, path):
 
 
 ########################################################
-# DATA LOADER
+# DATA LOADER (FIXED)
 ########################################################
 
 def load_training_data():
@@ -83,6 +82,9 @@ def load_training_data():
         if price_df is None or price_df.empty:
             continue
 
+        # Preserve close BEFORE pipeline
+        close_map = price_df[["date", "close"]].copy()
+
         news_df = news_fetcher.fetch(
             f"{ticker} stock",
             max_items=100
@@ -100,7 +102,22 @@ def load_training_data():
         if dataset is None or dataset.empty:
             continue
 
+        ####################################################
+        # REATTACH CLOSE SAFELY
+        ####################################################
+
+        dataset = dataset.merge(
+            close_map,
+            on="date",
+            how="left",
+            validate="one_to_one"
+        )
+
+        if dataset["close"].isna().any():
+            raise RuntimeError("Close price merge failure detected.")
+
         dataset["ticker"] = ticker
+
         datasets.append(dataset)
 
     if not datasets:
@@ -117,7 +134,7 @@ def load_training_data():
         )
 
     ####################################################
-    # VALIDATE FEATURES ONLY
+    # STRICT FEATURE VALIDATION
     ####################################################
 
     feature_block = validate_feature_schema(
@@ -125,18 +142,24 @@ def load_training_data():
     )
 
     ####################################################
-    # KEEP CLOSE FOR REGIME DETECTOR
+    # FINAL DATASET CONTRACT
     ####################################################
 
-    df = pd.concat(
+    final = pd.concat(
         [
-            df[["date", "ticker", "close", "target"]],
-            feature_block
+            df[["date", "ticker", "close", "target"]].reset_index(drop=True),
+            feature_block.reset_index(drop=True)
         ],
         axis=1
     )
 
-    return df, end_date
+    # Safety assertion
+    missing = set(MODEL_FEATURES) - set(final.columns)
+
+    if missing:
+        raise RuntimeError(f"Training dataset missing features: {missing}")
+
+    return final, end_date
 
 
 ########################################################
@@ -149,7 +172,6 @@ def train_model(train_df):
     y = train_df["target"]
 
     model = build_xgboost_model(y)
-
     model.fit(X, y)
 
     return model
@@ -177,7 +199,6 @@ def train_full_model(df):
     y = df["target"]
 
     model = build_final_xgboost_model(y)
-
     model.fit(X, y)
 
     importance = dict(
