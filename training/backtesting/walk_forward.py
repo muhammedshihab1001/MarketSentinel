@@ -16,6 +16,7 @@ class WalkForwardValidator:
     MIN_TRAIN_RATIO = 0.75
     MIN_WINDOWS = 6
     MIN_ASSETS_PER_DAY = 3
+    MIN_FEATURE_VARIANCE = 1e-8
 
     def __init__(
         self,
@@ -44,12 +45,20 @@ class WalkForwardValidator:
         if df["ticker"].nunique() < 3:
             raise RuntimeError("Training universe too small.")
 
-        if not df.index.equals(
-            df.sort_values(["date", "ticker"]).index
-        ):
+        df_sorted = df.sort_values(["date", "ticker"])
+
+        if not df.index.equals(df_sorted.index):
             raise RuntimeError("Training dataframe not sorted.")
 
         validate_feature_schema(df.loc[:, MODEL_FEATURES])
+
+        features = df.loc[:, MODEL_FEATURES].to_numpy(dtype=float)
+
+        if not np.isfinite(features).all():
+            raise RuntimeError("Non-finite feature values detected.")
+
+        if np.min(np.var(features, axis=0)) < self.MIN_FEATURE_VARIANCE:
+            raise RuntimeError("Feature variance collapsed.")
 
         if df["target"].nunique() < 2:
             raise RuntimeError("Training labels collapsed.")
@@ -92,7 +101,7 @@ class WalkForwardValidator:
         return prices
 
     ############################################
-    # CRITICAL FIX — UNIVERSE ALIGNMENT
+    # UNIVERSE ALIGNMENT
     ############################################
 
     def _align_universe(self, prices, signals):
@@ -121,7 +130,7 @@ class WalkForwardValidator:
             df["date"].drop_duplicates()
         ).sort_values()
 
-        if len(unique_dates) < self.window_size + self.step_size:
+        if len(unique_dates) < self.window_size + self.step_size + 1:
             raise RuntimeError("Dataset too small.")
 
         results = []
@@ -133,10 +142,10 @@ class WalkForwardValidator:
             "SIDEWAYS": []
         }
 
-        capital = 10_000
+        capital = 10_000.0
         start_idx = self.window_size
 
-        while start_idx < len(unique_dates):
+        while start_idx < len(unique_dates) - 1:
 
             train_end_date = unique_dates.iloc[start_idx]
 
@@ -153,25 +162,20 @@ class WalkForwardValidator:
                 continue
 
             test_dates = unique_dates[
-                (unique_dates >= train_end_date) &
-                (unique_dates < train_end_date + pd.Timedelta(days=365))
-            ][:self.step_size]
+                (unique_dates >= train_end_date)
+            ][:self.step_size + 1]  # +1 for T+1 execution
 
             if len(test_dates) < 2:
                 break
 
             train_df = df.loc[
-                df["date"].between(
-                    train_dates.iloc[0],
-                    train_dates.iloc[-1]
-                )
+                (df["date"] >= train_dates.iloc[0]) &
+                (df["date"] < train_dates.iloc[-1])
             ].copy()
 
             test_df = df.loc[
-                df["date"].between(
-                    test_dates.iloc[0],
-                    test_dates.iloc[-1]
-                )
+                (df["date"] >= test_dates.iloc[0]) &
+                (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
             self._validate_training_frame(train_df)
@@ -184,21 +188,29 @@ class WalkForwardValidator:
 
             trade_counter = 0
 
+            test_dates_sorted = sorted(test_df["date"].unique())
+
             ############################################
-            # DAILY LOOP
+            # T+1 EXECUTION LOOP
             ############################################
 
-            for date, slice_df in test_df.groupby("date"):
+            for i in range(len(test_dates_sorted) - 1):
 
-                prices = self._build_price_dict(slice_df)
+                signal_date = test_dates_sorted[i]
+                execution_date = test_dates_sorted[i + 1]
+
+                signal_slice = test_df[test_df["date"] == signal_date]
+                exec_slice = test_df[test_df["date"] == execution_date]
+
+                prices = self._build_price_dict(exec_slice)
 
                 signals_list = self.signal_generator(
                     model,
-                    slice_df
+                    signal_slice
                 )
 
                 raw_signals = dict(
-                    zip(slice_df["ticker"], signals_list)
+                    zip(signal_slice["ticker"], signals_list)
                 )
 
                 prices, signals = self._align_universe(
@@ -214,16 +226,12 @@ class WalkForwardValidator:
                     if s != "HOLD"
                 )
 
-                grouped_prices[date] = prices
-                grouped_signals[date] = signals
+                grouped_prices[execution_date] = prices
+                grouped_signals[execution_date] = signals
 
             if trade_counter < self.MIN_TRADES_PER_WINDOW:
                 start_idx += self.step_size
                 continue
-
-            ############################################
-            # PORTFOLIO
-            ############################################
 
             metrics = self.engine.run(
                 grouped_prices,
@@ -232,6 +240,9 @@ class WalkForwardValidator:
             )
 
             capital = float(metrics["final_portfolio"])
+
+            if not np.isfinite(capital) or capital <= 0:
+                raise RuntimeError("Capital corrupted during walk-forward.")
 
             curve = np.array(metrics["equity_curve"], dtype=float)
 
