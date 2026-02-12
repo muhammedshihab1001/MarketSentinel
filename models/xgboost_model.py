@@ -1,19 +1,54 @@
 from xgboost import XGBClassifier
 import numpy as np
+import xgboost as xgb
 
 
 SEED = 42
 
+MAX_CLASS_WEIGHT = 50.0
+
+
+###################################################
+# GPU DETECTION
+###################################################
+
+def get_tree_method():
+
+    try:
+        if xgb.core._has_cuda_support():
+            return "gpu_hist"
+    except Exception:
+        pass
+
+    return "hist"
+
+
+TREE_METHOD = get_tree_method()
+
+
+###################################################
+# CLASS WEIGHT
+###################################################
 
 def compute_class_weight(y):
 
-    pos = y.sum()
-    neg = len(y) - pos
+    if y is None or len(y) == 0:
+        raise RuntimeError("Empty labels provided to XGBoost.")
 
-    if pos == 0:
-        return 1.0
+    if np.isnan(y).any():
+        raise RuntimeError("NaN labels detected.")
 
-    return neg / pos
+    pos = float(np.sum(y))
+    neg = float(len(y) - pos)
+
+    if pos == 0 or neg == 0:
+        raise RuntimeError(
+            "Label collapse detected — model cannot train."
+        )
+
+    weight = neg / pos
+
+    return min(weight, MAX_CLASS_WEIGHT)
 
 
 ###################################################
@@ -37,9 +72,9 @@ def build_xgboost_model(y):
 
         random_state=SEED,
 
-        tree_method="hist",
+        tree_method=TREE_METHOD,
 
-        n_jobs=1,
+        n_jobs=-1,
 
         scale_pos_weight=pos_weight,
 
@@ -54,7 +89,7 @@ def build_xgboost_model(y):
 
 
 ###################################################
-# FULL TRAIN (FINAL MODEL)
+# FINAL MODEL
 ###################################################
 
 def build_final_xgboost_model(y):
@@ -74,9 +109,9 @@ def build_final_xgboost_model(y):
 
         random_state=SEED,
 
-        tree_method="hist",
+        tree_method=TREE_METHOD,
 
-        n_jobs=1,
+        n_jobs=-1,
 
         scale_pos_weight=pos_weight,
 
