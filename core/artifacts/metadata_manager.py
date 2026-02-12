@@ -31,7 +31,7 @@ class MetadataManager:
         "metadata_integrity_hash"
     ]
 
-    METADATA_VERSION = "3.0"
+    METADATA_VERSION = "4.0"
 
     ########################################################
     # SAFE DIRECTORY FSYNC
@@ -51,7 +51,43 @@ class MetadataManager:
             pass
 
     ########################################################
-    # DATASET FINGERPRINT (CROSS-PLATFORM STABLE)
+    # FEATURE CONTRACT ENFORCEMENT
+    ########################################################
+
+    @staticmethod
+    def _validate_feature_contract(
+        features: list,
+        metadata_type: str
+    ):
+
+        if metadata_type == "training_manifest_v1":
+
+            if tuple(features) != tuple(MODEL_FEATURES):
+                raise RuntimeError(
+                    "Feature list mismatch — schema drift detected."
+                )
+
+        elif metadata_type == "timeseries_manifest_v1":
+
+            if features != ["close"]:
+                raise RuntimeError(
+                    "Timeseries models must declare ['close'] only."
+                )
+
+        elif metadata_type == "sequence_manifest_v1":
+
+            if features != ["close_sequence"]:
+                raise RuntimeError(
+                    "Sequence models must declare ['close_sequence']."
+                )
+
+        else:
+            raise RuntimeError(
+                f"Unknown metadata_type: {metadata_type}"
+            )
+
+    ########################################################
+    # DATASET FINGERPRINT
     ########################################################
 
     @staticmethod
@@ -62,13 +98,11 @@ class MetadataManager:
 
         df_copy = df.copy(deep=True)
 
-        # deterministic column ordering
         df_copy = df_copy.reindex(sorted(df_copy.columns), axis=1)
 
         for col in df_copy.columns:
 
             if pd.api.types.is_float_dtype(df_copy[col]):
-
                 df_copy[col] = (
                     df_copy[col]
                     .astype("float64")
@@ -96,18 +130,17 @@ class MetadataManager:
 
         hasher = hashlib.sha256()
 
-        hasher.update(",".join(df_copy.columns).encode())
+        canonical = json.dumps(
+            df_copy.to_dict(orient="records"),
+            sort_keys=True
+        ).encode()
 
-        arr = np.ascontiguousarray(
-            df_copy.to_numpy(dtype="object")
-        )
-
-        hasher.update(arr.tobytes())
+        hasher.update(canonical)
 
         return hasher.hexdigest()
 
     ########################################################
-    # TRAINING CODE HASH (ELITE LINEAGE)
+    # TRAINING CODE HASH
     ########################################################
 
     @staticmethod
@@ -185,7 +218,6 @@ class MetadataManager:
     def _compute_metadata_hash(metadata: dict) -> str:
 
         clone = dict(metadata)
-
         clone.pop("metadata_integrity_hash", None)
 
         canonical = json.dumps(
@@ -205,14 +237,14 @@ class MetadataManager:
         training_start: str,
         training_end: str,
         dataset_hash: str,
-        metadata_type: str = "model",
+        metadata_type: str,
         extra_fields: dict | None = None
     ) -> dict:
 
-        if tuple(features) != MODEL_FEATURES:
-            raise RuntimeError(
-                "Feature list mismatch — possible schema drift."
-            )
+        MetadataManager._validate_feature_contract(
+            features,
+            metadata_type
+        )
 
         metadata = {
 
@@ -299,7 +331,7 @@ class MetadataManager:
         tmp = path + ".tmp"
 
         with open(tmp, "w") as f:
-            json.dump(payload, f, indent=4)
+            json.dump(payload, f, indent=4, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
 
