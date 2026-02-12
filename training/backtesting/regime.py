@@ -25,14 +25,19 @@ class MarketRegimeDetector:
     def __init__(self, config: RegimeConfig | None = None):
         self.config = config or RegimeConfig()
 
+    ########################################################
+    # PERSISTENCE FILTER
+    ########################################################
+
     def _apply_persistence(self, regimes):
 
         cfg = self.config
 
+        regimes = regimes.astype(object)
+
         confirmed = regimes.copy()
 
         current = regimes[0]
-        streak = 1
         candidate = None
         candidate_streak = 0
 
@@ -40,7 +45,6 @@ class MarketRegimeDetector:
 
             new = regimes[i]
 
-            # Crisis always overrides immediately
             if new == "CRISIS":
                 current = "CRISIS"
                 candidate = None
@@ -54,7 +58,6 @@ class MarketRegimeDetector:
                 confirmed[i] = current
                 continue
 
-            # Start candidate regime
             if candidate is None:
                 candidate = new
                 candidate_streak = 1
@@ -73,11 +76,27 @@ class MarketRegimeDetector:
 
         return confirmed
 
+    ########################################################
+    # SINGLE ASSET
+    ########################################################
+
     def _detect_single_asset(self, df: pd.DataFrame):
 
         cfg = self.config
 
+        required = {"date", "close"}
+
+        missing = required - set(df.columns)
+
+        if missing:
+            raise RuntimeError(
+                f"Regime detection missing columns: {missing}"
+            )
+
         df = df.sort_values("date").copy()
+
+        if df["close"].isna().any():
+            raise RuntimeError("NaN close prices detected.")
 
         shifted_close = df["close"].shift(1)
 
@@ -96,6 +115,7 @@ class MarketRegimeDetector:
                 min_periods=cfg.volatility_window
             )
             .std()
+            .clip(lower=cfg.EPSILON)
         )
 
         safe_ma = ma_long.replace(0, np.nan)
@@ -137,7 +157,21 @@ class MarketRegimeDetector:
 
         df["regime"] = regime
 
+        # Drop warmup rows where MA is unavailable
+        warmup_cut = max(cfg.trend_window, cfg.volatility_window)
+
+        if len(df) <= warmup_cut:
+            raise RuntimeError(
+                "Dataset too small for regime detection."
+            )
+
+        df = df.iloc[warmup_cut:].reset_index(drop=True)
+
         return df
+
+    ########################################################
+    # MULTI ASSET
+    ########################################################
 
     def detect(self, df: pd.DataFrame):
 
@@ -146,11 +180,27 @@ class MarketRegimeDetector:
                 "Regime detection requires ticker column."
             )
 
+        if df.empty:
+            raise RuntimeError("Empty dataframe passed to regime detector.")
+
         grouped = []
 
         for ticker, slice_df in df.groupby("ticker", sort=False):
+
+            if len(slice_df) < 300:
+                continue
+
             detected = self._detect_single_asset(slice_df)
+
+            if detected.empty:
+                continue
+
             grouped.append(detected)
+
+        if not grouped:
+            raise RuntimeError(
+                "All assets rejected during regime detection."
+            )
 
         result = (
             pd.concat(grouped)
