@@ -11,7 +11,8 @@ from statsmodels.tsa.stattools import adfuller
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
-from core.time.market_time import MarketTime   #  CRITICAL
+from core.time.market_time import MarketTime
+from core.market.universe import MarketUniverse   # ⭐ CRITICAL
 
 from models.sarimax_model import SarimaxModel
 
@@ -20,11 +21,6 @@ MODEL_DIR = "artifacts/sarimax"
 
 TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
-
-TRAINING_TICKERS = [
-    "AAPL","MSFT","NVDA","AMZN","GOOGL",
-    "META","TSLA","JPM","XOM","AVGO","AMD"
-]
 
 MIN_DATA_ROWS = 700
 VOL_FLOOR = 1e-4
@@ -106,7 +102,7 @@ def assert_stationary(series: pd.Series):
 
 
 ########################################################
-# LOAD DATA (WINDOW GOVERNED)
+# LOAD DATA — CLOCK + UNIVERSE GOVERNED
 ########################################################
 
 def load_training_data(
@@ -116,9 +112,13 @@ def load_training_data(
 
     fetcher = StockPriceFetcher()
 
+    universe = MarketUniverse.get_universe()
+
+    print(f"SARIMAX training universe size: {len(universe)}")
+
     datasets = {}
 
-    for ticker in TRAINING_TICKERS:
+    for ticker in universe:
 
         df = fetcher.fetch(
             ticker=ticker,
@@ -140,8 +140,11 @@ def load_training_data(
 
         datasets[ticker] = df
 
-    if not datasets:
-        raise RuntimeError("No datasets available for SARIMAX.")
+    # 🚨 collapse protection
+    if len(datasets) < 5:
+        raise RuntimeError(
+            "Universe collapse — too few assets survived."
+        )
 
     return datasets, end_date
 
@@ -232,7 +235,8 @@ def train_champion(start_date, end_date):
             "training_window": {
                 "start": start_date,
                 "end": end_date
-            }
+            },
+            "training_universe": MarketUniverse.get_universe()
         }
     )
 
@@ -240,7 +244,7 @@ def train_champion(start_date, end_date):
 
 
 ########################################################
-# MAIN (CLOCK GOVERNED)
+# MAIN — INSTITUTIONAL CLOCK
 ########################################################
 
 def main(start_date=None, end_date=None):
