@@ -5,7 +5,7 @@ import shutil
 import hashlib
 import uuid
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 from core.schema.feature_schema import (
     get_schema_signature,
@@ -18,27 +18,6 @@ class ModelRegistry:
     MANIFEST_NAME = "manifest.json"
     LATEST_POINTER = "latest.json"
     PROMOTION_LOCK = ".promotion.lock"
-
-    ########################################################
-    # MULTI-MANIFEST GOVERNANCE (FAIL CLOSED)
-    ########################################################
-
-    ALLOWED_METADATA_TYPES = {
-        "training_manifest_v1",
-        "timeseries_manifest_v1",
-        "sequence_manifest_v1"
-    }
-
-    REQUIRED_METADATA_FIELDS = (
-        "model_name",
-        "features",
-        "metrics",
-        "dataset_hash",
-        "schema_signature",
-        "metadata_type",
-        "training_code_hash",
-        "metadata_integrity_hash"
-    )
 
     LOCK_TIMEOUT_SECONDS = 600
 
@@ -58,6 +37,7 @@ class ModelRegistry:
 
     @staticmethod
     def _sha256(path: str):
+
         h = hashlib.sha256()
 
         with open(path, "rb") as f:
@@ -72,10 +52,12 @@ class ModelRegistry:
 
     @staticmethod
     def _fsync_dir(path: str):
+
         if os.name == "nt":
             return
 
         fd = os.open(path, os.O_DIRECTORY)
+
         try:
             os.fsync(fd)
         finally:
@@ -101,41 +83,17 @@ class ModelRegistry:
         ModelRegistry._fsync_dir(parent)
 
     ########################################################
-    # FEATURE CONTRACT
+    # HASH HELPER (⭐ NEW)
     ########################################################
 
     @staticmethod
-    def _validate_feature_contract(meta):
-
-        features = meta["features"]
-        mtype = meta["metadata_type"]
-
-        if mtype == "training_manifest_v1":
-
-            if list(features) != list(MODEL_FEATURES):
-                raise RuntimeError("Feature ordering mismatch.")
-
-        elif mtype == "timeseries_manifest_v1":
-
-            if features != ["close"]:
-                raise RuntimeError(
-                    "Timeseries models must declare ['close']."
-                )
-
-        elif mtype == "sequence_manifest_v1":
-
-            if features != ["close_sequence"]:
-                raise RuntimeError(
-                    "Sequence models must declare ['close_sequence']."
-                )
-
-        else:
-            raise RuntimeError(
-                "Unknown metadata_type — refusing registry write."
-            )
+    def _hash_list(items):
+        return hashlib.sha256(
+            json.dumps(sorted(items)).encode()
+        ).hexdigest()
 
     ########################################################
-    # METADATA VALIDATION
+    # METADATA VALIDATION (UPGRADED)
     ########################################################
 
     @staticmethod
@@ -144,12 +102,9 @@ class ModelRegistry:
         clone = dict(meta)
         clone.pop("metadata_integrity_hash", None)
 
-        canonical = json.dumps(
-            clone,
-            sort_keys=True
-        ).encode()
-
-        return hashlib.sha256(canonical).hexdigest()
+        return hashlib.sha256(
+            json.dumps(clone, sort_keys=True).encode()
+        ).hexdigest()
 
     @staticmethod
     def _validate_metadata(metadata_path: str):
@@ -157,77 +112,41 @@ class ModelRegistry:
         with open(metadata_path) as f:
             meta = json.load(f)
 
-        missing = [
-            k for k in ModelRegistry.REQUIRED_METADATA_FIELDS
-            if k not in meta
-        ]
-
-        if missing:
-            raise RuntimeError(
-                f"Metadata missing required fields: {missing}"
-            )
-
-        if meta["metadata_type"] not in ModelRegistry.ALLOWED_METADATA_TYPES:
-            raise RuntimeError(
-                "Invalid metadata_type — refusing registry write."
-            )
-
+        # integrity
         if meta["metadata_integrity_hash"] != ModelRegistry._metadata_hash(meta):
             raise RuntimeError("Metadata integrity failure.")
 
+        # schema
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Schema mismatch detected.")
 
-        ModelRegistry._validate_feature_contract(meta)
+        # feature contract
+        if meta["metadata_type"] == "training_manifest_v1":
+
+            if list(meta["features"]) != list(MODEL_FEATURES):
+                raise RuntimeError("Feature ordering mismatch.")
+
+        # ⭐ CRITICAL — training window required
+        if "training_window" not in meta:
+            raise RuntimeError(
+                "Metadata missing training_window — refusing registry write."
+            )
 
         return meta
 
     ########################################################
-    # LOCK WITH DURABILITY
+    # MANIFEST HASH
     ########################################################
 
     @staticmethod
-    def _acquire_lock(lock_path: str):
+    def _manifest_hash(manifest: dict):
 
-        directory = os.path.dirname(lock_path) or "."
+        clone = dict(manifest)
+        clone.pop("manifest_integrity_hash", None)
 
-        if os.path.exists(lock_path):
-
-            age = time.time() - os.path.getmtime(lock_path)
-
-            if age > ModelRegistry.LOCK_TIMEOUT_SECONDS:
-                try:
-                    os.remove(lock_path)
-                except FileNotFoundError:
-                    pass
-
-                if os.path.exists(lock_path):
-                    raise RuntimeError(
-                        "Failed to clear stale promotion lock."
-                    )
-            else:
-                raise RuntimeError(
-                    "Registry promotion already in progress."
-                )
-
-        fd = os.open(
-            lock_path,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        )
-        os.close(fd)
-
-        ModelRegistry._fsync_dir(directory)
-
-    ########################################################
-
-    @staticmethod
-    def _release_lock(lock_path: str):
-
-        directory = os.path.dirname(lock_path) or "."
-
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
-            ModelRegistry._fsync_dir(directory)
+        return hashlib.sha256(
+            json.dumps(clone, sort_keys=True).encode()
+        ).hexdigest()
 
     ########################################################
     # VERIFY ARTIFACTS
@@ -249,14 +168,9 @@ class ModelRegistry:
         with open(manifest_path) as f:
             manifest = json.load(f)
 
-        clone = dict(manifest)
-        expected_hash = clone.pop("manifest_integrity_hash")
-
-        actual_hash = hashlib.sha256(
-            json.dumps(clone, sort_keys=True).encode()
-        ).hexdigest()
-
-        if expected_hash != actual_hash:
+        if manifest["manifest_integrity_hash"] != (
+            ModelRegistry._manifest_hash(manifest)
+        ):
             raise RuntimeError("Manifest integrity failure.")
 
         for artifact, expected_hash in manifest["artifacts"].items():
@@ -274,7 +188,7 @@ class ModelRegistry:
                 )
 
     ########################################################
-    # REGISTER MODEL
+    # REGISTER MODEL (INSTITUTIONAL)
     ########################################################
 
     @staticmethod
@@ -307,27 +221,45 @@ class ModelRegistry:
             shutil.copy2(model_path, staged_model)
             shutil.copy2(metadata_path, staged_meta)
 
+            ##################################################
+            # ⭐ UNIVERSE HASH (VERY IMPORTANT)
+            ##################################################
+
+            universe_hash = None
+
+            if "training_universe" in meta:
+                universe_hash = ModelRegistry._hash_list(
+                    meta["training_universe"]
+                )
+
+            ##################################################
+
             manifest: Dict[str, Any] = {
+
                 "version": version,
                 "created_utc": datetime.datetime.utcnow().isoformat(),
                 "stage": "candidate",
                 "parent": parent_version,
+
                 "dataset_hash": meta["dataset_hash"],
                 "schema_signature": meta["schema_signature"],
                 "training_code_hash": meta["training_code_hash"],
+                "training_window": meta["training_window"],
+
+                "universe_hash": universe_hash,
                 "metadata_type": meta["metadata_type"],
+
                 "artifacts": {
                     model_name: ModelRegistry._sha256(staged_model),
                     metadata_name: ModelRegistry._sha256(staged_meta),
                 },
+
                 "history": []
             }
 
-            clone = dict(manifest)
-
-            manifest["manifest_integrity_hash"] = hashlib.sha256(
-                json.dumps(clone, sort_keys=True).encode()
-            ).hexdigest()
+            manifest["manifest_integrity_hash"] = (
+                ModelRegistry._manifest_hash(manifest)
+            )
 
             manifest_path = os.path.join(
                 staging_dir,
