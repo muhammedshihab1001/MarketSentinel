@@ -1,7 +1,6 @@
 import os
 import datetime
 import tempfile
-import shutil
 import joblib
 import pandas as pd
 import numpy as np
@@ -52,18 +51,33 @@ MIN_NEWS_PER_DAY = 0.6
 
 
 ########################################################
-# ATOMIC SAVE
+# ATOMIC SAVE (FSYNC SAFE)
 ########################################################
+
+def _fsync_dir(directory):
+
+    if os.name == "nt":
+        return
+
+    fd = os.open(directory, os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
 
 def save_model_atomic(model, path):
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
 
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         joblib.dump(model, tmp.name)
         temp_name = tmp.name
 
-    shutil.move(temp_name, path)
+    os.replace(temp_name, path)
+
+    _fsync_dir(directory)
 
     if not os.path.exists(path):
         raise RuntimeError("Model write failed.")
@@ -74,12 +88,11 @@ def save_model_atomic(model, path):
 ########################################################
 
 def build_news_query(ticker: str) -> str:
-
     return f"{ticker} earnings revenue guidance forecast upgrade downgrade"
 
 
 ########################################################
-# SIGNAL VALIDATION (SOFT — NOT FATAL)
+# SENTIMENT VALIDATION
 ########################################################
 
 def validate_sentiment_signal(sentiment_df, ticker):
@@ -91,19 +104,10 @@ def validate_sentiment_signal(sentiment_df, ticker):
     std = sentiment_df["avg_sentiment"].std()
     news_rate = sentiment_df["news_count"].mean()
 
-    logger.info(
-        "%s sentiment | std=%.4f | avg_news=%.2f",
-        ticker,
-        std,
-        news_rate
-    )
-
     if std < MIN_SENTIMENT_STD:
-        logger.warning("%s sentiment weak — downweighting.", ticker)
         sentiment_df["avg_sentiment"] *= 0.25
 
     if news_rate < MIN_NEWS_PER_DAY:
-        logger.warning("%s sparse news — downweighting.", ticker)
         sentiment_df["avg_sentiment"] *= 0.5
 
     return True
@@ -127,8 +131,6 @@ def load_training_data():
 
     for ticker in TRAINING_TICKERS:
 
-        logger.info("Building dataset for %s", ticker)
-
         try:
 
             price_df = fetcher.fetch(
@@ -140,23 +142,16 @@ def load_training_data():
             if price_df is None or price_df.empty:
                 continue
 
-            ################################################
-            # NEWS WITH RETRY
-            ################################################
-
             for attempt in range(3):
-
                 try:
                     news_df = news_fetcher.fetch(
                         build_news_query(ticker),
                         max_items=200
                     )
                     break
-
                 except Exception:
                     time.sleep(2 ** attempt)
             else:
-                logger.warning("News failed for %s", ticker)
                 continue
 
             scored_df = sentiment_analyzer.analyze_dataframe(news_df)
@@ -180,23 +175,10 @@ def load_training_data():
             surviving_tickers.append(ticker)
 
         except Exception as e:
-
-            logger.warning(
-                "Ticker rejected: %s | reason=%s",
-                ticker,
-                str(e)
-            )
-
-    ###################################################
-    # CROSS SECTION GUARD
-    ###################################################
+            logger.warning("Ticker rejected: %s | %s", ticker, str(e))
 
     if len(surviving_tickers) < MIN_SURVIVING_TICKERS:
-        raise RuntimeError(
-            f"Too few tickers survived ({len(surviving_tickers)})."
-        )
-
-    logger.info("Surviving tickers: %s", surviving_tickers)
+        raise RuntimeError("Too few tickers survived.")
 
     df = pd.concat(datasets, ignore_index=True)
 
@@ -204,29 +186,11 @@ def load_training_data():
     df.reset_index(drop=True, inplace=True)
 
     if len(df) < MIN_TRAINING_ROWS:
-        raise RuntimeError(
-            f"Training aborted — dataset too small ({len(df)} rows)"
-        )
+        raise RuntimeError("Training aborted — dataset too small.")
 
-    ###################################################
-    # FEATURE VALIDATION
-    ###################################################
+    validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
-    feature_block = validate_feature_schema(
-        df.loc[:, MODEL_FEATURES]
-    )
-
-    final = pd.concat(
-        [
-            df[["date", "ticker", "close", "target"]].reset_index(drop=True),
-            feature_block.reset_index(drop=True)
-        ],
-        axis=1
-    )
-
-    logger.info("FINAL DATASET SIZE: %s rows", len(final))
-
-    return final, end_date
+    return df, end_date
 
 
 ########################################################
@@ -269,6 +233,9 @@ def train_full_model(df):
         zip(MODEL_FEATURES, model.feature_importances_.tolist())
     )
 
+    if len(importance) != len(MODEL_FEATURES):
+        raise RuntimeError("Feature importance mismatch.")
+
     return model, importance
 
 
@@ -282,16 +249,16 @@ def main():
 
     df, end_date = load_training_data()
 
-    drift = DriftDetector()
-
     dataset_hash = MetadataManager.fingerprint_dataset(
-        df.loc[:, MODEL_FEATURES]
+        df[["ticker","date","target", *MODEL_FEATURES]]
     )
+
+    drift = DriftDetector()
 
     drift.create_baseline(
         df.loc[:, MODEL_FEATURES],
         dataset_hash=dataset_hash,
-        allow_overwrite=True
+        allow_overwrite=False
     )
 
     wf = WalkForwardValidator(
@@ -323,7 +290,7 @@ def main():
         training_start="2016-01-01",
         training_end=end_date,
         dataset_hash=dataset_hash,
-        metadata_type="tabular"
+        metadata_type="training_manifest_v1"
     )
 
     metadata["feature_importance"] = importance
