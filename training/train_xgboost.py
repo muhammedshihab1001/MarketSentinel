@@ -14,6 +14,8 @@ from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema
 
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
+from core.monitoring.drift_detector import DriftDetector
+
 from training.backtesting.walk_forward import WalkForwardValidator
 
 from models.xgboost_model import (
@@ -57,7 +59,7 @@ def save_model_atomic(model, path):
 
 
 ########################################################
-# DATA LOADER — FINAL FIX
+# DATA LOADER
 ########################################################
 
 def load_training_data():
@@ -138,10 +140,6 @@ def load_training_data():
         df.loc[:, MODEL_FEATURES]
     )
 
-    ####################################################
-    # FINAL DATASET CONTRACT
-    ####################################################
-
     final = pd.concat(
         [
             df[["date", "ticker", "close", "target"]].reset_index(drop=True),
@@ -200,18 +198,34 @@ def train_full_model(df):
 
 
 ########################################################
-# EXECUTION
+# MAIN ENTRYPOINT (CRITICAL FOR PIPELINES)
 ########################################################
 
-if __name__ == "__main__":
+def main():
 
     print("Institutional XGBoost Training")
 
     df, end_date = load_training_data()
 
+    ####################################################
+    # CREATE / VALIDATE DRIFT BASELINE
+    ####################################################
+
+    drift = DriftDetector()
+
     dataset_hash = MetadataManager.fingerprint_dataset(
         df.loc[:, MODEL_FEATURES]
     )
+
+    drift.create_baseline(
+        df.loc[:, MODEL_FEATURES],
+        dataset_hash=dataset_hash,
+        allow_overwrite=True
+    )
+
+    ####################################################
+    # WALK FORWARD
+    ####################################################
 
     wf = WalkForwardValidator(
         model_trainer=train_model,
@@ -225,6 +239,10 @@ if __name__ == "__main__":
 
     if strategy_metrics["max_drawdown"] < MAX_DRAWDOWN:
         raise RuntimeError("XGBoost rejected — drawdown too severe")
+
+    ####################################################
+    # FINAL MODEL
+    ####################################################
 
     model, importance = train_full_model(df)
 
@@ -255,3 +273,9 @@ if __name__ == "__main__":
     )
 
     print(f"XGBoost registered → {version}")
+
+
+########################################################
+
+if __name__ == "__main__":
+    main()
