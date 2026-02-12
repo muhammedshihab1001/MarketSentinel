@@ -16,7 +16,7 @@ class FinBERTSingleton:
 
     _tokenizer = None
     _model = None
-    _device = "cpu"
+    _device = "cuda" if torch.cuda.is_available() else "cpu"
     _lock = threading.Lock()
 
     MODEL_NAME = "ProsusAI/finbert"
@@ -35,10 +35,10 @@ class FinBERTSingleton:
 
             start = time.time()
 
-            logger.info("Loading FinBERT model")
+            logger.info("Loading FinBERT on %s", cls._device)
 
             torch.set_grad_enabled(False)
-            torch.set_num_threads(1)
+            torch.set_num_threads(min(4, os.cpu_count()))
 
             os.makedirs(cls.CACHE_DIR, exist_ok=True)
 
@@ -52,7 +52,10 @@ class FinBERTSingleton:
                 cls._model = AutoModelForSequenceClassification.from_pretrained(
                     cls.MODEL_NAME,
                     cache_dir=cls.CACHE_DIR
-                ).to("cpu")
+                ).to(cls._device)
+
+                if cls._model.config.num_labels != 3:
+                    raise RuntimeError("FinBERT label mismatch.")
 
             except Exception as e:
 
@@ -79,11 +82,12 @@ class SentimentAnalyzer:
     }
 
     BATCH_SIZE = 16
-    MAX_HEADLINE_CHARS = 512
+    MAX_HEADLINE_CHARS = 300
 
     MIN_CONFIDENCE = 0.55
-
     MAX_FAILURE_RATE = 0.40
+
+    SENTIMENT_EMBARGO_HOURS = 2
 
     def __init__(self):
 
@@ -98,7 +102,9 @@ class SentimentAnalyzer:
             logger.exception("FinBERT warmup failed")
 
     def _clamp_text(self, text: str) -> str:
-        return text[:self.MAX_HEADLINE_CHARS]
+        return str(text).replace("\n", " ")[:self.MAX_HEADLINE_CHARS]
+
+    ########################################################
 
     def analyze_batch(self, texts):
 
@@ -110,7 +116,7 @@ class SentimentAnalyzer:
             batch = texts[i:i+self.BATCH_SIZE]
 
             batch = [
-                self._clamp_text(str(t).strip())
+                self._clamp_text(t).strip()
                 for t in batch
             ]
 
@@ -126,7 +132,7 @@ class SentimentAnalyzer:
 
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-                with torch.no_grad():
+                with torch.inference_mode():
                     logits = self.model(**inputs).logits
                     probs = torch.softmax(logits, dim=1)
 
@@ -174,6 +180,8 @@ class SentimentAnalyzer:
 
         return results
 
+    ########################################################
+
     def analyze_dataframe(self, df: pd.DataFrame):
 
         if df.empty:
@@ -184,10 +192,11 @@ class SentimentAnalyzer:
 
         df = df.copy()
 
-        df["hash"] = df["headline"].apply(
-            lambda x: hashlib.sha256(
-                str(x).encode()
-            ).hexdigest()
+        df["hash"] = df.apply(
+            lambda row: hashlib.sha256(
+                f"{row.get('headline','')}|{row.get('source','')}|{row.get('published_at','')}".encode()
+            ).hexdigest(),
+            axis=1
         )
 
         df = df.drop_duplicates("hash")
@@ -210,6 +219,8 @@ class SentimentAnalyzer:
             axis=1
         )
 
+    ########################################################
+
     def aggregate_daily_sentiment(self, df: pd.DataFrame):
 
         if df.empty:
@@ -230,20 +241,24 @@ class SentimentAnalyzer:
 
         temp_df = temp_df.dropna(subset=["date"])
 
-        temp_df["date"] = (
+        embargo = pd.Timedelta(hours=self.SENTIMENT_EMBARGO_HOURS)
+
+        temp_df["effective_date"] = np.where(
+            temp_df["date"].dt.hour >= (24 - self.SENTIMENT_EMBARGO_HOURS),
+            temp_df["date"].dt.floor("D") + pd.Timedelta(days=1),
             temp_df["date"].dt.floor("D")
-            + pd.Timedelta(days=1)
         )
 
         aggregated = (
             temp_df
-            .groupby("date")
+            .groupby("effective_date")
             .agg(
                 avg_sentiment=("score", "mean"),
                 news_count=("score", "count"),
                 sentiment_std=("score", "std")
             )
             .reset_index()
+            .rename(columns={"effective_date": "date"})
         )
 
         aggregated["sentiment_std"] = aggregated[
