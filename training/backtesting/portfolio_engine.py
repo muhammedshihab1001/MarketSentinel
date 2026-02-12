@@ -10,6 +10,8 @@ class PortfolioBacktestEngine:
     CASH_BUFFER = 0.02
     MAX_INV_VOL = 5.0
 
+    MAX_SINGLE_STEP_RETURN = 0.40
+
     def __init__(
         self,
         transaction_cost=0.001,
@@ -24,13 +26,25 @@ class PortfolioBacktestEngine:
 
         self.return_buffers = defaultdict(list)
 
+    ###################################################
+    # RESET
+    ###################################################
+
     def _reset_state(self):
         self.return_buffers = defaultdict(list)
+
+    ###################################################
+    # SAFETY
+    ###################################################
 
     def _safe_price(self, price):
         if price is None or not np.isfinite(price) or price <= 0:
             raise RuntimeError("Invalid market price encountered.")
         return float(price)
+
+    ###################################################
+    # VOL ESTIMATION
+    ###################################################
 
     def _update_vol_buffers(self, prev_prices, prices):
 
@@ -52,13 +66,17 @@ class PortfolioBacktestEngine:
                 if len(buf) > self.VOL_WINDOW:
                     buf.pop(0)
 
-                vol = np.std(buf) if len(buf) > 2 else self.target_vol
+                vol = np.std(buf) if len(buf) > 5 else self.target_vol
                 vols[ticker] = max(vol, 1e-4)
 
             else:
                 vols[ticker] = self.target_vol
 
         return vols
+
+    ###################################################
+    # WEIGHTS
+    ###################################################
 
     def _compute_weights(self, signals, vols, current_weights):
 
@@ -71,7 +89,10 @@ class PortfolioBacktestEngine:
 
             vol = vols.get(ticker, self.target_vol)
 
-            inv_vol = min(1 / max(vol, 1e-4), self.MAX_INV_VOL)
+            inv_vol = min(
+                1 / max(vol, 1e-4),
+                self.MAX_INV_VOL
+            )
 
             raw[ticker] = inv_vol
 
@@ -80,38 +101,44 @@ class PortfolioBacktestEngine:
 
         total = sum(raw.values())
 
-        new_weights = {
+        weights = {
             t: w / total
             for t, w in raw.items()
         }
 
+        gross = sum(abs(w) for w in weights.values())
+
+        if gross > self.max_gross_exposure:
+            scale = self.max_gross_exposure / gross
+            weights = {t: w * scale for t, w in weights.items()}
+
+        portfolio_vol = np.sqrt(
+            sum((vols[t] ** 2) * (w ** 2) for t, w in weights.items())
+        )
+
+        if portfolio_vol > self.EPSILON:
+
+            vol_scale = min(
+                self.target_vol / portfolio_vol,
+                self.max_gross_exposure
+            )
+
+            weights = {t: w * vol_scale for t, w in weights.items()}
+
         final = {}
 
-        for t, w in new_weights.items():
+        for t, w in weights.items():
 
             if abs(w - current_weights.get(t, 0)) < self.REBALANCE_THRESHOLD:
                 final[t] = current_weights.get(t, 0)
             else:
                 final[t] = w
 
-        gross = sum(abs(w) for w in final.values())
-
-        if gross > self.max_gross_exposure:
-            scale = self.max_gross_exposure / gross
-            final = {t: w * scale for t, w in final.items()}
-
-        portfolio_vol = np.sqrt(
-            sum((vols[t] ** 2) * (w ** 2) for t, w in final.items())
-        )
-
-        if portfolio_vol > self.EPSILON:
-            vol_scale = min(
-                self.target_vol / portfolio_vol,
-                self.max_gross_exposure
-            )
-            final = {t: w * vol_scale for t, w in final.items()}
-
         return final
+
+    ###################################################
+    # RUN
+    ###################################################
 
     def run(
         self,
@@ -169,6 +196,10 @@ class PortfolioBacktestEngine:
                 for t, w in weights.items()
             }
 
+            ###################################################
+            # HARD CASH CHECK
+            ###################################################
+
             simulated_cash = cash
 
             for ticker in set(positions) | set(target_positions):
@@ -186,10 +217,12 @@ class PortfolioBacktestEngine:
                 simulated_cash -= delta * trade_price
                 simulated_cash -= cost
 
-            if simulated_cash < -self.EPSILON:
-                raise RuntimeError(
-                    "Backtest attempted leverage beyond cash."
-                )
+            if simulated_cash < -1e-6:
+                raise RuntimeError("Backtest attempted leverage.")
+
+            ###################################################
+            # EXECUTE
+            ###################################################
 
             for ticker in set(positions) | set(target_positions):
 
@@ -204,9 +237,13 @@ class PortfolioBacktestEngine:
                     continue
 
                 trade_notional = abs(delta) * trade_price
+
                 cost = trade_notional * (
                     self.transaction_cost + self.slippage
                 )
+
+                if trade_notional < cost * 2:
+                    continue
 
                 turnover += trade_notional
 
@@ -229,6 +266,14 @@ class PortfolioBacktestEngine:
             if equity <= 0:
                 raise RuntimeError("Portfolio capital depleted.")
 
+            if equity_curve:
+                step_return = equity / equity_curve[-1] - 1
+
+                if abs(step_return) > self.MAX_SINGLE_STEP_RETURN:
+                    raise RuntimeError(
+                        "Unrealistic single-step portfolio move detected."
+                    )
+
             equity_curve.append(float(equity))
 
             prev_prices = prices
@@ -241,12 +286,10 @@ class PortfolioBacktestEngine:
             np.maximum(curve[:-1], self.EPSILON)
         ) if len(curve) > 1 else np.array([0.0])
 
-        periods_per_year = min(252, len(curve))
-
         sharpe = (
             np.mean(returns) /
             max(np.std(returns), self.EPSILON) *
-            np.sqrt(periods_per_year)
+            np.sqrt(252)
         )
 
         peak = np.maximum.accumulate(curve)
