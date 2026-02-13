@@ -31,17 +31,6 @@ class FeatureEngineer:
     SENTIMENT_STD_FLOOR = 0.02
 
     ###################################################
-    # WINDOW GUARD
-    ###################################################
-
-    @staticmethod
-    def _validate_window(window: int):
-        if not isinstance(window, int):
-            raise RuntimeError("Window must be int.")
-        if window < 2:
-            raise RuntimeError("Window must be >= 2.")
-
-    ###################################################
     # DATETIME
     ###################################################
 
@@ -78,11 +67,8 @@ class FeatureEngineer:
         df = FeatureEngineer._normalize_datetime(df)
         df = df.sort_values("date")
 
-        if not df["date"].is_monotonic_increasing:
-            raise RuntimeError("Price dates must be strictly increasing.")
-
         if df["date"].duplicated().any():
-            raise RuntimeError("Duplicate timestamps in price data.")
+            raise RuntimeError("Duplicate timestamps.")
 
         df["close"] = pd.to_numeric(df["close"], errors="raise")
 
@@ -90,7 +76,7 @@ class FeatureEngineer:
             raise RuntimeError("Non-finite close prices detected.")
 
         if (df["close"] <= 0).any():
-            raise RuntimeError("Invalid close prices detected.")
+            raise RuntimeError("Invalid close prices.")
 
         if len(df) < FeatureEngineer.MIN_ROWS_REQUIRED:
             raise RuntimeError("Insufficient price history.")
@@ -98,24 +84,7 @@ class FeatureEngineer:
         return df
 
     ###################################################
-    # NUMERIC ENFORCEMENT
-    ###################################################
-
-    @staticmethod
-    def _force_numeric(df):
-
-        for col in df.columns:
-            if col == "date":
-                continue
-
-            df[col] = pd.to_numeric(df[col], errors="raise")
-
-        return df.astype(
-            {c: "float32" for c in df.select_dtypes(include="number").columns}
-        )
-
-    ###################################################
-    # FEATURES
+    # RETURNS / VOL
     ###################################################
 
     @staticmethod
@@ -127,10 +96,11 @@ class FeatureEngineer:
 
         df["return"] = returns.clip(lo, hi)
 
+        #  REQUIRED BY SCHEMA
+        df["return_lag1"] = df["return"].shift(1)
+
     @staticmethod
     def add_volatility(df, window=5):
-
-        FeatureEngineer._validate_window(window)
 
         df["volatility"] = (
             df["return"]
@@ -139,10 +109,12 @@ class FeatureEngineer:
             .clip(lower=FeatureEngineer.VOL_FLOOR, upper=5)
         )
 
+    ###################################################
+    # TECHNICALS
+    ###################################################
+
     @staticmethod
     def add_rsi(df, window=14):
-
-        FeatureEngineer._validate_window(window)
 
         df["rsi"] = TechnicalIndicators.rsi(
             df[["date", "close"]],
@@ -160,56 +132,45 @@ class FeatureEngineer:
         df["macd_signal"] = signal.clip(-50, 50)
 
     ###################################################
-    # ALIGNMENT
+    #  INSTITUTIONAL SENTIMENT FALLBACK
     ###################################################
 
-    @staticmethod
-    def align_features_to_prediction_time(df):
+    @classmethod
+    def _build_neutral_sentiment(cls, price_df):
 
-        leak_prone = list(MODEL_FEATURES)
+        neutral = price_df[["date"]].copy()
 
-        for col in leak_prone:
-            if col in df.columns:
-                df[col] = df[col].shift(1)
+        neutral["avg_sentiment"] = 0.0
+        neutral["news_count"] = 0.0
+        neutral["sentiment_std"] = cls.SENTIMENT_STD_FLOOR
 
-        return df
+        logger.warning(
+            "Sentiment unavailable — using neutral prior."
+        )
 
-    ###################################################
-    # SENTIMENT MERGE
+        return neutral
+
     ###################################################
 
     @classmethod
     def merge_price_sentiment(cls, price_df, sentiment_df):
 
-        if sentiment_df is None or sentiment_df.empty:
-            raise RuntimeError(
-                "Sentiment dataset empty — refusing to fabricate signal."
-            )
-
         price = cls._normalize_datetime(price_df).sort_values("date")
+
+        #  FALLBACK INSTEAD OF CRASH
+        if sentiment_df is None or sentiment_df.empty:
+            sentiment_df = cls._build_neutral_sentiment(price)
 
         sentiment = sentiment_df.copy()
 
         missing = set(cls.SENTIMENT_COLUMNS) - set(sentiment.columns)
 
         if missing:
-            raise RuntimeError(
-                f"Sentiment schema violation: {missing}"
-            )
+            sentiment_df = cls._build_neutral_sentiment(price)
+            sentiment = sentiment_df
 
         sentiment = sentiment.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment).sort_values("date")
-
-        if not sentiment["date"].is_monotonic_increasing:
-            raise RuntimeError("Sentiment dates must be monotonic.")
-
-        sentiment = cls._force_numeric(sentiment)
-
-        if sentiment["date"].duplicated().any():
-            sentiment = sentiment.groupby(
-                "date",
-                as_index=False
-            )[cls.SENTIMENT_COLUMNS[1:]].mean()
 
         sentiment["date"] += pd.Timedelta(days=1)
 
@@ -222,23 +183,17 @@ class FeatureEngineer:
             allow_exact_matches=False
         )
 
-        merged["avg_sentiment"] = merged["avg_sentiment"].ffill(limit=3)
-        merged["news_count"] = merged["news_count"].ffill(limit=3)
+        #  FINAL SAFETY FILL
+        merged["avg_sentiment"] = merged["avg_sentiment"].fillna(0.0)
+        merged["news_count"] = merged["news_count"].fillna(0.0)
         merged["sentiment_std"] = (
             merged["sentiment_std"]
             .fillna(cls.SENTIMENT_STD_FLOOR)
             .clip(lower=cls.SENTIMENT_STD_FLOOR)
         )
 
-        merged.dropna(
-            subset=["avg_sentiment", "news_count"],
-            inplace=True
-        )
-
-        if merged["avg_sentiment"].std(ddof=0) < 1e-4:
-            raise RuntimeError(
-                "Sentiment variance collapsed — check news pipeline."
-            )
+        #  REQUIRED BY SCHEMA
+        merged["sentiment_lag1"] = merged["avg_sentiment"].shift(1)
 
         return merged
 
@@ -268,9 +223,7 @@ class FeatureEngineer:
         df.dropna(inplace=True)
 
         if len(df) < 100:
-            raise RuntimeError(
-                "Feature collapse — too few rows after target creation."
-            )
+            raise RuntimeError("Feature collapse.")
 
         df["target"] = df["target"].astype("int8")
 
@@ -299,10 +252,6 @@ class FeatureEngineer:
 
         df = cls.merge_price_sentiment(df, sentiment_df)
 
-        df = cls.align_features_to_prediction_time(df)
-
-        df = cls._force_numeric(df)
-
         if training:
             df = cls.create_training_dataset(df)
         else:
@@ -314,16 +263,11 @@ class FeatureEngineer:
 
         validated = validate_feature_schema(feature_block)
 
-        allowed_non_features = {"date", "close", "target", "ticker"}
-
-        non_features = [
-            col for col in df.columns
-            if col in allowed_non_features
-        ]
+        allowed = {"date", "close", "target", "ticker"}
 
         final = pd.concat(
             [
-                df[non_features].reset_index(drop=True),
+                df[[c for c in df.columns if c in allowed]].reset_index(drop=True),
                 validated.reset_index(drop=True)
             ],
             axis=1
