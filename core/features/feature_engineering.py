@@ -29,8 +29,10 @@ class FeatureEngineer:
     VOL_FLOOR = 1e-4
     SENTIMENT_STD_FLOOR = 0.02
 
+    NON_NUMERIC_COLUMNS = {"date", "ticker"}
+
     ###################################################
-    # DATETIME
+    # DATETIME (TZ SAFE)
     ###################################################
 
     @staticmethod
@@ -38,33 +40,30 @@ class FeatureEngineer:
 
         df = df.copy()
 
-        dt = pd.to_datetime(
-            df["date"],
-            utc=True,
-            errors="raise"
+        df["date"] = (
+            pd.to_datetime(df["date"], utc=True, errors="raise")
+            .dt.tz_convert(None)
         )
-
-        df["date"] = dt.dt.tz_convert("UTC").dt.tz_localize(None)
 
         return df
 
     ###################################################
-    # 🚨 HARD GUARANTEE — TICKER MUST EXIST
+    # HARD TICKER ENFORCEMENT
     ###################################################
 
     @staticmethod
     def _enforce_ticker(df: pd.DataFrame, ticker=None):
 
         if "ticker" in df.columns:
+            df["ticker"] = df["ticker"].astype(str)
             return df
 
         if ticker is not None:
-            df["ticker"] = ticker
+            df["ticker"] = str(ticker)
             return df
 
         raise RuntimeError(
-            "Ticker column missing from price dataframe. "
-            "MarketDataService MUST attach ticker."
+            "Ticker column missing from price dataframe."
         )
 
     ###################################################
@@ -82,9 +81,7 @@ class FeatureEngineer:
         required = {"date", "close", "ticker"}
 
         if not required.issubset(df.columns):
-            raise RuntimeError(
-                "Price dataframe missing required columns."
-            )
+            raise RuntimeError("Price dataframe missing required columns.")
 
         df = cls._normalize_datetime(df)
         df = df.sort_values("date")
@@ -103,17 +100,18 @@ class FeatureEngineer:
         if len(df) < cls.MIN_ROWS_REQUIRED:
             raise RuntimeError("Insufficient price history.")
 
-        return df
+        return df.reset_index(drop=True)
 
     ###################################################
-    # NUMERIC ENFORCEMENT
+    # 🚨 FIXED — SAFE NUMERIC CAST
     ###################################################
 
-    @staticmethod
-    def _force_numeric(df):
+    @classmethod
+    def _force_numeric(cls, df):
 
         for col in df.columns:
-            if col == "date":
+
+            if col in cls.NON_NUMERIC_COLUMNS:
                 continue
 
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -169,7 +167,7 @@ class FeatureEngineer:
         df["macd_signal"] = signal.clip(-50, 50)
 
     ###################################################
-    # ANTI-LEAK ALIGNMENT
+    # ANTI-LOOKAHEAD
     ###################################################
 
     @staticmethod
@@ -182,7 +180,7 @@ class FeatureEngineer:
         return df
 
     ###################################################
-    #  STRONG VARIANCE SENTIMENT
+    # VARIANCE SAFE SENTIMENT
     ###################################################
 
     @classmethod
@@ -197,7 +195,6 @@ class FeatureEngineer:
             0.0, 0.02, n
         ).clip(-0.06, 0.06)
 
-        #  MUCH STRONGER variance than Poisson
         neutral["news_count"] = rng.integers(
             0, 5, n
         ).astype("float32")
@@ -280,6 +277,7 @@ class FeatureEngineer:
         )
 
         df = cls._force_numeric(df)
+
         df.dropna(inplace=True)
 
         if len(df) < 100:
@@ -287,7 +285,7 @@ class FeatureEngineer:
 
         df["target"] = df["target"].astype("int8")
 
-        return df
+        return df.reset_index(drop=True)
 
     ###################################################
     # MASTER PIPELINE
@@ -317,9 +315,7 @@ class FeatureEngineer:
         if training:
             df = cls.create_training_dataset(df)
         else:
-            raise RuntimeError(
-                "Inference pipeline should be built separately."
-            )
+            raise RuntimeError("Inference pipeline should be separate.")
 
         feature_block = df.loc[:, MODEL_FEATURES]
         validated = validate_feature_schema(feature_block)
