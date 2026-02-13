@@ -7,12 +7,12 @@ import tempfile
 
 from datetime import datetime, timedelta
 from dateutil import parser
-from typing import Optional
+from typing import Optional, Callable, List
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from core.config.env_loader import init_env, get_bool
+from core.config.env_loader import init_env, get_bool, get_env
 
 init_env()
 
@@ -21,6 +21,7 @@ logger = logging.getLogger("marketsentinel.news")
 
 class NewsFetcher:
 
+    FINNHUB_URL = "https://finnhub.io/api/v1/company-news"
     MARKET_AUX_URL = "https://api.marketaux.com/v1/news/all"
     GNEWS_URL = "https://gnews.io/api/v4/search"
 
@@ -32,11 +33,9 @@ class NewsFetcher:
 
     CACHE_DIR = "data/news_cache"
     CACHE_TTL_MIN = 20
-    CACHE_SCHEMA_VERSION = "v3"   #  bump version after schema hardening
 
-    ########################################################
-    #  SCHEMA LOCK
-    ########################################################
+    # bumped because provider logic changed
+    CACHE_SCHEMA_VERSION = "v4"
 
     EMPTY_SCHEMA = pd.DataFrame({
         "headline": pd.Series(dtype="string"),
@@ -45,12 +44,16 @@ class NewsFetcher:
         "link": pd.Series(dtype="string"),
     })
 
-    ########################################################
-
     def __init__(self):
 
+        self.finnhub_key = os.getenv("FINNHUB_API_KEY")
         self.marketaux_key = os.getenv("MARKETAUX_API_KEY")
         self.gnews_key = os.getenv("GNEWS_API_KEY")
+
+        self.primary = get_env(
+            "NEWS_PROVIDER_PRIMARY",
+            "finnhub"
+        ).lower()
 
         self.failover_enabled = get_bool(
             "NEWS_PROVIDER_FAILOVER", True
@@ -59,6 +62,17 @@ class NewsFetcher:
         os.makedirs(self.CACHE_DIR, exist_ok=True)
 
         self.session = self._build_session()
+
+        self.provider_map = {
+            "finnhub": self._fetch_finnhub,
+            "marketaux": self._fetch_marketaux,
+            "gnews": self._fetch_gnews,
+        }
+
+        if self.primary not in self.provider_map:
+            raise RuntimeError(
+                f"Unsupported news provider: {self.primary}"
+            )
 
     ########################################################
 
@@ -80,8 +94,6 @@ class NewsFetcher:
         )
 
         session.mount("https://", adapter)
-        session.mount("http://", adapter)
-
         session.headers.update(
             {"User-Agent": "MarketSentinel/Institutional"}
         )
@@ -99,8 +111,6 @@ class NewsFetcher:
 
         return f"{self.CACHE_DIR}/{key}.parquet"
 
-    ########################################################
-
     def _load_cache(self, path: str) -> Optional[pd.DataFrame]:
 
         if not os.path.exists(path):
@@ -116,8 +126,8 @@ class NewsFetcher:
             return None
 
         try:
-            df = pd.read_parquet(path)
-            return df.copy()
+            return pd.read_parquet(path).copy()
+
         except Exception:
             logger.warning("News cache corrupted — rebuilding.")
             try:
@@ -125,10 +135,6 @@ class NewsFetcher:
             except Exception:
                 pass
             return None
-
-    ########################################################
-    # ATOMIC WRITE
-    ########################################################
 
     def _write_cache(self, df, path):
 
@@ -159,13 +165,11 @@ class NewsFetcher:
             return None
 
         try:
-            ts = parser.parse(dt)
+            ts = parser.parse(str(dt))
             return ts.replace(tzinfo=None)
         except Exception:
             return None
 
-    ########################################################
-    # POST PROCESS — PANDAS SAFE
     ########################################################
 
     def _post_process(self, df):
@@ -186,7 +190,7 @@ class NewsFetcher:
             (df["published_at"] <= ingest_guard)
         )
 
-        df = df.loc[mask].copy()   #  CRITICAL FIX
+        df = df.loc[mask].copy()
 
         df["headline"] = df["headline"].str.strip()
 
@@ -203,6 +207,53 @@ class NewsFetcher:
 
     ########################################################
     # PROVIDERS
+    ########################################################
+
+    def _fetch_finnhub(self, query, limit):
+
+        if not self.finnhub_key:
+            return self.EMPTY_SCHEMA.copy()
+
+        # crude ticker extraction
+        ticker = query.split()[0].upper()
+
+        to_date = datetime.utcnow().date()
+        from_date = to_date - timedelta(days=7)
+
+        params = {
+            "symbol": ticker,
+            "from": from_date.isoformat(),
+            "to": to_date.isoformat(),
+            "token": self.finnhub_key
+        }
+
+        r = self.session.get(
+            self.FINNHUB_URL,
+            params=params,
+            timeout=self.REQUEST_TIMEOUT
+        )
+
+        r.raise_for_status()
+
+        data = r.json()
+
+        rows = []
+
+        for a in data:
+
+            published = datetime.utcfromtimestamp(
+                a.get("datetime", 0)
+            )
+
+            rows.append({
+                "headline": a.get("headline", ""),
+                "published_at": published,
+                "source": a.get("source", "finnhub"),
+                "link": a.get("url", "")
+            })
+
+        return self._post_process(pd.DataFrame(rows))
+
     ########################################################
 
     def _fetch_marketaux(self, query, limit):
@@ -292,7 +343,40 @@ class NewsFetcher:
         return self._post_process(pd.DataFrame(rows))
 
     ########################################################
-    # MERGE
+    # ROUTER
+    ########################################################
+
+    def _fetch_with_router(self, query, limit):
+
+        primary_fetch = self.provider_map[self.primary]
+
+        try:
+            primary = primary_fetch(query, limit)
+        except Exception as e:
+            logger.warning("Primary provider failed: %s", str(e))
+            primary = self.EMPTY_SCHEMA.copy()
+
+        if not self.failover_enabled:
+            return primary
+
+        fallbacks: List[Callable] = [
+            fn for name, fn in self.provider_map.items()
+            if name != self.primary
+        ]
+
+        fallback_df = pd.DataFrame()
+
+        for fn in fallbacks:
+
+            try:
+                fallback_df = fn(query, limit)
+                if not fallback_df.empty:
+                    break
+            except Exception as e:
+                logger.warning("Fallback failed: %s", str(e))
+
+        return self._merge_sources(primary, fallback_df)
+
     ########################################################
 
     def _merge_sources(self, primary, fallback):
@@ -334,23 +418,9 @@ class NewsFetcher:
             logger.info("News cache hit.")
             return cached
 
-        logger.info("Fetching news: %s", query)
+        logger.info("Fetching news via primary=%s", self.primary)
 
-        primary = pd.DataFrame()
-        fallback = pd.DataFrame()
-
-        try:
-            primary = self._fetch_marketaux(query, max_items)
-        except Exception as e:
-            logger.warning("Marketaux failed: %s", str(e))
-
-        if self.failover_enabled:
-            try:
-                fallback = self._fetch_gnews(query, max_items)
-            except Exception as e:
-                logger.warning("Fallback provider failed: %s", str(e))
-
-        merged = self._merge_sources(primary, fallback)
+        merged = self._fetch_with_router(query, max_items)
 
         if len(merged) < self.MIN_ARTICLES:
             logger.warning(
