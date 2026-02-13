@@ -3,7 +3,6 @@ import logging
 import requests
 import pandas as pd
 import hashlib
-import time
 import tempfile
 
 from datetime import datetime, timedelta
@@ -30,16 +29,21 @@ class NewsFetcher:
     MIN_ARTICLES = 12
 
     REQUEST_TIMEOUT = (4, 12)
-    MAX_RETRIES = 3
 
     CACHE_DIR = "data/news_cache"
     CACHE_TTL_MIN = 20
+    CACHE_SCHEMA_VERSION = "v3"   #  bump version after schema hardening
 
-    CACHE_SCHEMA_VERSION = "v2"
+    ########################################################
+    #  SCHEMA LOCK
+    ########################################################
 
-    EMPTY_SCHEMA = pd.DataFrame(
-        columns=["headline", "published_at", "source", "link"]
-    )
+    EMPTY_SCHEMA = pd.DataFrame({
+        "headline": pd.Series(dtype="string"),
+        "published_at": pd.Series(dtype="datetime64[ns]"),
+        "source": pd.Series(dtype="string"),
+        "link": pd.Series(dtype="string"),
+    })
 
     ########################################################
 
@@ -56,8 +60,6 @@ class NewsFetcher:
 
         self.session = self._build_session()
 
-    ########################################################
-    # HARDENED SESSION
     ########################################################
 
     def _build_session(self):
@@ -87,7 +89,7 @@ class NewsFetcher:
         return session
 
     ########################################################
-    # VERSIONED CACHE KEY (CRITICAL)
+    # CACHE
     ########################################################
 
     def _cache_path(self, query: str, limit: int):
@@ -114,7 +116,8 @@ class NewsFetcher:
             return None
 
         try:
-            return pd.read_parquet(path)
+            df = pd.read_parquet(path)
+            return df.copy()
         except Exception:
             logger.warning("News cache corrupted — rebuilding.")
             try:
@@ -124,7 +127,7 @@ class NewsFetcher:
             return None
 
     ########################################################
-    # TRUE ATOMIC WRITE
+    # ATOMIC WRITE
     ########################################################
 
     def _write_cache(self, df, path):
@@ -162,11 +165,13 @@ class NewsFetcher:
             return None
 
     ########################################################
+    # POST PROCESS — PANDAS SAFE
+    ########################################################
 
     def _post_process(self, df):
 
         if df.empty:
-            return df
+            return self.EMPTY_SCHEMA.copy()
 
         cutoff = datetime.utcnow() - timedelta(
             hours=self.MAX_AGE_HOURS
@@ -176,26 +181,25 @@ class NewsFetcher:
             minutes=self.INGESTION_DELAY_MIN
         )
 
-        df = df[
+        mask = (
             (df["published_at"] >= cutoff) &
             (df["published_at"] <= ingest_guard)
-        ]
+        )
+
+        df = df.loc[mask].copy()   #  CRITICAL FIX
 
         df["headline"] = df["headline"].str.strip()
-        df = df[df["headline"].str.len() > 12]
+
+        df = df.loc[df["headline"].str.len() > 12].copy()
 
         df["key"] = (
             df["headline"].str.lower() +
             df["source"].str.lower()
         )
 
-        df = df.drop_duplicates("key")
-        df = df.drop(columns="key")
+        df = df.drop_duplicates("key").drop(columns="key")
 
-        df = df.sort_values("published_at")
-        df.reset_index(drop=True, inplace=True)
-
-        return df
+        return df.sort_values("published_at").reset_index(drop=True)
 
     ########################################################
     # PROVIDERS
@@ -288,26 +292,31 @@ class NewsFetcher:
         return self._post_process(pd.DataFrame(rows))
 
     ########################################################
-    # MERGED PROVIDERS (INSTITUTIONAL FIX)
+    # MERGE
     ########################################################
 
     def _merge_sources(self, primary, fallback):
 
+        if primary.empty and fallback.empty:
+            return self.EMPTY_SCHEMA.copy()
+
         if primary.empty:
-            return fallback
+            return fallback.copy()
 
         if fallback.empty:
-            return primary
+            return primary.copy()
 
-        merged = pd.concat([primary, fallback], ignore_index=True)
+        merged = pd.concat(
+            [primary, fallback],
+            ignore_index=True
+        ).copy()
 
         merged["key"] = (
             merged["headline"].str.lower() +
             merged["source"].str.lower()
         )
 
-        merged = merged.drop_duplicates("key")
-        merged = merged.drop(columns="key")
+        merged = merged.drop_duplicates("key").drop(columns="key")
 
         return merged.sort_values("published_at").reset_index(drop=True)
 
@@ -323,7 +332,7 @@ class NewsFetcher:
 
         if cached is not None:
             logger.info("News cache hit.")
-            return cached.copy()
+            return cached
 
         logger.info("Fetching news: %s", query)
 
@@ -345,10 +354,10 @@ class NewsFetcher:
 
         if len(merged) < self.MIN_ARTICLES:
             logger.warning(
-                "Low article count after merge (%s).",
+                "Low article count (%s) — training will fallback to neutral sentiment.",
                 len(merged)
             )
 
         self._write_cache(merged, cache_path)
 
-        return merged if not merged.empty else self.EMPTY_SCHEMA.copy()
+        return merged.copy()
