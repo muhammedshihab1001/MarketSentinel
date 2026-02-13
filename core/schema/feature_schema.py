@@ -3,10 +3,15 @@ import pandas as pd
 import hashlib
 import numpy as np
 import json
+import re
 
 
-SCHEMA_VERSION = "10.0"
+SCHEMA_VERSION = "11.0"
 
+
+############################################################
+# IMMUTABLE FEATURE CONTRACT
+############################################################
 
 MODEL_FEATURES: Tuple[str, ...] = (
     "return",
@@ -23,10 +28,9 @@ MODEL_FEATURES: Tuple[str, ...] = (
 
 FEATURE_COUNT = len(MODEL_FEATURES)
 
-NUMERIC_FEATURES = frozenset(MODEL_FEATURES)
-
 DTYPE = "float32"
 
+MIN_ROWS = 120
 
 MAX_NAN_RATIO_PER_FEATURE = 0.05
 MAX_ROW_NAN_RATIO = 0.10
@@ -34,6 +38,10 @@ MAX_ROW_NAN_RATIO = 0.10
 ABSOLUTE_FEATURE_LIMIT = 1e6
 MIN_VARIANCE = 1e-8
 
+
+############################################################
+# PLAUSIBLE LIMITS
+############################################################
 
 FEATURE_LIMITS: Dict[str, tuple] = {
 
@@ -56,15 +64,13 @@ FEATURE_LIMITS: Dict[str, tuple] = {
 }
 
 
-FORBIDDEN_PATTERNS = (
-    "future",
-    "next",
-    "tomorrow",
-    "target",
-    "label",
-    "t+",
-    "lead",
-    "forward"
+############################################################
+# LOOKAHEAD FIREWALL
+############################################################
+
+FORBIDDEN_REGEX = re.compile(
+    r"(future|next|forward|target|label|tomorrow|t\+|lead)",
+    re.IGNORECASE
 )
 
 
@@ -75,14 +81,15 @@ def _check_forbidden_columns(df: pd.DataFrame):
         if not isinstance(col, str):
             raise RuntimeError("Non-string column detected.")
 
-        tokens = col.lower().replace("+", "_").split("_")
+        if FORBIDDEN_REGEX.search(col):
+            raise RuntimeError(
+                f"Potential lookahead column detected: {col}"
+            )
 
-        for bad in FORBIDDEN_PATTERNS:
-            if bad in tokens:
-                raise RuntimeError(
-                    f"Potential lookahead column detected: {col}"
-                )
 
+############################################################
+# SCHEMA LOCK HASH
+############################################################
 
 def _build_feature_lock():
 
@@ -94,7 +101,6 @@ def _build_feature_lock():
         "nan_row": MAX_ROW_NAN_RATIO,
         "abs_limit": ABSOLUTE_FEATURE_LIMIT,
         "variance_floor": MIN_VARIANCE,
-        "forbidden": sorted(FORBIDDEN_PATTERNS),
         "count": FEATURE_COUNT,
         "version": SCHEMA_VERSION
     }
@@ -107,10 +113,17 @@ def _build_feature_lock():
 FEATURE_LOCK_HASH = _build_feature_lock()
 
 
+############################################################
+# MAIN VALIDATOR
+############################################################
+
 def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     if df is None or df.empty:
         raise RuntimeError("Feature dataset is empty.")
+
+    if len(df) < MIN_ROWS:
+        raise RuntimeError("Dataset below institutional minimum rows.")
 
     if isinstance(df.columns, pd.MultiIndex):
         raise RuntimeError("MultiIndex columns are not allowed.")
@@ -124,6 +137,11 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     if len(df.columns) != FEATURE_COUNT:
         raise RuntimeError("Feature count mismatch detected.")
 
+    if df.duplicated().any():
+        raise RuntimeError("Duplicate rows detected.")
+
+    _check_forbidden_columns(df)
+
     missing_limits = set(MODEL_FEATURES) - set(FEATURE_LIMITS.keys())
 
     if missing_limits:
@@ -131,9 +149,11 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             f"Missing feature limits for: {missing_limits}"
         )
 
-    _check_forbidden_columns(df)
+    ########################################################
+    # VALIDATE IN FLOAT64 FIRST
+    ########################################################
 
-    feature_df = df.copy(deep=True)
+    feature_df = df.astype("float64", copy=True)
 
     feature_df.replace(
         [np.inf, -np.inf],
@@ -143,19 +163,17 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in MODEL_FEATURES:
 
-        coerced = pd.to_numeric(
+        series = pd.to_numeric(
             feature_df[col],
             errors="coerce"
         )
 
-        if coerced.isna().sum() > feature_df[col].isna().sum():
+        if series.isna().sum() > feature_df[col].isna().sum():
             raise RuntimeError(
                 f"Numeric coercion introduced NaNs in feature: {col}"
             )
 
-        feature_df[col] = coerced.astype(DTYPE)
-
-        finite_vals = feature_df[col][np.isfinite(feature_df[col])]
+        finite_vals = series[np.isfinite(series)]
 
         if finite_vals.empty:
             raise RuntimeError(
@@ -177,6 +195,10 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
                 f"Feature explosion detected: {col}"
             )
 
+    ########################################################
+    # NAN CHECKS
+    ########################################################
+
     per_feature_nan = feature_df.isna().mean()
 
     unsafe = per_feature_nan[
@@ -195,10 +217,13 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             "Row-level NaN explosion detected."
         )
 
+    ########################################################
+    # PLAUSIBILITY LIMITS
+    ########################################################
+
     for col, (lo, hi) in FEATURE_LIMITS.items():
 
-        series = feature_df[col]
-        finite = series[np.isfinite(series)]
+        finite = feature_df[col][np.isfinite(feature_df[col])]
 
         if finite.empty:
             continue
@@ -207,6 +232,10 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             raise RuntimeError(
                 f"Feature out of plausible bounds: {col}"
             )
+
+    ########################################################
+    # FINAL CAST → FLOAT32
+    ########################################################
 
     arr = np.ascontiguousarray(
         feature_df.to_numpy(dtype=DTYPE)
@@ -220,6 +249,10 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         columns=MODEL_FEATURES
     )
 
+
+############################################################
+# SIGNATURE
+############################################################
 
 def get_schema_signature() -> str:
 
