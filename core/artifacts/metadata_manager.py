@@ -17,7 +17,7 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "10.0"
+    METADATA_VERSION = "11.0"
     MIN_TRAINING_DAYS = 120
 
     REQUIRED_METADATA_FIELDS = [
@@ -41,7 +41,7 @@ class MetadataManager:
     ]
 
     #####################################################
-    # SAFE FSYNC
+    # FSYNC
     #####################################################
 
     @staticmethod
@@ -50,15 +50,78 @@ class MetadataManager:
         if os.name == "nt":
             return
 
+        fd = os.open(directory, os.O_DIRECTORY)
+
         try:
-            fd = os.open(directory, os.O_DIRECTORY)
             os.fsync(fd)
+        finally:
             os.close(fd)
-        except Exception:
-            pass
 
     #####################################################
-    # HASH LIST (RESTORED)
+    # ATOMIC WRITE
+    #####################################################
+
+    @staticmethod
+    def save_metadata(metadata: dict, path: str):
+
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+
+        tmp = path + ".tmp"
+
+        with open(tmp, "w") as f:
+            json.dump(metadata, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp, path)
+        MetadataManager._fsync_dir_safe(directory)
+
+    #####################################################
+    # SECURE LOAD
+    #####################################################
+
+    @staticmethod
+    def load_metadata(path: str) -> dict:
+
+        if os.path.islink(path):
+            raise RuntimeError("Symlinked metadata detected.")
+
+        if not os.path.exists(path):
+            raise RuntimeError(f"Metadata missing: {path}")
+
+        with open(path) as f:
+            metadata = json.load(f)
+
+        missing = [
+            k for k in MetadataManager.REQUIRED_METADATA_FIELDS
+            if k not in metadata
+        ]
+
+        if missing:
+            raise RuntimeError(
+                f"Metadata missing required fields: {missing}"
+            )
+
+        expected = metadata.get("metadata_integrity_hash")
+
+        actual = MetadataManager._compute_metadata_hash(metadata)
+
+        if expected != actual:
+            raise RuntimeError(
+                "Metadata integrity failure — possible tampering."
+            )
+
+        if metadata["metadata_version"] != MetadataManager.METADATA_VERSION:
+            raise RuntimeError("Metadata version mismatch.")
+
+        if metadata["schema_signature"] != get_schema_signature():
+            raise RuntimeError("Schema mismatch with runtime.")
+
+        return metadata
+
+    #####################################################
+    # HASH LIST
     #####################################################
 
     @staticmethod
@@ -77,7 +140,7 @@ class MetadataManager:
         return hashlib.sha256(canonical).hexdigest()
 
     #####################################################
-    # FEATURE CONTRACT (FIXED — MULTI MODEL)
+    # FEATURE CONTRACT
     #####################################################
 
     @staticmethod
@@ -112,7 +175,7 @@ class MetadataManager:
             )
 
     #####################################################
-    # DATASET HASH
+    # DATASET HASH (HARDENED)
     #####################################################
 
     @staticmethod
@@ -146,6 +209,11 @@ class MetadataManager:
                 .round(10)
             )
 
+        if not np.isfinite(
+            df_copy.select_dtypes(include=[np.number]).to_numpy()
+        ).all():
+            raise RuntimeError("Non-finite values detected in dataset.")
+
         hashed = pd.util.hash_pandas_object(
             df_copy,
             index=True
@@ -154,7 +222,7 @@ class MetadataManager:
         return hashlib.sha256(hashed.tobytes()).hexdigest()
 
     #####################################################
-    # TRAINING CODE HASH
+    # TRAINING CODE HASH (SYMLINK SAFE)
     #####################################################
 
     @staticmethod
@@ -185,6 +253,12 @@ class MetadataManager:
                 for f in files:
 
                     full_path = os.path.join(path, f)
+
+                    if os.path.islink(full_path):
+                        raise RuntimeError(
+                            f"Symlink detected in training code: {full_path}"
+                        )
+
                     rel_path = os.path.relpath(full_path)
 
                     hasher.update(rel_path.encode())
@@ -198,19 +272,39 @@ class MetadataManager:
         return hasher.hexdigest()
 
     #####################################################
-    # ENVIRONMENT
+    # ENVIRONMENT (EXTENDED)
     #####################################################
 
     @staticmethod
     def capture_environment():
 
-        return {
+        env = {
             "python": platform.python_version(),
             "platform": platform.platform(),
             "machine": platform.machine(),
             "numpy": np.__version__,
             "pandas": pd.__version__,
         }
+
+        try:
+            import xgboost
+            env["xgboost"] = xgboost.__version__
+        except Exception:
+            pass
+
+        try:
+            import torch
+            env["torch"] = torch.__version__
+        except Exception:
+            pass
+
+        try:
+            import sklearn
+            env["sklearn"] = sklearn.__version__
+        except Exception:
+            pass
+
+        return env
 
     #####################################################
     # METADATA HASH
@@ -231,7 +325,7 @@ class MetadataManager:
         return hashlib.sha256(canonical).hexdigest()
 
     #####################################################
-    # VALIDATORS
+    # TRAINING WINDOW
     #####################################################
 
     @staticmethod
