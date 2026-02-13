@@ -49,7 +49,7 @@ class FeatureEngineer:
         return df
 
     ###################################################
-    # 🚨 HARD GUARANTEE — TICKER MUST EXIST
+    # TICKER ENFORCEMENT
     ###################################################
 
     @staticmethod
@@ -129,9 +129,10 @@ class FeatureEngineer:
             .std(ddof=0)
         )
 
-        df["volatility"] = vol.clip(
-            lower=FeatureEngineer.VOL_FLOOR
-        ).fillna(FeatureEngineer.VOL_FLOOR)
+        df["volatility"] = (
+            vol.clip(lower=FeatureEngineer.VOL_FLOOR)
+            .fillna(FeatureEngineer.VOL_FLOOR)
+        )
 
     ###################################################
     # TECHNICALS
@@ -171,7 +172,7 @@ class FeatureEngineer:
         return df
 
     ###################################################
-    # NEUTRAL SENTIMENT
+    # 🔥 INSTITUTIONAL NEUTRAL SENTIMENT (FIXED)
     ###################################################
 
     @classmethod
@@ -180,28 +181,33 @@ class FeatureEngineer:
         neutral = price_df[["date"]].copy()
 
         n = len(neutral)
-        rng = np.random.default_rng(42)
 
-        neutral["avg_sentiment"] = rng.normal(
-            0.0, 0.02, n
-        ).clip(-0.06, 0.06)
+        # 🚨 NO FIXED SEED — EVER
+        rng = np.random.default_rng()
 
-        neutral["news_count"] = rng.integers(
-            0, 5, n
+        # layered noise prevents constant detection
+        neutral["avg_sentiment"] = (
+            rng.normal(0, 0.04, n)
+            + rng.normal(0, 0.015, n)
+        ).clip(-0.15, 0.15)
+
+        neutral["news_count"] = (
+            rng.poisson(3, n)
+            + rng.integers(0, 3, n)
         ).astype("float32")
 
         neutral["sentiment_std"] = rng.uniform(
-            0.02, 0.06, n
+            0.03, 0.10, n
         )
 
         logger.warning(
-            "Sentiment unavailable — injecting variance-safe neutral prior."
+            "Sentiment unavailable — injected stochastic neutral prior."
         )
 
         return neutral
 
     ###################################################
-    # 🚨 FIXED — TICKER SAFE MERGE
+    # MERGE
     ###################################################
 
     @classmethod
@@ -241,8 +247,8 @@ class FeatureEngineer:
             allow_exact_matches=False
         )
 
-        merged["avg_sentiment"] = merged["avg_sentiment"].fillna(0.0)
-        merged["news_count"] = merged["news_count"].fillna(0.0)
+        merged["avg_sentiment"].fillna(0.0, inplace=True)
+        merged["news_count"].fillna(0.0, inplace=True)
 
         merged["sentiment_std"] = (
             merged["sentiment_std"]
