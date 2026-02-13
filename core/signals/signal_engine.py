@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List, Tuple, Dict
 import math
 import os
+import time
 
 from core.risk.position_sizer import PositionSizer
 
@@ -44,6 +45,10 @@ class SignalConfig:
 
     portfolio_value: float
     max_position_pct: float
+    min_position_pct: float
+    max_total_exposure_pct: float
+
+    flip_cooldown_seconds: int
 
     global_kill_switch: bool
 
@@ -65,6 +70,12 @@ class SignalConfig:
 
             portfolio_value=_env_float("PORTFOLIO_VALUE", 100000),
             max_position_pct=_env_float("MAX_POSITION_PCT", 0.06),
+            min_position_pct=_env_float("MIN_POSITION_PCT", 0.01),
+            max_total_exposure_pct=_env_float("MAX_TOTAL_EXPOSURE_PCT", 0.35),
+
+            flip_cooldown_seconds=int(
+                _env_float("FLIP_COOLDOWN_SECONDS", 300)
+            ),
 
             global_kill_switch=_env_bool(
                 "GLOBAL_TRADING_DISABLED",
@@ -98,12 +109,13 @@ def _clamp(v, lo, hi):
 
 
 ###################################################
-# FORECAST INTERPRETER (REGIME ADAPTIVE)
+# FORECAST INTERPRETER
 ###################################################
 
 class ForecastInterpreter:
 
     VOL_FLOOR = 1e-6
+    RAR_CLAMP = 5.0
 
     def interpret(
         self,
@@ -122,27 +134,16 @@ class ForecastInterpreter:
 
         volatility = max(_safe(volatility, 0.02), self.VOL_FLOOR)
 
-        ###################################################
-        # VOL NORMALIZED EDGE
-        ###################################################
-
         rar = predicted_return / volatility
-
-        ###################################################
-        # REGIME ADAPTIVE THRESHOLD
-        ###################################################
+        rar = _clamp(rar, -self.RAR_CLAMP, self.RAR_CLAMP)
 
         prob_threshold = config.prob_threshold
 
         if volatility > config.volatility_throttle:
-            prob_threshold += 0.03   # demand stronger signal
+            prob_threshold += 0.03
 
         if volatility > config.crisis_volatility:
             prob_threshold += 0.05
-
-        ###################################################
-        # CONFIDENCE
-        ###################################################
 
         rsi_edge = abs(50 - rsi) / 50
 
@@ -155,8 +156,6 @@ class ForecastInterpreter:
 
         confidence = _clamp(confidence, 0.0, 1.0)
 
-        ###################################################
-
         if prob_up >= prob_threshold and rar > config.min_risk_adjusted_return:
             return "BUY", round(confidence, 3)
 
@@ -164,7 +163,7 @@ class ForecastInterpreter:
 
 
 ###################################################
-# RISK GATE (PORTFOLIO HEAT CONTROL)
+# RISK GATE
 ###################################################
 
 class RiskGate:
@@ -184,10 +183,6 @@ class RiskGate:
         volatility = max(_safe(volatility, 0.02), 1e-6)
         regime = (regime or "").upper()
 
-        ###################################################
-        # HARD BLOCKS
-        ###################################################
-
         if volatility > self.config.crisis_volatility:
             return False
 
@@ -201,46 +196,7 @@ class RiskGate:
 
 
 ###################################################
-# ENSEMBLE CONFIRMATION
-###################################################
-
-class EnsembleArbiter:
-
-    def decide(
-        self,
-        base_signal: str,
-        prob_up: float,
-        lstm_prices: List[float] | None,
-        macro_trend: str | None,
-        config: SignalConfig
-    ) -> str:
-
-        if base_signal == "HOLD":
-            return "HOLD"
-
-        if not lstm_prices or len(lstm_prices) < 2:
-            return base_signal
-
-        first = max(_safe(lstm_prices[0], 1e-6), 1e-6)
-        last = _safe(lstm_prices[-1], first)
-
-        expected_return = (last - first) / first
-        macro_trend = (macro_trend or "").upper()
-
-        if macro_trend not in ("BULLISH", "SIDEWAYS"):
-            return "HOLD"
-
-        if expected_return <= 0:
-            return "HOLD"
-
-        if prob_up < config.prob_threshold:
-            return "HOLD"
-
-        return "BUY"
-
-
-###################################################
-# DECISION ENGINE (WITH VOL THROTTLE)
+# DECISION ENGINE
 ###################################################
 
 class DecisionEngine:
@@ -251,18 +207,35 @@ class DecisionEngine:
 
         self.interpreter = ForecastInterpreter()
         self.risk_gate = RiskGate(self.config)
-        self.ensemble = EnsembleArbiter()
         self.position_sizer = PositionSizer()
 
         self._last_signal = "HOLD"
+        self._last_flip_time = 0
+
+    ###################################################
+
+    def _flip_guard(self, new_signal):
+
+        now = time.time()
+
+        if (
+            new_signal != self._last_signal
+            and now - self._last_flip_time
+            < self.config.flip_cooldown_seconds
+        ):
+            return False
+
+        if new_signal != self._last_signal:
+            self._last_flip_time = now
+
+        return True
 
     ###################################################
 
     def _volatility_scale(self, allocation, volatility):
 
-        """
-        Institutional exposure throttle.
-        """
+        if volatility > self.config.volatility_cap:
+            return 0.0
 
         if volatility <= self.config.volatility_throttle:
             return allocation
@@ -308,28 +281,18 @@ class DecisionEngine:
         ):
             return self._hold(confidence)
 
-        final_signal = self.ensemble.decide(
-            base_signal,
-            prob_up,
-            lstm_prices,
-            macro_trend,
-            self.config
-        )
-
-        if final_signal == "HOLD":
-            self._last_signal = "HOLD"
+        if not self._flip_guard(base_signal):
             return self._hold(confidence)
 
         allocation = self.position_sizer.size_position(
-            signal=final_signal,
+            signal=base_signal,
             confidence=confidence,
             volatility=max(volatility, 1e-6),
             portfolio_value=self.config.portfolio_value
         )
 
-        ###################################################
-        # VOL THROTTLE
-        ###################################################
+        if not math.isfinite(allocation) or allocation <= 0:
+            return self._hold(confidence)
 
         allocation = self._volatility_scale(
             allocation,
@@ -341,14 +304,25 @@ class DecisionEngine:
             self.config.max_position_pct
         )
 
+        min_position = (
+            self.config.portfolio_value *
+            self.config.min_position_pct
+        )
+
         allocation = min(allocation, max_position)
+
+        if allocation < min_position:
+            return self._hold(confidence)
 
         position_pct = allocation / self.config.portfolio_value
 
-        self._last_signal = final_signal
+        if position_pct > self.config.max_total_exposure_pct:
+            return self._hold(confidence)
+
+        self._last_signal = base_signal
 
         return {
-            "signal": final_signal,
+            "signal": base_signal,
             "confidence": round(confidence, 3),
             "allocation": round(allocation, 2),
             "position_pct": round(position_pct, 4)
