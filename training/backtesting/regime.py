@@ -142,15 +142,12 @@ class MarketRegimeDetector:
 
             volatility = (
                 returns
-                .rolling(cfg.volatility_window,
-                         min_periods=cfg.volatility_window)
+                .rolling(
+                    cfg.volatility_window,
+                    min_periods=cfg.volatility_window
+                )
                 .std()
             )
-
-            if not np.isfinite(
-                volatility.dropna()
-            ).all():
-                raise RuntimeError("Volatility corruption detected")
 
             volatility = volatility.clip(lower=cfg.EPSILON)
 
@@ -194,6 +191,17 @@ class MarketRegimeDetector:
 
             df["date"] = pd.to_datetime(df["date"], utc=True)
 
+            ###################################################
+            # 🔥 DROP WARMUP ROWS
+            ###################################################
+
+            warmup = max(
+                cfg.trend_window,
+                cfg.volatility_window
+            ) + cfg.persistence_days
+
+            df = df.iloc[warmup:].copy()
+
             return df
 
         except Exception as e:
@@ -204,6 +212,22 @@ class MarketRegimeDetector:
             )
 
             return None
+
+    ########################################################
+    # 🔥 MARKET REGIME (NEW — VERY IMPORTANT)
+    ########################################################
+
+    def _build_market_regime(self, df):
+
+        regime_counts = (
+            df.groupby(["date", "regime"])
+            .size()
+            .unstack(fill_value=0)
+        )
+
+        market_regime = regime_counts.idxmax(axis=1)
+
+        return market_regime.rename("market_regime")
 
     ########################################################
     # MULTI ASSET
@@ -225,10 +249,9 @@ class MarketRegimeDetector:
 
         for ticker, slice_df in df.sort_values(
             ["ticker", "date"]
-        ).groupby("ticker"):
+        ).groupby("ticker", sort=False):
 
             if len(slice_df) < 300:
-                logger.info("Skipping small asset: %s", ticker)
                 continue
 
             detected = self._detect_single_asset(slice_df)
@@ -252,6 +275,18 @@ class MarketRegimeDetector:
             pd.concat(grouped)
             .sort_values(["date", "ticker"])
             .reset_index(drop=True)
+        )
+
+        ###################################################
+        # 🔥 ADD MARKET REGIME
+        ###################################################
+
+        market_regime = self._build_market_regime(result)
+
+        result = result.merge(
+            market_regime,
+            on="date",
+            how="left"
         )
 
         ###################################################
