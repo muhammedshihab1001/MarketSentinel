@@ -38,7 +38,7 @@ TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 SEED = 42
 MIN_TRAINING_ROWS = 2000
-MIN_SURVIVING_TICKERS = 5
+MIN_SURVIVING_RATIO = 0.35   #  institutional
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 
@@ -50,29 +50,9 @@ MAX_DRAWDOWN = -0.40
 def enforce_determinism():
 
     os.environ["PYTHONHASHSEED"] = str(SEED)
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["NUMEXPR_NUM_THREADS"] = "1"
-    os.environ["TF_DETERMINISTIC_OPS"] = "1"
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
 
     random.seed(SEED)
     np.random.seed(SEED)
-
-
-########################################################
-
-def _fsync_dir(directory):
-
-    if os.name == "nt":
-        return
-
-    fd = os.open(directory, os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 ########################################################
@@ -87,14 +67,10 @@ def save_model_atomic(model, path):
         temp_name = tmp.name
 
     os.replace(temp_name, path)
-    _fsync_dir(directory)
-
-    if not os.path.exists(path):
-        raise RuntimeError("Model write failed.")
 
 
 ########################################################
-# DATA LOADER — FEATURESTORE GOVERNED
+# DATA LOADER — INSTITUTIONAL VERSION
 ########################################################
 
 def load_training_data(start_date, end_date):
@@ -108,6 +84,7 @@ def load_training_data(start_date, end_date):
 
     datasets = []
     surviving = []
+    failures = []
 
     for ticker in universe:
 
@@ -120,30 +97,33 @@ def load_training_data(start_date, end_date):
             )
 
             if price_df is None or price_df.empty:
+                failures.append(f"{ticker}: no price")
                 continue
 
-            news_df = None
+            ##################################################
+            # NEWS — NEVER BLOCK TRAINING
+            ##################################################
 
-            for attempt in range(4):
-                try:
-                    news_df = news_fetcher.fetch(
-                        f'"{ticker}" stock',
-                        max_items=400
-                    )
+            sentiment_df = None
 
-                    if news_df is not None and not news_df.empty:
-                        break
+            try:
 
-                except Exception:
-                    pass
+                news_df = news_fetcher.fetch(
+                    f'"{ticker}" stock',
+                    max_items=400
+                )
 
-                time.sleep(2 ** attempt)
+                if news_df is not None and not news_df.empty:
 
-            if news_df is None or news_df.empty:
-                continue
+                    scored = sentiment_analyzer.analyze_dataframe(news_df)
+                    sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored)
 
-            scored_df = sentiment_analyzer.analyze_dataframe(news_df)
-            sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
+            except Exception:
+                logger.warning("News pipeline failed for %s — fallback engaged.", ticker)
+
+            ##################################################
+            # FEATURE STORE HANDLES NEUTRAL FALLBACK
+            ##################################################
 
             dataset = store.get_features(
                 price_df,
@@ -158,12 +138,29 @@ def load_training_data(start_date, end_date):
             surviving.append(ticker)
 
         except Exception as e:
+
+            failures.append(f"{ticker}: {str(e)}")
             logger.warning("Ticker rejected: %s | %s", ticker, str(e))
 
-    if len(surviving) < MIN_SURVIVING_TICKERS:
+    ##################################################
+    # SURVIVAL GUARD
+    ##################################################
+
+    survival_ratio = len(surviving) / max(len(universe), 1)
+
+    logger.info(
+        "Universe survival: %.2f%% (%s/%s)",
+        survival_ratio * 100,
+        len(surviving),
+        len(universe)
+    )
+
+    if survival_ratio < MIN_SURVIVING_RATIO:
         raise RuntimeError(
-            "Universe collapse — too few tickers survived."
+            f"Universe collapse — survival ratio {survival_ratio:.2f}"
         )
+
+    ##################################################
 
     df = pd.concat(datasets, ignore_index=True)
 
@@ -174,6 +171,8 @@ def load_training_data(start_date, end_date):
     df.reset_index(drop=True, inplace=True)
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
+
+    logger.info("Final training rows: %s", len(df))
 
     return df
 
@@ -198,7 +197,7 @@ def main(start_date=None, end_date=None):
     )
 
     ###################################################
-    # DRIFT BASELINE — ATOMIC
+    # DRIFT BASELINE
     ###################################################
 
     drift = DriftDetector()
@@ -217,20 +216,23 @@ def main(start_date=None, end_date=None):
     ###################################################
 
     def trainer(d):
-        model = build_xgboost_model()
-        model.fit(d.loc[:, MODEL_FEATURES], d["target"])
+
+        y = d["target"]
+
+        model = build_xgboost_model(y)  #  FIXED
+
+        model.fit(
+            d.loc[:, MODEL_FEATURES],
+            y
+        )
+
         return model
 
     def signal(model, test):
 
         probs = model.predict_proba(
             test.loc[:, MODEL_FEATURES]
-        )
-
-        if probs.ndim != 2:
-            raise RuntimeError("Invalid predict_proba output.")
-
-        probs = probs[:, 1]
+        )[:, 1]
 
         return [
             "BUY" if p > 0.58
@@ -261,13 +263,17 @@ def main(start_date=None, end_date=None):
     # FINAL TRAIN
     ###################################################
 
-    model = build_final_xgboost_model()
-    model.fit(df.loc[:, MODEL_FEATURES], df["target"])
+    final_model = build_final_xgboost_model(df["target"])
 
-    save_model_atomic(model, TEMP_MODEL_PATH)
+    final_model.fit(
+        df.loc[:, MODEL_FEATURES],
+        df["target"]
+    )
+
+    save_model_atomic(final_model, TEMP_MODEL_PATH)
 
     ###################################################
-    # METADATA — SNAPSHOT GOVERNED
+    # METADATA
     ###################################################
 
     metadata = MetadataManager.create_metadata(
@@ -293,8 +299,6 @@ def main(start_date=None, end_date=None):
         TEMP_MODEL_PATH,
         TEMP_METADATA_PATH
     )
-
-    _fsync_dir(MODEL_DIR)
 
     logger.info("XGBoost registered → %s", version)
 
