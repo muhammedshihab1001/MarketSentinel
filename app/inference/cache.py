@@ -22,8 +22,10 @@ class RedisCache:
     BASE_RETRY = 15
     MAX_RETRY = 120
 
-    MAX_TTL = 900  # 15 minutes
-    MIN_PAYLOAD_BYTES = 20
+    MAX_TTL = 900
+    MIN_TTL = 30
+
+    CACHE_NAMESPACE_VERSION = "v2"
 
     ###################################################
 
@@ -38,7 +40,7 @@ class RedisCache:
         self._connect()
 
     ###################################################
-    # LAZY CONNECTION
+    # CONNECTION
     ###################################################
 
     def _connect(self):
@@ -55,6 +57,7 @@ class RedisCache:
                     port=port,
                     socket_timeout=2,
                     socket_connect_timeout=2,
+                    health_check_interval=30,
                     max_connections=20,
                     decode_responses=False
                 )
@@ -86,7 +89,8 @@ class RedisCache:
             )
 
             logger.warning(
-                f"Redis unavailable. Retry in {self._retry_delay}s"
+                "Redis unavailable. Retry in %ss",
+                self._retry_delay
             )
 
     ###################################################
@@ -103,7 +107,7 @@ class RedisCache:
         self._connect()
 
     ###################################################
-    # STRONG MODEL FINGERPRINT
+    # MODEL FINGERPRINT
     ###################################################
 
     def _model_fingerprint(self):
@@ -146,6 +150,7 @@ class RedisCache:
         model_fp = self._model_fingerprint()
 
         return (
+            f"{self.CACHE_NAMESPACE_VERSION}:"
             f"prediction:"
             f"{model_fp}:"
             f"{self.schema_sig}:"
@@ -163,6 +168,11 @@ class RedisCache:
 
         if not value:
             raise RuntimeError("Refusing to cache empty payload.")
+
+        required = {"ticker", "signal_today", "confidence"}
+
+        if not required.issubset(value.keys()):
+            raise RuntimeError("Cache payload missing required fields.")
 
     ###################################################
     # GET
@@ -182,16 +192,14 @@ class RedisCache:
             if not data:
                 return None
 
-            if len(data) < self.MIN_PAYLOAD_BYTES:
-                logger.warning("Truncated cache entry removed.")
-                self.client.delete(key)
-                return None
-
             try:
 
                 decompressed = zlib.decompress(data)
+                obj = json.loads(decompressed)
 
-                return json.loads(decompressed)
+                self._validate_payload(obj)
+
+                return obj
 
             except Exception:
 
@@ -204,6 +212,10 @@ class RedisCache:
             logger.exception("Redis GET failure.")
 
             self.enabled = False
+            self._retry_delay = min(
+                self._retry_delay * 2,
+                self.MAX_RETRY
+            )
             self._disabled_until = time.time() + self._retry_delay
 
             return None
@@ -227,21 +239,24 @@ class RedisCache:
                 os.getenv("CACHE_TTL_SECONDS", "180")
             )
 
-            ttl = min(ttl, self.MAX_TTL)
+            ttl = max(self.MIN_TTL, min(ttl, self.MAX_TTL))
 
             jitter = int(ttl * 0.15)
             final_ttl = ttl + random.randint(-jitter, jitter)
+            final_ttl = max(self.MIN_TTL, min(final_ttl, self.MAX_TTL))
 
-            payload = zlib.compress(
-                self._canonical_json(value).encode()
-            )
+            serialized = self._canonical_json(value).encode()
 
-            if len(payload) < self.MIN_PAYLOAD_BYTES:
-                raise RuntimeError("Payload compression failure.")
+            payload = zlib.compress(serialized)
+
+            # round-trip validation
+            test = json.loads(zlib.decompress(payload))
+
+            self._validate_payload(test)
 
             self.client.setex(
                 key,
-                max(30, final_ttl),
+                final_ttl,
                 payload
             )
 
@@ -250,4 +265,8 @@ class RedisCache:
             logger.exception("Redis SET failure.")
 
             self.enabled = False
+            self._retry_delay = min(
+                self._retry_delay * 2,
+                self.MAX_RETRY
+            )
             self._disabled_until = time.time() + self._retry_delay
