@@ -7,6 +7,7 @@ import socket
 import platform
 import random
 import subprocess
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -72,7 +73,7 @@ def _fsync_dir(directory):
 
 
 ########################################################
-# HARD GIT CHECK
+# HARD GIT CHECK (UPGRADED)
 ########################################################
 
 def get_git_commit():
@@ -84,13 +85,17 @@ def get_git_commit():
 
     try:
 
-        dirty = subprocess.call(
-            ["git", "diff", "--quiet"]
-        )
+        # detect staged OR unstaged changes
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True
+        ).stdout.strip()
 
-        if dirty != 0:
+        if dirty:
             raise RuntimeError(
-                "Repository has uncommitted changes — refusing training."
+                "Repository is dirty — commit ALL changes before training."
             )
 
         commit = subprocess.check_output(
@@ -103,40 +108,36 @@ def get_git_commit():
 
         return commit
 
-    except Exception:
+    except subprocess.CalledProcessError:
         raise RuntimeError(
             "Unable to resolve git commit — refusing training."
         )
 
 
 ########################################################
-# MANIFEST WRITE
+# MANIFEST WRITE — ATOMIC
 ########################################################
 
 def save_manifest(run_id: str, manifest: dict):
 
     os.makedirs(RUNS_DIR, exist_ok=True)
-    _fsync_dir(RUNS_DIR)
 
     final_path = os.path.join(RUNS_DIR, f"{run_id}.json")
-    temp_path = final_path + ".tmp"
 
-    try:
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        dir=RUNS_DIR,
+        suffix=".tmp"
+    ) as tmp:
 
-        with open(temp_path, "w") as f:
-            json.dump(manifest, f, indent=4, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
+        json.dump(manifest, tmp, indent=4, sort_keys=True)
+        tmp.flush()
+        os.fsync(tmp.fileno())
 
-        os.replace(temp_path, final_path)
-        _fsync_dir(RUNS_DIR)
+        temp_name = tmp.name
 
-    finally:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
+    os.replace(temp_name, final_path)
+    _fsync_dir(RUNS_DIR)
 
 
 ########################################################
@@ -181,14 +182,14 @@ def validate_metrics(metrics: dict):
 
 
 ########################################################
-# LINEAGE SNAPSHOT
+# LINEAGE SNAPSHOT (UPGRADED)
 ########################################################
 
 def build_lineage(start_date, end_date):
 
     universe_snapshot = MarketUniverse.snapshot()
 
-    return {
+    lineage_payload = {
         "schema_signature": get_schema_signature(),
         "training_code_hash": MetadataManager.fingerprint_training_code(),
         "git_commit": get_git_commit(),
@@ -209,6 +210,18 @@ def build_lineage(start_date, end_date):
         "training_universe": universe_snapshot
     }
 
+    # lineage hash = audit superpower
+    canonical = json.dumps(
+        lineage_payload,
+        sort_keys=True
+    ).encode()
+
+    lineage_payload["lineage_hash"] = (
+        MetadataManager.hash_list([canonical.hex()])
+    )
+
+    return lineage_payload
+
 
 ########################################################
 # MAIN
@@ -218,10 +231,6 @@ def main():
 
     init_env()
     enforce_determinism()
-
-    ####################################################
-    # FREEZE CLOCK VIA GOVERNOR
-    ####################################################
 
     today = MarketTime.today().isoformat()
     MarketTime.freeze_today(today)
