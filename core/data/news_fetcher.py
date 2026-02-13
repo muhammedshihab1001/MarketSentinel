@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 import hashlib
 import tempfile
+import re
 
 from datetime import datetime, timedelta
 from dateutil import parser
@@ -33,9 +34,7 @@ class NewsFetcher:
 
     CACHE_DIR = "data/news_cache"
     CACHE_TTL_MIN = 20
-
-    # bumped because provider logic changed
-    CACHE_SCHEMA_VERSION = "v4"
+    CACHE_SCHEMA_VERSION = "v5"
 
     EMPTY_SCHEMA = pd.DataFrame({
         "headline": pd.Series(dtype="string"),
@@ -43,6 +42,10 @@ class NewsFetcher:
         "source": pd.Series(dtype="string"),
         "link": pd.Series(dtype="string"),
     })
+
+    SAFE_TICKER = re.compile(r"^[A-Z0-9._-]{1,12}$")
+
+    ########################################################
 
     def __init__(self):
 
@@ -94,11 +97,41 @@ class NewsFetcher:
         )
 
         session.mount("https://", adapter)
+
         session.headers.update(
             {"User-Agent": "MarketSentinel/Institutional"}
         )
 
         return session
+
+    ########################################################
+    # SAFE TICKER EXTRACTION
+    ########################################################
+
+    def _extract_ticker(self, query: str):
+
+        candidate = query.split()[0].upper()
+
+        if not self.SAFE_TICKER.fullmatch(candidate):
+            raise RuntimeError(f"Unsafe ticker parsed from query: {query}")
+
+        return candidate
+
+    ########################################################
+    # CONTRACT CHECK
+    ########################################################
+
+    def _contract_check(self, df):
+
+        if df is None or df.empty:
+            return self.EMPTY_SCHEMA.copy()
+
+        required = {"headline", "published_at", "source", "link"}
+
+        if not required.issubset(df.columns):
+            raise RuntimeError("News provider schema violated.")
+
+        return df
 
     ########################################################
     # CACHE
@@ -171,6 +204,8 @@ class NewsFetcher:
             return None
 
     ########################################################
+    # POST PROCESS
+    ########################################################
 
     def _post_process(self, df):
 
@@ -185,6 +220,8 @@ class NewsFetcher:
             minutes=self.INGESTION_DELAY_MIN
         )
 
+        df = df.dropna(subset=["published_at"])
+
         mask = (
             (df["published_at"] >= cutoff) &
             (df["published_at"] <= ingest_guard)
@@ -192,8 +229,10 @@ class NewsFetcher:
 
         df = df.loc[mask].copy()
 
-        df["headline"] = df["headline"].str.strip()
+        if df.empty:
+            return self.EMPTY_SCHEMA.copy()
 
+        df["headline"] = df["headline"].astype(str).str.strip()
         df = df.loc[df["headline"].str.len() > 12].copy()
 
         df["key"] = (
@@ -206,7 +245,7 @@ class NewsFetcher:
         return df.sort_values("published_at").reset_index(drop=True)
 
     ########################################################
-    # PROVIDERS
+    # FINNHUB
     ########################################################
 
     def _fetch_finnhub(self, query, limit):
@@ -214,8 +253,7 @@ class NewsFetcher:
         if not self.finnhub_key:
             return self.EMPTY_SCHEMA.copy()
 
-        # crude ticker extraction
-        ticker = query.split()[0].upper()
+        ticker = self._extract_ticker(query)
 
         to_date = datetime.utcnow().date()
         from_date = to_date - timedelta(days=7)
@@ -241,9 +279,12 @@ class NewsFetcher:
 
         for a in data:
 
-            published = datetime.utcfromtimestamp(
-                a.get("datetime", 0)
-            )
+            ts = a.get("datetime")
+
+            if not ts:
+                continue
+
+            published = datetime.utcfromtimestamp(ts)
 
             rows.append({
                 "headline": a.get("headline", ""),
@@ -252,95 +293,11 @@ class NewsFetcher:
                 "link": a.get("url", "")
             })
 
-        return self._post_process(pd.DataFrame(rows))
+        df = pd.DataFrame(rows)
 
-    ########################################################
-
-    def _fetch_marketaux(self, query, limit):
-
-        if not self.marketaux_key:
-            return self.EMPTY_SCHEMA.copy()
-
-        params = {
-            "api_token": self.marketaux_key,
-            "search": query,
-            "language": "en",
-            "limit": limit
-        }
-
-        r = self.session.get(
-            self.MARKET_AUX_URL,
-            params=params,
-            timeout=self.REQUEST_TIMEOUT
+        return self._contract_check(
+            self._post_process(df)
         )
-
-        r.raise_for_status()
-
-        data = r.json().get("data", [])
-
-        rows = []
-
-        for a in data:
-
-            published = self._normalize_date(
-                a.get("published_at")
-            )
-
-            if not published:
-                continue
-
-            rows.append({
-                "headline": a.get("title", ""),
-                "published_at": published,
-                "source": a.get("source", "unknown"),
-                "link": a.get("url", "")
-            })
-
-        return self._post_process(pd.DataFrame(rows))
-
-    ########################################################
-
-    def _fetch_gnews(self, query, limit):
-
-        if not self.gnews_key:
-            return self.EMPTY_SCHEMA.copy()
-
-        params = {
-            "q": query,
-            "token": self.gnews_key,
-            "lang": "en",
-            "max": limit
-        }
-
-        r = self.session.get(
-            self.GNEWS_URL,
-            params=params,
-            timeout=self.REQUEST_TIMEOUT
-        )
-
-        r.raise_for_status()
-
-        data = r.json().get("articles", [])
-
-        rows = []
-
-        for a in data:
-
-            published = self._normalize_date(
-                a.get("publishedAt")
-            )
-
-            if not published:
-                continue
-
-            rows.append({
-                "headline": a.get("title", ""),
-                "published_at": published,
-                "source": a.get("source", {}).get("name", "unknown"),
-                "link": a.get("url", "")
-            })
-
-        return self._post_process(pd.DataFrame(rows))
 
     ########################################################
     # ROUTER
@@ -364,18 +321,18 @@ class NewsFetcher:
             if name != self.primary
         ]
 
-        fallback_df = pd.DataFrame()
-
         for fn in fallbacks:
 
             try:
                 fallback_df = fn(query, limit)
+
                 if not fallback_df.empty:
-                    break
+                    return self._merge_sources(primary, fallback_df)
+
             except Exception as e:
                 logger.warning("Fallback failed: %s", str(e))
 
-        return self._merge_sources(primary, fallback_df)
+        return primary
 
     ########################################################
 
