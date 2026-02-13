@@ -5,12 +5,19 @@ import numpy as np
 class TechnicalIndicators:
     """
     Institutional technical indicator engine.
+
+    Guarantees:
+    ✔ No synthetic price creation
+    ✔ Leak-safe rolling indicators
+    ✔ Corruption detection
+    ✔ Timestamp integrity
+    ✔ Numeric safety
     """
 
     REQUIRED_COLUMN = "close"
 
-    MAX_FORWARD_FILL = 2
     STD_FLOOR = 1e-6
+    MAX_DAILY_RETURN = 0.80  # corruption guard
 
     ####################################################
     # WINDOW VALIDATION
@@ -35,7 +42,6 @@ class TechnicalIndicators:
             raise RuntimeError("Indicator received empty dataframe.")
 
         df = df.copy()
-
         df.columns = [c.lower() for c in df.columns]
 
         if "close" not in df.columns:
@@ -43,19 +49,38 @@ class TechnicalIndicators:
                 "TechnicalIndicators requires 'close' column."
             )
 
+        ####################################################
+        # DATE INTEGRITY
+        ####################################################
+
         if "date" in df.columns:
+
+            df["date"] = pd.to_datetime(
+                df["date"],
+                utc=True,
+                errors="raise"
+            )
+
             df = df.sort_values("date")
 
+            if not df["date"].is_monotonic_increasing:
+                raise RuntimeError(
+                    "Non-monotonic timestamps detected."
+                )
+
             if df["date"].duplicated().any():
-                raise RuntimeError("Duplicate timestamps detected.")
+                raise RuntimeError(
+                    "Duplicate timestamps detected."
+                )
+
+        ####################################################
+        # PRICE SAFETY
+        ####################################################
 
         close = pd.to_numeric(
             df["close"],
             errors="coerce"
         )
-
-        if close.isna().all():
-            raise RuntimeError("Close column fully NaN.")
 
         close.replace(
             [np.inf, -np.inf],
@@ -63,15 +88,25 @@ class TechnicalIndicators:
             inplace=True
         )
 
-        close = close.ffill(limit=TechnicalIndicators.MAX_FORWARD_FILL)
-
         if close.isna().any():
             raise RuntimeError(
-                "Close contains unresolved NaNs — refusing indicator calc."
+                "Missing close prices detected — refusing indicator calc. "
+                "Provider integrity compromised."
             )
 
         if (close <= 0).any():
             raise RuntimeError("Invalid close prices detected.")
+
+        ####################################################
+        # CORRUPTION GUARD
+        ####################################################
+
+        returns = close.pct_change().abs()
+
+        if returns.dropna().max() > TechnicalIndicators.MAX_DAILY_RETURN:
+            raise RuntimeError(
+                "Unrealistic price jump detected — likely bad data."
+            )
 
         df["close"] = close.astype("float32")
 
@@ -85,7 +120,6 @@ class TechnicalIndicators:
     def moving_average(cls, df: pd.DataFrame, window: int = 20):
 
         cls._validate_window(window)
-
         df = cls._normalize_columns(df)
 
         ma = df["close"].rolling(
@@ -103,7 +137,6 @@ class TechnicalIndicators:
     def rsi(cls, df: pd.DataFrame, window: int = 14):
 
         cls._validate_window(window)
-
         df = cls._normalize_columns(df)
 
         close = df["close"]
@@ -141,7 +174,6 @@ class TechnicalIndicators:
     def bollinger_bands(cls, df: pd.DataFrame, window: int = 20):
 
         cls._validate_window(window)
-
         df = cls._normalize_columns(df)
 
         close = df["close"]
@@ -192,6 +224,13 @@ class TechnicalIndicators:
             [np.inf, -np.inf],
             np.nan
         ).fillna(0)
+
+        ####################################################
+        # EXPLOSION GUARD
+        ####################################################
+
+        macd_line = macd_line.clip(-500, 500)
+        signal = signal.clip(-500, 500)
 
         return (
             macd_line.astype("float32"),
