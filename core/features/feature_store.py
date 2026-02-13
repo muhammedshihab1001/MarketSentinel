@@ -24,7 +24,7 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v8"  # 🔥 bump cache version after bug fix
+    CACHE_VERSION = "v9"
     MAX_CACHE_FILES_PER_TICKER = 6
 
     MIN_ROWS_REQUIRED = 100
@@ -84,35 +84,44 @@ class FeatureStore:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     ##################################################
-    # 🚨 CRITICAL FIX — DO NOT NUMERIC CAST IDENTIFIERS
+    # CANONICALIZE (STRICT)
     ##################################################
 
     def _canonicalize_df(self, df: pd.DataFrame):
 
         df = df.copy()
 
+        if df.empty:
+            raise RuntimeError("Cannot hash empty dataframe.")
+
         for col in df.columns:
 
-            # NEVER cast identifiers
             if col == "date":
+
                 df[col] = pd.to_datetime(
                     df[col],
                     utc=True,
                     errors="raise"
                 )
+
+                if df[col].isna().any():
+                    raise RuntimeError("NaT detected in dataset.")
+
                 continue
 
             if col == "ticker":
                 df[col] = df[col].astype(str)
                 continue
 
-            df[col] = (
-                pd.to_numeric(df[col], errors="raise")
-                .astype("float64")
-                .round(10)
-            )
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="raise"
+            ).astype("float64")
 
-        return df.sort_values("date").reset_index(drop=True)
+        # CRITICAL — enforce deterministic ordering
+        df = df.sort_values(["ticker", "date"])
+
+        return df.reset_index(drop=True)
 
     ##################################################
 
@@ -168,8 +177,6 @@ class FeatureStore:
             f"{self.env_hash}.parquet"
         )
 
-    ##################################################
-    # FSYNC
     ##################################################
 
     def _fsync_dir(self, path):
@@ -230,10 +237,15 @@ class FeatureStore:
     # ATOMIC WRITE
     ##################################################
 
-    def _atomic_write(self, df: pd.DataFrame, path: str, dataset_hash: str):
+    def _atomic_write(self, df: pd.DataFrame, path: str, dataset_hash: str, training: bool):
 
         if len(df) < self.MIN_ROWS_REQUIRED:
             raise RuntimeError("Feature collapse detected.")
+
+        if training and "target" not in df.columns:
+            raise RuntimeError(
+                "Training dataset missing target column."
+            )
 
         tmp_path = path + ".tmp"
 
@@ -241,12 +253,14 @@ class FeatureStore:
 
         base_cols = ["date", "close", "ticker"]
 
-        if "target" in df.columns:
+        if training:
             base_cols.insert(2, "target")
 
         df = df[base_cols + list(MODEL_FEATURES)]
 
         df["__dataset_hash"] = dataset_hash
+        df["__schema_hash"] = self.schema_hash
+        df["__engineer_hash"] = self.engineer_hash
 
         self._validate_dataset_structure(df)
 
@@ -285,7 +299,13 @@ class FeatureStore:
 
             df = pd.read_parquet(path)
 
-            if "__dataset_hash" not in df.columns:
+            required_meta = [
+                "__dataset_hash",
+                "__schema_hash",
+                "__engineer_hash"
+            ]
+
+            if not all(c in df.columns for c in required_meta):
                 os.remove(path)
                 return None
 
@@ -293,7 +313,15 @@ class FeatureStore:
                 os.remove(path)
                 return None
 
-            df.drop(columns="__dataset_hash", inplace=True)
+            if df["__schema_hash"].iloc[0] != self.schema_hash:
+                os.remove(path)
+                return None
+
+            if df["__engineer_hash"].iloc[0] != self.engineer_hash:
+                os.remove(path)
+                return None
+
+            df.drop(columns=required_meta, inplace=True)
 
             self._validate_dataset_structure(df)
 
@@ -357,13 +385,14 @@ class FeatureStore:
             price_df,
             sentiment_df,
             training=training,
-            ticker=ticker  # 🔥 VERY IMPORTANT
+            ticker=ticker
         )
 
         self._atomic_write(
             features,
             path,
-            dataset_hash
+            dataset_hash,
+            training
         )
 
         self._prune_cache(ticker)
