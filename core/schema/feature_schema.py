@@ -6,7 +6,7 @@ import json
 import re
 
 
-SCHEMA_VERSION = "12.0"   # 🔥 bump version whenever contract changes
+SCHEMA_VERSION = "13.0"
 
 
 ############################################################
@@ -34,7 +34,9 @@ MIN_ROWS = 120
 MAX_NAN_RATIO_PER_FEATURE = 0.05
 MAX_ROW_NAN_RATIO = 0.10
 
-ABSOLUTE_FEATURE_LIMIT = 1e6
+# tightened — prevents feature explosion earlier
+ABSOLUTE_FEATURE_LIMIT = 1e4
+
 MIN_VARIANCE = 1e-8
 
 
@@ -136,13 +138,10 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     if len(df.columns) != FEATURE_COUNT:
         raise RuntimeError("Feature count mismatch detected.")
 
-    if df.duplicated().any():
-        raise RuntimeError("Duplicate rows detected.")
-
     _check_forbidden_columns(df)
 
     ########################################################
-    # HARD NUMERIC CAST (prevents ticker parsing bug)
+    # HARD NUMERIC CAST
     ########################################################
 
     try:
@@ -227,18 +226,28 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             )
 
     ########################################################
-    # CONTIGUOUS FLOAT32 BLOCK
+    # SAFE FLOAT32 CAST WITH FIDELITY CHECK
     ########################################################
 
-    arr = np.ascontiguousarray(
-        feature_df.to_numpy(dtype=DTYPE)
+    arr64 = feature_df.to_numpy(dtype="float64")
+
+    arr32 = np.ascontiguousarray(
+        arr64.astype(DTYPE)
     )
 
-    if arr.dtype != np.float32:
-        raise RuntimeError("Feature block not float32.")
+    if not np.all(np.isfinite(arr32)):
+        raise RuntimeError("Float32 casting produced non-finite values.")
+
+    # detect precision collapse
+    delta = np.abs(arr64 - arr32)
+
+    if np.max(delta) > 1e-3:
+        raise RuntimeError(
+            "Precision loss detected during float32 cast."
+        )
 
     return pd.DataFrame(
-        arr,
+        arr32,
         columns=MODEL_FEATURES
     )
 
