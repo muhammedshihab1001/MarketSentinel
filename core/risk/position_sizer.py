@@ -11,9 +11,16 @@ import numpy as np
 def _env_float(key: str, default: float) -> float:
     try:
         v = float(os.getenv(key, str(default)))
+
         if not math.isfinite(v):
             return default
+
+        # CONFIG POISONING GUARD
+        if abs(v) > 10:
+            return default
+
         return v
+
     except Exception:
         return default
 
@@ -38,7 +45,6 @@ class RiskConfig:
     volatility_shock_level: float
     correlation_heat_cap: float
 
-    # institutional additions
     max_drawdown_kill: float
 
     ###################################################
@@ -46,7 +52,7 @@ class RiskConfig:
     @staticmethod
     def load():
 
-        return RiskConfig(
+        cfg = RiskConfig(
             max_position_size=_env_float("MAX_POSITION_SIZE", 0.08),
             min_position_size=_env_float("MIN_POSITION_SIZE", 0.01),
             volatility_target=_env_float("VOL_TARGET", 0.02),
@@ -60,6 +66,24 @@ class RiskConfig:
 
             max_drawdown_kill=_env_float("MAX_DRAWDOWN_KILL", 0.30),
         )
+
+        ###################################################
+        # HARD VALIDATION
+        ###################################################
+
+        if not (0 < cfg.max_position_size <= 0.20):
+            raise RuntimeError("Unsafe max_position_size")
+
+        if not (0 < cfg.max_gross_exposure_pct <= 1.5):
+            raise RuntimeError("Unsafe gross exposure")
+
+        if not (0 <= cfg.max_drawdown_kill <= 0.8):
+            raise RuntimeError("Unsafe drawdown kill")
+
+        if cfg.volatility_target <= 0:
+            raise RuntimeError("Invalid volatility target")
+
+        return cfg
 
 
 ###################################################
@@ -76,7 +100,9 @@ class PositionSizer:
     EFFECTIVE_VOL_FLOOR = 0.01
 
     MAX_VOL_SCALAR = 1.25
-    MIN_CONFIDENCE_FLOOR = 0.20
+    MIN_CONFIDENCE_FLOOR = 0.25
+
+    MAX_KELLY_FRACTION = 0.08   # HARD ceiling
 
     def __init__(self, config: RiskConfig | None = None):
         self.config = config or RiskConfig.load()
@@ -112,7 +138,8 @@ class PositionSizer:
         if drawdown > 1:
             drawdown /= 100.0
 
-        return abs(min(drawdown, 0.90))
+        # HARD CLAMP
+        return min(max(drawdown, 0.0), 0.95)
 
     ###################################################
     # VOL SHOCK
@@ -133,18 +160,18 @@ class PositionSizer:
 
     def _kelly_cap(self, confidence, volatility, portfolio_value):
 
-        edge = confidence - 0.5
-        edge = max(edge, 0)
+        edge = max(confidence - 0.5, 0)
 
         if edge <= 0:
             return 0
 
-        variance = max(volatility ** 2, 1e-6)
+        variance = max(volatility ** 2, 1e-4)
 
         kelly_fraction = edge / variance
         kelly_fraction *= self.config.fractional_kelly
 
-        kelly_fraction = min(kelly_fraction, 0.10)
+        # HARD LIMIT
+        kelly_fraction = min(kelly_fraction, self.MAX_KELLY_FRACTION)
 
         return portfolio_value * kelly_fraction
 
@@ -170,16 +197,26 @@ class PositionSizer:
         if portfolio_value < self.MIN_DEPLOYABLE_CAPITAL:
             return 0.0
 
+        ###################################################
+        # HARD KILL SWITCH
+        ###################################################
+
         drawdown = self._drawdown_state()
 
-        # HARD KILL
         if drawdown >= self.config.max_drawdown_kill:
             return 0.0
+
+        ###################################################
+        # INPUT SANITY
+        ###################################################
 
         confidence = max(
             self._safe(confidence, 0.5),
             self.MIN_CONFIDENCE_FLOOR
         )
+
+        # Nonlinear confidence clamp
+        confidence = min(confidence, 0.92)
 
         volatility = self._safe(
             volatility,
@@ -219,7 +256,7 @@ class PositionSizer:
         # SCALARS
         ###################################################
 
-        confidence_scalar = confidence ** 1.5
+        confidence_scalar = confidence ** 1.35
 
         vol_scalar = math.sqrt(
             self.config.volatility_target / effective_vol
@@ -268,10 +305,6 @@ class PositionSizer:
             absolute_cap,
             trade_cap
         )
-
-        ###################################################
-        # SANITY CHECK
-        ###################################################
 
         if capped_size > portfolio_value:
             return 0.0
