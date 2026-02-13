@@ -60,7 +60,7 @@ class ModelLoader:
         self._lstm = None
         self._scaler = None
 
-        self._load_lock = threading.Lock()
+        self._load_lock = threading.RLock()
 
         self._initialized = True
 
@@ -79,7 +79,7 @@ class ModelLoader:
         return h.hexdigest()
 
     ###################################################
-    # PATH SAFETY (HARDENED)
+    # PATH SAFETY
     ###################################################
 
     def _resolve_registry_path(self, base_dir):
@@ -96,7 +96,27 @@ class ModelLoader:
         if not os.path.isdir(base_dir):
             raise RuntimeError("Registry path is not a directory.")
 
+        if os.path.islink(base_dir):
+            raise RuntimeError("Registry path cannot be a symlink.")
+
         return base_dir
+
+    ###################################################
+    # MANIFEST CROSS-CHECK (NEW — CRITICAL)
+    ###################################################
+
+    def _verify_manifest_lineage(self, manifest):
+
+        if manifest.get("schema_signature") != get_schema_signature():
+            raise RuntimeError(
+                "Manifest schema mismatch — refusing load."
+            )
+
+        if "dataset_hash" not in manifest:
+            raise RuntimeError("Manifest missing dataset hash.")
+
+        if "training_code_hash" not in manifest:
+            raise RuntimeError("Manifest missing code lineage.")
 
     ###################################################
     # REGISTRY RESOLUTION
@@ -135,6 +155,8 @@ class ModelLoader:
                 f"Refusing to load non-production model: {version}"
             )
 
+        self._verify_manifest_lineage(manifest)
+
         return version, version_dir, manifest
 
     ###################################################
@@ -165,14 +187,14 @@ class ModelLoader:
                 "Training code lineage mismatch."
             )
 
-        if "training_universe" not in meta:
-            raise RuntimeError(
-                "Metadata missing training_universe."
-            )
-
         if manifest.get("schema_signature") != meta.get("schema_signature"):
             raise RuntimeError(
                 "Manifest and metadata schema mismatch."
+            )
+
+        if "training_universe" not in meta:
+            raise RuntimeError(
+                "Metadata missing training_universe."
             )
 
         return meta
@@ -308,6 +330,15 @@ class ModelLoader:
         )
 
         return self._xgb_container.model
+
+    ###################################################
+    # VERSION ACCESSOR (CRITICAL FOR PIPELINE)
+    ###################################################
+
+    @property
+    def xgb_version(self):
+        _ = self.xgb
+        return self._xgb_container.version
 
     ###################################################
     # SARIMAX
