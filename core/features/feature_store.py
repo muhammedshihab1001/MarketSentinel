@@ -22,9 +22,9 @@ class FeatureStore:
 
     FEATURE_DIR = os.path.abspath("data/features")
 
-    REQUIRED_COLUMNS = {"date", "close"}
+    REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v7"
+    CACHE_VERSION = "v8"   # 🔥 bump version to invalidate old broken cache
     MAX_CACHE_FILES_PER_TICKER = 6
 
     MIN_ROWS_REQUIRED = 100
@@ -84,10 +84,17 @@ class FeatureStore:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     ##################################################
-    # CANONICAL DATASET
+    # 🔥 FIXED — SAFE CANONICALIZATION
     ##################################################
 
     def _canonicalize_df(self, df: pd.DataFrame):
+
+        """
+        Creates a deterministic dataframe for hashing.
+        CRITICAL:
+        - NEVER numeric-coerce ticker
+        - NEVER destroy date dtype
+        """
 
         df = df.copy()
 
@@ -101,13 +108,17 @@ class FeatureStore:
                 )
                 continue
 
+            if col == "ticker":
+                df[col] = df[col].astype(str)
+                continue
+
             df[col] = (
                 pd.to_numeric(df[col], errors="raise")
                 .astype("float64")
                 .round(10)
             )
 
-        return df.sort_values("date").reset_index(drop=True)
+        return df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     ##################################################
 
@@ -281,12 +292,10 @@ class FeatureStore:
             df = pd.read_parquet(path)
 
             if "__dataset_hash" not in df.columns:
-                logger.warning("Missing dataset hash — rebuilding.")
                 os.remove(path)
                 return None
 
             if df["__dataset_hash"].iloc[0] != dataset_hash:
-                logger.warning("Dataset hash mismatch — rebuilding.")
                 os.remove(path)
                 return None
 
@@ -325,7 +334,7 @@ class FeatureStore:
     def get_features(
         self,
         price_df: pd.DataFrame,
-        sentiment_df: pd.DataFrame,
+        sentiment_df: Optional[pd.DataFrame],
         ticker: str = "unknown",
         training: bool = False
     ):
@@ -355,10 +364,12 @@ class FeatureStore:
             "Feature cache miss or lineage change — rebuilding."
         )
 
+        # 🔥 PASS TICKER INTO ENGINEER (CRITICAL)
         features = self.engineer.build_feature_pipeline(
             price_df,
             sentiment_df,
-            training=training
+            training=training,
+            ticker=ticker
         )
 
         self._atomic_write(
