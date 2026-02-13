@@ -2,10 +2,11 @@ import logging
 from pathlib import Path
 import pandas as pd
 import time
-import os
 import numpy as np
 import hashlib
 import re
+import tempfile
+import os
 
 from core.data.providers.market.router import MarketProviderRouter
 
@@ -25,6 +26,8 @@ class MarketDataService:
     ✔ ticker enforcement
     ✔ timezone normalization
     ✔ numeric safety
+    ✔ dataset fingerprinting
+    ✔ atomic persistence
     """
 
     DATA_DIR = Path("data/lake")
@@ -66,21 +69,6 @@ class MarketDataService:
         return ticker
 
     ########################################################
-    # ATTACH TICKER (HARD GUARANTEE)
-    ########################################################
-
-    @staticmethod
-    def _attach_ticker(df: pd.DataFrame, ticker: str):
-
-        if df is None or df.empty:
-            raise RuntimeError("Fetcher returned empty dataframe.")
-
-        df = df.copy()
-        df["ticker"] = ticker
-
-        return df
-
-    ########################################################
     # LOOKAHEAD PROTECTION
     ########################################################
 
@@ -99,7 +87,7 @@ class MarketDataService:
         return min(requested, safe_cutoff)
 
     ########################################################
-    # TIMEZONE NORMALIZATION (CRITICAL)
+    # TIMEZONE NORMALIZATION (FIXED)
     ########################################################
 
     @staticmethod
@@ -107,18 +95,60 @@ class MarketDataService:
 
         df = df.copy()
 
-        dt = pd.to_datetime(
-            df["date"],
-            errors="coerce"
+        df["date"] = (
+            pd.to_datetime(
+                df["date"],
+                utc=True,
+                errors="coerce"
+            )
+            .dt.tz_convert(None)
         )
 
-        # If timezone exists → convert → strip
-        if getattr(dt.dt, "tz", None) is not None:
-            dt = dt.dt.tz_convert("UTC").dt.tz_localize(None)
-
-        df["date"] = dt
-
         return df
+
+    ########################################################
+    # DATASET HASH
+    ########################################################
+
+    @staticmethod
+    def _dataset_hash(df: pd.DataFrame):
+
+        payload = pd.util.hash_pandas_object(
+            df.sort_values(["ticker", "date"]),
+            index=True
+        ).values.tobytes()
+
+        return hashlib.sha256(payload).hexdigest()[:16]
+
+    ########################################################
+    # ATOMIC WRITE
+    ########################################################
+
+    def _atomic_write(self, df, path):
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            dir=self.DATA_DIR,
+            suffix=".tmp"
+        ) as tmp:
+
+            df.to_parquet(tmp.name, index=False)
+
+            temp_name = tmp.name
+
+        os.replace(temp_name, path)
+
+    ########################################################
+    # CACHE PATH
+    ########################################################
+
+    def _cache_path(self, ticker, start, end, interval):
+
+        key = hashlib.sha256(
+            f"{ticker}|{start}|{end}|{interval}|{self.SCHEMA_HASH}".encode()
+        ).hexdigest()[:18]
+
+        return self.DATA_DIR / f"{ticker}_{key}.parquet"
 
     ########################################################
     # HARD VALIDATOR
@@ -157,12 +187,17 @@ class MarketDataService:
 
         df = df.sort_values(["ticker", "date"])
 
+        if not df["date"].is_monotonic_increasing:
+            raise RuntimeError("Non-monotonic timestamps detected.")
+
         if len(df) < self.MIN_HISTORY_ROWS:
             raise RuntimeError("Insufficient market history.")
 
         if len(df) > self.MAX_ROWS:
             logger.warning("Dataset too large — trimming oldest rows.")
             df = df.tail(self.MAX_ROWS)
+
+        df["__dataset_hash"] = self._dataset_hash(df)
 
         return df.reset_index(drop=True)
 
@@ -192,7 +227,7 @@ class MarketDataService:
                     interval
                 )
 
-                df = self._attach_ticker(df, ticker)
+                df["ticker"] = ticker
 
                 return self._validate_dataset(df)
 
@@ -229,6 +264,22 @@ class MarketDataService:
 
         end_date = self._cap_to_safe_date(end_date)
 
+        cache_path = self._cache_path(
+            ticker,
+            start_date,
+            end_date.strftime("%Y-%m-%d"),
+            interval
+        )
+
+        if cache_path.exists():
+
+            try:
+                return pd.read_parquet(cache_path)
+
+            except Exception:
+                logger.warning("Corrupted cache — rebuilding.")
+                cache_path.unlink(missing_ok=True)
+
         logger.info("Fetching dataset for %s", ticker)
 
         df = self._fetch_with_retry(
@@ -237,5 +288,7 @@ class MarketDataService:
             end_date.strftime("%Y-%m-%d"),
             interval
         )
+
+        self._atomic_write(df, cache_path)
 
         return df.reset_index(drop=True)
