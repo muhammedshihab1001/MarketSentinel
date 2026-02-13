@@ -128,7 +128,7 @@ class ForecastInterpreter:
     ) -> Tuple[str, float]:
 
         predicted_return = _safe(predicted_return)
-        sentiment = _safe(sentiment)
+        sentiment = _safe(sentiment, None)  # allow None
         rsi = _safe(rsi, 50.0)
         prob_up = _safe(prob_up, 0.5)
 
@@ -145,19 +145,43 @@ class ForecastInterpreter:
         if volatility > config.crisis_volatility:
             prob_threshold += 0.05
 
+        ################################################
+        # DYNAMIC CONFIDENCE WEIGHTING
+        ################################################
+
         rsi_edge = abs(50 - rsi) / 50
 
+        weights = {
+            "prob": 0.50,
+            "rar": 0.35,
+            "rsi": 0.15,
+            "sentiment": 0.0
+        }
+
+        # Only activate sentiment if meaningful
+        if sentiment is not None and abs(sentiment) > config.sentiment_threshold:
+            weights["sentiment"] = 0.10
+            weights["prob"] -= 0.05
+            weights["rar"] -= 0.05
+
         confidence = (
-            prob_up * 0.45 +
-            math.tanh(rar) * 0.35 +
-            abs(sentiment) * 0.10 +
-            rsi_edge * 0.10
+            prob_up * weights["prob"] +
+            math.tanh(rar) * weights["rar"] +
+            rsi_edge * weights["rsi"] +
+            (abs(sentiment) if sentiment else 0.0) * weights["sentiment"]
         )
 
         confidence = _clamp(confidence, 0.0, 1.0)
 
-        if prob_up >= prob_threshold and rar > config.min_risk_adjusted_return:
+        ################################################
+        # BUY / SELL LOGIC
+        ################################################
+
+        if rar > config.min_risk_adjusted_return and prob_up >= prob_threshold:
             return "BUY", round(confidence, 3)
+
+        if rar < -config.min_risk_adjusted_return and prob_up <= (1 - prob_threshold):
+            return "SELL", round(confidence, 3)
 
         return "HOLD", round(confidence, 3)
 
@@ -232,24 +256,21 @@ class DecisionEngine:
 
     ###################################################
 
-    def _volatility_scale(self, allocation, volatility):
+    def _hold(self, confidence: float) -> Dict:
 
-        if volatility > self.config.volatility_cap:
-            return 0.0
-
-        if volatility <= self.config.volatility_throttle:
-            return allocation
-
-        scale = self.config.volatility_throttle / volatility
-
-        return allocation * _clamp(scale, 0.25, 1.0)
+        return {
+            "signal": "HOLD",
+            "confidence": round(confidence, 3),
+            "allocation": 0.0,
+            "position_pct": 0.0
+        }
 
     ###################################################
 
     def generate(
         self,
         predicted_return: float,
-        sentiment: float,
+        sentiment: float | None,
         rsi: float,
         prob_up: float,
         volatility: float,
@@ -294,47 +315,13 @@ class DecisionEngine:
         if not math.isfinite(allocation) or allocation <= 0:
             return self._hold(confidence)
 
-        allocation = self._volatility_scale(
-            allocation,
-            volatility
-        )
-
-        max_position = (
-            self.config.portfolio_value *
-            self.config.max_position_pct
-        )
-
-        min_position = (
-            self.config.portfolio_value *
-            self.config.min_position_pct
-        )
-
-        allocation = min(allocation, max_position)
-
-        if allocation < min_position:
-            return self._hold(confidence)
+        self._last_signal = base_signal
 
         position_pct = allocation / self.config.portfolio_value
-
-        if position_pct > self.config.max_total_exposure_pct:
-            return self._hold(confidence)
-
-        self._last_signal = base_signal
 
         return {
             "signal": base_signal,
             "confidence": round(confidence, 3),
             "allocation": round(allocation, 2),
             "position_pct": round(position_pct, 4)
-        }
-
-    ###################################################
-
-    def _hold(self, confidence: float) -> Dict:
-
-        return {
-            "signal": "HOLD",
-            "confidence": round(confidence, 3),
-            "allocation": 0.0,
-            "position_pct": 0.0
         }
