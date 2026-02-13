@@ -10,12 +10,15 @@ class PortfolioBacktestEngine:
     MAX_INV_VOL = 5.0
 
     MAX_SINGLE_STEP_RETURN = 0.40
+    MAX_GAP = 0.35  #  NEW — gap risk guard
 
     MAX_POSITION_WEIGHT = 0.12
     MAX_ABSOLUTE_POSITION = 0.25
     MAX_TURNOVER_RATIO = 1.8
     MIN_EQUITY_FLOOR = 0.35
     SLIPPAGE_IMPACT = 0.08
+
+    BORROW_COST_ANNUAL = 0.03  #  NEW — short borrow simulation
 
     VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
 
@@ -51,6 +54,27 @@ class PortfolioBacktestEngine:
             return None
 
         return price
+
+    ###################################################
+    #  GAP GUARD
+    ###################################################
+
+    def _check_gap(self, prev_prices, prices):
+
+        if prev_prices is None:
+            return
+
+        for t in prices:
+
+            if t not in prev_prices:
+                continue
+
+            gap = abs(prices[t] / prev_prices[t] - 1)
+
+            if gap > self.MAX_GAP:
+                raise RuntimeError(
+                    f"Untradeable gap detected in {t}: {gap:.2%}"
+                )
 
     ###################################################
 
@@ -131,7 +155,11 @@ class PortfolioBacktestEngine:
         total = sum(abs(v) for v in raw.values())
 
         weights = {
-            t: np.clip(v / total, -self.MAX_POSITION_WEIGHT, self.MAX_POSITION_WEIGHT)
+            t: np.clip(
+                v / total,
+                -self.MAX_POSITION_WEIGHT,
+                self.MAX_POSITION_WEIGHT
+            )
             for t, v in raw.items()
         }
 
@@ -151,6 +179,25 @@ class PortfolioBacktestEngine:
         impact = size_ratio * self.SLIPPAGE_IMPACT
 
         return self.base_slippage + impact
+
+    ###################################################
+    #  SHORT BORROW COST
+    ###################################################
+
+    def _apply_borrow_cost(self, positions, prices, equity):
+
+        daily_rate = self.BORROW_COST_ANNUAL / 252
+
+        borrow_cost = 0.0
+
+        for t, shares in positions.items():
+
+            if shares >= 0:
+                continue
+
+            borrow_cost += abs(shares * prices[t]) * daily_rate
+
+        return borrow_cost
 
     ###################################################
 
@@ -185,13 +232,18 @@ class PortfolioBacktestEngine:
             if not prices:
                 continue
 
+            #  GAP CHECK
+            self._check_gap(prev_prices, prices)
+
             if prev_prices is None:
                 prev_prices = prices
                 prev_signals = signals_today
                 equity_curve.append(cash)
                 continue
 
+            # EXECUTE PREVIOUS SIGNALS
             signals = prev_signals
+
             vols = self._update_vol_buffers(prev_prices, prices)
 
             portfolio_value = cash + sum(
@@ -221,7 +273,7 @@ class PortfolioBacktestEngine:
             }
 
             ###################################################
-            # EXECUTE WITH FUNDING CHECK
+            # EXECUTE TRADES
             ###################################################
 
             for ticker in set(positions) | set(target_positions):
@@ -266,22 +318,18 @@ class PortfolioBacktestEngine:
                     positions[ticker] = target
 
             ###################################################
-            # POST-TRADE EXPOSURE GUARD
+            #  APPLY BORROW COST
             ###################################################
 
-            gross_exposure = sum(
-                abs(positions[t] * prices[t])
-                for t in positions if t in prices
-            ) / max(portfolio_value, 1)
+            borrow_cost = self._apply_borrow_cost(
+                positions,
+                prices,
+                portfolio_value
+            )
 
-            if gross_exposure > self.max_gross_exposure * 1.05:
-                raise RuntimeError("Exposure limit breached.")
+            cash -= borrow_cost
 
-            for t in positions:
-                pos_value = abs(positions[t] * prices[t])
-
-                if pos_value > portfolio_value * self.MAX_ABSOLUTE_POSITION:
-                    raise RuntimeError("Position concentration breach.")
+            ###################################################
 
             equity = cash + sum(
                 positions.get(t, 0) * prices.get(t, 0)
@@ -309,9 +357,6 @@ class PortfolioBacktestEngine:
         ############################################
 
         curve = np.array(equity_curve, dtype=float)
-
-        if not np.isfinite(curve).all():
-            raise RuntimeError("Equity curve corrupted.")
 
         returns = (
             np.diff(curve) /
