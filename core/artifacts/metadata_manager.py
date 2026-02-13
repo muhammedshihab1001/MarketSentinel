@@ -4,7 +4,6 @@ import datetime
 import hashlib
 import pandas as pd
 import platform
-import sys
 import numpy as np
 
 from core.schema.feature_schema import (
@@ -18,6 +17,10 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
+    METADATA_VERSION = "9.0"
+
+    MIN_TRAINING_DAYS = 120
+
     REQUIRED_METADATA_FIELDS = [
         "metadata_type",
         "metadata_version",
@@ -25,7 +28,9 @@ class MetadataManager:
         "created_at",
         "training_window",
         "dataset_hash",
+        "dataset_rows",
         "features",
+        "feature_count",
         "metrics",
         "schema_signature",
         "schema_version",
@@ -35,8 +40,6 @@ class MetadataManager:
         "training_universe",
         "universe_hash"
     ]
-
-    METADATA_VERSION = "8.1"
 
     #####################################################
     # SAFE FSYNC
@@ -56,61 +59,7 @@ class MetadataManager:
             pass
 
     #####################################################
-    # HASH LIST (YOU WERE MISSING THIS)
-    #####################################################
-
-    @staticmethod
-    def hash_list(items):
-
-        if not items:
-            raise RuntimeError("Cannot hash empty list.")
-
-        normalized = sorted(str(x) for x in items)
-
-        canonical = json.dumps(
-            normalized,
-            separators=(",", ":")
-        ).encode()
-
-        return hashlib.sha256(canonical).hexdigest()
-
-    #####################################################
-    # FEATURE CONTRACT
-    #####################################################
-
-    @staticmethod
-    def _validate_feature_contract(features, metadata_type):
-
-        frozen = tuple(features)
-
-        if metadata_type == "training_manifest_v1":
-
-            if frozen != MODEL_FEATURES:
-                raise RuntimeError(
-                    "Feature list mismatch — schema drift detected."
-                )
-
-        elif metadata_type == "timeseries_manifest_v1":
-
-            if list(frozen) != ["close"]:
-                raise RuntimeError(
-                    "Timeseries models must declare ['close'] only."
-                )
-
-        elif metadata_type == "sequence_manifest_v1":
-
-            if list(frozen) != ["close_sequence"]:
-                raise RuntimeError(
-                    "Sequence models must declare ['close_sequence']."
-                )
-
-        else:
-            raise RuntimeError(
-                f"Unknown metadata_type: {metadata_type}"
-            )
-
-    #####################################################
-    # DATASET FINGERPRINT (FIXED — SUPPORTS STRINGS)
+    # DATASET HASH
     #####################################################
 
     @staticmethod
@@ -131,13 +80,9 @@ class MetadataManager:
         for col in df_copy.columns:
 
             if col == "date":
-                df_copy[col] = pd.to_datetime(
-                    df_copy[col],
-                    utc=True
-                )
+                df_copy[col] = pd.to_datetime(df_copy[col], utc=True)
                 continue
 
-            # ⭐ CRITICAL FIX — support categorical
             if df_copy[col].dtype == "object":
                 df_copy[col] = df_copy[col].astype(str)
                 continue
@@ -206,32 +151,13 @@ class MetadataManager:
     @staticmethod
     def capture_environment():
 
-        env = {
+        return {
             "python": platform.python_version(),
-            "platform": platform.system(),
+            "platform": platform.platform(),
+            "machine": platform.machine(),
             "numpy": np.__version__,
             "pandas": pd.__version__,
         }
-
-        try:
-            import sklearn
-            env["sklearn"] = sklearn.__version__
-        except Exception:
-            pass
-
-        try:
-            import xgboost
-            env["xgboost"] = xgboost.__version__
-        except Exception:
-            pass
-
-        try:
-            import tensorflow
-            env["tensorflow"] = tensorflow.__version__
-        except Exception:
-            pass
-
-        return env
 
     #####################################################
     # METADATA HASH
@@ -284,17 +210,28 @@ class MetadataManager:
         if end_dt <= start_dt:
             raise RuntimeError("Invalid training window.")
 
+        if (end_dt - start_dt).days < MetadataManager.MIN_TRAINING_DAYS:
+            raise RuntimeError(
+                "Training window below institutional minimum."
+            )
+
     @staticmethod
-    def _validate_universe_snapshot(snapshot):
+    def _validate_metrics(metrics):
 
-        if not isinstance(snapshot, dict):
-            raise RuntimeError("Universe snapshot must be dict.")
+        if not isinstance(metrics, dict):
+            raise RuntimeError("Metrics must be dict.")
 
-        if "tickers" not in snapshot:
-            raise RuntimeError("Universe snapshot missing tickers.")
+        for k, v in metrics.items():
 
-        if snapshot["tickers"] != sorted(snapshot["tickers"]):
-            raise RuntimeError("Universe tickers must be sorted.")
+            if not isinstance(v, (int, float)):
+                raise RuntimeError(
+                    f"Metric must be numeric: {k}"
+                )
+
+            if not np.isfinite(v):
+                raise RuntimeError(
+                    f"Metric is non-finite: {k}"
+                )
 
     #####################################################
     # CREATE METADATA
@@ -308,25 +245,21 @@ class MetadataManager:
         training_start,
         training_end,
         dataset_hash,
+        dataset_rows,
         metadata_type,
         extra_fields=None
     ):
 
-        MetadataManager._validate_feature_contract(
-            features,
-            metadata_type
-        )
+        if tuple(features) != MODEL_FEATURES:
+            raise RuntimeError("Feature mismatch detected.")
 
+        MetadataManager._validate_metrics(metrics)
         MetadataManager._validate_training_window(
             training_start,
             training_end
         )
 
         universe_snapshot = MarketUniverse.snapshot()
-
-        MetadataManager._validate_universe_snapshot(
-            universe_snapshot
-        )
 
         metadata = {
 
@@ -342,7 +275,11 @@ class MetadataManager:
             },
 
             "dataset_hash": dataset_hash,
-            "features": list(tuple(features)),
+            "dataset_rows": int(dataset_rows),
+
+            "features": list(features),
+            "feature_count": len(features),
+
             "metrics": metrics,
 
             "schema_signature": get_schema_signature(),
@@ -383,6 +320,9 @@ class MetadataManager:
             raise RuntimeError(
                 f"Metadata missing required fields: {missing}"
             )
+
+        if metadata["feature_count"] != len(MODEL_FEATURES):
+            raise RuntimeError("Feature count drift detected.")
 
         if metadata["metadata_integrity_hash"] != (
             MetadataManager._compute_metadata_hash(metadata)
