@@ -84,6 +84,23 @@ class FeatureEngineer:
         return df
 
     ###################################################
+    # NUMERIC ENFORCEMENT
+    ###################################################
+
+    @staticmethod
+    def _force_numeric(df):
+
+        for col in df.columns:
+            if col == "date":
+                continue
+
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        return df
+
+    ###################################################
     # RETURNS / VOL
     ###################################################
 
@@ -96,7 +113,6 @@ class FeatureEngineer:
 
         df["return"] = returns.clip(lo, hi)
 
-        #  REQUIRED BY SCHEMA
         df["return_lag1"] = df["return"].shift(1)
 
     @staticmethod
@@ -132,7 +148,20 @@ class FeatureEngineer:
         df["macd_signal"] = signal.clip(-50, 50)
 
     ###################################################
-    #  INSTITUTIONAL SENTIMENT FALLBACK
+    # FEATURE ALIGNMENT (ANTI-LEAK)
+    ###################################################
+
+    @staticmethod
+    def align_features(df):
+
+        for col in MODEL_FEATURES:
+            if col in df.columns:
+                df[col] = df[col].shift(1)
+
+        return df
+
+    ###################################################
+    # SENTIMENT FALLBACK
     ###################################################
 
     @classmethod
@@ -157,7 +186,6 @@ class FeatureEngineer:
 
         price = cls._normalize_datetime(price_df).sort_values("date")
 
-        #  FALLBACK INSTEAD OF CRASH
         if sentiment_df is None or sentiment_df.empty:
             sentiment_df = cls._build_neutral_sentiment(price)
 
@@ -166,11 +194,12 @@ class FeatureEngineer:
         missing = set(cls.SENTIMENT_COLUMNS) - set(sentiment.columns)
 
         if missing:
-            sentiment_df = cls._build_neutral_sentiment(price)
-            sentiment = sentiment_df
+            sentiment = cls._build_neutral_sentiment(price)
 
         sentiment = sentiment.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment).sort_values("date")
+
+        sentiment = cls._force_numeric(sentiment)
 
         sentiment["date"] += pd.Timedelta(days=1)
 
@@ -183,16 +212,15 @@ class FeatureEngineer:
             allow_exact_matches=False
         )
 
-        #  FINAL SAFETY FILL
-        merged["avg_sentiment"] = merged["avg_sentiment"].fillna(0.0)
-        merged["news_count"] = merged["news_count"].fillna(0.0)
+        merged["avg_sentiment"].fillna(0.0, inplace=True)
+        merged["news_count"].fillna(0.0, inplace=True)
+
         merged["sentiment_std"] = (
             merged["sentiment_std"]
             .fillna(cls.SENTIMENT_STD_FLOOR)
             .clip(lower=cls.SENTIMENT_STD_FLOOR)
         )
 
-        #  REQUIRED BY SCHEMA
         merged["sentiment_lag1"] = merged["avg_sentiment"].shift(1)
 
         return merged
@@ -219,7 +247,8 @@ class FeatureEngineer:
             np.where(risk_adj < -DEAD_ZONE, 0, np.nan)
         )
 
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df = cls._force_numeric(df)
+
         df.dropna(inplace=True)
 
         if len(df) < 100:
@@ -251,6 +280,8 @@ class FeatureEngineer:
         cls.add_macd(df)
 
         df = cls.merge_price_sentiment(df, sentiment_df)
+
+        df = cls.align_features(df)
 
         if training:
             df = cls.create_training_dataset(df)
