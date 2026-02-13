@@ -1,18 +1,34 @@
 from __future__ import annotations
 
 import warnings
+import os
+import hashlib
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
+
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
+
+
+########################################################
+# STRICT NUMERIC DETERMINISM
+########################################################
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 
 MIN_HISTORY = 300
 EPSILON = 1e-9
 MAX_FORWARD_FILL_RATIO = 0.05
+
+MAX_FORECAST_MULTIPLIER = 5.0   # prevents explosion
+MIN_FORECAST_MULTIPLIER = 0.2
 
 
 ########################################################
@@ -27,7 +43,7 @@ class SarimaxConfig:
     enforce_invertibility: bool = False
     maxiter: int = 200
     trend: Optional[str] = None
-    frequency: str = "B"   # Institutional equity calendar
+    frequency: str = "B"
 
 
 ########################################################
@@ -68,7 +84,10 @@ def prepare_series(df: pd.DataFrame, freq: str) -> pd.Series:
     if series["close"].isna().any():
         raise RuntimeError("NaNs detected in price series.")
 
-    # log transform
+    ########################################################
+    # LOG TRANSFORM
+    ########################################################
+
     series["close"] = np.log(
         series["close"].astype("float64")
     )
@@ -112,6 +131,7 @@ class SarimaxModel:
         self.config = config or SarimaxConfig()
         self._fitted = None
         self._train_index = None
+        self._fingerprint = None
 
     ########################################################
     # TRAIN
@@ -163,8 +183,28 @@ class SarimaxModel:
 
         self._fitted = fitted
         self._train_index = series.index
+        self._fingerprint = self._hash_model()
 
         return self
+
+    ########################################################
+    # MODEL HASH (CRITICAL)
+    ########################################################
+
+    def _hash_model(self) -> str:
+
+        params = np.ascontiguousarray(
+            self._fitted.params.astype("float64")
+        )
+
+        return hashlib.sha256(params.tobytes()).hexdigest()
+
+    def fingerprint(self) -> str:
+
+        if self._fingerprint is None:
+            raise RuntimeError("Model not trained.")
+
+        return self._fingerprint
 
     ########################################################
     # FORECAST
@@ -200,6 +240,20 @@ class SarimaxModel:
             forecast.values.astype("float64")
         )
 
+        ####################################################
+        # EXPLOSION GUARD
+        ####################################################
+
+        start_price = prices[0]
+
+        if (
+            prices.max() > start_price * MAX_FORECAST_MULTIPLIER
+            or prices.min() < start_price * MIN_FORECAST_MULTIPLIER
+        ):
+            raise RuntimeError(
+                "SARIMAX forecast exploded — regime shift suspected."
+            )
+
         slope = float(prices[-1] - prices[0])
         volatility = float(np.std(prices))
 
@@ -219,6 +273,7 @@ class SarimaxModel:
             "trend": trend,
             "forecast_volatility": volatility,
             "normalized_slope": normalized_slope,
+            "model_fingerprint": self._fingerprint
         }
 
     ########################################################
