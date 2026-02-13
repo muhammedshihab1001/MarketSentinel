@@ -29,10 +29,8 @@ class FeatureEngineer:
     VOL_FLOOR = 1e-4
     SENTIMENT_STD_FLOOR = 0.02
 
-    NON_NUMERIC_COLUMNS = {"date", "ticker"}
-
     ###################################################
-    # DATETIME (TZ SAFE)
+    # DATETIME
     ###################################################
 
     @staticmethod
@@ -41,30 +39,38 @@ class FeatureEngineer:
         df = df.copy()
 
         df["date"] = (
-            pd.to_datetime(df["date"], utc=True, errors="raise")
+            pd.to_datetime(
+                df["date"],
+                utc=True,
+                errors="raise"
+            )
             .dt.tz_convert(None)
         )
 
         return df
 
     ###################################################
-    # HARD TICKER ENFORCEMENT
+    # 🚨 HARD GUARANTEE — TICKER MUST EXIST
     ###################################################
 
     @staticmethod
     def _enforce_ticker(df: pd.DataFrame, ticker=None):
 
-        if "ticker" in df.columns:
-            df["ticker"] = df["ticker"].astype(str)
-            return df
+        df = df.copy()
 
-        if ticker is not None:
-            df["ticker"] = str(ticker)
-            return df
+        if "ticker" not in df.columns:
 
-        raise RuntimeError(
-            "Ticker column missing from price dataframe."
-        )
+            if ticker is None:
+                raise RuntimeError(
+                    "Ticker column missing from price dataframe."
+                )
+
+            df["ticker"] = ticker
+
+        # ALWAYS string (prevents hash drift)
+        df["ticker"] = df["ticker"].astype(str)
+
+        return df
 
     ###################################################
     # PRICE VALIDATION
@@ -81,7 +87,9 @@ class FeatureEngineer:
         required = {"date", "close", "ticker"}
 
         if not required.issubset(df.columns):
-            raise RuntimeError("Price dataframe missing required columns.")
+            raise RuntimeError(
+                "Price dataframe missing required columns."
+            )
 
         df = cls._normalize_datetime(df)
         df = df.sort_values("date")
@@ -103,24 +111,6 @@ class FeatureEngineer:
         return df.reset_index(drop=True)
 
     ###################################################
-    # 🚨 FIXED — SAFE NUMERIC CAST
-    ###################################################
-
-    @classmethod
-    def _force_numeric(cls, df):
-
-        for col in df.columns:
-
-            if col in cls.NON_NUMERIC_COLUMNS:
-                continue
-
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-        return df
-
-    ###################################################
     # RETURNS / VOL
     ###################################################
 
@@ -137,12 +127,16 @@ class FeatureEngineer:
     @staticmethod
     def add_volatility(df, window=5):
 
-        df["volatility"] = (
+        vol = (
             df["return"]
             .rolling(window, min_periods=window)
             .std(ddof=0)
-            .clip(lower=FeatureEngineer.VOL_FLOOR, upper=5)
         )
+
+        # 🚨 CRITICAL — prevents NaN cascade
+        df["volatility"] = vol.clip(
+            lower=FeatureEngineer.VOL_FLOOR
+        ).fillna(FeatureEngineer.VOL_FLOOR)
 
     ###################################################
     # TECHNICALS
@@ -167,11 +161,13 @@ class FeatureEngineer:
         df["macd_signal"] = signal.clip(-50, 50)
 
     ###################################################
-    # ANTI-LOOKAHEAD
+    # ANTI-LEAK ALIGNMENT
     ###################################################
 
     @staticmethod
     def align_features(df):
+
+        df = df.copy()
 
         for col in MODEL_FEATURES:
             if col in df.columns:
@@ -180,7 +176,7 @@ class FeatureEngineer:
         return df
 
     ###################################################
-    # VARIANCE SAFE SENTIMENT
+    # STRONG NEUTRAL SENTIMENT
     ###################################################
 
     @classmethod
@@ -229,8 +225,6 @@ class FeatureEngineer:
         sentiment = sentiment.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment).sort_values("date")
 
-        sentiment = cls._force_numeric(sentiment)
-
         sentiment["date"] += pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
@@ -267,7 +261,7 @@ class FeatureEngineer:
         log_close = np.log(df["close"])
         forward = log_close.shift(-1) - log_close
 
-        risk_adj = forward / df["volatility"].clip(lower=cls.VOL_FLOOR)
+        risk_adj = forward / df["volatility"]
 
         DEAD_ZONE = 0.06
 
@@ -276,8 +270,6 @@ class FeatureEngineer:
             np.where(risk_adj < -DEAD_ZONE, 0, np.nan)
         )
 
-        df = cls._force_numeric(df)
-
         df.dropna(inplace=True)
 
         if len(df) < 100:
@@ -285,7 +277,7 @@ class FeatureEngineer:
 
         df["target"] = df["target"].astype("int8")
 
-        return df.reset_index(drop=True)
+        return df
 
     ###################################################
     # MASTER PIPELINE
@@ -315,7 +307,9 @@ class FeatureEngineer:
         if training:
             df = cls.create_training_dataset(df)
         else:
-            raise RuntimeError("Inference pipeline should be separate.")
+            raise RuntimeError(
+                "Inference pipeline should be built separately."
+            )
 
         feature_block = df.loc[:, MODEL_FEATURES]
         validated = validate_feature_schema(feature_block)
