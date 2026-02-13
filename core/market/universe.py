@@ -1,87 +1,119 @@
-from typing import List, Dict
+from typing import Tuple, Dict
 import hashlib
 import json
+import os
 
 
 class MarketUniverse:
     """
     Institutional Universe Controller.
 
+    Universe is CONFIG — not code.
+
     Guarantees:
-    deterministic asset list
-    fingerprinted universe
-    audit-safe
-    mutation-proof
-    duplicate-proof
-    lineage traceable
+    ✔ deterministic
+    ✔ file-governed
+    ✔ audit safe
+    ✔ mutation proof
+    ✔ lineage traceable
     """
 
-    UNIVERSE_VERSION = "2.0"
-
-    _TRAINING_UNIVERSE = tuple(sorted([
-
-        "AAPL","MSFT","NVDA","AMZN",
-        "GOOGL","META","TSLA",
-
-        "JPM","GS",
-
-        "XOM",
-
-        "AMD","AVGO",
-
-        "SPY","QQQ"
-    ]))
+    UNIVERSE_FILE = "config/universe.json"
 
     ###################################################
-    # INTERNAL VALIDATION
+    # LOAD
     ###################################################
 
-    for t in _TRAINING_UNIVERSE:
+    @classmethod
+    def _load_file(cls):
 
-        if not isinstance(t, str):
-            raise RuntimeError("Non-string ticker detected.")
+        if not os.path.exists(cls.UNIVERSE_FILE):
+            raise RuntimeError(
+                f"Universe file missing: {cls.UNIVERSE_FILE}"
+            )
 
-        if t.strip() != t:
-            raise RuntimeError("Ticker contains whitespace.")
+        with open(cls.UNIVERSE_FILE, "r") as f:
+            payload = json.load(f)
 
-        if not t.isupper():
-            raise RuntimeError("Tickers must be uppercase.")
+        if "version" not in payload or "tickers" not in payload:
+            raise RuntimeError("Invalid universe config.")
 
-        if not t:
-            raise RuntimeError("Empty ticker detected.")
+        tickers = payload["tickers"]
 
-    if len(_TRAINING_UNIVERSE) != len(set(_TRAINING_UNIVERSE)):
-        raise RuntimeError("Duplicate tickers detected in universe.")
+        if not isinstance(tickers, list) or not tickers:
+            raise RuntimeError("Universe tickers invalid.")
 
-    if len(_TRAINING_UNIVERSE) < 5:
-        raise RuntimeError("Universe too small — unsafe for ML.")
+        #################################################
+        # NORMALIZE + VALIDATE
+        #################################################
+
+        normalized = []
+
+        for t in tickers:
+
+            if not isinstance(t, str):
+                raise RuntimeError("Non-string ticker detected.")
+
+            t = t.strip().upper()
+
+            if not t:
+                raise RuntimeError("Empty ticker detected.")
+
+            normalized.append(t)
+
+        if len(normalized) != len(set(normalized)):
+            raise RuntimeError("Duplicate tickers detected.")
+
+        if len(normalized) < 5:
+            raise RuntimeError("Universe too small.")
+
+        return payload["version"], tuple(sorted(normalized))
+
+    ###################################################
+    # CACHE (immutable)
+    ###################################################
+
+    _CACHE = None
+
+    @classmethod
+    def _get_cached(cls):
+
+        if cls._CACHE is None:
+
+            version, tickers = cls._load_file()
+
+            cls._CACHE = {
+                "version": version,
+                "tickers": tickers
+            }
+
+        return cls._CACHE
 
     ###################################################
     # PUBLIC
     ###################################################
 
     @classmethod
-    def get_universe(cls) -> List[str]:
-        return list(cls._TRAINING_UNIVERSE)
+    def get_universe(cls) -> Tuple[str, ...]:
+        """
+        Immutable tuple — cannot be mutated.
+        """
+        return cls._get_cached()["tickers"]
 
     ###################################################
     # FINGERPRINT
     ###################################################
 
     @classmethod
-    def _contract(cls) -> Dict:
-
-        return {
-            "version": cls.UNIVERSE_VERSION,
-            "tickers": list(cls._TRAINING_UNIVERSE),
-            "size": len(cls._TRAINING_UNIVERSE)
-        }
-
-    @classmethod
     def fingerprint(cls) -> str:
 
+        contract = {
+            "version": cls._get_cached()["version"],
+            "tickers": cls.get_universe(),
+        }
+
         canonical = json.dumps(
-            cls._contract(),
+            contract,
             sort_keys=True,
             separators=(",", ":")
         ).encode()
@@ -89,39 +121,31 @@ class MarketUniverse:
         return hashlib.sha256(canonical).hexdigest()
 
     ###################################################
-    # SAFETY
+    # SNAPSHOT
     ###################################################
 
     @classmethod
-    def universe_size(cls) -> int:
-        return len(cls._TRAINING_UNIVERSE)
+    def snapshot(cls) -> Dict:
+
+        tickers = list(cls.get_universe())
+
+        return {
+            "universe_version": cls._get_cached()["version"],
+            "universe_hash": cls.fingerprint(),
+            "universe_size": len(tickers),
+            "tickers": tickers
+        }
+
+    ###################################################
+    # VALIDATION
+    ###################################################
 
     @classmethod
-    def validate_subset(cls, tickers: List[str]):
+    def validate_subset(cls, tickers):
 
-        unknown = set(tickers) - set(cls._TRAINING_UNIVERSE)
+        unknown = set(tickers) - set(cls.get_universe())
 
         if unknown:
             raise RuntimeError(
                 f"Unknown tickers detected: {unknown}"
             )
-
-    ###################################################
-    # AUDIT SNAPSHOT
-    ###################################################
-
-    @classmethod
-    def snapshot(cls) -> Dict:
-        """
-        Snapshot is STRUCTURE LOCKED.
-        Do not modify without version bump.
-        """
-
-        contract = cls._contract()
-
-        return {
-            "universe_version": cls.UNIVERSE_VERSION,
-            "universe_hash": cls.fingerprint(),
-            "universe_size": contract["size"],
-            "tickers": contract["tickers"]
-        }

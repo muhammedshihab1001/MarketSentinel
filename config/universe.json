@@ -1,0 +1,11 @@
+{
+  "version": "3.0",
+  "tickers": [
+    "AAPL","MSFT","NVDA","AMZN",
+    "GOOGL","META","TSLA",
+    "JPM","GS",
+    "XOM",
+    "AMD","AVGO",
+    "SPY","QQQ"
+  ]
+}
