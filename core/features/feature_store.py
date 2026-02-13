@@ -3,7 +3,6 @@ import logging
 import hashlib
 import re
 import sys
-import platform
 from typing import Optional
 
 import pandas as pd
@@ -25,8 +24,10 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close"}
 
-    CACHE_VERSION = "v5"
+    CACHE_VERSION = "v6"
     MAX_CACHE_FILES_PER_TICKER = 6
+
+    MIN_ROWS_REQUIRED = 100
 
     ##################################################
 
@@ -37,9 +38,7 @@ class FeatureStore:
         self.engineer = FeatureEngineer()
 
         self.schema_hash = get_schema_signature()[:12]
-
         self.engineer_hash = self._fingerprint_engineer()[:12]
-
         self.env_hash = self._environment_fingerprint()[:12]
 
     ##################################################
@@ -70,16 +69,19 @@ class FeatureStore:
         return hashlib.sha256(payload).hexdigest()
 
     ##################################################
-    # ENVIRONMENT FINGERPRINT
+    # STABLE ENVIRONMENT FINGERPRINT
     ##################################################
 
     def _environment_fingerprint(self) -> str:
+        """
+        Hardware-independent fingerprint.
+
+        Prevents cache invalidation when Docker
+        moves across machines.
+        """
 
         payload = (
             sys.version +
-            platform.platform() +
-            platform.machine() +
-            sys.byteorder +
             pd.__version__ +
             np.__version__
         )
@@ -87,7 +89,7 @@ class FeatureStore:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     ##################################################
-    # CANONICAL DATASET HASH
+    # CANONICAL DATASET
     ##################################################
 
     def _canonicalize_df(self, df: pd.DataFrame):
@@ -104,10 +106,12 @@ class FeatureStore:
                 )
                 continue
 
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="raise"
-            ).astype("float64")
+            # deterministic float rounding
+            df[col] = (
+                pd.to_numeric(df[col], errors="raise")
+                .astype("float64")
+                .round(10)
+            )
 
         return df.sort_values("date").reset_index(drop=True)
 
@@ -182,7 +186,7 @@ class FeatureStore:
             os.close(fd)
 
     ##################################################
-    # CACHE PRUNING (DETERMINISTIC)
+    # CACHE PRUNING
     ##################################################
 
     def _prune_cache(self, ticker):
@@ -229,9 +233,23 @@ class FeatureStore:
 
     def _atomic_write(self, df: pd.DataFrame, path: str):
 
+        if len(df) < self.MIN_ROWS_REQUIRED:
+            raise RuntimeError("Feature collapse detected.")
+
         tmp_path = path + ".tmp"
 
         df = df.sort_values("date").reset_index(drop=True)
+
+        ##################################################
+        # FORCE COLUMN ORDER (CRITICAL)
+        ##################################################
+
+        base_cols = ["date", "close", "ticker"]
+
+        if "target" in df.columns:
+            base_cols.insert(2, "target")
+
+        df = df[base_cols + list(MODEL_FEATURES)]
 
         self._validate_dataset_structure(df)
 
@@ -262,6 +280,15 @@ class FeatureStore:
     def _load_features(self, path: str) -> Optional[pd.DataFrame]:
 
         if not os.path.exists(path):
+            return None
+
+        # corruption guard
+        if os.path.getsize(path) < 5_000:
+            logger.warning("Feature file too small — rebuilding.")
+            try:
+                os.remove(path)
+            except Exception:
+                pass
             return None
 
         filename = os.path.basename(path)
