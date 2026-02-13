@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import logging
 import os
+import hashlib
 
 from core.data.market_data_service import MarketDataService
 from core.data.news_fetcher import NewsFetcher
@@ -36,6 +37,10 @@ from app.monitoring.metrics import (
 
 logger = logging.getLogger("marketsentinel.pipeline")
 
+
+############################################################
+# CIRCUIT BREAKER
+############################################################
 
 class CircuitBreaker:
 
@@ -74,6 +79,10 @@ class CircuitBreaker:
             self.failures = 0
 
 
+############################################################
+# INFERENCE PIPELINE
+############################################################
+
 class InferencePipeline:
 
     HARD_PIPELINE_TIMEOUT = float(
@@ -100,6 +109,8 @@ class InferencePipeline:
 
     LOCK_TIMEOUT = 3
 
+    ############################################################
+
     def __init__(self):
 
         self.market_data = MarketDataService()
@@ -116,11 +127,15 @@ class InferencePipeline:
 
         self._validate_models_loaded()
 
+    ############################################################
+
     def _deadline(self, start):
         remaining = self.HARD_PIPELINE_TIMEOUT - (time.time() - start)
         if remaining <= 0:
             raise RuntimeError("Pipeline timeout exceeded.")
         return remaining
+
+    ############################################################
 
     def _validate_models_loaded(self):
 
@@ -132,6 +147,22 @@ class InferencePipeline:
 
         if self.models.sarimax is None:
             raise RuntimeError("SARIMAX model not loaded.")
+
+    ############################################################
+    # NEW — CANDLE CLOSE GUARD
+    ############################################################
+
+    def _assert_candle_closed(self, df: pd.DataFrame):
+
+        last_ts = pd.to_datetime(df["date"].iloc[-1], utc=True)
+        now = pd.Timestamp.utcnow()
+
+        if (now - last_ts).total_seconds() < 3600:
+            raise RuntimeError(
+                "Latest candle may still be forming — refusing inference."
+            )
+
+    ############################################################
 
     def _validate_data_freshness(self, df: pd.DataFrame):
 
@@ -147,29 +178,41 @@ class InferencePipeline:
                 age_hours
             )
 
+    ############################################################
+    # HARD FEATURE EXTRACTION
+    ############################################################
+
     def _extract_features(self, latest_row):
 
-        vector = latest_row.loc[list(MODEL_FEATURES)]
+        df = pd.DataFrame(
+            [latest_row.loc[list(MODEL_FEATURES)].values],
+            columns=MODEL_FEATURES
+        )
 
-        null_ratio = float(np.isnan(vector).mean())
-        MISSING_FEATURE_RATIO.set(null_ratio)
+        df = validate_feature_schema(df)
 
-        if null_ratio > self.MAX_NULL_RATIO:
-            raise RuntimeError("Feature null ratio exceeded safe threshold.")
+        arr = df.to_numpy(dtype="float32")
 
-        arr = vector.astype("float32").values.reshape(1, -1)
-
-        if not np.isfinite(arr).all():
-            raise RuntimeError("Non-finite feature vector detected.")
+        if arr.shape[1] != len(MODEL_FEATURES):
+            raise RuntimeError("Feature width mismatch.")
 
         return arr
+
+    ############################################################
 
     def _safe_probability(self, prob):
 
         if not np.isfinite(prob):
             raise RuntimeError("Model produced invalid probability.")
 
-        return float(np.clip(prob, 0.0001, 0.9999))
+        prob = float(np.clip(prob, 0.0001, 0.9999))
+
+        if prob < 0.01 or prob > 0.99:
+            raise RuntimeError("Probability collapse detected.")
+
+        return prob
+
+    ############################################################
 
     def _safe_sentiment_fetch(self, ticker):
 
@@ -188,6 +231,10 @@ class InferencePipeline:
 
             return pd.DataFrame()
 
+    ############################################################
+    # MAIN RUN
+    ############################################################
+
     def run(self, ticker="AAPL"):
 
         MarketUniverse.validate_subset([ticker])
@@ -201,11 +248,47 @@ class InferencePipeline:
 
         try:
 
-            model_version = self.models._xgb_container.version
+            model_version = self.models.xgb_version
+
+            ####################################################
+            # DATA
+            ####################################################
+
+            price_df = self.market_data.get_price_data(
+                ticker=ticker,
+                start_date="2018-01-01",
+                end_date=pd.Timestamp.utcnow().date().isoformat()
+            )
+
+            self._validate_data_freshness(price_df)
+
+            sentiment_df = self._safe_sentiment_fetch(ticker)
+
+            dataset = self.feature_store.get_features(
+                price_df,
+                sentiment_df,
+                ticker=ticker
+            )
+
+            if dataset.empty:
+                raise RuntimeError("Feature pipeline returned empty dataset.")
+
+            validate_feature_schema(dataset.loc[:, MODEL_FEATURES])
+
+            self._assert_candle_closed(dataset)
+
+            ####################################################
+            # DATASET HASH FOR CACHE LINEAGE
+            ####################################################
+
+            dataset_hash = hashlib.sha256(
+                dataset.iloc[-1].to_json().encode()
+            ).hexdigest()[:12]
 
             payload = {
                 "ticker": ticker,
-                "model_version": model_version
+                "model_version": model_version,
+                "dataset": dataset_hash
             }
 
             cache_key = self.cache.build_key(payload)
@@ -234,48 +317,43 @@ class InferencePipeline:
 
             try:
 
-                self._deadline(start_pipeline)
-
-                price_df = self.market_data.get_price_data(
-                    ticker=ticker,
-                    start_date="2018-01-01",
-                    end_date=pd.Timestamp.utcnow().date().isoformat()
-                )
-
-                self._validate_data_freshness(price_df)
-
-                self._deadline(start_pipeline)
-
-                sentiment_df = self._safe_sentiment_fetch(ticker)
-
-                dataset = self.feature_store.get_features(
-                    price_df,
-                    sentiment_df,
-                    ticker=ticker
-                )
-
-                if dataset.empty:
-                    raise RuntimeError("Feature pipeline returned empty dataset.")
-
-                validate_feature_schema(dataset.loc[:, MODEL_FEATURES])
+                ################################################
+                # DRIFT
+                ################################################
 
                 try:
+
                     drift = self.drift_detector.detect(
                         dataset[MODEL_FEATURES]
                     )
 
-                    if drift["drift_detected"] and self.FAIL_ON_DRIFT:
-                        raise RuntimeError(
-                            "Drift detected — inference halted."
+                    if drift.get("drift_detected"):
+                        logger.warning(
+                            "Inference drift snapshot | ticker=%s | score=%.4f",
+                            ticker,
+                            drift.get("drift_score", -1)
                         )
+
+                        if self.FAIL_ON_DRIFT:
+                            raise RuntimeError(
+                                "Drift detected — inference halted."
+                            )
 
                 except Exception:
                     logger.exception(
                         "Drift detector failure — continuing inference."
                     )
 
+                ################################################
+                # FEATURE VECTOR
+                ################################################
+
                 latest = dataset.iloc[-1].copy()
                 features = self._extract_features(latest)
+
+                ################################################
+                # PREDICT
+                ################################################
 
                 t0 = time.time()
 
@@ -295,6 +373,10 @@ class InferencePipeline:
                 MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
 
                 PREDICTION_CLASS_PROBABILITY.set(prob_up)
+
+                ################################################
+                # DECISION ENGINE
+                ################################################
 
                 predicted_return = prob_up - 0.5
 
