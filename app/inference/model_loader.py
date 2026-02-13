@@ -3,6 +3,7 @@ import joblib
 import logging
 import threading
 import json
+import hashlib
 from dataclasses import dataclass
 
 from core.artifacts.model_registry import ModelRegistry
@@ -64,6 +65,20 @@ class ModelLoader:
         self._initialized = True
 
     ###################################################
+    # HASH
+    ###################################################
+
+    def _sha256(self, path):
+
+        h = hashlib.sha256()
+
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+
+        return h.hexdigest()
+
+    ###################################################
     # REGISTRY PATH SAFETY
     ###################################################
 
@@ -90,9 +105,19 @@ class ModelLoader:
 
         version = ModelRegistry.get_latest_version(base_dir)
 
+        if not version:
+            raise RuntimeError(
+                "No production model found in registry."
+            )
+
         ModelRegistry.verify_artifacts(base_dir, version)
 
-        version_dir = os.path.join(base_dir, version)
+        version_dir = os.path.realpath(
+            os.path.join(base_dir, version)
+        )
+
+        if not version_dir.startswith(base_dir):
+            raise RuntimeError("Registry path traversal detected.")
 
         manifest_path = os.path.join(
             version_dir,
@@ -132,6 +157,21 @@ class ModelLoader:
                 "Dataset lineage mismatch between metadata and manifest."
             )
 
+        if meta.get("training_code_hash") != manifest.get("training_code_hash"):
+            raise RuntimeError(
+                "Training code lineage mismatch."
+            )
+
+        if "training_universe" not in meta:
+            raise RuntimeError(
+                "Metadata missing training_universe."
+            )
+
+        if manifest.get("schema_signature") != meta.get("schema_signature"):
+            raise RuntimeError(
+                "Manifest and metadata schema mismatch."
+            )
+
         return meta
 
     ###################################################
@@ -148,12 +188,21 @@ class ModelLoader:
                 f"Artifact too small — likely corrupted: {path}"
             )
 
+        pre_hash = self._sha256(path)
+
         try:
             model = joblib.load(path)
         except Exception as exc:
             raise RuntimeError(
                 f"Artifact appears corrupted: {path}"
             ) from exc
+
+        post_hash = self._sha256(path)
+
+        if pre_hash != post_hash:
+            raise RuntimeError(
+                "Artifact changed during load — disk instability suspected."
+            )
 
         return model
 
@@ -183,7 +232,7 @@ class ModelLoader:
             if container and container.version == version:
                 return container.model
 
-            logger.warning(
+            logger.info(
                 "Loading XGBoost model version=%s",
                 version
             )
@@ -200,20 +249,25 @@ class ModelLoader:
                     "Loaded artifact missing predict_proba"
                 )
 
-            # behavior check
-            try:
-                import numpy as np
-                sample = np.zeros((1, len(MODEL_FEATURES)))
-                preds = model.predict_proba(sample)
+            import numpy as np
 
-                if preds.ndim != 2:
-                    raise RuntimeError(
-                        "predict_proba returned invalid shape."
-                    )
-            except Exception as e:
+            sample = np.zeros((4, len(MODEL_FEATURES)))
+            preds = model.predict_proba(sample)
+
+            if preds.shape[1] != 2:
                 raise RuntimeError(
-                    "Model failed inference sanity check."
-                ) from e
+                    "predict_proba must output 2-class probabilities."
+                )
+
+            if not np.isfinite(preds).all():
+                raise RuntimeError(
+                    "Model produced non-finite probabilities."
+                )
+
+            if np.std(preds) < 1e-6:
+                raise RuntimeError(
+                    "Model probabilities collapsed."
+                )
 
             new_container = LoadedModel(
                 model=model,
@@ -262,7 +316,7 @@ class ModelLoader:
             if container and container.version == version:
                 return container.model
 
-            logger.warning(
+            logger.info(
                 "Loading SARIMAX model version=%s",
                 version
             )
@@ -319,7 +373,6 @@ class ModelLoader:
 
         logger.info("Warming models")
 
-        # must fail hard if anything breaks
         _ = self.xgb
         _ = self.sarimax
 
