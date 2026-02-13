@@ -24,11 +24,15 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v9"
+    CACHE_VERSION = "v10"   # 🔥 bump after institutional hardening
     MAX_CACHE_FILES_PER_TICKER = 6
 
     MIN_ROWS_REQUIRED = 100
     MIN_FILE_BYTES = 5_000
+
+    # 🔴 NEW — institutional guards
+    ABS_FEATURE_LIMIT = 1e5
+    MIN_ROW_STABILITY_RATIO = 0.65
 
     ##################################################
 
@@ -84,7 +88,7 @@ class FeatureStore:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     ##################################################
-    # CANONICALIZE (STRICT)
+    # CANONICALIZE (STRICT + LEAK SAFE)
     ##################################################
 
     def _canonicalize_df(self, df: pd.DataFrame):
@@ -118,11 +122,16 @@ class FeatureStore:
                 errors="raise"
             ).astype("float64")
 
-        # CRITICAL — enforce deterministic ordering
-        df = df.sort_values(["ticker", "date"])
+        # deterministic ordering
+        if "ticker" in df.columns:
+            df = df.sort_values(["ticker", "date"])
+        else:
+            df = df.sort_values("date")
 
         return df.reset_index(drop=True)
 
+    ##################################################
+    # LEAK-SAFE HASH
     ##################################################
 
     def _dataset_hash(
@@ -135,6 +144,15 @@ class FeatureStore:
 
         price_df = self._canonicalize_df(price_df)
 
+        if sentiment_df is not None and not sentiment_df.empty:
+
+            sentiment_df = self._canonicalize_df(sentiment_df)
+
+            # 🔴 ALIGN FIRST — prevents future leakage poisoning cache
+            sentiment_df = sentiment_df[
+                sentiment_df["date"].isin(price_df["date"])
+            ]
+
         h.update(
             pd.util.hash_pandas_object(
                 price_df,
@@ -143,8 +161,6 @@ class FeatureStore:
         )
 
         if sentiment_df is not None and not sentiment_df.empty:
-
-            sentiment_df = self._canonicalize_df(sentiment_df)
 
             h.update(
                 pd.util.hash_pandas_object(
@@ -215,7 +231,7 @@ class FeatureStore:
                 logger.warning("Failed pruning cache file: %s", old)
 
     ##################################################
-    # VALIDATION
+    # STRUCTURE VALIDATION (HARD LOCK)
     ##################################################
 
     def _validate_dataset_structure(self, df: pd.DataFrame):
@@ -227,6 +243,15 @@ class FeatureStore:
                 f"Feature file missing required columns: {missing}"
             )
 
+        if not pd.api.types.is_datetime64_any_dtype(df["date"]):
+            raise RuntimeError("date column must be datetime.")
+
+        if not pd.api.types.is_float_dtype(df["close"]):
+            raise RuntimeError("close must be float.")
+
+        if df["ticker"].dtype != "object":
+            raise RuntimeError("ticker must be string.")
+
         if df["date"].duplicated().any():
             raise RuntimeError("Duplicate timestamps detected.")
 
@@ -234,10 +259,16 @@ class FeatureStore:
             raise RuntimeError("Non-monotonic timestamps detected.")
 
     ##################################################
-    # ATOMIC WRITE
+    # ATOMIC WRITE (INSTITUTIONAL)
     ##################################################
 
-    def _atomic_write(self, df: pd.DataFrame, path: str, dataset_hash: str, training: bool):
+    def _atomic_write(
+        self,
+        df: pd.DataFrame,
+        path: str,
+        dataset_hash: str,
+        training: bool
+    ):
 
         if len(df) < self.MIN_ROWS_REQUIRED:
             raise RuntimeError("Feature collapse detected.")
@@ -266,12 +297,21 @@ class FeatureStore:
 
         validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
-        if not np.isfinite(
-            df.loc[:, MODEL_FEATURES].to_numpy()
-        ).all():
+        arr = df.loc[:, MODEL_FEATURES].to_numpy()
+
+        if not np.isfinite(arr).all():
             raise RuntimeError("Non-finite feature values.")
 
-        df.to_parquet(tmp_path, index=False)
+        # 🔴 FEATURE EXPLOSION GUARD
+        if np.abs(arr).max() > self.ABS_FEATURE_LIMIT:
+            raise RuntimeError("Feature explosion detected.")
+
+        df.to_parquet(
+            tmp_path,
+            index=False,
+            engine="pyarrow",
+            compression="zstd"
+        )
 
         if os.name != "nt":
             fd = os.open(tmp_path, os.O_RDONLY)
@@ -328,6 +368,12 @@ class FeatureStore:
             validate_feature_schema(
                 df.loc[:, MODEL_FEATURES]
             )
+
+            # 🔴 DATASET COLLAPSE DETECTOR
+            if len(df) < self.MIN_ROWS_REQUIRED * self.MIN_ROW_STABILITY_RATIO:
+                logger.warning("Dataset collapse detected — rebuilding.")
+                os.remove(path)
+                return None
 
             return df.sort_values("date")
 
