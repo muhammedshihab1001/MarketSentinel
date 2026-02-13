@@ -5,16 +5,12 @@ import numpy as np
 class TechnicalIndicators:
     """
     Institutional technical indicator engine.
-
-    Guarantees:
-    ✔ provider-agnostic column handling
-    ✔ numeric stability
-    ✔ zero divide protection
-    ✔ deterministic output
-    ✔ float32 safe
     """
 
     REQUIRED_COLUMN = "close"
+
+    MAX_FORWARD_FILL = 2
+    STD_FLOOR = 1e-6
 
     ####################################################
     # COLUMN NORMALIZATION
@@ -22,6 +18,9 @@ class TechnicalIndicators:
 
     @staticmethod
     def _normalize_columns(df: pd.DataFrame):
+
+        if df is None or df.empty:
+            raise RuntimeError("Indicator received empty dataframe.")
 
         df = df.copy()
 
@@ -32,24 +31,39 @@ class TechnicalIndicators:
                 "TechnicalIndicators requires 'close' column."
             )
 
-        df["close"] = pd.to_numeric(
+        # enforce deterministic ordering if date exists
+        if "date" in df.columns:
+            df = df.sort_values("date")
+
+            if df["date"].duplicated().any():
+                raise RuntimeError("Duplicate timestamps detected.")
+
+        close = pd.to_numeric(
             df["close"],
             errors="coerce"
         )
 
-        if df["close"].isna().all():
+        if close.isna().all():
             raise RuntimeError("Close column fully NaN.")
 
-        df["close"].replace(
+        close.replace(
             [np.inf, -np.inf],
             np.nan,
             inplace=True
         )
 
-        df["close"].fillna(method="ffill", inplace=True)
+        # bounded forward fill only
+        close = close.ffill(limit=TechnicalIndicators.MAX_FORWARD_FILL)
 
-        if (df["close"] <= 0).any():
+        if close.isna().any():
+            raise RuntimeError(
+                "Close contains unresolved NaNs — refusing indicator calc."
+            )
+
+        if (close <= 0).any():
             raise RuntimeError("Invalid close prices detected.")
+
+        df["close"] = close.astype("float64")
 
         return df
 
@@ -70,7 +84,7 @@ class TechnicalIndicators:
         return ma.astype("float32")
 
     ####################################################
-    # RSI (INSTITUTIONAL SAFE)
+    # RSI — WILDER SMOOTHING (INSTITUTIONAL)
     ####################################################
 
     @classmethod
@@ -78,20 +92,23 @@ class TechnicalIndicators:
 
         df = cls._normalize_columns(df)
 
-        close = df["close"].astype("float64")
+        close = df["close"]
 
         delta = close.diff()
 
         gain = delta.clip(lower=0)
         loss = -delta.clip(upper=0)
 
-        avg_gain = gain.rolling(
-            window=window,
+        # Wilder smoothing via EMA
+        avg_gain = gain.ewm(
+            alpha=1/window,
+            adjust=False,
             min_periods=window
         ).mean()
 
-        avg_loss = loss.rolling(
-            window=window,
+        avg_loss = loss.ewm(
+            alpha=1/window,
+            adjust=False,
             min_periods=window
         ).mean()
 
@@ -99,18 +116,7 @@ class TechnicalIndicators:
 
         rsi = 100 - (100 / (1 + rs))
 
-        # Flat market → RSI 50
-        flat_mask = (avg_gain == 0) & (avg_loss == 0)
-        rsi.loc[flat_mask] = 50
-
-        # Only gains → RSI 100
-        gain_mask = (avg_gain > 0) & (avg_loss == 0)
-        rsi.loc[gain_mask] = 100
-
-        # Only losses → RSI 0
-        loss_mask = (avg_gain == 0) & (avg_loss > 0)
-        rsi.loc[loss_mask] = 0
-
+        # deterministic fills
         rsi.fillna(50, inplace=True)
 
         return rsi.clip(0, 100).astype("float32")
@@ -136,6 +142,8 @@ class TechnicalIndicators:
             min_periods=window
         ).std()
 
+        std = std.clip(lower=cls.STD_FLOOR)
+
         upper = ma + 2 * std
         lower = ma - 2 * std
 
@@ -153,13 +161,23 @@ class TechnicalIndicators:
 
         df = cls._normalize_columns(df)
 
-        close = df["close"].astype("float64")
+        close = df["close"]
 
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
 
         macd_line = ema12 - ema26
         signal = macd_line.ewm(span=9, adjust=False).mean()
+
+        macd_line = macd_line.replace(
+            [np.inf, -np.inf],
+            np.nan
+        ).fillna(0)
+
+        signal = signal.replace(
+            [np.inf, -np.inf],
+            np.nan
+        ).fillna(0)
 
         return (
             macd_line.astype("float32"),
