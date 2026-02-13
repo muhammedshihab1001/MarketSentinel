@@ -7,16 +7,6 @@ from core.indicators.technical_indicators import TechnicalIndicators
 class RiskEngine:
     """
     Institutional Portfolio Risk Engine.
-
-    Produces:
-        risk_score (0–1)
-
-    Guarantees:
-    ✔ crisis detection
-    ✔ tail-risk awareness
-    ✔ regime throttling
-    ✔ numeric safety
-    ✔ deterministic output
     """
 
     VOL_LOOKBACK = 20
@@ -29,12 +19,61 @@ class RiskEngine:
     RSI_OVERSOLD = 30
 
     TAIL_RETURN = 0.06
+    TAIL_NORMALIZER = 5
+
+    MIN_ROWS = 80
+    EPSILON = 1e-8
 
     ##############################################
 
     @staticmethod
     def _clip01(x):
         return float(np.clip(x, 0, 1))
+
+    ##############################################
+    # INPUT VALIDATION
+    ##############################################
+
+    @classmethod
+    def _validate_df(cls, df):
+
+        if df is None or df.empty:
+            raise RuntimeError("RiskEngine received empty dataframe.")
+
+        if "close" not in df.columns:
+            raise RuntimeError("RiskEngine requires 'close' column.")
+
+        close = pd.to_numeric(df["close"], errors="coerce")
+
+        if close.isna().any():
+            raise RuntimeError("Non-numeric close prices detected.")
+
+        if not np.isfinite(close).all():
+            raise RuntimeError("Non-finite prices detected.")
+
+        if (close <= 0).any():
+            raise RuntimeError("Non-positive prices detected.")
+
+        if len(df) < cls.MIN_ROWS:
+            raise RuntimeError("Insufficient data for risk computation.")
+
+    ##############################################
+    # SAFE INDICATOR CALL
+    ##############################################
+
+    @staticmethod
+    def _safe_indicator(func, default=0.5):
+
+        try:
+            val = func()
+
+            if val is None or not np.isfinite(val):
+                return default
+
+            return float(val)
+
+        except Exception:
+            return default
 
     ##############################################
     # VOLATILITY
@@ -58,7 +97,7 @@ class RiskEngine:
         return cls._clip01(latest / cls.MAX_VOL)
 
     ##############################################
-    # TAIL RISK (⭐ VERY IMPORTANT)
+    # TAIL RISK
     ##############################################
 
     @classmethod
@@ -73,7 +112,7 @@ class RiskEngine:
             np.abs(returns.tail(20)) > cls.TAIL_RETURN
         )
 
-        return cls._clip01(extreme_moves / 5)
+        return cls._clip01(extreme_moves / cls.TAIL_NORMALIZER)
 
     ##############################################
     # RSI
@@ -82,10 +121,10 @@ class RiskEngine:
     @classmethod
     def rsi_risk(cls, df, signal):
 
-        rsi = TechnicalIndicators.rsi(df).iloc[-1]
+        def compute():
+            return TechnicalIndicators.rsi(df).iloc[-1]
 
-        if not np.isfinite(rsi):
-            return 0.5
+        rsi = cls._safe_indicator(compute)
 
         if signal == "BUY":
 
@@ -101,14 +140,14 @@ class RiskEngine:
     # TREND
     ##############################################
 
-    @staticmethod
-    def trend_risk(df, signal):
+    @classmethod
+    def trend_risk(cls, df, signal):
 
-        ma20 = TechnicalIndicators.moving_average(df, 20).iloc[-1]
-        price = df["close"].iloc[-1]
+        def ma():
+            return TechnicalIndicators.moving_average(df, 20).iloc[-1]
 
-        if not np.isfinite(ma20):
-            return 0.5
+        ma20 = cls._safe_indicator(ma)
+        price = float(df["close"].iloc[-1])
 
         if signal == "BUY" and price < ma20:
             return 0.75
@@ -119,36 +158,43 @@ class RiskEngine:
     # BOLLINGER
     ##############################################
 
-    @staticmethod
-    def bollinger_risk(df, signal):
+    @classmethod
+    def bollinger_risk(cls, df, signal):
 
-        upper, lower = TechnicalIndicators.bollinger_bands(df)
+        try:
+            upper, lower = TechnicalIndicators.bollinger_bands(df)
 
-        upper = upper.iloc[-1]
-        lower = lower.iloc[-1]
-        price = df["close"].iloc[-1]
+            upper = upper.iloc[-1]
+            lower = lower.iloc[-1]
+            price = df["close"].iloc[-1]
 
-        if not np.isfinite(upper) or not np.isfinite(lower):
+            if not np.isfinite(upper) or not np.isfinite(lower):
+                return 0.5
+
+            width = max(upper - lower, cls.EPSILON)
+
+            stretch = (
+                (price - lower) / width
+                if signal == "BUY"
+                else (upper - price) / width
+            )
+
+            return cls._clip01(stretch)
+
+        except Exception:
             return 0.5
 
-        width = upper - lower + 1e-9
-
-        stretch = (
-            (price - lower) / width
-            if signal == "BUY"
-            else (upper - price) / width
-        )
-
-        return float(np.clip(stretch, 0, 1))
-
     ##############################################
-    # REGIME DETECTOR (⭐ MAJOR UPGRADE)
+    # REGIME DETECTOR
     ##############################################
 
     @classmethod
     def regime_risk(cls, df):
 
-        returns = df["close"].pct_change()
+        returns = df["close"].pct_change().dropna()
+
+        if len(returns) < cls.REGIME_LOOKBACK:
+            return 0.5, "UNKNOWN"
 
         vol = returns.tail(cls.REGIME_LOOKBACK).std()
 
@@ -164,7 +210,7 @@ class RiskEngine:
         ma50 = df["close"].rolling(50).mean().iloc[-1]
         price = df["close"].iloc[-1]
 
-        if price < ma50:
+        if np.isfinite(ma50) and price < ma50:
             return 0.65, "BEAR"
 
         return 0.25, "NORMAL"
@@ -176,11 +222,13 @@ class RiskEngine:
     @classmethod
     def analyze(cls, df: pd.DataFrame, signal: str):
 
+        cls._validate_df(df)
+
         if signal == "HOLD":
             return {
                 "risk_score": 0.0,
                 "risk_pct": "0%",
-                "regime": "NONE",
+                "regime": "IDLE",
                 "components": {}
             }
 
@@ -191,10 +239,6 @@ class RiskEngine:
         bb = cls.bollinger_risk(df, signal)
 
         regime_score, regime = cls.regime_risk(df)
-
-        ##############################################
-        # DYNAMIC WEIGHTING
-        ##############################################
 
         if regime == "CRISIS":
 
