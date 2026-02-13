@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 
 from core.artifacts.model_registry import ModelRegistry
+from core.artifacts.metadata_manager import MetadataManager
 from core.schema.feature_schema import (
     get_schema_signature,
     MODEL_FEATURES
@@ -20,10 +21,6 @@ from app.monitoring.metrics import MODEL_VERSION
 logger = logging.getLogger("marketsentinel.loader")
 
 
-###################################################
-# IMMUTABLE CONTAINER
-###################################################
-
 @dataclass(frozen=True)
 class LoadedModel:
     model: object
@@ -36,7 +33,7 @@ class ModelLoader:
     _instance = None
     _instance_lock = threading.Lock()
 
-    MIN_ARTIFACT_BYTES = 50_000  # prevents zero-byte / truncated loads
+    MIN_ARTIFACT_BYTES = 50_000
 
     ###################################################
 
@@ -70,12 +67,18 @@ class ModelLoader:
     # REGISTRY PATH SAFETY
     ###################################################
 
-    def _validate_registry_path(self, base_dir):
+    def _resolve_registry_path(self, base_dir):
+
+        base_dir = os.path.realpath(
+            os.path.abspath(base_dir)
+        )
 
         if not os.path.exists(base_dir):
             raise RuntimeError(
                 f"Registry path does not exist: {base_dir}"
             )
+
+        return base_dir
 
     ###################################################
     # REGISTRY RESOLUTION
@@ -83,7 +86,7 @@ class ModelLoader:
 
     def _resolve_latest_verified(self, base_dir: str):
 
-        self._validate_registry_path(base_dir)
+        base_dir = self._resolve_registry_path(base_dir)
 
         version = ModelRegistry.get_latest_version(base_dir)
 
@@ -99,6 +102,11 @@ class ModelLoader:
         with open(manifest_path) as f:
             manifest = json.load(f)
 
+        if manifest.get("stage") != "production":
+            raise RuntimeError(
+                f"Refusing to load non-production model: {version}"
+            )
+
         return version, version_dir, manifest
 
     ###################################################
@@ -107,8 +115,7 @@ class ModelLoader:
 
     def _validate_metadata(self, metadata_path: str, manifest: dict):
 
-        with open(metadata_path) as f:
-            meta = json.load(f)
+        meta = MetadataManager.load_metadata(metadata_path)
 
         if meta.get("schema_signature") != get_schema_signature():
             raise RuntimeError(
@@ -124,9 +131,6 @@ class ModelLoader:
             raise RuntimeError(
                 "Dataset lineage mismatch between metadata and manifest."
             )
-
-        if "training_code_hash" not in meta:
-            raise RuntimeError("Training lineage missing.")
 
         return meta
 
@@ -161,7 +165,7 @@ class ModelLoader:
 
         base_dir = os.getenv(
             "XGB_REGISTRY_DIR",
-            "artifacts/xgboost"
+            os.path.abspath("artifacts/xgboost")
         )
 
         version, version_dir, manifest = \
@@ -196,19 +200,39 @@ class ModelLoader:
                     "Loaded artifact missing predict_proba"
                 )
 
+            # behavior check
+            try:
+                import numpy as np
+                sample = np.zeros((1, len(MODEL_FEATURES)))
+                preds = model.predict_proba(sample)
+
+                if preds.ndim != 2:
+                    raise RuntimeError(
+                        "predict_proba returned invalid shape."
+                    )
+            except Exception as e:
+                raise RuntimeError(
+                    "Model failed inference sanity check."
+                ) from e
+
             new_container = LoadedModel(
                 model=model,
                 version=version,
                 dataset_hash=meta["dataset_hash"]
             )
 
-            # ATOMIC SWAP
             self._xgb_container = new_container
 
             MODEL_VERSION.labels(
                 model="xgboost",
                 version=version
             ).set(1)
+
+        logger.info(
+            "Loaded XGBoost | version=%s | dataset=%s",
+            version,
+            meta["dataset_hash"][:10]
+        )
 
         return self._xgb_container.model
 
@@ -220,7 +244,7 @@ class ModelLoader:
 
         base_dir = os.getenv(
             "SARIMAX_REGISTRY_DIR",
-            "artifacts/sarimax"
+            os.path.abspath("artifacts/sarimax")
         )
 
         version, version_dir, manifest = \
@@ -295,6 +319,7 @@ class ModelLoader:
 
         logger.info("Warming models")
 
+        # must fail hard if anything breaks
         _ = self.xgb
         _ = self.sarimax
 
