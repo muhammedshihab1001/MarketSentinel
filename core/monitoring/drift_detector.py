@@ -57,6 +57,20 @@ class DriftDetector:
         ).lower() == "true"
 
     ########################################################
+    # PATH SAFETY
+    ########################################################
+
+    def _safe_baseline_path(self):
+
+        base = os.path.realpath("artifacts/drift")
+        path = os.path.realpath(self.BASELINE_PATH)
+
+        if not path.startswith(base):
+            raise RuntimeError("Baseline path traversal detected.")
+
+        return path
+
+    ########################################################
     # PSI
     ########################################################
 
@@ -67,6 +81,11 @@ class DriftDetector:
 
         breakpoints = np.linspace(0, 100, bins + 1)
         quantiles = np.percentile(expected, breakpoints)
+
+        quantiles = np.unique(quantiles)
+
+        if len(quantiles) < 2:
+            return 0.0
 
         expected_counts = np.histogram(expected, bins=quantiles)[0]
         actual_counts = np.histogram(actual, bins=quantiles)[0]
@@ -105,25 +124,37 @@ class DriftDetector:
 
     def _load_verified_baseline(self):
 
-        if not os.path.exists(self.BASELINE_PATH):
+        path = self._safe_baseline_path()
+
+        if not os.path.exists(path):
             raise RuntimeError("Baseline missing.")
 
-        with open(self.BASELINE_PATH) as f:
+        with open(path) as f:
             baseline = json.load(f)
+
+        required_top = {"features", "meta", "integrity_hash"}
+
+        if not required_top.issubset(baseline.keys()):
+            raise RuntimeError("Baseline structure invalid.")
 
         if baseline["integrity_hash"] != self._baseline_hash(baseline):
             raise RuntimeError("Baseline integrity failure.")
 
-        if baseline["meta"]["baseline_version"] != self.BASELINE_VERSION:
+        meta = baseline["meta"]
+
+        if meta["baseline_version"] != self.BASELINE_VERSION:
             raise RuntimeError("Baseline version mismatch.")
 
-        if baseline["meta"]["schema_signature"] != get_schema_signature():
+        if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Baseline schema mismatch.")
+
+        if not baseline["features"]:
+            raise RuntimeError("Baseline features empty.")
 
         return baseline
 
     ########################################################
-    # ACTIVE MODEL LINEAGE CHECK (UPGRADED)
+    # ACTIVE MODEL LINEAGE CHECK
     ########################################################
 
     def _validate_against_active_model(self, baseline):
@@ -139,20 +170,14 @@ class DriftDetector:
                 "Baseline dataset mismatch with active model."
             )
 
-        if container.schema_signature != get_schema_signature():
-            raise RuntimeError("Active schema mismatch.")
-
     ########################################################
     # SAFE FEATURE BLOCK
     ########################################################
 
     def _safe_feature_block(self, dataset: pd.DataFrame):
 
-        incoming = set(dataset.columns)
-        expected = set(MODEL_FEATURES)
-
-        if incoming != expected:
-            raise RuntimeError("Feature contract violated.")
+        if list(dataset.columns) != list(MODEL_FEATURES):
+            raise RuntimeError("Feature ordering violated.")
 
         block = dataset.loc[:, MODEL_FEATURES].copy()
 
@@ -194,6 +219,7 @@ class DriftDetector:
             drift_detected = False
             report = {}
 
+            total_features = len(baseline["features"])
             active_features = 0
 
             for col, stats in baseline["features"].items():
@@ -205,13 +231,13 @@ class DriftDetector:
 
                 active_features += 1
 
-                z_score = abs(current.mean() - stats["mean"]) / max(
-                    stats["std"], self.EPSILON
-                )
+                baseline_std = max(stats["std"], self.EPSILON)
+                baseline_var = max(stats["variance"], self.EPSILON)
+                current_var = max(current.var(), self.EPSILON)
 
-                variance_ratio = current.var() / max(
-                    stats["variance"], self.EPSILON
-                )
+                z_score = abs(current.mean() - stats["mean"]) / baseline_std
+
+                variance_ratio = current_var / baseline_var
 
                 psi = self._psi(
                     stats["distribution"],
@@ -235,7 +261,7 @@ class DriftDetector:
                     "drift": drift
                 }
 
-            coverage = active_features / len(baseline["features"])
+            coverage = active_features / max(total_features, 1)
 
             if coverage < self.MIN_ACTIVE_FEATURE_RATIO:
                 raise RuntimeError(
