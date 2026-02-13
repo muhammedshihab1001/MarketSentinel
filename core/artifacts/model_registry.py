@@ -33,6 +33,9 @@ class ModelRegistry:
     @staticmethod
     def _sha256(path: str):
 
+        if os.path.islink(path):
+            raise RuntimeError("Symlinked artifact detected.")
+
         h = hashlib.sha256()
 
         with open(path, "rb") as f:
@@ -130,27 +133,18 @@ class ModelRegistry:
 
         tmp = path + ".tmp"
 
-        try:
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=4, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
 
-            with open(tmp, "w") as f:
-                json.dump(payload, f, indent=4, sort_keys=True)
-                f.flush()
-                os.fsync(f.fileno())
+        os.replace(tmp, path)
 
-            os.replace(tmp, path)
-
-            parent = os.path.dirname(path) or "."
-            ModelRegistry._fsync_dir(parent)
-
-        finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
+        parent = os.path.dirname(path) or "."
+        ModelRegistry._fsync_dir(parent)
 
     ########################################################
-    # PROMOTION LOCK
+    # ATOMIC PROMOTION LOCK
     ########################################################
 
     @staticmethod
@@ -158,7 +152,19 @@ class ModelRegistry:
 
         lock_path = os.path.join(base_dir, ModelRegistry.PROMOTION_LOCK)
 
-        if os.path.exists(lock_path):
+        try:
+
+            fd = os.open(
+                lock_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            )
+
+            with os.fdopen(fd, "w") as f:
+                f.write(str(os.getpid()))
+
+            return lock_path
+
+        except FileExistsError:
 
             age = time.time() - os.path.getmtime(lock_path)
 
@@ -166,11 +172,7 @@ class ModelRegistry:
                 raise RuntimeError("Registry promotion locked.")
 
             os.remove(lock_path)
-
-        with open(lock_path, "w") as f:
-            f.write(str(os.getpid()))
-
-        return lock_path
+            return ModelRegistry._acquire_lock(base_dir)
 
     ########################################################
 
@@ -207,9 +209,15 @@ class ModelRegistry:
         ):
             raise RuntimeError("Manifest integrity failure.")
 
+        if manifest.get("stage") not in ("candidate", "production"):
+            raise RuntimeError("Invalid manifest stage.")
+
         for artifact, expected_hash in manifest["artifacts"].items():
 
             artifact_path = os.path.join(version_dir, artifact)
+
+            if os.path.islink(artifact_path):
+                raise RuntimeError("Symlinked artifact detected.")
 
             if not os.path.exists(artifact_path):
                 raise RuntimeError(f"Artifact missing: {artifact}")
@@ -250,11 +258,6 @@ class ModelRegistry:
         version_dir = ModelRegistry._safe_join(base_dir, version)
         staging_dir = version_dir + ".staging"
 
-        if os.path.exists(staging_dir):
-            raise RuntimeError(
-                "Staging directory already exists — possible prior crash."
-            )
-
         os.makedirs(staging_dir, exist_ok=False)
 
         try:
@@ -265,17 +268,16 @@ class ModelRegistry:
             staged_model = os.path.join(staging_dir, model_name)
             staged_meta = os.path.join(staging_dir, metadata_name)
 
-            if os.path.getsize(model_path) < ModelRegistry.MIN_ARTIFACT_BYTES:
-                raise RuntimeError("Source model artifact too small.")
-
             shutil.copy2(model_path, staged_model)
             shutil.copy2(metadata_path, staged_meta)
 
             if ModelRegistry._sha256(model_path) != \
                ModelRegistry._sha256(staged_model):
-                raise RuntimeError(
-                    "Model hash mismatch after copy."
-                )
+                raise RuntimeError("Model hash mismatch after copy.")
+
+            if ModelRegistry._sha256(metadata_path) != \
+               ModelRegistry._sha256(staged_meta):
+                raise RuntimeError("Metadata hash mismatch after copy.")
 
             manifest: Dict[str, Any] = {
 
@@ -392,7 +394,7 @@ class ModelRegistry:
             ModelRegistry._release_lock(lock)
 
     ########################################################
-    # LOAD LATEST
+    # LOAD LATEST (VERIFIED)
     ########################################################
 
     @staticmethod
@@ -406,4 +408,8 @@ class ModelRegistry:
         with open(pointer) as f:
             payload = json.load(f)
 
-        return payload["version"]
+        version = payload["version"]
+
+        ModelRegistry.verify_artifacts(base_dir, version)
+
+        return version
