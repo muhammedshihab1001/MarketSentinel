@@ -17,8 +17,10 @@ class WalkForwardValidator:
     MIN_WINDOWS = 6
     MIN_ASSETS_PER_DAY = 3
     MIN_FEATURE_VARIANCE = 1e-8
+    MAX_TURNOVER = 0.65
+    MAX_CAPITAL_MULTIPLE = 50
 
-    MAX_TURNOVER = 0.65   # ⭐ institutional threshold
+    VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
 
     def __init__(
         self,
@@ -39,7 +41,17 @@ class WalkForwardValidator:
         self.regime_detector = MarketRegimeDetector()
 
     ############################################
-    # TRAIN VALIDATION
+
+    def _assert_monotonic(self, df):
+
+        grouped = df.sort_values("date").groupby("ticker")
+
+        for ticker, g in grouped:
+            if not g["date"].is_monotonic_increasing:
+                raise RuntimeError(
+                    f"Non-monotonic dates detected for {ticker}"
+                )
+
     ############################################
 
     def _validate_training_frame(self, df):
@@ -66,8 +78,6 @@ class WalkForwardValidator:
             )
 
     ############################################
-    # MODEL CHECK
-    ############################################
 
     def _sanity_check_model(self, model, sample_df):
 
@@ -75,16 +85,36 @@ class WalkForwardValidator:
             raise RuntimeError("Classifier required.")
 
         X = sample_df.loc[:, MODEL_FEATURES].iloc[:50]
-        preds = model.predict_proba(X)[:, 1]
 
-        if not np.isfinite(preds).all():
+        preds = model.predict_proba(X)
+
+        if preds.ndim != 2 or preds.shape[1] < 2:
+            raise RuntimeError("Invalid predict_proba shape.")
+
+        probs = preds[:, 1]
+
+        if not np.isfinite(probs).all():
             raise RuntimeError("Non-finite predictions.")
 
-        if np.std(preds) < 5e-5:
+        if np.std(probs) < 5e-5:
             raise RuntimeError("Model collapsed.")
 
     ############################################
-    # TURNOVER
+
+    def _validate_signals(self, signals):
+
+        invalid = set(signals.values()) - self.VALID_SIGNALS
+
+        if invalid:
+            raise RuntimeError(
+                f"Invalid signal values detected: {invalid}"
+            )
+
+        if all(s == "HOLD" for s in signals.values()):
+            raise RuntimeError(
+                "Degenerate strategy — all HOLD signals."
+            )
+
     ############################################
 
     def _calculate_turnover(self, grouped_signals):
@@ -102,7 +132,6 @@ class WalkForwardValidator:
                 shared = set(previous) & set(current)
 
                 for t in shared:
-
                     if previous[t] != current[t]:
                         flips += 1
 
@@ -116,12 +145,15 @@ class WalkForwardValidator:
         return flips / total
 
     ############################################
-    # RUN
-    ############################################
 
     def run(self, df: pd.DataFrame):
 
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+        self._assert_monotonic(df)
+
+        # compute regime ONCE → leak safe
+        df = self.regime_detector.detect(df)
 
         unique_dates = pd.to_datetime(
             df["date"].drop_duplicates()
@@ -135,6 +167,8 @@ class WalkForwardValidator:
         sharpe_series = []
 
         capital = 10_000.0
+        initial_capital = capital
+
         start_idx = self.window_size
 
         while start_idx < len(unique_dates) - 1:
@@ -162,7 +196,7 @@ class WalkForwardValidator:
 
             train_df = df.loc[
                 (df["date"] >= train_dates.iloc[0]) &
-                (df["date"] < train_dates.iloc[-1])
+                (df["date"] <= train_dates.iloc[-1])
             ].copy()
 
             test_df = df.loc[
@@ -170,14 +204,8 @@ class WalkForwardValidator:
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
-            ################################################
-            # ⭐ REGIME DETECTION INSIDE WINDOW (LEAK SAFE)
-            ################################################
-
-            train_df = self.regime_detector.detect(train_df)
-            test_df = self.regime_detector.detect(test_df)
-
             self._validate_training_frame(train_df)
+            validate_feature_schema(test_df.loc[:, MODEL_FEATURES])
 
             model = self.model_trainer(train_df)
             self._sanity_check_model(model, train_df)
@@ -211,6 +239,8 @@ class WalkForwardValidator:
                     zip(signal_slice["ticker"], signals_list)
                 )
 
+                self._validate_signals(signals)
+
                 shared = set(prices) & set(signals)
 
                 if len(shared) < self.MIN_ASSETS_PER_DAY:
@@ -231,10 +261,6 @@ class WalkForwardValidator:
                 start_idx += self.step_size
                 continue
 
-            ############################################
-            # TURNOVER CHECK
-            ############################################
-
             turnover = self._calculate_turnover(grouped_signals)
 
             if turnover > self.MAX_TURNOVER:
@@ -249,10 +275,17 @@ class WalkForwardValidator:
 
             capital = float(metrics["final_portfolio"])
 
-            if not np.isfinite(capital) or capital <= 0:
-                raise RuntimeError("Capital corrupted.")
+            if (
+                not np.isfinite(capital) or
+                capital <= 0 or
+                capital > initial_capital * self.MAX_CAPITAL_MULTIPLE
+            ):
+                raise RuntimeError("Capital trajectory unrealistic.")
 
             curve = np.array(metrics["equity_curve"], dtype=float)
+
+            if not np.isfinite(curve).all():
+                raise RuntimeError("Equity curve corrupted.")
 
             if equity_curve:
                 equity_curve.extend(curve[1:].tolist())
@@ -269,10 +302,6 @@ class WalkForwardValidator:
                 "Walk-forward produced insufficient windows."
             )
 
-        ############################################
-        # STABILITY TEST (VERY IMPORTANT)
-        ############################################
-
         sharpe_std = np.std(sharpe_series)
 
         if sharpe_std > 1.2:
@@ -283,13 +312,14 @@ class WalkForwardValidator:
         return self.aggregate_results(results, equity_curve)
 
     ############################################
-    # AGGREGATION
-    ############################################
 
     def aggregate_results(self, results, equity_curve):
 
         df = pd.DataFrame(results)
         curve = np.array(equity_curve, dtype=float)
+
+        if not np.isfinite(curve).all():
+            raise RuntimeError("Equity curve corrupted.")
 
         peak = np.maximum.accumulate(curve)
         drawdowns = (curve - peak) / peak
