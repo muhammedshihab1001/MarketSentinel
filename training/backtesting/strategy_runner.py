@@ -6,6 +6,11 @@ from core.sentiment.sentiment import SentimentAnalyzer
 from core.data.news_fetcher import NewsFetcher
 from core.signals.signal_engine import DecisionEngine
 
+from core.schema.feature_schema import (
+    validate_feature_schema,
+    MODEL_FEATURES
+)
+
 from training.backtesting.backtest_engine import BacktestEngine
 
 
@@ -14,10 +19,11 @@ class StrategyRunner:
     Institutional strategy orchestration layer.
 
     Guarantees:
-    ✅ Backtest uses SAME pipeline as inference
-    ✅ Eliminates training/inference drift
-    ✅ Prevents lookahead bias
-    ✅ Enables reproducible research
+    ✔ zero lookahead
+    ✔ schema-locked
+    ✔ neutral sentiment fallback
+    ✔ deterministic signals
+    ✔ no engine state carryover
     """
 
     def __init__(self):
@@ -26,8 +32,6 @@ class StrategyRunner:
         self.feature_store = FeatureStore()
         self.sentiment = SentimentAnalyzer()
         self.news_fetcher = NewsFetcher()
-        self.decision_engine = DecisionEngine()
-        self.engine = BacktestEngine()
 
     # ---------------------------------------------------
 
@@ -38,13 +42,10 @@ class StrategyRunner:
         start_date: str,
         end_date: str
     ):
-        """
-        Runs a TRUE model-driven backtest.
-        """
 
-        # ---------------------------------------
-        # FETCH DATA (IDENTICAL TO INFERENCE)
-        # ---------------------------------------
+        ############################################
+        # FETCH PRICE
+        ############################################
 
         price_df = self.market_data.get_price_data(
             ticker=ticker,
@@ -52,57 +53,98 @@ class StrategyRunner:
             end_date=end_date
         )
 
-        news_df = self.news_fetcher.fetch(
-            f"{ticker} stock",
-            max_items=200
-        )
+        ############################################
+        # NEWS — NEVER BLOCK
+        ############################################
 
-        scored = self.sentiment.analyze_dataframe(news_df)
-        sentiment_df = self.sentiment.aggregate_daily_sentiment(scored)
+        sentiment_df = None
+
+        try:
+
+            news_df = self.news_fetcher.fetch(
+                f"{ticker} stock",
+                max_items=200
+            )
+
+            if news_df is not None and not news_df.empty:
+
+                scored = self.sentiment.analyze_dataframe(news_df)
+                sentiment_df = self.sentiment.aggregate_daily_sentiment(scored)
+
+        except Exception:
+            pass  # FeatureEngineer handles neutral fallback
+
+        ############################################
+        # FEATURES
+        ############################################
 
         dataset = self.feature_store.get_features(
             price_df,
-            sentiment_df
+            sentiment_df,
+            ticker=ticker,
+            training=True
         )
 
         if dataset.empty:
-            raise ValueError("Feature pipeline returned empty dataset")
+            raise RuntimeError("Feature pipeline returned empty dataset")
 
-        # ---------------------------------------
-        # MODEL-DRIVEN SIGNAL GENERATION
-        # ---------------------------------------
+        ############################################
+        # SCHEMA LOCK
+        ############################################
+
+        validate_feature_schema(dataset.loc[:, MODEL_FEATURES])
+
+        ############################################
+        # STRICT NO LOOKAHEAD
+        ############################################
+
+        dataset = dataset.sort_values("date").reset_index(drop=True)
+
+        features = dataset.loc[:, MODEL_FEATURES].to_numpy(dtype=np.float32)
+
+        probs = model.predict_proba(features)[:, 1]
+
+        # SHIFT SIGNALS → trade next bar
+        probs = np.roll(probs, 1)
+        probs[0] = 0.5
+
+        ############################################
+        # FRESH ENGINES (NO STATE LEAK)
+        ############################################
+
+        decision_engine = DecisionEngine()
+        backtest_engine = BacktestEngine()
 
         signals = []
 
-        feature_cols = model.feature_names_in_
+        for i in range(len(dataset)):
 
-        for _, row in dataset.iterrows():
+            row = dataset.iloc[i]
 
-            features = row[feature_cols].values.reshape(1, -1)
-
-            prob_up = model.predict_proba(features)[0][1]
+            prob_up = float(probs[i])
 
             predicted_return = prob_up - 0.5
 
-            signal, _ = self.decision_engine.generate(
+            signal_dict = decision_engine.generate(
                 predicted_return=predicted_return,
-                sentiment=row["avg_sentiment"],
-                rsi=row["rsi"],
+                sentiment=float(row["avg_sentiment"]),
+                rsi=float(row["rsi"]),
                 prob_up=prob_up,
-                volatility=row["volatility"],
-                lstm_prices=np.array([row["close"]]),  # placeholder
-                prophet_trend="NEUTRAL"
+                volatility=float(row["volatility"]),
+                lstm_prices=np.array([row["close"]]),
+                macro_trend="NEUTRAL",
+                regime=None
             )
 
-            signals.append(signal)
+            signals.append(signal_dict["signal"])
 
-        prices = dataset["close"].values
+        prices = dataset["close"].to_numpy(dtype=float)
 
-        # ---------------------------------------
-        # RUN BACKTEST
-        # ---------------------------------------
+        ############################################
+        # BACKTEST
+        ############################################
 
-        results = self.engine.run(
+        results = backtest_engine.run(
             prices=prices,
             signals=signals
         )
