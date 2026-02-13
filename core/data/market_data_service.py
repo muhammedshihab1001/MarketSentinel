@@ -7,7 +7,7 @@ import numpy as np
 import hashlib
 import re
 
-from core.data.data_fetcher import StockPriceFetcher
+from core.data.providers.market.router import MarketProviderRouter
 
 
 logger = logging.getLogger("marketsentinel.market_data")
@@ -47,7 +47,7 @@ class MarketDataService:
 
     def __init__(self):
         self.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self._fetcher = StockPriceFetcher()
+        self._fetcher = MarketProviderRouter()
 
         self.SCHEMA_HASH = hashlib.sha256(
             ",".join(sorted(self.REQUIRED_COLUMNS)).encode()
