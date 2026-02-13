@@ -17,6 +17,7 @@ class ModelRegistry:
     PROMOTION_LOCK = ".promotion.lock"
 
     LOCK_TIMEOUT_SECONDS = 600
+    MIN_ARTIFACT_BYTES = 50_000
 
     ########################################################
 
@@ -53,6 +54,41 @@ class ModelRegistry:
             os.fsync(fd)
         finally:
             os.close(fd)
+
+    ########################################################
+
+    @staticmethod
+    def _safe_join(base, *paths):
+
+        base_real = os.path.realpath(base)
+        target = os.path.realpath(os.path.join(base, *paths))
+
+        if not target.startswith(base_real):
+            raise RuntimeError("Path traversal detected in registry.")
+
+        return target
+
+    ########################################################
+
+    @staticmethod
+    def _validate_metadata_structure(meta: dict):
+
+        if meta.get("schema_signature") != get_schema_signature():
+            raise RuntimeError(
+                "Metadata schema does not match runtime schema."
+            )
+
+        universe = meta.get("training_universe")
+
+        if not isinstance(universe, dict):
+            raise RuntimeError("Metadata missing structured training_universe.")
+
+        required = {"universe_hash", "tickers", "universe_size"}
+
+        if not required.issubset(universe.keys()):
+            raise RuntimeError(
+                "training_universe missing required fields."
+            )
 
     ########################################################
 
@@ -117,7 +153,7 @@ class ModelRegistry:
     @staticmethod
     def _validate_parent(base_dir: str, parent_version: str, meta: dict):
 
-        parent_manifest_path = os.path.join(
+        parent_manifest_path = ModelRegistry._safe_join(
             base_dir,
             parent_version,
             ModelRegistry.MANIFEST_NAME
@@ -130,22 +166,21 @@ class ModelRegistry:
             parent = json.load(f)
 
         if parent["schema_signature"] != meta["schema_signature"]:
-            raise RuntimeError(
-                "Parent schema mismatch detected."
-            )
+            raise RuntimeError("Parent schema mismatch detected.")
+
+        if parent.get("training_code_hash") != meta["training_code_hash"]:
+            raise RuntimeError("Parent training code mismatch.")
 
         if parent.get("universe_hash") != \
            meta["training_universe"]["universe_hash"]:
-            raise RuntimeError(
-                "Parent universe mismatch detected."
-            )
+            raise RuntimeError("Parent universe mismatch detected.")
 
     ########################################################
 
     @staticmethod
     def verify_artifacts(base_dir: str, version: str):
 
-        version_dir = os.path.join(base_dir, version)
+        version_dir = ModelRegistry._safe_join(base_dir, version)
 
         manifest_path = os.path.join(
             version_dir,
@@ -170,6 +205,11 @@ class ModelRegistry:
             if not os.path.exists(artifact_path):
                 raise RuntimeError(f"Artifact missing: {artifact}")
 
+            if os.path.getsize(artifact_path) < ModelRegistry.MIN_ARTIFACT_BYTES:
+                raise RuntimeError(
+                    f"Artifact too small — likely corrupted: {artifact}"
+                )
+
             actual = ModelRegistry._sha256(artifact_path)
 
             if actual != expected_hash:
@@ -187,9 +227,12 @@ class ModelRegistry:
         parent_version: str | None = None
     ) -> str:
 
+        base_dir = os.path.realpath(base_dir)
         os.makedirs(base_dir, exist_ok=True)
 
         meta = MetadataManager.load_metadata(metadata_path)
+
+        ModelRegistry._validate_metadata_structure(meta)
 
         if parent_version:
             ModelRegistry._validate_parent(
@@ -200,8 +243,13 @@ class ModelRegistry:
 
         version = ModelRegistry._version()
 
-        version_dir = os.path.join(base_dir, version)
+        version_dir = ModelRegistry._safe_join(base_dir, version)
         staging_dir = version_dir + ".staging"
+
+        if os.path.exists(staging_dir):
+            raise RuntimeError(
+                "Staging directory already exists — possible prior crash."
+            )
 
         os.makedirs(staging_dir, exist_ok=False)
 
@@ -213,8 +261,18 @@ class ModelRegistry:
             staged_model = os.path.join(staging_dir, model_name)
             staged_meta = os.path.join(staging_dir, metadata_name)
 
+            if os.path.getsize(model_path) < ModelRegistry.MIN_ARTIFACT_BYTES:
+                raise RuntimeError("Source model artifact too small.")
+
             shutil.copy2(model_path, staged_model)
             shutil.copy2(metadata_path, staged_meta)
+
+            # pre/post hash
+            if ModelRegistry._sha256(model_path) != \
+               ModelRegistry._sha256(staged_model):
+                raise RuntimeError(
+                    "Model hash mismatch after copy."
+                )
 
             manifest: Dict[str, Any] = {
 
