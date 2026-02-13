@@ -7,7 +7,7 @@ import logging
 import random
 
 from core.config.env_loader import init_env
-from core.data.data_fetcher import StockPriceFetcher
+from core.data.market_data_service import MarketDataService
 from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_store import FeatureStore
@@ -43,7 +43,7 @@ MAX_DRAWDOWN = -0.40
 
 
 ########################################################
-# STRICT DETERMINISM (INSTITUTIONAL)
+# STRICT DETERMINISM
 ########################################################
 
 def enforce_determinism():
@@ -59,7 +59,7 @@ def enforce_determinism():
 
 
 ########################################################
-# FSYNC (CRITICAL)
+# FSYNC
 ########################################################
 
 def _fsync_dir(directory):
@@ -96,12 +96,12 @@ def save_model_atomic(model, path):
 
 
 ########################################################
-# DATA LOADER
+# DATA LOADER (FIXED — INSTITUTIONAL)
 ########################################################
 
 def load_training_data(start_date, end_date):
 
-    fetcher = StockPriceFetcher()
+    market_data = MarketDataService()
     news_fetcher = NewsFetcher()
     sentiment_analyzer = SentimentAnalyzer()
     store = FeatureStore()
@@ -116,7 +116,7 @@ def load_training_data(start_date, end_date):
 
         try:
 
-            price_df = fetcher.fetch(
+            price_df = market_data.get_price_data(
                 ticker=ticker,
                 start_date=start_date,
                 end_date=end_date
@@ -149,8 +149,6 @@ def load_training_data(start_date, end_date):
                 ticker=ticker,
                 training=True
             )
-
-            dataset["ticker"] = ticker
 
             datasets.append(dataset)
             surviving.append(ticker)
@@ -295,7 +293,7 @@ def main(start_date=None, end_date=None):
     save_model_atomic(final_model, TEMP_MODEL_PATH)
 
     ###################################################
-    # METADATA
+    # METADATA (FIXED)
     ###################################################
 
     metadata = MetadataManager.create_metadata(
@@ -305,6 +303,7 @@ def main(start_date=None, end_date=None):
         training_start=start_date,
         training_end=end_date,
         dataset_hash=dataset_hash,
+        dataset_rows=len(df),
         metadata_type="training_manifest_v1",
         extra_fields={
             "time_snapshot": MarketTime.snapshot_for("xgboost")
@@ -321,10 +320,6 @@ def main(start_date=None, end_date=None):
         TEMP_MODEL_PATH,
         TEMP_METADATA_PATH
     )
-
-    ###################################################
-    #  AUTO PROMOTION (VERY IMPORTANT)
-    ###################################################
 
     ModelRegistry.promote_to_production(
         MODEL_DIR,
