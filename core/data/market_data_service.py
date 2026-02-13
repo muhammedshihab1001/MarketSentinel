@@ -20,16 +20,17 @@ class MarketDataService:
     Guarantees:
     ✔ zero lookahead bias
     ✔ schema drift detection
-    ✔ concurrent write protection
-    ✔ corruption recovery
+    ✔ concurrent safety
+    ✔ corruption prevention
     ✔ ticker enforcement
-    ✔ atomic durability
+    ✔ timezone normalization
+    ✔ numeric safety
     """
 
     DATA_DIR = Path("data/lake")
 
     REQUIRED_COLUMNS = {
-        "ticker",   # 🔥 NEW — HARD REQUIREMENT
+        "ticker",
         "date",
         "open",
         "high",
@@ -39,9 +40,7 @@ class MarketDataService:
     }
 
     MIN_HISTORY_ROWS = 120
-    REVISION_DAYS = 5
     SAFE_LAG_DAYS = 2
-    MAX_FILES = 400
     MAX_ROWS = 15000
 
     ########################################################
@@ -67,7 +66,7 @@ class MarketDataService:
         return ticker
 
     ########################################################
-    # 🔥 HARD ATTACH TICKER
+    # ATTACH TICKER (HARD GUARANTEE)
     ########################################################
 
     @staticmethod
@@ -77,21 +76,9 @@ class MarketDataService:
             raise RuntimeError("Fetcher returned empty dataframe.")
 
         df = df.copy()
-
-        # overwrite if exists (prevents drift)
         df["ticker"] = ticker
 
         return df
-
-    ########################################################
-
-    def _dataset_path(self, ticker: str, interval: str):
-
-        ticker = self._sanitize_ticker(ticker)
-
-        name = f"{ticker}_{interval}_{self.SCHEMA_HASH}.parquet"
-
-        return self.DATA_DIR / name
 
     ########################################################
     # LOOKAHEAD PROTECTION
@@ -100,14 +87,38 @@ class MarketDataService:
     @classmethod
     def _cap_to_safe_date(cls, date_str: str):
 
-        requested = pd.Timestamp(date_str).normalize()
+        requested = pd.Timestamp(date_str).tz_localize(None)
 
         safe_cutoff = (
-            pd.Timestamp.utcnow().normalize()
+            pd.Timestamp.utcnow()
+            .tz_localize(None)
+            .normalize()
             - pd.Timedelta(days=cls.SAFE_LAG_DAYS)
         )
 
         return min(requested, safe_cutoff)
+
+    ########################################################
+    # TIMEZONE NORMALIZATION (CRITICAL)
+    ########################################################
+
+    @staticmethod
+    def _normalize_dates(df: pd.DataFrame):
+
+        df = df.copy()
+
+        dt = pd.to_datetime(
+            df["date"],
+            errors="coerce"
+        )
+
+        # If timezone exists → convert → strip
+        if getattr(dt.dt, "tz", None) is not None:
+            dt = dt.dt.tz_convert("UTC").dt.tz_localize(None)
+
+        df["date"] = dt
+
+        return df
 
     ########################################################
     # HARD VALIDATOR
@@ -121,17 +132,9 @@ class MarketDataService:
         missing = self.REQUIRED_COLUMNS - set(df.columns)
 
         if missing:
-            raise RuntimeError(
-                f"Schema violation. Missing={missing}"
-            )
+            raise RuntimeError(f"Schema violation. Missing={missing}")
 
-        df = df.copy()
-
-        df["date"] = pd.to_datetime(
-            df["date"],
-            utc=True,
-            errors="coerce"
-        ).dt.tz_convert(None)
+        df = self._normalize_dates(df)
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
@@ -211,6 +214,8 @@ class MarketDataService:
         ) from last_error
 
     ########################################################
+    # PUBLIC ENTRY
+    ########################################################
 
     def get_price_data(
         self,
@@ -223,13 +228,6 @@ class MarketDataService:
         ticker = self._sanitize_ticker(ticker)
 
         end_date = self._cap_to_safe_date(end_date)
-
-        path = self._dataset_path(ticker, interval)
-
-        ####################################################
-        # ALWAYS FETCH (Institutional preference)
-        # Avoid stale parquet schema conflicts
-        ####################################################
 
         logger.info("Fetching dataset for %s", ticker)
 
