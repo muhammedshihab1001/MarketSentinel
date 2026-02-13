@@ -2,40 +2,54 @@ from xgboost import XGBClassifier
 import numpy as np
 import xgboost as xgb
 
+from core.schema.feature_schema import FEATURE_COUNT
+
 
 SEED = 42
-MAX_CLASS_WEIGHT = 50.0
+
+MAX_CLASS_WEIGHT = 30.0
+MIN_CLASS_WEIGHT = 1.0
 
 
 ###################################################
-# SAFE GPU DETECTION (PRODUCTION GRADE)
+# HARD GPU VERIFICATION
 ###################################################
 
-def get_device():
+def _gpu_verified():
     """
-    Institutional GPU detection.
+    Institutional GPU probe.
 
-    No fake training.
-    No private APIs.
-    Docker-safe.
-    CI-safe.
+    Actually trains a tiny booster.
+    Prevents fake CUDA environments.
     """
 
     try:
-        if hasattr(xgb, "cuda_is_available"):
-            if xgb.cuda_is_available():
-                return "cuda"
+
+        dtrain = xgb.DMatrix(
+            np.random.rand(50, 4),
+            label=np.random.randint(0, 2, 50)
+        )
+
+        params = {
+            "tree_method": "hist",
+            "device": "cuda",
+            "max_depth": 1,
+            "verbosity": 0
+        }
+
+        xgb.train(params, dtrain, num_boost_round=1)
+
+        return True
+
     except Exception:
-        pass
-
-    return "cpu"
+        return False
 
 
-DEVICE = get_device()
+DEVICE = "cuda" if _gpu_verified() else "cpu"
 
 
 ###################################################
-# CLASS WEIGHT
+# CLASS WEIGHT (INSTITUTIONAL SAFE)
 ###################################################
 
 def compute_class_weight(y):
@@ -45,8 +59,8 @@ def compute_class_weight(y):
 
     y = np.asarray(y)
 
-    if np.isnan(y).any():
-        raise RuntimeError("NaN labels detected.")
+    if not np.isfinite(y).all():
+        raise RuntimeError("Non-finite labels detected.")
 
     pos = float(np.sum(y))
     neg = float(len(y) - pos)
@@ -58,7 +72,28 @@ def compute_class_weight(y):
 
     weight = neg / pos
 
-    return float(min(weight, MAX_CLASS_WEIGHT))
+    if not np.isfinite(weight):
+        raise RuntimeError("Invalid class weight.")
+
+    return float(
+        np.clip(
+            weight,
+            MIN_CLASS_WEIGHT,
+            MAX_CLASS_WEIGHT
+        )
+    )
+
+
+###################################################
+# FEATURE SAFETY
+###################################################
+
+def _validate_feature_count(X):
+
+    if X.shape[1] != FEATURE_COUNT:
+        raise RuntimeError(
+            f"Feature schema mismatch. Expected {FEATURE_COUNT}, got {X.shape[1]}"
+        )
 
 
 ###################################################
@@ -69,39 +104,51 @@ def _base_params(pos_weight):
 
     params = dict(
 
-        # tree structure
+        ############################
+        # TREE STRUCTURE
+        ############################
+
         max_depth=5,
         learning_rate=0.03,
 
-        subsample=0.85,
-        colsample_bytree=0.85,
+        subsample=0.80,
+        colsample_bytree=0.80,
 
-        min_child_weight=2,
-        gamma=0.1,
+        min_child_weight=3,
+        gamma=0.15,
 
-        reg_alpha=0.5,
-        reg_lambda=1.0,
+        reg_alpha=0.7,
+        reg_lambda=1.2,
 
-        # stability
+        ############################
+        # STABILITY
+        ############################
+
         eval_metric="logloss",
         random_state=SEED,
-        n_jobs=-1,
+        n_jobs=1,                 # deterministic
 
-        # modern xgboost
         tree_method="hist",
         device=DEVICE,
 
-        use_label_encoder=False,
+        sampling_method="uniform",
 
-        # imbalance
+        ############################
+        # IMBALANCE
+        ############################
+
         scale_pos_weight=pos_weight,
 
-        # prevents pathological trees
-        max_delta_step=1,
+        ############################
+        # PREVENT EXTREME TREES
+        ############################
 
-        # memory + stability
+        max_delta_step=1,
         grow_policy="depthwise",
-        max_bin=256
+        max_bin=192,
+
+        use_label_encoder=False,
+        verbosity=0
     )
 
     return params
@@ -117,13 +164,13 @@ def build_xgboost_model(y):
 
     params = _base_params(pos_weight)
 
-    params["n_estimators"] = 650
+    params["n_estimators"] = 600
 
     return XGBClassifier(**params)
 
 
 ###################################################
-# FINAL MODEL
+# FINAL MODEL (CHAMPION TRAIN)
 ###################################################
 
 def build_final_xgboost_model(y):
@@ -133,11 +180,11 @@ def build_final_xgboost_model(y):
     params = _base_params(pos_weight)
 
     params.update({
-        "n_estimators": 850,
+        "n_estimators": 800,
         "learning_rate": 0.025,
-        "reg_alpha": 0.7,
-        "reg_lambda": 1.2,
-        "gamma": 0.15
+        "gamma": 0.20,
+        "reg_alpha": 0.9,
+        "reg_lambda": 1.4,
     })
 
     return XGBClassifier(**params)
