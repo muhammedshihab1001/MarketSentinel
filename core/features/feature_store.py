@@ -24,10 +24,11 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close"}
 
-    CACHE_VERSION = "v6"
+    CACHE_VERSION = "v7"
     MAX_CACHE_FILES_PER_TICKER = 6
 
     MIN_ROWS_REQUIRED = 100
+    MIN_FILE_BYTES = 5_000
 
     ##################################################
 
@@ -49,7 +50,7 @@ class FeatureStore:
         return re.sub(r"[^A-Za-z0-9_]", "_", ticker)
 
     ##################################################
-    # ENGINEER FINGERPRINT — MODULE BYTES
+    # ENGINEER HASH
     ##################################################
 
     def _fingerprint_engineer(self) -> str:
@@ -69,16 +70,10 @@ class FeatureStore:
         return hashlib.sha256(payload).hexdigest()
 
     ##################################################
-    # STABLE ENVIRONMENT FINGERPRINT
+    # STABLE ENV HASH
     ##################################################
 
     def _environment_fingerprint(self) -> str:
-        """
-        Hardware-independent fingerprint.
-
-        Prevents cache invalidation when Docker
-        moves across machines.
-        """
 
         payload = (
             sys.version +
@@ -106,7 +101,6 @@ class FeatureStore:
                 )
                 continue
 
-            # deterministic float rounding
             df[col] = (
                 pd.to_numeric(df[col], errors="raise")
                 .astype("float64")
@@ -127,23 +121,23 @@ class FeatureStore:
 
         price_df = self._canonicalize_df(price_df)
 
-        price_arr = pd.util.hash_pandas_object(
-            price_df,
-            index=True
-        ).values
-
-        h.update(price_arr.tobytes())
+        h.update(
+            pd.util.hash_pandas_object(
+                price_df,
+                index=True
+            ).values.tobytes()
+        )
 
         if sentiment_df is not None and not sentiment_df.empty:
 
             sentiment_df = self._canonicalize_df(sentiment_df)
 
-            sent_arr = pd.util.hash_pandas_object(
-                sentiment_df,
-                index=True
-            ).values
-
-            h.update(sent_arr.tobytes())
+            h.update(
+                pd.util.hash_pandas_object(
+                    sentiment_df,
+                    index=True
+                ).values.tobytes()
+            )
 
         return h.hexdigest()[:20]
 
@@ -170,7 +164,7 @@ class FeatureStore:
         )
 
     ##################################################
-    # DIRECTORY FSYNC
+    # FSYNC
     ##################################################
 
     def _fsync_dir(self, path):
@@ -186,7 +180,7 @@ class FeatureStore:
             os.close(fd)
 
     ##################################################
-    # CACHE PRUNING
+    # CACHE PRUNE
     ##################################################
 
     def _prune_cache(self, ticker):
@@ -231,7 +225,7 @@ class FeatureStore:
     # ATOMIC WRITE
     ##################################################
 
-    def _atomic_write(self, df: pd.DataFrame, path: str):
+    def _atomic_write(self, df: pd.DataFrame, path: str, dataset_hash: str):
 
         if len(df) < self.MIN_ROWS_REQUIRED:
             raise RuntimeError("Feature collapse detected.")
@@ -240,10 +234,6 @@ class FeatureStore:
 
         df = df.sort_values("date").reset_index(drop=True)
 
-        ##################################################
-        # FORCE COLUMN ORDER (CRITICAL)
-        ##################################################
-
         base_cols = ["date", "close", "ticker"]
 
         if "target" in df.columns:
@@ -251,15 +241,15 @@ class FeatureStore:
 
         df = df[base_cols + list(MODEL_FEATURES)]
 
+        df["__dataset_hash"] = dataset_hash
+
         self._validate_dataset_structure(df)
 
-        feature_block = df.loc[:, MODEL_FEATURES]
+        validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
-        validate_feature_schema(feature_block)
-
-        arr = feature_block.to_numpy(dtype=float)
-
-        if not np.isfinite(arr).all():
+        if not np.isfinite(
+            df.loc[:, MODEL_FEATURES].to_numpy()
+        ).all():
             raise RuntimeError("Non-finite feature values.")
 
         df.to_parquet(tmp_path, index=False)
@@ -270,42 +260,37 @@ class FeatureStore:
             os.close(fd)
 
         os.replace(tmp_path, path)
-
         self._fsync_dir(self.FEATURE_DIR)
 
     ##################################################
     # SAFE LOAD
     ##################################################
 
-    def _load_features(self, path: str) -> Optional[pd.DataFrame]:
+    def _load_features(self, path: str, dataset_hash: str):
 
         if not os.path.exists(path):
             return None
 
-        # corruption guard
-        if os.path.getsize(path) < 5_000:
+        if os.path.getsize(path) < self.MIN_FILE_BYTES:
             logger.warning("Feature file too small — rebuilding.")
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-            return None
-
-        filename = os.path.basename(path)
-
-        if self.schema_hash not in filename \
-           or self.engineer_hash not in filename \
-           or self.env_hash not in filename:
-
-            logger.warning("Feature lineage mismatch — rebuilding.")
+            os.remove(path)
             return None
 
         try:
 
             df = pd.read_parquet(path)
 
-            if df.empty:
-                raise RuntimeError("Feature file empty.")
+            if "__dataset_hash" not in df.columns:
+                logger.warning("Missing dataset hash — rebuilding.")
+                os.remove(path)
+                return None
+
+            if df["__dataset_hash"].iloc[0] != dataset_hash:
+                logger.warning("Dataset hash mismatch — rebuilding.")
+                os.remove(path)
+                return None
+
+            df.drop(columns="__dataset_hash", inplace=True)
 
             self._validate_dataset_structure(df)
 
@@ -334,7 +319,7 @@ class FeatureStore:
             return None
 
     ##################################################
-    # PUBLIC API
+    # PUBLIC
     ##################################################
 
     def get_features(
@@ -361,7 +346,7 @@ class FeatureStore:
             training
         )
 
-        stored = self._load_features(path)
+        stored = self._load_features(path, dataset_hash)
 
         if stored is not None:
             return stored
@@ -376,7 +361,11 @@ class FeatureStore:
             training=training
         )
 
-        self._atomic_write(features, path)
+        self._atomic_write(
+            features,
+            path,
+            dataset_hash
+        )
 
         self._prune_cache(ticker)
 
