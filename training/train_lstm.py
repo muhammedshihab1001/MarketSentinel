@@ -4,8 +4,8 @@ import numpy as np
 import tensorflow as tf
 import pandas as pd
 
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.preprocessing import RobustScaler
+from tensorflow.keras.callbacks import EarlyStopping, TerminateOnNaN
 
 from core.data.data_fetcher import StockPriceFetcher
 from core.artifacts.metadata_manager import MetadataManager
@@ -23,9 +23,9 @@ SCALER_PATH = f"{MODEL_DIR}/scalers.pkl"
 METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 LOOKBACK_WINDOW = 60
-EPOCHS = 50
-MIN_ROWS_PER_TICKER = 900
-MIN_SEQUENCES = 400
+EPOCHS = 60
+MIN_ROWS_PER_TICKER = 950
+MIN_SEQUENCES = 600
 
 SEED = 42
 
@@ -43,7 +43,6 @@ def configure_runtime():
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
 
-    # CRITICAL — true determinism
     tf.config.experimental.enable_op_determinism()
 
 
@@ -90,7 +89,7 @@ def atomic_joblib_dump(obj, path):
 
 
 ############################################################
-# LOAD DATA — GOVERNED
+# LOAD DATA — NO SURVIVORSHIP BIAS
 ############################################################
 
 def load_data(start_date, end_date):
@@ -99,6 +98,7 @@ def load_data(start_date, end_date):
     universe = MarketUniverse.get_universe()
 
     datasets = []
+    surviving = []
 
     for ticker in universe:
 
@@ -111,7 +111,11 @@ def load_data(start_date, end_date):
         if df is None or len(df) < MIN_ROWS_PER_TICKER:
             continue
 
+        if (df["close"] <= 0).any():
+            continue
+
         df["ticker"] = ticker
+        surviving.append(ticker)
         datasets.append(df)
 
     if len(datasets) < 6:
@@ -119,14 +123,33 @@ def load_data(start_date, end_date):
 
     df = pd.concat(datasets, ignore_index=True)
 
-    df["date"] = pd.to_datetime(df["date"])
+    df["date"] = pd.to_datetime(df["date"], utc=True)
     df.sort_values(["ticker", "date"], inplace=True)
 
-    return df.reset_index(drop=True), universe
+    return df.reset_index(drop=True), surviving
 
 
 ############################################################
-# SEQUENCE BUILDER
+# RETURN MODELING (CRITICAL UPGRADE)
+############################################################
+
+def compute_returns(df):
+
+    df = df.copy()
+
+    df["log_price"] = np.log(df["close"].astype("float64"))
+    df["return"] = df.groupby("ticker")["log_price"].diff()
+
+    df.dropna(inplace=True)
+
+    if not np.isfinite(df["return"]).all():
+        raise RuntimeError("Non-finite returns detected.")
+
+    return df
+
+
+############################################################
+# SEQUENCE BUILDER — VOL NORMALIZED
 ############################################################
 
 def build_sequences(df):
@@ -137,10 +160,13 @@ def build_sequences(df):
 
     for ticker, tdf in df.groupby("ticker"):
 
-        prices = tdf["close"].astype("float32").values.reshape(-1, 1)
+        returns = tdf["return"].values.reshape(-1, 1)
 
-        scaler = MinMaxScaler()
-        scaled = scaler.fit_transform(prices)
+        if np.std(returns) < 1e-6:
+            continue
+
+        scaler = RobustScaler()
+        scaled = scaler.fit_transform(returns)
 
         scalers[ticker] = scaler
 
@@ -168,8 +194,8 @@ def apply_scalers(df, scalers):
         if ticker not in scalers:
             continue
 
-        prices = tdf["close"].astype("float32").values.reshape(-1, 1)
-        scaled = scalers[ticker].transform(prices)
+        returns = tdf["return"].values.reshape(-1, 1)
+        scaled = scalers[ticker].transform(returns)
 
         for i in range(len(scaled) - LOOKBACK_WINDOW):
             X_all.append(scaled[i:i+LOOKBACK_WINDOW])
@@ -185,35 +211,46 @@ def apply_scalers(df, scalers):
 
 
 ############################################################
-# TIME SAFE VALIDATION
+# TIME SAFE VALIDATION — PER TICKER SPLIT
 ############################################################
 
 def time_series_validation(df):
 
-    split_idx = int(len(df) * 0.8)
+    train_parts = []
+    test_parts = []
 
-    train_df = df.iloc[:split_idx]
-    test_df = df.iloc[split_idx:]
+    for ticker, tdf in df.groupby("ticker"):
+
+        split_idx = int(len(tdf) * 0.8)
+
+        train_parts.append(tdf.iloc[:split_idx])
+        test_parts.append(tdf.iloc[split_idx:])
+
+    train_df = pd.concat(train_parts)
+    test_df = pd.concat(test_parts)
 
     X_train, y_train, scalers = build_sequences(train_df)
     X_test, y_test = apply_scalers(test_df, scalers)
 
     model = build_lstm_model((LOOKBACK_WINDOW, 1))
 
-    early = EarlyStopping(
-        monitor="val_loss",
-        patience=7,
-        min_delta=1e-5,
-        restore_best_weights=True
-    )
+    callbacks = [
+        EarlyStopping(
+            monitor="val_loss",
+            patience=8,
+            min_delta=1e-5,
+            restore_best_weights=True
+        ),
+        TerminateOnNaN()
+    ]
 
     history = model.fit(
         X_train,
         y_train,
         validation_data=(X_test, y_test),
         epochs=EPOCHS,
-        batch_size=32,
-        callbacks=[early],
+        batch_size=64,
+        callbacks=callbacks,
         verbose=1
     )
 
@@ -221,6 +258,15 @@ def time_series_validation(df):
 
     if not np.isfinite(val_loss):
         raise RuntimeError("Training produced non-finite loss.")
+
+    ####################################################
+    # PREDICTION SANITY CHECK (VERY IMPORTANT)
+    ####################################################
+
+    preds = model.predict(X_test[:500])
+
+    if np.std(preds) < 1e-5:
+        raise RuntimeError("LSTM collapsed — constant predictions.")
 
     return model, scalers, val_loss
 
@@ -238,10 +284,12 @@ def main(start_date=None, end_date=None):
 
     print(f"Institutional LSTM Training | {start_date} -> {end_date}")
 
-    df, universe = load_data(start_date, end_date)
+    df, surviving = load_data(start_date, end_date)
+
+    df = compute_returns(df)
 
     dataset_hash = MetadataManager.fingerprint_dataset(
-        df[["ticker", "date", "close"]]
+        df[["ticker", "date", "return"]]
     )
 
     model, scalers, val_loss = time_series_validation(df)
@@ -250,7 +298,7 @@ def main(start_date=None, end_date=None):
     atomic_joblib_dump(scalers, SCALER_PATH)
 
     metadata = MetadataManager.create_metadata(
-        model_name="lstm_price_forecast",
+        model_name="lstm_return_forecast",
         metrics={"val_loss": val_loss},
         features=["close_sequence"],
         training_start=start_date,
@@ -258,9 +306,10 @@ def main(start_date=None, end_date=None):
         dataset_hash=dataset_hash,
         metadata_type="sequence_manifest_v1",
         extra_fields={
-            "training_universe": universe,
-            "universe_hash": MetadataManager.hash_list(universe),
-            "lookback_window": LOOKBACK_WINDOW
+            "training_universe": surviving,
+            "universe_hash": MetadataManager.hash_list(surviving),
+            "lookback_window": LOOKBACK_WINDOW,
+            "target": "log_returns"
         }
     )
 
