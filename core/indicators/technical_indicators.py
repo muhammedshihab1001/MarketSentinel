@@ -13,6 +13,18 @@ class TechnicalIndicators:
     STD_FLOOR = 1e-6
 
     ####################################################
+    # WINDOW VALIDATION
+    ####################################################
+
+    @staticmethod
+    def _validate_window(window: int):
+        if not isinstance(window, int):
+            raise RuntimeError("Window must be int.")
+
+        if window < 2:
+            raise RuntimeError("Window must be >= 2.")
+
+    ####################################################
     # COLUMN NORMALIZATION
     ####################################################
 
@@ -31,7 +43,6 @@ class TechnicalIndicators:
                 "TechnicalIndicators requires 'close' column."
             )
 
-        # enforce deterministic ordering if date exists
         if "date" in df.columns:
             df = df.sort_values("date")
 
@@ -52,7 +63,6 @@ class TechnicalIndicators:
             inplace=True
         )
 
-        # bounded forward fill only
         close = close.ffill(limit=TechnicalIndicators.MAX_FORWARD_FILL)
 
         if close.isna().any():
@@ -63,7 +73,7 @@ class TechnicalIndicators:
         if (close <= 0).any():
             raise RuntimeError("Invalid close prices detected.")
 
-        df["close"] = close.astype("float64")
+        df["close"] = close.astype("float32")
 
         return df
 
@@ -73,6 +83,8 @@ class TechnicalIndicators:
 
     @classmethod
     def moving_average(cls, df: pd.DataFrame, window: int = 20):
+
+        cls._validate_window(window)
 
         df = cls._normalize_columns(df)
 
@@ -84,11 +96,13 @@ class TechnicalIndicators:
         return ma.astype("float32")
 
     ####################################################
-    # RSI — WILDER SMOOTHING (INSTITUTIONAL)
+    # RSI — WILDER SMOOTHING
     ####################################################
 
     @classmethod
     def rsi(cls, df: pd.DataFrame, window: int = 14):
+
+        cls._validate_window(window)
 
         df = cls._normalize_columns(df)
 
@@ -99,7 +113,6 @@ class TechnicalIndicators:
         gain = delta.clip(lower=0)
         loss = -delta.clip(upper=0)
 
-        # Wilder smoothing via EMA
         avg_gain = gain.ewm(
             alpha=1/window,
             adjust=False,
@@ -116,7 +129,6 @@ class TechnicalIndicators:
 
         rsi = 100 - (100 / (1 + rs))
 
-        # deterministic fills
         rsi.fillna(50, inplace=True)
 
         return rsi.clip(0, 100).astype("float32")
@@ -127,6 +139,8 @@ class TechnicalIndicators:
 
     @classmethod
     def bollinger_bands(cls, df: pd.DataFrame, window: int = 20):
+
+        cls._validate_window(window)
 
         df = cls._normalize_columns(df)
 
@@ -140,7 +154,7 @@ class TechnicalIndicators:
         std = close.rolling(
             window=window,
             min_periods=window
-        ).std()
+        ).std(ddof=0)
 
         std = std.clip(lower=cls.STD_FLOOR)
 
