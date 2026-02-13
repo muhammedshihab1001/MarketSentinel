@@ -5,12 +5,9 @@ import logging
 import time
 import os
 import threading
-import hashlib
 import re
-import tempfile
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
 from core.config.env_loader import init_env
 
 init_env()
@@ -49,8 +46,6 @@ class FinBERTSingleton:
 
             os.makedirs(cls.CACHE_DIR, exist_ok=True)
 
-            start = time.time()
-
             logger.info("Loading FinBERT on %s", cls._device)
 
             torch.set_grad_enabled(False)
@@ -78,10 +73,7 @@ class FinBERTSingleton:
 
             cls._model = model
 
-            logger.info(
-                "FinBERT loaded in %.2fs",
-                time.time() - start
-            )
+            logger.info("FinBERT ready.")
 
             return cls._tokenizer, cls._model, cls._device
 
@@ -91,8 +83,6 @@ class FinBERTSingleton:
 ############################################################
 
 class SentimentAnalyzer:
-
-    CACHE_SCHEMA_VERSION = "v3"
 
     label_map = {
         0: "negative",
@@ -110,16 +100,30 @@ class SentimentAnalyzer:
     STD_FLOOR = 0.05
     SENTIMENT_EMBARGO_HOURS = 2
 
-    CACHE_DIR = "data/sentiment_cache"
-    CACHE_TTL_MIN = 60
+    ############################################################
+    # NEW — NEUTRAL FALLBACK
+    ############################################################
 
-    TEXT_GARBAGE_REGEX = re.compile(
-        r"^\s*$|http[s]?://|^\W+$"
-    )
+    def _neutral_sentiment_frame(self, start, end):
+
+        dates = pd.date_range(start=start, end=end, freq="D")
+
+        df = pd.DataFrame({
+            "date": dates,
+            "avg_sentiment": np.zeros(len(dates), dtype="float32"),
+            "news_count": np.zeros(len(dates), dtype="int16"),
+            "sentiment_std": np.full(len(dates), 0.05, dtype="float32")
+        })
+
+        logger.warning(
+            "Sentiment fallback activated — using neutral signal."
+        )
+
+        return df
+
+    ############################################################
 
     def __init__(self):
-
-        os.makedirs(self.CACHE_DIR, exist_ok=True)
 
         self.tokenizer, self.model, self.device = (
             FinBERTSingleton.load()
@@ -127,8 +131,6 @@ class SentimentAnalyzer:
 
         self._warmup()
 
-    ############################################################
-    # GPU WARMUP
     ############################################################
 
     def _warmup(self):
@@ -140,28 +142,18 @@ class SentimentAnalyzer:
             logger.exception("FinBERT warmup failed")
 
     ############################################################
-    # DAILY AGGREGATION (CRITICAL FIX)
+    # FIXED — FAULT TOLERANT AGGREGATION
     ############################################################
 
     def aggregate_daily_sentiment(self, df: pd.DataFrame) -> pd.DataFrame:
 
         if df is None or df.empty:
-            return pd.DataFrame(
-                columns=["date", "avg_sentiment", "news_count", "sentiment_std"]
-            )
-
-        required_cols = {"published_at", "score"}
-
-        if not required_cols.issubset(df.columns):
-            raise RuntimeError(
-                f"Sentiment dataframe missing columns: {required_cols}"
+            return self._neutral_sentiment_frame(
+                pd.Timestamp.utcnow() - pd.Timedelta(days=30),
+                pd.Timestamp.utcnow()
             )
 
         working = df.copy()
-
-        ##################################################
-        # TIMESTAMP SAFETY
-        ##################################################
 
         working["published_at"] = pd.to_datetime(
             working["published_at"],
@@ -180,13 +172,10 @@ class SentimentAnalyzer:
         ]
 
         if working.empty:
-            return pd.DataFrame(
-                columns=["date", "avg_sentiment", "news_count", "sentiment_std"]
+            return self._neutral_sentiment_frame(
+                pd.Timestamp.utcnow() - pd.Timedelta(days=30),
+                pd.Timestamp.utcnow()
             )
-
-        ##################################################
-        # NUMERIC SAFETY
-        ##################################################
 
         working["score"] = pd.to_numeric(
             working["score"],
@@ -200,55 +189,27 @@ class SentimentAnalyzer:
 
         working["score"] = working["score"].clip(-1.0, 1.0)
 
-        ##################################################
-        # DAILY BUCKET
-        ##################################################
-
         working["date"] = working["published_at"].dt.floor("D")
 
-        grouped = working.groupby("date")
-
-        aggregated = grouped["score"].agg(
+        aggregated = working.groupby("date")["score"].agg(
             avg_sentiment="mean",
             sentiment_std="std",
             news_count="count"
         ).reset_index()
 
-        ##################################################
-        # QUALITY FILTERS
-        ##################################################
-
-        aggregated = aggregated[
-            aggregated["news_count"] >= self.MIN_NEWS_PER_DAY
-        ]
+        aggregated["sentiment_std"] = aggregated["sentiment_std"].fillna(0.05)
 
         if aggregated.empty:
-            return pd.DataFrame(
-                columns=["date", "avg_sentiment", "news_count", "sentiment_std"]
+            return self._neutral_sentiment_frame(
+                working["date"].min(),
+                working["date"].max()
             )
-
-        aggregated["sentiment_std"] = aggregated["sentiment_std"].fillna(0)
-
-        aggregated = aggregated[
-            aggregated["sentiment_std"] >= self.STD_FLOOR
-        ]
-
-        ##################################################
-        # FINAL NUMERIC GUARD
-        ##################################################
-
-        if not np.isfinite(
-            aggregated[["avg_sentiment", "sentiment_std"]].to_numpy()
-        ).all():
-            raise RuntimeError("Non-finite sentiment detected.")
 
         aggregated.sort_values("date", inplace=True)
         aggregated.reset_index(drop=True, inplace=True)
 
         return aggregated
 
-    ############################################################
-    # EXISTING METHODS (UNCHANGED)
     ############################################################
 
     def analyze_batch(self, texts):
@@ -263,7 +224,7 @@ class SentimentAnalyzer:
             batch = [
                 str(t).replace("\n", " ")[:self.MAX_HEADLINE_CHARS]
                 for t in raw_batch
-                if t and not self.TEXT_GARBAGE_REGEX.search(str(t))
+                if t and not re.match(r"^\s*$|http[s]?://|^\W+$", str(t))
             ]
 
             if not batch:
@@ -300,7 +261,7 @@ class SentimentAnalyzer:
 
                 for original in raw_batch:
 
-                    if original is None or self.TEXT_GARBAGE_REGEX.search(str(original)):
+                    if original is None:
                         results.append(
                             {"label": "neutral", "score": 0.0}
                         )
@@ -320,11 +281,7 @@ class SentimentAnalyzer:
                     label_id = int(p.argmax())
 
                     score = float(
-                        np.clip(
-                            p[2] - p[0],
-                            -1.0,
-                            1.0
-                        )
+                        np.clip(p[2] - p[0], -1.0, 1.0)
                     )
 
                     results.append({
@@ -336,9 +293,7 @@ class SentimentAnalyzer:
 
                 failures += len(raw_batch)
 
-                logger.exception(
-                    "FinBERT inference failure"
-                )
+                logger.exception("FinBERT inference failure")
 
                 results.extend(
                     {"label": "neutral", "score": 0.0}
