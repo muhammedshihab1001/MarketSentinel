@@ -1,5 +1,6 @@
 import os
 import uuid
+import logging
 from typing import Dict, Tuple
 
 import numpy as np
@@ -17,6 +18,8 @@ from core.market.universe import MarketUniverse
 from models.sarimax_model import SarimaxModel
 
 
+logger = logging.getLogger("marketsentinel.sarimax")
+
 MODEL_DIR = "artifacts/sarimax"
 
 TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
@@ -26,6 +29,7 @@ MIN_DATA_ROWS = 700
 MIN_UNIVERSE = 5
 VOL_FLOOR = 1e-4
 VAR_FLOOR = 1e-8
+MAX_MISSING_RATIO = 0.01
 
 SEED = 42
 
@@ -36,6 +40,7 @@ SEED = 42
 
 def enforce_determinism():
 
+    os.environ["PYTHONHASHSEED"] = str(SEED)
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -88,7 +93,7 @@ def assert_stationary(series: pd.Series):
 
     series = series.dropna()
 
-    if len(series) < 200:
+    if len(series) < 250:
         raise RuntimeError("Series too short for stationarity test.")
 
     if not np.isfinite(series).all():
@@ -97,7 +102,7 @@ def assert_stationary(series: pd.Series):
     if series.var() < VAR_FLOOR:
         raise RuntimeError("Variance collapsed — unusable series.")
 
-    result = adfuller(series)
+    result = adfuller(series, autolag="AIC")
 
     p_value = result[1]
 
@@ -108,6 +113,43 @@ def assert_stationary(series: pd.Series):
         raise RuntimeError(
             f"Non-stationary series detected (p={p_value})."
         )
+
+
+########################################################
+# DATA CLEANING (NEW — VERY IMPORTANT)
+########################################################
+
+def clean_price_frame(df: pd.DataFrame):
+
+    if df is None or df.empty:
+        return None
+
+    df = df[["date", "close"]].copy()
+
+    df["date"] = pd.to_datetime(df["date"], utc=True)
+
+    df["close"] = pd.to_numeric(
+        df["close"],
+        errors="coerce"
+    )
+
+    if df["close"].isna().mean() > MAX_MISSING_RATIO:
+        return None
+
+    df = df.dropna()
+
+    if (df["close"] <= 0).any():
+        return None
+
+    if not df["date"].is_monotonic_increasing:
+        df = df.sort_values("date")
+
+    df = df.drop_duplicates("date")
+
+    if len(df) < MIN_DATA_ROWS:
+        return None
+
+    return df.reset_index(drop=True)
 
 
 ########################################################
@@ -122,43 +164,51 @@ def load_training_data(
     fetcher = StockPriceFetcher()
     universe = MarketUniverse.get_universe()
 
-    print(f"SARIMAX universe size: {len(universe)}")
+    logger.info("SARIMAX universe size=%s", len(universe))
 
     datasets = {}
     surviving = []
 
-    for ticker in universe:
+    for ticker in sorted(universe):  # deterministic
 
-        df = fetcher.fetch(
-            ticker=ticker,
-            start_date=start_date,
-            end_date=end_date
-        )
+        try:
 
-        if df is None or len(df) < MIN_DATA_ROWS:
-            continue
+            df = fetcher.fetch(
+                ticker=ticker,
+                start_date=start_date,
+                end_date=end_date
+            )
 
-        df = df[["date", "close"]].copy()
+            df = clean_price_frame(df)
 
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            if df is None:
+                continue
 
-        if df["close"].isna().any():
-            continue
+            log_returns = np.log(df["close"]).diff()
 
-        if (df["close"] <= 0).any():
-            continue
+            assert_stationary(log_returns)
 
-        log_returns = np.log(df["close"]).diff()
+            datasets[ticker] = df
+            surviving.append(ticker)
 
-        assert_stationary(log_returns)
+        except Exception as exc:
 
-        datasets[ticker] = df
-        surviving.append(ticker)
+            logger.warning(
+                "Ticker rejected | %s | %s",
+                ticker,
+                str(exc)
+            )
 
     if len(datasets) < MIN_UNIVERSE:
         raise RuntimeError(
             "Universe collapse — too few assets survived."
         )
+
+    logger.info(
+        "Survivors=%s/%s",
+        len(datasets),
+        len(universe)
+    )
 
     return datasets, surviving
 
@@ -193,10 +243,6 @@ def train_champion(start_date, end_date):
 
     rejection_log = {}
 
-    ####################################################
-    # DETERMINISTIC ORDER
-    ####################################################
-
     for ticker in sorted(datasets.keys()):
 
         df = datasets[ticker]
@@ -210,7 +256,11 @@ def train_champion(start_date, end_date):
 
             score = score_model(metrics)
 
-            print(f"SARIMAX {ticker} score={round(score,4)}")
+            logger.info(
+                "SARIMAX %s score=%.4f",
+                ticker,
+                score
+            )
 
             if (
                 score > best_score
@@ -224,15 +274,12 @@ def train_champion(start_date, end_date):
         except Exception as exc:
 
             rejection_log[ticker] = str(exc)
-            print(f"{ticker} rejected: {exc}")
 
     if best_model is None:
-        raise RuntimeError(
-            "All SARIMAX models rejected."
-        )
+        raise RuntimeError("All SARIMAX models rejected.")
 
     ####################################################
-    # DATASET HASH (CHAMPION)
+    # DATASET HASH (CHAMPION ONLY — lineage safe)
     ####################################################
 
     dataset_hash = MetadataManager.fingerprint_dataset(
@@ -251,10 +298,9 @@ def train_champion(start_date, end_date):
         training_start=start_date,
         training_end=end_date,
         dataset_hash=dataset_hash,
+        dataset_rows=len(datasets[best_ticker]),
         metadata_type="timeseries_manifest_v1",
         extra_fields={
-
-            # NEVER override training_universe
 
             "model_type": "SARIMAX",
             "parameters": best_model.get_params(),
@@ -280,8 +326,10 @@ def main(start_date=None, end_date=None):
     if start_date is None or end_date is None:
         start_date, end_date = MarketTime.window_for("sarimax")
 
-    print(
-        f"Institutional SARIMAX Training | {start_date} -> {end_date}"
+    logger.info(
+        "Institutional SARIMAX Training | %s -> %s",
+        start_date,
+        end_date
     )
 
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -306,9 +354,9 @@ def main(start_date=None, end_date=None):
         version
     )
 
-    print(
-        f"SARIMAX candidate registered -> {version}\n"
-        "Promotion requires governance approval."
+    logger.info(
+        "SARIMAX candidate registered -> %s | promotion requires approval.",
+        version
     )
 
 
