@@ -3,6 +3,7 @@ from typing import List, Tuple, Dict
 import math
 import os
 import time
+import threading
 
 from core.risk.position_sizer import PositionSizer
 
@@ -14,9 +15,16 @@ from core.risk.position_sizer import PositionSizer
 def _env_float(key: str, default: float) -> float:
     try:
         v = float(os.getenv(key, str(default)))
+
         if not math.isfinite(v):
             return default
+
+        # prevent config poisoning
+        if abs(v) > 1e6:
+            return default
+
         return v
+
     except Exception:
         return default
 
@@ -57,7 +65,7 @@ class SignalConfig:
     @staticmethod
     def load():
 
-        return SignalConfig(
+        cfg = SignalConfig(
             prob_threshold=_env_float("PROB_THRESHOLD", 0.60),
             sentiment_threshold=_env_float("SENTIMENT_THRESHOLD", 0.08),
 
@@ -82,6 +90,21 @@ class SignalConfig:
                 False
             )
         )
+
+        ###################################################
+        # HARD CONFIG VALIDATION
+        ###################################################
+
+        if not (0.5 <= cfg.prob_threshold <= 0.9):
+            raise RuntimeError("Unsafe prob_threshold")
+
+        if not (0.0 < cfg.min_confidence < 1.0):
+            raise RuntimeError("Unsafe min_confidence")
+
+        if cfg.portfolio_value <= 0:
+            raise RuntimeError("Invalid portfolio_value")
+
+        return cfg
 
 
 ###################################################
@@ -128,11 +151,15 @@ class ForecastInterpreter:
     ) -> Tuple[str, float]:
 
         predicted_return = _safe(predicted_return)
-        sentiment = _safe(sentiment, None)  # allow None
+        sentiment = _safe(sentiment, None)
         rsi = _safe(rsi, 50.0)
         prob_up = _safe(prob_up, 0.5)
 
         volatility = max(_safe(volatility, 0.02), self.VOL_FLOOR)
+
+        ################################################
+        # RISK ADJUSTED RETURN
+        ################################################
 
         rar = predicted_return / volatility
         rar = _clamp(rar, -self.RAR_CLAMP, self.RAR_CLAMP)
@@ -146,23 +173,23 @@ class ForecastInterpreter:
             prob_threshold += 0.05
 
         ################################################
-        # DYNAMIC CONFIDENCE WEIGHTING
+        # CONFIDENCE
         ################################################
 
         rsi_edge = abs(50 - rsi) / 50
 
         weights = {
-            "prob": 0.50,
+            "prob": 0.55,
             "rar": 0.35,
-            "rsi": 0.15,
+            "rsi": 0.10,
             "sentiment": 0.0
         }
 
-        # Only activate sentiment if meaningful
+        # activate sentiment only when strong
         if sentiment is not None and abs(sentiment) > config.sentiment_threshold:
-            weights["sentiment"] = 0.10
-            weights["prob"] -= 0.05
-            weights["rar"] -= 0.05
+            weights["sentiment"] = 0.08
+            weights["prob"] -= 0.04
+            weights["rar"] -= 0.04
 
         confidence = (
             prob_up * weights["prob"] +
@@ -174,7 +201,7 @@ class ForecastInterpreter:
         confidence = _clamp(confidence, 0.0, 1.0)
 
         ################################################
-        # BUY / SELL LOGIC
+        # SIGNAL LOGIC
         ################################################
 
         if rar > config.min_risk_adjusted_return and prob_up >= prob_threshold:
@@ -233,24 +260,29 @@ class DecisionEngine:
         self.risk_gate = RiskGate(self.config)
         self.position_sizer = PositionSizer()
 
-        self._last_signal = "HOLD"
-        self._last_flip_time = 0
+        self._lock = threading.RLock()
+
+        self._last_signal = {}
+        self._last_flip_time = {}
 
     ###################################################
 
-    def _flip_guard(self, new_signal):
+    def _flip_guard(self, ticker, new_signal):
 
         now = time.time()
 
+        last_signal = self._last_signal.get(ticker, "HOLD")
+        last_flip = self._last_flip_time.get(ticker, 0)
+
         if (
-            new_signal != self._last_signal
-            and now - self._last_flip_time
+            new_signal != last_signal
+            and now - last_flip
             < self.config.flip_cooldown_seconds
         ):
             return False
 
-        if new_signal != self._last_signal:
-            self._last_flip_time = now
+        if new_signal != last_signal:
+            self._last_flip_time[ticker] = now
 
         return True
 
@@ -269,6 +301,7 @@ class DecisionEngine:
 
     def generate(
         self,
+        ticker: str,
         predicted_return: float,
         sentiment: float | None,
         rsi: float,
@@ -279,49 +312,60 @@ class DecisionEngine:
         regime: str | None = None
     ) -> Dict:
 
-        if self.config.global_kill_switch:
-            return self._hold(0.0)
+        with self._lock:
 
-        base_signal, confidence = self.interpreter.interpret(
-            predicted_return,
-            sentiment,
-            rsi,
-            volatility,
-            prob_up,
-            self.config
-        )
+            if self.config.global_kill_switch:
+                return self._hold(0.0)
 
-        if confidence < self.config.min_confidence:
-            return self._hold(confidence)
+            base_signal, confidence = self.interpreter.interpret(
+                predicted_return,
+                sentiment,
+                rsi,
+                volatility,
+                prob_up,
+                self.config
+            )
 
-        if not self.risk_gate.allow(
-            base_signal,
-            prob_up,
-            volatility,
-            regime
-        ):
-            return self._hold(confidence)
+            if confidence < self.config.min_confidence:
+                return self._hold(confidence)
 
-        if not self._flip_guard(base_signal):
-            return self._hold(confidence)
+            if not self.risk_gate.allow(
+                base_signal,
+                prob_up,
+                volatility,
+                regime
+            ):
+                return self._hold(confidence)
 
-        allocation = self.position_sizer.size_position(
-            signal=base_signal,
-            confidence=confidence,
-            volatility=max(volatility, 1e-6),
-            portfolio_value=self.config.portfolio_value
-        )
+            if not self._flip_guard(ticker, base_signal):
+                return self._hold(confidence)
 
-        if not math.isfinite(allocation) or allocation <= 0:
-            return self._hold(confidence)
+            allocation = self.position_sizer.size_position(
+                signal=base_signal,
+                confidence=confidence,
+                volatility=max(volatility, 1e-6),
+                portfolio_value=self.config.portfolio_value
+            )
 
-        self._last_signal = base_signal
+            if not math.isfinite(allocation) or allocation <= 0:
+                return self._hold(confidence)
 
-        position_pct = allocation / self.config.portfolio_value
+            ###################################################
+            # HARD EXPOSURE CAP
+            ###################################################
 
-        return {
-            "signal": base_signal,
-            "confidence": round(confidence, 3),
-            "allocation": round(allocation, 2),
-            "position_pct": round(position_pct, 4)
-        }
+            max_alloc = self.config.portfolio_value * self.config.max_position_pct
+            min_alloc = self.config.portfolio_value * self.config.min_position_pct
+
+            allocation = _clamp(allocation, min_alloc, max_alloc)
+
+            self._last_signal[ticker] = base_signal
+
+            position_pct = allocation / self.config.portfolio_value
+
+            return {
+                "signal": base_signal,
+                "confidence": round(confidence, 3),
+                "allocation": round(allocation, 2),
+                "position_pct": round(position_pct, 4)
+            }
