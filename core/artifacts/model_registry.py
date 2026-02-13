@@ -4,6 +4,7 @@ import datetime
 import shutil
 import hashlib
 import uuid
+import time
 from typing import Dict, Any
 
 from core.schema.feature_schema import get_schema_signature
@@ -107,6 +108,24 @@ class ModelRegistry:
     ########################################################
 
     @staticmethod
+    def _manifest_hash(manifest: dict):
+
+        clone = dict(manifest)
+        clone.pop("manifest_integrity_hash", None)
+
+        normalized = ModelRegistry._normalize_for_hash(clone)
+
+        canonical = json.dumps(
+            normalized,
+            sort_keys=True,
+            separators=(",", ":")
+        ).encode()
+
+        return hashlib.sha256(canonical).hexdigest()
+
+    ########################################################
+
+    @staticmethod
     def _atomic_json_write(path: str, payload: dict):
 
         tmp = path + ".tmp"
@@ -131,50 +150,40 @@ class ModelRegistry:
                     pass
 
     ########################################################
+    # PROMOTION LOCK
+    ########################################################
 
     @staticmethod
-    def _manifest_hash(manifest: dict):
+    def _acquire_lock(base_dir):
 
-        clone = dict(manifest)
-        clone.pop("manifest_integrity_hash", None)
+        lock_path = os.path.join(base_dir, ModelRegistry.PROMOTION_LOCK)
 
-        normalized = ModelRegistry._normalize_for_hash(clone)
+        if os.path.exists(lock_path):
 
-        canonical = json.dumps(
-            normalized,
-            sort_keys=True,
-            separators=(",", ":")
-        ).encode()
+            age = time.time() - os.path.getmtime(lock_path)
 
-        return hashlib.sha256(canonical).hexdigest()
+            if age < ModelRegistry.LOCK_TIMEOUT_SECONDS:
+                raise RuntimeError("Registry promotion locked.")
+
+            os.remove(lock_path)
+
+        with open(lock_path, "w") as f:
+            f.write(str(os.getpid()))
+
+        return lock_path
 
     ########################################################
 
     @staticmethod
-    def _validate_parent(base_dir: str, parent_version: str, meta: dict):
+    def _release_lock(lock_path):
 
-        parent_manifest_path = ModelRegistry._safe_join(
-            base_dir,
-            parent_version,
-            ModelRegistry.MANIFEST_NAME
-        )
+        try:
+            os.remove(lock_path)
+        except Exception:
+            pass
 
-        if not os.path.exists(parent_manifest_path):
-            raise RuntimeError("Parent manifest not found.")
-
-        with open(parent_manifest_path) as f:
-            parent = json.load(f)
-
-        if parent["schema_signature"] != meta["schema_signature"]:
-            raise RuntimeError("Parent schema mismatch detected.")
-
-        if parent.get("training_code_hash") != meta["training_code_hash"]:
-            raise RuntimeError("Parent training code mismatch.")
-
-        if parent.get("universe_hash") != \
-           meta["training_universe"]["universe_hash"]:
-            raise RuntimeError("Parent universe mismatch detected.")
-
+    ########################################################
+    # VERIFY ARTIFACTS
     ########################################################
 
     @staticmethod
@@ -218,6 +227,8 @@ class ModelRegistry:
                 )
 
     ########################################################
+    # REGISTER MODEL
+    ########################################################
 
     @staticmethod
     def register_model(
@@ -233,13 +244,6 @@ class ModelRegistry:
         meta = MetadataManager.load_metadata(metadata_path)
 
         ModelRegistry._validate_metadata_structure(meta)
-
-        if parent_version:
-            ModelRegistry._validate_parent(
-                base_dir,
-                parent_version,
-                meta
-            )
 
         version = ModelRegistry._version()
 
@@ -267,7 +271,6 @@ class ModelRegistry:
             shutil.copy2(model_path, staged_model)
             shutil.copy2(metadata_path, staged_meta)
 
-            # pre/post hash
             if ModelRegistry._sha256(model_path) != \
                ModelRegistry._sha256(staged_model):
                 raise RuntimeError(
@@ -328,3 +331,79 @@ class ModelRegistry:
                 shutil.rmtree(staging_dir, ignore_errors=True)
 
             raise
+
+    ########################################################
+    # LATEST POINTER
+    ########################################################
+
+    @staticmethod
+    def _write_latest(base_dir, version):
+
+        payload = {
+            "version": version,
+            "updated_utc": datetime.datetime.utcnow().isoformat()
+        }
+
+        path = os.path.join(base_dir, ModelRegistry.LATEST_POINTER)
+
+        ModelRegistry._atomic_json_write(path, payload)
+
+    ########################################################
+    # PROMOTE MODEL
+    ########################################################
+
+    @staticmethod
+    def promote_to_production(base_dir: str, version: str):
+
+        base_dir = os.path.realpath(base_dir)
+
+        lock = ModelRegistry._acquire_lock(base_dir)
+
+        try:
+
+            ModelRegistry.verify_artifacts(base_dir, version)
+
+            manifest_path = os.path.join(
+                base_dir,
+                version,
+                ModelRegistry.MANIFEST_NAME
+            )
+
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+
+            manifest["stage"] = "production"
+            manifest["promoted_utc"] = datetime.datetime.utcnow().isoformat()
+
+            manifest["manifest_integrity_hash"] = (
+                ModelRegistry._manifest_hash(manifest)
+            )
+
+            ModelRegistry._atomic_json_write(
+                manifest_path,
+                manifest
+            )
+
+            ModelRegistry._write_latest(base_dir, version)
+
+            ModelRegistry._fsync_dir(base_dir)
+
+        finally:
+            ModelRegistry._release_lock(lock)
+
+    ########################################################
+    # LOAD LATEST
+    ########################################################
+
+    @staticmethod
+    def load_latest_version(base_dir: str) -> str:
+
+        pointer = os.path.join(base_dir, ModelRegistry.LATEST_POINTER)
+
+        if not os.path.exists(pointer):
+            raise RuntimeError("No production model found.")
+
+        with open(pointer) as f:
+            payload = json.load(f)
+
+        return payload["version"]
