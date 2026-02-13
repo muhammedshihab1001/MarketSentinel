@@ -2,8 +2,8 @@ import os
 import logging
 import hashlib
 import re
-import inspect
 import sys
+import platform
 from typing import Optional
 
 import pandas as pd
@@ -21,11 +21,11 @@ logger = logging.getLogger("marketsentinel.feature_store")
 
 class FeatureStore:
 
-    FEATURE_DIR = "data/features"
+    FEATURE_DIR = os.path.abspath("data/features")
 
     REQUIRED_COLUMNS = {"date", "close"}
 
-    CACHE_VERSION = "v4"
+    CACHE_VERSION = "v5"
     MAX_CACHE_FILES_PER_TICKER = 6
 
     ##################################################
@@ -36,13 +36,11 @@ class FeatureStore:
 
         self.engineer = FeatureEngineer()
 
-        self.schema_hash = hashlib.sha256(
-            get_schema_signature().encode()
-        ).hexdigest()[:12]
+        self.schema_hash = get_schema_signature()[:12]
 
         self.engineer_hash = self._fingerprint_engineer()[:12]
 
-        self.env_hash = self._environment_fingerprint()[:8]
+        self.env_hash = self._environment_fingerprint()[:12]
 
     ##################################################
     # SAFE TICKER
@@ -52,19 +50,24 @@ class FeatureStore:
         return re.sub(r"[^A-Za-z0-9_]", "_", ticker)
 
     ##################################################
-    # ENGINEER FINGERPRINT — FULL SOURCE
+    # ENGINEER FINGERPRINT — MODULE BYTES
     ##################################################
 
     def _fingerprint_engineer(self) -> str:
 
-        try:
-            source = inspect.getsource(FeatureEngineer)
-        except Exception:
+        module_path = sys.modules[
+            FeatureEngineer.__module__
+        ].__file__
+
+        if not module_path or not os.path.exists(module_path):
             raise RuntimeError(
-                "Unable to fingerprint FeatureEngineer source."
+                "Unable to fingerprint FeatureEngineer module."
             )
 
-        return hashlib.sha256(source.encode()).hexdigest()
+        with open(module_path, "rb") as f:
+            payload = f.read()
+
+        return hashlib.sha256(payload).hexdigest()
 
     ##################################################
     # ENVIRONMENT FINGERPRINT
@@ -74,6 +77,9 @@ class FeatureStore:
 
         payload = (
             sys.version +
+            platform.platform() +
+            platform.machine() +
+            sys.byteorder +
             pd.__version__ +
             np.__version__
         )
@@ -81,7 +87,30 @@ class FeatureStore:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     ##################################################
-    # FULL DATASET HASH
+    # CANONICAL DATASET HASH
+    ##################################################
+
+    def _canonicalize_df(self, df: pd.DataFrame):
+
+        df = df.copy()
+
+        for col in df.columns:
+
+            if col == "date":
+                df[col] = pd.to_datetime(
+                    df[col],
+                    utc=True,
+                    errors="raise"
+                )
+                continue
+
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="raise"
+            ).astype("float64")
+
+        return df.sort_values("date").reset_index(drop=True)
+
     ##################################################
 
     def _dataset_hash(
@@ -92,7 +121,7 @@ class FeatureStore:
 
         h = hashlib.sha256()
 
-        price_df = price_df.sort_values("date")
+        price_df = self._canonicalize_df(price_df)
 
         price_arr = pd.util.hash_pandas_object(
             price_df,
@@ -103,7 +132,7 @@ class FeatureStore:
 
         if sentiment_df is not None and not sentiment_df.empty:
 
-            sentiment_df = sentiment_df.sort_values("date")
+            sentiment_df = self._canonicalize_df(sentiment_df)
 
             sent_arr = pd.util.hash_pandas_object(
                 sentiment_df,
@@ -137,7 +166,23 @@ class FeatureStore:
         )
 
     ##################################################
-    # CACHE PRUNING
+    # DIRECTORY FSYNC
+    ##################################################
+
+    def _fsync_dir(self, path):
+
+        if os.name == "nt":
+            return
+
+        fd = os.open(path, os.O_DIRECTORY)
+
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    ##################################################
+    # CACHE PRUNING (DETERMINISTIC)
     ##################################################
 
     def _prune_cache(self, ticker):
@@ -149,9 +194,6 @@ class FeatureStore:
                 f for f in os.listdir(self.FEATURE_DIR)
                 if f"_{ticker}_" in f
             ],
-            key=lambda x: os.path.getmtime(
-                os.path.join(self.FEATURE_DIR, x)
-            ),
             reverse=True
         )
 
@@ -161,21 +203,6 @@ class FeatureStore:
                 os.remove(os.path.join(self.FEATURE_DIR, old))
             except Exception:
                 logger.warning("Failed pruning cache file: %s", old)
-
-    ##################################################
-    # FSYNC
-    ##################################################
-
-    def _fsync_file(self, path):
-
-        if os.name == "nt":
-            return
-
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
 
     ##################################################
     # VALIDATION
@@ -210,9 +237,6 @@ class FeatureStore:
 
         feature_block = df.loc[:, MODEL_FEATURES]
 
-        if list(feature_block.columns) != list(MODEL_FEATURES):
-            raise RuntimeError("Feature ordering violation.")
-
         validate_feature_schema(feature_block)
 
         arr = feature_block.to_numpy(dtype=float)
@@ -220,18 +244,16 @@ class FeatureStore:
         if not np.isfinite(arr).all():
             raise RuntimeError("Non-finite feature values.")
 
-        if np.isnan(arr[0]).any():
-            raise RuntimeError(
-                "Feature warmup NaNs detected — pipeline unsafe."
-            )
-
         df.to_parquet(tmp_path, index=False)
 
-        self._fsync_file(tmp_path)
+        if os.name != "nt":
+            fd = os.open(tmp_path, os.O_RDONLY)
+            os.fsync(fd)
+            os.close(fd)
 
         os.replace(tmp_path, path)
 
-        self._fsync_file(path)
+        self._fsync_dir(self.FEATURE_DIR)
 
     ##################################################
     # SAFE LOAD
@@ -240,6 +262,15 @@ class FeatureStore:
     def _load_features(self, path: str) -> Optional[pd.DataFrame]:
 
         if not os.path.exists(path):
+            return None
+
+        filename = os.path.basename(path)
+
+        if self.schema_hash not in filename \
+           or self.engineer_hash not in filename \
+           or self.env_hash not in filename:
+
+            logger.warning("Feature lineage mismatch — rebuilding.")
             return None
 
         try:
