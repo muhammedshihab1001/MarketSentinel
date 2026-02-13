@@ -2,6 +2,7 @@ from typing import Tuple, Dict
 import hashlib
 import json
 import os
+import threading
 
 
 class MarketUniverse:
@@ -16,9 +17,14 @@ class MarketUniverse:
     ✔ audit safe
     ✔ mutation proof
     ✔ lineage traceable
+    ✔ thread safe
     """
 
     UNIVERSE_FILE = "config/universe.json"
+    MIN_FILE_BYTES = 20
+
+    _CACHE = None
+    _LOCK = threading.Lock()
 
     ###################################################
     # LOAD
@@ -32,16 +38,49 @@ class MarketUniverse:
                 f"Universe file missing: {cls.UNIVERSE_FILE}"
             )
 
-        with open(cls.UNIVERSE_FILE, "r") as f:
-            payload = json.load(f)
+        if os.path.getsize(cls.UNIVERSE_FILE) < cls.MIN_FILE_BYTES:
+            raise RuntimeError(
+                "Universe file corrupted or truncated."
+            )
 
-        if "version" not in payload or "tickers" not in payload:
-            raise RuntimeError("Invalid universe config.")
+        try:
+            with open(cls.UNIVERSE_FILE, "r") as f:
+                payload = json.load(f)
+
+        except Exception as exc:
+            raise RuntimeError(
+                "Universe config unreadable."
+            ) from exc
+
+        #################################################
+        # STRICT SCHEMA
+        #################################################
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("Universe payload must be dict.")
+
+        if "version" not in payload:
+            raise RuntimeError("Universe missing version.")
+
+        if "tickers" not in payload:
+            raise RuntimeError("Universe missing tickers.")
+
+        version = payload["version"]
+
+        if not isinstance(version, str):
+            raise RuntimeError(
+                "Universe version must be string."
+            )
 
         tickers = payload["tickers"]
 
-        if not isinstance(tickers, list) or not tickers:
-            raise RuntimeError("Universe tickers invalid.")
+        if not isinstance(tickers, list):
+            raise RuntimeError(
+                "Universe tickers must be list."
+            )
+
+        if not tickers:
+            raise RuntimeError("Universe cannot be empty.")
 
         #################################################
         # NORMALIZE + VALIDATE
@@ -67,25 +106,27 @@ class MarketUniverse:
         if len(normalized) < 5:
             raise RuntimeError("Universe too small.")
 
-        return payload["version"], tuple(sorted(normalized))
+        return version, tuple(sorted(normalized))
 
     ###################################################
-    # CACHE (immutable)
+    # CACHE (THREAD SAFE)
     ###################################################
-
-    _CACHE = None
 
     @classmethod
     def _get_cached(cls):
 
         if cls._CACHE is None:
 
-            version, tickers = cls._load_file()
+            with cls._LOCK:
 
-            cls._CACHE = {
-                "version": version,
-                "tickers": tickers
-            }
+                if cls._CACHE is None:
+
+                    version, tickers = cls._load_file()
+
+                    cls._CACHE = {
+                        "version": version,
+                        "tickers": tickers
+                    }
 
         return cls._CACHE
 
@@ -101,15 +142,15 @@ class MarketUniverse:
         return cls._get_cached()["tickers"]
 
     ###################################################
-    # FINGERPRINT
+    # FINGERPRINT (CANONICAL)
     ###################################################
 
     @classmethod
     def fingerprint(cls) -> str:
 
         contract = {
+            "tickers": list(cls.get_universe()),
             "version": cls._get_cached()["version"],
-            "tickers": cls.get_universe(),
         }
 
         canonical = json.dumps(
