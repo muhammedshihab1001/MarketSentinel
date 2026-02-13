@@ -41,6 +41,24 @@ class WalkForwardValidator:
         self.regime_detector = MarketRegimeDetector()
 
     ############################################
+    # HARD TEMPORAL GUARD
+    ############################################
+
+    def _assert_no_future_leak(self, train_df, test_df):
+
+        if train_df["date"].max() >= test_df["date"].min():
+            raise RuntimeError(
+                "Temporal boundary violated — future leakage detected."
+            )
+
+        overlap = set(train_df.index) & set(test_df.index)
+
+        if overlap:
+            raise RuntimeError(
+                "Train/Test index overlap — leakage."
+            )
+
+    ############################################
 
     def _assert_monotonic(self, df):
 
@@ -51,6 +69,19 @@ class WalkForwardValidator:
                 raise RuntimeError(
                     f"Non-monotonic dates detected for {ticker}"
                 )
+
+    ############################################
+    # SURVIVORSHIP GUARD
+    ############################################
+
+    def _validate_survivorship(self, df):
+
+        coverage = df.groupby("ticker").size()
+
+        if (coverage < self.window_size * 0.60).any():
+            raise RuntimeError(
+                "Survivorship bias risk — assets missing large history."
+            )
 
     ############################################
 
@@ -77,6 +108,8 @@ class WalkForwardValidator:
                 "Training window too small after embargo."
             )
 
+        self._validate_survivorship(df)
+
     ############################################
 
     def _sanity_check_model(self, model, sample_df):
@@ -96,7 +129,6 @@ class WalkForwardValidator:
         if not np.isfinite(probs).all():
             raise RuntimeError("Non-finite predictions.")
 
-        # 🔴 NEW — probability collapse guard
         if np.std(probs) < 5e-5:
             raise RuntimeError("Model collapsed.")
 
@@ -168,11 +200,14 @@ class WalkForwardValidator:
         sharpe_series = []
 
         initial_capital = 10_000.0
+
         start_idx = self.window_size
+
+        # randomize window start to avoid lucky cycle alignment
+        start_idx += np.random.randint(0, self.step_size)
 
         while start_idx < len(unique_dates) - 1:
 
-            # 🔴 Force window independence
             model = None
 
             train_end_date = unique_dates.iloc[start_idx]
@@ -181,16 +216,20 @@ class WalkForwardValidator:
                 days=self.EMBARGO_DAYS
             )
 
+            # TIME-STABLE WINDOW (NOT ROW-STABLE)
+            train_start_cut = embargo_cutoff - pd.Timedelta(days=370)
+
             train_dates = unique_dates[
-                unique_dates < embargo_cutoff
-            ].tail(self.window_size)
+                (unique_dates >= train_start_cut) &
+                (unique_dates < embargo_cutoff)
+            ]
 
             if len(train_dates) < self.window_size * self.MIN_TRAIN_RATIO:
                 start_idx += self.step_size
                 continue
 
             test_dates = unique_dates[
-                (unique_dates >= train_end_date)
+                unique_dates >= train_end_date
             ][:self.step_size + 1]
 
             if len(test_dates) < 2:
@@ -206,11 +245,13 @@ class WalkForwardValidator:
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
-            # 🔴 CRITICAL FIX — compute regime AFTER split (no leakage)
-            train_df = self.regime_detector.detect(train_df)
-            test_df = self.regime_detector.detect(test_df)
+            # HARD LEAK CHECK
+            self._assert_no_future_leak(train_df, test_df)
 
-            # 🔴 Schema re-validation after regime injection
+            # regime injection with defensive copy
+            train_df = self.regime_detector.detect(train_df.copy())
+            test_df = self.regime_detector.detect(test_df.copy())
+
             validate_feature_schema(train_df.loc[:, MODEL_FEATURES])
             validate_feature_schema(test_df.loc[:, MODEL_FEATURES])
 
@@ -276,7 +317,6 @@ class WalkForwardValidator:
                 start_idx += self.step_size
                 continue
 
-            # 🔴 FIX — remove path-dependent capital bias
             metrics = self.engine.run(
                 grouped_prices,
                 grouped_signals,
@@ -287,6 +327,12 @@ class WalkForwardValidator:
 
             if not np.isfinite(curve).all():
                 raise RuntimeError("Equity curve corrupted.")
+
+            # CAPITAL EXPLOSION GUARD
+            if curve[-1] > initial_capital * self.MAX_CAPITAL_MULTIPLE:
+                raise RuntimeError(
+                    "Equity explosion detected — likely simulation bug."
+                )
 
             if equity_curve:
                 equity_curve.extend(curve[1:].tolist())
