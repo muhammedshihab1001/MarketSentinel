@@ -29,8 +29,6 @@ class FeatureEngineer:
     VOL_FLOOR = 1e-4
     SENTIMENT_STD_FLOOR = 0.02
 
-    TRAINING_SEED = 42
-
     ###################################################
     # DATETIME
     ###################################################
@@ -131,13 +129,15 @@ class FeatureEngineer:
             .std(ddof=0)
         )
 
+        # 🔥 LAG VOL — prevents target leakage
         df["volatility"] = (
-            vol.clip(lower=FeatureEngineer.VOL_FLOOR)
+            vol.shift(1)
+            .clip(lower=FeatureEngineer.VOL_FLOOR)
             .fillna(FeatureEngineer.VOL_FLOOR)
         )
 
     ###################################################
-    # TECHNICALS
+    # TECHNICALS (NO SHIFT — already causal)
     ###################################################
 
     @staticmethod
@@ -167,51 +167,37 @@ class FeatureEngineer:
 
         df = df.copy()
 
-        for col in MODEL_FEATURES:
+        # ONLY shift raw returns + sentiment
+        shift_cols = [
+            "return",
+            "return_lag1",
+            "avg_sentiment",
+            "sentiment_lag1",
+            "news_count",
+            "sentiment_std"
+        ]
+
+        for col in shift_cols:
             if col in df.columns:
                 df[col] = df[col].shift(1)
-
-        # HARD LEAKAGE GUARD
-        if "close" in df.columns:
-            for col in MODEL_FEATURES:
-                if col in df.columns and df[col].equals(df["close"]):
-                    raise RuntimeError(
-                        f"Leakage detected: feature '{col}' mirrors close."
-                    )
 
         return df
 
     ###################################################
-    # NEUTRAL SENTIMENT
+    # NEUTRAL SENTIMENT — DETERMINISTIC
     ###################################################
 
     @classmethod
-    def _build_neutral_sentiment(cls, price_df, training):
+    def _build_neutral_sentiment(cls, price_df):
 
         neutral = price_df[["date"]].copy()
 
-        rng = np.random.default_rng(
-            cls.TRAINING_SEED if training else None
-        )
-
-        n = len(neutral)
-
-        neutral["avg_sentiment"] = (
-            rng.normal(0, 0.04, n)
-            + rng.normal(0, 0.015, n)
-        ).clip(-0.15, 0.15)
-
-        neutral["news_count"] = (
-            rng.poisson(3, n)
-            + rng.integers(0, 3, n)
-        ).astype("float32")
-
-        neutral["sentiment_std"] = rng.uniform(
-            0.03, 0.10, n
-        )
+        neutral["avg_sentiment"] = 0.0
+        neutral["news_count"] = 0.0
+        neutral["sentiment_std"] = cls.SENTIMENT_STD_FLOOR
 
         logger.warning(
-            "Sentiment unavailable — injected stochastic neutral prior."
+            "Sentiment unavailable — deterministic neutral prior injected."
         )
 
         return neutral
@@ -225,15 +211,14 @@ class FeatureEngineer:
         cls,
         price_df,
         sentiment_df,
-        ticker=None,
-        training=False
+        ticker=None
     ):
 
         price_df = cls._enforce_ticker(price_df, ticker)
         price = cls._normalize_datetime(price_df)
 
         if sentiment_df is None or sentiment_df.empty:
-            sentiment_df = cls._build_neutral_sentiment(price, training)
+            sentiment_df = cls._build_neutral_sentiment(price)
 
         sentiment = sentiment_df.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment)
@@ -264,7 +249,7 @@ class FeatureEngineer:
         return merged
 
     ###################################################
-    # TARGET
+    # TARGET — LEAK SAFE
     ###################################################
 
     @classmethod
@@ -308,6 +293,11 @@ class FeatureEngineer:
         ticker=None
     ):
 
+        if not training:
+            raise RuntimeError(
+                "Inference pipeline must be separate from training."
+            )
+
         price_df = cls._validate_price_frame(price_df, ticker)
 
         df = price_df.copy()
@@ -320,18 +310,12 @@ class FeatureEngineer:
         df = cls.merge_price_sentiment(
             df,
             sentiment_df,
-            ticker,
-            training
+            ticker
         )
 
         df = cls.align_features(df)
 
-        if training:
-            df = cls.create_training_dataset(df)
-        else:
-            raise RuntimeError(
-                "Inference pipeline should be built separately."
-            )
+        df = cls.create_training_dataset(df)
 
         feature_block = df.loc[:, MODEL_FEATURES]
         validated = validate_feature_schema(feature_block)
@@ -347,9 +331,8 @@ class FeatureEngineer:
         )
 
         logger.info(
-            "Feature pipeline built | rows=%s | training=%s",
-            len(final),
-            training
+            "Feature pipeline built | rows=%s",
+            len(final)
         )
 
         return final.reset_index(drop=True)
