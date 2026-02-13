@@ -24,7 +24,7 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v8"   # 🔥 bump version to invalidate old broken cache
+    CACHE_VERSION = "v8"  # 🔥 bump cache version after bug fix
     MAX_CACHE_FILES_PER_TICKER = 6
 
     MIN_ROWS_REQUIRED = 100
@@ -84,22 +84,16 @@ class FeatureStore:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     ##################################################
-    # 🔥 FIXED — SAFE CANONICALIZATION
+    # 🚨 CRITICAL FIX — DO NOT NUMERIC CAST IDENTIFIERS
     ##################################################
 
     def _canonicalize_df(self, df: pd.DataFrame):
-
-        """
-        Creates a deterministic dataframe for hashing.
-        CRITICAL:
-        - NEVER numeric-coerce ticker
-        - NEVER destroy date dtype
-        """
 
         df = df.copy()
 
         for col in df.columns:
 
+            # NEVER cast identifiers
             if col == "date":
                 df[col] = pd.to_datetime(
                     df[col],
@@ -118,7 +112,7 @@ class FeatureStore:
                 .round(10)
             )
 
-        return df.sort_values(["ticker", "date"]).reset_index(drop=True)
+        return df.sort_values("date").reset_index(drop=True)
 
     ##################################################
 
@@ -307,11 +301,6 @@ class FeatureStore:
                 df.loc[:, MODEL_FEATURES]
             )
 
-            if not np.isfinite(
-                df.loc[:, MODEL_FEATURES].to_numpy()
-            ).all():
-                raise RuntimeError("Corrupted feature file.")
-
             return df.sort_values("date")
 
         except Exception:
@@ -334,7 +323,7 @@ class FeatureStore:
     def get_features(
         self,
         price_df: pd.DataFrame,
-        sentiment_df: Optional[pd.DataFrame],
+        sentiment_df: pd.DataFrame,
         ticker: str = "unknown",
         training: bool = False
     ):
@@ -361,15 +350,14 @@ class FeatureStore:
             return stored
 
         logger.info(
-            "Feature cache miss or lineage change — rebuilding."
+            "Feature cache miss — rebuilding."
         )
 
-        # 🔥 PASS TICKER INTO ENGINEER (CRITICAL)
         features = self.engineer.build_feature_pipeline(
             price_df,
             sentiment_df,
             training=training,
-            ticker=ticker
+            ticker=ticker  # 🔥 VERY IMPORTANT
         )
 
         self._atomic_write(
