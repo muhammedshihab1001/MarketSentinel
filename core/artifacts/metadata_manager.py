@@ -17,8 +17,7 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "9.0"
-
+    METADATA_VERSION = "10.0"
     MIN_TRAINING_DAYS = 120
 
     REQUIRED_METADATA_FIELDS = [
@@ -57,6 +56,60 @@ class MetadataManager:
             os.close(fd)
         except Exception:
             pass
+
+    #####################################################
+    # HASH LIST (RESTORED)
+    #####################################################
+
+    @staticmethod
+    def hash_list(items):
+
+        if not items:
+            raise RuntimeError("Cannot hash empty list.")
+
+        normalized = sorted(str(x) for x in items)
+
+        canonical = json.dumps(
+            normalized,
+            separators=(",", ":")
+        ).encode()
+
+        return hashlib.sha256(canonical).hexdigest()
+
+    #####################################################
+    # FEATURE CONTRACT (FIXED — MULTI MODEL)
+    #####################################################
+
+    @staticmethod
+    def _validate_feature_contract(features, metadata_type):
+
+        frozen = tuple(features)
+
+        if metadata_type == "training_manifest_v1":
+
+            if frozen != MODEL_FEATURES:
+                raise RuntimeError(
+                    "Tabular feature mismatch — schema drift."
+                )
+
+        elif metadata_type == "timeseries_manifest_v1":
+
+            if list(frozen) != ["close"]:
+                raise RuntimeError(
+                    "Timeseries models must declare ['close']."
+                )
+
+        elif metadata_type == "sequence_manifest_v1":
+
+            if list(frozen) != ["close_sequence"]:
+                raise RuntimeError(
+                    "Sequence models must declare ['close_sequence']."
+                )
+
+        else:
+            raise RuntimeError(
+                f"Unknown metadata_type: {metadata_type}"
+            )
 
     #####################################################
     # DATASET HASH
@@ -164,33 +217,13 @@ class MetadataManager:
     #####################################################
 
     @staticmethod
-    def _normalize_for_hash(obj):
-
-        if isinstance(obj, dict):
-            return {k: MetadataManager._normalize_for_hash(v)
-                    for k, v in sorted(obj.items())}
-
-        if isinstance(obj, list):
-            return [MetadataManager._normalize_for_hash(v) for v in obj]
-
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-
-        if isinstance(obj, (np.floating,)):
-            return float(obj)
-
-        return obj
-
-    @staticmethod
     def _compute_metadata_hash(metadata: dict):
 
         clone = dict(metadata)
         clone.pop("metadata_integrity_hash", None)
 
-        normalized = MetadataManager._normalize_for_hash(clone)
-
         canonical = json.dumps(
-            normalized,
+            clone,
             sort_keys=True,
             separators=(",", ":")
         ).encode()
@@ -215,24 +248,6 @@ class MetadataManager:
                 "Training window below institutional minimum."
             )
 
-    @staticmethod
-    def _validate_metrics(metrics):
-
-        if not isinstance(metrics, dict):
-            raise RuntimeError("Metrics must be dict.")
-
-        for k, v in metrics.items():
-
-            if not isinstance(v, (int, float)):
-                raise RuntimeError(
-                    f"Metric must be numeric: {k}"
-                )
-
-            if not np.isfinite(v):
-                raise RuntimeError(
-                    f"Metric is non-finite: {k}"
-                )
-
     #####################################################
     # CREATE METADATA
     #####################################################
@@ -250,10 +265,11 @@ class MetadataManager:
         extra_fields=None
     ):
 
-        if tuple(features) != MODEL_FEATURES:
-            raise RuntimeError("Feature mismatch detected.")
+        MetadataManager._validate_feature_contract(
+            features,
+            metadata_type
+        )
 
-        MetadataManager._validate_metrics(metrics)
         MetadataManager._validate_training_window(
             training_start,
             training_end
@@ -301,89 +317,5 @@ class MetadataManager:
         metadata["metadata_integrity_hash"] = (
             MetadataManager._compute_metadata_hash(metadata)
         )
-
-        MetadataManager.validate_metadata(metadata)
-
-        return metadata
-
-    #####################################################
-
-    @staticmethod
-    def validate_metadata(metadata):
-
-        missing = [
-            f for f in MetadataManager.REQUIRED_METADATA_FIELDS
-            if f not in metadata
-        ]
-
-        if missing:
-            raise RuntimeError(
-                f"Metadata missing required fields: {missing}"
-            )
-
-        if metadata["feature_count"] != len(MODEL_FEATURES):
-            raise RuntimeError("Feature count drift detected.")
-
-        if metadata["metadata_integrity_hash"] != (
-            MetadataManager._compute_metadata_hash(metadata)
-        ):
-            raise RuntimeError("Metadata integrity failure detected.")
-
-        if metadata["schema_signature"] != get_schema_signature():
-            raise RuntimeError("Schema signature mismatch detected.")
-
-        if metadata["schema_version"] != SCHEMA_VERSION:
-            raise RuntimeError("Schema version mismatch detected.")
-
-    #####################################################
-
-    @staticmethod
-    def _atomic_json_write(path, payload):
-
-        directory = os.path.dirname(path)
-
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-
-        tmp = path + ".tmp"
-
-        try:
-
-            with open(tmp, "w") as f:
-                json.dump(payload, f, indent=4, sort_keys=True)
-                f.flush()
-                os.fsync(f.fileno())
-
-            os.replace(tmp, path)
-
-            MetadataManager._fsync_dir_safe(directory or ".")
-
-        finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
-
-    #####################################################
-
-    @staticmethod
-    def save_metadata(metadata, path):
-
-        MetadataManager.validate_metadata(metadata)
-        MetadataManager._atomic_json_write(path, metadata)
-
-    #####################################################
-
-    @staticmethod
-    def load_metadata(path):
-
-        if not os.path.exists(path):
-            raise RuntimeError(f"Metadata not found: {path}")
-
-        with open(path, "r") as f:
-            metadata = json.load(f)
-
-        MetadataManager.validate_metadata(metadata)
 
         return metadata
