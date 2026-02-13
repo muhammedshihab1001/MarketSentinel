@@ -6,7 +6,7 @@ import json
 import re
 
 
-SCHEMA_VERSION = "11.0"
+SCHEMA_VERSION = "12.0"   # 🔥 bump version whenever contract changes
 
 
 ############################################################
@@ -28,8 +28,7 @@ MODEL_FEATURES: Tuple[str, ...] = (
 
 FEATURE_COUNT = len(MODEL_FEATURES)
 
-DTYPE = "float32"
-
+DTYPE = np.float32
 MIN_ROWS = 120
 
 MAX_NAN_RATIO_PER_FEATURE = 0.05
@@ -95,7 +94,7 @@ def _build_feature_lock():
 
     contract = {
         "features": MODEL_FEATURES,
-        "dtype": DTYPE,
+        "dtype": "float32",
         "limits": FEATURE_LIMITS,
         "nan_feature": MAX_NAN_RATIO_PER_FEATURE,
         "nan_row": MAX_ROW_NAN_RATIO,
@@ -142,18 +141,16 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     _check_forbidden_columns(df)
 
-    missing_limits = set(MODEL_FEATURES) - set(FEATURE_LIMITS.keys())
+    ########################################################
+    # HARD NUMERIC CAST (prevents ticker parsing bug)
+    ########################################################
 
-    if missing_limits:
+    try:
+        feature_df = df.astype("float64", copy=True)
+    except Exception as e:
         raise RuntimeError(
-            f"Missing feature limits for: {missing_limits}"
+            f"Non-numeric feature detected → {e}"
         )
-
-    ########################################################
-    # VALIDATE IN FLOAT64 FIRST
-    ########################################################
-
-    feature_df = df.astype("float64", copy=True)
 
     feature_df.replace(
         [np.inf, -np.inf],
@@ -161,17 +158,13 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         inplace=True
     )
 
+    ########################################################
+    # VARIANCE + CONSTANT CHECK
+    ########################################################
+
     for col in MODEL_FEATURES:
 
-        series = pd.to_numeric(
-            feature_df[col],
-            errors="coerce"
-        )
-
-        if series.isna().sum() > feature_df[col].isna().sum():
-            raise RuntimeError(
-                f"Numeric coercion introduced NaNs in feature: {col}"
-            )
+        series = feature_df[col]
 
         finite_vals = series[np.isfinite(series)]
 
@@ -234,7 +227,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             )
 
     ########################################################
-    # FINAL CAST → FLOAT32
+    # CONTIGUOUS FLOAT32 BLOCK
     ########################################################
 
     arr = np.ascontiguousarray(
@@ -245,7 +238,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         raise RuntimeError("Feature block not float32.")
 
     return pd.DataFrame(
-        arr.copy(),
+        arr,
         columns=MODEL_FEATURES
     )
 
@@ -257,7 +250,8 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 def get_schema_signature() -> str:
 
     contract = {
-        "lock": FEATURE_LOCK_HASH
+        "lock": FEATURE_LOCK_HASH,
+        "version": SCHEMA_VERSION
     }
 
     canonical = json.dumps(contract, sort_keys=True)
