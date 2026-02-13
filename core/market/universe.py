@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Dict
 import hashlib
 import json
 
@@ -8,40 +8,47 @@ class MarketUniverse:
     Institutional Universe Controller.
 
     Guarantees:
-    ✔ deterministic asset list
-    ✔ fingerprinted universe
-    ✔ audit-safe
-    ✔ mutation-proof
-    ✔ duplicate-proof
-    ✔ lineage traceable
+    deterministic asset list
+    fingerprinted universe
+    audit-safe
+    mutation-proof
+    duplicate-proof
+    lineage traceable
     """
 
-    ###################################################
-    # DO NOT MODIFY WITHOUT GOVERNANCE
-    ###################################################
+    UNIVERSE_VERSION = "2.0"
 
     _TRAINING_UNIVERSE = tuple(sorted([
 
-        # Mega-cap tech
         "AAPL","MSFT","NVDA","AMZN",
         "GOOGL","META","TSLA",
 
-        # Financials
         "JPM","GS",
 
-        # Energy
         "XOM",
 
-        # Semis
         "AMD","AVGO",
 
-        # Market structure proxies
         "SPY","QQQ"
     ]))
 
     ###################################################
-    # INTERNAL VALIDATION (runs at import)
+    # INTERNAL VALIDATION
     ###################################################
+
+    for t in _TRAINING_UNIVERSE:
+
+        if not isinstance(t, str):
+            raise RuntimeError("Non-string ticker detected.")
+
+        if t.strip() != t:
+            raise RuntimeError("Ticker contains whitespace.")
+
+        if not t.isupper():
+            raise RuntimeError("Tickers must be uppercase.")
+
+        if not t:
+            raise RuntimeError("Empty ticker detected.")
 
     if len(_TRAINING_UNIVERSE) != len(set(_TRAINING_UNIVERSE)):
         raise RuntimeError("Duplicate tickers detected in universe.")
@@ -55,25 +62,28 @@ class MarketUniverse:
 
     @classmethod
     def get_universe(cls) -> List[str]:
-        """
-        Always return a COPY to prevent mutation.
-        """
         return list(cls._TRAINING_UNIVERSE)
 
     ###################################################
-    # FINGERPRINT (⭐ CRITICAL)
+    # FINGERPRINT
     ###################################################
 
     @classmethod
+    def _contract(cls) -> Dict:
+
+        return {
+            "version": cls.UNIVERSE_VERSION,
+            "tickers": list(cls._TRAINING_UNIVERSE),
+            "size": len(cls._TRAINING_UNIVERSE)
+        }
+
+    @classmethod
     def fingerprint(cls) -> str:
-        """
-        Tamper-proof universe hash.
-        Must be stored in metadata.
-        """
 
         canonical = json.dumps(
-            cls._TRAINING_UNIVERSE,
-            sort_keys=True
+            cls._contract(),
+            sort_keys=True,
+            separators=(",", ":")
         ).encode()
 
         return hashlib.sha256(canonical).hexdigest()
@@ -88,9 +98,6 @@ class MarketUniverse:
 
     @classmethod
     def validate_subset(cls, tickers: List[str]):
-        """
-        Prevent silent research corruption.
-        """
 
         unknown = set(tickers) - set(cls._TRAINING_UNIVERSE)
 
@@ -104,13 +111,17 @@ class MarketUniverse:
     ###################################################
 
     @classmethod
-    def snapshot(cls) -> dict:
+    def snapshot(cls) -> Dict:
         """
-        Institutional lineage helper.
+        Snapshot is STRUCTURE LOCKED.
+        Do not modify without version bump.
         """
 
+        contract = cls._contract()
+
         return {
-            "universe_size": len(cls._TRAINING_UNIVERSE),
+            "universe_version": cls.UNIVERSE_VERSION,
             "universe_hash": cls.fingerprint(),
-            "tickers": list(cls._TRAINING_UNIVERSE)
+            "universe_size": contract["size"],
+            "tickers": contract["tickers"]
         }
