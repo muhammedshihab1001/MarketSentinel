@@ -5,12 +5,13 @@ import pandas as pd
 import numpy as np
 import logging
 import time
+import random
 
 from core.config.env_loader import init_env
 from core.data.data_fetcher import StockPriceFetcher
 from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
-from core.features.feature_engineering import FeatureEngineer
+from core.features.feature_store import FeatureStore
 from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema
 
 from core.artifacts.metadata_manager import MetadataManager
@@ -31,7 +32,7 @@ logger = logging.getLogger("marketsentinel.training")
 
 init_env()
 
-MODEL_DIR = "artifacts/xgboost"
+MODEL_DIR = os.path.abspath("artifacts/xgboost")
 TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
 TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
@@ -43,7 +44,7 @@ MAX_DRAWDOWN = -0.40
 
 
 ########################################################
-# STRICT DETERMINISM (CRITICAL FOR AUDIT)
+# STRICT DETERMINISM
 ########################################################
 
 def enforce_determinism():
@@ -53,12 +54,13 @@ def enforce_determinism():
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["TF_DETERMINISTIC_OPS"] = "1"
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
 
+    random.seed(SEED)
     np.random.seed(SEED)
 
 
-########################################################
-# ATOMIC SAVE
 ########################################################
 
 def _fsync_dir(directory):
@@ -72,6 +74,8 @@ def _fsync_dir(directory):
     finally:
         os.close(fd)
 
+
+########################################################
 
 def save_model_atomic(model, path):
 
@@ -90,35 +94,7 @@ def save_model_atomic(model, path):
 
 
 ########################################################
-# NEWS QUERY
-########################################################
-
-def build_news_query(ticker: str):
-
-    COMPANY_MAP = {
-        "AAPL": "Apple",
-        "MSFT": "Microsoft",
-        "NVDA": "Nvidia",
-        "AMZN": "Amazon",
-        "GOOGL": "Google",
-        "META": "Meta",
-        "TSLA": "Tesla",
-        "JPM": "JPMorgan",
-        "GS": "Goldman Sachs",
-        "BAC": "Bank of America",
-        "AMD": "Advanced Micro Devices",
-        "AVGO": "Broadcom",
-        "SPY": "S&P 500 ETF",
-        "QQQ": "Nasdaq 100 ETF"
-    }
-
-    name = COMPANY_MAP.get(ticker, ticker)
-
-    return f'"{name}" OR "{ticker}" stock'
-
-
-########################################################
-# DATA LOADER — CLOCK + UNIVERSE GOVERNED
+# DATA LOADER — FEATURESTORE GOVERNED
 ########################################################
 
 def load_training_data(start_date, end_date):
@@ -126,16 +102,9 @@ def load_training_data(start_date, end_date):
     fetcher = StockPriceFetcher()
     news_fetcher = NewsFetcher()
     sentiment_analyzer = SentimentAnalyzer()
-    engineer = FeatureEngineer()
+    store = FeatureStore()
 
     universe = MarketUniverse.get_universe()
-
-    logger.info(
-        "Training window | %s -> %s | universe=%s",
-        start_date,
-        end_date,
-        len(universe)
-    )
 
     datasets = []
     surviving = []
@@ -153,16 +122,12 @@ def load_training_data(start_date, end_date):
             if price_df is None or price_df.empty:
                 continue
 
-            ###########################################
-            # NEWS RETRY WITH EXP BACKOFF
-            ###########################################
-
             news_df = None
 
             for attempt in range(4):
                 try:
                     news_df = news_fetcher.fetch(
-                        build_news_query(ticker),
+                        f'"{ticker}" stock',
                         max_items=400
                     )
 
@@ -180,9 +145,10 @@ def load_training_data(start_date, end_date):
             scored_df = sentiment_analyzer.analyze_dataframe(news_df)
             sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored_df)
 
-            dataset = engineer.build_feature_pipeline(
+            dataset = store.get_features(
                 price_df,
                 sentiment_df,
+                ticker=ticker,
                 training=True
             )
 
@@ -193,10 +159,6 @@ def load_training_data(start_date, end_date):
 
         except Exception as e:
             logger.warning("Ticker rejected: %s | %s", ticker, str(e))
-
-    ###################################################
-    # COLLAPSE PROTECTION
-    ###################################################
 
     if len(surviving) < MIN_SURVIVING_TICKERS:
         raise RuntimeError(
@@ -213,7 +175,7 @@ def load_training_data(start_date, end_date):
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
-    return df, surviving
+    return df
 
 
 ########################################################
@@ -226,41 +188,29 @@ def main(start_date=None, end_date=None):
 
     logger.info("Institutional XGBoost Training")
 
-    ###################################################
-    # MODEL-SPECIFIC CLOCK
-    ###################################################
-
     if not start_date or not end_date:
         start_date, end_date = MarketTime.window_for("xgboost")
 
-    # 🔥 Freeze time for audit reproducibility
-    MarketTime.freeze_today(end_date)
-
-    df, surviving = load_training_data(start_date, end_date)
-
-    ###################################################
-    # GOVERNANCE HASHES
-    ###################################################
+    df = load_training_data(start_date, end_date)
 
     dataset_hash = MetadataManager.fingerprint_dataset(
         df[["ticker", "date", "target", *MODEL_FEATURES]]
     )
 
-    universe_hash = MetadataManager.hash_list(surviving)
-
     ###################################################
-    # DRIFT BASELINE (CREATE ONLY ONCE)
+    # DRIFT BASELINE — ATOMIC
     ###################################################
 
     drift = DriftDetector()
 
-    if not os.path.exists(DriftDetector.BASELINE_PATH):
-
+    try:
         drift.create_baseline(
             df.loc[:, MODEL_FEATURES],
             dataset_hash=dataset_hash,
             allow_overwrite=False
         )
+    except FileExistsError:
+        pass
 
     ###################################################
     # WALK FORWARD
@@ -272,11 +222,22 @@ def main(start_date=None, end_date=None):
         return model
 
     def signal(model, test):
+
         probs = model.predict_proba(
             test.loc[:, MODEL_FEATURES]
-        )[:, 1]
+        )
 
-        return ["BUY" if p > 0.58 else "HOLD" for p in probs]
+        if probs.ndim != 2:
+            raise RuntimeError("Invalid predict_proba output.")
+
+        probs = probs[:, 1]
+
+        return [
+            "BUY" if p > 0.58
+            else "SELL" if p < 0.42
+            else "HOLD"
+            for p in probs
+        ]
 
     wf = WalkForwardValidator(
         model_trainer=trainer,
@@ -306,7 +267,7 @@ def main(start_date=None, end_date=None):
     save_model_atomic(model, TEMP_MODEL_PATH)
 
     ###################################################
-    # METADATA
+    # METADATA — SNAPSHOT GOVERNED
     ###################################################
 
     metadata = MetadataManager.create_metadata(
@@ -318,8 +279,6 @@ def main(start_date=None, end_date=None):
         dataset_hash=dataset_hash,
         metadata_type="training_manifest_v1",
         extra_fields={
-            "training_universe": surviving,
-            "universe_hash": universe_hash,
             "time_snapshot": MarketTime.snapshot_for("xgboost")
         }
     )
@@ -335,7 +294,6 @@ def main(start_date=None, end_date=None):
         TEMP_METADATA_PATH
     )
 
-    # 🔥 durability guarantee
     _fsync_dir(MODEL_DIR)
 
     logger.info("XGBoost registered → %s", version)
