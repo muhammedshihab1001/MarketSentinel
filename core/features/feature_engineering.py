@@ -37,10 +37,13 @@ class FeatureEngineer:
 
         df = df.copy()
 
-        df["date"] = (
-            pd.to_datetime(df["date"], utc=True)
-            .dt.tz_convert(None)
+        dt = pd.to_datetime(
+            df["date"],
+            utc=True,
+            errors="raise"
         )
+
+        df["date"] = dt.dt.tz_convert("UTC").dt.tz_localize(None)
 
         return df
 
@@ -62,13 +65,13 @@ class FeatureEngineer:
         df = FeatureEngineer._normalize_datetime(df)
         df = df.sort_values("date")
 
+        if not df["date"].is_monotonic_increasing:
+            raise RuntimeError("Price dates must be strictly increasing.")
+
         if df["date"].duplicated().any():
             raise RuntimeError("Duplicate timestamps in price data.")
 
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-
-        if df["close"].isna().any():
-            raise RuntimeError("NaN close prices detected.")
+        df["close"] = pd.to_numeric(df["close"], errors="raise")
 
         if not np.isfinite(df["close"]).all():
             raise RuntimeError("Non-finite close prices detected.")
@@ -82,16 +85,21 @@ class FeatureEngineer:
         return df
 
     ###################################################
-    # FLOAT32 ENFORCEMENT
+    # NUMERIC ENFORCEMENT
     ###################################################
 
     @staticmethod
-    def _enforce_float32(df):
+    def _force_numeric(df):
 
-        for col in df.select_dtypes(include=["float64"]).columns:
-            df[col] = df[col].astype("float32")
+        for col in df.columns:
+            if col == "date":
+                continue
 
-        return df
+            df[col] = pd.to_numeric(df[col], errors="raise")
+
+        return df.astype(
+            {c: "float32" for c in df.select_dtypes(include="number").columns}
+        )
 
     ###################################################
     # FEATURES
@@ -144,71 +152,13 @@ class FeatureEngineer:
         df["macd_signal"] = signal.clip(-50, 50)
 
     ###################################################
-    # INSTITUTIONAL FEATURES
-    ###################################################
-
-    @staticmethod
-    def add_vol_regime(df, window=50):
-
-        long_vol = (
-            df["return"]
-            .rolling(window, min_periods=window)
-            .std()
-        )
-
-        short_vol = df["volatility"]
-
-        df["vol_regime"] = (
-            short_vol / long_vol.clip(lower=1e-4)
-        ).clip(0.2, 5)
-
-    @staticmethod
-    def add_drawdown_feature(df, window=60):
-
-        rolling_max = df["close"].rolling(window).max()
-
-        df["drawdown"] = (
-            df["close"] / rolling_max - 1
-        ).clip(-0.8, 0)
-
-    @staticmethod
-    def add_dollar_volume(df, window=20):
-
-        if "volume" not in df.columns:
-            return
-
-        dv = df["close"] * df["volume"]
-
-        df["dollar_volume"] = (
-            dv.rolling(window, min_periods=window)
-            .mean()
-            .clip(lower=1e6)
-        )
-
-    ###################################################
-    # 🚨 CRITICAL — FEATURE TIME ALIGNMENT
+    # ALIGNMENT
     ###################################################
 
     @staticmethod
     def align_features_to_prediction_time(df):
-        """
-        Prevent bar-close leakage.
-        Model only sees information available BEFORE prediction.
-        """
 
-        leak_prone = [
-            "return",
-            "volatility",
-            "rsi",
-            "macd",
-            "macd_signal",
-            "avg_sentiment",
-            "news_count",
-            "sentiment_std",
-            "vol_regime",
-            "drawdown",
-            "dollar_volume"
-        ]
+        leak_prone = list(MODEL_FEATURES)
 
         for col in leak_prone:
             if col in df.columns:
@@ -217,7 +167,7 @@ class FeatureEngineer:
         return df
 
     ###################################################
-    # SENTIMENT MERGE — FAIL CLOSED
+    # SENTIMENT MERGE
     ###################################################
 
     @classmethod
@@ -242,15 +192,16 @@ class FeatureEngineer:
         sentiment = sentiment.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment).sort_values("date")
 
+        if not sentiment["date"].is_monotonic_increasing:
+            raise RuntimeError("Sentiment dates must be monotonic.")
+
+        sentiment = cls._force_numeric(sentiment)
+
         if sentiment["date"].duplicated().any():
             sentiment = sentiment.groupby(
                 "date",
                 as_index=False
             )[cls.SENTIMENT_COLUMNS[1:]].mean()
-
-        ###################################
-        # LOOKAHEAD SAFE SHIFT
-        ###################################
 
         sentiment["date"] += pd.Timedelta(days=1)
 
@@ -265,8 +216,6 @@ class FeatureEngineer:
 
         merged["avg_sentiment"] = merged["avg_sentiment"].ffill(limit=3)
         merged["news_count"] = merged["news_count"].ffill(limit=3)
-        merged["sentiment_std"] = merged["sentiment_std"].ffill(limit=3)
-
         merged["sentiment_std"] = (
             merged["sentiment_std"]
             .fillna(cls.SENTIMENT_STD_FLOOR)
@@ -293,6 +242,9 @@ class FeatureEngineer:
     def create_training_dataset(cls, df):
 
         df = df.sort_values("date").copy()
+
+        if not df["date"].is_monotonic_increasing:
+            raise RuntimeError("Datetime ordering violated.")
 
         log_close = np.log(df["close"])
 
@@ -340,17 +292,11 @@ class FeatureEngineer:
         cls.add_rsi(df)
         cls.add_macd(df)
 
-        # Institutional additions
-        cls.add_vol_regime(df)
-        cls.add_drawdown_feature(df)
-        cls.add_dollar_volume(df)
-
         df = cls.merge_price_sentiment(df, sentiment_df)
 
-        # 🚨 CRITICAL
         df = cls.align_features_to_prediction_time(df)
 
-        df = cls._enforce_float32(df)
+        df = cls._force_numeric(df)
 
         if training:
             df = cls.create_training_dataset(df)
