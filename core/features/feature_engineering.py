@@ -29,6 +29,8 @@ class FeatureEngineer:
     VOL_FLOOR = 1e-4
     SENTIMENT_STD_FLOOR = 0.02
 
+    TRAINING_SEED = 42
+
     ###################################################
     # DATETIME
     ###################################################
@@ -157,7 +159,7 @@ class FeatureEngineer:
         df["macd_signal"] = signal.clip(-50, 50)
 
     ###################################################
-    # ANTI-LEAK ALIGNMENT
+    # FEATURE ALIGNMENT
     ###################################################
 
     @staticmethod
@@ -169,23 +171,31 @@ class FeatureEngineer:
             if col in df.columns:
                 df[col] = df[col].shift(1)
 
+        # HARD LEAKAGE GUARD
+        if "close" in df.columns:
+            for col in MODEL_FEATURES:
+                if col in df.columns and df[col].equals(df["close"]):
+                    raise RuntimeError(
+                        f"Leakage detected: feature '{col}' mirrors close."
+                    )
+
         return df
 
     ###################################################
-    # 🔥 INSTITUTIONAL NEUTRAL SENTIMENT (FIXED)
+    # NEUTRAL SENTIMENT
     ###################################################
 
     @classmethod
-    def _build_neutral_sentiment(cls, price_df):
+    def _build_neutral_sentiment(cls, price_df, training):
 
         neutral = price_df[["date"]].copy()
 
+        rng = np.random.default_rng(
+            cls.TRAINING_SEED if training else None
+        )
+
         n = len(neutral)
 
-        # 🚨 NO FIXED SEED — EVER
-        rng = np.random.default_rng()
-
-        # layered noise prevents constant detection
         neutral["avg_sentiment"] = (
             rng.normal(0, 0.04, n)
             + rng.normal(0, 0.015, n)
@@ -215,32 +225,25 @@ class FeatureEngineer:
         cls,
         price_df,
         sentiment_df,
-        ticker=None
+        ticker=None,
+        training=False
     ):
 
         price_df = cls._enforce_ticker(price_df, ticker)
         price = cls._normalize_datetime(price_df)
 
-        price = price.sort_values(["ticker", "date"])
-
         if sentiment_df is None or sentiment_df.empty:
-            sentiment_df = cls._build_neutral_sentiment(price)
+            sentiment_df = cls._build_neutral_sentiment(price, training)
 
-        sentiment = sentiment_df.copy()
+        sentiment = sentiment_df.loc[:, cls.SENTIMENT_COLUMNS]
+        sentiment = cls._normalize_datetime(sentiment)
 
-        missing = set(cls.SENTIMENT_COLUMNS) - set(sentiment.columns)
-
-        if missing:
-            sentiment = cls._build_neutral_sentiment(price)
-
-        sentiment = sentiment.loc[:, cls.SENTIMENT_COLUMNS]
-        sentiment = cls._normalize_datetime(sentiment).sort_values("date")
-
+        # HARD LOOKAHEAD GUARD
         sentiment["date"] += pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
-            price,
-            sentiment,
+            price.sort_values("date"),
+            sentiment.sort_values("date"),
             on="date",
             direction="backward",
             tolerance=cls.MERGE_TOLERANCE,
@@ -272,7 +275,9 @@ class FeatureEngineer:
         log_close = np.log(df["close"])
         forward = log_close.shift(-1) - log_close
 
-        risk_adj = forward / df["volatility"]
+        safe_vol = df["volatility"].clip(lower=cls.VOL_FLOOR)
+
+        risk_adj = (forward / safe_vol).clip(-5, 5)
 
         DEAD_ZONE = 0.06
 
@@ -312,7 +317,13 @@ class FeatureEngineer:
         cls.add_rsi(df)
         cls.add_macd(df)
 
-        df = cls.merge_price_sentiment(df, sentiment_df, ticker)
+        df = cls.merge_price_sentiment(
+            df,
+            sentiment_df,
+            ticker,
+            training
+        )
+
         df = cls.align_features(df)
 
         if training:
