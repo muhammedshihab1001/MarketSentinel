@@ -1,9 +1,38 @@
+import os
+import random
+import hashlib
+import numpy as np
 import tensorflow as tf
+
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, LayerNormalization
 from tensorflow.keras.optimizers import Adam
-import numpy as np
+from tensorflow.keras.callbacks import TerminateOnNaN
 
+
+############################################################
+# STRICT DETERMINISM
+############################################################
+
+SEED = 42
+
+
+def _enforce_determinism():
+
+    os.environ["PYTHONHASHSEED"] = str(SEED)
+    os.environ["TF_DETERMINISTIC_OPS"] = "1"
+
+    random.seed(SEED)
+    np.random.seed(SEED)
+    tf.random.set_seed(SEED)
+
+
+_enforce_determinism()
+
+
+############################################################
+# GPU CONFIG
+############################################################
 
 def _configure_runtime():
 
@@ -14,7 +43,8 @@ def _configure_runtime():
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
 
-            tf.keras.mixed_precision.set_global_policy("mixed_float16")
+            if os.getenv("LSTM_USE_MIXED_PRECISION", "false").lower() == "true":
+                tf.keras.mixed_precision.set_global_policy("mixed_float16")
 
         except Exception:
             pass
@@ -23,7 +53,14 @@ def _configure_runtime():
 _configure_runtime()
 
 
+############################################################
+# MODEL BUILDER
+############################################################
+
 def build_lstm_model(input_shape):
+
+    if len(input_shape) != 2:
+        raise RuntimeError("LSTM expects (timesteps, features).")
 
     model = Sequential([
 
@@ -33,7 +70,8 @@ def build_lstm_model(input_shape):
             activation="tanh",
             recurrent_activation="sigmoid",
             kernel_initializer="glorot_uniform",
-            recurrent_initializer="orthogonal"
+            recurrent_initializer="orthogonal",
+            input_shape=input_shape
         ),
 
         LayerNormalization(),
@@ -72,6 +110,38 @@ def build_lstm_model(input_shape):
     return model
 
 
+############################################################
+# TRAINING CALLBACKS
+############################################################
+
+def institutional_callbacks():
+
+    return [
+        TerminateOnNaN()
+    ]
+
+
+############################################################
+# MODEL FINGERPRINT
+############################################################
+
+def fingerprint_model(model) -> str:
+    """
+    Hash model weights for audit lineage.
+    """
+
+    h = hashlib.sha256()
+
+    for w in model.get_weights():
+        h.update(np.ascontiguousarray(w).tobytes())
+
+    return h.hexdigest()
+
+
+############################################################
+# FORECAST
+############################################################
+
 def forecast_lstm(
     model,
     scaler,
@@ -82,20 +152,29 @@ def forecast_lstm(
 
     if len(recent_prices) < lookback:
         raise ValueError(
-            f"At least {lookback} prices required for LSTM forecast"
+            f"At least {lookback} prices required."
         )
 
-    prices = recent_prices.astype("float32").reshape(-1, 1)
+    prices = np.asarray(
+        recent_prices,
+        dtype="float32"
+    ).reshape(-1, 1)
 
     scaled_seq = scaler.transform(prices)[-lookback:]
 
-    seq = scaled_seq.reshape(1, lookback, 1).astype("float32")
+    seq = np.ascontiguousarray(
+        scaled_seq.reshape(1, lookback, 1),
+        dtype="float32"
+    )
 
     preds = []
 
     for _ in range(horizon):
 
-        pred_scaled = model.predict(seq, verbose=0)[0][0]
+        pred_scaled = model.predict(
+            seq,
+            verbose=0
+        )[0][0]
 
         if not np.isfinite(pred_scaled):
             raise RuntimeError(
@@ -115,12 +194,12 @@ def forecast_lstm(
         )
 
     preds = scaler.inverse_transform(
-        np.array(preds, dtype="float32").reshape(-1, 1)
+        np.asarray(preds, dtype="float32").reshape(-1, 1)
     ).flatten()
 
     if not np.isfinite(preds).all():
         raise RuntimeError(
-            "Inverse-scaled predictions contain invalid values."
+            "Inverse-scaled predictions invalid."
         )
 
     return preds.tolist()
