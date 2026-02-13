@@ -91,6 +91,9 @@ def assert_stationary(series: pd.Series):
     if len(series) < 200:
         raise RuntimeError("Series too short for stationarity test.")
 
+    if not np.isfinite(series).all():
+        raise RuntimeError("Non-finite values in returns.")
+
     if series.var() < VAR_FLOOR:
         raise RuntimeError("Variance collapsed — unusable series.")
 
@@ -108,7 +111,7 @@ def assert_stationary(series: pd.Series):
 
 
 ########################################################
-# LOAD DATA — GOVERNED
+# LOAD DATA
 ########################################################
 
 def load_training_data(
@@ -188,9 +191,15 @@ def train_champion(start_date, end_date):
     best_ticker = None
     best_metrics = None
 
-    rejection_log = []
+    rejection_log = {}
 
-    for ticker, df in datasets.items():
+    ####################################################
+    # DETERMINISTIC ORDER
+    ####################################################
+
+    for ticker in sorted(datasets.keys()):
+
+        df = datasets[ticker]
 
         try:
 
@@ -203,7 +212,10 @@ def train_champion(start_date, end_date):
 
             print(f"SARIMAX {ticker} score={round(score,4)}")
 
-            if score > best_score:
+            if (
+                score > best_score
+                or (score == best_score and ticker < best_ticker)
+            ):
                 best_model = model
                 best_score = score
                 best_ticker = ticker
@@ -211,15 +223,17 @@ def train_champion(start_date, end_date):
 
         except Exception as exc:
 
-            msg = f"{ticker} rejected: {str(exc)}"
-            rejection_log.append(msg)
-            print(msg)
+            rejection_log[ticker] = str(exc)
+            print(f"{ticker} rejected: {exc}")
 
     if best_model is None:
         raise RuntimeError(
-            "All SARIMAX models rejected.\n"
-            + "\n".join(rejection_log)
+            "All SARIMAX models rejected."
         )
+
+    ####################################################
+    # DATASET HASH (CHAMPION)
+    ####################################################
 
     dataset_hash = MetadataManager.fingerprint_dataset(
         datasets[best_ticker]
@@ -230,6 +244,7 @@ def train_champion(start_date, end_date):
         metrics={
             "champion_asset": best_ticker,
             "risk_adjusted_score": float(best_score),
+            "model_fingerprint": best_model.fingerprint(),
             **best_metrics
         },
         features=["close"],
@@ -238,10 +253,16 @@ def train_champion(start_date, end_date):
         dataset_hash=dataset_hash,
         metadata_type="timeseries_manifest_v1",
         extra_fields={
+
+            # NEVER override training_universe
+
             "model_type": "SARIMAX",
             "parameters": best_model.get_params(),
-            "training_universe": surviving,
-            "universe_hash": MetadataManager.hash_list(surviving)
+
+            "surviving_universe": sorted(surviving),
+            "survivor_count": len(surviving),
+
+            "rejections": rejection_log
         }
     )
 
@@ -249,7 +270,7 @@ def train_champion(start_date, end_date):
 
 
 ########################################################
-# MAIN — MODEL GOVERNED CLOCK
+# MAIN
 ########################################################
 
 def main(start_date=None, end_date=None):
