@@ -19,10 +19,6 @@ from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
 
 
-########################################################
-# LOGGING
-########################################################
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
@@ -30,11 +26,12 @@ logging.basicConfig(
 
 logger = logging.getLogger("marketsentinel.training")
 
-RUNS_DIR = "artifacts/training_runs"
+RUNS_DIR = os.path.abspath("artifacts/training_runs")
 
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 MAX_REASONABLE_SHARPE = 8.0
+MAX_PROFIT_FACTOR = 10.0
 MAX_TRAINING_SECONDS = 7200
 
 GLOBAL_SEED = 42
@@ -51,6 +48,8 @@ def enforce_determinism():
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["TF_DETERMINISTIC_OPS"] = "1"
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
 
     random.seed(GLOBAL_SEED)
     np.random.seed(GLOBAL_SEED)
@@ -84,6 +83,16 @@ def get_git_commit():
         )
 
     try:
+
+        dirty = subprocess.call(
+            ["git", "diff", "--quiet"]
+        )
+
+        if dirty != 0:
+            raise RuntimeError(
+                "Repository has uncommitted changes — refusing training."
+            )
+
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             stderr=subprocess.DEVNULL
@@ -112,13 +121,22 @@ def save_manifest(run_id: str, manifest: dict):
     final_path = os.path.join(RUNS_DIR, f"{run_id}.json")
     temp_path = final_path + ".tmp"
 
-    with open(temp_path, "w") as f:
-        json.dump(manifest, f, indent=4, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())
+    try:
 
-    os.replace(temp_path, final_path)
-    _fsync_dir(RUNS_DIR)
+        with open(temp_path, "w") as f:
+            json.dump(manifest, f, indent=4, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(temp_path, final_path)
+        _fsync_dir(RUNS_DIR)
+
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
 ########################################################
@@ -144,6 +162,7 @@ def validate_metrics(metrics: dict):
 
     sharpe = metrics["avg_sharpe"]
     drawdown = metrics["max_drawdown"]
+    profit_factor = metrics["profit_factor"]
 
     if sharpe > MAX_REASONABLE_SHARPE:
         raise RuntimeError("Sharpe unrealistically high — leakage suspected.")
@@ -154,6 +173,9 @@ def validate_metrics(metrics: dict):
     if drawdown < MAX_DRAWDOWN:
         raise RuntimeError("Model rejected — drawdown too severe.")
 
+    if profit_factor > MAX_PROFIT_FACTOR:
+        raise RuntimeError("Profit factor unrealistic — leakage suspected.")
+
     if metrics["final_equity"] <= 0:
         raise RuntimeError("Backtest produced non-positive equity.")
 
@@ -162,7 +184,9 @@ def validate_metrics(metrics: dict):
 # LINEAGE SNAPSHOT
 ########################################################
 
-def build_lineage(start_date, end_date, universe):
+def build_lineage(start_date, end_date):
+
+    universe_snapshot = MarketUniverse.snapshot()
 
     return {
         "schema_signature": get_schema_signature(),
@@ -182,8 +206,7 @@ def build_lineage(start_date, end_date, universe):
 
         "market_time_snapshot": MarketTime.snapshot_for("xgboost"),
 
-        "training_universe": universe,
-        "universe_hash": MetadataManager.hash_list(universe)
+        "training_universe": universe_snapshot
     }
 
 
@@ -197,21 +220,18 @@ def main():
     enforce_determinism()
 
     ####################################################
-    # FREEZE CLOCK ONCE (PIPELINE GOVERNANCE)
+    # FREEZE CLOCK VIA GOVERNOR
     ####################################################
 
-    today = datetime.date.today().isoformat()
+    today = MarketTime.today().isoformat()
     MarketTime.freeze_today(today)
 
     start_date, end_date = MarketTime.window_for("xgboost")
 
-    universe = MarketUniverse.get_universe()
-
     logger.info(
-        "Pipeline training window | %s -> %s | universe=%s",
+        "Pipeline training window | %s -> %s",
         start_date,
-        end_date,
-        len(universe)
+        end_date
     )
 
     run_id = datetime.datetime.utcnow().strftime(
@@ -243,8 +263,7 @@ def main():
             "runtime_sec": round(runtime, 2),
             "lineage": build_lineage(
                 start_date,
-                end_date,
-                universe
+                end_date
             ),
             "created_utc": datetime.datetime.utcnow().isoformat()
         }
@@ -265,8 +284,7 @@ def main():
             "runtime_sec": round(time.time() - start, 2),
             "lineage": build_lineage(
                 start_date,
-                end_date,
-                universe
+                end_date
             ),
             "created_utc": datetime.datetime.utcnow().isoformat()
         }
