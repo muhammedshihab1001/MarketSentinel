@@ -7,6 +7,8 @@ from core.schema.feature_schema import (
     MODEL_FEATURES
 )
 
+from core.indicators.technical_indicators import TechnicalIndicators
+
 logger = logging.getLogger("marketsentinel.features")
 
 
@@ -27,6 +29,17 @@ class FeatureEngineer:
 
     VOL_FLOOR = 1e-4
     SENTIMENT_STD_FLOOR = 0.02
+
+    ###################################################
+    # WINDOW GUARD
+    ###################################################
+
+    @staticmethod
+    def _validate_window(window: int):
+        if not isinstance(window, int):
+            raise RuntimeError("Window must be int.")
+        if window < 2:
+            raise RuntimeError("Window must be >= 2.")
 
     ###################################################
     # DATETIME
@@ -117,36 +130,31 @@ class FeatureEngineer:
     @staticmethod
     def add_volatility(df, window=5):
 
+        FeatureEngineer._validate_window(window)
+
         df["volatility"] = (
             df["return"]
             .rolling(window, min_periods=window)
-            .std()
+            .std(ddof=0)
             .clip(lower=FeatureEngineer.VOL_FLOOR, upper=5)
         )
 
     @staticmethod
     def add_rsi(df, window=14):
 
-        delta = df["close"].diff()
+        FeatureEngineer._validate_window(window)
 
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-
-        avg_gain = gain.rolling(window, min_periods=window).mean()
-        avg_loss = loss.rolling(window, min_periods=window).mean()
-
-        rs = avg_gain / (avg_loss + 1e-9)
-
-        df["rsi"] = (100 - (100 / (1 + rs))).clip(0, 100)
+        df["rsi"] = TechnicalIndicators.rsi(
+            df[["date", "close"]],
+            window=window
+        )
 
     @staticmethod
     def add_macd(df):
 
-        ema12 = df["close"].ewm(span=12, adjust=False).mean()
-        ema26 = df["close"].ewm(span=26, adjust=False).mean()
-
-        macd = ema12 - ema26
-        signal = macd.ewm(span=9, adjust=False).mean()
+        macd, signal = TechnicalIndicators.macd(
+            df[["date", "close"]]
+        )
 
         df["macd"] = macd.clip(-50, 50)
         df["macd_signal"] = signal.clip(-50, 50)
@@ -227,7 +235,7 @@ class FeatureEngineer:
             inplace=True
         )
 
-        if merged["avg_sentiment"].std() < 1e-4:
+        if merged["avg_sentiment"].std(ddof=0) < 1e-4:
             raise RuntimeError(
                 "Sentiment variance collapsed — check news pipeline."
             )
@@ -242,9 +250,6 @@ class FeatureEngineer:
     def create_training_dataset(cls, df):
 
         df = df.sort_values("date").copy()
-
-        if not df["date"].is_monotonic_increasing:
-            raise RuntimeError("Datetime ordering violated.")
 
         log_close = np.log(df["close"])
 
