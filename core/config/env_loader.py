@@ -31,11 +31,6 @@ def _validate_not_empty(key: str) -> bool:
 
 
 def _fail_fast_dotenv():
-    """
-    Detect malformed .env BEFORE loading it.
-    python-dotenv logs parse errors but does not raise.
-    We enforce crash-on-malformed-config.
-    """
 
     if not os.path.exists(".env"):
         return
@@ -49,9 +44,6 @@ def _fail_fast_dotenv():
 
 
 def _validate_paths():
-    """
-    Prevent silent registry / feature store corruption.
-    """
 
     required_paths = [
         "MODEL_REGISTRY_PATH",
@@ -74,32 +66,52 @@ def _validate_paths():
             )
 
 
-def _validate_sentiment_secrets():
-    """
-    Secrets enforced ONLY if sentiment is enabled.
-    """
+########################################################
+# PROVIDER SECRET VALIDATION (UPDATED)
+########################################################
+
+def _validate_news_provider_secrets():
 
     if not _as_bool(os.getenv("ENABLE_SENTIMENT"), False):
         logger.info("Sentiment disabled via ENABLE_SENTIMENT=0")
         return
 
-    required = [
-        "MARKETAUX_API_KEY",
-        "GNEWS_API_KEY",
-    ]
+    primary = os.getenv("NEWS_PROVIDER_PRIMARY", "finnhub").lower()
 
-    missing = [k for k in required if not _validate_not_empty(k)]
+    providers = {
+        "finnhub": "FINNHUB_API_KEY",
+        "marketaux": "MARKETAUX_API_KEY",
+        "gnews": "GNEWS_API_KEY",
+    }
 
-    if missing:
+    if primary not in providers:
         raise RuntimeError(
-            f"ENABLE_SENTIMENT=1 but secrets missing: {missing}"
+            f"Invalid NEWS_PROVIDER_PRIMARY='{primary}'. "
+            f"Valid options: {list(providers.keys())}"
         )
 
-    if len(os.getenv("MARKETAUX_API_KEY")) < 10:
-        raise RuntimeError("MARKETAUX_API_KEY appears invalid.")
+    primary_key = providers[primary]
 
-    if len(os.getenv("GNEWS_API_KEY")) < 10:
-        raise RuntimeError("GNEWS_API_KEY appears invalid.")
+    if not _validate_not_empty(primary_key):
+        raise RuntimeError(
+            f"Primary news provider '{primary}' requires env '{primary_key}'."
+        )
+
+    if len(os.getenv(primary_key)) < 10:
+        raise RuntimeError(f"{primary_key} appears invalid.")
+
+    # Optional failover validation
+    if _as_bool(os.getenv("NEWS_PROVIDER_FAILOVER", "1")):
+
+        optional_keys = [
+            v for k, v in providers.items()
+            if k != primary and _validate_not_empty(v)
+        ]
+
+        if not optional_keys:
+            logger.warning(
+                "Failover enabled but no secondary provider keys detected."
+            )
 
 
 ########################################################
@@ -134,6 +146,7 @@ def init_env() -> None:
             # provider flags
             "ENABLE_SENTIMENT": "0",
             "NEWS_PROVIDER_FAILOVER": "1",
+            "NEWS_PROVIDER_PRIMARY": "finnhub",
 
             # dotenv behavior
             "DOTENV_ENABLED": "1",
@@ -156,10 +169,10 @@ def init_env() -> None:
         _validate_paths()
 
         ####################################################
-        # SENTIMENT SAFETY
+        # PROVIDER SAFETY
         ####################################################
 
-        _validate_sentiment_secrets()
+        _validate_news_provider_secrets()
 
         ####################################################
         # OFFLINE MODE CONTROL
