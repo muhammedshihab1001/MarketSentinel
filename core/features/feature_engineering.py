@@ -43,8 +43,7 @@ class FeatureEngineer:
                 df["date"],
                 utc=True,
                 errors="raise"
-            )
-            .dt.tz_convert(None)
+            ).dt.tz_convert(None)
         )
 
         return df
@@ -67,7 +66,6 @@ class FeatureEngineer:
 
             df["ticker"] = ticker
 
-        # ALWAYS string (prevents hash drift)
         df["ticker"] = df["ticker"].astype(str)
 
         return df
@@ -83,19 +81,17 @@ class FeatureEngineer:
             raise RuntimeError("Price dataframe is empty.")
 
         df = cls._enforce_ticker(df, ticker)
+        df = cls._normalize_datetime(df)
 
         required = {"date", "close", "ticker"}
 
         if not required.issubset(df.columns):
-            raise RuntimeError(
-                "Price dataframe missing required columns."
-            )
+            raise RuntimeError("Price dataframe missing required columns.")
 
-        df = cls._normalize_datetime(df)
-        df = df.sort_values("date")
+        df = df.sort_values(["ticker", "date"])
 
-        if df["date"].duplicated().any():
-            raise RuntimeError("Duplicate timestamps.")
+        if df.duplicated(["ticker", "date"]).any():
+            raise RuntimeError("Duplicate ticker-date detected.")
 
         df["close"] = pd.to_numeric(df["close"], errors="raise")
 
@@ -133,7 +129,6 @@ class FeatureEngineer:
             .std(ddof=0)
         )
 
-        # 🚨 CRITICAL — prevents NaN cascade
         df["volatility"] = vol.clip(
             lower=FeatureEngineer.VOL_FLOOR
         ).fillna(FeatureEngineer.VOL_FLOOR)
@@ -176,7 +171,7 @@ class FeatureEngineer:
         return df
 
     ###################################################
-    # STRONG NEUTRAL SENTIMENT
+    # NEUTRAL SENTIMENT
     ###################################################
 
     @classmethod
@@ -206,11 +201,21 @@ class FeatureEngineer:
         return neutral
 
     ###################################################
+    # 🚨 FIXED — TICKER SAFE MERGE
+    ###################################################
 
     @classmethod
-    def merge_price_sentiment(cls, price_df, sentiment_df):
+    def merge_price_sentiment(
+        cls,
+        price_df,
+        sentiment_df,
+        ticker=None
+    ):
 
-        price = cls._normalize_datetime(price_df).sort_values("date")
+        price_df = cls._enforce_ticker(price_df, ticker)
+        price = cls._normalize_datetime(price_df)
+
+        price = price.sort_values(["ticker", "date"])
 
         if sentiment_df is None or sentiment_df.empty:
             sentiment_df = cls._build_neutral_sentiment(price)
@@ -256,7 +261,7 @@ class FeatureEngineer:
     @classmethod
     def create_training_dataset(cls, df):
 
-        df = df.sort_values("date").copy()
+        df = df.sort_values(["ticker", "date"]).copy()
 
         log_close = np.log(df["close"])
         forward = log_close.shift(-1) - log_close
@@ -301,7 +306,7 @@ class FeatureEngineer:
         cls.add_rsi(df)
         cls.add_macd(df)
 
-        df = cls.merge_price_sentiment(df, sentiment_df)
+        df = cls.merge_price_sentiment(df, sentiment_df, ticker)
         df = cls.align_features(df)
 
         if training:
