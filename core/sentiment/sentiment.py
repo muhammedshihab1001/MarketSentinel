@@ -7,7 +7,7 @@ import threading
 import re
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from core.config.env_loader import init_env
+from core.config.env_loader import init_env, get_bool
 
 init_env()
 
@@ -30,7 +30,17 @@ class FinBERTSingleton:
     MODEL_NAME = "ProsusAI/finbert"
     CACHE_DIR = "artifacts/huggingface"
 
-    USE_FP16 = torch.cuda.is_available()
+    USE_FP16 = torch.cuda.is_available() and get_bool(
+        "ENABLE_FP16",
+        True
+    )
+
+    @classmethod
+    def _enforce_offline_mode(cls):
+
+        if get_bool("HF_FORCE_OFFLINE", True):
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            os.environ["HF_DATASETS_OFFLINE"] = "1"
 
     @classmethod
     def load(cls):
@@ -43,33 +53,53 @@ class FinBERTSingleton:
             if cls._model is not None:
                 return cls._tokenizer, cls._model, cls._device
 
+            cls._enforce_offline_mode()
+
             os.makedirs(cls.CACHE_DIR, exist_ok=True)
 
             logger.info("Loading FinBERT on %s", cls._device)
 
             torch.set_grad_enabled(False)
-            torch.set_num_threads(min(4, os.cpu_count()))
 
-            cls._tokenizer = AutoTokenizer.from_pretrained(
+            # deterministic behavior
+            torch.set_num_threads(min(4, os.cpu_count()))
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+            tokenizer = AutoTokenizer.from_pretrained(
                 cls.MODEL_NAME,
-                cache_dir=cls.CACHE_DIR
+                cache_dir=cls.CACHE_DIR,
+                local_files_only=get_bool("HF_FORCE_OFFLINE", True)
             )
 
             model = AutoModelForSequenceClassification.from_pretrained(
                 cls.MODEL_NAME,
-                cache_dir=cls.CACHE_DIR
+                cache_dir=cls.CACHE_DIR,
+                local_files_only=get_bool("HF_FORCE_OFFLINE", True)
             )
 
             model = model.to(cls._device)
 
+            ###################################################
+            # SAFE FP16
+            ###################################################
+
             if cls.USE_FP16:
-                model = model.half()
+
+                try:
+                    model = model.half()
+
+                except Exception:
+                    logger.warning(
+                        "FP16 conversion failed — falling back to FP32."
+                    )
 
             model.eval()
 
             if model.config.num_labels != 3:
                 raise RuntimeError("FinBERT label mismatch.")
 
+            cls._tokenizer = tokenizer
             cls._model = model
 
             logger.info("FinBERT ready.")
@@ -102,8 +132,6 @@ class SentimentAnalyzer:
     RNG = np.random.default_rng(42)
 
     ############################################################
-    # 🚨 INSTITUTIONAL FIX — STOCHASTIC NEUTRAL
-    ############################################################
 
     def _neutral_sentiment_frame(self, start, end):
 
@@ -113,22 +141,16 @@ class SentimentAnalyzer:
 
         df = pd.DataFrame({
             "date": dates,
-
-            # small noise prevents constant feature
             "avg_sentiment": self.RNG.normal(
                 0.0,
                 0.03,
                 n
             ).clip(-0.08, 0.08).astype("float32"),
-
-            # realistic low-news regime
             "news_count": self.RNG.integers(
                 0,
                 4,
                 n
             ).astype("int16"),
-
-            # NEVER zero variance
             "sentiment_std": self.RNG.uniform(
                 0.03,
                 0.08,
@@ -159,11 +181,10 @@ class SentimentAnalyzer:
         try:
             dummy = ["market stable"] * self.BATCH_SIZE
             self.analyze_batch(dummy)
+
         except Exception:
             logger.exception("FinBERT warmup failed")
 
-    ############################################################
-    # FAULT-TOLERANT AGGREGATION
     ############################################################
 
     def aggregate_daily_sentiment(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -218,18 +239,11 @@ class SentimentAnalyzer:
             news_count="count"
         ).reset_index()
 
-        # 🚨 critical variance protection
         aggregated["sentiment_std"] = (
             aggregated["sentiment_std"]
             .fillna(self.STD_FLOOR)
             .clip(lower=self.STD_FLOOR)
         )
-
-        if aggregated.empty:
-            return self._neutral_sentiment_frame(
-                working["date"].min(),
-                working["date"].max()
-            )
 
         aggregated.sort_values("date", inplace=True)
         aggregated.reset_index(drop=True, inplace=True)
