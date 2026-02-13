@@ -24,13 +24,24 @@ class RegimeConfig:
     EPSILON: float = 1e-8
     MAX_DAILY_RETURN: float = 0.60
 
+    MIN_SURVIVAL_RATIO: float = 0.6
+
 
 class MarketRegimeDetector:
 
-    VALID_REGIMES = {"BULL", "BEAR", "SIDEWAYS", "CRISIS"}
+    VALID_REGIMES = ("BULL", "BEAR", "SIDEWAYS", "CRISIS")
 
     def __init__(self, config: RegimeConfig | None = None):
         self.config = config or RegimeConfig()
+
+    ########################################################
+
+    def _assert_monotonic(self, df):
+
+        if not df["date"].is_monotonic_increasing:
+            raise RuntimeError(
+                "Non-monotonic timestamps detected."
+            )
 
     ########################################################
     # PERSISTENCE FILTER
@@ -42,20 +53,23 @@ class MarketRegimeDetector:
         regimes = np.asarray(regimes, dtype=object)
 
         confirmed = regimes.copy()
-        current = regimes[0]
 
+        current = None
         candidate = None
         streak = 0
 
-        for i in range(1, len(regimes)):
+        for i in range(len(regimes)):
 
             new = regimes[i]
 
             if new not in self.VALID_REGIMES:
-                logger.warning("Invalid regime detected: %s", new)
                 new = "SIDEWAYS"
 
-            # Crisis has ABSOLUTE PRIORITY
+            if current is None:
+                current = new
+                confirmed[i] = current
+                continue
+
             if new == "CRISIS":
                 current = "CRISIS"
                 candidate = None
@@ -95,6 +109,7 @@ class MarketRegimeDetector:
         try:
 
             df = df.sort_values("date").copy()
+            self._assert_monotonic(df)
 
             if df["close"].isna().any():
                 raise RuntimeError("NaN close prices")
@@ -105,13 +120,20 @@ class MarketRegimeDetector:
             if (df["close"] <= 0).any():
                 raise RuntimeError("Non-positive prices")
 
-            shifted = df["close"].shift(1)
+            ###################################################
+            # LEAK-SAFE RETURNS
+            ###################################################
 
-            returns = shifted.pct_change()
+            raw_returns = df["close"].pct_change()
 
-            # SOFT GUARD — drop ticker instead of crashing
-            if returns.abs().max() > cfg.MAX_DAILY_RETURN:
+            if raw_returns.abs().max() > cfg.MAX_DAILY_RETURN:
                 raise RuntimeError("Unrealistic returns")
+
+            returns = raw_returns.shift(1)
+
+            ###################################################
+
+            shifted = df["close"].shift(1)
 
             ma_long = shifted.rolling(
                 cfg.trend_window,
@@ -123,8 +145,14 @@ class MarketRegimeDetector:
                 .rolling(cfg.volatility_window,
                          min_periods=cfg.volatility_window)
                 .std()
-                .clip(lower=cfg.EPSILON)
             )
+
+            if not np.isfinite(
+                volatility.dropna()
+            ).all():
+                raise RuntimeError("Volatility corruption detected")
+
+            volatility = volatility.clip(lower=cfg.EPSILON)
 
             safe_ma = ma_long.replace(0, np.nan)
 
@@ -137,7 +165,6 @@ class MarketRegimeDetector:
 
             ready = ma_long.notna() & volatility.notna()
 
-            # CRISIS FIRST (priority)
             crisis = ready & (volatility > cfg.crash_vol_threshold)
 
             bull = (
@@ -160,10 +187,10 @@ class MarketRegimeDetector:
 
             regime = self._apply_persistence(regime)
 
-            df["regime"] = regime
-
-            # DO NOT DELETE WARMUP ROWS
-            df["regime"] = df["regime"].fillna("SIDEWAYS")
+            df["regime"] = pd.Categorical(
+                regime,
+                categories=self.VALID_REGIMES
+            )
 
             df["date"] = pd.to_datetime(df["date"], utc=True)
 
@@ -192,6 +219,8 @@ class MarketRegimeDetector:
         if df.empty:
             raise RuntimeError("Empty dataframe passed to regime detector.")
 
+        tickers_total = df["ticker"].nunique()
+
         grouped = []
 
         for ticker, slice_df in df.sort_values(
@@ -207,9 +236,16 @@ class MarketRegimeDetector:
             if detected is not None and not detected.empty:
                 grouped.append(detected)
 
-        if len(grouped) < 3:
+        survivors = len(grouped)
+
+        if survivors < 3:
             raise RuntimeError(
                 "Too few assets survived regime detection."
+            )
+
+        if survivors / tickers_total < self.config.MIN_SURVIVAL_RATIO:
+            raise RuntimeError(
+                "Universe collapse detected during regime filtering."
             )
 
         result = (
@@ -217,5 +253,16 @@ class MarketRegimeDetector:
             .sort_values(["date", "ticker"])
             .reset_index(drop=True)
         )
+
+        ###################################################
+        # CALENDAR ALIGNMENT CHECK
+        ###################################################
+
+        counts = result.groupby("date")["ticker"].nunique()
+
+        if counts.min() < 2:
+            raise RuntimeError(
+                "Calendar misalignment detected across assets."
+            )
 
         return result
