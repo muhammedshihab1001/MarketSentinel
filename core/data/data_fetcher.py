@@ -7,6 +7,7 @@ import os
 import random
 from datetime import timedelta
 import uuid
+import numpy as np
 
 
 logger = logging.getLogger("marketsentinel.fetcher")
@@ -15,7 +16,7 @@ logger = logging.getLogger("marketsentinel.fetcher")
 class StockPriceFetcher:
 
     REQUIRED_COLUMNS = {
-        "ticker",   # ⭐ NOW HARD REQUIRED
+        "ticker",
         "date",
         "open",
         "high",
@@ -24,7 +25,7 @@ class StockPriceFetcher:
         "volume"
     }
 
-    CACHE_VERSION = "3.0"  # ⭐ bump version to invalidate old cache
+    CACHE_VERSION = "4.0"
 
     MIN_ROWS = 120
     MAX_RETRIES = 5
@@ -107,7 +108,7 @@ class StockPriceFetcher:
         return df.loc[:, ~df.columns.duplicated()]
 
     ##################################################
-    # NORMALIZE + ATTACH TICKER (CRITICAL FIX)
+    # NORMALIZE + ATTACH TICKER
     ##################################################
 
     def _normalize_schema(self, df: pd.DataFrame, ticker: str):
@@ -125,10 +126,12 @@ class StockPriceFetcher:
             df = df.reset_index()
             df.rename(columns={df.columns[0]: "date"}, inplace=True)
 
-        df["date"] = (
-            pd.to_datetime(df["date"], errors="coerce", utc=True)
-            .dt.tz_convert(None)
-        )
+        # STRICT parsing — do not coerce silently
+        df["date"] = pd.to_datetime(
+            df["date"],
+            utc=True,
+            errors="raise"
+        ).dt.tz_convert(None)
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
@@ -140,17 +143,18 @@ class StockPriceFetcher:
             )
 
         for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors="raise")
 
-        df = df.dropna(subset=["date"] + numeric_cols)
+        if not np.isfinite(df[numeric_cols].to_numpy()).all():
+            raise RuntimeError("Non-finite numeric values detected.")
 
         df = df.loc[:, ["date", "open", "high", "low", "close", "volume"]]
 
-        ##################################################
-        # ⭐ THE FIX THAT STOPS YOUR TRAINING CRASH
-        ##################################################
-
         df["ticker"] = ticker
+
+        # FINAL CONTRACT CHECK
+        if set(df.columns) != self.REQUIRED_COLUMNS:
+            raise RuntimeError("Final schema mismatch detected.")
 
         return df
 
@@ -220,9 +224,6 @@ class StockPriceFetcher:
 
         df = self._normalize_schema(df, ticker)
 
-        if not pd.api.types.is_datetime64_any_dtype(df["date"]):
-            raise RuntimeError("Date column corrupted.")
-
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices detected.")
 
@@ -281,6 +282,9 @@ class StockPriceFetcher:
 
             try:
                 cached = pd.read_parquet(cache_file)
+
+                if set(cached.columns) != self.REQUIRED_COLUMNS:
+                    raise RuntimeError("Cache schema mismatch.")
 
                 return self._validate_dataset(
                     cached,
