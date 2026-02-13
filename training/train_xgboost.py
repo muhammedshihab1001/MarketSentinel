@@ -4,7 +4,6 @@ import joblib
 import pandas as pd
 import numpy as np
 import logging
-import time
 import random
 
 from core.config.env_loader import init_env
@@ -38,23 +37,46 @@ TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
 
 SEED = 42
 MIN_TRAINING_ROWS = 2000
-MIN_SURVIVING_RATIO = 0.35   #  institutional
+MIN_SURVIVING_RATIO = 0.35
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 
 
 ########################################################
-# STRICT DETERMINISM
+# STRICT DETERMINISM (INSTITUTIONAL)
 ########################################################
 
 def enforce_determinism():
 
     os.environ["PYTHONHASHSEED"] = str(SEED)
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
     random.seed(SEED)
     np.random.seed(SEED)
 
 
+########################################################
+# FSYNC (CRITICAL)
+########################################################
+
+def _fsync_dir(directory):
+
+    if os.name == "nt":
+        return
+
+    fd = os.open(directory, os.O_DIRECTORY)
+
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+########################################################
+# ATOMIC MODEL SAVE
 ########################################################
 
 def save_model_atomic(model, path):
@@ -67,10 +89,14 @@ def save_model_atomic(model, path):
         temp_name = tmp.name
 
     os.replace(temp_name, path)
+    _fsync_dir(directory)
+
+    if not os.path.exists(path):
+        raise RuntimeError("Model write failed.")
 
 
 ########################################################
-# DATA LOADER — INSTITUTIONAL VERSION
+# DATA LOADER
 ########################################################
 
 def load_training_data(start_date, end_date):
@@ -100,10 +126,6 @@ def load_training_data(start_date, end_date):
                 failures.append(f"{ticker}: no price")
                 continue
 
-            ##################################################
-            # NEWS — NEVER BLOCK TRAINING
-            ##################################################
-
             sentiment_df = None
 
             try:
@@ -119,11 +141,7 @@ def load_training_data(start_date, end_date):
                     sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored)
 
             except Exception:
-                logger.warning("News pipeline failed for %s — fallback engaged.", ticker)
-
-            ##################################################
-            # FEATURE STORE HANDLES NEUTRAL FALLBACK
-            ##################################################
+                logger.warning("News failed for %s — neutral fallback used.", ticker)
 
             dataset = store.get_features(
                 price_df,
@@ -143,8 +161,9 @@ def load_training_data(start_date, end_date):
             logger.warning("Ticker rejected: %s | %s", ticker, str(e))
 
     ##################################################
-    # SURVIVAL GUARD
-    ##################################################
+
+    if not datasets:
+        raise RuntimeError("All tickers failed — training aborted.")
 
     survival_ratio = len(surviving) / max(len(universe), 1)
 
@@ -154,6 +173,9 @@ def load_training_data(start_date, end_date):
         len(surviving),
         len(universe)
     )
+
+    if failures:
+        logger.warning("Ticker failures:\n%s", "\n".join(failures))
 
     if survival_ratio < MIN_SURVIVING_RATIO:
         raise RuntimeError(
@@ -197,7 +219,7 @@ def main(start_date=None, end_date=None):
     )
 
     ###################################################
-    # DRIFT BASELINE
+    # DRIFT
     ###################################################
 
     drift = DriftDetector()
@@ -219,7 +241,7 @@ def main(start_date=None, end_date=None):
 
         y = d["target"]
 
-        model = build_xgboost_model(y)  #  FIXED
+        model = build_xgboost_model(y)
 
         model.fit(
             d.loc[:, MODEL_FEATURES],
@@ -300,7 +322,16 @@ def main(start_date=None, end_date=None):
         TEMP_METADATA_PATH
     )
 
-    logger.info("XGBoost registered → %s", version)
+    ###################################################
+    #  AUTO PROMOTION (VERY IMPORTANT)
+    ###################################################
+
+    ModelRegistry.promote_to_production(
+        MODEL_DIR,
+        version
+    )
+
+    logger.info("XGBoost promoted → %s", version)
 
     return strategy_metrics
 
