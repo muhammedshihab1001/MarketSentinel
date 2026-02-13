@@ -1,6 +1,7 @@
 from xgboost import XGBClassifier
 import numpy as np
 import xgboost as xgb
+import threading
 
 from core.schema.feature_schema import FEATURE_COUNT
 
@@ -12,44 +13,62 @@ MIN_CLASS_WEIGHT = 1.0
 
 
 ###################################################
-# HARD GPU VERIFICATION
+# LAZY GPU DETECTION (INSTITUTIONAL SAFE)
 ###################################################
+
+_GPU_AVAILABLE = None
+_GPU_LOCK = threading.Lock()
+
 
 def _gpu_verified():
     """
     Institutional GPU probe.
 
+    Runs ONCE.
     Actually trains a tiny booster.
     Prevents fake CUDA environments.
     """
 
-    try:
+    global _GPU_AVAILABLE
 
-        dtrain = xgb.DMatrix(
-            np.random.rand(50, 4),
-            label=np.random.randint(0, 2, 50)
-        )
+    if _GPU_AVAILABLE is not None:
+        return _GPU_AVAILABLE
 
-        params = {
-            "tree_method": "hist",
-            "device": "cuda",
-            "max_depth": 1,
-            "verbosity": 0
-        }
+    with _GPU_LOCK:
 
-        xgb.train(params, dtrain, num_boost_round=1)
+        if _GPU_AVAILABLE is not None:
+            return _GPU_AVAILABLE
 
-        return True
+        try:
 
-    except Exception:
-        return False
+            dtrain = xgb.DMatrix(
+                np.random.rand(50, 4),
+                label=np.random.randint(0, 2, 50)
+            )
+
+            params = {
+                "tree_method": "hist",
+                "device": "cuda",
+                "max_depth": 1,
+                "verbosity": 0
+            }
+
+            xgb.train(params, dtrain, num_boost_round=1)
+
+            _GPU_AVAILABLE = True
+
+        except Exception:
+            _GPU_AVAILABLE = False
+
+        return _GPU_AVAILABLE
 
 
-DEVICE = "cuda" if _gpu_verified() else "cpu"
+def _device():
+    return "cuda" if _gpu_verified() else "cpu"
 
 
 ###################################################
-# CLASS WEIGHT (INSTITUTIONAL SAFE)
+# CLASS WEIGHT
 ###################################################
 
 def compute_class_weight(y):
@@ -88,12 +107,15 @@ def compute_class_weight(y):
 # FEATURE SAFETY
 ###################################################
 
-def _validate_feature_count(X):
+def _validate_features(X):
 
     if X.shape[1] != FEATURE_COUNT:
         raise RuntimeError(
             f"Feature schema mismatch. Expected {FEATURE_COUNT}, got {X.shape[1]}"
         )
+
+    if not np.isfinite(X).all():
+        raise RuntimeError("Non-finite feature values detected.")
 
 
 ###################################################
@@ -101,6 +123,8 @@ def _validate_feature_count(X):
 ###################################################
 
 def _base_params(pos_weight):
+
+    device = _device()
 
     params = dict(
 
@@ -126,10 +150,12 @@ def _base_params(pos_weight):
 
         eval_metric="logloss",
         random_state=SEED,
-        n_jobs=1,                 # deterministic
+        n_jobs=1,
 
         tree_method="hist",
-        device=DEVICE,
+        device=device,
+
+        deterministic_histogram=True,
 
         sampling_method="uniform",
 
@@ -151,7 +177,29 @@ def _base_params(pos_weight):
         verbosity=0
     )
 
+    if device == "cuda":
+        params["predictor"] = "gpu_predictor"
+
     return params
+
+
+###################################################
+# SAFE WRAPPER
+###################################################
+
+class SafeXGBClassifier(XGBClassifier):
+    """
+    Enforces schema validation before training.
+    Prevents silent garbage models.
+    """
+
+    def fit(self, X, y, **kwargs):
+
+        X = np.asarray(X)
+
+        _validate_features(X)
+
+        return super().fit(X, y, **kwargs)
 
 
 ###################################################
@@ -166,11 +214,11 @@ def build_xgboost_model(y):
 
     params["n_estimators"] = 600
 
-    return XGBClassifier(**params)
+    return SafeXGBClassifier(**params)
 
 
 ###################################################
-# FINAL MODEL (CHAMPION TRAIN)
+# FINAL MODEL
 ###################################################
 
 def build_final_xgboost_model(y):
@@ -187,4 +235,4 @@ def build_final_xgboost_model(y):
         "reg_lambda": 1.4,
     })
 
-    return XGBClassifier(**params)
+    return SafeXGBClassifier(**params)
