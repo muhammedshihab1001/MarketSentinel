@@ -32,11 +32,15 @@ class MetadataManager:
         "training_code_hash",
         "metadata_integrity_hash",
         "environment",
-        "training_universe"
+        "training_universe",
+        "universe_hash"   # ⭐ NEW
     ]
 
-    METADATA_VERSION = "7.0"
+    METADATA_VERSION = "8.0"
 
+    #####################################################
+    # SAFE FSYNC
+    #####################################################
 
     @staticmethod
     def _fsync_dir_safe(directory: str):
@@ -51,6 +55,9 @@ class MetadataManager:
         except Exception:
             pass
 
+    #####################################################
+    # FEATURE CONTRACT
+    #####################################################
 
     @staticmethod
     def _validate_feature_contract(features, metadata_type):
@@ -83,6 +90,9 @@ class MetadataManager:
                 f"Unknown metadata_type: {metadata_type}"
             )
 
+    #####################################################
+    # DATASET FINGERPRINT (DETERMINISTIC)
+    #####################################################
 
     @staticmethod
     def fingerprint_dataset(df: pd.DataFrame) -> str:
@@ -92,13 +102,31 @@ class MetadataManager:
 
         df_copy = df.copy(deep=True)
 
-        if "date" in df_copy.columns:
-            df_copy = df_copy.sort_values("date")
-
         if "ticker" in df_copy.columns:
             df_copy = df_copy.sort_values(["ticker", "date"])
+        elif "date" in df_copy.columns:
+            df_copy = df_copy.sort_values("date")
 
         df_copy = df_copy.reset_index(drop=True)
+
+        #################################################
+        # FLOAT NORMALIZATION — CRITICAL
+        #################################################
+
+        for col in df_copy.columns:
+
+            if col == "date":
+                df_copy[col] = pd.to_datetime(
+                    df_copy[col],
+                    utc=True
+                )
+                continue
+
+            df_copy[col] = (
+                pd.to_numeric(df_copy[col], errors="raise")
+                .astype("float64")
+                .round(10)
+            )
 
         hashed = pd.util.hash_pandas_object(
             df_copy,
@@ -107,6 +135,9 @@ class MetadataManager:
 
         return hashlib.sha256(hashed.tobytes()).hexdigest()
 
+    #####################################################
+    # TRAINING CODE HASH (STRICT)
+    #####################################################
 
     @staticmethod
     def fingerprint_training_code():
@@ -131,12 +162,9 @@ class MetadataManager:
             for path, dirs, files in os.walk(root):
 
                 dirs.sort()
-                files.sort()
+                files = sorted(f for f in files if f.endswith(".py"))
 
                 for f in files:
-
-                    if not f.endswith(".py"):
-                        continue
 
                     full_path = os.path.join(path, f)
                     rel_path = os.path.relpath(full_path)
@@ -151,19 +179,21 @@ class MetadataManager:
 
         return hasher.hexdigest()
 
+    #####################################################
+    # ENVIRONMENT (REPRODUCIBLE)
+    #####################################################
 
     @staticmethod
     def capture_environment():
 
         env = {
-            "python": sys.version,
-            "platform": platform.platform(),
-            "architecture": platform.machine(),
-            "processor": platform.processor(),
-            "byteorder": sys.byteorder,
+            "python": platform.python_version(),
+            "platform": platform.system(),
             "numpy": np.__version__,
             "pandas": pd.__version__,
         }
+
+        # optional libs
 
         try:
             import sklearn
@@ -185,6 +215,9 @@ class MetadataManager:
 
         return env
 
+    #####################################################
+    # NORMALIZATION FOR HASH
+    #####################################################
 
     @staticmethod
     def _normalize_for_hash(obj):
@@ -204,6 +237,7 @@ class MetadataManager:
 
         return obj
 
+    #####################################################
 
     @staticmethod
     def _compute_metadata_hash(metadata: dict):
@@ -221,6 +255,7 @@ class MetadataManager:
 
         return hashlib.sha256(canonical).hexdigest()
 
+    #####################################################
 
     @staticmethod
     def _validate_training_window(start, end):
@@ -230,9 +265,10 @@ class MetadataManager:
 
         if end_dt <= start_dt:
             raise RuntimeError(
-                "Invalid training window: end must be after start."
+                "Invalid training window."
             )
 
+    #####################################################
 
     @staticmethod
     def _validate_universe(universe):
@@ -242,9 +278,12 @@ class MetadataManager:
 
         if universe != sorted(universe):
             raise RuntimeError(
-                "Universe snapshot must be sorted for determinism."
+                "Universe snapshot must be sorted."
             )
 
+    #####################################################
+    # CREATE METADATA
+    #####################################################
 
     @staticmethod
     def create_metadata(
@@ -272,6 +311,10 @@ class MetadataManager:
 
         MetadataManager._validate_universe(universe)
 
+        universe_hash = hashlib.sha256(
+            json.dumps(universe).encode()
+        ).hexdigest()
+
         metadata = {
 
             "metadata_type": metadata_type,
@@ -298,8 +341,8 @@ class MetadataManager:
             "environment":
                 MetadataManager.capture_environment(),
 
-            "training_universe":
-                universe
+            "training_universe": universe,
+            "universe_hash": universe_hash
         }
 
         if extra_fields:
@@ -313,6 +356,7 @@ class MetadataManager:
 
         return metadata
 
+    #####################################################
 
     @staticmethod
     def validate_metadata(metadata):
@@ -344,6 +388,7 @@ class MetadataManager:
                 "Schema version mismatch detected."
             )
 
+    #####################################################
 
     @staticmethod
     def _atomic_json_write(path, payload):
@@ -373,6 +418,7 @@ class MetadataManager:
                 except Exception:
                     pass
 
+    #####################################################
 
     @staticmethod
     def save_metadata(metadata, path):
@@ -380,6 +426,7 @@ class MetadataManager:
         MetadataManager.validate_metadata(metadata)
         MetadataManager._atomic_json_write(path, metadata)
 
+    #####################################################
 
     @staticmethod
     def load_metadata(path):
