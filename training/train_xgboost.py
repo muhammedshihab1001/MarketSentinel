@@ -40,6 +40,7 @@ MIN_TRAINING_ROWS = 2000
 MIN_SURVIVING_RATIO = 0.35
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
+MIN_MODEL_BYTES = 50_000
 
 
 ########################################################
@@ -94,9 +95,12 @@ def save_model_atomic(model, path):
     if not os.path.exists(path):
         raise RuntimeError("Model write failed.")
 
+    if os.path.getsize(path) < MIN_MODEL_BYTES:
+        raise RuntimeError("Model artifact suspiciously small.")
+
 
 ########################################################
-# DATA LOADER (FIXED — INSTITUTIONAL)
+# DATA LOADER
 ########################################################
 
 def load_training_data(start_date, end_date):
@@ -121,10 +125,6 @@ def load_training_data(start_date, end_date):
                 start_date=start_date,
                 end_date=end_date
             )
-
-            if price_df is None or price_df.empty:
-                failures.append(f"{ticker}: no price")
-                continue
 
             sentiment_df = None
 
@@ -158,8 +158,6 @@ def load_training_data(start_date, end_date):
             failures.append(f"{ticker}: {str(e)}")
             logger.warning("Ticker rejected: %s | %s", ticker, str(e))
 
-    ##################################################
-
     if not datasets:
         raise RuntimeError("All tickers failed — training aborted.")
 
@@ -180,8 +178,6 @@ def load_training_data(start_date, end_date):
             f"Universe collapse — survival ratio {survival_ratio:.2f}"
         )
 
-    ##################################################
-
     df = pd.concat(datasets, ignore_index=True)
 
     if len(df) < MIN_TRAINING_ROWS:
@@ -191,6 +187,12 @@ def load_training_data(start_date, end_date):
     df.reset_index(drop=True, inplace=True)
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
+
+    if not np.isfinite(df.loc[:, MODEL_FEATURES].to_numpy()).all():
+        raise RuntimeError("Non-finite values detected in training features.")
+
+    if df["target"].nunique() < 2:
+        raise RuntimeError("Target collapsed — cannot train classifier.")
 
     logger.info("Final training rows: %s", len(df))
 
@@ -212,6 +214,8 @@ def main(start_date=None, end_date=None):
 
     df = load_training_data(start_date, end_date)
 
+    df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
     dataset_hash = MetadataManager.fingerprint_dataset(
         df[["ticker", "date", "target", *MODEL_FEATURES]]
     )
@@ -228,8 +232,13 @@ def main(start_date=None, end_date=None):
             dataset_hash=dataset_hash,
             allow_overwrite=False
         )
-    except FileExistsError:
-        pass
+
+    except RuntimeError as e:
+
+        if "already exists" not in str(e):
+            raise
+
+        logger.info("Drift baseline already exists.")
 
     ###################################################
     # WALK FORWARD
@@ -239,7 +248,11 @@ def main(start_date=None, end_date=None):
 
         y = d["target"]
 
-        model = build_xgboost_model(y)
+        model = build_xgboost_model(
+            y,
+            random_state=SEED,
+            nthread=1
+        )
 
         model.fit(
             d.loc[:, MODEL_FEATURES],
@@ -283,7 +296,11 @@ def main(start_date=None, end_date=None):
     # FINAL TRAIN
     ###################################################
 
-    final_model = build_final_xgboost_model(df["target"])
+    final_model = build_final_xgboost_model(
+        df["target"],
+        random_state=SEED,
+        nthread=1
+    )
 
     final_model.fit(
         df.loc[:, MODEL_FEATURES],
@@ -293,7 +310,7 @@ def main(start_date=None, end_date=None):
     save_model_atomic(final_model, TEMP_MODEL_PATH)
 
     ###################################################
-    # METADATA (FIXED)
+    # METADATA
     ###################################################
 
     metadata = MetadataManager.create_metadata(
