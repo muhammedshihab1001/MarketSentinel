@@ -17,18 +17,22 @@ from statsmodels.tools.sm_exceptions import ConvergenceWarning
 # STRICT NUMERIC DETERMINISM
 ########################################################
 
+os.environ["PYTHONHASHSEED"] = "42"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 
-MIN_HISTORY = 300
+MIN_HISTORY = 320
 EPSILON = 1e-9
 MAX_FORWARD_FILL_RATIO = 0.05
 
-MAX_FORECAST_MULTIPLIER = 5.0   # prevents explosion
-MIN_FORECAST_MULTIPLIER = 0.2
+MAX_FORECAST_MULTIPLIER = 4.0
+MIN_FORECAST_MULTIPLIER = 0.25
+
+MAX_PARAM_ABS = 50
+MAX_PARAM_NORM = 120
 
 
 ########################################################
@@ -39,9 +43,9 @@ MIN_FORECAST_MULTIPLIER = 0.2
 class SarimaxConfig:
     order: tuple = (1, 1, 1)
     seasonal_order: tuple = (0, 0, 0, 0)
-    enforce_stationarity: bool = False
-    enforce_invertibility: bool = False
-    maxiter: int = 200
+    enforce_stationarity: bool = True
+    enforce_invertibility: bool = True
+    maxiter: int = 250
     trend: Optional[str] = None
     frequency: str = "B"
 
@@ -116,6 +120,9 @@ def prepare_series(df: pd.DataFrame, freq: str) -> pd.Series:
 
     reindexed = reindexed.ffill()
 
+    if not np.isfinite(reindexed).all():
+        raise RuntimeError("Forward fill produced non-finite values.")
+
     reindexed.index.freq = freq
 
     return reindexed
@@ -134,6 +141,23 @@ class SarimaxModel:
         self._fingerprint = None
 
     ########################################################
+    # PARAMETER STABILITY CHECK (VERY IMPORTANT)
+    ########################################################
+
+    def _validate_parameters(self):
+
+        params = np.asarray(self._fitted.params, dtype="float64")
+
+        if not np.isfinite(params).all():
+            raise RuntimeError("Non-finite SARIMAX parameters detected.")
+
+        if np.max(np.abs(params)) > MAX_PARAM_ABS:
+            raise RuntimeError("Parameter explosion detected.")
+
+        if np.linalg.norm(params) > MAX_PARAM_NORM:
+            raise RuntimeError("Parameter surface unstable.")
+
+    ########################################################
     # TRAIN
     ########################################################
 
@@ -145,6 +169,7 @@ class SarimaxModel:
         )
 
         with warnings.catch_warnings():
+
             warnings.filterwarnings(
                 "error",
                 category=ConvergenceWarning
@@ -183,21 +208,28 @@ class SarimaxModel:
 
         self._fitted = fitted
         self._train_index = series.index
+
+        self._validate_parameters()
+
         self._fingerprint = self._hash_model()
 
         return self
 
     ########################################################
-    # MODEL HASH (CRITICAL)
+    # MODEL HASH (UPGRADED)
     ########################################################
 
     def _hash_model(self) -> str:
 
-        params = np.ascontiguousarray(
-            self._fitted.params.astype("float64")
+        payload = np.ascontiguousarray(
+            np.concatenate([
+                self._fitted.params.astype("float64"),
+                np.array(self.config.order),
+                np.array(self.config.seasonal_order),
+            ])
         )
 
-        return hashlib.sha256(params.tobytes()).hexdigest()
+        return hashlib.sha256(payload.tobytes()).hexdigest()
 
     def fingerprint(self) -> str:
 
@@ -261,6 +293,9 @@ class SarimaxModel:
             prices[0],
             EPSILON
         )
+
+        if not np.isfinite(volatility):
+            raise RuntimeError("Invalid forecast volatility.")
 
         if abs(normalized_slope) < (
             volatility / max(prices[0], EPSILON)
