@@ -26,6 +26,9 @@ class RegimeConfig:
 
     MIN_SURVIVAL_RATIO: float = 0.6
 
+    # NEW — institutional panic guard
+    MAX_CRISIS_RATIO: float = 0.65
+
 
 class MarketRegimeDetector:
 
@@ -131,14 +134,16 @@ class MarketRegimeDetector:
 
             returns = raw_returns.shift(1)
 
-            ###################################################
-
             shifted = df["close"].shift(1)
+
+            ###################################################
+            # 🔥 INSTITUTIONAL FIX — DOUBLE LAG ROLLING
+            ###################################################
 
             ma_long = shifted.rolling(
                 cfg.trend_window,
                 min_periods=cfg.trend_window
-            ).mean()
+            ).mean().shift(1)
 
             volatility = (
                 returns
@@ -147,6 +152,7 @@ class MarketRegimeDetector:
                     min_periods=cfg.volatility_window
                 )
                 .std()
+                .shift(1)
             )
 
             volatility = volatility.clip(lower=cfg.EPSILON)
@@ -191,14 +197,10 @@ class MarketRegimeDetector:
 
             df["date"] = pd.to_datetime(df["date"], utc=True)
 
-            ###################################################
-            # 🔥 DROP WARMUP ROWS
-            ###################################################
-
             warmup = max(
                 cfg.trend_window,
                 cfg.volatility_window
-            ) + cfg.persistence_days
+            ) + cfg.persistence_days + 2
 
             df = df.iloc[warmup:].copy()
 
@@ -214,7 +216,7 @@ class MarketRegimeDetector:
             return None
 
     ########################################################
-    # 🔥 MARKET REGIME (NEW — VERY IMPORTANT)
+    # MARKET REGIME
     ########################################################
 
     def _build_market_regime(self, df):
@@ -225,7 +227,18 @@ class MarketRegimeDetector:
             .unstack(fill_value=0)
         )
 
-        market_regime = regime_counts.idxmax(axis=1)
+        crisis_ratio = (
+            regime_counts.get("CRISIS", 0) /
+            regime_counts.sum(axis=1)
+        )
+
+        if (crisis_ratio > self.config.MAX_CRISIS_RATIO).any():
+            raise RuntimeError(
+                "Market-wide crisis detected — trading unsafe."
+            )
+
+        # 🔥 FIX — SHIFT MARKET REGIME
+        market_regime = regime_counts.idxmax(axis=1).shift(1)
 
         return market_regime.rename("market_regime")
 
@@ -278,7 +291,7 @@ class MarketRegimeDetector:
         )
 
         ###################################################
-        # 🔥 ADD MARKET REGIME
+        # ADD MARKET REGIME
         ###################################################
 
         market_regime = self._build_market_regime(result)
@@ -288,10 +301,6 @@ class MarketRegimeDetector:
             on="date",
             how="left"
         )
-
-        ###################################################
-        # CALENDAR ALIGNMENT CHECK
-        ###################################################
 
         counts = result.groupby("date")["ticker"].nunique()
 
