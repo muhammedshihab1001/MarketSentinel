@@ -15,6 +15,7 @@ logger = logging.getLogger("marketsentinel.fetcher")
 class StockPriceFetcher:
 
     REQUIRED_COLUMNS = {
+        "ticker",   # ⭐ NOW HARD REQUIRED
         "date",
         "open",
         "high",
@@ -23,7 +24,7 @@ class StockPriceFetcher:
         "volume"
     }
 
-    CACHE_VERSION = "2.0"
+    CACHE_VERSION = "3.0"  # ⭐ bump version to invalidate old cache
 
     MIN_ROWS = 120
     MAX_RETRIES = 5
@@ -106,10 +107,10 @@ class StockPriceFetcher:
         return df.loc[:, ~df.columns.duplicated()]
 
     ##################################################
-    # NORMALIZE
+    # NORMALIZE + ATTACH TICKER (CRITICAL FIX)
     ##################################################
 
-    def _normalize_schema(self, df: pd.DataFrame):
+    def _normalize_schema(self, df: pd.DataFrame, ticker: str):
 
         df = self._flatten_columns(df)
 
@@ -144,6 +145,12 @@ class StockPriceFetcher:
         df = df.dropna(subset=["date"] + numeric_cols)
 
         df = df.loc[:, ["date", "open", "high", "low", "close", "volume"]]
+
+        ##################################################
+        # ⭐ THE FIX THAT STOPS YOUR TRAINING CRASH
+        ##################################################
+
+        df["ticker"] = ticker
 
         return df
 
@@ -206,12 +213,12 @@ class StockPriceFetcher:
 
     ##################################################
 
-    def _validate_dataset(self, df, start_date, end_date):
+    def _validate_dataset(self, df, start_date, end_date, ticker):
 
         if df is None or df.empty:
             raise RuntimeError("Provider returned empty dataset.")
 
-        df = self._normalize_schema(df)
+        df = self._normalize_schema(df, ticker)
 
         if not pd.api.types.is_datetime64_any_dtype(df["date"]):
             raise RuntimeError("Date column corrupted.")
@@ -222,7 +229,7 @@ class StockPriceFetcher:
         if (df["high"] < df["low"]).any():
             raise RuntimeError("High < Low detected.")
 
-        df = df.drop_duplicates("date").sort_values("date")
+        df = df.drop_duplicates(["ticker", "date"]).sort_values("date")
 
         self._validate_monotonic(df)
         self._detect_gaps(df)
@@ -274,12 +281,12 @@ class StockPriceFetcher:
 
             try:
                 cached = pd.read_parquet(cache_file)
-                cached = self._normalize_schema(cached)
 
                 return self._validate_dataset(
                     cached,
                     start_date,
-                    end_date
+                    end_date,
+                    ticker
                 )
 
             except Exception:
@@ -299,7 +306,8 @@ class StockPriceFetcher:
         df = self._validate_dataset(
             df,
             start_date,
-            end_date
+            end_date,
+            ticker
         )
 
         self._atomic_cache_write(df, cache_file)
