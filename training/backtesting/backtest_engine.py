@@ -2,29 +2,23 @@ import numpy as np
 
 
 class BacktestEngine:
-    """
-    Institutional-grade trading simulator.
-
-    Guarantees:
-    - no lookahead execution
-    - leverage guard
-    - slippage modeling
-    - bankruptcy termination
-    - signal validation
-    - exposure tracking
-    - true turnover
-    """
 
     VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
 
     MIN_CAPITAL = 1e-6
+    MAX_DRAWDOWN_KILL = -0.70
+    MAX_SHARPE = 5.0
+
+    MIN_HOLD_BARS = 2
+    REENTRY_COOLDOWN = 1
+
+    ############################################################
 
     def _validate_inputs(self, prices, signals, position_size):
 
         if position_size <= 0 or position_size > 1.0:
             raise RuntimeError(
-                "position_size must be within (0, 1]. "
-                "Leverage requires explicit margin modeling."
+                "position_size must be within (0, 1]."
             )
 
         if len(prices) != len(signals):
@@ -39,7 +33,7 @@ class BacktestEngine:
             raise RuntimeError("Non-finite prices detected.")
 
         if (prices <= 0).any():
-            raise RuntimeError("Invalid non-positive prices detected.")
+            raise RuntimeError("Invalid prices detected.")
 
         unknown = set(signals) - self.VALID_SIGNALS
         if unknown:
@@ -76,6 +70,13 @@ class BacktestEngine:
 
         prev_signal = "HOLD"
 
+        hold_bars = 0
+        cooldown = 0
+
+        peak_equity = initial_cash
+
+        ####################################################
+
         for i in range(len(prices)):
 
             price = prices[i]
@@ -84,28 +85,41 @@ class BacktestEngine:
             # EXECUTE PREVIOUS SIGNAL
             ####################################################
 
-            if prev_signal == "BUY" and cash > self.MIN_CAPITAL and position == 0:
+            if position > 0:
+                hold_bars += 1
+
+            if cooldown > 0:
+                cooldown -= 1
+
+            if (
+                prev_signal == "BUY"
+                and cash > self.MIN_CAPITAL
+                and position == 0
+                and cooldown == 0
+            ):
 
                 execution_price = price * (1 + slippage)
 
                 deploy_cash = cash * position_size
 
-                if deploy_cash <= self.MIN_CAPITAL:
-                    prev_signal = signals[i]
-                    portfolio_values.append(cash)
-                    continue
+                if deploy_cash > self.MIN_CAPITAL:
 
-                shares = (
-                    deploy_cash * (1 - transaction_cost)
-                ) / execution_price
+                    shares = (
+                        deploy_cash * (1 - transaction_cost)
+                    ) / execution_price
 
-                position = shares
-                cash -= deploy_cash
+                    position = shares
+                    cash -= deploy_cash
 
-                capital_rotated += deploy_cash
-                trade_count += 1
+                    capital_rotated += deploy_cash
+                    trade_count += 1
+                    hold_bars = 0
 
-            elif prev_signal == "SELL" and position > 0:
+            elif (
+                prev_signal == "SELL"
+                and position > 0
+                and hold_bars >= self.MIN_HOLD_BARS
+            ):
 
                 execution_price = price * (1 - slippage)
 
@@ -121,15 +135,26 @@ class BacktestEngine:
                 position = 0
 
                 trade_count += 1
+                cooldown = self.REENTRY_COOLDOWN
 
             ####################################################
-            # BANKRUPTCY GUARD
+            # EQUITY
             ####################################################
 
             portfolio_value = cash + position * price
 
             if portfolio_value <= self.MIN_CAPITAL:
                 portfolio_values.append(self.MIN_CAPITAL)
+                break
+
+            peak_equity = max(peak_equity, portfolio_value)
+
+            drawdown = (
+                portfolio_value - peak_equity
+            ) / peak_equity
+
+            if drawdown < self.MAX_DRAWDOWN_KILL:
+                portfolio_values.append(portfolio_value)
                 break
 
             if position > 0:
@@ -151,11 +176,11 @@ class BacktestEngine:
             position = 0
 
             portfolio_values[-1] = cash
-
             trade_count += 1
 
-        portfolio_values = np.array(portfolio_values, dtype=float)
+        ####################################################
 
+        portfolio_values = np.array(portfolio_values, dtype=float)
         portfolio_values = np.maximum(portfolio_values, self.MIN_CAPITAL)
 
         strategy_return = portfolio_values[-1] / initial_cash - 1
@@ -163,7 +188,6 @@ class BacktestEngine:
         alpha = strategy_return - buy_hold_return
 
         returns = np.diff(portfolio_values) / portfolio_values[:-1]
-
         returns = returns[np.isfinite(returns)]
 
         if len(returns) > 1:
@@ -174,6 +198,9 @@ class BacktestEngine:
                 np.mean(returns) / std * np.sqrt(252)
                 if std > 0 else 0.0
             )
+
+            sharpe = float(np.clip(sharpe, -self.MAX_SHARPE, self.MAX_SHARPE))
+
         else:
             sharpe = 0.0
 
@@ -211,48 +238,3 @@ class BacktestEngine:
             "turnover": 0.0,
             "equity_curve": [initial_cash]
         }
-
-
-############################################################
-# SAFE WRAPPERS
-############################################################
-
-def backtest_strategy(df, signal_column="signal"):
-
-    engine = BacktestEngine()
-
-    prices = df["close"].values
-    signals = df[signal_column].fillna("HOLD").values
-
-    results = engine.run(prices, signals)
-
-    curve = np.array(results["equity_curve"])
-
-    peak = np.maximum.accumulate(curve)
-    drawdown = (curve - peak) / peak
-
-    return {
-        "total_return": results["strategy_return"],
-        "max_drawdown": float(drawdown.min()),
-        "sharpe_ratio": results["sharpe_ratio"]
-    }
-
-
-def signal_hit_rate(df, signal_column="signal"):
-
-    df = df.copy()
-
-    df["future_return"] = df["close"].shift(-1) / df["close"] - 1
-
-    valid = df[signal_column].isin(["BUY", "SELL"])
-
-    hits = df[
-        ((df[signal_column] == "BUY") & (df["future_return"] > 0)) |
-        ((df[signal_column] == "SELL") & (df["future_return"] < 0))
-    ]
-
-    total = valid.sum()
-
-    return {
-        "hit_rate": len(hits) / total if total > 0 else 0.0
-    }
