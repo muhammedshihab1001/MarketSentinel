@@ -33,10 +33,10 @@ class MetadataManager:
         "metadata_integrity_hash",
         "environment",
         "training_universe",
-        "universe_hash"   # ⭐ NEW
+        "universe_hash"
     ]
 
-    METADATA_VERSION = "8.0"
+    METADATA_VERSION = "8.1"
 
     #####################################################
     # SAFE FSYNC
@@ -54,6 +54,25 @@ class MetadataManager:
             os.close(fd)
         except Exception:
             pass
+
+    #####################################################
+    # HASH LIST (YOU WERE MISSING THIS)
+    #####################################################
+
+    @staticmethod
+    def hash_list(items):
+
+        if not items:
+            raise RuntimeError("Cannot hash empty list.")
+
+        normalized = sorted(str(x) for x in items)
+
+        canonical = json.dumps(
+            normalized,
+            separators=(",", ":")
+        ).encode()
+
+        return hashlib.sha256(canonical).hexdigest()
 
     #####################################################
     # FEATURE CONTRACT
@@ -91,7 +110,7 @@ class MetadataManager:
             )
 
     #####################################################
-    # DATASET FINGERPRINT (DETERMINISTIC)
+    # DATASET FINGERPRINT (FIXED — SUPPORTS STRINGS)
     #####################################################
 
     @staticmethod
@@ -109,10 +128,6 @@ class MetadataManager:
 
         df_copy = df_copy.reset_index(drop=True)
 
-        #################################################
-        # FLOAT NORMALIZATION — CRITICAL
-        #################################################
-
         for col in df_copy.columns:
 
             if col == "date":
@@ -120,6 +135,11 @@ class MetadataManager:
                     df_copy[col],
                     utc=True
                 )
+                continue
+
+            # ⭐ CRITICAL FIX — support categorical
+            if df_copy[col].dtype == "object":
+                df_copy[col] = df_copy[col].astype(str)
                 continue
 
             df_copy[col] = (
@@ -136,7 +156,7 @@ class MetadataManager:
         return hashlib.sha256(hashed.tobytes()).hexdigest()
 
     #####################################################
-    # TRAINING CODE HASH (STRICT)
+    # TRAINING CODE HASH
     #####################################################
 
     @staticmethod
@@ -180,7 +200,7 @@ class MetadataManager:
         return hasher.hexdigest()
 
     #####################################################
-    # ENVIRONMENT (REPRODUCIBLE)
+    # ENVIRONMENT
     #####################################################
 
     @staticmethod
@@ -192,8 +212,6 @@ class MetadataManager:
             "numpy": np.__version__,
             "pandas": pd.__version__,
         }
-
-        # optional libs
 
         try:
             import sklearn
@@ -216,7 +234,7 @@ class MetadataManager:
         return env
 
     #####################################################
-    # NORMALIZATION FOR HASH
+    # METADATA HASH
     #####################################################
 
     @staticmethod
@@ -237,8 +255,6 @@ class MetadataManager:
 
         return obj
 
-    #####################################################
-
     @staticmethod
     def _compute_metadata_hash(metadata: dict):
 
@@ -256,6 +272,8 @@ class MetadataManager:
         return hashlib.sha256(canonical).hexdigest()
 
     #####################################################
+    # VALIDATORS
+    #####################################################
 
     @staticmethod
     def _validate_training_window(start, end):
@@ -264,22 +282,19 @@ class MetadataManager:
         end_dt = pd.to_datetime(end, utc=True)
 
         if end_dt <= start_dt:
-            raise RuntimeError(
-                "Invalid training window."
-            )
-
-    #####################################################
+            raise RuntimeError("Invalid training window.")
 
     @staticmethod
-    def _validate_universe(universe):
+    def _validate_universe_snapshot(snapshot):
 
-        if not universe:
-            raise RuntimeError("Training universe is empty.")
+        if not isinstance(snapshot, dict):
+            raise RuntimeError("Universe snapshot must be dict.")
 
-        if universe != sorted(universe):
-            raise RuntimeError(
-                "Universe snapshot must be sorted."
-            )
+        if "tickers" not in snapshot:
+            raise RuntimeError("Universe snapshot missing tickers.")
+
+        if snapshot["tickers"] != sorted(snapshot["tickers"]):
+            raise RuntimeError("Universe tickers must be sorted.")
 
     #####################################################
     # CREATE METADATA
@@ -307,13 +322,11 @@ class MetadataManager:
             training_end
         )
 
-        universe = MarketUniverse.snapshot()
+        universe_snapshot = MarketUniverse.snapshot()
 
-        MetadataManager._validate_universe(universe)
-
-        universe_hash = hashlib.sha256(
-            json.dumps(universe).encode()
-        ).hexdigest()
+        MetadataManager._validate_universe_snapshot(
+            universe_snapshot
+        )
 
         metadata = {
 
@@ -341,8 +354,8 @@ class MetadataManager:
             "environment":
                 MetadataManager.capture_environment(),
 
-            "training_universe": universe,
-            "universe_hash": universe_hash
+            "training_universe": universe_snapshot,
+            "universe_hash": universe_snapshot["universe_hash"]
         }
 
         if extra_fields:
@@ -374,19 +387,13 @@ class MetadataManager:
         if metadata["metadata_integrity_hash"] != (
             MetadataManager._compute_metadata_hash(metadata)
         ):
-            raise RuntimeError(
-                "Metadata integrity failure detected."
-            )
+            raise RuntimeError("Metadata integrity failure detected.")
 
         if metadata["schema_signature"] != get_schema_signature():
-            raise RuntimeError(
-                "Schema signature mismatch detected."
-            )
+            raise RuntimeError("Schema signature mismatch detected.")
 
         if metadata["schema_version"] != SCHEMA_VERSION:
-            raise RuntimeError(
-                "Schema version mismatch detected."
-            )
+            raise RuntimeError("Schema version mismatch detected.")
 
     #####################################################
 
