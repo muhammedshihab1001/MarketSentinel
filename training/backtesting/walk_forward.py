@@ -96,8 +96,12 @@ class WalkForwardValidator:
         if not np.isfinite(probs).all():
             raise RuntimeError("Non-finite predictions.")
 
+        # 🔴 NEW — probability collapse guard
         if np.std(probs) < 5e-5:
             raise RuntimeError("Model collapsed.")
+
+        if np.mean(probs) < 0.02 or np.mean(probs) > 0.98:
+            raise RuntimeError("Probability collapse detected.")
 
     ############################################
 
@@ -152,9 +156,6 @@ class WalkForwardValidator:
 
         self._assert_monotonic(df)
 
-        # compute regime ONCE → leak safe
-        df = self.regime_detector.detect(df)
-
         unique_dates = pd.to_datetime(
             df["date"].drop_duplicates()
         ).sort_values()
@@ -166,12 +167,13 @@ class WalkForwardValidator:
         equity_curve = []
         sharpe_series = []
 
-        capital = 10_000.0
-        initial_capital = capital
-
+        initial_capital = 10_000.0
         start_idx = self.window_size
 
         while start_idx < len(unique_dates) - 1:
+
+            # 🔴 Force window independence
+            model = None
 
             train_end_date = unique_dates.iloc[start_idx]
 
@@ -204,8 +206,15 @@ class WalkForwardValidator:
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
-            self._validate_training_frame(train_df)
+            # 🔴 CRITICAL FIX — compute regime AFTER split (no leakage)
+            train_df = self.regime_detector.detect(train_df)
+            test_df = self.regime_detector.detect(test_df)
+
+            # 🔴 Schema re-validation after regime injection
+            validate_feature_schema(train_df.loc[:, MODEL_FEATURES])
             validate_feature_schema(test_df.loc[:, MODEL_FEATURES])
+
+            self._validate_training_frame(train_df)
 
             model = self.model_trainer(train_df)
             self._sanity_check_model(model, train_df)
@@ -267,20 +276,12 @@ class WalkForwardValidator:
                 start_idx += self.step_size
                 continue
 
+            # 🔴 FIX — remove path-dependent capital bias
             metrics = self.engine.run(
                 grouped_prices,
                 grouped_signals,
-                initial_cash=capital
+                initial_cash=initial_capital
             )
-
-            capital = float(metrics["final_portfolio"])
-
-            if (
-                not np.isfinite(capital) or
-                capital <= 0 or
-                capital > initial_capital * self.MAX_CAPITAL_MULTIPLE
-            ):
-                raise RuntimeError("Capital trajectory unrealistic.")
 
             curve = np.array(metrics["equity_curve"], dtype=float)
 
