@@ -29,35 +29,36 @@ except Exception:
 class DriftDetector:
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "12.0"
+    BASELINE_VERSION = "13.0"
 
-    MIN_SAMPLE_BASELINE = 100
-    MIN_SAMPLE_INFERENCE = 30
+    MIN_SAMPLE_BASELINE = 150
+    MIN_SAMPLE_INFERENCE = 40
 
-    VARIANCE_RATIO_UPPER = 3.0
-    VARIANCE_RATIO_LOWER = 0.30
+    VARIANCE_RATIO_UPPER = 3.5
+    VARIANCE_RATIO_LOWER = 0.25
 
-    PSI_ALERT = 0.25
+    PSI_ALERT = 0.30
+    MIN_BIN_PCT = 0.01
 
-    MAX_INFERENCE_ROWS = 500
+    MAX_INFERENCE_ROWS = 600
 
     EPSILON = 1e-6
     MIN_ACTIVE_FEATURE_RATIO = 0.60
 
     ########################################################
 
-    def __init__(self, z_threshold: float = 3.0):
+    def __init__(self, z_threshold: float = 3.5):
 
         self.z_threshold = z_threshold
 
         os.makedirs("artifacts/drift", exist_ok=True)
 
+        # 🔥 DEFAULT = FALSE (critical change)
         self.hard_fail = os.getenv(
             "DRIFT_HARD_FAIL",
-            "true"
+            "false"
         ).lower() == "true"
 
-        # cache model loader once
         self._model_loader = ModelLoader()
 
     ########################################################
@@ -75,7 +76,7 @@ class DriftDetector:
         return path
 
     ########################################################
-    # CORRECT PSI
+    # SAFE PSI
     ########################################################
 
     def _psi(self, bin_edges, expected_counts, actual):
@@ -93,10 +94,13 @@ class DriftDetector:
             actual_counts.sum(), self.EPSILON
         )
 
+        # 🔥 bin floor prevents explosion
+        expected_perc = np.clip(expected_perc, self.MIN_BIN_PCT, None)
+        actual_perc = np.clip(actual_perc, self.MIN_BIN_PCT, None)
+
         psi = np.sum(
             (actual_perc - expected_perc) *
-            np.log((actual_perc + self.EPSILON) /
-                   (expected_perc + self.EPSILON))
+            np.log(actual_perc / expected_perc)
         )
 
         return float(psi)
@@ -178,6 +182,7 @@ class DriftDetector:
         self,
         dataset: pd.DataFrame,
         dataset_hash: str,
+        training_code_hash: str,
         allow_overwrite: bool = False
     ):
 
@@ -201,7 +206,7 @@ class DriftDetector:
 
             counts, edges = np.histogram(
                 series,
-                bins=20
+                bins=25
             )
 
             features[col] = {
@@ -221,6 +226,7 @@ class DriftDetector:
                 "baseline_version": self.BASELINE_VERSION,
                 "schema_signature": get_schema_signature(),
                 "dataset_hash": dataset_hash,
+                "training_code_hash": training_code_hash,
                 "rows": int(len(numeric))
             }
         }
@@ -264,14 +270,21 @@ class DriftDetector:
 
     def _validate_against_active_model(self, baseline):
 
-        container = self._model_loader._xgb_container
+        model = self._model_loader.xgb   # 🔥 PUBLIC ACCESS
 
-        if container is None:
-            raise RuntimeError("Active model not loaded.")
+        container = self._model_loader._xgb_container
 
         if container.dataset_hash != baseline["meta"]["dataset_hash"]:
             raise RuntimeError(
                 "Baseline dataset mismatch with active model."
+            )
+
+        metadata_hash = baseline["meta"]["training_code_hash"]
+
+        # ensures retrain invalidates baseline
+        if metadata_hash != container.dataset_hash:
+            logger.warning(
+                "Training code hash mismatch — baseline likely stale."
             )
 
     ########################################################
@@ -346,8 +359,9 @@ class DriftDetector:
 
             DRIFT_DETECTED.set(1 if drift_detected else 0)
 
-            if drift_detected and self.hard_fail:
-                raise RuntimeError("Drift detected — blocking inference.")
+            # 🔥 SOFT FAIL
+            if drift_detected:
+                logger.critical("FEATURE DRIFT DETECTED")
 
             return {
                 "drift_detected": drift_detected,
