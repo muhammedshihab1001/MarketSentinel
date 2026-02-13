@@ -3,61 +3,61 @@ from sklearn.metrics import (
     accuracy_score,
     mean_squared_error,
     roc_auc_score,
-    mean_absolute_error
+    mean_absolute_error,
+    balanced_accuracy_score
 )
 
 
-# ---------------------------------------------------
-# INTERNAL SAFETY
-# ---------------------------------------------------
-
 def _flatten(arr):
-    """
-    Prevent silent metric corruption from (N,1) arrays.
-    """
     return np.asarray(arr).reshape(-1)
 
 
-# ---------------------------------------------------
+###################################################
 # XGBOOST / CLASSIFICATION
-# ---------------------------------------------------
+###################################################
 
 def evaluate_xgboost(y_true, y_pred, y_prob=None):
-    """
-    Institutional evaluation for classification models.
-
-    Guarantees:
-    - shape safety
-    - ROC protection
-    - backward compatibility
-    """
 
     y_true = _flatten(y_true)
     y_pred = _flatten(y_pred)
 
+    if len(y_true) != len(y_pred):
+        raise RuntimeError("Prediction length mismatch.")
+
+    valid_labels = {0, 1}
+
+    if not set(np.unique(y_true)).issubset(valid_labels):
+        raise RuntimeError("Invalid classification labels detected.")
+
+    if not set(np.unique(y_pred)).issubset(valid_labels):
+        raise RuntimeError("Invalid prediction labels detected.")
+
     metrics = {
-        "accuracy": float(
-            accuracy_score(y_true, y_pred)
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(
+            balanced_accuracy_score(y_true, y_pred)
         )
     }
-
-    # -----------------------------------------
-    # ROC AUC
-    # -----------------------------------------
 
     if y_prob is not None:
 
         y_prob = _flatten(y_prob)
 
-        # Detect invalid probabilities
+        if len(y_prob) != len(y_true):
+            raise RuntimeError("Probability length mismatch.")
+
         if np.any(y_prob < 0) or np.any(y_prob > 1):
             raise RuntimeError(
                 "Invalid probabilities detected in evaluation."
             )
 
+        if np.std(y_prob) < 1e-5:
+            raise RuntimeError(
+                "Probability distribution collapsed."
+            )
+
         try:
 
-            # Guard against single-class folds
             if len(np.unique(y_true)) < 2:
                 metrics["roc_auc"] = 0.5
             else:
@@ -74,21 +74,20 @@ def evaluate_xgboost(y_true, y_pred, y_prob=None):
     return metrics
 
 
-# ---------------------------------------------------
+###################################################
 # LSTM / REGRESSION
-# ---------------------------------------------------
+###################################################
 
 def evaluate_lstm(y_true, y_pred):
-    """
-    Institutional RMSE.
-
-    Adds:
-    - shape safety
-    - NaN guard
-    """
 
     y_true = _flatten(y_true)
     y_pred = _flatten(y_pred)
+
+    if len(y_true) != len(y_pred):
+        raise RuntimeError("Prediction length mismatch.")
+
+    if np.isnan(y_true).any():
+        raise RuntimeError("NaNs detected in targets.")
 
     if np.isnan(y_pred).any():
         raise RuntimeError("NaNs detected in predictions.")
@@ -102,22 +101,23 @@ def evaluate_lstm(y_true, y_pred):
     }
 
 
-# ---------------------------------------------------
+###################################################
 # PROPHET / FORECASTING
-# ---------------------------------------------------
+###################################################
 
 def evaluate_prophet(actual, predicted):
-    """
-    Institutional MAE with shape safety.
-    """
 
     actual = _flatten(actual)
     predicted = _flatten(predicted)
 
     if len(actual) != len(predicted):
-        raise RuntimeError(
-            "Forecast length mismatch."
-        )
+        raise RuntimeError("Forecast length mismatch.")
+
+    if np.isnan(actual).any():
+        raise RuntimeError("NaNs detected in actual values.")
+
+    if np.isnan(predicted).any():
+        raise RuntimeError("NaNs detected in forecast.")
 
     mae = mean_absolute_error(
         actual,
