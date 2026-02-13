@@ -31,4 +31,4 @@ class YahooProvider(MarketDataProvider):
             len(df)
         )
 
-        return df
+        return self.validate_contract(df)

@@ -137,4 +137,4 @@ class FinnhubProvider(MarketDataProvider):
             len(df)
         )
 
-        return df
+        return self.validate_contract(df)
