@@ -34,10 +34,12 @@ class RiskConfig:
     max_gross_exposure_pct: float
     max_single_trade_dollars: float
 
-    # ⭐ NEW
     fractional_kelly: float
     volatility_shock_level: float
     correlation_heat_cap: float
+
+    # institutional additions
+    max_drawdown_kill: float
 
     ###################################################
 
@@ -52,10 +54,11 @@ class RiskConfig:
             max_gross_exposure_pct=_env_float("MAX_GROSS_EXPOSURE", 0.40),
             max_single_trade_dollars=_env_float("MAX_SINGLE_TRADE", 25_000),
 
-            # ⭐ Institutional additions
             fractional_kelly=_env_float("FRACTIONAL_KELLY", 0.25),
             volatility_shock_level=_env_float("VOL_SHOCK_LEVEL", 0.08),
             correlation_heat_cap=_env_float("HEAT_CAP", 0.22),
+
+            max_drawdown_kill=_env_float("MAX_DRAWDOWN_KILL", 0.30),
         )
 
 
@@ -70,8 +73,9 @@ class PositionSizer:
 
     VOL_FLOOR = 0.006
     VOL_CEILING = 0.12
+    EFFECTIVE_VOL_FLOOR = 0.01
 
-    MAX_VOL_SCALAR = 1.4
+    MAX_VOL_SCALAR = 1.25
     MIN_CONFIDENCE_FLOOR = 0.20
 
     def __init__(self, config: RiskConfig | None = None):
@@ -96,32 +100,22 @@ class PositionSizer:
     # DRAW DOWN SCALAR
     ###################################################
 
-    def _drawdown_scalar(self):
+    def _drawdown_state(self):
 
         raw = os.getenv("PORTFOLIO_DRAWDOWN_PCT", "0")
 
         try:
             drawdown = float(raw)
         except Exception:
-            return 1.0
+            return 0.0
 
         if drawdown > 1:
             drawdown /= 100.0
 
-        drawdown = abs(drawdown)
-        drawdown = min(drawdown, 0.80)
-
-        if drawdown < 0.05:
-            return 1.0
-        if drawdown < 0.10:
-            return 0.70
-        if drawdown < 0.20:
-            return 0.45
-
-        return 0.20
+        return abs(min(drawdown, 0.90))
 
     ###################################################
-    # VOL SHOCK SCALAR (⭐ VERY IMPORTANT)
+    # VOL SHOCK
     ###################################################
 
     def _volatility_shock_scalar(self, volatility):
@@ -129,13 +123,12 @@ class PositionSizer:
         if volatility <= self.config.volatility_shock_level:
             return 1.0
 
-        # nonlinear cut
         ratio = self.config.volatility_shock_level / volatility
 
         return max(0.25, ratio)
 
     ###################################################
-    # FRACTIONAL KELLY LIMITER
+    # TRUE FRACTIONAL KELLY
     ###################################################
 
     def _kelly_cap(self, confidence, volatility, portfolio_value):
@@ -146,8 +139,9 @@ class PositionSizer:
         if edge <= 0:
             return 0
 
-        kelly_fraction = (edge / max(volatility, 1e-6))
+        variance = max(volatility ** 2, 1e-6)
 
+        kelly_fraction = edge / variance
         kelly_fraction *= self.config.fractional_kelly
 
         kelly_fraction = min(kelly_fraction, 0.10)
@@ -165,7 +159,7 @@ class PositionSizer:
         volatility: float | None,
         portfolio_value: float,
         current_gross_exposure: float | None = None,
-        current_heat: float | None = None   # ⭐ NEW
+        current_heat: float | None = None
     ) -> float:
 
         if signal != "BUY":
@@ -174,6 +168,12 @@ class PositionSizer:
         portfolio_value = self._safe(portfolio_value, 0)
 
         if portfolio_value < self.MIN_DEPLOYABLE_CAPITAL:
+            return 0.0
+
+        drawdown = self._drawdown_state()
+
+        # HARD KILL
+        if drawdown >= self.config.max_drawdown_kill:
             return 0.0
 
         confidence = max(
@@ -191,12 +191,13 @@ class PositionSizer:
             min(volatility, self.VOL_CEILING)
         )
 
+        effective_vol = max(volatility, self.EFFECTIVE_VOL_FLOOR)
+
         ###################################################
         # HEAT LIMIT
         ###################################################
 
         if current_heat is not None:
-
             if current_heat >= self.config.correlation_heat_cap:
                 return 0.0
 
@@ -218,17 +219,14 @@ class PositionSizer:
         # SCALARS
         ###################################################
 
-        confidence_scalar = math.tanh(
-            confidence * self.config.confidence_boost
-        )
+        confidence_scalar = confidence ** 1.5
 
         vol_scalar = math.sqrt(
-            self.config.volatility_target / volatility
+            self.config.volatility_target / effective_vol
         )
 
         vol_scalar = min(vol_scalar, self.MAX_VOL_SCALAR)
 
-        dd_scalar = self._drawdown_scalar()
         shock_scalar = self._volatility_shock_scalar(volatility)
 
         ###################################################
@@ -240,7 +238,6 @@ class PositionSizer:
             self.config.max_position_size *
             confidence_scalar *
             vol_scalar *
-            dd_scalar *
             shock_scalar
         )
 
@@ -271,6 +268,13 @@ class PositionSizer:
             absolute_cap,
             trade_cap
         )
+
+        ###################################################
+        # SANITY CHECK
+        ###################################################
+
+        if capped_size > portfolio_value:
+            return 0.0
 
         ###################################################
         # GROSS FINAL
