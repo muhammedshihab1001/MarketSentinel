@@ -13,14 +13,10 @@ from core.schema.feature_schema import (
     MODEL_FEATURES
 )
 
-from core.market.universe import MarketUniverse   # ⭐ NEW
+from core.market.universe import MarketUniverse
 
 
 class MetadataManager:
-
-    ########################################################
-    # REQUIRED FIELDS (INSTITUTIONAL)
-    ########################################################
 
     REQUIRED_METADATA_FIELDS = [
         "metadata_type",
@@ -36,17 +32,11 @@ class MetadataManager:
         "training_code_hash",
         "metadata_integrity_hash",
         "environment",
-
-        # ⭐ NEW (CRITICAL)
         "training_universe"
     ]
 
-    METADATA_VERSION = "6.0"   # ← bump again
+    METADATA_VERSION = "7.0"
 
-
-    ########################################################
-    # FSYNC SAFE
-    ########################################################
 
     @staticmethod
     def _fsync_dir_safe(directory: str):
@@ -62,30 +52,28 @@ class MetadataManager:
             pass
 
 
-    ########################################################
-    # FEATURE CONTRACT
-    ########################################################
-
     @staticmethod
     def _validate_feature_contract(features, metadata_type):
 
+        frozen = tuple(features)
+
         if metadata_type == "training_manifest_v1":
 
-            if tuple(features) != tuple(MODEL_FEATURES):
+            if frozen != MODEL_FEATURES:
                 raise RuntimeError(
                     "Feature list mismatch — schema drift detected."
                 )
 
         elif metadata_type == "timeseries_manifest_v1":
 
-            if features != ["close"]:
+            if list(frozen) != ["close"]:
                 raise RuntimeError(
                     "Timeseries models must declare ['close'] only."
                 )
 
         elif metadata_type == "sequence_manifest_v1":
 
-            if features != ["close_sequence"]:
+            if list(frozen) != ["close_sequence"]:
                 raise RuntimeError(
                     "Sequence models must declare ['close_sequence']."
                 )
@@ -96,10 +84,6 @@ class MetadataManager:
             )
 
 
-    ########################################################
-    # DATASET FINGERPRINT
-    ########################################################
-
     @staticmethod
     def fingerprint_dataset(df: pd.DataFrame) -> str:
 
@@ -107,47 +91,22 @@ class MetadataManager:
             raise RuntimeError("Cannot fingerprint empty dataset.")
 
         df_copy = df.copy(deep=True)
-        df_copy = df_copy.reindex(sorted(df_copy.columns), axis=1)
-
-        for col in df_copy.columns:
-
-            if pd.api.types.is_float_dtype(df_copy[col]):
-                df_copy[col] = (
-                    df_copy[col]
-                    .astype("float64")
-                    .round(10)
-                )
-
-            elif pd.api.types.is_integer_dtype(df_copy[col]):
-                df_copy[col] = df_copy[col].astype("int64")
-
-            else:
-                df_copy[col] = df_copy[col].astype(str)
-
-        sort_cols = []
 
         if "date" in df_copy.columns:
-            sort_cols.append("date")
+            df_copy = df_copy.sort_values("date")
 
         if "ticker" in df_copy.columns:
-            sort_cols.append("ticker")
-
-        if sort_cols:
-            df_copy = df_copy.sort_values(sort_cols)
+            df_copy = df_copy.sort_values(["ticker", "date"])
 
         df_copy = df_copy.reset_index(drop=True)
 
-        canonical = json.dumps(
-            df_copy.to_dict(orient="records"),
-            sort_keys=True
-        ).encode()
+        hashed = pd.util.hash_pandas_object(
+            df_copy,
+            index=True
+        ).values
 
-        return hashlib.sha256(canonical).hexdigest()
+        return hashlib.sha256(hashed.tobytes()).hexdigest()
 
-
-    ########################################################
-    # TRAINING CODE HASH
-    ########################################################
 
     @staticmethod
     def fingerprint_training_code():
@@ -161,7 +120,7 @@ class MetadataManager:
             "core/schema",
             "core/data",
             "core/time",
-            "core/market",   # ⭐ ensures universe changes trigger hash
+            "core/market",
         ]
 
         for root in sorted(CRITICAL_DIRS):
@@ -193,16 +152,15 @@ class MetadataManager:
         return hasher.hexdigest()
 
 
-    ########################################################
-    # ENV CAPTURE
-    ########################################################
-
     @staticmethod
     def capture_environment():
 
         env = {
             "python": sys.version,
             "platform": platform.platform(),
+            "architecture": platform.machine(),
+            "processor": platform.processor(),
+            "byteorder": sys.byteorder,
             "numpy": np.__version__,
             "pandas": pd.__version__,
         }
@@ -228,9 +186,24 @@ class MetadataManager:
         return env
 
 
-    ########################################################
-    # METADATA HASH
-    ########################################################
+    @staticmethod
+    def _normalize_for_hash(obj):
+
+        if isinstance(obj, dict):
+            return {k: MetadataManager._normalize_for_hash(v)
+                    for k, v in sorted(obj.items())}
+
+        if isinstance(obj, list):
+            return [MetadataManager._normalize_for_hash(v) for v in obj]
+
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+
+        return obj
+
 
     @staticmethod
     def _compute_metadata_hash(metadata: dict):
@@ -238,17 +211,40 @@ class MetadataManager:
         clone = dict(metadata)
         clone.pop("metadata_integrity_hash", None)
 
+        normalized = MetadataManager._normalize_for_hash(clone)
+
         canonical = json.dumps(
-            clone,
-            sort_keys=True
+            normalized,
+            sort_keys=True,
+            separators=(",", ":")
         ).encode()
 
         return hashlib.sha256(canonical).hexdigest()
 
 
-    ########################################################
-    # CREATE METADATA (INSTITUTIONAL)
-    ########################################################
+    @staticmethod
+    def _validate_training_window(start, end):
+
+        start_dt = pd.to_datetime(start, utc=True)
+        end_dt = pd.to_datetime(end, utc=True)
+
+        if end_dt <= start_dt:
+            raise RuntimeError(
+                "Invalid training window: end must be after start."
+            )
+
+
+    @staticmethod
+    def _validate_universe(universe):
+
+        if not universe:
+            raise RuntimeError("Training universe is empty.")
+
+        if universe != sorted(universe):
+            raise RuntimeError(
+                "Universe snapshot must be sorted for determinism."
+            )
+
 
     @staticmethod
     def create_metadata(
@@ -267,6 +263,15 @@ class MetadataManager:
             metadata_type
         )
 
+        MetadataManager._validate_training_window(
+            training_start,
+            training_end
+        )
+
+        universe = MarketUniverse.snapshot()
+
+        MetadataManager._validate_universe(universe)
+
         metadata = {
 
             "metadata_type": metadata_type,
@@ -281,7 +286,7 @@ class MetadataManager:
             },
 
             "dataset_hash": dataset_hash,
-            "features": features,
+            "features": list(tuple(features)),
             "metrics": metrics,
 
             "schema_signature": get_schema_signature(),
@@ -293,11 +298,8 @@ class MetadataManager:
             "environment":
                 MetadataManager.capture_environment(),
 
-            ##################################################
-            # ⭐ CRITICAL — UNIVERSE LINEAGE
-            ##################################################
             "training_universe":
-                MarketUniverse.snapshot()
+                universe
         }
 
         if extra_fields:
@@ -311,10 +313,6 @@ class MetadataManager:
 
         return metadata
 
-
-    ########################################################
-    # VALIDATE
-    ########################################################
 
     @staticmethod
     def validate_metadata(metadata):
@@ -347,10 +345,6 @@ class MetadataManager:
             )
 
 
-    ########################################################
-    # ATOMIC WRITE
-    ########################################################
-
     @staticmethod
     def _atomic_json_write(path, payload):
 
@@ -361,17 +355,24 @@ class MetadataManager:
 
         tmp = path + ".tmp"
 
-        with open(tmp, "w") as f:
-            json.dump(payload, f, indent=4, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
+        try:
 
-        os.replace(tmp, path)
+            with open(tmp, "w") as f:
+                json.dump(payload, f, indent=4, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
 
-        MetadataManager._fsync_dir_safe(directory or ".")
+            os.replace(tmp, path)
 
+            MetadataManager._fsync_dir_safe(directory or ".")
 
-    ########################################################
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+
 
     @staticmethod
     def save_metadata(metadata, path):
@@ -379,8 +380,6 @@ class MetadataManager:
         MetadataManager.validate_metadata(metadata)
         MetadataManager._atomic_json_write(path, metadata)
 
-
-    ########################################################
 
     @staticmethod
     def load_metadata(path):
