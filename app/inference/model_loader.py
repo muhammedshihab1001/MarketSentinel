@@ -79,7 +79,7 @@ class ModelLoader:
         return h.hexdigest()
 
     ###################################################
-    # REGISTRY PATH SAFETY
+    # PATH SAFETY (HARDENED)
     ###################################################
 
     def _resolve_registry_path(self, base_dir):
@@ -92,6 +92,9 @@ class ModelLoader:
             raise RuntimeError(
                 f"Registry path does not exist: {base_dir}"
             )
+
+        if not os.path.isdir(base_dir):
+            raise RuntimeError("Registry path is not a directory.")
 
         return base_dir
 
@@ -244,9 +247,25 @@ class ModelLoader:
 
             model = self._safe_joblib_load(model_path)
 
+            ###################################################
+            # HARD MODEL SANITY
+            ###################################################
+
             if not hasattr(model, "predict_proba"):
                 raise RuntimeError(
                     "Loaded artifact missing predict_proba"
+                )
+
+            if getattr(model, "n_features_in_", None) != len(MODEL_FEATURES):
+                raise RuntimeError(
+                    "Model feature count mismatch."
+                )
+
+            booster = model.get_booster()
+
+            if booster.num_boosted_rounds() < 10:
+                raise RuntimeError(
+                    "Booster appears untrained."
                 )
 
             import numpy as np
@@ -373,8 +392,12 @@ class ModelLoader:
 
         logger.info("Warming models")
 
-        _ = self.xgb
-        _ = self.sarimax
+        try:
+            _ = self.xgb
+            _ = self.sarimax
+        except Exception:
+            logger.critical("Model warmup failed — refusing to boot.")
+            raise
 
         logger.info("Model warmup complete")
 
