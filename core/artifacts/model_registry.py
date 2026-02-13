@@ -4,13 +4,10 @@ import datetime
 import shutil
 import hashlib
 import uuid
-import time
 from typing import Dict, Any
 
-from core.schema.feature_schema import (
-    get_schema_signature,
-    MODEL_FEATURES
-)
+from core.schema.feature_schema import get_schema_signature
+from core.artifacts.metadata_manager import MetadataManager
 
 
 class ModelRegistry:
@@ -22,8 +19,6 @@ class ModelRegistry:
     LOCK_TIMEOUT_SECONDS = 600
 
     ########################################################
-    # VERSION
-    ########################################################
 
     @staticmethod
     def _version() -> str:
@@ -31,8 +26,6 @@ class ModelRegistry:
         suffix = uuid.uuid4().hex[:6]
         return f"{ts}_{suffix}"
 
-    ########################################################
-    # HASHING
     ########################################################
 
     @staticmethod
@@ -46,8 +39,6 @@ class ModelRegistry:
 
         return h.hexdigest()
 
-    ########################################################
-    # FSYNC
     ########################################################
 
     @staticmethod
@@ -64,7 +55,19 @@ class ModelRegistry:
             os.close(fd)
 
     ########################################################
-    # ATOMIC JSON
+
+    @staticmethod
+    def _normalize_for_hash(obj):
+
+        if isinstance(obj, dict):
+            return {k: ModelRegistry._normalize_for_hash(v)
+                    for k, v in sorted(obj.items())}
+
+        if isinstance(obj, list):
+            return [ModelRegistry._normalize_for_hash(v) for v in obj]
+
+        return obj
+
     ########################################################
 
     @staticmethod
@@ -72,70 +75,25 @@ class ModelRegistry:
 
         tmp = path + ".tmp"
 
-        with open(tmp, "w") as f:
-            json.dump(payload, f, indent=4, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
+        try:
 
-        os.replace(tmp, path)
+            with open(tmp, "w") as f:
+                json.dump(payload, f, indent=4, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
 
-        parent = os.path.dirname(path) or "."
-        ModelRegistry._fsync_dir(parent)
+            os.replace(tmp, path)
 
-    ########################################################
-    # HASH HELPER (⭐ NEW)
-    ########################################################
+            parent = os.path.dirname(path) or "."
+            ModelRegistry._fsync_dir(parent)
 
-    @staticmethod
-    def _hash_list(items):
-        return hashlib.sha256(
-            json.dumps(sorted(items)).encode()
-        ).hexdigest()
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
 
-    ########################################################
-    # METADATA VALIDATION (UPGRADED)
-    ########################################################
-
-    @staticmethod
-    def _metadata_hash(meta: dict):
-
-        clone = dict(meta)
-        clone.pop("metadata_integrity_hash", None)
-
-        return hashlib.sha256(
-            json.dumps(clone, sort_keys=True).encode()
-        ).hexdigest()
-
-    @staticmethod
-    def _validate_metadata(metadata_path: str):
-
-        with open(metadata_path) as f:
-            meta = json.load(f)
-
-        # integrity
-        if meta["metadata_integrity_hash"] != ModelRegistry._metadata_hash(meta):
-            raise RuntimeError("Metadata integrity failure.")
-
-        # schema
-        if meta["schema_signature"] != get_schema_signature():
-            raise RuntimeError("Schema mismatch detected.")
-
-        # feature contract
-        if meta["metadata_type"] == "training_manifest_v1":
-
-            if list(meta["features"]) != list(MODEL_FEATURES):
-                raise RuntimeError("Feature ordering mismatch.")
-
-        # ⭐ CRITICAL — training window required
-        if "training_window" not in meta:
-            raise RuntimeError(
-                "Metadata missing training_window — refusing registry write."
-            )
-
-        return meta
-
-    ########################################################
-    # MANIFEST HASH
     ########################################################
 
     @staticmethod
@@ -144,12 +102,44 @@ class ModelRegistry:
         clone = dict(manifest)
         clone.pop("manifest_integrity_hash", None)
 
-        return hashlib.sha256(
-            json.dumps(clone, sort_keys=True).encode()
-        ).hexdigest()
+        normalized = ModelRegistry._normalize_for_hash(clone)
+
+        canonical = json.dumps(
+            normalized,
+            sort_keys=True,
+            separators=(",", ":")
+        ).encode()
+
+        return hashlib.sha256(canonical).hexdigest()
 
     ########################################################
-    # VERIFY ARTIFACTS
+
+    @staticmethod
+    def _validate_parent(base_dir: str, parent_version: str, meta: dict):
+
+        parent_manifest_path = os.path.join(
+            base_dir,
+            parent_version,
+            ModelRegistry.MANIFEST_NAME
+        )
+
+        if not os.path.exists(parent_manifest_path):
+            raise RuntimeError("Parent manifest not found.")
+
+        with open(parent_manifest_path) as f:
+            parent = json.load(f)
+
+        if parent["schema_signature"] != meta["schema_signature"]:
+            raise RuntimeError(
+                "Parent schema mismatch detected."
+            )
+
+        if parent.get("universe_hash") != \
+           meta["training_universe"]["universe_hash"]:
+            raise RuntimeError(
+                "Parent universe mismatch detected."
+            )
+
     ########################################################
 
     @staticmethod
@@ -188,8 +178,6 @@ class ModelRegistry:
                 )
 
     ########################################################
-    # REGISTER MODEL (INSTITUTIONAL)
-    ########################################################
 
     @staticmethod
     def register_model(
@@ -201,7 +189,14 @@ class ModelRegistry:
 
         os.makedirs(base_dir, exist_ok=True)
 
-        meta = ModelRegistry._validate_metadata(metadata_path)
+        meta = MetadataManager.load_metadata(metadata_path)
+
+        if parent_version:
+            ModelRegistry._validate_parent(
+                base_dir,
+                parent_version,
+                meta
+            )
 
         version = ModelRegistry._version()
 
@@ -221,19 +216,6 @@ class ModelRegistry:
             shutil.copy2(model_path, staged_model)
             shutil.copy2(metadata_path, staged_meta)
 
-            ##################################################
-            # ⭐ UNIVERSE HASH (VERY IMPORTANT)
-            ##################################################
-
-            universe_hash = None
-
-            if "training_universe" in meta:
-                universe_hash = ModelRegistry._hash_list(
-                    meta["training_universe"]
-                )
-
-            ##################################################
-
             manifest: Dict[str, Any] = {
 
                 "version": version,
@@ -246,7 +228,9 @@ class ModelRegistry:
                 "training_code_hash": meta["training_code_hash"],
                 "training_window": meta["training_window"],
 
-                "universe_hash": universe_hash,
+                "universe_hash":
+                    meta["training_universe"]["universe_hash"],
+
                 "metadata_type": meta["metadata_type"],
 
                 "artifacts": {
