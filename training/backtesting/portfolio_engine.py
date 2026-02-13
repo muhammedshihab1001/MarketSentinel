@@ -10,7 +10,7 @@ class PortfolioBacktestEngine:
     MAX_INV_VOL = 5.0
 
     MAX_SINGLE_STEP_RETURN = 0.40
-    MAX_GAP = 0.35  #  NEW — gap risk guard
+    MAX_GAP = 0.35
 
     MAX_POSITION_WEIGHT = 0.12
     MAX_ABSOLUTE_POSITION = 0.25
@@ -18,7 +18,7 @@ class PortfolioBacktestEngine:
     MIN_EQUITY_FLOOR = 0.35
     SLIPPAGE_IMPACT = 0.08
 
-    BORROW_COST_ANNUAL = 0.03  #  NEW — short borrow simulation
+    BORROW_COST_ANNUAL = 0.03
 
     VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
 
@@ -56,7 +56,7 @@ class PortfolioBacktestEngine:
         return price
 
     ###################################################
-    #  GAP GUARD
+    # GAP GUARD
     ###################################################
 
     def _check_gap(self, prev_prices, prices):
@@ -128,6 +128,19 @@ class PortfolioBacktestEngine:
         return vols
 
     ###################################################
+    # HARD EXPOSURE CHECK
+    ###################################################
+
+    def _gross_exposure(self, positions, prices, equity):
+
+        exposure = sum(
+            abs(shares * prices.get(t, 0))
+            for t, shares in positions.items()
+        )
+
+        return exposure / max(equity, 1)
+
+    ###################################################
 
     def _compute_weights(self, signals, vols):
 
@@ -181,10 +194,8 @@ class PortfolioBacktestEngine:
         return self.base_slippage + impact
 
     ###################################################
-    #  SHORT BORROW COST
-    ###################################################
 
-    def _apply_borrow_cost(self, positions, prices, equity):
+    def _apply_borrow_cost(self, positions, prices):
 
         daily_rate = self.BORROW_COST_ANNUAL / 252
 
@@ -198,6 +209,20 @@ class PortfolioBacktestEngine:
             borrow_cost += abs(shares * prices[t]) * daily_rate
 
         return borrow_cost
+
+    ###################################################
+    # 🔥 NEW — FORCE LIQUIDATION
+    ###################################################
+
+    def _force_liquidations(self, positions, target_positions):
+        """
+        If a ticker disappears from targets,
+        close the position.
+        """
+
+        for ticker in list(positions.keys()):
+            if ticker not in target_positions:
+                target_positions[ticker] = 0.0
 
     ###################################################
 
@@ -232,7 +257,6 @@ class PortfolioBacktestEngine:
             if not prices:
                 continue
 
-            #  GAP CHECK
             self._check_gap(prev_prices, prices)
 
             if prev_prices is None:
@@ -241,7 +265,6 @@ class PortfolioBacktestEngine:
                 equity_curve.append(cash)
                 continue
 
-            # EXECUTE PREVIOUS SIGNALS
             signals = prev_signals
 
             vols = self._update_vol_buffers(prev_prices, prices)
@@ -252,25 +275,20 @@ class PortfolioBacktestEngine:
                 if t in prices
             )
 
-            if not np.isfinite(portfolio_value):
-                raise RuntimeError("Portfolio value corrupted.")
-
             if portfolio_value < initial_cash * self.MIN_EQUITY_FLOOR:
-                raise RuntimeError(
-                    "Equity breached institutional floor."
-                )
+                raise RuntimeError("Equity breached institutional floor.")
+
+            weights = self._compute_weights(signals, vols)
 
             deployable_capital = portfolio_value * (1 - self.CASH_BUFFER)
-
-            weights = self._compute_weights(
-                signals,
-                vols
-            )
 
             target_positions = {
                 t: (deployable_capital * w) / prices[t]
                 for t, w in weights.items()
             }
+
+            # FORCE CLOSE OLD POSITIONS
+            self._force_liquidations(positions, target_positions)
 
             ###################################################
             # EXECUTE TRADES
@@ -302,9 +320,7 @@ class PortfolioBacktestEngine:
                     self.transaction_cost + slippage
                 )
 
-                required_cash = delta * trade_price + cost
-
-                if required_cash > cash and delta > 0:
+                if delta > 0 and (delta * trade_price + cost) > cash:
                     continue
 
                 turnover += trade_notional / max(portfolio_value, 1)
@@ -318,27 +334,38 @@ class PortfolioBacktestEngine:
                     positions[ticker] = target
 
             ###################################################
-            #  APPLY BORROW COST
-            ###################################################
-
-            borrow_cost = self._apply_borrow_cost(
-                positions,
-                prices,
-                portfolio_value
-            )
-
-            cash -= borrow_cost
-
+            # HARD GROSS CHECK
             ###################################################
 
             equity = cash + sum(
                 positions.get(t, 0) * prices.get(t, 0)
                 for t in positions
-                if t in prices
             )
 
-            if not np.isfinite(equity):
-                raise RuntimeError("Equity became non-finite.")
+            gross = self._gross_exposure(
+                positions,
+                prices,
+                equity
+            )
+
+            if gross > self.max_gross_exposure * 1.05:
+                raise RuntimeError(
+                    "Gross exposure breach detected."
+                )
+
+            ###################################################
+
+            borrow_cost = self._apply_borrow_cost(
+                positions,
+                prices
+            )
+
+            cash -= borrow_cost
+
+            equity = cash + sum(
+                positions.get(t, 0) * prices.get(t, 0)
+                for t in positions
+            )
 
             if equity_curve:
 
@@ -353,8 +380,6 @@ class PortfolioBacktestEngine:
 
             prev_prices = prices
             prev_signals = signals_today
-
-        ############################################
 
         curve = np.array(equity_curve, dtype=float)
 
