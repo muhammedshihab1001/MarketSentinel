@@ -11,7 +11,12 @@ from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_store import FeatureStore
 from core.signals.signal_engine import DecisionEngine
 from core.monitoring.drift_detector import DriftDetector
-from core.schema.feature_schema import MODEL_FEATURES
+from core.schema.feature_schema import (
+    MODEL_FEATURES,
+    validate_feature_schema
+)
+
+from core.market.universe import MarketUniverse
 
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
@@ -31,10 +36,6 @@ from app.monitoring.metrics import (
 
 logger = logging.getLogger("marketsentinel.pipeline")
 
-
-############################################################
-# CIRCUIT BREAKER
-############################################################
 
 class CircuitBreaker:
 
@@ -65,16 +66,13 @@ class CircuitBreaker:
         with self._lock:
             self.failures += 1
             self.last_failure = time.time()
+            logger.critical("Circuit breaker failure count=%s", self.failures)
 
     def record_success(self):
 
         with self._lock:
             self.failures = 0
 
-
-############################################################
-# PIPELINE
-############################################################
 
 class InferencePipeline:
 
@@ -100,11 +98,7 @@ class InferencePipeline:
         os.getenv("MAX_DATA_AGE_HOURS", "24")
     )
 
-    SHADOW_DIVERGENCE_THRESHOLD = 0.35
-
     LOCK_TIMEOUT = 3
-
-    ########################################################
 
     def __init__(self):
 
@@ -122,12 +116,11 @@ class InferencePipeline:
 
         self._validate_models_loaded()
 
-    ########################################################
-
     def _deadline(self, start):
-        return self.HARD_PIPELINE_TIMEOUT - (time.time() - start)
-
-    ########################################################
+        remaining = self.HARD_PIPELINE_TIMEOUT - (time.time() - start)
+        if remaining <= 0:
+            raise RuntimeError("Pipeline timeout exceeded.")
+        return remaining
 
     def _validate_models_loaded(self):
 
@@ -139,8 +132,6 @@ class InferencePipeline:
 
         if self.models.sarimax is None:
             raise RuntimeError("SARIMAX model not loaded.")
-
-    ########################################################
 
     def _validate_data_freshness(self, df: pd.DataFrame):
 
@@ -156,18 +147,15 @@ class InferencePipeline:
                 age_hours
             )
 
-    ########################################################
-
     def _extract_features(self, latest_row):
 
         vector = latest_row.loc[list(MODEL_FEATURES)]
 
-        if vector.isna().all():
-            raise RuntimeError("All features are NaN.")
-
         null_ratio = float(np.isnan(vector).mean())
-
         MISSING_FEATURE_RATIO.set(null_ratio)
+
+        if null_ratio > self.MAX_NULL_RATIO:
+            raise RuntimeError("Feature null ratio exceeded safe threshold.")
 
         arr = vector.astype("float32").values.reshape(1, -1)
 
@@ -176,16 +164,12 @@ class InferencePipeline:
 
         return arr
 
-    ########################################################
-
     def _safe_probability(self, prob):
 
         if not np.isfinite(prob):
             raise RuntimeError("Model produced invalid probability.")
 
         return float(np.clip(prob, 0.0001, 0.9999))
-
-    ########################################################
 
     def _safe_sentiment_fetch(self, ticker):
 
@@ -204,9 +188,9 @@ class InferencePipeline:
 
             return pd.DataFrame()
 
-    ########################################################
-
     def run(self, ticker="AAPL"):
+
+        MarketUniverse.validate_subset([ticker])
 
         if not self.breaker.allow():
             PIPELINE_FAILURES.labels(stage="circuit_open").inc()
@@ -217,7 +201,13 @@ class InferencePipeline:
 
         try:
 
-            payload = {"ticker": ticker}
+            model_version = self.models._xgb_container.version
+
+            payload = {
+                "ticker": ticker,
+                "model_version": model_version
+            }
+
             cache_key = self.cache.build_key(payload)
 
             cached = self.cache.get(cache_key)
@@ -234,7 +224,6 @@ class InferencePipeline:
             )
 
             if not lock.acquire(blocking=False):
-                logger.warning("Lock busy — serving stale if available.")
 
                 cached = self.cache.get(cache_key)
 
@@ -245,8 +234,7 @@ class InferencePipeline:
 
             try:
 
-                if self._deadline(start_pipeline) <= 0:
-                    raise RuntimeError("Pipeline timeout exceeded.")
+                self._deadline(start_pipeline)
 
                 price_df = self.market_data.get_price_data(
                     ticker=ticker,
@@ -255,6 +243,8 @@ class InferencePipeline:
                 )
 
                 self._validate_data_freshness(price_df)
+
+                self._deadline(start_pipeline)
 
                 sentiment_df = self._safe_sentiment_fetch(ticker)
 
@@ -266,6 +256,8 @@ class InferencePipeline:
 
                 if dataset.empty:
                     raise RuntimeError("Feature pipeline returned empty dataset.")
+
+                validate_feature_schema(dataset.loc[:, MODEL_FEATURES])
 
                 try:
                     drift = self.drift_detector.detect(
@@ -282,16 +274,22 @@ class InferencePipeline:
                         "Drift detector failure — continuing inference."
                     )
 
-                latest = dataset.iloc[-1]
+                latest = dataset.iloc[-1].copy()
                 features = self._extract_features(latest)
 
                 t0 = time.time()
 
-                prob_up = self.models.xgb.predict_proba(features)[0][1]
+                preds = self.models.xgb.predict_proba(features)
 
-                prob_up = self._safe_probability(prob_up)
+                if preds.ndim != 2 or preds.shape[1] < 2:
+                    raise RuntimeError("predict_proba returned invalid shape.")
+
+                prob_up = self._safe_probability(preds[0][1])
 
                 latency = time.time() - t0
+
+                if latency > self.LATENCY_GUARD_SECONDS:
+                    logger.warning("Inference latency breach: %.2fs", latency)
 
                 MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
                 MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
