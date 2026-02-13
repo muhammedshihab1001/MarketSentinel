@@ -4,6 +4,7 @@ import os
 import json
 import logging
 import hashlib
+import tempfile
 from datetime import datetime
 
 from core.schema.feature_schema import (
@@ -28,7 +29,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "11.0"
+    BASELINE_VERSION = "12.0"
 
     MIN_SAMPLE_BASELINE = 100
     MIN_SAMPLE_INFERENCE = 30
@@ -37,7 +38,6 @@ class DriftDetector:
     VARIANCE_RATIO_LOWER = 0.30
 
     PSI_ALERT = 0.25
-    PSI_CRITICAL = 0.40
 
     MAX_INFERENCE_ROWS = 500
 
@@ -57,8 +57,11 @@ class DriftDetector:
             "true"
         ).lower() == "true"
 
+        # cache model loader once
+        self._model_loader = ModelLoader()
+
     ########################################################
-    # PATH SAFETY
+    # SAFE PATH
     ########################################################
 
     def _safe_baseline_path(self):
@@ -72,29 +75,23 @@ class DriftDetector:
         return path
 
     ########################################################
-    # PSI
+    # CORRECT PSI
     ########################################################
 
-    def _psi(self, expected, actual, bins=10):
+    def _psi(self, bin_edges, expected_counts, actual):
 
-        expected = np.asarray(expected)
-        actual = np.asarray(actual)
+        actual_counts = np.histogram(
+            actual,
+            bins=bin_edges
+        )[0]
 
-        quantiles = np.percentile(
-            expected,
-            np.linspace(0, 100, bins + 1)
+        expected_perc = expected_counts / max(
+            expected_counts.sum(), self.EPSILON
         )
 
-        quantiles = np.unique(quantiles)
-
-        if len(quantiles) < 2:
-            return 0.0
-
-        expected_counts = np.histogram(expected, bins=quantiles)[0]
-        actual_counts = np.histogram(actual, bins=quantiles)[0]
-
-        expected_perc = expected_counts / max(len(expected), self.EPSILON)
-        actual_perc = actual_counts / max(len(actual), self.EPSILON)
+        actual_perc = actual_counts / max(
+            actual_counts.sum(), self.EPSILON
+        )
 
         psi = np.sum(
             (actual_perc - expected_perc) *
@@ -105,7 +102,7 @@ class DriftDetector:
         return float(psi)
 
     ########################################################
-    # BASELINE HASH
+    # HASH
     ########################################################
 
     @staticmethod
@@ -127,8 +124,12 @@ class DriftDetector:
 
     def _safe_feature_block(self, dataset: pd.DataFrame):
 
-        if list(dataset.columns) != list(MODEL_FEATURES):
-            raise RuntimeError("Feature ordering violated.")
+        missing = set(MODEL_FEATURES) - set(dataset.columns)
+
+        if missing:
+            raise RuntimeError(
+                f"Missing features for drift detection: {missing}"
+            )
 
         block = dataset.loc[:, MODEL_FEATURES].copy()
 
@@ -150,7 +151,27 @@ class DriftDetector:
         return block
 
     ########################################################
-    # CREATE BASELINE (FINAL SAFE VERSION)
+    # ATOMIC WRITE
+    ########################################################
+
+    def _atomic_write(self, payload, path):
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            dir=os.path.dirname(path),
+            suffix=".tmp"
+        ) as tmp:
+
+            json.dump(payload, tmp, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+
+            temp_name = tmp.name
+
+        os.replace(temp_name, path)
+
+    ########################################################
+    # CREATE BASELINE
     ########################################################
 
     def create_baseline(
@@ -163,15 +184,10 @@ class DriftDetector:
         path = self._safe_baseline_path()
 
         if os.path.exists(path) and not allow_overwrite:
-            raise RuntimeError(
-                "Baseline already exists. "
-                "Use allow_overwrite=True to replace it."
-            )
+            raise RuntimeError("Baseline already exists.")
 
         if len(dataset) < self.MIN_SAMPLE_BASELINE:
-            raise RuntimeError(
-                "Dataset too small for baseline."
-            )
+            raise RuntimeError("Dataset too small for baseline.")
 
         logger.info("Creating drift baseline...")
 
@@ -183,14 +199,17 @@ class DriftDetector:
 
             series = numeric[col].dropna()
 
+            counts, edges = np.histogram(
+                series,
+                bins=20
+            )
+
             features[col] = {
                 "mean": float(series.mean()),
                 "std": float(max(series.std(), self.EPSILON)),
                 "variance": float(max(series.var(), self.EPSILON)),
-                "distribution": np.percentile(
-                    series,
-                    np.linspace(0, 100, 21)
-                ).tolist()
+                "bin_edges": edges.tolist(),
+                "expected_counts": counts.tolist()
             }
 
         payload = {
@@ -208,8 +227,7 @@ class DriftDetector:
 
         payload["integrity_hash"] = self._baseline_hash(payload)
 
-        with open(path, "w") as f:
-            json.dump(payload, f, indent=2)
+        self._atomic_write(payload, path)
 
         logger.info("Drift baseline created successfully.")
 
@@ -241,13 +259,12 @@ class DriftDetector:
         return baseline
 
     ########################################################
-    # ACTIVE MODEL LINEAGE CHECK
+    # VALIDATE AGAINST ACTIVE MODEL
     ########################################################
 
     def _validate_against_active_model(self, baseline):
 
-        loader = ModelLoader()
-        container = loader._xgb_container
+        container = self._model_loader._xgb_container
 
         if container is None:
             raise RuntimeError("Active model not loaded.")
@@ -296,7 +313,12 @@ class DriftDetector:
 
                 z_score = abs(current.mean() - stats["mean"]) / baseline_std
                 variance_ratio = current_var / baseline_var
-                psi = self._psi(stats["distribution"], current.values)
+
+                psi = self._psi(
+                    np.array(stats["bin_edges"]),
+                    np.array(stats["expected_counts"]),
+                    current.values
+                )
 
                 drift = any([
                     z_score > self.z_threshold,
