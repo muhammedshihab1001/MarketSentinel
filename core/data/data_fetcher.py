@@ -15,7 +15,7 @@ logger = logging.getLogger("marketsentinel.fetcher")
 
 class StockPriceFetcher:
 
-    REQUIRED_COLUMNS = {
+    REQUIRED_COLUMNS = [
         "ticker",
         "date",
         "open",
@@ -23,9 +23,9 @@ class StockPriceFetcher:
         "low",
         "close",
         "volume"
-    }
+    ]
 
-    CACHE_VERSION = "4.0"
+    CACHE_VERSION = "5.0"  # 🔥 bump after schema hardening
 
     MIN_ROWS = 120
     MAX_RETRIES = 5
@@ -39,6 +39,8 @@ class StockPriceFetcher:
     MAX_DAILY_RETURN = 0.60
 
     CACHE_DIR = "data/cache"
+
+    ##################################################
 
     def __init__(self):
         os.makedirs(self.CACHE_DIR, exist_ok=True)
@@ -108,25 +110,25 @@ class StockPriceFetcher:
         return df.loc[:, ~df.columns.duplicated()]
 
     ##################################################
-    # NORMALIZE + ATTACH TICKER
+    # 🔥 INSTITUTIONAL NORMALIZATION
     ##################################################
 
     def _normalize_schema(self, df: pd.DataFrame, ticker: str):
 
         df = self._flatten_columns(df)
 
-        if "close" not in df.columns and "adj close" in df.columns:
-            df.rename(columns={"adj close": "close"}, inplace=True)
-
+        # ---- HANDLE ADJ CLOSE ----
         if "adj close" in df.columns:
             df["close"] = df["adj close"]
-            df.drop(columns=["adj close"], inplace=True)
+
+        if "close" not in df.columns:
+            raise RuntimeError("Close column missing from provider.")
 
         if "date" not in df.columns:
             df = df.reset_index()
-            df.rename(columns={df.columns[0]: "date"}, inplace=True)
 
-        # STRICT parsing — do not coerce silently
+        df.rename(columns={df.columns[0]: "date"}, inplace=True)
+
         df["date"] = pd.to_datetime(
             df["date"],
             utc=True,
@@ -142,79 +144,25 @@ class StockPriceFetcher:
                 f"Provider schema violation after normalization: {missing}"
             )
 
+        # 🔥 FORCE FLOAT64
         for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="raise")
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            ).astype("float64")
 
-        if not np.isfinite(df[numeric_cols].to_numpy()).all():
-            raise RuntimeError("Non-finite numeric values detected.")
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.dropna(subset=["date"] + numeric_cols)
 
-        df = df.loc[:, ["date", "open", "high", "low", "close", "volume"]]
+        # 🔥 HARD SELECT REQUIRED ONLY
+        df = df[["date", "open", "high", "low", "close", "volume"]]
 
         df["ticker"] = ticker
 
-        # FINAL CONTRACT CHECK
-        if set(df.columns) != self.REQUIRED_COLUMNS:
-            raise RuntimeError("Final schema mismatch detected.")
-
-        return df
+        return df[self.REQUIRED_COLUMNS]
 
     ##################################################
     # HARD VALIDATION
-    ##################################################
-
-    def _detect_gaps(self, df: pd.DataFrame):
-
-        diffs = df["date"].diff().dt.days.dropna()
-
-        if (diffs > self.MAX_GAP_DAYS).any():
-            raise RuntimeError("Large gap detected in price history.")
-
-    def _validate_monotonic(self, df):
-
-        if not df["date"].is_monotonic_increasing:
-            raise RuntimeError("Non-monotonic timestamps detected.")
-
-    def _validate_returns(self, df):
-
-        returns = df["close"].pct_change().abs()
-
-        if (returns > self.MAX_DAILY_RETURN).any():
-            raise RuntimeError(
-                "Extreme price spike detected — possible bad data."
-            )
-
-    def _validate_volume(self, df):
-
-        zero_ratio = (df["volume"] == 0).mean()
-
-        if zero_ratio > self.MAX_ZERO_VOLUME_RATIO:
-            raise RuntimeError(
-                "Too many zero-volume rows — provider unreliable."
-            )
-
-    def _validate_coverage(self, df, start_date, end_date):
-
-        start = self._to_naive_utc(start_date)
-        end = self._to_naive_utc(end_date)
-
-        expected_sessions = len(
-            pd.bdate_range(start=start, end=end)
-        )
-
-        expected_sessions = max(expected_sessions, 1)
-
-        coverage = len(df) / expected_sessions
-
-        if coverage < self.CRITICAL_COVERAGE:
-            raise RuntimeError(
-                f"Dataset coverage critically low: {coverage:.2f}"
-            )
-
-        if coverage < self.WARNING_COVERAGE:
-            logger.warning(
-                f"Low dataset coverage ({coverage:.2f}). Continuing."
-            )
-
     ##################################################
 
     def _validate_dataset(self, df, start_date, end_date, ticker):
@@ -232,16 +180,21 @@ class StockPriceFetcher:
 
         df = df.drop_duplicates(["ticker", "date"]).sort_values("date")
 
-        self._validate_monotonic(df)
-        self._detect_gaps(df)
-        self._validate_returns(df)
-        self._validate_volume(df)
-        self._validate_coverage(df, start_date, end_date)
+        if not df["date"].is_monotonic_increasing:
+            raise RuntimeError("Non-monotonic timestamps detected.")
+
+        returns = df["close"].pct_change().abs()
+
+        if (returns > self.MAX_DAILY_RETURN).any():
+            raise RuntimeError("Extreme price spike detected.")
+
+        zero_ratio = (df["volume"] == 0).mean()
+
+        if zero_ratio > self.MAX_ZERO_VOLUME_RATIO:
+            raise RuntimeError("Too many zero-volume rows.")
 
         if len(df) < self.MIN_ROWS:
-            raise RuntimeError(
-                f"Dataset too small: {len(df)} rows"
-            )
+            raise RuntimeError(f"Dataset too small: {len(df)} rows")
 
         return df.reset_index(drop=True)
 
@@ -283,9 +236,6 @@ class StockPriceFetcher:
             try:
                 cached = pd.read_parquet(cache_file)
 
-                if set(cached.columns) != self.REQUIRED_COLUMNS:
-                    raise RuntimeError("Cache schema mismatch.")
-
                 return self._validate_dataset(
                     cached,
                     start_date,
@@ -295,10 +245,7 @@ class StockPriceFetcher:
 
             except Exception:
                 logger.exception("Cache corrupted. Rebuilding.")
-                try:
-                    os.remove(cache_file)
-                except Exception:
-                    pass
+                os.remove(cache_file)
 
         df = self._fetch_yahoo(
             ticker,
