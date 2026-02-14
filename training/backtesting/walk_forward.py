@@ -19,6 +19,8 @@ class WalkForwardValidator:
     MIN_FEATURE_VARIANCE = 1e-8
     MAX_TURNOVER = 0.65
     MAX_CAPITAL_MULTIPLE = 50
+    MAX_SHARPE_REALITY = 4.0   # NEW
+    MIN_EQUITY_STD = 1e-4      # NEW
 
     VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
 
@@ -28,7 +30,8 @@ class WalkForwardValidator:
         signal_generator,
         window_size=252,
         step_size=63,
-        embargo_days=None
+        embargo_days=None,
+        seed=42   # NEW
     ):
         self.model_trainer = model_trainer
         self.signal_generator = signal_generator
@@ -40,8 +43,9 @@ class WalkForwardValidator:
         self.engine = PortfolioBacktestEngine()
         self.regime_detector = MarketRegimeDetector()
 
-    ############################################
-    # HARD TEMPORAL GUARD
+        # deterministic RNG
+        self.rng = np.random.default_rng(seed)
+
     ############################################
 
     def _assert_no_future_leak(self, train_df, test_df):
@@ -51,9 +55,7 @@ class WalkForwardValidator:
                 "Temporal boundary violated — future leakage detected."
             )
 
-        overlap = set(train_df.index) & set(test_df.index)
-
-        if overlap:
+        if set(train_df.index) & set(test_df.index):
             raise RuntimeError(
                 "Train/Test index overlap — leakage."
             )
@@ -70,8 +72,6 @@ class WalkForwardValidator:
                     f"Non-monotonic dates detected for {ticker}"
                 )
 
-    ############################################
-    # SURVIVORSHIP GUARD
     ############################################
 
     def _validate_survivorship(self, df):
@@ -93,6 +93,9 @@ class WalkForwardValidator:
         validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
         features = df.loc[:, MODEL_FEATURES].to_numpy(dtype=float)
+
+        if features.shape[1] != len(MODEL_FEATURES):
+            raise RuntimeError("Feature width changed.")
 
         if not np.isfinite(features).all():
             raise RuntimeError("Non-finite feature values detected.")
@@ -203,12 +206,10 @@ class WalkForwardValidator:
 
         start_idx = self.window_size
 
-        # randomize window start to avoid lucky cycle alignment
-        start_idx += np.random.randint(0, self.step_size)
+        # deterministic offset
+        start_idx += self.rng.integers(0, self.step_size)
 
         while start_idx < len(unique_dates) - 1:
-
-            model = None
 
             train_end_date = unique_dates.iloc[start_idx]
 
@@ -216,7 +217,6 @@ class WalkForwardValidator:
                 days=self.EMBARGO_DAYS
             )
 
-            # TIME-STABLE WINDOW (NOT ROW-STABLE)
             train_start_cut = embargo_cutoff - pd.Timedelta(days=370)
 
             train_dates = unique_dates[
@@ -245,15 +245,10 @@ class WalkForwardValidator:
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
-            # HARD LEAK CHECK
             self._assert_no_future_leak(train_df, test_df)
 
-            # regime injection with defensive copy
             train_df = self.regime_detector.detect(train_df.copy())
             test_df = self.regime_detector.detect(test_df.copy())
-
-            validate_feature_schema(train_df.loc[:, MODEL_FEATURES])
-            validate_feature_schema(test_df.loc[:, MODEL_FEATURES])
 
             self._validate_training_frame(train_df)
 
@@ -323,15 +318,21 @@ class WalkForwardValidator:
                 initial_cash=initial_capital
             )
 
+            if metrics["sharpe_ratio"] > self.MAX_SHARPE_REALITY:
+                raise RuntimeError(
+                    "Sharpe too high — simulation likely invalid."
+                )
+
             curve = np.array(metrics["equity_curve"], dtype=float)
 
-            if not np.isfinite(curve).all():
-                raise RuntimeError("Equity curve corrupted.")
+            if np.std(curve) < self.MIN_EQUITY_STD:
+                raise RuntimeError(
+                    "Equity curve unnaturally smooth — overfit suspected."
+                )
 
-            # CAPITAL EXPLOSION GUARD
             if curve[-1] > initial_capital * self.MAX_CAPITAL_MULTIPLE:
                 raise RuntimeError(
-                    "Equity explosion detected — likely simulation bug."
+                    "Equity explosion detected — simulation bug."
                 )
 
             if equity_curve:
@@ -364,9 +365,6 @@ class WalkForwardValidator:
 
         df = pd.DataFrame(results)
         curve = np.array(equity_curve, dtype=float)
-
-        if not np.isfinite(curve).all():
-            raise RuntimeError("Equity curve corrupted.")
 
         peak = np.maximum.accumulate(curve)
         drawdowns = (curve - peak) / peak
