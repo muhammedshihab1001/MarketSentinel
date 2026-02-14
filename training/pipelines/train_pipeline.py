@@ -8,6 +8,7 @@ import platform
 import random
 import subprocess
 import tempfile
+import uuid
 
 import numpy as np
 import pandas as pd
@@ -20,14 +21,10 @@ from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-
-logger = logging.getLogger("marketsentinel.training")
+logger = logging.getLogger(__name__)
 
 RUNS_DIR = os.path.abspath("artifacts/training_runs")
+LOCK_FILE = os.path.join(RUNS_DIR, ".training.lock")
 
 MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
@@ -38,10 +35,6 @@ MAX_TRAINING_SECONDS = 7200
 GLOBAL_SEED = 42
 
 
-########################################################
-# TRUE DETERMINISM
-########################################################
-
 def enforce_determinism():
 
     os.environ["PYTHONHASHSEED"] = str(GLOBAL_SEED)
@@ -49,16 +42,36 @@ def enforce_determinism():
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    os.environ["MKL_DYNAMIC"] = "FALSE"
     os.environ["TF_DETERMINISTIC_OPS"] = "1"
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+    os.environ["NUMPY_EXPERIMENTAL_ARRAY_FUNCTION"] = "0"
 
     random.seed(GLOBAL_SEED)
     np.random.seed(GLOBAL_SEED)
 
 
-########################################################
-# FSYNC DIRECTORY
-########################################################
+def _acquire_lock():
+
+    os.makedirs(RUNS_DIR, exist_ok=True)
+
+    if os.path.exists(LOCK_FILE):
+        raise RuntimeError(
+            "Training lock detected — another training may be running."
+        )
+
+    with open(LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    return True
+
+
+def _release_lock():
+
+    if os.path.exists(LOCK_FILE):
+        os.remove(LOCK_FILE)
+
 
 def _fsync_dir(directory):
 
@@ -72,10 +85,6 @@ def _fsync_dir(directory):
         os.close(fd)
 
 
-########################################################
-# HARD GIT CHECK (UPGRADED)
-########################################################
-
 def get_git_commit():
 
     if not os.path.exists(".git"):
@@ -85,7 +94,6 @@ def get_git_commit():
 
     try:
 
-        # detect staged OR unstaged changes
         dirty = subprocess.run(
             ["git", "status", "--porcelain"],
             capture_output=True,
@@ -114,10 +122,6 @@ def get_git_commit():
         )
 
 
-########################################################
-# MANIFEST WRITE — ATOMIC
-########################################################
-
 def save_manifest(run_id: str, manifest: dict):
 
     os.makedirs(RUNS_DIR, exist_ok=True)
@@ -139,10 +143,10 @@ def save_manifest(run_id: str, manifest: dict):
     os.replace(temp_name, final_path)
     _fsync_dir(RUNS_DIR)
 
+    # verify readability
+    with open(final_path, "r") as f:
+        json.load(f)
 
-########################################################
-# METRIC VALIDATION
-########################################################
 
 def _assert_finite(value, name):
     if value is None or not np.isfinite(value):
@@ -180,10 +184,10 @@ def validate_metrics(metrics: dict):
     if metrics["final_equity"] <= 0:
         raise RuntimeError("Backtest produced non-positive equity.")
 
+    win_rate = metrics.get("win_rate")
+    if win_rate is not None and win_rate > 0.80:
+        logger.warning("Win rate extremely high — investigate leakage.")
 
-########################################################
-# LINEAGE SNAPSHOT (UPGRADED)
-########################################################
 
 def build_lineage(start_date, end_date):
 
@@ -200,17 +204,20 @@ def build_lineage(start_date, end_date):
         "platform": platform.platform(),
         "hostname": socket.gethostname(),
 
+        "env": {
+            "cpu_count": os.cpu_count(),
+            "machine": platform.machine()
+        },
+
         "training_window": {
             "start": start_date,
             "end": end_date
         },
 
         "market_time_snapshot": MarketTime.snapshot_for("xgboost"),
-
         "training_universe": universe_snapshot
     }
 
-    # lineage hash = audit superpower
     canonical = json.dumps(
         lineage_payload,
         sort_keys=True
@@ -223,14 +230,12 @@ def build_lineage(start_date, end_date):
     return lineage_payload
 
 
-########################################################
-# MAIN
-########################################################
-
 def main():
 
     init_env()
     enforce_determinism()
+
+    _acquire_lock()
 
     today = MarketTime.today().isoformat()
     MarketTime.freeze_today(today)
@@ -243,8 +248,9 @@ def main():
         end_date
     )
 
-    run_id = datetime.datetime.utcnow().strftime(
-        "run_%Y_%m_%d_%H%M%S_%f"
+    run_id = (
+        datetime.datetime.utcnow().strftime("run_%Y_%m_%d_%H%M%S_%f")
+        + "_" + uuid.uuid4().hex[:6]
     )
 
     start = time.time()
@@ -301,6 +307,9 @@ def main():
         save_manifest(run_id, manifest)
 
         raise
+
+    finally:
+        _release_lock()
 
 
 if __name__ == "__main__":
