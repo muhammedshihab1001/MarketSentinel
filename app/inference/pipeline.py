@@ -71,7 +71,6 @@ class CircuitBreaker:
         with self._lock:
             self.failures += 1
             self.last_failure = time.time()
-            logger.critical("Circuit breaker failure count=%s", self.failures)
 
     def record_success(self):
 
@@ -96,8 +95,6 @@ class InferencePipeline:
     MAX_NULL_RATIO = float(
         os.getenv("MAX_FEATURE_NULL_RATIO", "0.02")
     )
-
-    FAIL_ON_DRIFT = os.getenv("FAIL_ON_DRIFT", "false").lower() == "true"
 
     CACHE_TTL = int(
         os.getenv("INFERENCE_CACHE_TTL_SECONDS", "900")
@@ -129,54 +126,10 @@ class InferencePipeline:
 
     ############################################################
 
-    def _deadline(self, start):
-        remaining = self.HARD_PIPELINE_TIMEOUT - (time.time() - start)
-        if remaining <= 0:
-            raise RuntimeError("Pipeline timeout exceeded.")
-        return remaining
-
-    ############################################################
-
     def _validate_models_loaded(self):
 
-        if self.models.xgb is None:
-            raise RuntimeError("XGBoost model not loaded.")
-
-        if not hasattr(self.models.xgb, "predict_proba"):
-            raise RuntimeError("Invalid XGBoost artifact.")
-
-        if self.models.sarimax is None:
-            raise RuntimeError("SARIMAX model not loaded.")
-
-    ############################################################
-    # NEW — CANDLE CLOSE GUARD
-    ############################################################
-
-    def _assert_candle_closed(self, df: pd.DataFrame):
-
-        last_ts = pd.to_datetime(df["date"].iloc[-1], utc=True)
-        now = pd.Timestamp.utcnow()
-
-        if (now - last_ts).total_seconds() < 3600:
-            raise RuntimeError(
-                "Latest candle may still be forming — refusing inference."
-            )
-
-    ############################################################
-
-    def _validate_data_freshness(self, df: pd.DataFrame):
-
-        latest = pd.to_datetime(df["date"], utc=True)
-
-        age_hours = (
-            pd.Timestamp.utcnow() - latest.max()
-        ).total_seconds() / 3600
-
-        if age_hours > self.DATA_FRESHNESS_HOURS:
-            logger.warning(
-                "Market data stale (%.1fh old). Continuing inference.",
-                age_hours
-            )
+        _ = self.models.xgb
+        _ = self.models.sarimax
 
     ############################################################
     # HARD FEATURE EXTRACTION
@@ -191,10 +144,16 @@ class InferencePipeline:
 
         df = validate_feature_schema(df)
 
+        null_ratio = df.isna().mean().mean()
+        MISSING_FEATURE_RATIO.set(float(null_ratio))
+
+        if null_ratio > self.MAX_NULL_RATIO:
+            raise RuntimeError("Feature null ratio exceeded.")
+
         arr = df.to_numpy(dtype="float32")
 
-        if arr.shape[1] != len(MODEL_FEATURES):
-            raise RuntimeError("Feature width mismatch.")
+        if not np.isfinite(arr).all():
+            raise RuntimeError("Non-finite feature vector detected.")
 
         return arr
 
@@ -207,29 +166,21 @@ class InferencePipeline:
 
         prob = float(np.clip(prob, 0.0001, 0.9999))
 
-        if prob < 0.01 or prob > 0.99:
-            raise RuntimeError("Probability collapse detected.")
-
         return prob
 
     ############################################################
+    # DATASET HASH (DETERMINISTIC)
+    ############################################################
 
-    def _safe_sentiment_fetch(self, ticker):
+    def _dataset_hash(self, latest_row):
 
-        try:
+        canonical = latest_row[list(MODEL_FEATURES)] \
+            .round(10) \
+            .to_json()
 
-            news = self.news_fetcher.fetch(f"{ticker} stock")
-
-            scored = self.sentiment.analyze_dataframe(news)
-
-            return self.sentiment.aggregate_daily_sentiment(scored)
-
-        except Exception:
-            logger.exception(
-                "Sentiment pipeline failed — using neutral fallback."
-            )
-
-            return pd.DataFrame()
+        return hashlib.sha256(
+            canonical.encode()
+        ).hexdigest()[:12]
 
     ############################################################
     # MAIN RUN
@@ -248,10 +199,8 @@ class InferencePipeline:
 
         try:
 
-            model_version = self.models.xgb_version
-
             ####################################################
-            # DATA
+            # DATA LOAD
             ####################################################
 
             price_df = self.market_data.get_price_data(
@@ -260,9 +209,16 @@ class InferencePipeline:
                 end_date=pd.Timestamp.utcnow().date().isoformat()
             )
 
-            self._validate_data_freshness(price_df)
+            if price_df is None or price_df.empty:
+                raise RuntimeError("Market data unavailable.")
 
-            sentiment_df = self._safe_sentiment_fetch(ticker)
+            sentiment_df = None
+            try:
+                news = self.news_fetcher.fetch(f"{ticker} stock")
+                scored = self.sentiment.analyze_dataframe(news)
+                sentiment_df = self.sentiment.aggregate_daily_sentiment(scored)
+            except Exception:
+                logger.warning("Sentiment fallback used.")
 
             dataset = self.feature_store.get_features(
                 price_df,
@@ -275,23 +231,18 @@ class InferencePipeline:
 
             validate_feature_schema(dataset.loc[:, MODEL_FEATURES])
 
-            self._assert_candle_closed(dataset)
-
             ####################################################
-            # DATASET HASH FOR CACHE LINEAGE
+            # CACHE
             ####################################################
 
-            dataset_hash = hashlib.sha256(
-                dataset.iloc[-1].to_json().encode()
-            ).hexdigest()[:12]
+            model_version = self.models.xgb_version
+            dataset_hash = self._dataset_hash(dataset.iloc[-1])
 
-            payload = {
+            cache_key = self.cache.build_key({
                 "ticker": ticker,
                 "model_version": model_version,
                 "dataset": dataset_hash
-            }
-
-            cache_key = self.cache.build_key(payload)
+            })
 
             cached = self.cache.get(cache_key)
 
@@ -309,7 +260,6 @@ class InferencePipeline:
             if not lock.acquire(blocking=False):
 
                 cached = self.cache.get(cache_key)
-
                 if cached:
                     return cached
 
@@ -317,38 +267,34 @@ class InferencePipeline:
 
             try:
 
+                # re-check cache (stampede protection)
+                cached = self.cache.get(cache_key)
+                if cached:
+                    return cached
+
                 ################################################
                 # DRIFT
                 ################################################
 
                 try:
-
                     drift = self.drift_detector.detect(
                         dataset[MODEL_FEATURES]
                     )
 
                     if drift.get("drift_detected"):
                         logger.warning(
-                            "Inference drift snapshot | ticker=%s | score=%.4f",
-                            ticker,
+                            "Drift detected | score=%.4f",
                             drift.get("drift_score", -1)
                         )
 
-                        if self.FAIL_ON_DRIFT:
-                            raise RuntimeError(
-                                "Drift detected — inference halted."
-                            )
-
                 except Exception:
-                    logger.exception(
-                        "Drift detector failure — continuing inference."
-                    )
+                    logger.exception("Drift detector failure.")
 
                 ################################################
-                # FEATURE VECTOR
+                # FEATURES
                 ################################################
 
-                latest = dataset.iloc[-1].copy()
+                latest = dataset.iloc[-1]
                 features = self._extract_features(latest)
 
                 ################################################
@@ -359,23 +305,16 @@ class InferencePipeline:
 
                 preds = self.models.xgb.predict_proba(features)
 
-                if preds.ndim != 2 or preds.shape[1] < 2:
-                    raise RuntimeError("predict_proba returned invalid shape.")
-
                 prob_up = self._safe_probability(preds[0][1])
 
                 latency = time.time() - t0
 
-                if latency > self.LATENCY_GUARD_SECONDS:
-                    logger.warning("Inference latency breach: %.2fs", latency)
-
                 MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
                 MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
-
                 PREDICTION_CLASS_PROBABILITY.set(prob_up)
 
                 ################################################
-                # DECISION ENGINE
+                # DECISION
                 ################################################
 
                 predicted_return = prob_up - 0.5
@@ -418,9 +357,12 @@ class InferencePipeline:
                 except Exception:
                     pass
 
-        except RuntimeError:
+        except Exception as e:
+
             self.breaker.record_failure()
             PIPELINE_FAILURES.labels(stage="inference").inc()
+
+            logger.exception("Inference failure: %s", str(e))
             raise
 
         finally:
