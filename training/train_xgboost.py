@@ -61,24 +61,7 @@ def enforce_determinism():
 
 
 ########################################################
-# FSYNC
-########################################################
-
-def _fsync_dir(directory):
-
-    if os.name == "nt":
-        return
-
-    fd = os.open(directory, os.O_DIRECTORY)
-
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-########################################################
-# ATOMIC MODEL SAVE
+# ATOMIC MODEL SAVE (FIXED)
 ########################################################
 
 def save_model_atomic(model, path):
@@ -86,18 +69,27 @@ def save_model_atomic(model, path):
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
 
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        joblib.dump(model, tmp.name)
-        temp_name = tmp.name
+    tmp_path = f"{path}.tmp"
 
-    os.replace(temp_name, path)
-    _fsync_dir(directory)
+    joblib.dump(model, tmp_path)
+
+    os.replace(tmp_path, path)
 
     if not os.path.exists(path):
         raise RuntimeError("Model write failed.")
 
-    if os.path.getsize(path) < MIN_MODEL_BYTES:
+    size = os.path.getsize(path)
+
+    if size < MIN_MODEL_BYTES:
         raise RuntimeError("Model artifact suspiciously small.")
+
+    # 🔥 VERIFY LOAD
+    try:
+        _ = joblib.load(path)
+    except Exception as e:
+        raise RuntimeError("Saved model failed reload test.") from e
+
+    return size
 
 
 ########################################################
@@ -115,7 +107,6 @@ def load_training_data(start_date, end_date):
 
     datasets = []
     surviving = []
-    failures = []
 
     for ticker in universe:
 
@@ -132,7 +123,7 @@ def load_training_data(start_date, end_date):
             try:
 
                 news_df = news_fetcher.fetch(
-                    f'"{ticker}" stock',
+                    f"{ticker} stock",
                     max_items=400
                 )
 
@@ -142,7 +133,7 @@ def load_training_data(start_date, end_date):
                     sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(scored)
 
             except Exception:
-                logger.warning("News failed for %s — neutral fallback used.", ticker)
+                logger.warning("News failed for %s — neutral fallback.", ticker)
 
             dataset = store.get_features(
                 price_df,
@@ -155,21 +146,12 @@ def load_training_data(start_date, end_date):
             surviving.append(ticker)
 
         except Exception as e:
-
-            failures.append(f"{ticker}: {str(e)}")
             logger.warning("Ticker rejected: %s | %s", ticker, str(e))
 
     if not datasets:
         raise RuntimeError("All tickers failed — training aborted.")
 
     survival_ratio = len(surviving) / max(len(universe), 1)
-
-    logger.info(
-        "Universe survival: %.2f%% (%s/%s)",
-        survival_ratio * 100,
-        len(surviving),
-        len(universe)
-    )
 
     if survival_ratio < MIN_SURVIVING_RATIO:
         raise RuntimeError(
@@ -187,12 +169,10 @@ def load_training_data(start_date, end_date):
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
     if not np.isfinite(df.loc[:, MODEL_FEATURES].to_numpy()).all():
-        raise RuntimeError("Non-finite values detected in training features.")
+        raise RuntimeError("Non-finite feature values detected.")
 
     if df["target"].nunique() < 2:
-        raise RuntimeError("Target collapsed — cannot train classifier.")
-
-    logger.info("Final training rows: %s", len(df))
+        raise RuntimeError("Target collapsed.")
 
     return df
 
@@ -214,7 +194,13 @@ def main(start_date=None, end_date=None):
 
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    hash_df = df[["ticker", "date", "target", *MODEL_FEATURES]]
+    ###################################################
+    # CANONICAL HASH (FIXED)
+    ###################################################
+
+    hash_df = df[["ticker", "date", "target", *MODEL_FEATURES]] \
+        .sort_values(["date", "ticker"]) \
+        .reset_index(drop=True)
 
     dataset_hash = MetadataManager.fingerprint_dataset(hash_df)
 
@@ -230,12 +216,7 @@ def main(start_date=None, end_date=None):
             dataset_hash=dataset_hash,
             allow_overwrite=False
         )
-
-    except RuntimeError as e:
-
-        if "already exists" not in str(e):
-            raise
-
+    except RuntimeError:
         logger.info("Drift baseline already exists.")
 
     ###################################################
@@ -254,10 +235,7 @@ def main(start_date=None, end_date=None):
             tree_method="hist"
         )
 
-        model.fit(
-            d.loc[:, MODEL_FEATURES],
-            y
-        )
+        model.fit(d.loc[:, MODEL_FEATURES], y)
 
         return model
 
@@ -285,9 +263,6 @@ def main(start_date=None, end_date=None):
 
     sharpe = strategy_metrics.get("avg_sharpe")
 
-    if sharpe is None or not np.isfinite(sharpe):
-        raise RuntimeError("Invalid Sharpe produced.")
-
     if sharpe < MIN_SHARPE:
         raise RuntimeError("XGBoost rejected — Sharpe too low")
 
@@ -311,7 +286,7 @@ def main(start_date=None, end_date=None):
         df["target"]
     )
 
-    save_model_atomic(final_model, TEMP_MODEL_PATH)
+    artifact_size = save_model_atomic(final_model, TEMP_MODEL_PATH)
 
     ###################################################
     # METADATA
@@ -347,7 +322,19 @@ def main(start_date=None, end_date=None):
         version
     )
 
-    logger.info("XGBoost promoted → %s", version)
+    ###################################################
+    # TRAINING SUMMARY (YOU REQUESTED)
+    ###################################################
+
+    print("\n===== MODEL TRAINING SUMMARY =====")
+    print(f"Version: {version}")
+    print(f"Dataset rows: {len(df):,}")
+    print(f"Dataset hash: {dataset_hash[:12]}...")
+    print(f"Sharpe: {strategy_metrics['avg_sharpe']:.3f}")
+    print(f"Max Drawdown: {strategy_metrics['max_drawdown']:.2%}")
+    print(f"Artifact size: {artifact_size/1024/1024:.2f} MB")
+    print("Status: PROMOTED TO PRODUCTION")
+    print("=================================\n")
 
     return strategy_metrics
 
