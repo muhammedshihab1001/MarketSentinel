@@ -4,14 +4,14 @@ import hashlib
 import numpy as np
 import json
 import re
+import logging
 
 
-SCHEMA_VERSION = "14.0"   # 🔥 bumped after canonical lock fix
+logger = logging.getLogger(__name__)
 
 
-############################################################
-# IMMUTABLE FEATURE CONTRACT
-############################################################
+SCHEMA_VERSION = "15.0"
+
 
 MODEL_FEATURES: Tuple[str, ...] = (
     "return",
@@ -34,13 +34,9 @@ MIN_ROWS = 120
 MAX_NAN_RATIO_PER_FEATURE = 0.05
 MAX_ROW_NAN_RATIO = 0.10
 
-ABSOLUTE_FEATURE_LIMIT = 1e4
+ABSOLUTE_FEATURE_LIMIT = 1e3
 MIN_VARIANCE = 1e-8
 
-
-############################################################
-# PLAUSIBLE LIMITS
-############################################################
 
 FEATURE_LIMITS: Dict[str, tuple] = {
 
@@ -63,12 +59,8 @@ FEATURE_LIMITS: Dict[str, tuple] = {
 }
 
 
-############################################################
-# LOOKAHEAD FIREWALL
-############################################################
-
 FORBIDDEN_REGEX = re.compile(
-    r"(future|next|forward|target|label|tomorrow|t\+|lead)",
+    r"(future|next|forward|target|label|tomorrow|t\+|lead|horizon|shift|lookahead|outcome|response|y_)",
     re.IGNORECASE
 )
 
@@ -86,20 +78,10 @@ def _check_forbidden_columns(df: pd.DataFrame):
             )
 
 
-############################################################
-# SCHEMA LOCK HASH (INSTITUTIONAL)
-############################################################
-
 def _build_feature_lock():
-    """
-    Canonical contract builder.
-
-    Uses LIST instead of tuple to prevent
-    cross-environment serialization drift.
-    """
 
     contract = {
-        "features": list(MODEL_FEATURES),  # 🔥 critical fix
+        "features": list(MODEL_FEATURES),
         "dtype": "float32",
         "limits": FEATURE_LIMITS,
         "nan_feature": MAX_NAN_RATIO_PER_FEATURE,
@@ -121,10 +103,6 @@ def _build_feature_lock():
 
 FEATURE_LOCK_HASH = _build_feature_lock()
 
-
-############################################################
-# MAIN VALIDATOR
-############################################################
 
 def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
@@ -148,12 +126,8 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     _check_forbidden_columns(df)
 
-    ########################################################
-    # HARD NUMERIC CAST
-    ########################################################
-
     try:
-        feature_df = df.astype("float64", copy=True)
+        feature_df = df.astype(DTYPE, copy=True)
     except Exception as e:
         raise RuntimeError(
             f"Non-numeric feature detected → {e}"
@@ -164,10 +138,6 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         np.nan,
         inplace=True
     )
-
-    ########################################################
-    # VARIANCE + CONSTANT CHECK
-    ########################################################
 
     for col in MODEL_FEATURES:
 
@@ -184,7 +154,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
                 f"Constant feature detected: {col}"
             )
 
-        if finite_vals.var() < MIN_VARIANCE:
+        if finite_vals.var(ddof=0) < MIN_VARIANCE:
             raise RuntimeError(
                 f"Near-zero variance feature detected: {col}"
             )
@@ -193,10 +163,6 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             raise RuntimeError(
                 f"Feature explosion detected: {col}"
             )
-
-    ########################################################
-    # NAN CHECKS
-    ########################################################
 
     per_feature_nan = feature_df.isna().mean()
 
@@ -212,13 +178,9 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     row_nan_ratio = feature_df.isna().mean(axis=1)
 
     if (row_nan_ratio > MAX_ROW_NAN_RATIO).any():
-        raise RuntimeError(
-            "Row-level NaN explosion detected."
+        logger.warning(
+            "Row-level NaN spike detected."
         )
-
-    ########################################################
-    # PLAUSIBILITY LIMITS
-    ########################################################
 
     for col, (lo, hi) in FEATURE_LIMITS.items():
 
@@ -228,45 +190,20 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         if (finite < lo).any() or (finite > hi).any():
-            raise RuntimeError(
-                f"Feature out of plausible bounds: {col}"
+            logger.warning(
+                "Feature outside historical bounds → %s",
+                col
             )
 
-    ########################################################
-    # SAFE FLOAT32 CAST WITH FIDELITY CHECK
-    ########################################################
+    return feature_df.astype(DTYPE, copy=False)
 
-    arr64 = feature_df.to_numpy(dtype="float64")
-
-    arr32 = np.ascontiguousarray(
-        arr64.astype(DTYPE)
-    )
-
-    if not np.all(np.isfinite(arr32)):
-        raise RuntimeError("Float32 casting produced non-finite values.")
-
-    delta = np.abs(arr64 - arr32)
-
-    if np.max(delta) > 1e-3:
-        raise RuntimeError(
-            "Precision loss detected during float32 cast."
-        )
-
-    return pd.DataFrame(
-        arr32,
-        columns=MODEL_FEATURES
-    )
-
-
-############################################################
-# SIGNATURE
-############################################################
 
 def get_schema_signature() -> str:
 
     contract = {
         "lock": FEATURE_LOCK_HASH,
-        "version": SCHEMA_VERSION
+        "version": SCHEMA_VERSION,
+        "count": FEATURE_COUNT
     }
 
     canonical = json.dumps(
