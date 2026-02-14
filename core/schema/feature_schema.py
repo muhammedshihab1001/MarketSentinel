@@ -6,7 +6,7 @@ import json
 import re
 
 
-SCHEMA_VERSION = "13.0"
+SCHEMA_VERSION = "14.0"   # 🔥 bumped after canonical lock fix
 
 
 ############################################################
@@ -34,9 +34,7 @@ MIN_ROWS = 120
 MAX_NAN_RATIO_PER_FEATURE = 0.05
 MAX_ROW_NAN_RATIO = 0.10
 
-# tightened — prevents feature explosion earlier
 ABSOLUTE_FEATURE_LIMIT = 1e4
-
 MIN_VARIANCE = 1e-8
 
 
@@ -89,13 +87,19 @@ def _check_forbidden_columns(df: pd.DataFrame):
 
 
 ############################################################
-# SCHEMA LOCK HASH
+# SCHEMA LOCK HASH (INSTITUTIONAL)
 ############################################################
 
 def _build_feature_lock():
+    """
+    Canonical contract builder.
+
+    Uses LIST instead of tuple to prevent
+    cross-environment serialization drift.
+    """
 
     contract = {
-        "features": MODEL_FEATURES,
+        "features": list(MODEL_FEATURES),  # 🔥 critical fix
         "dtype": "float32",
         "limits": FEATURE_LIMITS,
         "nan_feature": MAX_NAN_RATIO_PER_FEATURE,
@@ -106,7 +110,11 @@ def _build_feature_lock():
         "version": SCHEMA_VERSION
     }
 
-    canonical = json.dumps(contract, sort_keys=True)
+    canonical = json.dumps(
+        contract,
+        sort_keys=True,
+        separators=(",", ":")
+    )
 
     return hashlib.sha256(canonical.encode()).hexdigest()
 
@@ -164,7 +172,6 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     for col in MODEL_FEATURES:
 
         series = feature_df[col]
-
         finite_vals = series[np.isfinite(series)]
 
         if finite_vals.empty:
@@ -238,7 +245,6 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     if not np.all(np.isfinite(arr32)):
         raise RuntimeError("Float32 casting produced non-finite values.")
 
-    # detect precision collapse
     delta = np.abs(arr64 - arr32)
 
     if np.max(delta) > 1e-3:
@@ -263,6 +269,10 @@ def get_schema_signature() -> str:
         "version": SCHEMA_VERSION
     }
 
-    canonical = json.dumps(contract, sort_keys=True)
+    canonical = json.dumps(
+        contract,
+        sort_keys=True,
+        separators=(",", ":")
+    )
 
     return hashlib.sha256(canonical.encode()).hexdigest()
