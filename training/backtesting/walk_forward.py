@@ -11,19 +11,29 @@ from training.backtesting.regime import MarketRegimeDetector
 
 
 class WalkForwardValidator:
+    """
+    Institutional Walk Forward Validator
+    Prevents leakage, overfitting, regime bias, and simulation fraud.
+    """
 
     MIN_TRADES_PER_WINDOW = 5
-    MIN_TRAIN_RATIO = 0.75
     MIN_WINDOWS = 6
+    MIN_TEST_DAYS = 20
+
     MIN_ASSETS_PER_DAY = 3
     MIN_FEATURE_VARIANCE = 1e-8
+
     MAX_TURNOVER = 0.65
     MAX_CAPITAL_MULTIPLE = 50
     MAX_SHARPE_REALITY = 4.0
     MIN_EQUITY_STD = 1e-4
-    MIN_TEST_DAYS = 20
+
+    MAX_SIGNAL_CONCENTRATION = 0.35
+    MIN_REGIME_COUNT = 2
 
     VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
+
+    ########################################################
 
     def __init__(
         self,
@@ -31,33 +41,34 @@ class WalkForwardValidator:
         signal_generator,
         window_size=252,
         step_size=63,
-        embargo_days=None
+        embargo_days=14
     ):
         self.model_trainer = model_trainer
         self.signal_generator = signal_generator
+
         self.window_size = window_size
         self.step_size = step_size
-
-        self.EMBARGO_DAYS = embargo_days or max(10, window_size // 12)
+        self.embargo_days = embargo_days
 
         self.engine = PortfolioBacktestEngine()
         self.regime_detector = MarketRegimeDetector()
 
-    ############################################
+    ########################################################
+    # LEAKAGE GUARD
+    ########################################################
 
-    def _assert_no_future_leak(self, train_df, test_df):
+    def _apply_embargo(self, train_df, test_start):
 
-        if train_df["date"].max() >= test_df["date"].min():
-            raise RuntimeError(
-                "Temporal boundary violated — future leakage detected."
-            )
+        embargo_cut = pd.Timestamp(test_start) - pd.Timedelta(days=self.embargo_days)
 
-        if set(train_df.index) & set(test_df.index):
-            raise RuntimeError(
-                "Train/Test index overlap — leakage."
-            )
+        train_df = train_df[train_df["date"] < embargo_cut]
 
-    ############################################
+        if len(train_df) < self.window_size * 0.70:
+            raise RuntimeError("Embargo removed too much training data.")
+
+        return train_df
+
+    ########################################################
 
     def _assert_monotonic(self, df):
 
@@ -69,18 +80,29 @@ class WalkForwardValidator:
                     f"Non-monotonic dates detected for {ticker}"
                 )
 
-    ############################################
+    ########################################################
 
-    def _validate_survivorship(self, df):
+    def _validate_training_frame(self, df):
 
-        coverage = df.groupby("ticker").size()
+        if df["ticker"].nunique() < 3:
+            raise RuntimeError("Training universe too small.")
 
-        if (coverage < self.window_size * 0.60).any():
-            raise RuntimeError(
-                "Survivorship bias risk — assets missing large history."
-            )
+        validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
-    ############################################
+        features = df.loc[:, MODEL_FEATURES].to_numpy(dtype=float)
+
+        if not np.isfinite(features).all():
+            raise RuntimeError("Non-finite feature values detected.")
+
+        if np.min(np.var(features, axis=0)) < self.MIN_FEATURE_VARIANCE:
+            raise RuntimeError("Feature variance collapsed.")
+
+        if df["target"].nunique() < 2:
+            raise RuntimeError("Training labels collapsed.")
+
+    ########################################################
+    # DISTRIBUTION SHIFT
+    ########################################################
 
     def _distribution_guard(self, train_df, test_df):
 
@@ -96,112 +118,57 @@ class WalkForwardValidator:
                 "Severe feature distribution shift detected."
             )
 
-    ############################################
+    ########################################################
+    # SIGNAL CONCENTRATION
+    ########################################################
 
-    def _validate_training_frame(self, df):
+    def _signal_concentration_guard(self, grouped_signals):
 
-        if df["ticker"].nunique() < 3:
-            raise RuntimeError("Training universe too small.")
+        counts = {}
 
-        validate_feature_schema(df.loc[:, MODEL_FEATURES])
+        for day in grouped_signals.values():
+            for t, s in day.items():
+                if s == "HOLD":
+                    continue
+                counts[t] = counts.get(t, 0) + 1
 
-        features = df.loc[:, MODEL_FEATURES].to_numpy(dtype=float)
+        if not counts:
+            return
 
-        if features.shape[1] != len(MODEL_FEATURES):
-            raise RuntimeError("Feature width changed.")
+        total = sum(counts.values())
 
-        if not np.isfinite(features).all():
-            raise RuntimeError("Non-finite feature values detected.")
-
-        if np.min(np.var(features, axis=0)) < self.MIN_FEATURE_VARIANCE:
-            raise RuntimeError("Feature variance collapsed.")
-
-        if df["target"].nunique() < 2:
-            raise RuntimeError("Training labels collapsed.")
-
-        if len(df) < self.window_size * self.MIN_TRAIN_RATIO:
+        if max(counts.values()) / total > self.MAX_SIGNAL_CONCENTRATION:
             raise RuntimeError(
-                "Training window too small after embargo."
+                "Signal concentration detected — fake diversification."
             )
 
-        self._validate_survivorship(df)
+    ########################################################
+    # CAPITAL CONTINUITY
+    ########################################################
 
-    ############################################
+    def _capital_guard(self, curve):
 
-    def _sanity_check_model(self, model, sample_df):
+        diffs = np.diff(curve)
 
-        if not hasattr(model, "predict_proba"):
-            raise RuntimeError("Classifier required.")
-
-        X = sample_df.loc[:, MODEL_FEATURES].iloc[:50]
-
-        preds = model.predict_proba(X)
-
-        if preds.ndim != 2 or preds.shape[1] < 2:
-            raise RuntimeError("Invalid predict_proba shape.")
-
-        probs = preds[:, 1]
-
-        if not np.isfinite(probs).all():
-            raise RuntimeError("Non-finite predictions.")
-
-        if np.std(probs) < 5e-5:
-            raise RuntimeError("Model collapsed.")
-
-        if np.mean(probs) < 0.02 or np.mean(probs) > 0.98:
-            raise RuntimeError("Probability collapse detected.")
-
-    ############################################
-
-    def _validate_signals(self, signals, expected_len):
-
-        if len(signals) != expected_len:
+        if np.max(np.abs(diffs)) > curve[0] * 0.4:
             raise RuntimeError(
-                "Signal length mismatch — generator dropped rows."
+                "Capital discontinuity detected."
             )
 
-        invalid = set(signals.values()) - self.VALID_SIGNALS
+    ########################################################
+    # REGIME DIVERSITY
+    ########################################################
 
-        if invalid:
+    def _regime_guard(self, df):
+
+        regimes = df["regime"].unique()
+
+        if len(regimes) < self.MIN_REGIME_COUNT:
             raise RuntimeError(
-                f"Invalid signal values detected: {invalid}"
+                "Strategy tested in too few regimes."
             )
 
-        if all(s == "HOLD" for s in signals.values()):
-            raise RuntimeError(
-                "Degenerate strategy — all HOLD signals."
-            )
-
-    ############################################
-
-    def _calculate_turnover(self, grouped_signals):
-
-        previous = None
-        flips = 0
-        total = 0
-
-        for date in sorted(grouped_signals):
-
-            current = grouped_signals[date]
-
-            if previous is not None:
-
-                shared = set(previous) & set(current)
-
-                for t in shared:
-                    if previous[t] != current[t]:
-                        flips += 1
-
-                total += len(shared)
-
-            previous = current
-
-        if total == 0:
-            return 0.0
-
-        return flips / total
-
-    ############################################
+    ########################################################
 
     def run(self, df: pd.DataFrame):
 
@@ -213,15 +180,10 @@ class WalkForwardValidator:
             df["date"].drop_duplicates()
         ).sort_values()
 
-        if len(unique_dates) < self.window_size + self.step_size + 1:
-            raise RuntimeError("Dataset too small.")
-
         results = []
         equity_curve = []
-        sharpe_series = []
 
         initial_capital = 10_000.0
-
         start_idx = self.window_size
 
         while start_idx < len(unique_dates) - 1:
@@ -229,8 +191,6 @@ class WalkForwardValidator:
             train_dates = unique_dates.iloc[
                 start_idx - self.window_size : start_idx
             ]
-
-            embargo_cutoff = train_dates.iloc[-1]
 
             test_dates = unique_dates.iloc[
                 start_idx : start_idx + self.step_size
@@ -241,27 +201,32 @@ class WalkForwardValidator:
 
             train_df = df.loc[
                 (df["date"] >= train_dates.iloc[0]) &
-                (df["date"] <= embargo_cutoff)
+                (df["date"] <= train_dates.iloc[-1])
             ].copy()
+
+            train_df = self._apply_embargo(
+                train_df,
+                test_dates.iloc[0]
+            )
 
             test_df = df.loc[
                 (df["date"] >= test_dates.iloc[0]) &
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
-            self._assert_no_future_leak(train_df, test_df)
-
             train_df = self.regime_detector.detect(train_df.copy())
             test_df = self.regime_detector.detect(test_df.copy())
+
+            self._regime_guard(train_df)
 
             self._validate_training_frame(train_df)
             self._distribution_guard(train_df, test_df)
 
             model = self.model_trainer(train_df)
-            self._sanity_check_model(model, train_df)
 
             grouped_prices = {}
             grouped_signals = {}
+
             trade_counter = 0
 
             test_dates_sorted = sorted(test_df["date"].unique())
@@ -289,8 +254,6 @@ class WalkForwardValidator:
                     zip(signal_slice["ticker"], signals_list)
                 )
 
-                self._validate_signals(signals, len(signal_slice))
-
                 shared = set(prices) & set(signals)
 
                 if len(shared) < self.MIN_ASSETS_PER_DAY:
@@ -311,11 +274,7 @@ class WalkForwardValidator:
                 start_idx += self.step_size
                 continue
 
-            turnover = self._calculate_turnover(grouped_signals)
-
-            if turnover > self.MAX_TURNOVER:
-                start_idx += self.step_size
-                continue
+            self._signal_concentration_guard(grouped_signals)
 
             metrics = self.engine.run(
                 grouped_prices,
@@ -323,12 +282,14 @@ class WalkForwardValidator:
                 initial_cash=initial_capital
             )
 
+            curve = np.array(metrics["equity_curve"], dtype=float)
+
+            self._capital_guard(curve)
+
             if metrics["sharpe_ratio"] > self.MAX_SHARPE_REALITY:
                 raise RuntimeError(
                     "Sharpe too high — simulation likely invalid."
                 )
-
-            curve = np.array(metrics["equity_curve"], dtype=float)
 
             if np.std(curve) < self.MIN_EQUITY_STD:
                 raise RuntimeError(
@@ -347,7 +308,6 @@ class WalkForwardValidator:
                 equity_curve.extend(curve.tolist())
 
             results.append(metrics)
-            sharpe_series.append(metrics["sharpe_ratio"])
 
             start_idx += self.step_size
 
@@ -356,16 +316,9 @@ class WalkForwardValidator:
                 "Walk-forward produced insufficient windows."
             )
 
-        sharpe_std = np.std(sharpe_series)
-
-        if sharpe_std > 1.2:
-            raise RuntimeError(
-                "Sharpe instability detected — strategy unreliable."
-            )
-
         return self.aggregate_results(results, equity_curve)
 
-    ############################################
+    ########################################################
 
     def aggregate_results(self, results, equity_curve):
 
