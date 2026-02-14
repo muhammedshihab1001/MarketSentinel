@@ -5,27 +5,36 @@ from collections import defaultdict
 class PortfolioBacktestEngine:
 
     EPSILON = 1e-12
+
     VOL_WINDOW = 20
-    CASH_BUFFER = 0.02
-    MAX_INV_VOL = 5.0
+    CASH_BUFFER = 0.03
 
-    MAX_SINGLE_STEP_RETURN = 0.40
-    MAX_GAP = 0.35
+    MAX_INV_VOL = 4.0
 
-    MAX_POSITION_WEIGHT = 0.12
-    MAX_ABSOLUTE_POSITION = 0.25
-    MAX_TURNOVER_RATIO = 1.8
-    MIN_EQUITY_FLOOR = 0.35
-    SLIPPAGE_IMPACT = 0.08
+    MAX_SINGLE_STEP_RETURN = 0.35
+    MAX_GAP = 0.30
 
-    BORROW_COST_ANNUAL = 0.03
+    MAX_POSITION_WEIGHT = 0.10
+    MAX_ABSOLUTE_POSITION = 0.20
+
+    MAX_TURNOVER_RATIO = 1.5
+    MIN_EQUITY_FLOOR = 0.40
+
+    SLIPPAGE_IMPACT = 0.10
+
+    BORROW_COST_ANNUAL = 0.04
+
+    LIQUIDITY_CAP_PCT = 0.05
+    MIN_PRICE_HISTORY = 5
 
     VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
+
+    ###################################################
 
     def __init__(
         self,
         transaction_cost=0.001,
-        base_slippage=0.0005,
+        base_slippage=0.0007,
         target_vol=0.02,
         max_gross_exposure=1.0
     ):
@@ -35,12 +44,16 @@ class PortfolioBacktestEngine:
         self.max_gross_exposure = max_gross_exposure
 
         self.return_buffers = defaultdict(list)
+        self.price_history = defaultdict(list)
 
     ###################################################
 
     def _reset_state(self):
-        self.return_buffers = defaultdict(list)
+        self.return_buffers.clear()
+        self.price_history.clear()
 
+    ###################################################
+    # SAFE PRICE
     ###################################################
 
     def _safe_price(self, price):
@@ -77,6 +90,8 @@ class PortfolioBacktestEngine:
                 )
 
     ###################################################
+    # CLEAN INPUT
+    ###################################################
 
     def _clean_prices_and_signals(self, prices, signals):
 
@@ -102,12 +117,19 @@ class PortfolioBacktestEngine:
         return clean_prices, clean_signals
 
     ###################################################
+    # VOL BUFFER
+    ###################################################
 
-    def _update_vol_buffers(self, prev_prices, prices):
+    def _update_buffers(self, prev_prices, prices):
 
         vols = {}
 
         for ticker in prices:
+
+            self.price_history[ticker].append(prices[ticker])
+
+            if len(self.price_history[ticker]) > self.VOL_WINDOW:
+                self.price_history[ticker].pop(0)
 
             if prev_prices and ticker in prev_prices:
 
@@ -128,7 +150,7 @@ class PortfolioBacktestEngine:
         return vols
 
     ###################################################
-    # HARD EXPOSURE CHECK
+    # GROSS EXPOSURE
     ###################################################
 
     def _gross_exposure(self, positions, prices, equity):
@@ -140,6 +162,8 @@ class PortfolioBacktestEngine:
 
         return exposure / max(equity, 1)
 
+    ###################################################
+    # WEIGHTS — RISK PARITY STYLE
     ###################################################
 
     def _compute_weights(self, signals, vols):
@@ -185,20 +209,39 @@ class PortfolioBacktestEngine:
         return weights
 
     ###################################################
+    # SLIPPAGE — NONLINEAR
+    ###################################################
 
     def _trade_slippage(self, notional, portfolio_value):
 
-        size_ratio = min(notional / max(portfolio_value, 1), 0.25)
-        impact = size_ratio * self.SLIPPAGE_IMPACT
+        size_ratio = min(notional / max(portfolio_value, 1), 0.30)
+
+        impact = (size_ratio ** 1.5) * self.SLIPPAGE_IMPACT
 
         return self.base_slippage + impact
 
+    ###################################################
+    # LIQUIDITY GUARD
+    ###################################################
+
+    def _liquidity_cap(self, price_history, portfolio_value):
+
+        if len(price_history) < self.MIN_PRICE_HISTORY:
+            return portfolio_value * 0.01
+
+        avg_price = np.mean(price_history)
+
+        proxy_daily_dollar_vol = avg_price * 1e6
+
+        return proxy_daily_dollar_vol * self.LIQUIDITY_CAP_PCT
+
+    ###################################################
+    # BORROW COST
     ###################################################
 
     def _apply_borrow_cost(self, positions, prices):
 
         daily_rate = self.BORROW_COST_ANNUAL / 252
-
         borrow_cost = 0.0
 
         for t, shares in positions.items():
@@ -211,19 +254,17 @@ class PortfolioBacktestEngine:
         return borrow_cost
 
     ###################################################
-    # 🔥 NEW — FORCE LIQUIDATION
+    # FORCE LIQUIDATION
     ###################################################
 
     def _force_liquidations(self, positions, target_positions):
-        """
-        If a ticker disappears from targets,
-        close the position.
-        """
 
         for ticker in list(positions.keys()):
             if ticker not in target_positions:
                 target_positions[ticker] = 0.0
 
+    ###################################################
+    # MAIN LOOP
     ###################################################
 
     def run(
@@ -267,7 +308,7 @@ class PortfolioBacktestEngine:
 
             signals = prev_signals
 
-            vols = self._update_vol_buffers(prev_prices, prices)
+            vols = self._update_buffers(prev_prices, prices)
 
             portfolio_value = cash + sum(
                 positions.get(t, 0) * prices.get(t, 0)
@@ -287,11 +328,10 @@ class PortfolioBacktestEngine:
                 for t, w in weights.items()
             }
 
-            # FORCE CLOSE OLD POSITIONS
             self._force_liquidations(positions, target_positions)
 
             ###################################################
-            # EXECUTE TRADES
+            # EXECUTION
             ###################################################
 
             for ticker in set(positions) | set(target_positions):
@@ -310,6 +350,15 @@ class PortfolioBacktestEngine:
                     continue
 
                 trade_notional = abs(delta) * trade_price
+
+                liquidity_cap = self._liquidity_cap(
+                    self.price_history[ticker],
+                    portfolio_value
+                )
+
+                if trade_notional > liquidity_cap:
+                    delta *= liquidity_cap / trade_notional
+                    trade_notional = liquidity_cap
 
                 slippage = self._trade_slippage(
                     trade_notional,
@@ -331,10 +380,10 @@ class PortfolioBacktestEngine:
                 if abs(target) < self.EPSILON:
                     positions.pop(ticker, None)
                 else:
-                    positions[ticker] = target
+                    positions[ticker] = current + delta
 
             ###################################################
-            # HARD GROSS CHECK
+            # EXPOSURE CHECK
             ###################################################
 
             equity = cash + sum(
@@ -348,12 +397,8 @@ class PortfolioBacktestEngine:
                 equity
             )
 
-            if gross > self.max_gross_exposure * 1.05:
-                raise RuntimeError(
-                    "Gross exposure breach detected."
-                )
-
-            ###################################################
+            if gross > self.max_gross_exposure * 1.03:
+                raise RuntimeError("Gross exposure breach detected.")
 
             borrow_cost = self._apply_borrow_cost(
                 positions,
