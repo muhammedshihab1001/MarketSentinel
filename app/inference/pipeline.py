@@ -98,7 +98,7 @@ class InferencePipeline:
         os.getenv("MAX_FEATURE_NULL_RATIO", "0.02")
     )
 
-    LOCK_TIMEOUT = 3
+    LOCK_TIMEOUT = 5
 
     ############################################################
 
@@ -130,6 +130,22 @@ class InferencePipeline:
 
         if not hasattr(model, "predict_proba"):
             raise RuntimeError("Loaded model is not a classifier.")
+
+    ############################################################
+    # DATA FRESHNESS (VERY IMPORTANT)
+    ############################################################
+
+    def _assert_data_freshness(self, price_df):
+
+        latest_date = pd.to_datetime(price_df["date"].max(), utc=True)
+        now = pd.Timestamp.utcnow()
+
+        age_hours = (now - latest_date).total_seconds() / 3600
+
+        if age_hours > 36:
+            raise RuntimeError(
+                f"Market data stale: {age_hours:.1f}h old."
+            )
 
     ############################################################
 
@@ -192,11 +208,24 @@ class InferencePipeline:
 
         try:
 
+            ####################################################
+            # LOAD DATA
+            ####################################################
+
             price_df = self.market_data.get_price_data(
                 ticker=ticker,
                 start_date="2018-01-01",
                 end_date=pd.Timestamp.utcnow().date().isoformat()
             )
+
+            if price_df is None or price_df.empty:
+                raise RuntimeError("Market data unavailable.")
+
+            self._assert_data_freshness(price_df)
+
+            ####################################################
+            # FEATURES
+            ####################################################
 
             sentiment_df = None
             try:
@@ -213,11 +242,14 @@ class InferencePipeline:
                 training=False
             )
 
+            if dataset.empty:
+                raise RuntimeError("Feature pipeline returned empty dataset.")
+
             latest = dataset.iloc[-1]
             features = self._extract_features(latest)
 
             ####################################################
-            # CACHE
+            # CACHE (stampede-safe)
             ####################################################
 
             model_version = self.models.xgb_version
@@ -236,88 +268,125 @@ class InferencePipeline:
                 CACHE_HITS.inc()
                 return cached
 
-            CACHE_MISSES.inc()
+            lock = self.cache.get_lock(
+                cache_key,
+                timeout=self.LOCK_TIMEOUT
+            )
 
-            ####################################################
-            # MODEL
-            ####################################################
-
-            t0 = time.time()
-
-            preds = self.models.xgb.predict_proba(features)
-            prob_up = self._safe_probability(preds[0][1])
-
-            latency = time.time() - t0
-
-            if latency > self.LATENCY_GUARD_SECONDS:
-                raise RuntimeError("Inference latency breach.")
-
-            MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-            MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
-            PREDICTION_CLASS_PROBABILITY.set(prob_up)
-
-            ####################################################
-            # BUILD DISTRIBUTION (ELITE UPGRADE)
-            ####################################################
-
-            current_price = float(latest["close"])
-            volatility = float(latest.get("volatility", 0.02))
+            if not lock.acquire(blocking=False):
+                time.sleep(0.15)
+                cached = self.cache.get(cache_key)
+                if cached:
+                    return cached
+                raise RuntimeError("Inference contention detected.")
 
             try:
 
-                recent_prices = price_df["close"].tail(60).tolist()
+                ####################################################
+                # DRIFT CHECK
+                ####################################################
 
-                lstm_forecast = self.models.lstm_forecast(recent_prices)
+                try:
+                    drift = self.drift_detector.detect(
+                        dataset[MODEL_FEATURES]
+                    )
 
-                surface = self.distribution.from_lstm(
-                    current_price,
-                    lstm_forecast
+                    if drift.get("drift_detected"):
+                        logger.warning(
+                            "Drift detected | score=%.4f",
+                            drift.get("drift_score", -1)
+                        )
+
+                except Exception:
+                    logger.exception("Drift detector failure.")
+
+                ####################################################
+                # MODEL
+                ####################################################
+
+                t0 = time.time()
+
+                preds = self.models.xgb.predict_proba(features)
+                prob_up = self._safe_probability(preds[0][1])
+
+                latency = time.time() - t0
+
+                if latency > self.LATENCY_GUARD_SECONDS:
+                    raise RuntimeError("Inference latency breach.")
+
+                MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
+                MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
+                PREDICTION_CLASS_PROBABILITY.set(prob_up)
+
+                ####################################################
+                # DISTRIBUTION
+                ####################################################
+
+                current_price = float(latest["close"])
+                volatility = float(latest.get("volatility", 0.02))
+
+                try:
+
+                    recent_prices = price_df["close"].tail(60).tolist()
+                    lstm_forecast = self.models.lstm_forecast(recent_prices)
+
+                    surface = self.distribution.from_lstm(
+                        current_price,
+                        lstm_forecast
+                    )
+
+                except Exception:
+                    logger.warning("Falling back to volatility distribution.")
+
+                    surface = self.distribution.from_volatility(
+                        current_price,
+                        volatility,
+                        prob_up
+                    )
+
+                ####################################################
+                # DECISION — PASS FULL PRICE DF
+                ####################################################
+
+                decision = self.decision_engine.generate(
+                    ticker=ticker,
+                    price_df=price_df,
+                    current_price=current_price,
+                    forecast_up=surface["p90"],
+                    forecast_down=surface["p10"],
+                    prob_up=prob_up,
+                    volatility=volatility,
+                    regime=None
                 )
 
-            except Exception:
-                logger.warning("Falling back to volatility distribution.")
+                SIGNAL_DISTRIBUTION.labels(
+                    signal=decision["signal"]
+                ).inc()
 
-                surface = self.distribution.from_volatility(
-                    current_price,
-                    volatility,
-                    prob_up
-                )
+                CONFIDENCE_SCORE.set(float(decision["confidence"]))
 
-            ####################################################
-            # DECISION
-            ####################################################
+                response = {
+                    "ticker": ticker,
+                    "signal_today": decision["signal"],
+                    "confidence": decision["confidence"],
+                    "probability_up": prob_up,
+                    "expected_value": decision.get("expected_value"),
+                    "risk_score": decision.get("risk_score"),
+                    "allocation": decision["allocation"],
+                    "position_pct": decision["position_pct"]
+                }
 
-            decision = self.decision_engine.generate(
-                ticker=ticker,
-                current_price=current_price,
-                forecast_up=surface["p90"],
-                forecast_down=surface["p10"],
-                prob_up=prob_up,
-                volatility=volatility,
-                regime=None
-            )
+                self.cache.set(cache_key, response, ttl=self.CACHE_TTL)
 
-            SIGNAL_DISTRIBUTION.labels(
-                signal=decision["signal"]
-            ).inc()
+                self.breaker.record_success()
 
-            CONFIDENCE_SCORE.set(float(decision["confidence"]))
+                return response
 
-            response = {
-                "ticker": ticker,
-                "signal_today": decision["signal"],
-                "confidence": decision["confidence"],
-                "probability_up": prob_up,
-                "expected_value": decision.get("expected_value"),
-                "allocation": decision["allocation"],
-                "position_pct": decision["position_pct"]
-            }
-
-            self.cache.set(cache_key, response, ttl=self.CACHE_TTL)
-
-            self.breaker.record_success()
-
-            return response
+            finally:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
 
         except Exception as e:
 
