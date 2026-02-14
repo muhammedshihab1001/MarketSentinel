@@ -30,6 +30,7 @@ MIN_UNIVERSE = 5
 VOL_FLOOR = 1e-4
 VAR_FLOOR = 1e-8
 MAX_MISSING_RATIO = 0.01
+MIN_MODEL_BYTES = 50_000
 
 SEED = 42
 
@@ -77,6 +78,9 @@ def save_model_atomic(model: SarimaxModel, path: str):
     tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
 
     joblib.dump(model, tmp_path)
+
+    if os.path.getsize(tmp_path) < MIN_MODEL_BYTES:
+        raise RuntimeError("Model artifact suspiciously small.")
 
     os.replace(tmp_path, path)
     _fsync_dir(directory)
@@ -128,10 +132,7 @@ def clean_price_frame(df: pd.DataFrame):
 
     df["date"] = pd.to_datetime(df["date"], utc=True)
 
-    df["close"] = pd.to_numeric(
-        df["close"],
-        errors="coerce"
-    )
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
 
     if df["close"].isna().mean() > MAX_MISSING_RATIO:
         return None
@@ -162,14 +163,14 @@ def load_training_data(
 ) -> Tuple[Dict[str, pd.DataFrame], list]:
 
     fetcher = StockPriceFetcher()
-    universe = MarketUniverse.get_universe()
+    universe = sorted(MarketUniverse.get_universe())
 
     logger.info("SARIMAX universe size=%s", len(universe))
 
     datasets = {}
     surviving = []
 
-    for ticker in sorted(universe):
+    for ticker in universe:
 
         try:
 
@@ -185,7 +186,6 @@ def load_training_data(
                 continue
 
             log_returns = np.log(df["close"]).diff()
-
             assert_stationary(log_returns)
 
             datasets[ticker] = df
@@ -258,10 +258,7 @@ def train_champion(start_date, end_date):
                 score
             )
 
-            if (
-                score > best_score
-                or (score == best_score and ticker < best_ticker)
-            ):
+            if best_ticker is None or score > best_score:
                 best_model = model
                 best_score = score
                 best_ticker = ticker
@@ -273,17 +270,11 @@ def train_champion(start_date, end_date):
     if best_model is None:
         raise RuntimeError("All SARIMAX models rejected.")
 
-    ####################################################
-    # DATASET HASH
-    ####################################################
-
     champion_df = datasets[best_ticker]
 
     dataset_hash = MetadataManager.fingerprint_dataset(
-        champion_df
+        champion_df[["date", "close"]]
     )
-
-    dataset_rows = len(champion_df)
 
     metadata = MetadataManager.create_metadata(
         model_name="sarimax_trend",
@@ -297,7 +288,7 @@ def train_champion(start_date, end_date):
         training_start=start_date,
         training_end=end_date,
         dataset_hash=dataset_hash,
-        dataset_rows=dataset_rows,
+        dataset_rows=len(champion_df),
         metadata_type="timeseries_manifest_v1",
         extra_fields={
             "model_type": "SARIMAX",
