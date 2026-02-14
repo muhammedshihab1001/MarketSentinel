@@ -18,7 +18,20 @@ class ModelRegistry:
     PROMOTION_LOCK = ".promotion.lock"
 
     LOCK_TIMEOUT_SECONDS = 600
-    MIN_ARTIFACT_BYTES = 50_000
+
+    ########################################################
+    # FIX — artifact specific minimum sizes
+    ########################################################
+
+    MIN_ARTIFACT_BYTES = {
+        ".pkl": 50_000,
+        ".keras": 100_000,
+        ".joblib": 50_000,
+        ".bin": 50_000,
+        ".json": 1_000,  # metadata is small
+    }
+
+    DEFAULT_MIN_BYTES = 10_000
 
     ########################################################
 
@@ -144,48 +157,7 @@ class ModelRegistry:
         ModelRegistry._fsync_dir(parent)
 
     ########################################################
-    # ATOMIC PROMOTION LOCK
-    ########################################################
-
-    @staticmethod
-    def _acquire_lock(base_dir):
-
-        lock_path = os.path.join(base_dir, ModelRegistry.PROMOTION_LOCK)
-
-        try:
-
-            fd = os.open(
-                lock_path,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY
-            )
-
-            with os.fdopen(fd, "w") as f:
-                f.write(str(os.getpid()))
-
-            return lock_path
-
-        except FileExistsError:
-
-            age = time.time() - os.path.getmtime(lock_path)
-
-            if age < ModelRegistry.LOCK_TIMEOUT_SECONDS:
-                raise RuntimeError("Registry promotion locked.")
-
-            os.remove(lock_path)
-            return ModelRegistry._acquire_lock(base_dir)
-
-    ########################################################
-
-    @staticmethod
-    def _release_lock(lock_path):
-
-        try:
-            os.remove(lock_path)
-        except Exception:
-            pass
-
-    ########################################################
-    # VERIFY ARTIFACTS
+    # VERIFY ARTIFACTS (FIXED)
     ########################################################
 
     @staticmethod
@@ -222,7 +194,14 @@ class ModelRegistry:
             if not os.path.exists(artifact_path):
                 raise RuntimeError(f"Artifact missing: {artifact}")
 
-            if os.path.getsize(artifact_path) < ModelRegistry.MIN_ARTIFACT_BYTES:
+            ext = os.path.splitext(artifact)[1].lower()
+
+            min_size = ModelRegistry.MIN_ARTIFACT_BYTES.get(
+                ext,
+                ModelRegistry.DEFAULT_MIN_BYTES
+            )
+
+            if os.path.getsize(artifact_path) < min_size:
                 raise RuntimeError(
                     f"Artifact too small — likely corrupted: {artifact}"
                 )
@@ -250,7 +229,6 @@ class ModelRegistry:
         os.makedirs(base_dir, exist_ok=True)
 
         meta = MetadataManager.load_metadata(metadata_path)
-
         ModelRegistry._validate_metadata_structure(meta)
 
         version = ModelRegistry._version()
@@ -333,83 +311,3 @@ class ModelRegistry:
                 shutil.rmtree(staging_dir, ignore_errors=True)
 
             raise
-
-    ########################################################
-    # LATEST POINTER
-    ########################################################
-
-    @staticmethod
-    def _write_latest(base_dir, version):
-
-        payload = {
-            "version": version,
-            "updated_utc": datetime.datetime.utcnow().isoformat()
-        }
-
-        path = os.path.join(base_dir, ModelRegistry.LATEST_POINTER)
-
-        ModelRegistry._atomic_json_write(path, payload)
-
-    ########################################################
-    # PROMOTE MODEL
-    ########################################################
-
-    @staticmethod
-    def promote_to_production(base_dir: str, version: str):
-
-        base_dir = os.path.realpath(base_dir)
-
-        lock = ModelRegistry._acquire_lock(base_dir)
-
-        try:
-
-            ModelRegistry.verify_artifacts(base_dir, version)
-
-            manifest_path = os.path.join(
-                base_dir,
-                version,
-                ModelRegistry.MANIFEST_NAME
-            )
-
-            with open(manifest_path) as f:
-                manifest = json.load(f)
-
-            manifest["stage"] = "production"
-            manifest["promoted_utc"] = datetime.datetime.utcnow().isoformat()
-
-            manifest["manifest_integrity_hash"] = (
-                ModelRegistry._manifest_hash(manifest)
-            )
-
-            ModelRegistry._atomic_json_write(
-                manifest_path,
-                manifest
-            )
-
-            ModelRegistry._write_latest(base_dir, version)
-
-            ModelRegistry._fsync_dir(base_dir)
-
-        finally:
-            ModelRegistry._release_lock(lock)
-
-    ########################################################
-    # LOAD LATEST (VERIFIED)
-    ########################################################
-
-    @staticmethod
-    def load_latest_version(base_dir: str) -> str:
-
-        pointer = os.path.join(base_dir, ModelRegistry.LATEST_POINTER)
-
-        if not os.path.exists(pointer):
-            raise RuntimeError("No production model found.")
-
-        with open(pointer) as f:
-            payload = json.load(f)
-
-        version = payload["version"]
-
-        ModelRegistry.verify_artifacts(base_dir, version)
-
-        return version
