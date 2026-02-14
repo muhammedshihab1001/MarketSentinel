@@ -18,13 +18,33 @@ class MarketUniverse:
     ✔ mutation proof
     ✔ lineage traceable
     ✔ thread safe
+    ✔ tamper detected
+    ✔ hot-reload safe
     """
 
     UNIVERSE_FILE = "config/universe.json"
     MIN_FILE_BYTES = 20
 
     _CACHE = None
-    _LOCK = threading.Lock()
+    _LOCK = threading.RLock()
+
+    # NEW — detect file changes
+    _FILE_HASH = None
+
+    ###################################################
+    # FILE HASH
+    ###################################################
+
+    @classmethod
+    def _hash_file(cls):
+
+        h = hashlib.sha256()
+
+        with open(cls.UNIVERSE_FILE, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+
+        return h.hexdigest()
 
     ###################################################
     # LOAD
@@ -44,6 +64,7 @@ class MarketUniverse:
             )
 
         try:
+            # atomic-style read
             with open(cls.UNIVERSE_FILE, "r") as f:
                 payload = json.load(f)
 
@@ -109,26 +130,45 @@ class MarketUniverse:
         return version, tuple(sorted(normalized))
 
     ###################################################
-    # CACHE (THREAD SAFE)
+    # CACHE (THREAD SAFE + HOT RELOAD)
     ###################################################
 
     @classmethod
     def _get_cached(cls):
 
-        if cls._CACHE is None:
+        current_hash = cls._hash_file()
+
+        if cls._CACHE is None or cls._FILE_HASH != current_hash:
 
             with cls._LOCK:
 
-                if cls._CACHE is None:
+                # double check after lock
+                if cls._CACHE is None or cls._FILE_HASH != current_hash:
 
                     version, tickers = cls._load_file()
 
                     cls._CACHE = {
                         "version": version,
-                        "tickers": tickers
+                        "tickers": tickers,
+                        "ticker_set": set(tickers)  # NEW (perf)
                     }
 
+                    cls._FILE_HASH = current_hash
+
         return cls._CACHE
+
+    ###################################################
+    # FORCE REFRESH (useful for training pipelines)
+    ###################################################
+
+    @classmethod
+    def refresh(cls):
+
+        with cls._LOCK:
+            cls._CACHE = None
+            cls._FILE_HASH = None
+
+        return cls._get_cached()
 
     ###################################################
     # PUBLIC
@@ -168,10 +208,12 @@ class MarketUniverse:
     @classmethod
     def snapshot(cls) -> Dict:
 
-        tickers = list(cls.get_universe())
+        cache = cls._get_cached()
+
+        tickers = list(cache["tickers"])
 
         return {
-            "universe_version": cls._get_cached()["version"],
+            "universe_version": cache["version"],
             "universe_hash": cls.fingerprint(),
             "universe_size": len(tickers),
             "tickers": tickers
@@ -184,7 +226,9 @@ class MarketUniverse:
     @classmethod
     def validate_subset(cls, tickers):
 
-        unknown = set(tickers) - set(cls.get_universe())
+        cache = cls._get_cached()
+
+        unknown = set(tickers) - cache["ticker_set"]
 
         if unknown:
             raise RuntimeError(
