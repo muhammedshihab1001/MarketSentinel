@@ -6,6 +6,7 @@ import os
 import random
 import time
 import zlib
+import numpy as np
 
 from core.schema.feature_schema import get_schema_signature
 from app.inference.model_loader import ModelLoader
@@ -25,7 +26,9 @@ class RedisCache:
     MAX_TTL = 900
     MIN_TTL = 30
 
-    CACHE_NAMESPACE_VERSION = "v2"
+    MAX_PAYLOAD_BYTES = 256_000   # 🔥 HARD LIMIT (256KB)
+
+    CACHE_NAMESPACE_VERSION = "v3"
 
     ###################################################
 
@@ -57,8 +60,10 @@ class RedisCache:
                     port=port,
                     socket_timeout=2,
                     socket_connect_timeout=2,
+                    socket_keepalive=True,      # 🔥 critical
                     health_check_interval=30,
-                    max_connections=20,
+                    max_connections=32,
+                    retry_on_timeout=True,
                     decode_responses=False
                 )
 
@@ -81,7 +86,12 @@ class RedisCache:
             self.enabled = False
 
             jitter = random.randint(0, 5)
-            self._disabled_until = time.time() + self._retry_delay + jitter
+
+            self._disabled_until = (
+                time.time() +
+                self._retry_delay +
+                jitter
+            )
 
             self._retry_delay = min(
                 self._retry_delay * 2,
@@ -107,17 +117,18 @@ class RedisCache:
         self._connect()
 
     ###################################################
-    # MODEL FINGERPRINT
+    # SAFE MODEL FINGERPRINT
     ###################################################
 
     def _model_fingerprint(self):
 
         try:
             loader = ModelLoader()
-            container = loader._xgb_container
 
-            if container:
-                return container.version
+            # SAFE ACCESSOR
+            version = loader.xgb_version
+            if version:
+                return version
 
         except Exception:
             pass
@@ -158,7 +169,7 @@ class RedisCache:
         )
 
     ###################################################
-    # PAYLOAD VALIDATION
+    # PAYLOAD VALIDATION (HARDENED)
     ###################################################
 
     def _validate_payload(self, value):
@@ -167,12 +178,23 @@ class RedisCache:
             raise RuntimeError("Cache payload must be dict.")
 
         if not value:
-            raise RuntimeError("Refusing to cache empty payload.")
+            raise RuntimeError("Refusing empty payload.")
 
         required = {"ticker", "signal_today", "confidence"}
 
         if not required.issubset(value.keys()):
-            raise RuntimeError("Cache payload missing required fields.")
+            raise RuntimeError("Cache payload missing fields.")
+
+        confidence = value.get("confidence")
+
+        if not isinstance(confidence, (int, float)):
+            raise RuntimeError("Invalid confidence type.")
+
+        if not np.isfinite(confidence):
+            raise RuntimeError("Non-finite confidence.")
+
+        if not (0 <= confidence <= 1.5):
+            raise RuntimeError("Confidence out of bounds.")
 
     ###################################################
     # GET
@@ -195,6 +217,12 @@ class RedisCache:
             try:
 
                 decompressed = zlib.decompress(data)
+
+                if len(decompressed) > self.MAX_PAYLOAD_BYTES:
+                    logger.warning("Oversized cache entry removed.")
+                    self.client.delete(key)
+                    return None
+
                 obj = json.loads(decompressed)
 
                 self._validate_payload(obj)
@@ -247,17 +275,20 @@ class RedisCache:
 
             serialized = self._canonical_json(value).encode()
 
+            if len(serialized) > self.MAX_PAYLOAD_BYTES:
+                raise RuntimeError("Payload exceeds safe cache size.")
+
             payload = zlib.compress(serialized)
 
             # round-trip validation
             test = json.loads(zlib.decompress(payload))
-
             self._validate_payload(test)
 
-            self.client.setex(
+            # 🔥 Modern atomic set
+            self.client.set(
                 key,
-                final_ttl,
-                payload
+                payload,
+                ex=final_ttl
             )
 
         except Exception:
