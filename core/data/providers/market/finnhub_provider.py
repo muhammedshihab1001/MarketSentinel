@@ -10,7 +10,7 @@ from urllib3.util.retry import Retry
 from core.data.providers.market.base import MarketDataProvider
 
 
-logger = logging.getLogger("marketsentinel.provider.finnhub")
+logger = logging.getLogger(__name__)
 
 
 class FinnhubProvider(MarketDataProvider):
@@ -23,7 +23,11 @@ class FinnhubProvider(MarketDataProvider):
 
     REQUIRED_PAYLOAD_KEYS = {"t", "o", "h", "l", "c", "v"}
 
-    ########################################################
+    INTERVAL_MAP = {
+        "1d": "D",
+        "1h": "60",
+        "5m": "5"
+    }
 
     def __init__(self):
 
@@ -34,8 +38,6 @@ class FinnhubProvider(MarketDataProvider):
 
         self.session = self._build_session()
 
-    ########################################################
-
     def _build_session(self):
 
         session = requests.Session()
@@ -44,13 +46,16 @@ class FinnhubProvider(MarketDataProvider):
             total=3,
             backoff_factor=0.6,
             status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"]
+            allowed_methods=["GET"],
+            raise_on_status=False,
+            respect_retry_after_header=True
         )
 
         adapter = HTTPAdapter(
             pool_connections=20,
             pool_maxsize=20,
-            max_retries=retry
+            max_retries=retry,
+            pool_block=True
         )
 
         session.mount("https://", adapter)
@@ -62,22 +67,26 @@ class FinnhubProvider(MarketDataProvider):
 
         return session
 
-    ########################################################
-
     @staticmethod
     def _to_unix(dt: str):
-        return int(pd.Timestamp(dt).timestamp())
+        ts = pd.Timestamp(dt)
 
-    ########################################################
-    # 🔥 HARD PAYLOAD VALIDATION
-    ########################################################
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+
+        return int(ts.timestamp())
 
     def _validate_payload(self, payload, ticker):
 
-        if payload.get("s") != "ok":
-            raise RuntimeError(
-                f"Finnhub returned no usable data for {ticker}"
-            )
+        status = payload.get("s")
+
+        if status == "no_data":
+            raise RuntimeError(f"No market data available for {ticker}")
+
+        if status != "ok":
+            raise RuntimeError(f"Finnhub error for {ticker} | status={status}")
 
         missing = self.REQUIRED_PAYLOAD_KEYS - payload.keys()
 
@@ -86,17 +95,17 @@ class FinnhubProvider(MarketDataProvider):
                 f"Finnhub payload schema drift. Missing={missing}"
             )
 
-    ########################################################
-    # INSTITUTIONAL NORMALIZATION
-    ########################################################
+        lengths = {len(payload[k]) for k in self.REQUIRED_PAYLOAD_KEYS}
+
+        if len(lengths) != 1:
+            raise RuntimeError("Finnhub payload arrays length mismatch.")
 
     def _normalize_schema(self, payload, ticker):
 
         self._validate_payload(payload, ticker)
 
         df = pd.DataFrame({
-            "date": pd.to_datetime(payload["t"], unit="s", utc=True)
-                    .tz_convert(None),
+            "date": pd.to_datetime(payload["t"], unit="s", utc=True),
             "open": payload["o"],
             "high": payload["h"],
             "low": payload["l"],
@@ -115,19 +124,14 @@ class FinnhubProvider(MarketDataProvider):
         if df.empty:
             raise RuntimeError("Finnhub returned empty normalized dataset.")
 
-        ####################################################
-        # PRICE SANITY
-        ####################################################
+        if (df[numeric_cols] <= 0).any().any():
+            raise RuntimeError("Non-positive price/volume detected.")
 
-        if (df["close"] <= 0).any():
-            raise RuntimeError("Invalid close prices from Finnhub.")
+        if (df["high"] < df[["open", "close"]].max(axis=1)).any():
+            raise RuntimeError("High price invariant violated.")
 
-        if (df["high"] < df["low"]).any():
-            raise RuntimeError("High < Low detected.")
-
-        ####################################################
-        # SORT + DEDUP
-        ####################################################
+        if (df["low"] > df[["open", "close"]].min(axis=1)).any():
+            raise RuntimeError("Low price invariant violated.")
 
         df = (
             df
@@ -136,30 +140,19 @@ class FinnhubProvider(MarketDataProvider):
             .reset_index(drop=True)
         )
 
-        ####################################################
-        # MIN HISTORY GUARD
-        ####################################################
-
         if len(df) < self.MIN_ROWS:
             raise RuntimeError("Finnhub returned insufficient history.")
-
-        ####################################################
-        # CRITICAL — TICKER INJECTION
-        ####################################################
 
         df["ticker"] = ticker
 
         return df
 
-    ########################################################
-
     def fetch(self, ticker, start_date, end_date, interval="1d"):
 
-        resolution = {
-            "1d": "D",
-            "1h": "60",
-            "5m": "5"
-        }.get(interval, "D")
+        if interval not in self.INTERVAL_MAP:
+            raise ValueError(f"Unsupported interval for Finnhub: {interval}")
+
+        resolution = self.INTERVAL_MAP[interval]
 
         params = {
             "symbol": ticker,
