@@ -10,7 +10,6 @@ import os
 
 from core.data.providers.market.router import MarketProviderRouter
 
-
 logger = logging.getLogger("marketsentinel.market_data")
 
 
@@ -21,13 +20,13 @@ class MarketDataService:
     Guarantees:
     ✔ zero lookahead bias
     ✔ schema drift detection
-    ✔ concurrent safety
     ✔ corruption prevention
     ✔ ticker enforcement
     ✔ timezone normalization
     ✔ numeric safety
     ✔ dataset fingerprinting
     ✔ atomic persistence
+    ✔ provider contract validation
     """
 
     DATA_DIR = Path("data/lake")
@@ -45,6 +44,7 @@ class MarketDataService:
     MIN_HISTORY_ROWS = 120
     SAFE_LAG_DAYS = 2
     MAX_ROWS = 15000
+    MIN_FILE_BYTES = 5_000
 
     ########################################################
 
@@ -62,6 +62,8 @@ class MarketDataService:
 
     @staticmethod
     def _sanitize_ticker(ticker: str):
+
+        ticker = ticker.upper()
 
         if not re.fullmatch(r"[A-Z0-9._-]{1,12}", ticker):
             raise RuntimeError(f"Unsafe ticker: {ticker}")
@@ -87,7 +89,7 @@ class MarketDataService:
         return min(requested, safe_cutoff)
 
     ########################################################
-    # TIMEZONE NORMALIZATION (FIXED)
+    # DATE NORMALIZATION
     ########################################################
 
     @staticmethod
@@ -100,9 +102,28 @@ class MarketDataService:
                 df["date"],
                 utc=True,
                 errors="coerce"
-            )
-            .dt.tz_convert(None)
+            ).dt.tz_convert(None)
         )
+
+        return df
+
+    ########################################################
+    # PROVIDER COLUMN NORMALIZATION
+    ########################################################
+
+    @staticmethod
+    def _normalize_provider_columns(df: pd.DataFrame):
+
+        # handles Yahoo / Finnhub variations
+        rename_map = {
+            "Datetime": "date",
+            "Date": "date",
+            "timestamp": "date",
+            "adjclose": "close",
+            "Adj Close": "close",
+        }
+
+        df = df.rename(columns=rename_map)
 
         return df
 
@@ -114,7 +135,7 @@ class MarketDataService:
     def _dataset_hash(df: pd.DataFrame):
 
         payload = pd.util.hash_pandas_object(
-            df.sort_values(["ticker", "date"]),
+            df.sort_values("date"),
             index=True
         ).values.tobytes()
 
@@ -154,10 +175,15 @@ class MarketDataService:
     # HARD VALIDATOR
     ########################################################
 
-    def _validate_dataset(self, df: pd.DataFrame):
+    def _validate_dataset(self, df: pd.DataFrame, ticker: str):
 
         if df is None or df.empty:
             raise RuntimeError("Market data empty.")
+
+        df = self._normalize_provider_columns(df)
+
+        # FORCE ticker column
+        df["ticker"] = ticker
 
         missing = self.REQUIRED_COLUMNS - set(df.columns)
 
@@ -182,10 +208,10 @@ class MarketDataService:
         if (df["high"] < df["low"]).any():
             raise RuntimeError("High < Low detected.")
 
-        if df.duplicated(subset=["ticker", "date"]).any():
-            raise RuntimeError("Duplicate ticker-date detected.")
+        if df["date"].duplicated().any():
+            raise RuntimeError("Duplicate timestamps detected.")
 
-        df = df.sort_values(["ticker", "date"])
+        df = df.sort_values("date")
 
         if not df["date"].is_monotonic_increasing:
             raise RuntimeError("Non-monotonic timestamps detected.")
@@ -227,26 +253,52 @@ class MarketDataService:
                     interval
                 )
 
-                df["ticker"] = ticker
-
-                return self._validate_dataset(df)
+                return self._validate_dataset(df, ticker)
 
             except Exception as e:
 
                 last_error = e
 
                 logger.warning(
-                    "Fetch failed (%s) attempt %d/%d",
+                    "Fetch failed (%s) attempt %d/%d | %s",
                     ticker,
                     attempt + 1,
-                    retries
+                    retries,
+                    str(e)
                 )
 
-                time.sleep(1.5)
+                time.sleep(1.2)
 
         raise RuntimeError(
             f"Market fetch failed after retries: {ticker}"
         ) from last_error
+
+    ########################################################
+    # CACHE SAFE LOAD
+    ########################################################
+
+    def _load_cache(self, path):
+
+        if not path.exists():
+            return None
+
+        if path.stat().st_size < self.MIN_FILE_BYTES:
+            path.unlink(missing_ok=True)
+            return None
+
+        try:
+            df = pd.read_parquet(path)
+
+            if "__dataset_hash" not in df.columns:
+                path.unlink(missing_ok=True)
+                return None
+
+            return df
+
+        except Exception:
+            logger.warning("Corrupted cache — rebuilding.")
+            path.unlink(missing_ok=True)
+            return None
 
     ########################################################
     # PUBLIC ENTRY
@@ -271,14 +323,10 @@ class MarketDataService:
             interval
         )
 
-        if cache_path.exists():
+        cached = self._load_cache(cache_path)
 
-            try:
-                return pd.read_parquet(cache_path)
-
-            except Exception:
-                logger.warning("Corrupted cache — rebuilding.")
-                cache_path.unlink(missing_ok=True)
+        if cached is not None:
+            return cached.reset_index(drop=True)
 
         logger.info("Fetching dataset for %s", ticker)
 
