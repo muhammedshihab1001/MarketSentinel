@@ -6,7 +6,13 @@ from core.indicators.technical_indicators import TechnicalIndicators
 
 class RiskEngine:
     """
-    Institutional Portfolio Risk Engine — Hardened
+    Institutional Portfolio Risk Engine
+
+    PURPOSE:
+    Convert market state into deployable capital decisions.
+
+    This is NOT indicator stacking.
+    This is capital protection infrastructure.
     """
 
     VOL_LOOKBACK = 20
@@ -22,20 +28,23 @@ class RiskEngine:
     RSI_OVERSOLD = 30
 
     TAIL_RETURN = 0.06
+    TAIL_CLUSTER_THRESHOLD = 3
     TAIL_NORMALIZER = 5
 
     MIN_ROWS = 80
     EPSILON = 1e-8
 
-    ##############################################
+    ########################################################
+    # SAFE UTIL
+    ########################################################
 
     @staticmethod
     def _clip01(x):
-        return float(np.clip(x, 0, 1))
+        return float(np.clip(x, 0.0, 1.0))
 
-    ##############################################
+    ########################################################
     # STRICT VALIDATION
-    ##############################################
+    ########################################################
 
     @classmethod
     def _validate_df(cls, df):
@@ -46,9 +55,8 @@ class RiskEngine:
         if "close" not in df.columns:
             raise RuntimeError("RiskEngine requires 'close' column.")
 
-        if "date" in df.columns:
-            if df["date"].duplicated().any():
-                raise RuntimeError("Duplicate candles detected.")
+        if "date" in df.columns and df["date"].duplicated().any():
+            raise RuntimeError("Duplicate candles detected.")
 
         close = pd.to_numeric(df["close"], errors="raise")
 
@@ -61,7 +69,7 @@ class RiskEngine:
         if len(df) < cls.MIN_ROWS:
             raise RuntimeError("Insufficient data for risk computation.")
 
-        # 🔥 GAP CHECK
+        # GAP DETECTOR (prevents split / bad feed damage)
         log_returns = np.log(close).diff().dropna()
 
         if np.abs(log_returns).max() > cls.GAP_LIMIT:
@@ -69,9 +77,9 @@ class RiskEngine:
                 "Extreme price gap detected — refusing risk calc."
             )
 
-    ##############################################
-    # SAFE INDICATOR CALL
-    ##############################################
+    ########################################################
+    # SAFE INDICATOR
+    ########################################################
 
     @staticmethod
     def _safe_indicator(func, default=0.5):
@@ -92,9 +100,9 @@ class RiskEngine:
         except Exception:
             return default
 
-    ##############################################
-    # VOLATILITY (LOG RETURNS)
-    ##############################################
+    ########################################################
+    # VOLATILITY RISK
+    ########################################################
 
     @classmethod
     def volatility_risk(cls, df):
@@ -113,11 +121,13 @@ class RiskEngine:
 
         latest = max(latest, cls.VOL_FLOOR)
 
-        return cls._clip01(latest / cls.MAX_VOL)
+        normalized = latest / cls.MAX_VOL
 
-    ##############################################
-    # CRASH CLUSTER DETECTOR
-    ##############################################
+        return cls._clip01(normalized)
+
+    ########################################################
+    # TAIL RISK (Crash Clustering)
+    ########################################################
 
     @classmethod
     def tail_risk(cls, df):
@@ -127,19 +137,18 @@ class RiskEngine:
         if len(log_returns) < 30:
             return 0.3
 
-        extremes = np.sum(
-            np.abs(log_returns.tail(20)) > cls.TAIL_RETURN
-        )
+        recent = np.abs(log_returns.tail(20))
 
-        # crash clustering multiplier
-        if extremes >= 3:
+        extremes = np.sum(recent > cls.TAIL_RETURN)
+
+        if extremes >= cls.TAIL_CLUSTER_THRESHOLD:
             return 0.9
 
         return cls._clip01(extremes / cls.TAIL_NORMALIZER)
 
-    ##############################################
-    # RSI
-    ##############################################
+    ########################################################
+    # RSI RISK
+    ########################################################
 
     @classmethod
     def rsi_risk(cls, df, signal):
@@ -159,9 +168,9 @@ class RiskEngine:
 
         return 0.4
 
-    ##############################################
-    # TREND
-    ##############################################
+    ########################################################
+    # TREND RISK
+    ########################################################
 
     @classmethod
     def trend_risk(cls, df, signal):
@@ -177,9 +186,9 @@ class RiskEngine:
 
         return 0.25
 
-    ##############################################
-    # BOLLINGER
-    ##############################################
+    ########################################################
+    # BOLLINGER STRETCH
+    ########################################################
 
     @classmethod
     def bollinger_risk(cls, df, signal):
@@ -207,9 +216,9 @@ class RiskEngine:
         except Exception:
             return 0.5
 
-    ##############################################
+    ########################################################
     # REGIME DETECTOR
-    ##############################################
+    ########################################################
 
     @classmethod
     def regime_risk(cls, df):
@@ -238,9 +247,33 @@ class RiskEngine:
 
         return 0.25, "NORMAL"
 
-    ##############################################
+    ########################################################
+    # 🔥 CAPITAL THROTTLE (MOST IMPORTANT METHOD)
+    ########################################################
+
+    @staticmethod
+    def capital_multiplier(risk_score: float) -> float:
+        """
+        Converts risk into deployable capital.
+        """
+
+        if risk_score >= 0.90:
+            return 0.0   # HARD BLOCK
+
+        if risk_score >= 0.75:
+            return 0.10
+
+        if risk_score >= 0.60:
+            return 0.35
+
+        if risk_score >= 0.40:
+            return 0.65
+
+        return 1.0
+
+    ########################################################
     # FINAL COMPOSITE
-    ##############################################
+    ########################################################
 
     @classmethod
     def analyze(cls, df: pd.DataFrame, signal: str):
@@ -250,6 +283,7 @@ class RiskEngine:
         if signal == "HOLD":
             return {
                 "risk_score": 0.0,
+                "capital_multiplier": 0.0,
                 "risk_pct": "0%",
                 "regime": "IDLE",
                 "components": {}
@@ -282,8 +316,11 @@ class RiskEngine:
 
         risk = cls._clip01(max(risk, regime_score))
 
+        capital_mult = cls.capital_multiplier(risk)
+
         return {
             "risk_score": round(risk, 4),
+            "capital_multiplier": capital_mult,
             "risk_pct": f"{round(risk * 100, 2)}%",
             "regime": regime,
             "components": {
