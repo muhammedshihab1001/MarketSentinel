@@ -5,7 +5,7 @@ import numpy as np
 
 
 ###################################################
-# SAFE ENV
+# SAFE ENV LOADER (CONFIG POISONING DEFENSE)
 ###################################################
 
 def _env_float(key: str, default: float) -> float:
@@ -15,7 +15,7 @@ def _env_float(key: str, default: float) -> float:
         if not math.isfinite(v):
             return default
 
-        # CONFIG POISONING GUARD
+        # Prevent malicious / broken configs
         if abs(v) > 10:
             return default
 
@@ -26,7 +26,7 @@ def _env_float(key: str, default: float) -> float:
 
 
 ###################################################
-# CONFIG
+# RISK CONFIG
 ###################################################
 
 @dataclass(frozen=True)
@@ -53,16 +53,18 @@ class RiskConfig:
     def load():
 
         cfg = RiskConfig(
-            max_position_size=_env_float("MAX_POSITION_SIZE", 0.08),
+            max_position_size=_env_float("MAX_POSITION_SIZE", 0.07),
             min_position_size=_env_float("MIN_POSITION_SIZE", 0.01),
-            volatility_target=_env_float("VOL_TARGET", 0.02),
-            confidence_boost=_env_float("CONFIDENCE_BOOST", 1.35),
-            max_gross_exposure_pct=_env_float("MAX_GROSS_EXPOSURE", 0.40),
-            max_single_trade_dollars=_env_float("MAX_SINGLE_TRADE", 25_000),
 
-            fractional_kelly=_env_float("FRACTIONAL_KELLY", 0.25),
-            volatility_shock_level=_env_float("VOL_SHOCK_LEVEL", 0.08),
-            correlation_heat_cap=_env_float("HEAT_CAP", 0.22),
+            volatility_target=_env_float("VOL_TARGET", 0.02),
+            confidence_boost=_env_float("CONFIDENCE_BOOST", 1.25),
+
+            max_gross_exposure_pct=_env_float("MAX_GROSS_EXPOSURE", 0.35),
+            max_single_trade_dollars=_env_float("MAX_SINGLE_TRADE", 20_000),
+
+            fractional_kelly=_env_float("FRACTIONAL_KELLY", 0.20),
+            volatility_shock_level=_env_float("VOL_SHOCK_LEVEL", 0.07),
+            correlation_heat_cap=_env_float("HEAT_CAP", 0.20),
 
             max_drawdown_kill=_env_float("MAX_DRAWDOWN_KILL", 0.30),
         )
@@ -87,7 +89,7 @@ class RiskConfig:
 
 
 ###################################################
-# POSITION SIZER
+# POSITION SIZER (INSTITUTIONAL)
 ###################################################
 
 class PositionSizer:
@@ -95,18 +97,25 @@ class PositionSizer:
     ABSOLUTE_MAX_POSITION = 0.15
     MIN_DEPLOYABLE_CAPITAL = 10_000
 
-    VOL_FLOOR = 0.006
+    VOL_FLOOR = 0.007
     VOL_CEILING = 0.12
-    EFFECTIVE_VOL_FLOOR = 0.01
+    EFFECTIVE_VOL_FLOOR = 0.012
 
-    MAX_VOL_SCALAR = 1.25
+    MAX_VOL_SCALAR = 1.20
     MIN_CONFIDENCE_FLOOR = 0.25
 
-    MAX_KELLY_FRACTION = 0.08   # HARD ceiling
+    MAX_KELLY_FRACTION = 0.06
+
+    PORTFOLIO_VOL_SOFT_CAP = 0.035
+    PORTFOLIO_VOL_HARD_CAP = 0.06
+
+    ###################################################
 
     def __init__(self, config: RiskConfig | None = None):
         self.config = config or RiskConfig.load()
 
+    ###################################################
+    # SAFE FLOAT
     ###################################################
 
     @staticmethod
@@ -123,26 +132,54 @@ class PositionSizer:
         return v
 
     ###################################################
-    # DRAW DOWN SCALAR
+    # CONVEX DRAWDOWN SCALING
     ###################################################
 
-    def _drawdown_state(self):
+    def _drawdown_scalar(self, drawdown):
 
-        raw = os.getenv("PORTFOLIO_DRAWDOWN_PCT", "0")
+        if drawdown < 0.05:
+            return 1.0
+
+        if drawdown < 0.10:
+            return 0.85
+
+        if drawdown < 0.15:
+            return 0.70
+
+        if drawdown < 0.20:
+            return 0.50
+
+        if drawdown < self.config.max_drawdown_kill:
+            return 0.30
+
+        return 0.0
+
+    ###################################################
+    # PORTFOLIO VOL THROTTLE
+    ###################################################
+
+    def _portfolio_vol_scalar(self):
+
+        raw = os.getenv("PORTFOLIO_VOLATILITY", "0.02")
 
         try:
-            drawdown = float(raw)
+            vol = float(raw)
         except Exception:
-            return 0.0
+            return 1.0
 
-        if drawdown > 1:
-            drawdown /= 100.0
+        if vol <= self.PORTFOLIO_VOL_SOFT_CAP:
+            return 1.0
 
-        # HARD CLAMP
-        return min(max(drawdown, 0.0), 0.95)
+        if vol >= self.PORTFOLIO_VOL_HARD_CAP:
+            return 0.25
+
+        return max(
+            0.25,
+            self.PORTFOLIO_VOL_SOFT_CAP / vol
+        )
 
     ###################################################
-    # VOL SHOCK
+    # VOL SHOCK GUARD
     ###################################################
 
     def _volatility_shock_scalar(self, volatility):
@@ -155,7 +192,7 @@ class PositionSizer:
         return max(0.25, ratio)
 
     ###################################################
-    # TRUE FRACTIONAL KELLY
+    # STABILIZED KELLY
     ###################################################
 
     def _kelly_cap(self, confidence, volatility, portfolio_value):
@@ -165,13 +202,17 @@ class PositionSizer:
         if edge <= 0:
             return 0
 
-        variance = max(volatility ** 2, 1e-4)
+        effective_vol = max(volatility, self.EFFECTIVE_VOL_FLOOR)
+
+        variance = effective_vol ** 2
 
         kelly_fraction = edge / variance
         kelly_fraction *= self.config.fractional_kelly
 
-        # HARD LIMIT
-        kelly_fraction = min(kelly_fraction, self.MAX_KELLY_FRACTION)
+        kelly_fraction = min(
+            kelly_fraction,
+            self.MAX_KELLY_FRACTION
+        )
 
         return portfolio_value * kelly_fraction
 
@@ -198,13 +239,26 @@ class PositionSizer:
             return 0.0
 
         ###################################################
-        # HARD KILL SWITCH
+        # DRAWDOWN CONTROL
         ###################################################
 
-        drawdown = self._drawdown_state()
+        drawdown = float(os.getenv("PORTFOLIO_DRAWDOWN_PCT", "0"))
 
-        if drawdown >= self.config.max_drawdown_kill:
+        if drawdown > 1:
+            drawdown /= 100
+
+        drawdown = min(max(drawdown, 0), 0.95)
+
+        dd_scalar = self._drawdown_scalar(drawdown)
+
+        if dd_scalar == 0:
             return 0.0
+
+        ###################################################
+        # PORTFOLIO VOL CONTROL
+        ###################################################
+
+        port_vol_scalar = self._portfolio_vol_scalar()
 
         ###################################################
         # INPUT SANITY
@@ -215,7 +269,6 @@ class PositionSizer:
             self.MIN_CONFIDENCE_FLOOR
         )
 
-        # Nonlinear confidence clamp
         confidence = min(confidence, 0.92)
 
         volatility = self._safe(
@@ -256,7 +309,7 @@ class PositionSizer:
         # SCALARS
         ###################################################
 
-        confidence_scalar = confidence ** 1.35
+        confidence_scalar = confidence ** 1.3
 
         vol_scalar = math.sqrt(
             self.config.volatility_target / effective_vol
@@ -275,7 +328,9 @@ class PositionSizer:
             self.config.max_position_size *
             confidence_scalar *
             vol_scalar *
-            shock_scalar
+            shock_scalar *
+            dd_scalar *
+            port_vol_scalar
         )
 
         ###################################################
