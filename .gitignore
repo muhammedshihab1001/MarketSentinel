@@ -15,39 +15,46 @@ ENV/
 
 
 ########################################################
-# SECRETS — NEVER COMMIT
+# ENV — NEVER COMMIT SECRETS
 ########################################################
 
-.env
-.env.*
+.env*
 !.env.example
 
-*.pem
-*.key
-*.crt
-*.p12
-secrets/
-credentials/
-
 
 ########################################################
-# NOTEBOOKS
+# JUPYTER
 ########################################################
 
 .ipynb_checkpoints/
 
 
 ########################################################
-# DATA — NEVER VERSION MARKET DATA
+# DATA — ONLY BLOCK REAL DATA
 ########################################################
 
-data/
-datasets/
-*.csv
-*.parquet
-*.feather
-*.hdf5
-*.db
+data/raw/
+data/processed/
+data/cache/
+data/features/
+data/news_cache/
+data/sentiment_cache/
+
+# block datasets anywhere
+**/*.csv
+**/*.parquet
+**/*.feather
+**/*.hdf5
+
+
+########################################################
+# 🚨 DO NOT BLOCK SOURCE CODE
+########################################################
+
+# NEVER ignore core/
+# NEVER ignore app/
+# NEVER ignore training/
+# NEVER ignore models/
 
 
 ########################################################
@@ -60,79 +67,57 @@ datasets/
 *.pt
 *.onnx
 *.keras
-*.bin
 
 
 ########################################################
-# ARTIFACT GOVERNANCE (VERY IMPORTANT)
+# ARTIFACT GOVERNANCE
 ########################################################
 
-# Ignore heavy artifacts
-artifacts/**
-
-# BUT allow registry metadata
-!artifacts/**/
-!artifacts/**/*.json
-!artifacts/**/*.lock
-
-# Explicitly block model weights again
+artifacts/**/model*
 artifacts/**/*.pkl
 artifacts/**/*.joblib
 artifacts/**/*.keras
-artifacts/**/*.onnx
 artifacts/**/*.pt
+artifacts/**/*.onnx
 
-# Allow governance files only
+artifacts/feature_store/
+artifacts/training_runs/
+
 !artifacts/**/manifest.json
-!artifacts/**/metadata.json
-!artifacts/**/latest.json
-!artifacts/**/.promotion.lock
+!artifacts/latest.json
 
-# Keep folder structure
 !artifacts/.keep
 !artifacts/**/.keep
 
 
 ########################################################
-# FEATURE STORE / TRAINING RUNS
-########################################################
-
-artifacts/feature_store/**
-artifacts/training_runs/**
-artifacts/cache/**
-artifacts/tmp/**
-
-
-########################################################
-# HUGGINGFACE / TRANSFORMERS
+# CACHE / HF
 ########################################################
 
 .cache/
 .huggingface/
-hf_cache/
+artifacts/huggingface/
 
 
 ########################################################
-# LOGGING
+# LOGS
 ########################################################
 
-logs/
 *.log
+logs/
 
 
 ########################################################
-# TORCH / TENSORFLOW / EXPERIMENTS
+# TORCH / TF
 ########################################################
 
 runs/
 wandb/
-mlruns/
 lightning_logs/
-tensorboard/
 
 
 ########################################################
-# TESTING
+# TEST
 ########################################################
 
 .pytest_cache/
@@ -141,7 +126,7 @@ htmlcov/
 
 
 ########################################################
-# OS / EDITORS
+# OS / IDE
 ########################################################
 
 .DS_Store
@@ -151,7 +136,7 @@ Thumbs.db
 
 
 ########################################################
-# BUILD / PACKAGING
+# BUILD
 ########################################################
 
 dist/
@@ -164,12 +149,10 @@ build/
 ########################################################
 
 docker-compose.override.yml
-*.tar
-*.tar.gz
 
 
 ########################################################
-# TEMP FILES
+# TEMP
 ########################################################
 
 *.tmp
@@ -178,7 +161,7 @@ docker-compose.override.yml
 
 
 ########################################################
-# PROJECT FILES
+# PROJECT EXPORTS
 ########################################################
 
 project_structure.txt
