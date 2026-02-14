@@ -20,6 +20,8 @@ class FinnhubProvider(MarketDataProvider):
     REQUEST_TIMEOUT = (4, 15)
 
     MIN_ROWS = 120
+    MAX_ROWS = 20_000
+    FUTURE_TOLERANCE_SECONDS = 5
 
     REQUIRED_PAYLOAD_KEYS = {"t", "o", "h", "l", "c", "v"}
 
@@ -37,6 +39,8 @@ class FinnhubProvider(MarketDataProvider):
             raise RuntimeError("FINNHUB_API_KEY missing.")
 
         self.session = self._build_session()
+
+    ########################################################
 
     def _build_session(self):
 
@@ -67,9 +71,15 @@ class FinnhubProvider(MarketDataProvider):
 
         return session
 
+    ########################################################
+
     @staticmethod
     def _to_unix(dt: str):
-        ts = pd.Timestamp(dt)
+
+        try:
+            ts = pd.Timestamp(dt)
+        except Exception:
+            raise RuntimeError(f"Invalid datetime supplied: {dt}")
 
         if ts.tzinfo is None:
             ts = ts.tz_localize("UTC")
@@ -77,6 +87,23 @@ class FinnhubProvider(MarketDataProvider):
             ts = ts.tz_convert("UTC")
 
         return int(ts.timestamp())
+
+    ########################################################
+
+    def _validate_response(self, response):
+
+        if response is None:
+            raise RuntimeError("Finnhub returned no response.")
+
+        if not response.content:
+            raise RuntimeError("Finnhub returned empty body.")
+
+        try:
+            return response.json()
+        except Exception:
+            raise RuntimeError("Finnhub returned non-JSON response.")
+
+    ########################################################
 
     def _validate_payload(self, payload, ticker):
 
@@ -100,7 +127,30 @@ class FinnhubProvider(MarketDataProvider):
         if len(lengths) != 1:
             raise RuntimeError("Finnhub payload arrays length mismatch.")
 
-    def _normalize_schema(self, payload, ticker):
+    ########################################################
+
+    def _range_guard(self, df, start_date, end_date):
+
+        start_ts = pd.Timestamp(start_date, tz="UTC")
+        end_ts = pd.Timestamp(end_date, tz="UTC")
+
+        max_allowed = end_ts + pd.Timedelta(
+            seconds=self.FUTURE_TOLERANCE_SECONDS
+        )
+
+        if df["date"].max() > max_allowed:
+            raise RuntimeError(
+                "Provider returned future candle — leakage risk."
+            )
+
+        if df["date"].min() < start_ts - pd.Timedelta(days=7):
+            logger.warning(
+                "Provider returned earlier-than-requested data."
+            )
+
+    ########################################################
+
+    def _normalize_schema(self, payload, ticker, start_date, end_date):
 
         self._validate_payload(payload, ticker)
 
@@ -119,13 +169,16 @@ class FinnhubProvider(MarketDataProvider):
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df = df.replace([np.inf, -np.inf], np.nan)
-        df = df.dropna(subset=["date"] + numeric_cols)
+        df = df.dropna(subset=["date", "open", "high", "low", "close"])
 
         if df.empty:
             raise RuntimeError("Finnhub returned empty normalized dataset.")
 
-        if (df[numeric_cols] <= 0).any().any():
-            raise RuntimeError("Non-positive price/volume detected.")
+        # price-only validation
+        price_cols = ["open", "high", "low", "close"]
+
+        if (df[price_cols] <= 0).any().any():
+            raise RuntimeError("Non-positive price detected.")
 
         if (df["high"] < df[["open", "close"]].max(axis=1)).any():
             raise RuntimeError("High price invariant violated.")
@@ -137,8 +190,11 @@ class FinnhubProvider(MarketDataProvider):
             df
             .drop_duplicates("date")
             .sort_values("date")
+            .tail(self.MAX_ROWS)
             .reset_index(drop=True)
         )
+
+        self._range_guard(df, start_date, end_date)
 
         if len(df) < self.MIN_ROWS:
             raise RuntimeError("Finnhub returned insufficient history.")
@@ -146,6 +202,8 @@ class FinnhubProvider(MarketDataProvider):
         df["ticker"] = ticker
 
         return df
+
+    ########################################################
 
     def fetch(self, ticker, start_date, end_date, interval="1d"):
 
@@ -170,9 +228,14 @@ class FinnhubProvider(MarketDataProvider):
 
         response.raise_for_status()
 
-        payload = response.json()
+        payload = self._validate_response(response)
 
-        df = self._normalize_schema(payload, ticker)
+        df = self._normalize_schema(
+            payload,
+            ticker,
+            start_date,
+            end_date
+        )
 
         logger.debug(
             "Finnhub served market data | ticker=%s rows=%s",
