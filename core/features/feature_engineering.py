@@ -15,7 +15,6 @@ logger = logging.getLogger("marketsentinel.features")
 class FeatureEngineer:
 
     MIN_ROWS_REQUIRED = 250
-    ABS_FEATURE_LIMIT = 1e5
     VOL_FLOOR = 1e-4
     SENTIMENT_STD_FLOOR = 0.02
     RETURN_CLAMP = (-0.5, 0.5)
@@ -179,7 +178,7 @@ class FeatureEngineer:
         return neutral
 
     ###################################################
-    # MERGE (INSTITUTIONAL SAFE)
+    # MERGE
     ###################################################
 
     @classmethod
@@ -200,7 +199,6 @@ class FeatureEngineer:
         sentiment = sentiment_df.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment)
 
-        # lookahead firewall
         sentiment["date"] += pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
@@ -212,24 +210,7 @@ class FeatureEngineer:
             allow_exact_matches=False
         )
 
-        #################################################
-        # HARD TICKER REATTACH
-        #################################################
-
-        if "ticker" not in merged.columns:
-
-            if ticker is None:
-                raise RuntimeError(
-                    "Ticker lost during merge — pipeline unsafe."
-                )
-
-            merged["ticker"] = ticker
-
         merged["ticker"] = merged["ticker"].astype(str)
-
-        #################################################
-        # Pandas 3 SAFE
-        #################################################
 
         merged["avg_sentiment"] = merged["avg_sentiment"].fillna(0.0)
         merged["news_count"] = merged["news_count"].fillna(0.0)
@@ -245,7 +226,7 @@ class FeatureEngineer:
         return merged
 
     ###################################################
-    # TARGET — 🔥 ADAPTIVE (CRITICAL FIX)
+    # 🔥 QUANTILE TARGET (MAJOR FIX)
     ###################################################
 
     @classmethod
@@ -260,25 +241,19 @@ class FeatureEngineer:
 
         risk_adj = (forward / safe_vol).clip(-5, 5)
 
-        #################################################
-        # ADAPTIVE DEADZONE
-        #################################################
-
-        dynamic_zone = np.nanpercentile(
-            np.abs(risk_adj.dropna()),
-            55
-        )
-
-        DEAD_ZONE = max(dynamic_zone, 0.015)
+        # 🚨 QUANTILE LABELING
+        upper = np.nanpercentile(risk_adj.dropna(), 65)
+        lower = np.nanpercentile(risk_adj.dropna(), 35)
 
         logger.info(
-            "Adaptive deadzone selected → %.4f",
-            DEAD_ZONE
+            "Quantile thresholds → upper=%.4f lower=%.4f",
+            upper,
+            lower
         )
 
         df["target"] = np.where(
-            risk_adj > DEAD_ZONE, 1,
-            np.where(risk_adj < -DEAD_ZONE, 0, np.nan)
+            risk_adj >= upper, 1,
+            np.where(risk_adj <= lower, 0, np.nan)
         )
 
         before = len(df)
@@ -292,9 +267,9 @@ class FeatureEngineer:
             survival * 100
         )
 
-        if survival < 0.25:
+        if survival < 0.40:
             raise RuntimeError(
-                f"Feature collapse — survival ratio too low ({survival:.2f})"
+                f"Feature collapse — survival too low ({survival:.2f})"
             )
 
         df["target"] = df["target"].astype("int8")
@@ -356,3 +331,4 @@ class FeatureEngineer:
         )
 
         return final.reset_index(drop=True)
+ 
