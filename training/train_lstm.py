@@ -130,7 +130,7 @@ def load_data(start_date, end_date):
 
 
 ############################################################
-# RETURN MODELING (CRITICAL UPGRADE)
+# RETURN MODELING
 ############################################################
 
 def compute_returns(df):
@@ -149,7 +149,7 @@ def compute_returns(df):
 
 
 ############################################################
-# SEQUENCE BUILDER — VOL NORMALIZED
+# SEQUENCE BUILDER
 ############################################################
 
 def build_sequences(df):
@@ -211,7 +211,7 @@ def apply_scalers(df, scalers):
 
 
 ############################################################
-# TIME SAFE VALIDATION — PER TICKER SPLIT
+# TIME SAFE VALIDATION
 ############################################################
 
 def time_series_validation(df):
@@ -259,10 +259,6 @@ def time_series_validation(df):
     if not np.isfinite(val_loss):
         raise RuntimeError("Training produced non-finite loss.")
 
-    ####################################################
-    # PREDICTION SANITY CHECK (VERY IMPORTANT)
-    ####################################################
-
     preds = model.predict(X_test[:500])
 
     if np.std(preds) < 1e-5:
@@ -272,7 +268,7 @@ def time_series_validation(df):
 
 
 ############################################################
-# MAIN — GOVERNED CLOCK
+# MAIN
 ############################################################
 
 def main(start_date=None, end_date=None):
@@ -292,10 +288,16 @@ def main(start_date=None, end_date=None):
         df[["ticker", "date", "return"]]
     )
 
+    dataset_rows = len(df)   # 🔥 CRITICAL FIX
+
     model, scalers, val_loss = time_series_validation(df)
 
     atomic_save_model(model, MODEL_PATH)
     atomic_joblib_dump(scalers, SCALER_PATH)
+
+    ####################################################
+    # DO NOT OVERRIDE training_universe
+    ####################################################
 
     metadata = MetadataManager.create_metadata(
         model_name="lstm_return_forecast",
@@ -304,12 +306,12 @@ def main(start_date=None, end_date=None):
         training_start=start_date,
         training_end=end_date,
         dataset_hash=dataset_hash,
+        dataset_rows=dataset_rows,   # 🔥 REQUIRED
         metadata_type="sequence_manifest_v1",
         extra_fields={
-            "training_universe": surviving,
-            "universe_hash": MetadataManager.hash_list(surviving),
             "lookback_window": LOOKBACK_WINDOW,
-            "target": "log_returns"
+            "target": "log_returns",
+            "surviving_tickers": surviving
         }
     )
 
