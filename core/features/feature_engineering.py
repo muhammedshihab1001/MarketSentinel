@@ -17,7 +17,10 @@ class FeatureEngineer:
     MIN_ROWS_REQUIRED = 250
     VOL_FLOOR = 1e-4
     SENTIMENT_STD_FLOOR = 0.02
+
     RETURN_CLAMP = (-0.5, 0.5)
+    MAX_DAILY_MOVE = 0.80   # 🔥 HARD GUARD
+
     MERGE_TOLERANCE = pd.Timedelta("1D")
     MIN_CLASS_RATIO = 0.30
 
@@ -27,6 +30,8 @@ class FeatureEngineer:
         "news_count",
         "sentiment_std"
     ]
+
+    ########################################################
 
     @staticmethod
     def _normalize_datetime(df):
@@ -40,6 +45,8 @@ class FeatureEngineer:
         )
 
         return df
+
+    ########################################################
 
     @staticmethod
     def _enforce_ticker(df, ticker=None):
@@ -62,6 +69,8 @@ class FeatureEngineer:
 
         return df
 
+    ########################################################
+
     @classmethod
     def _validate_price_frame(cls, df, ticker=None):
 
@@ -78,6 +87,9 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"])
 
+        if not df["date"].is_monotonic_increasing:
+            raise RuntimeError("Non-monotonic timestamps.")
+
         if df.duplicated(["ticker", "date"]).any():
             raise RuntimeError("Duplicate timestamps.")
 
@@ -89,10 +101,20 @@ class FeatureEngineer:
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices.")
 
+        # 🔥 HARD SPLIT / GLITCH GUARD
+        returns = df["close"].pct_change().abs()
+
+        if (returns > cls.MAX_DAILY_MOVE).any():
+            raise RuntimeError(
+                "Extreme price jump detected — split or provider corruption."
+            )
+
         if len(df) < cls.MIN_ROWS_REQUIRED:
             raise RuntimeError("Insufficient price history.")
 
         return df.reset_index(drop=True)
+
+    ########################################################
 
     @staticmethod
     def add_returns(df):
@@ -103,6 +125,8 @@ class FeatureEngineer:
 
         df["return"] = returns.clip(lo, hi)
         df["return_lag1"] = df["return"].shift(1)
+
+    ########################################################
 
     @staticmethod
     def add_volatility(df, window=5):
@@ -119,6 +143,8 @@ class FeatureEngineer:
             .fillna(FeatureEngineer.VOL_FLOOR)
         )
 
+    ########################################################
+
     @staticmethod
     def add_rsi(df, window=14):
 
@@ -126,6 +152,8 @@ class FeatureEngineer:
             df[["date", "close"]],
             window=window
         )
+
+    ########################################################
 
     @staticmethod
     def add_macd(df):
@@ -136,6 +164,8 @@ class FeatureEngineer:
 
         df["macd"] = macd.clip(-50, 50)
         df["macd_signal"] = signal.clip(-50, 50)
+
+    ########################################################
 
     @classmethod
     def _build_neutral_sentiment(cls, price_df):
@@ -152,6 +182,8 @@ class FeatureEngineer:
 
         return neutral
 
+    ########################################################
+
     @classmethod
     def merge_price_sentiment(
         cls,
@@ -162,26 +194,31 @@ class FeatureEngineer:
 
         price = cls._normalize_datetime(
             cls._enforce_ticker(price_df, ticker)
-        )
+        ).sort_values("date")
+
+        if not price["date"].is_monotonic_increasing:
+            raise RuntimeError("Price dates not monotonic before merge.")
 
         if sentiment_df is None or sentiment_df.empty:
             sentiment_df = cls._build_neutral_sentiment(price)
 
         sentiment = sentiment_df.loc[:, cls.SENTIMENT_COLUMNS]
-        sentiment = cls._normalize_datetime(sentiment)
+        sentiment = cls._normalize_datetime(sentiment).sort_values("date")
 
+        if not sentiment["date"].is_monotonic_increasing:
+            raise RuntimeError("Sentiment dates not monotonic.")
+
+        # shift → prevents same-day leakage
         sentiment["date"] += pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
-            price.sort_values("date"),
-            sentiment.sort_values("date"),
+            price,
+            sentiment,
             on="date",
             direction="backward",
             tolerance=cls.MERGE_TOLERANCE,
             allow_exact_matches=False
         )
-
-        merged["ticker"] = merged["ticker"].astype(str)
 
         merged["avg_sentiment"] = merged["avg_sentiment"].fillna(0.0)
         merged["news_count"] = merged["news_count"].fillna(0.0)
@@ -196,24 +233,35 @@ class FeatureEngineer:
 
         return merged
 
+    ########################################################
+    # TARGET — HARDENED
+    ########################################################
+
     @classmethod
     def create_training_dataset(cls, df):
 
         df = df.sort_values(["ticker", "date"]).copy()
 
         log_close = np.log(df["close"])
+
+        # forward return
         forward = log_close.shift(-1) - log_close
+
+        # 🔥 explicit leakage removal
+        df = df.iloc[:-1].copy()
+        forward = forward.iloc[:-1]
 
         safe_vol = df["volatility"].clip(lower=cls.VOL_FLOOR)
 
         risk_adj = (forward / safe_vol).clip(-5, 5)
 
-        rolling_upper = risk_adj.rolling(252, min_periods=126).quantile(0.65)
-        rolling_lower = risk_adj.rolling(252, min_periods=126).quantile(0.35)
+        # 🔥 stabilized quantiles
+        upper = risk_adj.expanding(min_periods=150).quantile(0.65)
+        lower = risk_adj.expanding(min_periods=150).quantile(0.35)
 
         df["target"] = np.where(
-            risk_adj >= rolling_upper, 1,
-            np.where(risk_adj <= rolling_lower, 0, np.nan)
+            risk_adj >= upper, 1,
+            np.where(risk_adj <= lower, 0, np.nan)
         )
 
         required = ["target"] + MODEL_FEATURES
@@ -247,6 +295,8 @@ class FeatureEngineer:
         df[float_cols] = df[float_cols].astype("float32")
 
         return df
+
+    ########################################################
 
     @classmethod
     def build_feature_pipeline(
