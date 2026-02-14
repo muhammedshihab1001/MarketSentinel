@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import logging
 import random
+import gc
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
@@ -170,9 +171,6 @@ def load_training_data(start_date, end_date):
         len(universe)
     )
 
-    if failures:
-        logger.warning("Ticker failures:\n%s", "\n".join(failures))
-
     if survival_ratio < MIN_SURVIVING_RATIO:
         raise RuntimeError(
             f"Universe collapse — survival ratio {survival_ratio:.2f}"
@@ -216,9 +214,9 @@ def main(start_date=None, end_date=None):
 
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    dataset_hash = MetadataManager.fingerprint_dataset(
-        df[["ticker", "date", "target", *MODEL_FEATURES]]
-    )
+    hash_df = df[["ticker", "date", "target", *MODEL_FEATURES]]
+
+    dataset_hash = MetadataManager.fingerprint_dataset(hash_df)
 
     ###################################################
     # DRIFT
@@ -228,7 +226,7 @@ def main(start_date=None, end_date=None):
 
     try:
         drift.create_baseline(
-            df.loc[:, MODEL_FEATURES],
+            hash_df,
             dataset_hash=dataset_hash,
             allow_overwrite=False
         )
@@ -251,7 +249,9 @@ def main(start_date=None, end_date=None):
         model = build_xgboost_model(
             y,
             random_state=SEED,
-            nthread=1
+            nthread=1,
+            predictor="cpu_predictor",
+            tree_method="hist"
         )
 
         model.fit(
@@ -281,6 +281,8 @@ def main(start_date=None, end_date=None):
 
     strategy_metrics = wf.run(df)
 
+    gc.collect()
+
     sharpe = strategy_metrics.get("avg_sharpe")
 
     if sharpe is None or not np.isfinite(sharpe):
@@ -299,7 +301,9 @@ def main(start_date=None, end_date=None):
     final_model = build_final_xgboost_model(
         df["target"],
         random_state=SEED,
-        nthread=1
+        nthread=1,
+        predictor="cpu_predictor",
+        tree_method="hist"
     )
 
     final_model.fit(
