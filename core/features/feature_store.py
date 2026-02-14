@@ -10,13 +10,14 @@ import pandas as pd
 import numpy as np
 
 from core.features.feature_engineering import FeatureEngineer
+from core.indicators.technical_indicators import TechnicalIndicators
 from core.schema.feature_schema import (
     validate_feature_schema,
     MODEL_FEATURES,
     get_schema_signature
 )
 
-logger = logging.getLogger("marketsentinel.feature_store")
+logger = logging.getLogger(__name__)
 
 
 class FeatureStore:
@@ -25,7 +26,7 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v11"   # 🔥 bumped after hardening
+    CACHE_VERSION = "v11"
     MAX_CACHE_FILES_PER_TICKER = 6
 
     MIN_ROWS_REQUIRED = 100
@@ -33,8 +34,6 @@ class FeatureStore:
 
     ABS_FEATURE_LIMIT = 1e5
     MIN_ROW_STABILITY_RATIO = 0.65
-
-    ##################################################
 
     def __init__(self):
 
@@ -46,25 +45,24 @@ class FeatureStore:
         self.engineer_hash = self._fingerprint_engineer()[:12]
         self.env_hash = self._environment_fingerprint()[:12]
 
-    ##################################################
-
     def _sanitize_ticker(self, ticker: str) -> str:
         return re.sub(r"[^A-Za-z0-9_]", "_", ticker)
 
-    ##################################################
+    def _module_hash(self, module) -> str:
+
+        path = sys.modules[module.__module__].__file__
+
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
 
     def _fingerprint_engineer(self) -> str:
 
-        module_path = sys.modules[
-            FeatureEngineer.__module__
-        ].__file__
+        engineer_hash = self._module_hash(FeatureEngineer)
+        indicators_hash = self._module_hash(TechnicalIndicators)
 
-        with open(module_path, "rb") as f:
-            payload = f.read()
+        payload = engineer_hash + indicators_hash
 
-        return hashlib.sha256(payload).hexdigest()
-
-    ##################################################
+        return hashlib.sha256(payload.encode()).hexdigest()
 
     def _environment_fingerprint(self) -> str:
 
@@ -76,10 +74,6 @@ class FeatureStore:
 
         return hashlib.sha256(payload.encode()).hexdigest()
 
-    ##################################################
-    # CANONICALIZE
-    ##################################################
-
     def _canonicalize_df(self, df: pd.DataFrame):
 
         df = df.copy()
@@ -87,17 +81,18 @@ class FeatureStore:
         if df.empty:
             raise RuntimeError("Cannot hash empty dataframe.")
 
-        df["date"] = pd.to_datetime(df["date"], utc=True)
+        df["date"] = (
+            pd.to_datetime(df["date"], utc=True)
+            .dt.tz_convert(None)
+        )
+
         df["ticker"] = df["ticker"].astype(str)
         df["close"] = pd.to_numeric(df["close"]).astype("float64")
 
         numeric_cols = df.select_dtypes(include=[np.number]).columns
-
         df[numeric_cols] = df[numeric_cols].astype("float64")
 
         return df.sort_values(["ticker", "date"]).reset_index(drop=True)
-
-    ##################################################
 
     def _dataset_hash(
         self,
@@ -133,8 +128,6 @@ class FeatureStore:
 
         return h.hexdigest()[:20]
 
-    ##################################################
-
     def _feature_path(
         self,
         ticker: str,
@@ -155,10 +148,6 @@ class FeatureStore:
             f"{self.env_hash}.parquet"
         )
 
-    ##################################################
-    # STRUCTURE VALIDATION
-    ##################################################
-
     def _validate_dataset_structure(self, df: pd.DataFrame):
 
         missing = self.REQUIRED_COLUMNS - set(df.columns)
@@ -172,7 +161,6 @@ class FeatureStore:
         if not pd.api.types.is_float_dtype(df["close"]):
             raise RuntimeError("close must be float.")
 
-        # 🔥 FIXED — multi ticker duplicate guard
         if df.duplicated(subset=["ticker", "date"]).any():
             raise RuntimeError("Duplicate ticker/date detected.")
 
@@ -181,9 +169,16 @@ class FeatureStore:
                 .equals(df.reset_index(drop=True)):
             raise RuntimeError("Dataset not strictly ordered.")
 
-    ##################################################
-    # ATOMIC WRITE
-    ##################################################
+    def _fsync_dir(self, directory):
+
+        if os.name == "nt":
+            return
+
+        fd = os.open(directory, os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def _atomic_write(
         self,
@@ -214,25 +209,24 @@ class FeatureStore:
         if arr.size > 0 and np.abs(arr).max() > self.ABS_FEATURE_LIMIT:
             raise RuntimeError("Feature explosion detected.")
 
-        # 🔥 metadata AFTER validation
         df["__dataset_hash"] = dataset_hash
         df["__schema_hash"] = self.schema_hash
         df["__engineer_hash"] = self.engineer_hash
 
         tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
 
-        df.to_parquet(
-            tmp_path,
-            index=False,
-            engine="pyarrow",
-            compression="zstd"
-        )
+        with open(tmp_path, "wb") as f:
+            df.to_parquet(
+                f,
+                index=False,
+                engine="pyarrow",
+                compression="zstd"
+            )
+            f.flush()
+            os.fsync(f.fileno())
 
         os.replace(tmp_path, path)
-
-    ##################################################
-    # SAFE LOAD
-    ##################################################
+        self._fsync_dir(self.FEATURE_DIR)
 
     def _load_features(self, path: str, dataset_hash: str):
 
@@ -245,7 +239,7 @@ class FeatureStore:
 
         try:
 
-            df = pd.read_parquet(path)
+            df = pd.read_parquet(path, engine="pyarrow")
 
             meta = [
                 "__dataset_hash",
@@ -258,6 +252,10 @@ class FeatureStore:
                 return None
 
             if df["__dataset_hash"].iloc[0] != dataset_hash:
+                os.remove(path)
+                return None
+
+            if df["__engineer_hash"].iloc[0] != self.engineer_hash:
                 os.remove(path)
                 return None
 
@@ -282,10 +280,6 @@ class FeatureStore:
                 pass
 
             return None
-
-    ##################################################
-    # PUBLIC
-    ##################################################
 
     def get_features(
         self,
