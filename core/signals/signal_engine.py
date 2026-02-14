@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
+from typing import Dict
 import math
 import os
 import time
@@ -7,6 +7,7 @@ import threading
 
 from core.risk.position_sizer import PositionSizer
 from core.portfolio.expected_value import ExpectedValueEngine
+from core.portfolio.risk_engine import RiskEngine
 
 
 ###################################################
@@ -43,7 +44,6 @@ class SignalConfig:
 
     prob_threshold: float
     min_confidence: float
-
     crisis_volatility: float
 
     portfolio_value: float
@@ -51,7 +51,6 @@ class SignalConfig:
     min_position_pct: float
 
     flip_cooldown_seconds: int
-
     global_kill_switch: bool
 
     ###################################################
@@ -162,7 +161,9 @@ class DecisionEngine:
             "signal": "HOLD",
             "confidence": round(confidence, 3),
             "allocation": 0.0,
-            "position_pct": 0.0
+            "position_pct": 0.0,
+            "expected_value": 0.0,
+            "risk_score": 0.0
         }
 
     ###################################################
@@ -170,6 +171,7 @@ class DecisionEngine:
     def generate(
         self,
         ticker: str,
+        price_df,
         current_price: float,
         forecast_up: float,
         forecast_down: float,
@@ -186,7 +188,7 @@ class DecisionEngine:
             volatility = max(_safe(volatility, 0.02), 1e-6)
 
             if volatility > self.config.crisis_volatility:
-                return self._hold(0.1)
+                return self._hold(0.15)
 
             ###################################################
             # EXPECTED VALUE
@@ -199,16 +201,20 @@ class DecisionEngine:
                 forecast_down
             )
 
+            # Prevent nonsense edges
+            if abs(ev) > 0.25:
+                return self._hold(0.2)
+
             if not self.ev_engine.worthy_trade(ev):
                 return self._hold(0.25)
 
             ###################################################
-            # SIGNAL FROM EV
+            # SIGNAL
             ###################################################
 
             signal = "BUY" if ev > 0 else "SELL"
 
-            confidence = _clamp(abs(ev) * 8, 0.2, 0.95)
+            confidence = _clamp(abs(ev) * 7, 0.2, 0.95)
 
             if confidence < self.config.min_confidence:
                 return self._hold(confidence)
@@ -217,10 +223,19 @@ class DecisionEngine:
                 return self._hold(confidence)
 
             ###################################################
-            # EDGE-AWARE POSITION SIZING
+            # 🔥 RISK ENGINE (MOST IMPORTANT STEP)
             ###################################################
 
-            edge_boost = min(abs(ev) * 6, 2.5)
+            risk = RiskEngine.analyze(price_df, signal)
+
+            if risk["capital_multiplier"] == 0:
+                return self._hold(0.1)
+
+            ###################################################
+            # POSITION SIZING
+            ###################################################
+
+            edge_boost = min(abs(ev) * 5, 2.0)
 
             allocation = self.position_sizer.size_position(
                 signal=signal,
@@ -231,6 +246,12 @@ class DecisionEngine:
 
             if not math.isfinite(allocation) or allocation <= 0:
                 return self._hold(confidence)
+
+            ###################################################
+            # CAPITAL THROTTLE
+            ###################################################
+
+            allocation *= risk["capital_multiplier"]
 
             max_alloc = self.config.portfolio_value * self.config.max_position_pct
             min_alloc = self.config.portfolio_value * self.config.min_position_pct
@@ -246,5 +267,7 @@ class DecisionEngine:
                 "confidence": round(confidence, 3),
                 "allocation": round(allocation, 2),
                 "position_pct": round(position_pct, 4),
-                "expected_value": round(ev, 5)
+                "expected_value": round(ev, 5),
+                "risk_score": risk["risk_score"],
+                "regime": risk["regime"]
             }
