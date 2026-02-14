@@ -59,11 +59,16 @@ class FeatureEngineer:
         if "ticker" not in df.columns:
 
             if ticker is None:
-                raise RuntimeError("Ticker column missing.")
+                raise RuntimeError(
+                    "Ticker column missing from dataframe."
+                )
 
             df["ticker"] = ticker
 
         df["ticker"] = df["ticker"].astype(str)
+
+        if df["ticker"].isna().any():
+            raise RuntimeError("NaN ticker detected.")
 
         return df
 
@@ -155,45 +160,7 @@ class FeatureEngineer:
         df["macd_signal"] = signal.clip(-50, 50)
 
     ###################################################
-    # GLOBAL SANITIZER (🔥 VERY IMPORTANT)
-    ###################################################
-
-    @classmethod
-    def _sanitize_features(cls, df):
-
-        feature_block = df.loc[:, MODEL_FEATURES]
-
-        arr = feature_block.to_numpy()
-
-        if not np.isfinite(arr).all():
-            raise RuntimeError("Non-finite feature values detected.")
-
-        if np.abs(arr).max() > cls.ABS_FEATURE_LIMIT:
-            raise RuntimeError("Feature explosion detected.")
-
-        return df
-
-    ###################################################
-    # NEUTRAL SENTIMENT
-    ###################################################
-
-    @classmethod
-    def _build_neutral_sentiment(cls, price_df):
-
-        neutral = price_df[["date"]].copy()
-
-        neutral["avg_sentiment"] = 0.0
-        neutral["news_count"] = 0.0
-        neutral["sentiment_std"] = cls.SENTIMENT_STD_FLOOR
-
-        logger.warning(
-            "Sentiment unavailable — deterministic neutral prior injected."
-        )
-
-        return neutral
-
-    ###################################################
-    # MERGE
+    # 🔥 CRITICAL FIX — MERGE SAFE
     ###################################################
 
     @classmethod
@@ -225,6 +192,26 @@ class FeatureEngineer:
             allow_exact_matches=False
         )
 
+        #################################################
+        # 🚨 HARD TICKER REATTACH (INSTITUTIONAL)
+        #################################################
+
+        if "ticker" not in merged.columns:
+
+            if ticker is None:
+                raise RuntimeError(
+                    "Ticker lost during merge — pipeline unsafe."
+                )
+
+            merged["ticker"] = ticker
+
+        merged["ticker"] = merged["ticker"].astype(str)
+
+        if merged["ticker"].isna().any():
+            raise RuntimeError("NaN ticker post-merge.")
+
+        #################################################
+
         merged["avg_sentiment"].fillna(0.0, inplace=True)
         merged["news_count"].fillna(0.0, inplace=True)
 
@@ -237,6 +224,25 @@ class FeatureEngineer:
         merged["sentiment_lag1"] = merged["avg_sentiment"].shift(1)
 
         return merged
+
+    ###################################################
+    # NEUTRAL SENTIMENT
+    ###################################################
+
+    @classmethod
+    def _build_neutral_sentiment(cls, price_df):
+
+        neutral = price_df[["date"]].copy()
+
+        neutral["avg_sentiment"] = 0.0
+        neutral["news_count"] = 0.0
+        neutral["sentiment_std"] = cls.SENTIMENT_STD_FLOOR
+
+        logger.warning(
+            "Sentiment unavailable — deterministic neutral prior injected."
+        )
+
+        return neutral
 
     ###################################################
     # TARGET
@@ -304,8 +310,6 @@ class FeatureEngineer:
         )
 
         df = cls.create_training_dataset(df)
-
-        df = cls._sanitize_features(df)
 
         validated = validate_feature_schema(
             df.loc[:, MODEL_FEATURES]
