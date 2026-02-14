@@ -6,20 +6,10 @@ from core.data.providers.market.yahoo_provider import YahooProvider
 from core.data.providers.market.finnhub_provider import FinnhubProvider
 
 
-logger = logging.getLogger("marketsentinel.market_router")
+logger = logging.getLogger(__name__)
 
 
 class MarketProviderRouter:
-    """
-    Institutional Provider Router (Production Grade)
-
-    Guarantees:
-    ✔ No crash when API keys missing
-    ✔ Dynamic provider registration
-    ✔ Automatic fallback
-    ✔ Schema validation
-    ✔ Provider observability
-    """
 
     REQUIRED_COLUMNS = {
         "date",
@@ -30,17 +20,19 @@ class MarketProviderRouter:
         "volume"
     }
 
-    ########################################################
+    ALLOWED_INTERVALS = {
+        "1d", "D",
+        "1h", "60m",
+        "15m",
+        "5m",
+        "1m"
+    }
 
     def __init__(self):
 
         self.providers = []
 
         preferred = os.getenv("MARKET_PROVIDER", "yahoo").lower()
-
-        ############################################
-        # SAFE REGISTRATION FUNCTION
-        ############################################
 
         def register(name, builder):
             try:
@@ -54,26 +46,16 @@ class MarketProviderRouter:
                     str(e)
                 )
 
-        ############################################
-        # REGISTER PROVIDERS
-        ############################################
-
         if preferred == "finnhub":
-
             register("finnhub", FinnhubProvider)
             register("yahoo", YahooProvider)
-
         else:
-
             register("yahoo", YahooProvider)
             register("finnhub", FinnhubProvider)
-
-        ############################################
 
         if not self.providers:
             raise RuntimeError(
-                "No market providers available. "
-                "Check API keys or network."
+                "No market providers available. Check API keys or network."
             )
 
         logger.info(
@@ -81,10 +63,14 @@ class MarketProviderRouter:
             [p[0] for p in self.providers]
         )
 
-    ########################################################
+    @classmethod
+    def _validate_interval(cls, interval):
+
+        if interval not in cls.ALLOWED_INTERVALS:
+            raise ValueError(f"Unsupported interval: {interval}")
 
     @classmethod
-    def _sanity_check(cls, df: pd.DataFrame):
+    def _sanitize_dataframe(cls, df: pd.DataFrame):
 
         if df is None or df.empty:
             raise RuntimeError("Provider returned empty dataframe.")
@@ -96,11 +82,34 @@ class MarketProviderRouter:
                 f"Provider schema invalid. Missing={missing}"
             )
 
+        df = df.copy()
+
+        # normalize datetime
+        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+
+        if df["date"].isna().any():
+            raise RuntimeError("Invalid datetime values from provider.")
+
+        # enforce numeric columns
+        numeric_cols = ["open", "high", "low", "close", "volume"]
+
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if df[numeric_cols].isna().any().any():
+            raise RuntimeError("NaNs detected in numeric columns.")
+
+        # remove duplicates
+        df = df.drop_duplicates(subset=["date"])
+
+        # enforce chronological order
+        df = df.sort_values("date")
+
         return df
 
-    ########################################################
-
     def fetch(self, ticker, start, end, interval):
+
+        self._validate_interval(interval)
 
         last_error = None
 
@@ -115,7 +124,7 @@ class MarketProviderRouter:
                     interval
                 )
 
-                df = self._sanity_check(df)
+                df = self._sanitize_dataframe(df)
 
                 logger.info(
                     "Market data served | provider=%s ticker=%s",
@@ -123,7 +132,7 @@ class MarketProviderRouter:
                     ticker
                 )
 
-                return df
+                return df.copy()
 
             except Exception as e:
 
