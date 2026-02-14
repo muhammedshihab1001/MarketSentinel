@@ -107,7 +107,6 @@ def assert_stationary(series: pd.Series):
         raise RuntimeError("Variance collapsed — unusable series.")
 
     result = adfuller(series, autolag="AIC")
-
     p_value = result[1]
 
     if not np.isfinite(p_value):
@@ -131,7 +130,6 @@ def clean_price_frame(df: pd.DataFrame):
     df = df[["date", "close"]].copy()
 
     df["date"] = pd.to_datetime(df["date"], utc=True)
-
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
 
     if df["close"].isna().mean() > MAX_MISSING_RATIO:
@@ -282,6 +280,7 @@ def train_champion(start_date, end_date):
             "champion_asset": best_ticker,
             "risk_adjusted_score": float(best_score),
             "model_fingerprint": best_model.fingerprint(),
+            "universe_hash": MarketUniverse.fingerprint(),
             **best_metrics
         },
         features=["close"],
@@ -298,7 +297,7 @@ def train_champion(start_date, end_date):
         }
     )
 
-    return best_model, metadata
+    return best_model, metadata, best_ticker, best_score
 
 
 ########################################################
@@ -320,7 +319,7 @@ def main(start_date=None, end_date=None):
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    model, metadata = train_champion(start_date, end_date)
+    model, metadata, ticker, score = train_champion(start_date, end_date)
 
     save_model_atomic(model, TEMP_MODEL_PATH)
 
@@ -339,6 +338,14 @@ def main(start_date=None, end_date=None):
         MODEL_DIR,
         version
     )
+
+    print("\n==============================")
+    print(" SARIMAX TRAINING COMPLETE")
+    print("==============================")
+    print(f"Champion Asset : {ticker}")
+    print(f"Risk Score     : {score:.4f}")
+    print(f"Model Version  : {version}")
+    print("==============================\n")
 
     logger.info(
         "SARIMAX candidate registered -> %s | promotion requires approval.",
