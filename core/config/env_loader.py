@@ -17,17 +17,12 @@ _ENV_LOCK = threading.Lock()
 def _as_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
-
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _validate_not_empty(key: str) -> bool:
     val = os.getenv(key)
-
-    if val is None:
-        return False
-
-    return bool(val.strip())
+    return bool(val and val.strip())
 
 
 def _fail_fast_dotenv():
@@ -67,7 +62,7 @@ def _validate_paths():
 
 
 ########################################################
-# PROVIDER SECRET VALIDATION (UPDATED)
+# PROVIDER SECRET VALIDATION (INSTITUTIONAL SAFE)
 ########################################################
 
 def _validate_news_provider_secrets():
@@ -76,7 +71,7 @@ def _validate_news_provider_secrets():
         logger.info("Sentiment disabled via ENABLE_SENTIMENT=0")
         return
 
-    primary = os.getenv("NEWS_PROVIDER_PRIMARY", "finnhub").lower()
+    primary = os.getenv("NEWS_PROVIDER_PRIMARY", "auto").lower()
 
     providers = {
         "finnhub": "FINNHUB_API_KEY",
@@ -84,23 +79,65 @@ def _validate_news_provider_secrets():
         "gnews": "GNEWS_API_KEY",
     }
 
+    ####################################################
+    # AUTO MODE (VERY IMPORTANT)
+    ####################################################
+
+    if primary == "auto":
+
+        for provider, key in providers.items():
+
+            if _validate_not_empty(key) and len(os.getenv(key)) >= 10:
+
+                logger.info(
+                    "Auto-selected news provider → %s",
+                    provider
+                )
+
+                os.environ["NEWS_PROVIDER_PRIMARY"] = provider
+                return
+
+        # No keys found → disable sentiment safely
+        logger.warning(
+            "No news provider keys detected — sentiment auto-disabled."
+        )
+
+        os.environ["ENABLE_SENTIMENT"] = "0"
+        return
+
+    ####################################################
+    # EXPLICIT PROVIDER
+    ####################################################
+
     if primary not in providers:
         raise RuntimeError(
             f"Invalid NEWS_PROVIDER_PRIMARY='{primary}'. "
-            f"Valid options: {list(providers.keys())}"
+            f"Valid options: {list(providers.keys()) + ['auto']}"
         )
 
     primary_key = providers[primary]
 
     if not _validate_not_empty(primary_key):
-        raise RuntimeError(
-            f"Primary news provider '{primary}' requires env '{primary_key}'."
+
+        logger.warning(
+            f"Primary news provider '{primary}' disabled — missing {primary_key}."
         )
+
+        os.environ["ENABLE_SENTIMENT"] = "0"
+
+        logger.warning(
+            "Sentiment automatically disabled due to missing provider key."
+        )
+
+        return
 
     if len(os.getenv(primary_key)) < 10:
         raise RuntimeError(f"{primary_key} appears invalid.")
 
-    # Optional failover validation
+    ####################################################
+    # OPTIONAL FAILOVER CHECK
+    ####################################################
+
     if _as_bool(os.getenv("NEWS_PROVIDER_FAILOVER", "1")):
 
         optional_keys = [
@@ -143,12 +180,12 @@ def init_env() -> None:
 
         defaults = {
 
-            # provider flags
+            # sentiment control
             "ENABLE_SENTIMENT": "0",
             "NEWS_PROVIDER_FAILOVER": "1",
-            "NEWS_PROVIDER_PRIMARY": "finnhub",
+            "NEWS_PROVIDER_PRIMARY": "auto",
 
-            # dotenv behavior
+            # dotenv
             "DOTENV_ENABLED": "1",
 
             # tokenizer / hf stability
