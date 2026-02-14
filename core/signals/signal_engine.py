@@ -19,7 +19,7 @@ def _env_float(key: str, default: float) -> float:
         if not math.isfinite(v):
             return default
 
-        # prevent config poisoning
+        # config poisoning guard
         if abs(v) > 1e6:
             return default
 
@@ -104,6 +104,9 @@ class SignalConfig:
         if cfg.portfolio_value <= 0:
             raise RuntimeError("Invalid portfolio_value")
 
+        if cfg.max_position_pct > 0.20:
+            raise RuntimeError("Position cap too large — institutional violation.")
+
         return cfg
 
 
@@ -139,6 +142,7 @@ class ForecastInterpreter:
 
     VOL_FLOOR = 1e-6
     RAR_CLAMP = 5.0
+    ENTROPY_GUARD = 0.03  # prevents trading when prob≈0.5
 
     def interpret(
         self,
@@ -156,6 +160,13 @@ class ForecastInterpreter:
         prob_up = _safe(prob_up, 0.5)
 
         volatility = max(_safe(volatility, 0.02), self.VOL_FLOOR)
+
+        ################################################
+        # ENTROPY GUARD (NEW — VERY IMPORTANT)
+        ################################################
+
+        if abs(prob_up - 0.5) < self.ENTROPY_GUARD:
+            return "HOLD", 0.2
 
         ################################################
         # RISK ADJUSTED RETURN
@@ -178,30 +189,20 @@ class ForecastInterpreter:
 
         rsi_edge = abs(50 - rsi) / 50
 
-        weights = {
-            "prob": 0.55,
-            "rar": 0.35,
-            "rsi": 0.10,
-            "sentiment": 0.0
-        }
-
-        # activate sentiment only when strong
-        if sentiment is not None and abs(sentiment) > config.sentiment_threshold:
-            weights["sentiment"] = 0.08
-            weights["prob"] -= 0.04
-            weights["rar"] -= 0.04
-
         confidence = (
-            prob_up * weights["prob"] +
-            math.tanh(rar) * weights["rar"] +
-            rsi_edge * weights["rsi"] +
-            (abs(sentiment) if sentiment else 0.0) * weights["sentiment"]
+            prob_up * 0.55 +
+            math.tanh(rar) * 0.30 +
+            rsi_edge * 0.10 +
+            (abs(sentiment) if sentiment else 0.0) * 0.05
         )
+
+        # volatility suppresses confidence
+        confidence *= (1 - min(volatility, 0.15))
 
         confidence = _clamp(confidence, 0.0, 1.0)
 
         ################################################
-        # SIGNAL LOGIC
+        # SIGNAL
         ################################################
 
         if rar > config.min_risk_adjusted_return and prob_up >= prob_threshold:
