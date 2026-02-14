@@ -17,7 +17,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 ############################################################
-# FINBERT SINGLETON
+# FINBERT SINGLETON (PRODUCTION SAFE)
 ############################################################
 
 class FinBERTSingleton:
@@ -26,24 +26,25 @@ class FinBERTSingleton:
     _model = None
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     _lock = threading.Lock()
+    _failed = False   # 🔥 prevents retry storm
 
-    MODEL_NAME = "ProsusAI/finbert"
-    CACHE_DIR = "artifacts/huggingface"
+    MODEL_PATH = os.getenv(
+        "FINBERT_PATH",
+        "artifacts/nlp/finbert"
+    )
 
     USE_FP16 = torch.cuda.is_available() and get_bool(
         "ENABLE_FP16",
         True
     )
 
-    @classmethod
-    def _enforce_offline_mode(cls):
-
-        if get_bool("HF_FORCE_OFFLINE", True):
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            os.environ["HF_DATASETS_OFFLINE"] = "1"
+    ########################################################
 
     @classmethod
     def load(cls):
+
+        if cls._failed:
+            raise RuntimeError("FinBERT previously failed to load.")
 
         if cls._model is not None:
             return cls._tokenizer, cls._model, cls._device
@@ -53,30 +54,39 @@ class FinBERTSingleton:
             if cls._model is not None:
                 return cls._tokenizer, cls._model, cls._device
 
-            cls._enforce_offline_mode()
+            if not os.path.exists(cls.MODEL_PATH):
+                cls._failed = True
+                raise RuntimeError(
+                    f"FinBERT artifact missing at {cls.MODEL_PATH}. "
+                    "Download once on an internet machine."
+                )
 
-            os.makedirs(cls.CACHE_DIR, exist_ok=True)
-
-            logger.info("Loading FinBERT on %s", cls._device)
+            logger.info("Loading FinBERT from local artifact → %s", cls.MODEL_PATH)
+            logger.info("Device → %s", cls._device)
 
             torch.set_grad_enabled(False)
 
-            # deterministic behavior
             torch.set_num_threads(min(4, os.cpu_count()))
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
-            tokenizer = AutoTokenizer.from_pretrained(
-                cls.MODEL_NAME,
-                cache_dir=cls.CACHE_DIR,
-                local_files_only=get_bool("HF_FORCE_OFFLINE", True)
-            )
+            try:
 
-            model = AutoModelForSequenceClassification.from_pretrained(
-                cls.MODEL_NAME,
-                cache_dir=cls.CACHE_DIR,
-                local_files_only=get_bool("HF_FORCE_OFFLINE", True)
-            )
+                tokenizer = AutoTokenizer.from_pretrained(
+                    cls.MODEL_PATH,
+                    local_files_only=True
+                )
+
+                model = AutoModelForSequenceClassification.from_pretrained(
+                    cls.MODEL_PATH,
+                    local_files_only=True
+                )
+
+            except Exception as e:
+                cls._failed = True
+                raise RuntimeError(
+                    "FinBERT failed to load from disk."
+                ) from e
 
             model = model.to(cls._device)
 
@@ -85,14 +95,10 @@ class FinBERTSingleton:
             ###################################################
 
             if cls.USE_FP16:
-
                 try:
                     model = model.half()
-
                 except Exception:
-                    logger.warning(
-                        "FP16 conversion failed — falling back to FP32."
-                    )
+                    logger.warning("FP16 conversion failed — using FP32.")
 
             model.eval()
 
@@ -102,13 +108,13 @@ class FinBERTSingleton:
             cls._tokenizer = tokenizer
             cls._model = model
 
-            logger.info("FinBERT ready.")
+            logger.info("FinBERT READY (offline mode).")
 
             return cls._tokenizer, cls._model, cls._device
 
 
 ############################################################
-# SENTIMENT ANALYZER
+# SENTIMENT ANALYZER (FAILSAFE)
 ############################################################
 
 class SentimentAnalyzer:
@@ -133,61 +139,66 @@ class SentimentAnalyzer:
 
     ############################################################
 
+    def __init__(self):
+
+        try:
+            self.tokenizer, self.model, self.device = (
+                FinBERTSingleton.load()
+            )
+            self.available = True
+            self._warmup()
+
+        except Exception as e:
+
+            logger.warning(
+                "FinBERT unavailable → neutral sentiment fallback enabled."
+            )
+
+            self.available = False
+            self.tokenizer = None
+            self.model = None
+            self.device = None
+
+    ############################################################
+
     def _neutral_sentiment_frame(self, start, end):
 
         dates = pd.date_range(start=start, end=end, freq="D")
 
         n = len(dates)
 
-        df = pd.DataFrame({
+        return pd.DataFrame({
             "date": dates,
             "avg_sentiment": self.RNG.normal(
-                0.0,
-                0.03,
-                n
+                0.0, 0.03, n
             ).clip(-0.08, 0.08).astype("float32"),
-            "news_count": self.RNG.integers(
-                0,
-                4,
-                n
-            ).astype("int16"),
+            "news_count": self.RNG.integers(0, 4, n).astype("int16"),
             "sentiment_std": self.RNG.uniform(
-                0.03,
-                0.08,
-                n
+                0.03, 0.08, n
             ).astype("float32")
         })
-
-        logger.warning(
-            "Sentiment unavailable — injected stochastic neutral prior."
-        )
-
-        return df
-
-    ############################################################
-
-    def __init__(self):
-
-        self.tokenizer, self.model, self.device = (
-            FinBERTSingleton.load()
-        )
-
-        self._warmup()
 
     ############################################################
 
     def _warmup(self):
+        if not self.available:
+            return
 
         try:
             dummy = ["market stable"] * self.BATCH_SIZE
             self.analyze_batch(dummy)
-
         except Exception:
-            logger.exception("FinBERT warmup failed")
+            logger.warning("FinBERT warmup skipped.")
 
     ############################################################
 
-    def aggregate_daily_sentiment(self, df: pd.DataFrame) -> pd.DataFrame:
+    def aggregate_daily_sentiment(self, df):
+
+        if not self.available:
+            return self._neutral_sentiment_frame(
+                pd.Timestamp.utcnow() - pd.Timedelta(days=30),
+                pd.Timestamp.utcnow()
+            )
 
         if df is None or df.empty:
             return self._neutral_sentiment_frame(
@@ -245,113 +256,54 @@ class SentimentAnalyzer:
             .clip(lower=self.STD_FLOOR)
         )
 
-        aggregated.sort_values("date", inplace=True)
-        aggregated.reset_index(drop=True, inplace=True)
-
-        return aggregated
+        return aggregated.sort_values("date").reset_index(drop=True)
 
     ############################################################
 
     def analyze_batch(self, texts):
 
+        if not self.available:
+            return [
+                {"label": "neutral", "score": 0.0}
+                for _ in texts
+            ]
+
         results = []
-        failures = 0
 
         for i in range(0, len(texts), self.BATCH_SIZE):
 
-            raw_batch = texts[i:i+self.BATCH_SIZE]
-
             batch = [
                 str(t).replace("\n", " ")[:self.MAX_HEADLINE_CHARS]
-                for t in raw_batch
-                if t and not re.match(r"^\s*$|http[s]?://|^\W+$", str(t))
+                for t in texts[i:i+self.BATCH_SIZE]
             ]
 
-            if not batch:
-                results.extend(
-                    {
-                        "label": "neutral",
-                        "score": float(self.RNG.normal(0, 0.02))
-                    }
-                    for _ in raw_batch
-                )
-                continue
-
-            try:
-
-                inputs = self.tokenizer(
-                    batch,
-                    return_tensors="pt",
-                    truncation=True,
-                    padding=True,
-                    max_length=128
-                )
-
-                inputs = {
-                    k: v.to(self.device)
-                    for k, v in inputs.items()
-                }
-
-                with torch.inference_mode():
-
-                    logits = self.model(**inputs).logits
-                    probs = torch.softmax(
-                        logits,
-                        dim=1
-                    ).float().cpu().numpy()
-
-                idx = 0
-
-                for original in raw_batch:
-
-                    if original is None:
-                        results.append({
-                            "label": "neutral",
-                            "score": float(self.RNG.normal(0, 0.02))
-                        })
-                        continue
-
-                    p = probs[idx]
-                    idx += 1
-
-                    confidence = float(p.max())
-
-                    if confidence < self.MIN_CONFIDENCE:
-                        results.append({
-                            "label": "neutral",
-                            "score": float(self.RNG.normal(0, 0.02))
-                        })
-                        continue
-
-                    label_id = int(p.argmax())
-
-                    score = float(
-                        np.clip(p[2] - p[0], -1.0, 1.0)
-                    )
-
-                    results.append({
-                        "label": self.label_map[label_id],
-                        "score": round(score, 4)
-                    })
-
-            except Exception:
-
-                failures += len(raw_batch)
-
-                logger.exception("FinBERT inference failure")
-
-                results.extend(
-                    {
-                        "label": "neutral",
-                        "score": float(self.RNG.normal(0, 0.02))
-                    }
-                    for _ in raw_batch
-                )
-
-        if failures / max(len(texts), 1) > self.MAX_FAILURE_RATE:
-            raise RuntimeError(
-                "FinBERT failure rate exceeded threshold."
+            inputs = self.tokenizer(
+                batch,
+                return_tensors="pt",
+                truncation=True,
+                padding=True,
+                max_length=128
             )
+
+            inputs = {
+                k: v.to(self.device)
+                for k, v in inputs.items()
+            }
+
+            with torch.inference_mode():
+
+                logits = self.model(**inputs).logits
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
+
+            for p in probs:
+
+                label_id = int(p.argmax())
+                score = float(np.clip(p[2] - p[0], -1, 1))
+
+                results.append({
+                    "label": self.label_map[label_id],
+                    "score": round(score, 4)
+                })
 
         return results
 
@@ -362,7 +314,10 @@ class SentimentAnalyzer:
         if df.empty:
             return df
 
-        df = df.copy()
+        if not self.available:
+            df["label"] = "neutral"
+            df["score"] = 0.0
+            return df
 
         headlines = df["headline"].astype(str).tolist()
 
@@ -370,11 +325,7 @@ class SentimentAnalyzer:
 
         sentiment_df = pd.DataFrame(results)
 
-        df = df.reset_index(drop=True)
-
-        final = pd.concat(
-            [df, sentiment_df],
+        return pd.concat(
+            [df.reset_index(drop=True), sentiment_df],
             axis=1
         )
-
-        return final
