@@ -1,7 +1,6 @@
 import os
 import logging
 import pandas as pd
-import time
 
 from core.data.providers.market.yahoo_provider import YahooProvider
 from core.data.providers.market.finnhub_provider import FinnhubProvider
@@ -12,14 +11,14 @@ logger = logging.getLogger("marketsentinel.market_router")
 
 class MarketProviderRouter:
     """
-    Institutional Provider Router.
+    Institutional Provider Router (Production Grade)
 
     Guarantees:
-    - explicit provider visibility
-    - safe fallback
-    - schema sanity check
-    - no silent degradation
-    - provider cooldown protection
+    ✔ No crash when API keys missing
+    ✔ Dynamic provider registration
+    ✔ Automatic fallback
+    ✔ Schema validation
+    ✔ Provider observability
     """
 
     REQUIRED_COLUMNS = {
@@ -31,61 +30,63 @@ class MarketProviderRouter:
         "volume"
     }
 
-    PROVIDER_COOLDOWN = 90  # seconds
-
     ########################################################
 
     def __init__(self):
 
-        provider = os.getenv("MARKET_PROVIDER", "yahoo").lower()
+        self.providers = []
 
-        if provider == "finnhub":
-            self.primary = FinnhubProvider()
-            self.fallback = YahooProvider()
-            self.primary_name = "finnhub"
-            self.fallback_name = "yahoo"
+        preferred = os.getenv("MARKET_PROVIDER", "yahoo").lower()
+
+        ############################################
+        # SAFE REGISTRATION FUNCTION
+        ############################################
+
+        def register(name, builder):
+            try:
+                provider = builder()
+                self.providers.append((name, provider))
+                logger.info("Market provider registered → %s", name)
+            except Exception as e:
+                logger.warning(
+                    "Provider disabled → %s | reason=%s",
+                    name,
+                    str(e)
+                )
+
+        ############################################
+        # REGISTER PROVIDERS
+        ############################################
+
+        if preferred == "finnhub":
+
+            register("finnhub", FinnhubProvider)
+            register("yahoo", YahooProvider)
+
         else:
-            self.primary = YahooProvider()
-            self.fallback = FinnhubProvider()
-            self.primary_name = "yahoo"
-            self.fallback_name = "finnhub"
 
-        self._primary_failed_at = None
+            register("yahoo", YahooProvider)
+            register("finnhub", FinnhubProvider)
+
+        ############################################
+
+        if not self.providers:
+            raise RuntimeError(
+                "No market providers available. "
+                "Check API keys or network."
+            )
 
         logger.info(
-            "Market router initialized | primary=%s fallback=%s",
-            self.primary_name,
-            self.fallback_name
+            "Market router ready | providers=%s",
+            [p[0] for p in self.providers]
         )
-
-    ########################################################
-
-    def _primary_available(self):
-
-        if self._primary_failed_at is None:
-            return True
-
-        elapsed = time.time() - self._primary_failed_at
-
-        if elapsed > self.PROVIDER_COOLDOWN:
-            logger.warning(
-                "Primary provider cooldown expired — retrying %s",
-                self.primary_name
-            )
-            self._primary_failed_at = None
-            return True
-
-        return False
 
     ########################################################
 
     @classmethod
     def _sanity_check(cls, df: pd.DataFrame):
 
-        if df is None:
-            raise RuntimeError("Provider returned None.")
-
-        if df.empty:
+        if df is None or df.empty:
             raise RuntimeError("Provider returned empty dataframe.")
 
         missing = cls.REQUIRED_COLUMNS - set(df.columns)
@@ -101,13 +102,13 @@ class MarketProviderRouter:
 
     def fetch(self, ticker, start, end, interval):
 
-        # ---------- TRY PRIMARY ----------
+        last_error = None
 
-        if self._primary_available():
+        for name, provider in self.providers:
 
             try:
 
-                df = self.primary.fetch(
+                df = provider.fetch(
                     ticker,
                     start,
                     end,
@@ -116,55 +117,25 @@ class MarketProviderRouter:
 
                 df = self._sanity_check(df)
 
-                logger.debug(
-                    "Market data served by PRIMARY provider=%s ticker=%s",
-                    self.primary_name,
+                logger.info(
+                    "Market data served | provider=%s ticker=%s",
+                    name,
                     ticker
                 )
 
                 return df
 
-            except Exception as primary_error:
+            except Exception as e:
 
-                self._primary_failed_at = time.time()
+                last_error = e
 
                 logger.warning(
-                    "Primary provider failed | provider=%s ticker=%s error=%s",
-                    self.primary_name,
+                    "Provider failed → %s | ticker=%s | error=%s",
+                    name,
                     ticker,
-                    str(primary_error)
+                    str(e)
                 )
 
-        # ---------- FALLBACK ----------
-
-        try:
-
-            df = self.fallback.fetch(
-                ticker,
-                start,
-                end,
-                interval
-            )
-
-            df = self._sanity_check(df)
-
-            logger.critical(
-                "FALLBACK provider engaged | provider=%s ticker=%s",
-                self.fallback_name,
-                ticker
-            )
-
-            return df
-
-        except Exception as fallback_error:
-
-            logger.critical(
-                "Both providers failed | primary=%s fallback=%s ticker=%s",
-                self.primary_name,
-                self.fallback_name,
-                ticker
-            )
-
-            raise RuntimeError(
-                "Market data unavailable from all providers."
-            ) from fallback_error
+        raise RuntimeError(
+            f"All market providers failed for {ticker}"
+        ) from last_error
