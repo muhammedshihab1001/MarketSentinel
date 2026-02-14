@@ -10,24 +10,10 @@ import os
 
 from core.data.providers.market.router import MarketProviderRouter
 
-logger = logging.getLogger("marketsentinel.market_data")
+logger = logging.getLogger(__name__)
 
 
 class MarketDataService:
-    """
-    Institutional Market Data Layer.
-
-    Guarantees:
-    ✔ zero lookahead bias
-    ✔ schema drift detection
-    ✔ corruption prevention
-    ✔ ticker enforcement
-    ✔ timezone normalization
-    ✔ numeric safety
-    ✔ dataset fingerprinting
-    ✔ atomic persistence
-    ✔ provider contract validation
-    """
 
     DATA_DIR = Path("data/lake")
 
@@ -46,19 +32,19 @@ class MarketDataService:
     MAX_ROWS = 15000
     MIN_FILE_BYTES = 5_000
 
-    ########################################################
+    _PROVIDER = None
 
     def __init__(self):
         self.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self._fetcher = MarketProviderRouter()
+
+        if MarketDataService._PROVIDER is None:
+            MarketDataService._PROVIDER = MarketProviderRouter()
+
+        self._fetcher = MarketDataService._PROVIDER
 
         self.SCHEMA_HASH = hashlib.sha256(
             ",".join(sorted(self.REQUIRED_COLUMNS)).encode()
         ).hexdigest()[:10]
-
-    ########################################################
-    # TICKER SAFETY
-    ########################################################
 
     @staticmethod
     def _sanitize_ticker(ticker: str):
@@ -69,10 +55,6 @@ class MarketDataService:
             raise RuntimeError(f"Unsafe ticker: {ticker}")
 
         return ticker
-
-    ########################################################
-    # LOOKAHEAD PROTECTION
-    ########################################################
 
     @classmethod
     def _cap_to_safe_date(cls, date_str: str):
@@ -88,10 +70,6 @@ class MarketDataService:
 
         return min(requested, safe_cutoff)
 
-    ########################################################
-    # DATE NORMALIZATION
-    ########################################################
-
     @staticmethod
     def _normalize_dates(df: pd.DataFrame):
 
@@ -101,20 +79,15 @@ class MarketDataService:
             pd.to_datetime(
                 df["date"],
                 utc=True,
-                errors="coerce"
+                errors="raise"
             ).dt.tz_convert(None)
         )
 
         return df
 
-    ########################################################
-    # PROVIDER COLUMN NORMALIZATION
-    ########################################################
-
     @staticmethod
     def _normalize_provider_columns(df: pd.DataFrame):
 
-        # handles Yahoo / Finnhub variations
         rename_map = {
             "Datetime": "date",
             "Date": "date",
@@ -127,23 +100,26 @@ class MarketDataService:
 
         return df
 
-    ########################################################
-    # DATASET HASH
-    ########################################################
-
     @staticmethod
     def _dataset_hash(df: pd.DataFrame):
 
         payload = pd.util.hash_pandas_object(
-            df.sort_values("date"),
+            df.sort_values(["ticker", "date"]),
             index=True
         ).values.tobytes()
 
         return hashlib.sha256(payload).hexdigest()[:16]
 
-    ########################################################
-    # ATOMIC WRITE
-    ########################################################
+    def _fsync_dir(self, directory):
+
+        if os.name == "nt":
+            return
+
+        fd = os.open(directory, os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def _atomic_write(self, df, path):
 
@@ -155,13 +131,13 @@ class MarketDataService:
 
             df.to_parquet(tmp.name, index=False)
 
+            tmp.flush()
+            os.fsync(tmp.fileno())
+
             temp_name = tmp.name
 
         os.replace(temp_name, path)
-
-    ########################################################
-    # CACHE PATH
-    ########################################################
+        self._fsync_dir(self.DATA_DIR)
 
     def _cache_path(self, ticker, start, end, interval):
 
@@ -171,10 +147,6 @@ class MarketDataService:
 
         return self.DATA_DIR / f"{ticker}_{key}.parquet"
 
-    ########################################################
-    # HARD VALIDATOR
-    ########################################################
-
     def _validate_dataset(self, df: pd.DataFrame, ticker: str):
 
         if df is None or df.empty:
@@ -182,7 +154,6 @@ class MarketDataService:
 
         df = self._normalize_provider_columns(df)
 
-        # FORCE ticker column
         df["ticker"] = ticker
 
         missing = self.REQUIRED_COLUMNS - set(df.columns)
@@ -195,9 +166,7 @@ class MarketDataService:
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
         for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df = df.dropna(subset=["date"] + numeric_cols)
+            df[col] = pd.to_numeric(df[col], errors="raise")
 
         if not np.isfinite(df[numeric_cols].to_numpy()).all():
             raise RuntimeError("Non-finite prices detected.")
@@ -226,10 +195,6 @@ class MarketDataService:
         df["__dataset_hash"] = self._dataset_hash(df)
 
         return df.reset_index(drop=True)
-
-    ########################################################
-    # FETCH WITH RETRY
-    ########################################################
 
     def _fetch_with_retry(
         self,
@@ -273,11 +238,7 @@ class MarketDataService:
             f"Market fetch failed after retries: {ticker}"
         ) from last_error
 
-    ########################################################
-    # CACHE SAFE LOAD
-    ########################################################
-
-    def _load_cache(self, path):
+    def _load_cache(self, path, ticker):
 
         if not path.exists():
             return None
@@ -293,16 +254,22 @@ class MarketDataService:
                 path.unlink(missing_ok=True)
                 return None
 
+            df = self._validate_dataset(df, ticker)
+
+            expected = df["__dataset_hash"].iloc[0]
+            actual = self._dataset_hash(df)
+
+            if expected != actual:
+                logger.warning("Dataset hash mismatch — rebuilding cache.")
+                path.unlink(missing_ok=True)
+                return None
+
             return df
 
         except Exception:
             logger.warning("Corrupted cache — rebuilding.")
             path.unlink(missing_ok=True)
             return None
-
-    ########################################################
-    # PUBLIC ENTRY
-    ########################################################
 
     def get_price_data(
         self,
@@ -323,7 +290,7 @@ class MarketDataService:
             interval
         )
 
-        cached = self._load_cache(cache_path)
+        cached = self._load_cache(cache_path, ticker)
 
         if cached is not None:
             return cached.reset_index(drop=True)
