@@ -10,7 +10,7 @@ import uuid
 import numpy as np
 
 
-logger = logging.getLogger("marketsentinel.fetcher")
+logger = logging.getLogger(__name__)
 
 
 class StockPriceFetcher:
@@ -25,7 +25,7 @@ class StockPriceFetcher:
         "volume"
     ]
 
-    CACHE_VERSION = "5.0"  # 🔥 bump after schema hardening
+    CACHE_VERSION = "6.0"
 
     MIN_ROWS = 120
     MAX_RETRIES = 5
@@ -35,19 +35,13 @@ class StockPriceFetcher:
     CRITICAL_COVERAGE = 0.55
     WARNING_COVERAGE = 0.70
 
-    MAX_ZERO_VOLUME_RATIO = 0.05
-    MAX_DAILY_RETURN = 0.60
+    MAX_ZERO_VOLUME_RATIO = 0.20
+    MAX_DAILY_RETURN = 1.50
 
     CACHE_DIR = "data/cache"
 
-    ##################################################
-
     def __init__(self):
         os.makedirs(self.CACHE_DIR, exist_ok=True)
-
-    ##################################################
-    # FSYNC
-    ##################################################
 
     @staticmethod
     def _fsync_dir(directory):
@@ -61,33 +55,26 @@ class StockPriceFetcher:
         finally:
             os.close(fd)
 
-    ##################################################
-    # TIME SAFETY
-    ##################################################
-
     @staticmethod
-    def _to_naive_utc(ts):
-
+    def _to_utc(ts):
         ts = pd.Timestamp(ts)
 
-        if ts.tzinfo is not None:
-            ts = ts.tz_convert("UTC").tz_localize(None)
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")
 
-        return ts
+        return ts.tz_convert("UTC")
 
     def _cap_to_yesterday(self, end_date: str):
 
-        requested = self._to_naive_utc(end_date)
+        requested = self._to_utc(end_date)
 
         yesterday = (
             pd.Timestamp.utcnow()
-            .tz_localize(None)
+            .tz_localize("UTC")
             - timedelta(days=1)
         )
 
         return min(requested, yesterday)
-
-    ##################################################
 
     @staticmethod
     def _validate_dates(start_date, end_date):
@@ -98,8 +85,6 @@ class StockPriceFetcher:
         if start >= end:
             raise ValueError("start_date must be before end_date")
 
-    ##################################################
-
     def _flatten_columns(self, df: pd.DataFrame):
 
         if isinstance(df.columns, pd.MultiIndex):
@@ -109,15 +94,18 @@ class StockPriceFetcher:
 
         return df.loc[:, ~df.columns.duplicated()]
 
-    ##################################################
-    # 🔥 INSTITUTIONAL NORMALIZATION
-    ##################################################
+    def _detect_datetime_column(self, df):
+
+        for col in df.columns:
+            if "date" in col or "time" in col:
+                return col
+
+        raise RuntimeError("No datetime column detected.")
 
     def _normalize_schema(self, df: pd.DataFrame, ticker: str):
 
         df = self._flatten_columns(df)
 
-        # ---- HANDLE ADJ CLOSE ----
         if "adj close" in df.columns:
             df["close"] = df["adj close"]
 
@@ -125,15 +113,14 @@ class StockPriceFetcher:
             raise RuntimeError("Close column missing from provider.")
 
         if "date" not in df.columns:
-            df = df.reset_index()
-
-        df.rename(columns={df.columns[0]: "date"}, inplace=True)
+            dt_col = self._detect_datetime_column(df)
+            df.rename(columns={dt_col: "date"}, inplace=True)
 
         df["date"] = pd.to_datetime(
             df["date"],
             utc=True,
             errors="raise"
-        ).dt.tz_convert(None)
+        )
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
@@ -144,7 +131,6 @@ class StockPriceFetcher:
                 f"Provider schema violation after normalization: {missing}"
             )
 
-        # 🔥 FORCE FLOAT64
         for col in numeric_cols:
             df[col] = pd.to_numeric(
                 df[col],
@@ -154,16 +140,27 @@ class StockPriceFetcher:
         df = df.replace([np.inf, -np.inf], np.nan)
         df = df.dropna(subset=["date"] + numeric_cols)
 
-        # 🔥 HARD SELECT REQUIRED ONLY
         df = df[["date", "open", "high", "low", "close", "volume"]]
 
         df["ticker"] = ticker
 
         return df[self.REQUIRED_COLUMNS]
 
-    ##################################################
-    # HARD VALIDATION
-    ##################################################
+    def _coverage_ratio(self, df, start_date, end_date):
+
+        expected = pd.date_range(
+            start=start_date,
+            end=end_date,
+            freq="B"
+        )
+
+        coverage = len(df) / max(len(expected), 1)
+
+        if coverage < self.CRITICAL_COVERAGE:
+            raise RuntimeError("Critical coverage failure.")
+
+        if coverage < self.WARNING_COVERAGE:
+            logger.warning("Low coverage detected: %.2f", coverage)
 
     def _validate_dataset(self, df, start_date, end_date, ticker):
 
@@ -171,12 +168,6 @@ class StockPriceFetcher:
             raise RuntimeError("Provider returned empty dataset.")
 
         df = self._normalize_schema(df, ticker)
-
-        if (df["close"] <= 0).any():
-            raise RuntimeError("Invalid close prices detected.")
-
-        if (df["high"] < df["low"]).any():
-            raise RuntimeError("High < Low detected.")
 
         df = df.drop_duplicates(["ticker", "date"]).sort_values("date")
 
@@ -186,21 +177,19 @@ class StockPriceFetcher:
         returns = df["close"].pct_change().abs()
 
         if (returns > self.MAX_DAILY_RETURN).any():
-            raise RuntimeError("Extreme price spike detected.")
+            logger.warning("Extreme return detected for %s", ticker)
 
         zero_ratio = (df["volume"] == 0).mean()
 
         if zero_ratio > self.MAX_ZERO_VOLUME_RATIO:
-            raise RuntimeError("Too many zero-volume rows.")
+            logger.warning("High zero-volume ratio for %s", ticker)
 
         if len(df) < self.MIN_ROWS:
             raise RuntimeError(f"Dataset too small: {len(df)} rows")
 
-        return df.reset_index(drop=True)
+        self._coverage_ratio(df, start_date, end_date)
 
-    ##################################################
-    # CACHE
-    ##################################################
+        return df.reset_index(drop=True)
 
     def _atomic_cache_write(self, df, cache_file):
 
@@ -209,17 +198,16 @@ class StockPriceFetcher:
 
         df.to_parquet(tmp, index=False)
 
+        # verify
+        pd.read_parquet(tmp)
+
         os.replace(tmp, cache_file)
         self._fsync_dir(directory)
 
     def _cache_key(self, ticker, start, end, interval):
 
-        raw = f"{self.CACHE_VERSION}_{ticker}_{start}_{end}_{interval}"
+        raw = f"{self.CACHE_VERSION}|{ticker}|{start}|{end}|{interval}|schema=v2"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-    ##################################################
-    # PUBLIC FETCH
-    ##################################################
 
     def fetch(self, ticker, start_date, end_date, interval="1d"):
 
@@ -265,8 +253,6 @@ class StockPriceFetcher:
 
         return df
 
-    ##################################################
-
     def _fetch_yahoo(
         self,
         ticker,
@@ -302,8 +288,11 @@ class StockPriceFetcher:
                 )
 
                 logger.warning(
-                    f"Yahoo retry {attempt+1}/{self.MAX_RETRIES} "
-                    f"in {round(sleep_time,2)}s: {e}"
+                    "Yahoo retry %s/%s in %.2fs | %s",
+                    attempt + 1,
+                    self.MAX_RETRIES,
+                    sleep_time,
+                    str(e)
                 )
 
                 time.sleep(sleep_time)
