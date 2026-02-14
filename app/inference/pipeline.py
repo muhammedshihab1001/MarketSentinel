@@ -19,6 +19,7 @@ from core.schema.feature_schema import (
 )
 
 from core.market.universe import MarketUniverse
+from core.portfolio.distribution_forecaster import DistributionForecaster
 
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
@@ -59,7 +60,7 @@ class CircuitBreaker:
             if self.failures < self.threshold:
                 return True
 
-            if (time.time() - self.last_failure) > self.cooldown:
+            if self.last_failure and (time.time() - self.last_failure) > self.cooldown:
                 logger.warning("Circuit breaker reset.")
                 self.failures = 0
                 return True
@@ -99,10 +100,6 @@ class InferencePipeline:
 
     LOCK_TIMEOUT = 3
 
-    FORECAST_SIGMA = float(
-        os.getenv("FORECAST_SIGMA_MULTIPLIER", "1.25")
-    )
-
     ############################################################
 
     def __init__(self):
@@ -119,6 +116,8 @@ class InferencePipeline:
         self.drift_detector = DriftDetector()
         self.breaker = CircuitBreaker()
 
+        self.distribution = DistributionForecaster()
+
         self.schema_sig = get_schema_signature()
 
         self._validate_models_loaded()
@@ -132,8 +131,6 @@ class InferencePipeline:
         if not hasattr(model, "predict_proba"):
             raise RuntimeError("Loaded model is not a classifier.")
 
-    ############################################################
-    # SAFE FEATURE EXTRACTION
     ############################################################
 
     def _extract_features(self, latest_row):
@@ -159,8 +156,6 @@ class InferencePipeline:
         return arr
 
     ############################################################
-    # PROBABILITY SAFETY
-    ############################################################
 
     def _safe_probability(self, prob):
 
@@ -168,32 +163,6 @@ class InferencePipeline:
             raise RuntimeError("Model produced invalid probability.")
 
         return float(np.clip(prob, 0.001, 0.999))
-
-    ############################################################
-    # DISTRIBUTION BUILDER (VERY IMPORTANT)
-    ############################################################
-
-    def _build_forecast_distribution(
-        self,
-        current_price,
-        prob_up,
-        volatility
-    ):
-        """
-        Converts classifier output into a pseudo-price distribution.
-
-        This is NOT perfect quant modeling,
-        but it is FAR superior to trading raw probabilities.
-        """
-
-        volatility = max(volatility, 1e-6)
-
-        move = current_price * volatility * self.FORECAST_SIGMA
-
-        forecast_up = current_price + (move * prob_up)
-        forecast_down = current_price - (move * (1 - prob_up))
-
-        return forecast_up, forecast_down
 
     ############################################################
 
@@ -288,17 +257,30 @@ class InferencePipeline:
             PREDICTION_CLASS_PROBABILITY.set(prob_up)
 
             ####################################################
-            # BUILD DISTRIBUTION
+            # BUILD DISTRIBUTION (ELITE UPGRADE)
             ####################################################
 
             current_price = float(latest["close"])
             volatility = float(latest.get("volatility", 0.02))
 
-            forecast_up, forecast_down = \
-                self._build_forecast_distribution(
+            try:
+
+                recent_prices = price_df["close"].tail(60).tolist()
+
+                lstm_forecast = self.models.lstm_forecast(recent_prices)
+
+                surface = self.distribution.from_lstm(
                     current_price,
-                    prob_up,
-                    volatility
+                    lstm_forecast
+                )
+
+            except Exception:
+                logger.warning("Falling back to volatility distribution.")
+
+                surface = self.distribution.from_volatility(
+                    current_price,
+                    volatility,
+                    prob_up
                 )
 
             ####################################################
@@ -308,8 +290,8 @@ class InferencePipeline:
             decision = self.decision_engine.generate(
                 ticker=ticker,
                 current_price=current_price,
-                forecast_up=forecast_up,
-                forecast_down=forecast_down,
+                forecast_up=surface["p90"],
+                forecast_down=surface["p10"],
                 prob_up=prob_up,
                 volatility=volatility,
                 regime=None
