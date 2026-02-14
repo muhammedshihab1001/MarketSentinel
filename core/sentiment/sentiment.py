@@ -4,7 +4,6 @@ import numpy as np
 import logging
 import os
 import threading
-import re
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from core.config.env_loader import init_env, get_bool
@@ -17,7 +16,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 ############################################################
-# FINBERT SINGLETON (PRODUCTION SAFE)
+# FINBERT SINGLETON (AUTO DOWNLOAD + OFFLINE SAFE)
 ############################################################
 
 class FinBERTSingleton:
@@ -26,17 +25,52 @@ class FinBERTSingleton:
     _model = None
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     _lock = threading.Lock()
-    _failed = False   # 🔥 prevents retry storm
+    _failed = False
 
     MODEL_PATH = os.getenv(
         "FINBERT_PATH",
         "artifacts/nlp/finbert"
     )
 
+    HF_MODEL = "ProsusAI/finbert"
+
     USE_FP16 = torch.cuda.is_available() and get_bool(
         "ENABLE_FP16",
         True
     )
+
+    ########################################################
+
+    @classmethod
+    def _download_once(cls):
+
+        logger.warning("FinBERT not found locally → downloading from HuggingFace.")
+
+        os.makedirs(cls.MODEL_PATH, exist_ok=True)
+
+        try:
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                cls.HF_MODEL
+            )
+
+            model = AutoModelForSequenceClassification.from_pretrained(
+                cls.HF_MODEL
+            )
+
+            tokenizer.save_pretrained(cls.MODEL_PATH)
+            model.save_pretrained(cls.MODEL_PATH)
+
+            logger.warning("FinBERT downloaded and cached locally.")
+
+        except Exception as e:
+
+            cls._failed = True
+
+            raise RuntimeError(
+                "FinBERT auto-download failed. "
+                "Check internet or HuggingFace access."
+            ) from e
 
     ########################################################
 
@@ -54,14 +88,14 @@ class FinBERTSingleton:
             if cls._model is not None:
                 return cls._tokenizer, cls._model, cls._device
 
-            if not os.path.exists(cls.MODEL_PATH):
-                cls._failed = True
-                raise RuntimeError(
-                    f"FinBERT artifact missing at {cls.MODEL_PATH}. "
-                    "Download once on an internet machine."
-                )
+            ###################################################
+            # AUTO DOWNLOAD
+            ###################################################
 
-            logger.info("Loading FinBERT from local artifact → %s", cls.MODEL_PATH)
+            if not os.path.exists(cls.MODEL_PATH):
+                cls._download_once()
+
+            logger.info("Loading FinBERT → %s", cls.MODEL_PATH)
             logger.info("Device → %s", cls._device)
 
             torch.set_grad_enabled(False)
@@ -83,7 +117,9 @@ class FinBERTSingleton:
                 )
 
             except Exception as e:
+
                 cls._failed = True
+
                 raise RuntimeError(
                     "FinBERT failed to load from disk."
                 ) from e
@@ -108,13 +144,13 @@ class FinBERTSingleton:
             cls._tokenizer = tokenizer
             cls._model = model
 
-            logger.info("FinBERT READY (offline mode).")
+            logger.info("FinBERT READY.")
 
             return cls._tokenizer, cls._model, cls._device
 
 
 ############################################################
-# SENTIMENT ANALYZER (FAILSAFE)
+# SENTIMENT ANALYZER
 ############################################################
 
 class SentimentAnalyzer:
@@ -127,13 +163,6 @@ class SentimentAnalyzer:
 
     BATCH_SIZE = 32 if torch.cuda.is_available() else 16
     MAX_HEADLINE_CHARS = 300
-
-    MIN_CONFIDENCE = 0.55
-    MAX_FAILURE_RATE = 0.40
-
-    MIN_NEWS_PER_DAY = 3
-    STD_FLOOR = 0.03
-    SENTIMENT_EMBARGO_HOURS = 2
 
     RNG = np.random.default_rng(42)
 
@@ -148,16 +177,29 @@ class SentimentAnalyzer:
             self.available = True
             self._warmup()
 
-        except Exception as e:
+        except Exception:
 
             logger.warning(
-                "FinBERT unavailable → neutral sentiment fallback enabled."
+                "FinBERT unavailable → neutral fallback enabled."
             )
 
             self.available = False
             self.tokenizer = None
             self.model = None
             self.device = None
+
+    ############################################################
+
+    def _warmup(self):
+
+        if not self.available:
+            return
+
+        try:
+            dummy = ["market stable"] * self.BATCH_SIZE
+            self.analyze_batch(dummy)
+        except Exception:
+            logger.warning("FinBERT warmup skipped.")
 
     ############################################################
 
@@ -177,86 +219,6 @@ class SentimentAnalyzer:
                 0.03, 0.08, n
             ).astype("float32")
         })
-
-    ############################################################
-
-    def _warmup(self):
-        if not self.available:
-            return
-
-        try:
-            dummy = ["market stable"] * self.BATCH_SIZE
-            self.analyze_batch(dummy)
-        except Exception:
-            logger.warning("FinBERT warmup skipped.")
-
-    ############################################################
-
-    def aggregate_daily_sentiment(self, df):
-
-        if not self.available:
-            return self._neutral_sentiment_frame(
-                pd.Timestamp.utcnow() - pd.Timedelta(days=30),
-                pd.Timestamp.utcnow()
-            )
-
-        if df is None or df.empty:
-            return self._neutral_sentiment_frame(
-                pd.Timestamp.utcnow() - pd.Timedelta(days=30),
-                pd.Timestamp.utcnow()
-            )
-
-        working = df.copy()
-
-        working["published_at"] = pd.to_datetime(
-            working["published_at"],
-            utc=True,
-            errors="coerce"
-        )
-
-        working = working.dropna(subset=["published_at"])
-
-        embargo_cutoff = pd.Timestamp.utcnow() - pd.Timedelta(
-            hours=self.SENTIMENT_EMBARGO_HOURS
-        )
-
-        working = working[
-            working["published_at"] <= embargo_cutoff
-        ]
-
-        if working.empty:
-            return self._neutral_sentiment_frame(
-                pd.Timestamp.utcnow() - pd.Timedelta(days=30),
-                pd.Timestamp.utcnow()
-            )
-
-        working["score"] = pd.to_numeric(
-            working["score"],
-            errors="coerce"
-        )
-
-        working = working.replace(
-            [np.inf, -np.inf],
-            np.nan
-        ).dropna(subset=["score"])
-
-        working["score"] = working["score"].clip(-1.0, 1.0)
-
-        working["date"] = working["published_at"].dt.floor("D")
-
-        aggregated = working.groupby("date")["score"].agg(
-            avg_sentiment="mean",
-            sentiment_std="std",
-            news_count="count"
-        ).reset_index()
-
-        aggregated["sentiment_std"] = (
-            aggregated["sentiment_std"]
-            .fillna(self.STD_FLOOR)
-            .clip(lower=self.STD_FLOOR)
-        )
-
-        return aggregated.sort_values("date").reset_index(drop=True)
 
     ############################################################
 
