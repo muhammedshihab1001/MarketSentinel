@@ -25,9 +25,10 @@ class RegimeConfig:
     MAX_DAILY_RETURN: float = 0.60
 
     MIN_SURVIVAL_RATIO: float = 0.6
-
-    # NEW — institutional panic guard
     MAX_CRISIS_RATIO: float = 0.65
+
+    # NEW — prevents regime flip noise
+    HYSTERESIS_BUFFER: float = 0.003
 
 
 class MarketRegimeDetector:
@@ -47,7 +48,7 @@ class MarketRegimeDetector:
             )
 
     ########################################################
-    # PERSISTENCE FILTER
+    # INSTITUTIONAL PERSISTENCE + HYSTERESIS
     ########################################################
 
     def _apply_persistence(self, regimes):
@@ -68,11 +69,7 @@ class MarketRegimeDetector:
             if new not in self.VALID_REGIMES:
                 new = "SIDEWAYS"
 
-            if current is None:
-                current = new
-                confirmed[i] = current
-                continue
-
+            # crisis overrides everything
             if new == "CRISIS":
                 current = "CRISIS"
                 candidate = None
@@ -80,22 +77,30 @@ class MarketRegimeDetector:
                 confirmed[i] = current
                 continue
 
-            if new == current:
-                candidate = None
-                streak = 0
+            if current is None:
+                current = new
                 confirmed[i] = current
                 continue
 
-            if candidate == new:
-                streak += 1
-            else:
-                candidate = new
-                streak = 1
+            # hysteresis — prevent flip noise
+            if (
+                new != current
+                and new != "CRISIS"
+                and current != "CRISIS"
+            ):
+                if candidate == new:
+                    streak += 1
+                else:
+                    candidate = new
+                    streak = 1
 
-            if streak >= cfg.persistence_days:
-                current = candidate
-                candidate = None
-                streak = 0
+                if streak >= cfg.persistence_days:
+                    current = candidate
+                    candidate = None
+                    streak = 0
+
+                confirmed[i] = current
+                continue
 
             confirmed[i] = current
 
@@ -114,53 +119,48 @@ class MarketRegimeDetector:
             df = df.sort_values("date").copy()
             self._assert_monotonic(df)
 
-            if df["close"].isna().any():
-                raise RuntimeError("NaN close prices")
+            close = pd.to_numeric(df["close"], errors="raise")
 
-            if not np.isfinite(df["close"]).all():
+            if not np.isfinite(close).all():
                 raise RuntimeError("Non-finite prices")
 
-            if (df["close"] <= 0).any():
+            if (close <= 0).any():
                 raise RuntimeError("Non-positive prices")
 
             ###################################################
-            # LEAK-SAFE RETURNS
+            # TRUE NO-LEAK RETURNS
             ###################################################
 
-            raw_returns = df["close"].pct_change()
+            shifted_close = close.shift(1)
+            returns = shifted_close.pct_change()
 
-            if raw_returns.abs().max() > cfg.MAX_DAILY_RETURN:
+            if returns.abs().max() > cfg.MAX_DAILY_RETURN:
                 raise RuntimeError("Unrealistic returns")
 
-            returns = raw_returns.shift(1)
-
-            shifted = df["close"].shift(1)
-
             ###################################################
-            # 🔥 INSTITUTIONAL FIX — DOUBLE LAG ROLLING
+            # DOUBLE LAG ROLLING
             ###################################################
 
-            ma_long = shifted.rolling(
-                cfg.trend_window,
-                min_periods=cfg.trend_window
-            ).mean().shift(1)
-
-            volatility = (
-                returns
-                .rolling(
-                    cfg.volatility_window,
-                    min_periods=cfg.volatility_window
-                )
-                .std()
+            ma_long = (
+                shifted_close
+                .rolling(cfg.trend_window,
+                         min_periods=cfg.trend_window)
+                .mean()
                 .shift(1)
             )
 
-            volatility = volatility.clip(lower=cfg.EPSILON)
+            volatility = (
+                returns
+                .rolling(cfg.volatility_window,
+                         min_periods=cfg.volatility_window)
+                .std()
+                .shift(1)
+            ).clip(lower=cfg.EPSILON)
 
             safe_ma = ma_long.replace(0, np.nan)
 
             trend_dev = (
-                (shifted - safe_ma) /
+                (shifted_close - safe_ma) /
                 (safe_ma + cfg.EPSILON)
             )
 
@@ -173,14 +173,14 @@ class MarketRegimeDetector:
             bull = (
                 ready &
                 ~crisis &
-                (trend_dev > cfg.trend_buffer) &
+                (trend_dev > (cfg.trend_buffer + cfg.HYSTERESIS_BUFFER)) &
                 (volatility < cfg.bull_vol_threshold)
             )
 
             bear = (
                 ready &
                 ~crisis &
-                (trend_dev < -cfg.trend_buffer) &
+                (trend_dev < -(cfg.trend_buffer + cfg.HYSTERESIS_BUFFER)) &
                 (volatility > cfg.bear_vol_threshold)
             )
 
@@ -200,11 +200,12 @@ class MarketRegimeDetector:
             warmup = max(
                 cfg.trend_window,
                 cfg.volatility_window
-            ) + cfg.persistence_days + 2
+            ) + cfg.persistence_days + 5
 
-            df = df.iloc[warmup:].copy()
+            if len(df) <= warmup:
+                return None
 
-            return df
+            return df.iloc[warmup:].copy()
 
         except Exception as e:
 
@@ -232,13 +233,16 @@ class MarketRegimeDetector:
             regime_counts.sum(axis=1)
         )
 
-        if (crisis_ratio > self.config.MAX_CRISIS_RATIO).any():
-            raise RuntimeError(
-                "Market-wide crisis detected — trading unsafe."
-            )
+        ###################################################
+        # INSTITUTIONAL FIX — NEVER CRASH PIPELINE
+        ###################################################
 
-        # 🔥 FIX — SHIFT MARKET REGIME
-        market_regime = regime_counts.idxmax(axis=1).shift(1)
+        market_regime = regime_counts.idxmax(axis=1)
+
+        market_regime[crisis_ratio > self.config.MAX_CRISIS_RATIO] = "CRISIS"
+
+        # shift to prevent lookahead
+        market_regime = market_regime.shift(1)
 
         return market_regime.rename("market_regime")
 
@@ -264,7 +268,13 @@ class MarketRegimeDetector:
             ["ticker", "date"]
         ).groupby("ticker", sort=False):
 
-            if len(slice_df) < 300:
+            min_required = (
+                self.config.trend_window +
+                self.config.volatility_window +
+                self.config.persistence_days + 10
+            )
+
+            if len(slice_df) < min_required:
                 continue
 
             detected = self._detect_single_asset(slice_df)
