@@ -19,16 +19,12 @@ class ModelRegistry:
 
     LOCK_TIMEOUT_SECONDS = 600
 
-    ########################################################
-    # FIX — artifact specific minimum sizes
-    ########################################################
-
     MIN_ARTIFACT_BYTES = {
         ".pkl": 50_000,
         ".keras": 100_000,
         ".joblib": 50_000,
         ".bin": 50_000,
-        ".json": 1_000,  # metadata is small
+        ".json": 1_000,
     }
 
     DEFAULT_MIN_BYTES = 10_000
@@ -40,6 +36,48 @@ class ModelRegistry:
         ts = datetime.datetime.utcnow().strftime("v%Y_%m_%d_%H%M%S")
         suffix = uuid.uuid4().hex[:6]
         return f"{ts}_{suffix}"
+
+    ########################################################
+    # PROMOTION LOCK
+    ########################################################
+
+    @staticmethod
+    def _acquire_lock(base_dir: str):
+
+        lock_path = os.path.join(base_dir, ModelRegistry.PROMOTION_LOCK)
+
+        start = time.time()
+
+        while True:
+
+            try:
+                fd = os.open(
+                    lock_path,
+                    os.O_CREAT | os.O_EXCL | os.O_RDWR
+                )
+
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+
+                return lock_path
+
+            except FileExistsError:
+
+                if time.time() - start > ModelRegistry.LOCK_TIMEOUT_SECONDS:
+                    raise RuntimeError(
+                        "Promotion lock timeout — possible dead registry."
+                    )
+
+                time.sleep(1.5)
+
+    @staticmethod
+    def _release_lock(lock_path: str):
+
+        try:
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+        except Exception:
+            pass
 
     ########################################################
 
@@ -157,15 +195,13 @@ class ModelRegistry:
         ModelRegistry._fsync_dir(parent)
 
     ########################################################
-    # VERIFY ARTIFACTS (FIXED)
-    ########################################################
 
     @staticmethod
     def verify_artifacts(base_dir: str, version: str):
 
         version_dir = ModelRegistry._safe_join(base_dir, version)
 
-        manifest_path = os.path.join(
+        manifest_path = ModelRegistry._safe_join(
             version_dir,
             ModelRegistry.MANIFEST_NAME
         )
@@ -186,7 +222,10 @@ class ModelRegistry:
 
         for artifact, expected_hash in manifest["artifacts"].items():
 
-            artifact_path = os.path.join(version_dir, artifact)
+            artifact_path = ModelRegistry._safe_join(
+                version_dir,
+                artifact
+            )
 
             if os.path.islink(artifact_path):
                 raise RuntimeError("Symlinked artifact detected.")
@@ -214,8 +253,6 @@ class ModelRegistry:
                 )
 
     ########################################################
-    # REGISTER MODEL
-    ########################################################
 
     @staticmethod
     def register_model(
@@ -228,86 +265,91 @@ class ModelRegistry:
         base_dir = os.path.realpath(base_dir)
         os.makedirs(base_dir, exist_ok=True)
 
-        meta = MetadataManager.load_metadata(metadata_path)
-        ModelRegistry._validate_metadata_structure(meta)
-
-        version = ModelRegistry._version()
-
-        version_dir = ModelRegistry._safe_join(base_dir, version)
-        staging_dir = version_dir + ".staging"
-
-        os.makedirs(staging_dir, exist_ok=False)
+        lock = ModelRegistry._acquire_lock(base_dir)
 
         try:
 
-            model_name = os.path.basename(model_path)
-            metadata_name = os.path.basename(metadata_path)
+            meta = MetadataManager.load_metadata(metadata_path)
+            ModelRegistry._validate_metadata_structure(meta)
 
-            staged_model = os.path.join(staging_dir, model_name)
-            staged_meta = os.path.join(staging_dir, metadata_name)
+            version = ModelRegistry._version()
 
-            shutil.copy2(model_path, staged_model)
-            shutil.copy2(metadata_path, staged_meta)
+            version_dir = ModelRegistry._safe_join(base_dir, version)
+            staging_dir = version_dir + ".staging"
 
-            if ModelRegistry._sha256(model_path) != \
-               ModelRegistry._sha256(staged_model):
-                raise RuntimeError("Model hash mismatch after copy.")
+            os.makedirs(staging_dir, exist_ok=False)
 
-            if ModelRegistry._sha256(metadata_path) != \
-               ModelRegistry._sha256(staged_meta):
-                raise RuntimeError("Metadata hash mismatch after copy.")
+            try:
 
-            manifest: Dict[str, Any] = {
+                model_name = os.path.basename(model_path)
+                metadata_name = os.path.basename(metadata_path)
 
-                "version": version,
-                "created_utc": datetime.datetime.utcnow().isoformat(),
-                "stage": "candidate",
-                "parent": parent_version,
+                staged_model = os.path.join(staging_dir, model_name)
+                staged_meta = os.path.join(staging_dir, metadata_name)
 
-                "dataset_hash": meta["dataset_hash"],
-                "schema_signature": meta["schema_signature"],
-                "training_code_hash": meta["training_code_hash"],
-                "training_window": meta["training_window"],
+                shutil.copy2(model_path, staged_model)
+                shutil.copy2(metadata_path, staged_meta)
 
-                "universe_hash":
-                    meta["training_universe"]["universe_hash"],
+                # revalidate metadata after copy
+                copied_meta = MetadataManager.load_metadata(staged_meta)
+                ModelRegistry._validate_metadata_structure(copied_meta)
 
-                "metadata_type": meta["metadata_type"],
+                ModelRegistry._fsync_dir(staging_dir)
 
-                "artifacts": {
-                    model_name: ModelRegistry._sha256(staged_model),
-                    metadata_name: ModelRegistry._sha256(staged_meta),
-                },
+                manifest: Dict[str, Any] = {
 
-                "history": []
-            }
+                    "version": version,
+                    "created_utc": datetime.datetime.utcnow().isoformat(),
+                    "stage": "candidate",
+                    "parent": parent_version,
 
-            manifest["manifest_integrity_hash"] = (
-                ModelRegistry._manifest_hash(manifest)
-            )
+                    "dataset_hash": meta["dataset_hash"],
+                    "schema_signature": meta["schema_signature"],
+                    "training_code_hash": meta["training_code_hash"],
+                    "training_window": meta["training_window"],
 
-            manifest_path = os.path.join(
-                staging_dir,
-                ModelRegistry.MANIFEST_NAME
-            )
+                    "universe_hash":
+                        meta["training_universe"]["universe_hash"],
 
-            ModelRegistry._atomic_json_write(
-                manifest_path,
-                manifest
-            )
+                    "metadata_type": meta["metadata_type"],
 
-            os.replace(staging_dir, version_dir)
+                    "artifacts": {
+                        model_name: ModelRegistry._sha256(staged_model),
+                        metadata_name: ModelRegistry._sha256(staged_meta),
+                    },
 
-            ModelRegistry._fsync_dir(base_dir)
-            ModelRegistry._fsync_dir(version_dir)
+                    "history": []
+                }
 
-            ModelRegistry.verify_artifacts(base_dir, version)
+                manifest["manifest_integrity_hash"] = (
+                    ModelRegistry._manifest_hash(manifest)
+                )
 
-            return version
+                manifest_path = os.path.join(
+                    staging_dir,
+                    ModelRegistry.MANIFEST_NAME
+                )
 
-        except Exception:
+                ModelRegistry._atomic_json_write(
+                    manifest_path,
+                    manifest
+                )
 
-            if os.path.exists(staging_dir):
-                shutil.rmtree(staging_dir, ignore_errors=True)
+                os.replace(staging_dir, version_dir)
 
-            raise
+                ModelRegistry._fsync_dir(base_dir)
+                ModelRegistry._fsync_dir(version_dir)
+
+                ModelRegistry.verify_artifacts(base_dir, version)
+
+                return version
+
+            except Exception:
+
+                if os.path.exists(staging_dir):
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+
+                raise
+
+        finally:
+            ModelRegistry._release_lock(lock)
