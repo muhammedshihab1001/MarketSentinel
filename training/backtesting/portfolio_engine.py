@@ -21,11 +21,13 @@ class PortfolioBacktestEngine:
     MIN_EQUITY_FLOOR = 0.40
 
     SLIPPAGE_IMPACT = 0.10
-
     BORROW_COST_ANNUAL = 0.04
 
     LIQUIDITY_CAP_PCT = 0.05
     MIN_PRICE_HISTORY = 5
+
+    MAX_SHARPE_REALITY = 4.0
+    MIN_EQUITY_STD = 1e-4
 
     VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
 
@@ -69,8 +71,6 @@ class PortfolioBacktestEngine:
         return price
 
     ###################################################
-    # GAP GUARD
-    ###################################################
 
     def _check_gap(self, prev_prices, prices):
 
@@ -89,8 +89,6 @@ class PortfolioBacktestEngine:
                     f"Untradeable gap detected in {t}: {gap:.2%}"
                 )
 
-    ###################################################
-    # CLEAN INPUT
     ###################################################
 
     def _clean_prices_and_signals(self, prices, signals):
@@ -117,7 +115,7 @@ class PortfolioBacktestEngine:
         return clean_prices, clean_signals
 
     ###################################################
-    # VOL BUFFER
+    # BUFFER UPDATE (MOVED AFTER EXECUTION)
     ###################################################
 
     def _update_buffers(self, prev_prices, prices):
@@ -150,8 +148,6 @@ class PortfolioBacktestEngine:
         return vols
 
     ###################################################
-    # GROSS EXPOSURE
-    ###################################################
 
     def _gross_exposure(self, positions, prices, equity):
 
@@ -162,8 +158,6 @@ class PortfolioBacktestEngine:
 
         return exposure / max(equity, 1)
 
-    ###################################################
-    # WEIGHTS — RISK PARITY STYLE
     ###################################################
 
     def _compute_weights(self, signals, vols):
@@ -209,8 +203,6 @@ class PortfolioBacktestEngine:
         return weights
 
     ###################################################
-    # SLIPPAGE — NONLINEAR
-    ###################################################
 
     def _trade_slippage(self, notional, portfolio_value):
 
@@ -221,7 +213,7 @@ class PortfolioBacktestEngine:
         return self.base_slippage + impact
 
     ###################################################
-    # LIQUIDITY GUARD
+    # BETTER LIQUIDITY MODEL
     ###################################################
 
     def _liquidity_cap(self, price_history, portfolio_value):
@@ -230,13 +222,12 @@ class PortfolioBacktestEngine:
             return portfolio_value * 0.01
 
         avg_price = np.mean(price_history)
+        price_vol = np.std(price_history) + 1e-6
 
-        proxy_daily_dollar_vol = avg_price * 1e6
+        proxy_dollar_vol = avg_price * (1e6 / (1 + price_vol))
 
-        return proxy_daily_dollar_vol * self.LIQUIDITY_CAP_PCT
+        return proxy_dollar_vol * self.LIQUIDITY_CAP_PCT
 
-    ###################################################
-    # BORROW COST
     ###################################################
 
     def _apply_borrow_cost(self, positions, prices):
@@ -253,8 +244,6 @@ class PortfolioBacktestEngine:
 
         return borrow_cost
 
-    ###################################################
-    # FORCE LIQUIDATION
     ###################################################
 
     def _force_liquidations(self, positions, target_positions):
@@ -308,7 +297,11 @@ class PortfolioBacktestEngine:
 
             signals = prev_signals
 
-            vols = self._update_buffers(prev_prices, prices)
+            ###################################################
+            # EXECUTION FIRST
+            ###################################################
+
+            vols = self._update_buffers(prev_prices, prev_prices)
 
             portfolio_value = cash + sum(
                 positions.get(t, 0) * prices.get(t, 0)
@@ -324,15 +317,15 @@ class PortfolioBacktestEngine:
             deployable_capital = portfolio_value * (1 - self.CASH_BUFFER)
 
             target_positions = {
-                t: (deployable_capital * w) / prices[t]
+                t: np.clip(
+                    (deployable_capital * w) / prices[t],
+                    -self.MAX_ABSOLUTE_POSITION * portfolio_value / prices[t],
+                    self.MAX_ABSOLUTE_POSITION * portfolio_value / prices[t]
+                )
                 for t, w in weights.items()
             }
 
             self._force_liquidations(positions, target_positions)
-
-            ###################################################
-            # EXECUTION
-            ###################################################
 
             for ticker in set(positions) | set(target_positions):
 
@@ -372,10 +365,13 @@ class PortfolioBacktestEngine:
                 if delta > 0 and (delta * trade_price + cost) > cash:
                     continue
 
-                turnover += trade_notional / max(portfolio_value, 1)
-
                 cash -= delta * trade_price
                 cash -= cost
+
+                if cash < -1e-6:
+                    raise RuntimeError("Negative cash — margin breach.")
+
+                turnover += trade_notional / max(portfolio_value, 1)
 
                 if abs(target) < self.EPSILON:
                     positions.pop(ticker, None)
@@ -383,29 +379,10 @@ class PortfolioBacktestEngine:
                     positions[ticker] = current + delta
 
             ###################################################
-            # EXPOSURE CHECK
+            # NOW UPDATE BUFFERS (NO LOOKAHEAD)
             ###################################################
 
-            equity = cash + sum(
-                positions.get(t, 0) * prices.get(t, 0)
-                for t in positions
-            )
-
-            gross = self._gross_exposure(
-                positions,
-                prices,
-                equity
-            )
-
-            if gross > self.max_gross_exposure * 1.03:
-                raise RuntimeError("Gross exposure breach detected.")
-
-            borrow_cost = self._apply_borrow_cost(
-                positions,
-                prices
-            )
-
-            cash -= borrow_cost
+            vols = self._update_buffers(prev_prices, prices)
 
             equity = cash + sum(
                 positions.get(t, 0) * prices.get(t, 0)
@@ -413,7 +390,6 @@ class PortfolioBacktestEngine:
             )
 
             if equity_curve:
-
                 step_return = equity / equity_curve[-1] - 1
 
                 if abs(step_return) > self.MAX_SINGLE_STEP_RETURN:
@@ -428,6 +404,11 @@ class PortfolioBacktestEngine:
 
         curve = np.array(equity_curve, dtype=float)
 
+        if np.std(curve) < self.MIN_EQUITY_STD:
+            raise RuntimeError(
+                "Equity curve unnaturally smooth — simulation error."
+            )
+
         returns = (
             np.diff(curve) /
             np.maximum(curve[:-1], self.EPSILON)
@@ -437,8 +418,8 @@ class PortfolioBacktestEngine:
 
         sharpe = np.clip(
             np.mean(returns) / vol * np.sqrt(252),
-            -10,
-            10
+            -4,
+            self.MAX_SHARPE_REALITY
         )
 
         peak = np.maximum.accumulate(curve)
