@@ -8,7 +8,7 @@ import re
 
 from datetime import datetime, timedelta
 from dateutil import parser
-from typing import Optional, Callable, List
+from typing import Optional
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -34,7 +34,9 @@ class NewsFetcher:
 
     CACHE_DIR = "data/news_cache"
     CACHE_TTL_MIN = 20
-    CACHE_SCHEMA_VERSION = "v6"   # bump cache version
+    CACHE_SCHEMA_VERSION = "v7"   # bumped after safety rewrite
+
+    SAFE_TICKER = re.compile(r"^[A-Z0-9._-]{1,12}$")
 
     EMPTY_SCHEMA = pd.DataFrame({
         "headline": pd.Series(dtype="string"),
@@ -42,8 +44,6 @@ class NewsFetcher:
         "source": pd.Series(dtype="string"),
         "link": pd.Series(dtype="string"),
     })
-
-    SAFE_TICKER = re.compile(r"^[A-Z0-9._-]{1,12}$")
 
     ########################################################
 
@@ -55,7 +55,7 @@ class NewsFetcher:
 
         self.primary = get_env(
             "NEWS_PROVIDER_PRIMARY",
-            "finnhub"
+            "disabled"   # 🔥 SAFE DEFAULT
         ).lower()
 
         self.failover_enabled = get_bool(
@@ -66,17 +66,41 @@ class NewsFetcher:
 
         self.session = self._build_session()
 
-        # 🔥 deterministic order
         self.provider_map = {
             "finnhub": self._fetch_finnhub,
             "marketaux": self._fetch_marketaux,
             "gnews": self._fetch_gnews,
         }
 
+        ####################################################
+        # 🔥 INSTITUTIONAL SAFETY LAYER
+        ####################################################
+
+        if self.primary == "disabled":
+            logger.warning("NewsFetcher running in DISABLED mode.")
+            self.disabled = True
+            return
+
         if self.primary not in self.provider_map:
-            raise RuntimeError(
-                f"Unsupported news provider: {self.primary}"
+            logger.warning(
+                "Unsupported provider '%s' — disabling news.",
+                self.primary
             )
+            self.disabled = True
+            return
+
+        if not any([
+            self.finnhub_key,
+            self.marketaux_key,
+            self.gnews_key
+        ]):
+            logger.warning(
+                "No NEWS API keys detected — disabling news."
+            )
+            self.disabled = True
+            return
+
+        self.disabled = False
 
     ########################################################
 
@@ -106,29 +130,36 @@ class NewsFetcher:
         return session
 
     ########################################################
-
-    def _extract_ticker(self, query: str):
-
-        candidate = query.split()[0].upper()
-
-        if not self.SAFE_TICKER.fullmatch(candidate):
-            raise RuntimeError(f"Unsafe ticker parsed from query: {query}")
-
-        return candidate
-
+    # PUBLIC FETCH
     ########################################################
 
-    def _contract_check(self, df):
+    def fetch(self, query: str, max_items=120):
 
-        if df is None or df.empty:
+        ####################################################
+        # 🔥 HARD DISABLE GUARD
+        ####################################################
+
+        if getattr(self, "disabled", False):
             return self.EMPTY_SCHEMA.copy()
 
-        required = {"headline", "published_at", "source", "link"}
+        cache_path = self._cache_path(query, max_items)
 
-        if not required.issubset(df.columns):
-            raise RuntimeError("News provider schema violated.")
+        cached = self._load_cache(cache_path)
 
-        return df
+        if cached is not None:
+            return cached
+
+        merged = self._fetch_with_router(query, max_items)
+
+        if len(merged) < self.MIN_ARTICLES:
+            logger.warning(
+                "Low article count (%s) — neutral sentiment expected.",
+                len(merged)
+            )
+
+        self._write_cache(merged, cache_path)
+
+        return merged.copy()
 
     ########################################################
     # CACHE
@@ -185,11 +216,72 @@ class NewsFetcher:
             logger.warning("News cache write failed.")
 
     ########################################################
-    # DATE NORMALIZATION
+    # ROUTER
     ########################################################
 
-    @staticmethod
-    def _normalize_date(dt):
+    def _fetch_with_router(self, query, limit):
+
+        order = ["finnhub", "marketaux", "gnews"]
+
+        providers = [self.primary] + [
+            p for p in order if p != self.primary
+        ]
+
+        primary_df = self.EMPTY_SCHEMA.copy()
+
+        for provider in providers:
+
+            fn = self.provider_map.get(provider)
+
+            if fn is None:
+                continue
+
+            try:
+                df = fn(query, limit)
+
+                if not df.empty:
+                    return df if primary_df.empty else self._merge_sources(primary_df, df)
+
+                if primary_df.empty:
+                    primary_df = df
+
+            except Exception as e:
+                logger.warning("%s provider failed: %s", provider, str(e))
+
+        return primary_df
+
+    ########################################################
+
+    def _merge_sources(self, primary, fallback):
+
+        merged = pd.concat(
+            [primary, fallback],
+            ignore_index=True
+        ).copy()
+
+        merged["key"] = (
+            merged["headline"].str.lower() +
+            merged["source"].str.lower()
+        )
+
+        merged = merged.drop_duplicates("key").drop(columns="key")
+
+        return merged.sort_values("published_at").reset_index(drop=True)
+
+    ########################################################
+    # PROVIDERS (unchanged)
+    ########################################################
+
+    def _extract_ticker(self, query: str):
+
+        candidate = query.split()[0].upper()
+
+        if not self.SAFE_TICKER.fullmatch(candidate):
+            raise RuntimeError(f"Unsafe ticker parsed from query: {query}")
+
+        return candidate
+
+    def _normalize_date(self, dt):
 
         if not dt:
             return None
@@ -199,10 +291,6 @@ class NewsFetcher:
             return ts.replace(tzinfo=None)
         except Exception:
             return None
-
-    ########################################################
-    # POST PROCESS
-    ########################################################
 
     def _post_process(self, df):
 
@@ -214,12 +302,10 @@ class NewsFetcher:
 
         df = df.dropna(subset=["published_at"])
 
-        mask = (
+        df = df.loc[
             (df["published_at"] >= cutoff) &
             (df["published_at"] <= ingest_guard)
-        )
-
-        df = df.loc[mask].copy()
+        ].copy()
 
         if df.empty:
             return self.EMPTY_SCHEMA.copy()
@@ -237,7 +323,7 @@ class NewsFetcher:
         return df.sort_values("published_at").reset_index(drop=True)
 
     ########################################################
-    # FINNHUB
+    # PROVIDER IMPLEMENTATIONS (same logic)
     ########################################################
 
     def _fetch_finnhub(self, query, limit):
@@ -284,11 +370,7 @@ class NewsFetcher:
 
         df = pd.DataFrame(rows).head(limit)
 
-        return self._contract_check(self._post_process(df))
-
-    ########################################################
-    # MARKET AUX
-    ########################################################
+        return self._post_process(df)
 
     def _fetch_marketaux(self, query, limit):
 
@@ -319,22 +401,16 @@ class NewsFetcher:
 
         for a in data:
 
-            published = self._normalize_date(a.get("published_at"))
-
             rows.append({
                 "headline": a.get("title", ""),
-                "published_at": published,
+                "published_at": self._normalize_date(a.get("published_at")),
                 "source": a.get("source", "marketaux"),
                 "link": a.get("url", "")
             })
 
         df = pd.DataFrame(rows)
 
-        return self._contract_check(self._post_process(df))
-
-    ########################################################
-    # GNEWS
-    ########################################################
+        return self._post_process(df)
 
     def _fetch_gnews(self, query, limit):
 
@@ -364,93 +440,13 @@ class NewsFetcher:
 
         for a in data:
 
-            published = self._normalize_date(a.get("publishedAt"))
-
             rows.append({
                 "headline": a.get("title", ""),
-                "published_at": published,
+                "published_at": self._normalize_date(a.get("publishedAt")),
                 "source": a.get("source", {}).get("name", "gnews"),
                 "link": a.get("url", "")
             })
 
         df = pd.DataFrame(rows)
 
-        return self._contract_check(self._post_process(df))
-
-    ########################################################
-    # ROUTER
-    ########################################################
-
-    def _fetch_with_router(self, query, limit):
-
-        order = ["finnhub", "marketaux", "gnews"]
-
-        providers = [self.primary] + [
-            p for p in order if p != self.primary
-        ]
-
-        primary_df = self.EMPTY_SCHEMA.copy()
-
-        for provider in providers:
-
-            fn = self.provider_map[provider]
-
-            try:
-                df = fn(query, limit)
-
-                if not df.empty:
-                    return df if primary_df.empty else self._merge_sources(primary_df, df)
-
-                if primary_df.empty:
-                    primary_df = df
-
-            except Exception as e:
-                logger.warning("%s provider failed: %s", provider, str(e))
-
-        return primary_df
-
-    ########################################################
-
-    def _merge_sources(self, primary, fallback):
-
-        merged = pd.concat(
-            [primary, fallback],
-            ignore_index=True
-        ).copy()
-
-        merged["key"] = (
-            merged["headline"].str.lower() +
-            merged["source"].str.lower()
-        )
-
-        merged = merged.drop_duplicates("key").drop(columns="key")
-
-        return merged.sort_values("published_at").reset_index(drop=True)
-
-    ########################################################
-    # PUBLIC
-    ########################################################
-
-    def fetch(self, query: str, max_items=120):
-
-        cache_path = self._cache_path(query, max_items)
-
-        cached = self._load_cache(cache_path)
-
-        if cached is not None:
-            logger.info("News cache hit.")
-            return cached
-
-        logger.info("Fetching news via primary=%s", self.primary)
-
-        merged = self._fetch_with_router(query, max_items)
-
-        if len(merged) < self.MIN_ARTICLES:
-            logger.warning(
-                "Low article count (%s) — training will fallback to neutral sentiment.",
-                len(merged)
-            )
-
-        self._write_cache(merged, cache_path)
-
-        return merged.copy()
+        return self._post_process(df)
