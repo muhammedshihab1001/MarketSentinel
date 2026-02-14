@@ -116,7 +116,7 @@ def assert_stationary(series: pd.Series):
 
 
 ########################################################
-# DATA CLEANING (NEW — VERY IMPORTANT)
+# DATA CLEANING
 ########################################################
 
 def clean_price_frame(df: pd.DataFrame):
@@ -169,7 +169,7 @@ def load_training_data(
     datasets = {}
     surviving = []
 
-    for ticker in sorted(universe):  # deterministic
+    for ticker in sorted(universe):
 
         try:
 
@@ -204,11 +204,7 @@ def load_training_data(
             "Universe collapse — too few assets survived."
         )
 
-    logger.info(
-        "Survivors=%s/%s",
-        len(datasets),
-        len(universe)
-    )
+    logger.info("Survivors=%s/%s", len(datasets), len(universe))
 
     return datasets, surviving
 
@@ -272,19 +268,22 @@ def train_champion(start_date, end_date):
                 best_metrics = metrics
 
         except Exception as exc:
-
             rejection_log[ticker] = str(exc)
 
     if best_model is None:
         raise RuntimeError("All SARIMAX models rejected.")
 
     ####################################################
-    # DATASET HASH (CHAMPION ONLY — lineage safe)
+    # DATASET HASH
     ####################################################
 
+    champion_df = datasets[best_ticker]
+
     dataset_hash = MetadataManager.fingerprint_dataset(
-        datasets[best_ticker]
+        champion_df
     )
+
+    dataset_rows = len(champion_df)
 
     metadata = MetadataManager.create_metadata(
         model_name="sarimax_trend",
@@ -298,16 +297,12 @@ def train_champion(start_date, end_date):
         training_start=start_date,
         training_end=end_date,
         dataset_hash=dataset_hash,
-        dataset_rows=len(datasets[best_ticker]),
+        dataset_rows=dataset_rows,
         metadata_type="timeseries_manifest_v1",
         extra_fields={
-
             "model_type": "SARIMAX",
             "parameters": best_model.get_params(),
-
-            "surviving_universe": sorted(surviving),
             "survivor_count": len(surviving),
-
             "rejections": rejection_log
         }
     )
