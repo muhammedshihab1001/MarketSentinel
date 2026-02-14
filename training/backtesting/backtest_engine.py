@@ -12,13 +12,18 @@ class BacktestEngine:
     MIN_HOLD_BARS = 2
     REENTRY_COOLDOWN = 1
 
+    MAX_POSITION_SIZE = 0.30      # 🔥 institutional cap
+    MAX_SINGLE_BAR_RETURN = 0.40  # gap / bug protection
+    MAX_GAP = 0.35               # overnight crash guard
+    MAX_TURNOVER = 8.0          # institutional sanity
+
     ############################################################
 
     def _validate_inputs(self, prices, signals, position_size):
 
-        if position_size <= 0 or position_size > 1.0:
+        if position_size <= 0 or position_size > self.MAX_POSITION_SIZE:
             raise RuntimeError(
-                "position_size must be within (0, 1]."
+                f"position_size must be within (0, {self.MAX_POSITION_SIZE}]"
             )
 
         if len(prices) != len(signals):
@@ -40,6 +45,19 @@ class BacktestEngine:
             raise RuntimeError(f"Unknown signals detected: {unknown}")
 
     ############################################################
+    # GAP GUARD
+    ############################################################
+
+    def _check_gap(self, prev_price, price):
+
+        gap = abs(price / prev_price - 1)
+
+        if gap > self.MAX_GAP:
+            raise RuntimeError(
+                f"Untradeable gap detected: {gap:.2%}"
+            )
+
+    ############################################################
 
     def run(
         self,
@@ -48,7 +66,7 @@ class BacktestEngine:
         initial_cash=10_000,
         transaction_cost=0.001,
         slippage=0.0005,
-        position_size=1.0
+        position_size=0.25   # safer default
     ):
 
         self._validate_inputs(prices, signals, position_size)
@@ -68,21 +86,27 @@ class BacktestEngine:
         time_in_market = 0
         capital_rotated = 0.0
 
-        prev_signal = "HOLD"
-
         hold_bars = 0
         cooldown = 0
 
         peak_equity = initial_cash
 
+        prev_price = prices[0]
+
+        ####################################################
+        # EXECUTION LAG — institutional realism
         ####################################################
 
-        for i in range(len(prices)):
+        prev_signal = "HOLD"
+
+        for i in range(1, len(prices)):
 
             price = prices[i]
 
+            self._check_gap(prev_price, price)
+
             ####################################################
-            # EXECUTE PREVIOUS SIGNAL
+            # EXECUTE PREVIOUS SIGNAL (t → t+1)
             ####################################################
 
             if position > 0:
@@ -102,18 +126,16 @@ class BacktestEngine:
 
                 deploy_cash = cash * position_size
 
-                if deploy_cash > self.MIN_CAPITAL:
+                shares = (
+                    deploy_cash * (1 - transaction_cost)
+                ) / execution_price
 
-                    shares = (
-                        deploy_cash * (1 - transaction_cost)
-                    ) / execution_price
+                position = shares
+                cash -= deploy_cash
 
-                    position = shares
-                    cash -= deploy_cash
-
-                    capital_rotated += deploy_cash
-                    trade_count += 1
-                    hold_bars = 0
+                capital_rotated += deploy_cash
+                trade_count += 1
+                hold_bars = 0
 
             elif (
                 prev_signal == "SELL"
@@ -157,12 +179,28 @@ class BacktestEngine:
                 portfolio_values.append(portfolio_value)
                 break
 
+            ####################################################
+            # RETURN CIRCUIT BREAKER
+            ####################################################
+
+            if portfolio_values:
+
+                step_return = (
+                    portfolio_value / portfolio_values[-1] - 1
+                )
+
+                if abs(step_return) > self.MAX_SINGLE_BAR_RETURN:
+                    raise RuntimeError(
+                        "Unrealistic portfolio jump detected."
+                    )
+
             if position > 0:
                 time_in_market += 1
 
             portfolio_values.append(portfolio_value)
 
             prev_signal = signals[i]
+            prev_price = price
 
         ####################################################
         # FORCE LIQUIDATION
@@ -170,7 +208,7 @@ class BacktestEngine:
 
         if position > 0:
 
-            final_price = prices[len(portfolio_values) - 1] * (1 - slippage)
+            final_price = prices[len(portfolio_values)] * (1 - slippage)
 
             cash += position * final_price * (1 - transaction_cost)
             position = 0
@@ -210,6 +248,11 @@ class BacktestEngine:
             capital_rotated / initial_cash
             if initial_cash > 0 else 0.0
         )
+
+        if turnover > self.MAX_TURNOVER:
+            raise RuntimeError(
+                "Turnover exceeds institutional threshold."
+            )
 
         return {
             "final_portfolio": float(portfolio_values[-1]),
