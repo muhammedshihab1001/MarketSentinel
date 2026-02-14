@@ -14,7 +14,12 @@ logger = logging.getLogger("marketsentinel.features")
 
 class FeatureEngineer:
 
-    MIN_ROWS_REQUIRED = 120
+    MIN_ROWS_REQUIRED = 250
+    ABS_FEATURE_LIMIT = 1e5
+    VOL_FLOOR = 1e-4
+    SENTIMENT_STD_FLOOR = 0.02
+    RETURN_CLAMP = (-0.5, 0.5)
+    MERGE_TOLERANCE = pd.Timedelta("2D")
 
     SENTIMENT_COLUMNS = [
         "date",
@@ -23,18 +28,12 @@ class FeatureEngineer:
         "sentiment_std"
     ]
 
-    RETURN_CLAMP = (-0.5, 0.5)
-    MERGE_TOLERANCE = pd.Timedelta("2D")
-
-    VOL_FLOOR = 1e-4
-    SENTIMENT_STD_FLOOR = 0.02
-
     ###################################################
     # DATETIME
     ###################################################
 
     @staticmethod
-    def _normalize_datetime(df: pd.DataFrame):
+    def _normalize_datetime(df):
 
         df = df.copy()
 
@@ -53,16 +52,14 @@ class FeatureEngineer:
     ###################################################
 
     @staticmethod
-    def _enforce_ticker(df: pd.DataFrame, ticker=None):
+    def _enforce_ticker(df, ticker=None):
 
         df = df.copy()
 
         if "ticker" not in df.columns:
 
             if ticker is None:
-                raise RuntimeError(
-                    "Ticker column missing from price dataframe."
-                )
+                raise RuntimeError("Ticker column missing.")
 
             df["ticker"] = ticker
 
@@ -75,10 +72,10 @@ class FeatureEngineer:
     ###################################################
 
     @classmethod
-    def _validate_price_frame(cls, df: pd.DataFrame, ticker=None):
+    def _validate_price_frame(cls, df, ticker=None):
 
         if df is None or df.empty:
-            raise RuntimeError("Price dataframe is empty.")
+            raise RuntimeError("Price dataframe empty.")
 
         df = cls._enforce_ticker(df, ticker)
         df = cls._normalize_datetime(df)
@@ -86,17 +83,17 @@ class FeatureEngineer:
         required = {"date", "close", "ticker"}
 
         if not required.issubset(df.columns):
-            raise RuntimeError("Price dataframe missing required columns.")
+            raise RuntimeError("Price schema violation.")
 
         df = df.sort_values(["ticker", "date"])
 
         if df.duplicated(["ticker", "date"]).any():
-            raise RuntimeError("Duplicate ticker-date detected.")
+            raise RuntimeError("Duplicate timestamps.")
 
         df["close"] = pd.to_numeric(df["close"], errors="raise")
 
         if not np.isfinite(df["close"]).all():
-            raise RuntimeError("Non-finite close prices detected.")
+            raise RuntimeError("Non-finite prices.")
 
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices.")
@@ -129,7 +126,6 @@ class FeatureEngineer:
             .std(ddof=0)
         )
 
-        # 🔥 LAG VOL — prevents target leakage
         df["volatility"] = (
             vol.shift(1)
             .clip(lower=FeatureEngineer.VOL_FLOOR)
@@ -137,7 +133,7 @@ class FeatureEngineer:
         )
 
     ###################################################
-    # TECHNICALS (NO SHIFT — already causal)
+    # TECHNICALS
     ###################################################
 
     @staticmethod
@@ -159,32 +155,26 @@ class FeatureEngineer:
         df["macd_signal"] = signal.clip(-50, 50)
 
     ###################################################
-    # FEATURE ALIGNMENT
+    # GLOBAL SANITIZER (🔥 VERY IMPORTANT)
     ###################################################
 
-    @staticmethod
-    def align_features(df):
+    @classmethod
+    def _sanitize_features(cls, df):
 
-        df = df.copy()
+        feature_block = df.loc[:, MODEL_FEATURES]
 
-        # ONLY shift raw returns + sentiment
-        shift_cols = [
-            "return",
-            "return_lag1",
-            "avg_sentiment",
-            "sentiment_lag1",
-            "news_count",
-            "sentiment_std"
-        ]
+        arr = feature_block.to_numpy()
 
-        for col in shift_cols:
-            if col in df.columns:
-                df[col] = df[col].shift(1)
+        if not np.isfinite(arr).all():
+            raise RuntimeError("Non-finite feature values detected.")
+
+        if np.abs(arr).max() > cls.ABS_FEATURE_LIMIT:
+            raise RuntimeError("Feature explosion detected.")
 
         return df
 
     ###################################################
-    # NEUTRAL SENTIMENT — DETERMINISTIC
+    # NEUTRAL SENTIMENT
     ###################################################
 
     @classmethod
@@ -214,8 +204,9 @@ class FeatureEngineer:
         ticker=None
     ):
 
-        price_df = cls._enforce_ticker(price_df, ticker)
-        price = cls._normalize_datetime(price_df)
+        price = cls._normalize_datetime(
+            cls._enforce_ticker(price_df, ticker)
+        )
 
         if sentiment_df is None or sentiment_df.empty:
             sentiment_df = cls._build_neutral_sentiment(price)
@@ -223,7 +214,6 @@ class FeatureEngineer:
         sentiment = sentiment_df.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment)
 
-        # HARD LOOKAHEAD GUARD
         sentiment["date"] += pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
@@ -249,7 +239,7 @@ class FeatureEngineer:
         return merged
 
     ###################################################
-    # TARGET — LEAK SAFE
+    # TARGET
     ###################################################
 
     @classmethod
@@ -273,8 +263,8 @@ class FeatureEngineer:
 
         df.dropna(inplace=True)
 
-        if len(df) < 100:
-            raise RuntimeError("Feature collapse.")
+        if len(df) < cls.MIN_ROWS_REQUIRED:
+            raise RuntimeError("Feature collapse detected.")
 
         df["target"] = df["target"].astype("int8")
 
@@ -313,12 +303,13 @@ class FeatureEngineer:
             ticker
         )
 
-        df = cls.align_features(df)
-
         df = cls.create_training_dataset(df)
 
-        feature_block = df.loc[:, MODEL_FEATURES]
-        validated = validate_feature_schema(feature_block)
+        df = cls._sanitize_features(df)
+
+        validated = validate_feature_schema(
+            df.loc[:, MODEL_FEATURES]
+        )
 
         allowed = {"date", "close", "target", "ticker"}
 
