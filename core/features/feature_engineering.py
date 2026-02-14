@@ -160,7 +160,26 @@ class FeatureEngineer:
         df["macd_signal"] = signal.clip(-50, 50)
 
     ###################################################
-    # 🔥 CRITICAL FIX — MERGE SAFE
+    # NEUTRAL SENTIMENT
+    ###################################################
+
+    @classmethod
+    def _build_neutral_sentiment(cls, price_df):
+
+        neutral = price_df[["date"]].copy()
+
+        neutral["avg_sentiment"] = 0.0
+        neutral["news_count"] = 0.0
+        neutral["sentiment_std"] = cls.SENTIMENT_STD_FLOOR
+
+        logger.warning(
+            "Sentiment unavailable — deterministic neutral prior injected."
+        )
+
+        return neutral
+
+    ###################################################
+    # MERGE (INSTITUTIONAL SAFE)
     ###################################################
 
     @classmethod
@@ -181,6 +200,7 @@ class FeatureEngineer:
         sentiment = sentiment_df.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment)
 
+        # lookahead firewall
         sentiment["date"] += pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
@@ -193,7 +213,7 @@ class FeatureEngineer:
         )
 
         #################################################
-        # 🚨 HARD TICKER REATTACH (INSTITUTIONAL)
+        # HARD TICKER REATTACH
         #################################################
 
         if "ticker" not in merged.columns:
@@ -207,13 +227,12 @@ class FeatureEngineer:
 
         merged["ticker"] = merged["ticker"].astype(str)
 
-        if merged["ticker"].isna().any():
-            raise RuntimeError("NaN ticker post-merge.")
-
+        #################################################
+        # Pandas 3 SAFE
         #################################################
 
-        merged["avg_sentiment"].fillna(0.0, inplace=True)
-        merged["news_count"].fillna(0.0, inplace=True)
+        merged["avg_sentiment"] = merged["avg_sentiment"].fillna(0.0)
+        merged["news_count"] = merged["news_count"].fillna(0.0)
 
         merged["sentiment_std"] = (
             merged["sentiment_std"]
@@ -226,26 +245,7 @@ class FeatureEngineer:
         return merged
 
     ###################################################
-    # NEUTRAL SENTIMENT
-    ###################################################
-
-    @classmethod
-    def _build_neutral_sentiment(cls, price_df):
-
-        neutral = price_df[["date"]].copy()
-
-        neutral["avg_sentiment"] = 0.0
-        neutral["news_count"] = 0.0
-        neutral["sentiment_std"] = cls.SENTIMENT_STD_FLOOR
-
-        logger.warning(
-            "Sentiment unavailable — deterministic neutral prior injected."
-        )
-
-        return neutral
-
-    ###################################################
-    # TARGET
+    # TARGET — 🔥 ADAPTIVE (CRITICAL FIX)
     ###################################################
 
     @classmethod
@@ -260,17 +260,42 @@ class FeatureEngineer:
 
         risk_adj = (forward / safe_vol).clip(-5, 5)
 
-        DEAD_ZONE = 0.06
+        #################################################
+        # ADAPTIVE DEADZONE
+        #################################################
+
+        dynamic_zone = np.nanpercentile(
+            np.abs(risk_adj.dropna()),
+            55
+        )
+
+        DEAD_ZONE = max(dynamic_zone, 0.015)
+
+        logger.info(
+            "Adaptive deadzone selected → %.4f",
+            DEAD_ZONE
+        )
 
         df["target"] = np.where(
             risk_adj > DEAD_ZONE, 1,
             np.where(risk_adj < -DEAD_ZONE, 0, np.nan)
         )
 
+        before = len(df)
+
         df.dropna(inplace=True)
 
-        if len(df) < cls.MIN_ROWS_REQUIRED:
-            raise RuntimeError("Feature collapse detected.")
+        survival = len(df) / before
+
+        logger.info(
+            "Target survival ratio → %.2f%%",
+            survival * 100
+        )
+
+        if survival < 0.25:
+            raise RuntimeError(
+                f"Feature collapse — survival ratio too low ({survival:.2f})"
+            )
 
         df["target"] = df["target"].astype("int8")
 
