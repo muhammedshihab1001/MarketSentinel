@@ -1,5 +1,7 @@
 import os
 import tempfile
+import shutil
+import time
 import joblib
 import pandas as pd
 import numpy as np
@@ -31,8 +33,11 @@ from core.market.universe import MarketUniverse
 logger = logging.getLogger(__name__)
 
 MODEL_DIR = os.path.abspath("artifacts/xgboost")
-TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
-TEMP_METADATA_PATH = f"{MODEL_DIR}/metadata.json"
+
+# 🔥 SANDBOX TRAINING (CRITICAL)
+TEMP_DIR = tempfile.mkdtemp(prefix="xgb_train_")
+TEMP_MODEL_PATH = os.path.join(TEMP_DIR, "model.pkl")
+TEMP_METADATA_PATH = os.path.join(TEMP_DIR, "metadata.json")
 
 SEED = 42
 MIN_TRAINING_ROWS = 2000
@@ -48,6 +53,10 @@ BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "0.58"))
 SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.42"))
 
 
+############################################################
+# DETERMINISM
+############################################################
+
 def enforce_determinism():
 
     os.environ["PYTHONHASHSEED"] = str(SEED)
@@ -60,6 +69,10 @@ def enforce_determinism():
     np.random.seed(SEED)
 
 
+############################################################
+# ATOMIC SAVE
+############################################################
+
 def save_model_atomic(model, path):
 
     directory = os.path.dirname(path)
@@ -68,7 +81,6 @@ def save_model_atomic(model, path):
     tmp_path = f"{path}.tmp"
 
     joblib.dump(model, tmp_path)
-
     os.replace(tmp_path, path)
 
     if not os.path.exists(path):
@@ -79,13 +91,15 @@ def save_model_atomic(model, path):
     if size < MIN_MODEL_BYTES:
         raise RuntimeError("Model artifact suspiciously small.")
 
-    try:
-        _ = joblib.load(path)
-    except Exception as e:
-        raise RuntimeError("Saved model failed reload test.") from e
+    # reload test
+    joblib.load(path)
 
     return size
 
+
+############################################################
+# DATA LOADER
+############################################################
 
 def load_training_data(start_date, end_date):
 
@@ -159,8 +173,14 @@ def load_training_data(start_date, end_date):
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
-    if not np.isfinite(df.loc[:, MODEL_FEATURES].to_numpy()).all():
+    features = df.loc[:, MODEL_FEATURES].to_numpy()
+
+    if not np.isfinite(features).all():
         raise RuntimeError("Non-finite feature values detected.")
+
+    # 🔥 variance guard
+    if (np.var(features, axis=0) < 1e-6).any():
+        raise RuntimeError("Feature variance collapse detected.")
 
     if df["target"].nunique() < 2:
         raise RuntimeError("Target collapsed.")
@@ -172,6 +192,7 @@ def load_training_data(start_date, end_date):
     dataset_hash = MetadataManager.hash_list([
         MetadataManager.fingerprint_dataset(hash_df),
         get_schema_signature(),
+        list(MODEL_FEATURES),   # 🔥 anchor feature order
         start_date,
         end_date
     ])
@@ -179,7 +200,13 @@ def load_training_data(start_date, end_date):
     return df, dataset_hash
 
 
+############################################################
+# MAIN
+############################################################
+
 def main(start_date=None, end_date=None):
+
+    t0 = time.time()
 
     init_env()
     enforce_determinism()
@@ -193,17 +220,9 @@ def main(start_date=None, end_date=None):
 
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    drift = DriftDetector()
-
-    if ALLOW_BASELINE_FLAG:
-        try:
-            drift.create_baseline(
-                df,
-                dataset_hash=dataset_hash,
-                allow_overwrite=False
-            )
-        except RuntimeError:
-            logger.info("Drift baseline already exists.")
+    ########################################################
+    # TRAINER
+    ########################################################
 
     def trainer(d):
 
@@ -212,6 +231,9 @@ def main(start_date=None, end_date=None):
         model = build_xgboost_model(
             y,
             random_state=SEED,
+            seed=SEED,
+            subsample=1.0,
+            colsample_bytree=1.0,
             nthread=1,
             predictor="cpu_predictor",
             tree_method="hist"
@@ -221,11 +243,19 @@ def main(start_date=None, end_date=None):
 
         return model
 
+    ########################################################
+    # SIGNAL
+    ########################################################
+
     def signal(model, test):
 
         probs = model.predict_proba(
             test.loc[:, MODEL_FEATURES]
         )[:, 1]
+
+        # 🔥 probability collapse guard
+        if np.std(probs) < 1e-5:
+            raise RuntimeError("Model probability collapse detected.")
 
         return [
             "BUY" if p > BUY_THRESHOLD
@@ -243,17 +273,22 @@ def main(start_date=None, end_date=None):
 
     gc.collect()
 
-    sharpe = strategy_metrics.get("avg_sharpe")
-
-    if sharpe < MIN_SHARPE:
+    if strategy_metrics["avg_sharpe"] < MIN_SHARPE:
         raise RuntimeError("XGBoost rejected — Sharpe too low")
 
     if strategy_metrics["max_drawdown"] < MAX_DRAWDOWN:
         raise RuntimeError("XGBoost rejected — drawdown too severe")
 
+    ########################################################
+    # FINAL MODEL
+    ########################################################
+
     final_model = build_final_xgboost_model(
         df["target"],
         random_state=SEED,
+        seed=SEED,
+        subsample=1.0,
+        colsample_bytree=1.0,
         nthread=1,
         predictor="cpu_predictor",
         tree_method="hist"
@@ -301,6 +336,23 @@ def main(start_date=None, end_date=None):
         TEMP_METADATA_PATH
     )
 
+    ########################################################
+    # DRIFT BASELINE — ONLY AFTER REGISTRATION
+    ########################################################
+
+    if ALLOW_BASELINE_FLAG and PROMOTE_FLAG:
+
+        drift = DriftDetector()
+
+        try:
+            drift.create_baseline(
+                df,
+                dataset_hash=dataset_hash,
+                allow_overwrite=False
+            )
+        except RuntimeError:
+            logger.info("Drift baseline already exists.")
+
     if PROMOTE_FLAG:
         ModelRegistry.promote_to_production(
             MODEL_DIR,
@@ -312,12 +364,17 @@ def main(start_date=None, end_date=None):
             "Model NOT promoted — set ALLOW_MODEL_PROMOTION=true to enable."
         )
 
+    shutil.rmtree(TEMP_DIR, ignore_errors=True)
+
     logger.info(
         "Training summary | version=%s rows=%s sharpe=%.3f",
         version,
         len(df),
         strategy_metrics["avg_sharpe"]
     )
+
+    logger.info("Total training time: %.2f minutes",
+                (time.time() - t0) / 60)
 
     return strategy_metrics
 
