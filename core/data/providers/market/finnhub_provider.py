@@ -2,6 +2,7 @@ import os
 import logging
 import requests
 import pandas as pd
+import numpy as np
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -17,6 +18,12 @@ class FinnhubProvider(MarketDataProvider):
     URL = "https://finnhub.io/api/v1/stock/candle"
 
     REQUEST_TIMEOUT = (4, 15)
+
+    MIN_ROWS = 120
+
+    REQUIRED_PAYLOAD_KEYS = {"t", "o", "h", "l", "c", "v"}
+
+    ########################################################
 
     def __init__(self):
 
@@ -62,8 +69,30 @@ class FinnhubProvider(MarketDataProvider):
         return int(pd.Timestamp(dt).timestamp())
 
     ########################################################
+    # 🔥 HARD PAYLOAD VALIDATION
+    ########################################################
+
+    def _validate_payload(self, payload, ticker):
+
+        if payload.get("s") != "ok":
+            raise RuntimeError(
+                f"Finnhub returned no usable data for {ticker}"
+            )
+
+        missing = self.REQUIRED_PAYLOAD_KEYS - payload.keys()
+
+        if missing:
+            raise RuntimeError(
+                f"Finnhub payload schema drift. Missing={missing}"
+            )
+
+    ########################################################
+    # INSTITUTIONAL NORMALIZATION
+    ########################################################
 
     def _normalize_schema(self, payload, ticker):
+
+        self._validate_payload(payload, ticker)
 
         df = pd.DataFrame({
             "date": pd.to_datetime(payload["t"], unit="s", utc=True)
@@ -80,10 +109,25 @@ class FinnhubProvider(MarketDataProvider):
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+        df = df.replace([np.inf, -np.inf], np.nan)
         df = df.dropna(subset=["date"] + numeric_cols)
 
         if df.empty:
             raise RuntimeError("Finnhub returned empty normalized dataset.")
+
+        ####################################################
+        # PRICE SANITY
+        ####################################################
+
+        if (df["close"] <= 0).any():
+            raise RuntimeError("Invalid close prices from Finnhub.")
+
+        if (df["high"] < df["low"]).any():
+            raise RuntimeError("High < Low detected.")
+
+        ####################################################
+        # SORT + DEDUP
+        ####################################################
 
         df = (
             df
@@ -91,6 +135,17 @@ class FinnhubProvider(MarketDataProvider):
             .sort_values("date")
             .reset_index(drop=True)
         )
+
+        ####################################################
+        # MIN HISTORY GUARD
+        ####################################################
+
+        if len(df) < self.MIN_ROWS:
+            raise RuntimeError("Finnhub returned insufficient history.")
+
+        ####################################################
+        # CRITICAL — TICKER INJECTION
+        ####################################################
 
         df["ticker"] = ticker
 
@@ -123,11 +178,6 @@ class FinnhubProvider(MarketDataProvider):
         response.raise_for_status()
 
         payload = response.json()
-
-        if payload.get("s") != "ok":
-            raise RuntimeError(
-                f"Finnhub returned no usable data for {ticker}"
-            )
 
         df = self._normalize_schema(payload, ticker)
 
