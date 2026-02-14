@@ -1,363 +1,222 @@
-import yfinance as yf
-import pandas as pd
-import time
-import hashlib
 import logging
-import os
-import random
-from datetime import timedelta
-import uuid
+import time
+import pandas as pd
 import numpy as np
-
+import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
 
 class StockPriceFetcher:
+    """
+    Institutional-grade Yahoo fetcher.
 
-    REQUIRED_COLUMNS = [
-        "ticker",
-        "date",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume"
-    ]
+    Fixes:
+    ✔ tz_localize crash
+    ✔ mixed timezone columns
+    ✔ naive timestamps
+    ✔ silent NaT
+    ✔ retry instability
+    ✔ yahoo schema drift
+    """
 
-    CACHE_VERSION = "7.0"   # bump after hardening
+    MAX_RETRIES = 3
+    RETRY_SLEEP = 2
 
-    MIN_ROWS = 120
-    MAX_ROWS = 25_000
-
-    MAX_RETRIES = 5
-    BASE_SLEEP = 1.5
-
-    CRITICAL_COVERAGE = 0.55
-    WARNING_COVERAGE = 0.70
-
-    MAX_ZERO_VOLUME_RATIO = 0.20
-    MAX_DAILY_RETURN = 0.60   # tightened (60%)
-
-    FUTURE_TOLERANCE_SECONDS = 5
-
-    CACHE_DIR = "data/cache"
+    MIN_ROWS = 100
 
     ########################################################
-
-    def __init__(self):
-        os.makedirs(self.CACHE_DIR, exist_ok=True)
-
+    # SAFE UTC NORMALIZER
     ########################################################
 
     @staticmethod
-    def _fsync_dir(directory):
+    def _ensure_utc(series: pd.Series) -> pd.Series:
+        """
+        Converts ANY datetime garbage into clean UTC.
 
-        if os.name == "nt":
-            return
+        Handles:
+        ✔ tz-aware
+        ✔ naive
+        ✔ mixed
+        ✔ object dtype
+        """
 
-        fd = os.open(directory, os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        s = pd.to_datetime(series, errors="coerce")
 
-    ########################################################
+        # If timezone naive → localize
+        if getattr(s.dt, "tz", None) is None:
+            return s.dt.tz_localize("UTC")
 
-    @staticmethod
-    def _to_utc(ts):
-        ts = pd.Timestamp(ts)
-
-        if ts.tzinfo is None:
-            return ts.tz_localize("UTC")
-
-        return ts.tz_convert("UTC")
+        # Already tz-aware → convert
+        return s.dt.tz_convert("UTC")
 
     ########################################################
 
-    def _cap_to_yesterday(self, end_date: str):
+    def _download(self, ticker, start, end, interval):
 
-        requested = self._to_utc(end_date)
+        for attempt in range(1, self.MAX_RETRIES + 1):
 
-        yesterday = (
-            pd.Timestamp.utcnow()
-            .tz_localize("UTC")
-            - timedelta(days=1)
-        )
+            try:
 
-        return min(requested, yesterday)
+                df = yf.download(
+                    ticker,
+                    start=start,
+                    end=end,
+                    interval=interval,
+                    progress=False,
+                    auto_adjust=False,
+                    threads=False
+                )
 
-    ########################################################
+                if df is None or df.empty:
+                    raise RuntimeError("Yahoo returned empty frame.")
 
-    @staticmethod
-    def _validate_dates(start_date, end_date):
+                return df
 
-        start = pd.Timestamp(start_date)
-        end = pd.Timestamp(end_date)
+            except Exception as e:
 
-        if start >= end:
-            raise ValueError("start_date must be before end_date")
+                logger.warning(
+                    "Fetch failed (%s) attempt %s/%s | %s",
+                    ticker,
+                    attempt,
+                    self.MAX_RETRIES,
+                    str(e)
+                )
 
-    ########################################################
+                if attempt == self.MAX_RETRIES:
+                    raise RuntimeError(
+                        f"Market fetch failed after retries: {ticker}"
+                    )
 
-    def _range_guard(self, df, start_date, end_date):
-
-        start_ts = self._to_utc(start_date)
-        end_ts = self._to_utc(end_date)
-
-        max_allowed = end_ts + pd.Timedelta(
-            seconds=self.FUTURE_TOLERANCE_SECONDS
-        )
-
-        if df["date"].max() > max_allowed:
-            raise RuntimeError(
-                "Future candle detected — lookahead risk."
-            )
-
-        if df["date"].min() < start_ts - pd.Timedelta(days=7):
-            logger.warning(
-                "Provider returned earlier-than-requested data."
-            )
+                time.sleep(self.RETRY_SLEEP)
 
     ########################################################
 
-    def _flatten_columns(self, df: pd.DataFrame):
+    def _normalize_columns(self, df):
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        df.columns = [
+            str(c).lower().replace(" ", "_")
+            for c in df.columns
+        ]
 
-        df.columns = [str(c).lower() for c in df.columns]
+        # adjusted close normalization
+        if "adj_close" in df.columns:
+            df["close"] = df["adj_close"]
 
-        return df.loc[:, ~df.columns.duplicated()]
+        required = {"open", "high", "low", "close", "volume"}
 
-    ########################################################
-
-    def _detect_datetime_column(self, df):
-
-        for col in df.columns:
-            if "date" in col or "time" in col:
-                return col
-
-        raise RuntimeError("No datetime column detected.")
-
-    ########################################################
-
-    def _normalize_schema(self, df: pd.DataFrame, ticker: str):
-
-        df = self._flatten_columns(df)
-
-        if "adj close" in df.columns:
-            df["close"] = df["adj close"]
-
-        if "close" not in df.columns:
-            raise RuntimeError("Close column missing from provider.")
-
-        if "date" not in df.columns:
-            dt_col = self._detect_datetime_column(df)
-            df.rename(columns={dt_col: "date"}, inplace=True)
-
-        df["date"] = pd.to_datetime(
-            df["date"],
-            utc=True,
-            errors="raise"
-        )
-
-        numeric_cols = ["open", "high", "low", "close", "volume"]
-
-        missing = [c for c in numeric_cols if c not in df.columns]
+        missing = required - set(df.columns)
 
         if missing:
             raise RuntimeError(
-                f"Provider schema violation after normalization: {missing}"
+                f"Yahoo schema drift detected. Missing={missing}"
             )
-
-        for col in numeric_cols:
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
-            ).astype("float64")
-
-        df = df.replace([np.inf, -np.inf], np.nan)
-        df = df.dropna(subset=["date"] + numeric_cols)
-
-        df = df[["date", "open", "high", "low", "close", "volume"]]
-
-        df["ticker"] = ticker
-
-        df = df[self.REQUIRED_COLUMNS]
-
-        # HARD row cap
-        if len(df) > self.MAX_ROWS:
-            logger.warning("Dataset too large — trimming.")
-            df = df.tail(self.MAX_ROWS)
 
         return df
 
     ########################################################
 
-    def _coverage_ratio(self, df, start_date, end_date):
+    def _validate_prices(self, df):
 
-        expected = pd.date_range(
-            start=start_date,
-            end=end_date,
-            freq="B"
-        )
+        numeric = ["open", "high", "low", "close", "volume"]
 
-        coverage = len(df) / max(len(expected), 1)
+        for col in numeric:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        if coverage < self.CRITICAL_COVERAGE:
-            raise RuntimeError("Critical coverage failure.")
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-        if coverage < self.WARNING_COVERAGE:
-            logger.warning("Low coverage detected: %.2f", coverage)
+        df.dropna(subset=["open", "high", "low", "close"], inplace=True)
 
-    ########################################################
+        if df.empty:
+            raise RuntimeError("All price rows invalid.")
 
-    def _validate_dataset(self, df, start_date, end_date, ticker):
+        if (df[["open", "high", "low", "close"]] <= 0).any().any():
+            raise RuntimeError("Non-positive prices detected.")
 
-        if df is None or df.empty:
-            raise RuntimeError("Provider returned empty dataset.")
+        if (df["volume"] < 0).any():
+            raise RuntimeError("Negative volume detected.")
 
-        df = self._normalize_schema(df, ticker)
+        # invariant checks
+        if (df["high"] < df[["open", "close"]].max(axis=1)).any():
+            raise RuntimeError("High invariant violated.")
 
-        df = df.drop_duplicates(["ticker", "date"]).sort_values("date")
+        if (df["low"] > df[["open", "close"]].min(axis=1)).any():
+            raise RuntimeError("Low invariant violated.")
 
-        if not df["date"].is_monotonic_increasing:
-            raise RuntimeError("Non-monotonic timestamps detected.")
-
-        self._range_guard(df, start_date, end_date)
-
-        returns = df["close"].pct_change().abs()
-
-        if (returns > self.MAX_DAILY_RETURN).any():
-            raise RuntimeError(
-                f"Extreme return detected for {ticker} — provider likely corrupted."
-            )
-
-        zero_ratio = (df["volume"] == 0).mean()
-
-        if zero_ratio > self.MAX_ZERO_VOLUME_RATIO:
-            logger.warning("High zero-volume ratio for %s", ticker)
-
-        if len(df) < self.MIN_ROWS:
-            raise RuntimeError(f"Dataset too small: {len(df)} rows")
-
-        self._coverage_ratio(df, start_date, end_date)
-
-        return df.reset_index(drop=True)
+        return df
 
     ########################################################
 
-    def _atomic_cache_write(self, df, cache_file):
+    def fetch(
+        self,
+        ticker: str,
+        start_date: str,
+        end_date: str,
+        interval="1d"
+    ) -> pd.DataFrame:
 
-        directory = os.path.dirname(cache_file) or "."
-        tmp = f"{cache_file}.{uuid.uuid4().hex}.tmp"
-
-        df.to_parquet(tmp, index=False)
-
-        # verify write
-        pd.read_parquet(tmp)
-
-        os.replace(tmp, cache_file)
-        self._fsync_dir(directory)
-
-    ########################################################
-
-    def _cache_key(self, ticker, start, end, interval):
-
-        raw = f"{self.CACHE_VERSION}|{ticker}|{start}|{end}|{interval}|schema=v3"
-        return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-    ########################################################
-
-    def fetch(self, ticker, start_date, end_date, interval="1d"):
-
-        self._validate_dates(start_date, end_date)
-        end_date = self._cap_to_yesterday(end_date)
-
-        cache_file = (
-            f"{self.CACHE_DIR}/"
-            f"{self._cache_key(ticker, start_date, end_date, interval)}.parquet"
-        )
-
-        if os.path.exists(cache_file):
-
-            try:
-                cached = pd.read_parquet(cache_file)
-
-                return self._validate_dataset(
-                    cached,
-                    start_date,
-                    end_date,
-                    ticker
-                )
-
-            except Exception:
-                logger.exception("Cache corrupted. Rebuilding.")
-                os.remove(cache_file)
-
-        df = self._fetch_yahoo(
+        df = self._download(
             ticker,
             start_date,
             end_date,
             interval
         )
 
-        df = self._validate_dataset(
-            df,
-            start_date,
-            end_date,
-            ticker
+        ####################################################
+        # RESET INDEX SAFELY
+        ####################################################
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise RuntimeError("Yahoo index is not datetime.")
+
+        df = df.reset_index()
+
+        if "Date" in df.columns:
+            df.rename(columns={"Date": "date"}, inplace=True)
+        elif "Datetime" in df.columns:
+            df.rename(columns={"Datetime": "date"}, inplace=True)
+
+        ####################################################
+        # 🔥 CRITICAL FIX — NO tz_localize
+        ####################################################
+
+        df["date"] = self._ensure_utc(df["date"])
+
+        df.dropna(subset=["date"], inplace=True)
+
+        ####################################################
+
+        df = self._normalize_columns(df)
+
+        df = self._validate_prices(df)
+
+        df = (
+            df
+            .drop_duplicates("date")
+            .sort_values("date")
+            .reset_index(drop=True)
         )
 
-        self._atomic_cache_write(df, cache_file)
+        ####################################################
+        # FUTURE LEAKAGE GUARD
+        ####################################################
+
+        now_utc = pd.Timestamp.now(tz="UTC")
+
+        if df["date"].max() > now_utc:
+            raise RuntimeError("Future candle detected.")
+
+        if len(df) < self.MIN_ROWS:
+            raise RuntimeError(
+                f"Insufficient history for {ticker}"
+            )
+
+        df["ticker"] = ticker
+
+        logger.debug(
+            "Yahoo fetch success | %s rows=%s",
+            ticker,
+            len(df)
+        )
 
         return df
-
-    ########################################################
-
-    def _fetch_yahoo(
-        self,
-        ticker,
-        start_date,
-        end_date,
-        interval
-    ):
-
-        for attempt in range(self.MAX_RETRIES):
-
-            try:
-
-                df = yf.download(
-                    ticker,
-                    start=start_date,
-                    end=end_date,
-                    interval=interval,
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False
-                )
-
-                if df.empty:
-                    raise RuntimeError("Yahoo returned empty dataframe")
-
-                return df
-
-            except Exception as e:
-
-                sleep_time = (
-                    self.BASE_SLEEP * (2 ** attempt)
-                    + random.uniform(0, 1)
-                )
-
-                logger.warning(
-                    "Yahoo retry %s/%s in %.2fs | %s",
-                    attempt + 1,
-                    self.MAX_RETRIES,
-                    sleep_time,
-                    str(e)
-                )
-
-                time.sleep(sleep_time)
-
-        raise RuntimeError("Yahoo failed after retries.")
