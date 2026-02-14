@@ -14,7 +14,8 @@ from core.signals.signal_engine import DecisionEngine
 from core.monitoring.drift_detector import DriftDetector
 from core.schema.feature_schema import (
     MODEL_FEATURES,
-    validate_feature_schema
+    validate_feature_schema,
+    get_schema_signature
 )
 
 from core.market.universe import MarketUniverse
@@ -37,10 +38,6 @@ from app.monitoring.metrics import (
 
 logger = logging.getLogger("marketsentinel.pipeline")
 
-
-############################################################
-# CIRCUIT BREAKER
-############################################################
 
 class CircuitBreaker:
 
@@ -78,10 +75,6 @@ class CircuitBreaker:
             self.failures = 0
 
 
-############################################################
-# INFERENCE PIPELINE
-############################################################
-
 class InferencePipeline:
 
     HARD_PIPELINE_TIMEOUT = float(
@@ -106,8 +99,6 @@ class InferencePipeline:
 
     LOCK_TIMEOUT = 3
 
-    ############################################################
-
     def __init__(self):
 
         self.market_data = MarketDataService()
@@ -122,17 +113,36 @@ class InferencePipeline:
         self.drift_detector = DriftDetector()
         self.breaker = CircuitBreaker()
 
+        self.schema_sig = get_schema_signature()
+
         self._validate_models_loaded()
 
     ############################################################
 
     def _validate_models_loaded(self):
 
-        _ = self.models.xgb
-        _ = self.models.sarimax
+        model = self.models.xgb
+
+        if not hasattr(model, "predict_proba"):
+            raise RuntimeError("Loaded model is not a classifier.")
+
+        if len(MODEL_FEATURES) <= 0:
+            raise RuntimeError("Feature contract invalid.")
 
     ############################################################
-    # HARD FEATURE EXTRACTION
+
+    def _assert_data_freshness(self, dataset):
+
+        latest_date = pd.to_datetime(dataset["date"].max(), utc=True)
+        now = pd.Timestamp.utcnow()
+
+        age_hours = (now - latest_date).total_seconds() / 3600
+
+        if age_hours > self.DATA_FRESHNESS_HOURS:
+            raise RuntimeError(
+                f"Market data stale: {age_hours:.1f}h old."
+            )
+
     ############################################################
 
     def _extract_features(self, latest_row):
@@ -143,6 +153,9 @@ class InferencePipeline:
         )
 
         df = validate_feature_schema(df)
+
+        if df.shape[1] != len(MODEL_FEATURES):
+            raise RuntimeError("Feature width mismatch.")
 
         null_ratio = df.isna().mean().mean()
         MISSING_FEATURE_RATIO.set(float(null_ratio))
@@ -169,8 +182,6 @@ class InferencePipeline:
         return prob
 
     ############################################################
-    # DATASET HASH (DETERMINISTIC)
-    ############################################################
 
     def _dataset_hash(self, latest_row):
 
@@ -182,8 +193,6 @@ class InferencePipeline:
             canonical.encode()
         ).hexdigest()[:12]
 
-    ############################################################
-    # MAIN RUN
     ############################################################
 
     def run(self, ticker="AAPL"):
@@ -198,10 +207,6 @@ class InferencePipeline:
         INFERENCE_IN_PROGRESS.inc()
 
         try:
-
-            ####################################################
-            # DATA LOAD
-            ####################################################
 
             price_df = self.market_data.get_price_data(
                 ticker=ticker,
@@ -223,16 +228,17 @@ class InferencePipeline:
             dataset = self.feature_store.get_features(
                 price_df,
                 sentiment_df,
-                ticker=ticker
+                ticker=ticker,
+                training=False
             )
 
             if dataset.empty:
                 raise RuntimeError("Feature pipeline returned empty dataset.")
 
+            self._assert_data_freshness(dataset)
+
             validate_feature_schema(dataset.loc[:, MODEL_FEATURES])
 
-            ####################################################
-            # CACHE
             ####################################################
 
             model_version = self.models.xgb_version
@@ -241,7 +247,8 @@ class InferencePipeline:
             cache_key = self.cache.build_key({
                 "ticker": ticker,
                 "model_version": model_version,
-                "dataset": dataset_hash
+                "dataset": dataset_hash,
+                "schema": self.schema_sig
             })
 
             cached = self.cache.get(cache_key)
@@ -267,14 +274,9 @@ class InferencePipeline:
 
             try:
 
-                # re-check cache (stampede protection)
                 cached = self.cache.get(cache_key)
                 if cached:
                     return cached
-
-                ################################################
-                # DRIFT
-                ################################################
 
                 try:
                     drift = self.drift_detector.detect(
@@ -290,32 +292,24 @@ class InferencePipeline:
                 except Exception:
                     logger.exception("Drift detector failure.")
 
-                ################################################
-                # FEATURES
-                ################################################
-
                 latest = dataset.iloc[-1]
                 features = self._extract_features(latest)
-
-                ################################################
-                # PREDICT
-                ################################################
 
                 t0 = time.time()
 
                 preds = self.models.xgb.predict_proba(features)
-
                 prob_up = self._safe_probability(preds[0][1])
 
                 latency = time.time() - t0
 
+                if latency > self.LATENCY_GUARD_SECONDS:
+                    raise RuntimeError(
+                        f"Inference latency breach: {latency:.2f}s"
+                    )
+
                 MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
                 MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
                 PREDICTION_CLASS_PROBABILITY.set(prob_up)
-
-                ################################################
-                # DECISION
-                ################################################
 
                 predicted_return = prob_up - 0.5
 
