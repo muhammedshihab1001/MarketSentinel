@@ -25,23 +25,30 @@ class StockPriceFetcher:
         "volume"
     ]
 
-    CACHE_VERSION = "6.0"
+    CACHE_VERSION = "7.0"   # bump after hardening
 
     MIN_ROWS = 120
+    MAX_ROWS = 25_000
+
     MAX_RETRIES = 5
     BASE_SLEEP = 1.5
-    MAX_GAP_DAYS = 10
 
     CRITICAL_COVERAGE = 0.55
     WARNING_COVERAGE = 0.70
 
     MAX_ZERO_VOLUME_RATIO = 0.20
-    MAX_DAILY_RETURN = 1.50
+    MAX_DAILY_RETURN = 0.60   # tightened (60%)
+
+    FUTURE_TOLERANCE_SECONDS = 5
 
     CACHE_DIR = "data/cache"
 
+    ########################################################
+
     def __init__(self):
         os.makedirs(self.CACHE_DIR, exist_ok=True)
+
+    ########################################################
 
     @staticmethod
     def _fsync_dir(directory):
@@ -55,6 +62,8 @@ class StockPriceFetcher:
         finally:
             os.close(fd)
 
+    ########################################################
+
     @staticmethod
     def _to_utc(ts):
         ts = pd.Timestamp(ts)
@@ -63,6 +72,8 @@ class StockPriceFetcher:
             return ts.tz_localize("UTC")
 
         return ts.tz_convert("UTC")
+
+    ########################################################
 
     def _cap_to_yesterday(self, end_date: str):
 
@@ -76,6 +87,8 @@ class StockPriceFetcher:
 
         return min(requested, yesterday)
 
+    ########################################################
+
     @staticmethod
     def _validate_dates(start_date, end_date):
 
@@ -84,6 +97,29 @@ class StockPriceFetcher:
 
         if start >= end:
             raise ValueError("start_date must be before end_date")
+
+    ########################################################
+
+    def _range_guard(self, df, start_date, end_date):
+
+        start_ts = self._to_utc(start_date)
+        end_ts = self._to_utc(end_date)
+
+        max_allowed = end_ts + pd.Timedelta(
+            seconds=self.FUTURE_TOLERANCE_SECONDS
+        )
+
+        if df["date"].max() > max_allowed:
+            raise RuntimeError(
+                "Future candle detected — lookahead risk."
+            )
+
+        if df["date"].min() < start_ts - pd.Timedelta(days=7):
+            logger.warning(
+                "Provider returned earlier-than-requested data."
+            )
+
+    ########################################################
 
     def _flatten_columns(self, df: pd.DataFrame):
 
@@ -94,6 +130,8 @@ class StockPriceFetcher:
 
         return df.loc[:, ~df.columns.duplicated()]
 
+    ########################################################
+
     def _detect_datetime_column(self, df):
 
         for col in df.columns:
@@ -101,6 +139,8 @@ class StockPriceFetcher:
                 return col
 
         raise RuntimeError("No datetime column detected.")
+
+    ########################################################
 
     def _normalize_schema(self, df: pd.DataFrame, ticker: str):
 
@@ -144,7 +184,16 @@ class StockPriceFetcher:
 
         df["ticker"] = ticker
 
-        return df[self.REQUIRED_COLUMNS]
+        df = df[self.REQUIRED_COLUMNS]
+
+        # HARD row cap
+        if len(df) > self.MAX_ROWS:
+            logger.warning("Dataset too large — trimming.")
+            df = df.tail(self.MAX_ROWS)
+
+        return df
+
+    ########################################################
 
     def _coverage_ratio(self, df, start_date, end_date):
 
@@ -162,6 +211,8 @@ class StockPriceFetcher:
         if coverage < self.WARNING_COVERAGE:
             logger.warning("Low coverage detected: %.2f", coverage)
 
+    ########################################################
+
     def _validate_dataset(self, df, start_date, end_date, ticker):
 
         if df is None or df.empty:
@@ -174,10 +225,14 @@ class StockPriceFetcher:
         if not df["date"].is_monotonic_increasing:
             raise RuntimeError("Non-monotonic timestamps detected.")
 
+        self._range_guard(df, start_date, end_date)
+
         returns = df["close"].pct_change().abs()
 
         if (returns > self.MAX_DAILY_RETURN).any():
-            logger.warning("Extreme return detected for %s", ticker)
+            raise RuntimeError(
+                f"Extreme return detected for {ticker} — provider likely corrupted."
+            )
 
         zero_ratio = (df["volume"] == 0).mean()
 
@@ -191,6 +246,8 @@ class StockPriceFetcher:
 
         return df.reset_index(drop=True)
 
+    ########################################################
+
     def _atomic_cache_write(self, df, cache_file):
 
         directory = os.path.dirname(cache_file) or "."
@@ -198,16 +255,20 @@ class StockPriceFetcher:
 
         df.to_parquet(tmp, index=False)
 
-        # verify
+        # verify write
         pd.read_parquet(tmp)
 
         os.replace(tmp, cache_file)
         self._fsync_dir(directory)
 
+    ########################################################
+
     def _cache_key(self, ticker, start, end, interval):
 
-        raw = f"{self.CACHE_VERSION}|{ticker}|{start}|{end}|{interval}|schema=v2"
+        raw = f"{self.CACHE_VERSION}|{ticker}|{start}|{end}|{interval}|schema=v3"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    ########################################################
 
     def fetch(self, ticker, start_date, end_date, interval="1d"):
 
@@ -252,6 +313,8 @@ class StockPriceFetcher:
         self._atomic_cache_write(df, cache_file)
 
         return df
+
+    ########################################################
 
     def _fetch_yahoo(
         self,
