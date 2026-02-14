@@ -9,7 +9,7 @@ from core.schema.feature_schema import (
 
 from core.indicators.technical_indicators import TechnicalIndicators
 
-logger = logging.getLogger("marketsentinel.features")
+logger = logging.getLogger(__name__)
 
 
 class FeatureEngineer:
@@ -18,7 +18,8 @@ class FeatureEngineer:
     VOL_FLOOR = 1e-4
     SENTIMENT_STD_FLOOR = 0.02
     RETURN_CLAMP = (-0.5, 0.5)
-    MERGE_TOLERANCE = pd.Timedelta("2D")
+    MERGE_TOLERANCE = pd.Timedelta("1D")
+    MIN_CLASS_RATIO = 0.30
 
     SENTIMENT_COLUMNS = [
         "date",
@@ -27,28 +28,18 @@ class FeatureEngineer:
         "sentiment_std"
     ]
 
-    ###################################################
-    # DATETIME
-    ###################################################
-
     @staticmethod
     def _normalize_datetime(df):
 
         df = df.copy()
 
-        df["date"] = (
-            pd.to_datetime(
-                df["date"],
-                utc=True,
-                errors="raise"
-            ).dt.tz_convert(None)
+        df["date"] = pd.to_datetime(
+            df["date"],
+            utc=True,
+            errors="raise"
         )
 
         return df
-
-    ###################################################
-    # TICKER ENFORCEMENT
-    ###################################################
 
     @staticmethod
     def _enforce_ticker(df, ticker=None):
@@ -70,10 +61,6 @@ class FeatureEngineer:
             raise RuntimeError("NaN ticker detected.")
 
         return df
-
-    ###################################################
-    # PRICE VALIDATION
-    ###################################################
 
     @classmethod
     def _validate_price_frame(cls, df, ticker=None):
@@ -107,10 +94,6 @@ class FeatureEngineer:
 
         return df.reset_index(drop=True)
 
-    ###################################################
-    # RETURNS / VOL
-    ###################################################
-
     @staticmethod
     def add_returns(df):
 
@@ -136,10 +119,6 @@ class FeatureEngineer:
             .fillna(FeatureEngineer.VOL_FLOOR)
         )
 
-    ###################################################
-    # TECHNICALS
-    ###################################################
-
     @staticmethod
     def add_rsi(df, window=14):
 
@@ -158,49 +137,20 @@ class FeatureEngineer:
         df["macd"] = macd.clip(-50, 50)
         df["macd_signal"] = signal.clip(-50, 50)
 
-    ###################################################
-    # 🔥 INSTITUTIONAL SENTIMENT FALLBACK
-    ###################################################
-
     @classmethod
     def _build_neutral_sentiment(cls, price_df):
 
         neutral = price_df[["date"]].copy()
 
-        #################################################
-        # Deterministic micro-noise
-        # prevents constant feature crash
-        #################################################
-
-        rng = np.random.default_rng(42)
-
-        noise = rng.normal(
-            loc=0.0,
-            scale=0.0005,
-            size=len(neutral)
-        ).astype("float32")
-
-        neutral["avg_sentiment"] = noise
-
-        neutral["news_count"] = rng.integers(
-            0,
-            3,
-            size=len(neutral)
-        ).astype("float32")
-
-        neutral["sentiment_std"] = (
-            np.abs(noise) + cls.SENTIMENT_STD_FLOOR
-        ).astype("float32")
+        neutral["avg_sentiment"] = 0.0
+        neutral["news_count"] = 0.0
+        neutral["sentiment_std"] = cls.SENTIMENT_STD_FLOOR
 
         logger.warning(
-            "Sentiment unavailable — injected deterministic microstructure prior."
+            "Sentiment unavailable — neutral prior injected."
         )
 
         return neutral
-
-    ###################################################
-    # MERGE
-    ###################################################
 
     @classmethod
     def merge_price_sentiment(
@@ -220,7 +170,6 @@ class FeatureEngineer:
         sentiment = sentiment_df.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment)
 
-        # lookahead firewall
         sentiment["date"] += pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
@@ -247,10 +196,6 @@ class FeatureEngineer:
 
         return merged
 
-    ###################################################
-    # 🔥 QUANTILE TARGET (Institutional Labeling)
-    ###################################################
-
     @classmethod
     def create_training_dataset(cls, df):
 
@@ -263,23 +208,19 @@ class FeatureEngineer:
 
         risk_adj = (forward / safe_vol).clip(-5, 5)
 
-        upper = np.nanpercentile(risk_adj.dropna(), 65)
-        lower = np.nanpercentile(risk_adj.dropna(), 35)
-
-        logger.info(
-            "Quantile thresholds → upper=%.4f lower=%.4f",
-            upper,
-            lower
-        )
+        rolling_upper = risk_adj.rolling(252, min_periods=126).quantile(0.65)
+        rolling_lower = risk_adj.rolling(252, min_periods=126).quantile(0.35)
 
         df["target"] = np.where(
-            risk_adj >= upper, 1,
-            np.where(risk_adj <= lower, 0, np.nan)
+            risk_adj >= rolling_upper, 1,
+            np.where(risk_adj <= rolling_lower, 0, np.nan)
         )
+
+        required = ["target"] + MODEL_FEATURES
 
         before = len(df)
 
-        df.dropna(inplace=True)
+        df = df.dropna(subset=required)
 
         survival = len(df) / before
 
@@ -293,13 +234,19 @@ class FeatureEngineer:
                 f"Feature collapse — survival too low ({survival:.2f})"
             )
 
+        class_ratio = df["target"].mean()
+
+        if not (cls.MIN_CLASS_RATIO < class_ratio < 1 - cls.MIN_CLASS_RATIO):
+            raise RuntimeError(
+                f"Class imbalance detected ({class_ratio:.2f})"
+            )
+
         df["target"] = df["target"].astype("int8")
 
-        return df
+        float_cols = df.select_dtypes("float64").columns
+        df[float_cols] = df[float_cols].astype("float32")
 
-    ###################################################
-    # MASTER PIPELINE
-    ###################################################
+        return df
 
     @classmethod
     def build_feature_pipeline(
