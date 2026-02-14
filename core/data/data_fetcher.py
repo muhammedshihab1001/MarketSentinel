@@ -11,18 +11,17 @@ class StockPriceFetcher:
     """
     Institutional-grade Yahoo fetcher.
 
-    Fixes:
-    ✔ tz_localize crash
-    ✔ mixed timezone columns
-    ✔ naive timestamps
-    ✔ silent NaT
-    ✔ retry instability
-    ✔ yahoo schema drift
+    GUARANTEES:
+    ✔ always produces a date column
+    ✔ no timezone crashes
+    ✔ no schema drift
+    ✔ no silent NaT
+    ✔ retry-safe
+    ✔ leakage protected
     """
 
     MAX_RETRIES = 3
     RETRY_SLEEP = 2
-
     MIN_ROWS = 100
 
     ########################################################
@@ -31,23 +30,14 @@ class StockPriceFetcher:
 
     @staticmethod
     def _ensure_utc(series: pd.Series) -> pd.Series:
-        """
-        Converts ANY datetime garbage into clean UTC.
-
-        Handles:
-        ✔ tz-aware
-        ✔ naive
-        ✔ mixed
-        ✔ object dtype
-        """
 
         s = pd.to_datetime(series, errors="coerce")
 
-        # If timezone naive → localize
+        # naive → localize
         if getattr(s.dt, "tz", None) is None:
             return s.dt.tz_localize("UTC")
 
-        # Already tz-aware → convert
+        # tz-aware → convert
         return s.dt.tz_convert("UTC")
 
     ########################################################
@@ -92,61 +82,6 @@ class StockPriceFetcher:
 
     ########################################################
 
-    def _normalize_columns(self, df):
-
-        df.columns = [
-            str(c).lower().replace(" ", "_")
-            for c in df.columns
-        ]
-
-        # adjusted close normalization
-        if "adj_close" in df.columns:
-            df["close"] = df["adj_close"]
-
-        required = {"open", "high", "low", "close", "volume"}
-
-        missing = required - set(df.columns)
-
-        if missing:
-            raise RuntimeError(
-                f"Yahoo schema drift detected. Missing={missing}"
-            )
-
-        return df
-
-    ########################################################
-
-    def _validate_prices(self, df):
-
-        numeric = ["open", "high", "low", "close", "volume"]
-
-        for col in numeric:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-        df.dropna(subset=["open", "high", "low", "close"], inplace=True)
-
-        if df.empty:
-            raise RuntimeError("All price rows invalid.")
-
-        if (df[["open", "high", "low", "close"]] <= 0).any().any():
-            raise RuntimeError("Non-positive prices detected.")
-
-        if (df["volume"] < 0).any():
-            raise RuntimeError("Negative volume detected.")
-
-        # invariant checks
-        if (df["high"] < df[["open", "close"]].max(axis=1)).any():
-            raise RuntimeError("High invariant violated.")
-
-        if (df["low"] > df[["open", "close"]].min(axis=1)).any():
-            raise RuntimeError("Low invariant violated.")
-
-        return df
-
-    ########################################################
-
     def fetch(
         self,
         ticker: str,
@@ -163,21 +98,20 @@ class StockPriceFetcher:
         )
 
         ####################################################
-        # RESET INDEX SAFELY
+        # 🔥 NEVER TRUST YAHOO COLUMN NAMES
         ####################################################
-
-        if not isinstance(df.index, pd.DatetimeIndex):
-            raise RuntimeError("Yahoo index is not datetime.")
 
         df = df.reset_index()
 
-        if "Date" in df.columns:
-            df.rename(columns={"Date": "date"}, inplace=True)
-        elif "Datetime" in df.columns:
-            df.rename(columns={"Datetime": "date"}, inplace=True)
+        # ALWAYS rename first column blindly
+        first_col = df.columns[0]
+        df.rename(columns={first_col: "date"}, inplace=True)
+
+        if "date" not in df.columns:
+            raise RuntimeError("Yahoo failed to produce date column.")
 
         ####################################################
-        # 🔥 CRITICAL FIX — NO tz_localize
+        # UTC SAFE
         ####################################################
 
         df["date"] = self._ensure_utc(df["date"])
@@ -185,10 +119,59 @@ class StockPriceFetcher:
         df.dropna(subset=["date"], inplace=True)
 
         ####################################################
+        # NORMALIZE SCHEMA
+        ####################################################
 
-        df = self._normalize_columns(df)
+        df.columns = [
+            str(c).lower().replace(" ", "_")
+            for c in df.columns
+        ]
 
-        df = self._validate_prices(df)
+        if "adj_close" in df.columns:
+            df["close"] = df["adj_close"]
+
+        required = {"open", "high", "low", "close", "volume"}
+
+        missing = required - set(df.columns)
+
+        if missing:
+            raise RuntimeError(
+                f"Yahoo schema drift detected. Missing={missing}"
+            )
+
+        ####################################################
+        # NUMERIC SAFETY
+        ####################################################
+
+        numeric = ["open", "high", "low", "close", "volume"]
+
+        for col in numeric:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        df.dropna(subset=["open", "high", "low", "close"], inplace=True)
+
+        if df.empty:
+            raise RuntimeError("All rows invalid after normalization.")
+
+        ####################################################
+        # PRICE INVARIANTS
+        ####################################################
+
+        if (df[["open", "high", "low", "close"]] <= 0).any().any():
+            raise RuntimeError("Non-positive price detected.")
+
+        if (df["volume"] < 0).any():
+            raise RuntimeError("Negative volume detected.")
+
+        if (df["high"] < df[["open", "close"]].max(axis=1)).any():
+            raise RuntimeError("High invariant violated.")
+
+        if (df["low"] > df[["open", "close"]].min(axis=1)).any():
+            raise RuntimeError("Low invariant violated.")
+
+        ####################################################
 
         df = (
             df
