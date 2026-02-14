@@ -17,7 +17,7 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "11.1"   # 🔥 bump version after safety upgrade
+    METADATA_VERSION = "11.2"
     MIN_TRAINING_DAYS = 120
 
     REQUIRED_METADATA_FIELDS = [
@@ -40,8 +40,17 @@ class MetadataManager:
         "universe_hash"
     ]
 
-    #####################################################
-    # FSYNC
+    IMMUTABLE_KEYS = {
+        "dataset_hash",
+        "schema_signature",
+        "schema_version",
+        "training_code_hash",
+        "training_universe",
+        "universe_hash",
+        "features",
+        "feature_count",
+    }
+
     #####################################################
 
     @staticmethod
@@ -57,8 +66,6 @@ class MetadataManager:
         finally:
             os.close(fd)
 
-    #####################################################
-    # ATOMIC WRITE
     #####################################################
 
     @staticmethod
@@ -77,8 +84,6 @@ class MetadataManager:
         os.replace(tmp, path)
         MetadataManager._fsync_dir_safe(directory)
 
-    #####################################################
-    # SECURE LOAD
     #####################################################
 
     @staticmethod
@@ -111,7 +116,7 @@ class MetadataManager:
                 "Metadata integrity failure — possible tampering."
             )
 
-        if metadata["metadata_version"] not in ("11.0", "11.1"):
+        if metadata["metadata_version"] not in ("11.0", "11.1", "11.2"):
             raise RuntimeError("Metadata version mismatch.")
 
         if metadata["schema_signature"] != get_schema_signature():
@@ -119,8 +124,6 @@ class MetadataManager:
 
         return metadata
 
-    #####################################################
-    # HASH LIST
     #####################################################
 
     @staticmethod
@@ -138,8 +141,6 @@ class MetadataManager:
 
         return hashlib.sha256(canonical).hexdigest()
 
-    #####################################################
-    # FEATURE CONTRACT
     #####################################################
 
     @staticmethod
@@ -174,7 +175,34 @@ class MetadataManager:
             )
 
     #####################################################
-    # DATASET HASH (HARDENED)
+    # METRIC VALIDATION
+    #####################################################
+
+    @staticmethod
+    def _validate_metrics(metrics: dict):
+
+        if not isinstance(metrics, dict) or not metrics:
+            raise RuntimeError("Metrics must be a non-empty dict.")
+
+        for k, v in metrics.items():
+
+            if isinstance(v, (list, tuple, dict)):
+                raise RuntimeError(
+                    f"Metric must be scalar: {k}"
+                )
+
+            try:
+                val = float(v)
+            except Exception:
+                raise RuntimeError(
+                    f"Metric must be numeric: {k}"
+                )
+
+            if not np.isfinite(val):
+                raise RuntimeError(
+                    f"Non-finite metric detected: {k}"
+                )
+
     #####################################################
 
     @staticmethod
@@ -220,8 +248,6 @@ class MetadataManager:
 
         return hashlib.sha256(hashed.tobytes()).hexdigest()
 
-    #####################################################
-    # TRAINING CODE HASH
     #####################################################
 
     @staticmethod
@@ -270,8 +296,6 @@ class MetadataManager:
         return hasher.hexdigest()
 
     #####################################################
-    # ENVIRONMENT
-    #####################################################
 
     @staticmethod
     def capture_environment():
@@ -305,8 +329,28 @@ class MetadataManager:
         return env
 
     #####################################################
-    # METADATA HASH
+    # FLOAT-STABLE HASH
     #####################################################
+
+    @staticmethod
+    def _normalize_for_hash(obj):
+
+        if isinstance(obj, float):
+            return round(obj, 10)
+
+        if isinstance(obj, dict):
+            return {
+                k: MetadataManager._normalize_for_hash(v)
+                for k, v in sorted(obj.items())
+            }
+
+        if isinstance(obj, list):
+            return [
+                MetadataManager._normalize_for_hash(v)
+                for v in obj
+            ]
+
+        return obj
 
     @staticmethod
     def _compute_metadata_hash(metadata: dict):
@@ -314,16 +358,16 @@ class MetadataManager:
         clone = dict(metadata)
         clone.pop("metadata_integrity_hash", None)
 
+        normalized = MetadataManager._normalize_for_hash(clone)
+
         canonical = json.dumps(
-            clone,
+            normalized,
             sort_keys=True,
             separators=(",", ":")
         ).encode()
 
         return hashlib.sha256(canonical).hexdigest()
 
-    #####################################################
-    # TRAINING WINDOW
     #####################################################
 
     @staticmethod
@@ -341,8 +385,6 @@ class MetadataManager:
             )
 
     #####################################################
-    # CREATE METADATA — HARDENED
-    #####################################################
 
     @staticmethod
     def create_metadata(
@@ -352,7 +394,7 @@ class MetadataManager:
         training_start,
         training_end,
         dataset_hash,
-        dataset_rows=None,   # 🔥 backward-safe
+        dataset_rows=None,
         metadata_type=None,
         extra_fields=None
     ):
@@ -365,29 +407,22 @@ class MetadataManager:
             metadata_type
         )
 
+        MetadataManager._validate_metrics(metrics)
+
         MetadataManager._validate_training_window(
             training_start,
             training_end
         )
-
-        ###################################################
-        # DATASET ROW VALIDATION
-        ###################################################
 
         if dataset_rows is None:
             raise RuntimeError(
                 "dataset_rows must be supplied by training pipeline."
             )
 
-        try:
-            dataset_rows = int(dataset_rows)
-        except Exception:
-            raise RuntimeError("dataset_rows must be an integer.")
+        dataset_rows = int(dataset_rows)
 
         if dataset_rows <= 0:
             raise RuntimeError("dataset_rows must be > 0.")
-
-        ###################################################
 
         universe_snapshot = MarketUniverse.snapshot()
 
@@ -426,6 +461,14 @@ class MetadataManager:
         }
 
         if extra_fields:
+
+            forbidden = MetadataManager.IMMUTABLE_KEYS & set(extra_fields)
+
+            if forbidden:
+                raise RuntimeError(
+                    f"extra_fields cannot override immutable lineage keys: {forbidden}"
+                )
+
             metadata.update(extra_fields)
 
         metadata["metadata_integrity_hash"] = (
