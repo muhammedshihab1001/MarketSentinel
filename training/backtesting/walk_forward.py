@@ -19,8 +19,9 @@ class WalkForwardValidator:
     MIN_FEATURE_VARIANCE = 1e-8
     MAX_TURNOVER = 0.65
     MAX_CAPITAL_MULTIPLE = 50
-    MAX_SHARPE_REALITY = 4.0   # NEW
-    MIN_EQUITY_STD = 1e-4      # NEW
+    MAX_SHARPE_REALITY = 4.0
+    MIN_EQUITY_STD = 1e-4
+    MIN_TEST_DAYS = 20
 
     VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
 
@@ -30,8 +31,7 @@ class WalkForwardValidator:
         signal_generator,
         window_size=252,
         step_size=63,
-        embargo_days=None,
-        seed=42   # NEW
+        embargo_days=None
     ):
         self.model_trainer = model_trainer
         self.signal_generator = signal_generator
@@ -42,9 +42,6 @@ class WalkForwardValidator:
 
         self.engine = PortfolioBacktestEngine()
         self.regime_detector = MarketRegimeDetector()
-
-        # deterministic RNG
-        self.rng = np.random.default_rng(seed)
 
     ############################################
 
@@ -81,6 +78,22 @@ class WalkForwardValidator:
         if (coverage < self.window_size * 0.60).any():
             raise RuntimeError(
                 "Survivorship bias risk — assets missing large history."
+            )
+
+    ############################################
+
+    def _distribution_guard(self, train_df, test_df):
+
+        train_mu = train_df[MODEL_FEATURES].mean()
+        train_std = train_df[MODEL_FEATURES].std(ddof=0) + 1e-9
+
+        z = np.abs(
+            (test_df[MODEL_FEATURES] - train_mu) / train_std
+        )
+
+        if (z > 8).any().any():
+            raise RuntimeError(
+                "Severe feature distribution shift detected."
             )
 
     ############################################
@@ -140,7 +153,12 @@ class WalkForwardValidator:
 
     ############################################
 
-    def _validate_signals(self, signals):
+    def _validate_signals(self, signals, expected_len):
+
+        if len(signals) != expected_len:
+            raise RuntimeError(
+                "Signal length mismatch — generator dropped rows."
+            )
 
         invalid = set(signals.values()) - self.VALID_SIGNALS
 
@@ -206,38 +224,24 @@ class WalkForwardValidator:
 
         start_idx = self.window_size
 
-        # deterministic offset
-        start_idx += self.rng.integers(0, self.step_size)
-
         while start_idx < len(unique_dates) - 1:
 
-            train_end_date = unique_dates.iloc[start_idx]
-
-            embargo_cutoff = train_end_date - pd.Timedelta(
-                days=self.EMBARGO_DAYS
-            )
-
-            train_start_cut = embargo_cutoff - pd.Timedelta(days=370)
-
-            train_dates = unique_dates[
-                (unique_dates >= train_start_cut) &
-                (unique_dates < embargo_cutoff)
+            train_dates = unique_dates.iloc[
+                start_idx - self.window_size : start_idx
             ]
 
-            if len(train_dates) < self.window_size * self.MIN_TRAIN_RATIO:
-                start_idx += self.step_size
-                continue
+            embargo_cutoff = train_dates.iloc[-1]
 
-            test_dates = unique_dates[
-                unique_dates >= train_end_date
-            ][:self.step_size + 1]
+            test_dates = unique_dates.iloc[
+                start_idx : start_idx + self.step_size
+            ]
 
-            if len(test_dates) < 2:
+            if len(test_dates) < self.MIN_TEST_DAYS:
                 break
 
             train_df = df.loc[
                 (df["date"] >= train_dates.iloc[0]) &
-                (df["date"] <= train_dates.iloc[-1])
+                (df["date"] <= embargo_cutoff)
             ].copy()
 
             test_df = df.loc[
@@ -251,6 +255,7 @@ class WalkForwardValidator:
             test_df = self.regime_detector.detect(test_df.copy())
 
             self._validate_training_frame(train_df)
+            self._distribution_guard(train_df, test_df)
 
             model = self.model_trainer(train_df)
             self._sanity_check_model(model, train_df)
@@ -284,7 +289,7 @@ class WalkForwardValidator:
                     zip(signal_slice["ticker"], signals_list)
                 )
 
-                self._validate_signals(signals)
+                self._validate_signals(signals, len(signal_slice))
 
                 shared = set(prices) & set(signals)
 
@@ -336,7 +341,8 @@ class WalkForwardValidator:
                 )
 
             if equity_curve:
-                equity_curve.extend(curve[1:].tolist())
+                scale = equity_curve[-1] / curve[0]
+                equity_curve.extend((curve * scale)[1:].tolist())
             else:
                 equity_curve.extend(curve.tolist())
 
