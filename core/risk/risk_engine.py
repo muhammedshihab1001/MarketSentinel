@@ -6,7 +6,7 @@ from core.indicators.technical_indicators import TechnicalIndicators
 
 class RiskEngine:
     """
-    Institutional Portfolio Risk Engine.
+    Institutional Portfolio Risk Engine — Hardened
     """
 
     VOL_LOOKBACK = 20
@@ -14,6 +14,9 @@ class RiskEngine:
 
     MAX_VOL = 0.06
     CRISIS_VOL = 0.09
+    VOL_FLOOR = 0.004
+
+    GAP_LIMIT = 0.22
 
     RSI_OVERBOUGHT = 70
     RSI_OVERSOLD = 30
@@ -31,7 +34,7 @@ class RiskEngine:
         return float(np.clip(x, 0, 1))
 
     ##############################################
-    # INPUT VALIDATION
+    # STRICT VALIDATION
     ##############################################
 
     @classmethod
@@ -43,10 +46,11 @@ class RiskEngine:
         if "close" not in df.columns:
             raise RuntimeError("RiskEngine requires 'close' column.")
 
-        close = pd.to_numeric(df["close"], errors="coerce")
+        if "date" in df.columns:
+            if df["date"].duplicated().any():
+                raise RuntimeError("Duplicate candles detected.")
 
-        if close.isna().any():
-            raise RuntimeError("Non-numeric close prices detected.")
+        close = pd.to_numeric(df["close"], errors="raise")
 
         if not np.isfinite(close).all():
             raise RuntimeError("Non-finite prices detected.")
@@ -56,6 +60,14 @@ class RiskEngine:
 
         if len(df) < cls.MIN_ROWS:
             raise RuntimeError("Insufficient data for risk computation.")
+
+        # 🔥 GAP CHECK
+        log_returns = np.log(close).diff().dropna()
+
+        if np.abs(log_returns).max() > cls.GAP_LIMIT:
+            raise RuntimeError(
+                "Extreme price gap detected — refusing risk calc."
+            )
 
     ##############################################
     # SAFE INDICATOR CALL
@@ -67,24 +79,29 @@ class RiskEngine:
         try:
             val = func()
 
-            if val is None or not np.isfinite(val):
+            if val is None:
                 return default
 
-            return float(val)
+            val = float(val)
+
+            if not np.isfinite(val):
+                return default
+
+            return val
 
         except Exception:
             return default
 
     ##############################################
-    # VOLATILITY
+    # VOLATILITY (LOG RETURNS)
     ##############################################
 
     @classmethod
     def volatility_risk(cls, df):
 
-        returns = df["close"].pct_change()
+        log_returns = np.log(df["close"]).diff()
 
-        vol = returns.rolling(
+        vol = log_returns.rolling(
             cls.VOL_LOOKBACK,
             min_periods=cls.VOL_LOOKBACK
         ).std()
@@ -94,25 +111,31 @@ class RiskEngine:
         if not np.isfinite(latest):
             return 0.5
 
+        latest = max(latest, cls.VOL_FLOOR)
+
         return cls._clip01(latest / cls.MAX_VOL)
 
     ##############################################
-    # TAIL RISK
+    # CRASH CLUSTER DETECTOR
     ##############################################
 
     @classmethod
     def tail_risk(cls, df):
 
-        returns = df["close"].pct_change().dropna()
+        log_returns = np.log(df["close"]).diff().dropna()
 
-        if len(returns) < 30:
+        if len(log_returns) < 30:
             return 0.3
 
-        extreme_moves = np.sum(
-            np.abs(returns.tail(20)) > cls.TAIL_RETURN
+        extremes = np.sum(
+            np.abs(log_returns.tail(20)) > cls.TAIL_RETURN
         )
 
-        return cls._clip01(extreme_moves / cls.TAIL_NORMALIZER)
+        # crash clustering multiplier
+        if extremes >= 3:
+            return 0.9
+
+        return cls._clip01(extremes / cls.TAIL_NORMALIZER)
 
     ##############################################
     # RSI
@@ -124,7 +147,7 @@ class RiskEngine:
         def compute():
             return TechnicalIndicators.rsi(df).iloc[-1]
 
-        rsi = cls._safe_indicator(compute)
+        rsi = cls._safe_indicator(compute, default=50)
 
         if signal == "BUY":
 
@@ -146,7 +169,7 @@ class RiskEngine:
         def ma():
             return TechnicalIndicators.moving_average(df, 20).iloc[-1]
 
-        ma20 = cls._safe_indicator(ma)
+        ma20 = cls._safe_indicator(ma, default=df["close"].iloc[-1])
         price = float(df["close"].iloc[-1])
 
         if signal == "BUY" and price < ma20:
@@ -164,9 +187,9 @@ class RiskEngine:
         try:
             upper, lower = TechnicalIndicators.bollinger_bands(df)
 
-            upper = upper.iloc[-1]
-            lower = lower.iloc[-1]
-            price = df["close"].iloc[-1]
+            upper = float(upper.iloc[-1])
+            lower = float(lower.iloc[-1])
+            price = float(df["close"].iloc[-1])
 
             if not np.isfinite(upper) or not np.isfinite(lower):
                 return 0.5
@@ -191,12 +214,12 @@ class RiskEngine:
     @classmethod
     def regime_risk(cls, df):
 
-        returns = df["close"].pct_change().dropna()
+        log_returns = np.log(df["close"]).diff().dropna()
 
-        if len(returns) < cls.REGIME_LOOKBACK:
+        if len(log_returns) < cls.REGIME_LOOKBACK:
             return 0.5, "UNKNOWN"
 
-        vol = returns.tail(cls.REGIME_LOOKBACK).std()
+        vol = log_returns.tail(cls.REGIME_LOOKBACK).std()
 
         if not np.isfinite(vol):
             return 0.5, "UNKNOWN"
