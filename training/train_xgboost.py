@@ -12,7 +12,7 @@ from core.data.market_data_service import MarketDataService
 from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_store import FeatureStore
-from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema
+from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema, get_schema_signature
 
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
@@ -28,9 +28,7 @@ from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
 
 
-logger = logging.getLogger("marketsentinel.training")
-
-init_env()
+logger = logging.getLogger(__name__)
 
 MODEL_DIR = os.path.abspath("artifacts/xgboost")
 TEMP_MODEL_PATH = f"{MODEL_DIR}/model.pkl"
@@ -43,10 +41,12 @@ MIN_SHARPE = 0.25
 MAX_DRAWDOWN = -0.40
 MIN_MODEL_BYTES = 50_000
 
+PROMOTE_FLAG = os.getenv("ALLOW_MODEL_PROMOTION", "false").lower() == "true"
+ALLOW_BASELINE_FLAG = os.getenv("ALLOW_DRIFT_BASELINE", "false").lower() == "true"
 
-########################################################
-# STRICT DETERMINISM
-########################################################
+BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "0.58"))
+SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.42"))
+
 
 def enforce_determinism():
 
@@ -59,10 +59,6 @@ def enforce_determinism():
     random.seed(SEED)
     np.random.seed(SEED)
 
-
-########################################################
-# ATOMIC MODEL SAVE (FIXED)
-########################################################
 
 def save_model_atomic(model, path):
 
@@ -83,7 +79,6 @@ def save_model_atomic(model, path):
     if size < MIN_MODEL_BYTES:
         raise RuntimeError("Model artifact suspiciously small.")
 
-    # 🔥 VERIFY LOAD
     try:
         _ = joblib.load(path)
     except Exception as e:
@@ -91,10 +86,6 @@ def save_model_atomic(model, path):
 
     return size
 
-
-########################################################
-# DATA LOADER
-########################################################
 
 def load_training_data(start_date, end_date):
 
@@ -174,15 +165,23 @@ def load_training_data(start_date, end_date):
     if df["target"].nunique() < 2:
         raise RuntimeError("Target collapsed.")
 
-    return df
+    hash_df = df[["ticker", "date", "target", *MODEL_FEATURES]] \
+        .sort_values(["date", "ticker"]) \
+        .reset_index(drop=True)
 
+    dataset_hash = MetadataManager.hash_list([
+        MetadataManager.fingerprint_dataset(hash_df),
+        get_schema_signature(),
+        start_date,
+        end_date
+    ])
 
-########################################################
-# MAIN
-########################################################
+    return df, dataset_hash
+
 
 def main(start_date=None, end_date=None):
 
+    init_env()
     enforce_determinism()
 
     logger.info("Institutional XGBoost Training")
@@ -190,38 +189,21 @@ def main(start_date=None, end_date=None):
     if not start_date or not end_date:
         start_date, end_date = MarketTime.window_for("xgboost")
 
-    df = load_training_data(start_date, end_date)
+    df, dataset_hash = load_training_data(start_date, end_date)
 
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    ###################################################
-    # CANONICAL HASH (FIXED)
-    ###################################################
-
-    hash_df = df[["ticker", "date", "target", *MODEL_FEATURES]] \
-        .sort_values(["date", "ticker"]) \
-        .reset_index(drop=True)
-
-    dataset_hash = MetadataManager.fingerprint_dataset(hash_df)
-
-    ###################################################
-    # DRIFT
-    ###################################################
-
     drift = DriftDetector()
 
-    try:
-        drift.create_baseline(
-            hash_df,
-            dataset_hash=dataset_hash,
-            allow_overwrite=False
-        )
-    except RuntimeError:
-        logger.info("Drift baseline already exists.")
-
-    ###################################################
-    # WALK FORWARD
-    ###################################################
+    if ALLOW_BASELINE_FLAG:
+        try:
+            drift.create_baseline(
+                df,
+                dataset_hash=dataset_hash,
+                allow_overwrite=False
+            )
+        except RuntimeError:
+            logger.info("Drift baseline already exists.")
 
     def trainer(d):
 
@@ -246,8 +228,8 @@ def main(start_date=None, end_date=None):
         )[:, 1]
 
         return [
-            "BUY" if p > 0.58
-            else "SELL" if p < 0.42
+            "BUY" if p > BUY_THRESHOLD
+            else "SELL" if p < SELL_THRESHOLD
             else "HOLD"
             for p in probs
         ]
@@ -269,10 +251,6 @@ def main(start_date=None, end_date=None):
     if strategy_metrics["max_drawdown"] < MAX_DRAWDOWN:
         raise RuntimeError("XGBoost rejected — drawdown too severe")
 
-    ###################################################
-    # FINAL TRAIN
-    ###################################################
-
     final_model = build_final_xgboost_model(
         df["target"],
         random_state=SEED,
@@ -286,11 +264,14 @@ def main(start_date=None, end_date=None):
         df["target"]
     )
 
-    artifact_size = save_model_atomic(final_model, TEMP_MODEL_PATH)
+    importance = dict(
+        zip(
+            MODEL_FEATURES,
+            final_model.feature_importances_.tolist()
+        )
+    )
 
-    ###################################################
-    # METADATA
-    ###################################################
+    artifact_size = save_model_atomic(final_model, TEMP_MODEL_PATH)
 
     metadata = MetadataManager.create_metadata(
         model_name="xgboost_direction",
@@ -302,6 +283,9 @@ def main(start_date=None, end_date=None):
         dataset_rows=len(df),
         metadata_type="training_manifest_v1",
         extra_fields={
+            "feature_importance": importance,
+            "buy_threshold": BUY_THRESHOLD,
+            "sell_threshold": SELL_THRESHOLD,
             "time_snapshot": MarketTime.snapshot_for("xgboost")
         }
     )
@@ -317,24 +301,23 @@ def main(start_date=None, end_date=None):
         TEMP_METADATA_PATH
     )
 
-    ModelRegistry.promote_to_production(
-        MODEL_DIR,
-        version
+    if PROMOTE_FLAG:
+        ModelRegistry.promote_to_production(
+            MODEL_DIR,
+            version
+        )
+        logger.info("Model promoted → version=%s", version)
+    else:
+        logger.warning(
+            "Model NOT promoted — set ALLOW_MODEL_PROMOTION=true to enable."
+        )
+
+    logger.info(
+        "Training summary | version=%s rows=%s sharpe=%.3f",
+        version,
+        len(df),
+        strategy_metrics["avg_sharpe"]
     )
-
-    ###################################################
-    # TRAINING SUMMARY (YOU REQUESTED)
-    ###################################################
-
-    print("\n===== MODEL TRAINING SUMMARY =====")
-    print(f"Version: {version}")
-    print(f"Dataset rows: {len(df):,}")
-    print(f"Dataset hash: {dataset_hash[:12]}...")
-    print(f"Sharpe: {strategy_metrics['avg_sharpe']:.3f}")
-    print(f"Max Drawdown: {strategy_metrics['max_drawdown']:.2%}")
-    print(f"Artifact size: {artifact_size/1024/1024:.2f} MB")
-    print("Status: PROMOTED TO PRODUCTION")
-    print("=================================\n")
 
     return strategy_metrics
 
