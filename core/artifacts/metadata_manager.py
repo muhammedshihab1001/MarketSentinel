@@ -17,7 +17,7 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "11.0"
+    METADATA_VERSION = "11.1"   # 🔥 bump version after safety upgrade
     MIN_TRAINING_DAYS = 120
 
     REQUIRED_METADATA_FIELDS = [
@@ -104,7 +104,6 @@ class MetadataManager:
             )
 
         expected = metadata.get("metadata_integrity_hash")
-
         actual = MetadataManager._compute_metadata_hash(metadata)
 
         if expected != actual:
@@ -112,7 +111,7 @@ class MetadataManager:
                 "Metadata integrity failure — possible tampering."
             )
 
-        if metadata["metadata_version"] != MetadataManager.METADATA_VERSION:
+        if metadata["metadata_version"] not in ("11.0", "11.1"):
             raise RuntimeError("Metadata version mismatch.")
 
         if metadata["schema_signature"] != get_schema_signature():
@@ -222,7 +221,7 @@ class MetadataManager:
         return hashlib.sha256(hashed.tobytes()).hexdigest()
 
     #####################################################
-    # TRAINING CODE HASH (SYMLINK SAFE)
+    # TRAINING CODE HASH
     #####################################################
 
     @staticmethod
@@ -260,7 +259,6 @@ class MetadataManager:
                         )
 
                     rel_path = os.path.relpath(full_path)
-
                     hasher.update(rel_path.encode())
 
                     with open(full_path, "rb") as fh:
@@ -272,7 +270,7 @@ class MetadataManager:
         return hasher.hexdigest()
 
     #####################################################
-    # ENVIRONMENT (EXTENDED)
+    # ENVIRONMENT
     #####################################################
 
     @staticmethod
@@ -343,7 +341,7 @@ class MetadataManager:
             )
 
     #####################################################
-    # CREATE METADATA
+    # CREATE METADATA — HARDENED
     #####################################################
 
     @staticmethod
@@ -354,10 +352,13 @@ class MetadataManager:
         training_start,
         training_end,
         dataset_hash,
-        dataset_rows,
-        metadata_type,
+        dataset_rows=None,   # 🔥 backward-safe
+        metadata_type=None,
         extra_fields=None
     ):
+
+        if metadata_type is None:
+            raise RuntimeError("metadata_type is required.")
 
         MetadataManager._validate_feature_contract(
             features,
@@ -368,6 +369,25 @@ class MetadataManager:
             training_start,
             training_end
         )
+
+        ###################################################
+        # DATASET ROW VALIDATION
+        ###################################################
+
+        if dataset_rows is None:
+            raise RuntimeError(
+                "dataset_rows must be supplied by training pipeline."
+            )
+
+        try:
+            dataset_rows = int(dataset_rows)
+        except Exception:
+            raise RuntimeError("dataset_rows must be an integer.")
+
+        if dataset_rows <= 0:
+            raise RuntimeError("dataset_rows must be > 0.")
+
+        ###################################################
 
         universe_snapshot = MarketUniverse.snapshot()
 
@@ -385,7 +405,7 @@ class MetadataManager:
             },
 
             "dataset_hash": dataset_hash,
-            "dataset_rows": int(dataset_rows),
+            "dataset_rows": dataset_rows,
 
             "features": list(features),
             "feature_count": len(features),
