@@ -34,7 +34,7 @@ class NewsFetcher:
 
     CACHE_DIR = "data/news_cache"
     CACHE_TTL_MIN = 20
-    CACHE_SCHEMA_VERSION = "v5"
+    CACHE_SCHEMA_VERSION = "v6"   # bump cache version
 
     EMPTY_SCHEMA = pd.DataFrame({
         "headline": pd.Series(dtype="string"),
@@ -66,6 +66,7 @@ class NewsFetcher:
 
         self.session = self._build_session()
 
+        # 🔥 deterministic order
         self.provider_map = {
             "finnhub": self._fetch_finnhub,
             "marketaux": self._fetch_marketaux,
@@ -105,8 +106,6 @@ class NewsFetcher:
         return session
 
     ########################################################
-    # SAFE TICKER EXTRACTION
-    ########################################################
 
     def _extract_ticker(self, query: str):
 
@@ -117,8 +116,6 @@ class NewsFetcher:
 
         return candidate
 
-    ########################################################
-    # CONTRACT CHECK
     ########################################################
 
     def _contract_check(self, df):
@@ -212,13 +209,8 @@ class NewsFetcher:
         if df.empty:
             return self.EMPTY_SCHEMA.copy()
 
-        cutoff = datetime.utcnow() - timedelta(
-            hours=self.MAX_AGE_HOURS
-        )
-
-        ingest_guard = datetime.utcnow() - timedelta(
-            minutes=self.INGESTION_DELAY_MIN
-        )
+        cutoff = datetime.utcnow() - timedelta(hours=self.MAX_AGE_HOURS)
+        ingest_guard = datetime.utcnow() - timedelta(minutes=self.INGESTION_DELAY_MIN)
 
         df = df.dropna(subset=["published_at"])
 
@@ -280,24 +272,110 @@ class NewsFetcher:
         for a in data:
 
             ts = a.get("datetime")
-
             if not ts:
                 continue
 
-            published = datetime.utcfromtimestamp(ts)
-
             rows.append({
                 "headline": a.get("headline", ""),
-                "published_at": published,
+                "published_at": datetime.utcfromtimestamp(ts),
                 "source": a.get("source", "finnhub"),
+                "link": a.get("url", "")
+            })
+
+        df = pd.DataFrame(rows).head(limit)
+
+        return self._contract_check(self._post_process(df))
+
+    ########################################################
+    # MARKET AUX
+    ########################################################
+
+    def _fetch_marketaux(self, query, limit):
+
+        if not self.marketaux_key:
+            return self.EMPTY_SCHEMA.copy()
+
+        ticker = self._extract_ticker(query)
+
+        params = {
+            "symbols": ticker,
+            "filter_entities": "true",
+            "language": "en",
+            "limit": min(limit, 100),
+            "api_token": self.marketaux_key
+        }
+
+        r = self.session.get(
+            self.MARKET_AUX_URL,
+            params=params,
+            timeout=self.REQUEST_TIMEOUT
+        )
+
+        r.raise_for_status()
+
+        data = r.json().get("data", [])
+
+        rows = []
+
+        for a in data:
+
+            published = self._normalize_date(a.get("published_at"))
+
+            rows.append({
+                "headline": a.get("title", ""),
+                "published_at": published,
+                "source": a.get("source", "marketaux"),
                 "link": a.get("url", "")
             })
 
         df = pd.DataFrame(rows)
 
-        return self._contract_check(
-            self._post_process(df)
+        return self._contract_check(self._post_process(df))
+
+    ########################################################
+    # GNEWS
+    ########################################################
+
+    def _fetch_gnews(self, query, limit):
+
+        if not self.gnews_key:
+            return self.EMPTY_SCHEMA.copy()
+
+        ticker = self._extract_ticker(query)
+
+        params = {
+            "q": ticker,
+            "lang": "en",
+            "max": min(limit, 100),
+            "token": self.gnews_key
+        }
+
+        r = self.session.get(
+            self.GNEWS_URL,
+            params=params,
+            timeout=self.REQUEST_TIMEOUT
         )
+
+        r.raise_for_status()
+
+        data = r.json().get("articles", [])
+
+        rows = []
+
+        for a in data:
+
+            published = self._normalize_date(a.get("publishedAt"))
+
+            rows.append({
+                "headline": a.get("title", ""),
+                "published_at": published,
+                "source": a.get("source", {}).get("name", "gnews"),
+                "link": a.get("url", "")
+            })
+
+        df = pd.DataFrame(rows)
+
+        return self._contract_check(self._post_process(df))
 
     ########################################################
     # ROUTER
@@ -305,47 +383,35 @@ class NewsFetcher:
 
     def _fetch_with_router(self, query, limit):
 
-        primary_fetch = self.provider_map[self.primary]
+        order = ["finnhub", "marketaux", "gnews"]
 
-        try:
-            primary = primary_fetch(query, limit)
-        except Exception as e:
-            logger.warning("Primary provider failed: %s", str(e))
-            primary = self.EMPTY_SCHEMA.copy()
-
-        if not self.failover_enabled:
-            return primary
-
-        fallbacks: List[Callable] = [
-            fn for name, fn in self.provider_map.items()
-            if name != self.primary
+        providers = [self.primary] + [
+            p for p in order if p != self.primary
         ]
 
-        for fn in fallbacks:
+        primary_df = self.EMPTY_SCHEMA.copy()
+
+        for provider in providers:
+
+            fn = self.provider_map[provider]
 
             try:
-                fallback_df = fn(query, limit)
+                df = fn(query, limit)
 
-                if not fallback_df.empty:
-                    return self._merge_sources(primary, fallback_df)
+                if not df.empty:
+                    return df if primary_df.empty else self._merge_sources(primary_df, df)
+
+                if primary_df.empty:
+                    primary_df = df
 
             except Exception as e:
-                logger.warning("Fallback failed: %s", str(e))
+                logger.warning("%s provider failed: %s", provider, str(e))
 
-        return primary
+        return primary_df
 
     ########################################################
 
     def _merge_sources(self, primary, fallback):
-
-        if primary.empty and fallback.empty:
-            return self.EMPTY_SCHEMA.copy()
-
-        if primary.empty:
-            return fallback.copy()
-
-        if fallback.empty:
-            return primary.copy()
 
         merged = pd.concat(
             [primary, fallback],
