@@ -168,34 +168,39 @@ class FeatureEngineer:
 
         rows = len(price_df)
 
-        # tiny stochastic noise
-        noise = np.random.normal(
-            loc=0.0,
-            scale=0.015,
-            size=rows
-        )
+        rng = np.random.default_rng(42)  
+        # fixed seed = reproducible training
 
         neutral = price_df[["date"]].copy()
 
-        neutral["avg_sentiment"] = noise.astype("float32")
-
-        neutral["news_count"] = np.random.randint(
-            0,
-            2,
-            size=rows
+        # small mean-zero noise
+        neutral["avg_sentiment"] = rng.normal(
+            0.0,
+            0.02,
+            rows
         ).astype("float32")
 
-        neutral["sentiment_std"] = np.full(
-            rows,
-            cls.SENTIMENT_STD_FLOOR,
-            dtype="float32"
-        )
+        # simulate sparse news arrival
+        neutral["news_count"] = rng.poisson(
+            0.3,
+            rows
+        ).astype("float32")
+
+        # ⭐ FIX — NO CONSTANT STD
+        neutral["sentiment_std"] = np.abs(
+            rng.normal(
+                cls.SENTIMENT_STD_FLOOR,
+                0.01,
+                rows
+            )
+        ).astype("float32")
 
         logger.warning(
-            "Sentiment unavailable — stochastic prior injected."
+            "Sentiment unavailable — stochastic distribution injected."
         )
 
         return neutral
+
 
     ########################################################
 
