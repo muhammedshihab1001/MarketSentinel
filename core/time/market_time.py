@@ -6,10 +6,17 @@ import hashlib
 
 class MarketTime:
     """
-    Institutional time governor.
+    Institutional Time Governor (Deterministic).
+
+    Guarantees:
+    ✔ reproducible training
+    ✔ tamper-detected freeze file
+    ✔ atomic persistence
+    ✔ lineage-safe time hashing
+    ✔ walk-forward protection
     """
 
-    TIME_GOVERNANCE_VERSION = "2.0"
+    TIME_GOVERNANCE_VERSION = "3.0"
 
     MODEL_WINDOWS = {
         "xgboost": 3,
@@ -28,20 +35,39 @@ class MarketTime:
     _frozen_today = None
 
     ########################################################
+    # UTC
+    ########################################################
 
     @staticmethod
     def _utc_today():
         return datetime.datetime.utcnow().date()
 
     ########################################################
-    # ATOMIC WRITE
+    # HASH
     ########################################################
 
     @staticmethod
-    def _atomic_write(path, payload):
+    def _hash_payload(payload: dict):
+
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":")
+        ).encode()
+
+        return hashlib.sha256(canonical).hexdigest()
+
+    ########################################################
+    # ATOMIC WRITE
+    ########################################################
+
+    @classmethod
+    def _atomic_write(cls, path, payload):
 
         directory = os.path.dirname(path)
         os.makedirs(directory, exist_ok=True)
+
+        payload["integrity_hash"] = cls._hash_payload(payload)
 
         tmp = path + ".tmp"
 
@@ -79,6 +105,7 @@ class MarketTime:
                 os.O_CREAT | os.O_EXCL | os.O_RDWR
             )
             os.close(fd)
+
         except FileExistsError:
             raise RuntimeError(
                 "Time freeze lock detected — another process may be freezing time."
@@ -113,20 +140,22 @@ class MarketTime:
 
             cls._frozen_today = frozen
 
+            payload = {
+                "frozen_today": date_str,
+                "governance_version":
+                    cls.TIME_GOVERNANCE_VERSION
+            }
+
             cls._atomic_write(
                 cls.FREEZE_FILE,
-                {
-                    "frozen_today": date_str,
-                    "governance_version":
-                        cls.TIME_GOVERNANCE_VERSION
-                }
+                payload
             )
 
         finally:
             cls._release_lock()
 
     ########################################################
-    # LOAD FREEZE
+    # LOAD FREEZE (TAMPER SAFE)
     ########################################################
 
     @classmethod
@@ -138,6 +167,13 @@ class MarketTime:
         try:
             with open(cls.FREEZE_FILE) as f:
                 payload = json.load(f)
+
+            integrity = payload.pop("integrity_hash", None)
+
+            if integrity != cls._hash_payload(payload):
+                raise RuntimeError(
+                    "Freeze file integrity failure — possible tampering."
+                )
 
             frozen = datetime.date.fromisoformat(
                 payload["frozen_today"]
@@ -236,7 +272,7 @@ class MarketTime:
         return anchor
 
     ########################################################
-    # SNAPSHOT (STRUCTURE LOCKED)
+    # SNAPSHOT
     ########################################################
 
     @classmethod
