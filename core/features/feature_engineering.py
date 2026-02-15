@@ -14,18 +14,15 @@ logger = logging.getLogger(__name__)
 
 class FeatureEngineer:
 
-    MIN_ROWS_REQUIRED = 180   # lowered → prevents universe collapse
+    MIN_ROWS_REQUIRED = 180
     VOL_FLOOR = 1e-4
     SENTIMENT_STD_FLOOR = 0.02
 
     RETURN_CLAMP = (-0.5, 0.5)
 
-    # allow splits safely
     SPLIT_THRESHOLD = 3.5
-
     MERGE_TOLERANCE = pd.Timedelta("3D")
 
-    # relaxed — models handle imbalance
     MIN_CLASS_RATIO = 0.15
 
     SENTIMENT_COLUMNS = [
@@ -60,11 +57,7 @@ class FeatureEngineer:
         df = df.copy()
 
         if "ticker" not in df.columns:
-
-            if ticker is None:
-                ticker = "unknown"
-
-            df["ticker"] = ticker
+            df["ticker"] = ticker or "unknown"
 
         df["ticker"] = df["ticker"].astype(str)
 
@@ -82,7 +75,6 @@ class FeatureEngineer:
         df = cls._normalize_datetime(df)
 
         required = {"date", "close", "ticker"}
-
         missing = required - set(df.columns)
 
         if missing:
@@ -106,11 +98,7 @@ class FeatureEngineer:
         extreme = returns > cls.SPLIT_THRESHOLD
 
         if extreme.any():
-
-            logger.warning(
-                "Split detected — repairing price path."
-            )
-
+            logger.warning("Split detected — repairing price path.")
             df.loc[extreme, "close"] = np.nan
             df["close"] = df["close"].ffill()
 
@@ -178,9 +166,7 @@ class FeatureEngineer:
         neutral["news_count"] = 0.0
         neutral["sentiment_std"] = cls.SENTIMENT_STD_FLOOR
 
-        logger.warning(
-            "Sentiment unavailable — neutral prior injected."
-        )
+        logger.warning("Sentiment unavailable — neutral prior injected.")
 
         return neutral
 
@@ -204,7 +190,6 @@ class FeatureEngineer:
         sentiment = sentiment_df.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment)
 
-        # shift → prevents leakage
         sentiment["date"] += pd.Timedelta(days=1)
 
         merged = pd.merge_asof(
@@ -253,7 +238,8 @@ class FeatureEngineer:
             np.where(risk_adj <= lower, 0, np.nan)
         )
 
-        required = ["target"] + MODEL_FEATURES
+        # ✅ FIXED — cast tuple to list
+        required = ["target"] + list(MODEL_FEATURES)
 
         df = df.dropna(subset=required)
 
@@ -312,9 +298,6 @@ class FeatureEngineer:
             df.loc[:, MODEL_FEATURES]
         )
 
-        if isinstance(validated, tuple):
-            validated = validated[0]
-
         final = pd.concat(
             [
                 df[["date", "close", "target", "ticker"]].reset_index(drop=True),
@@ -323,9 +306,6 @@ class FeatureEngineer:
             axis=1
         )
 
-        logger.info(
-            "Feature pipeline built | rows=%s",
-            len(final)
-        )
+        logger.info("Feature pipeline built | rows=%s", len(final))
 
         return final.reset_index(drop=True)
