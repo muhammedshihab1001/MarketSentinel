@@ -24,7 +24,7 @@ class YahooProvider(MarketDataProvider):
         self.fetcher = StockPriceFetcher()
 
     ########################################################
-    # 🔥 PRODUCTION TZ NORMALIZER
+    # SAFE DATETIME
     ########################################################
 
     def _normalize_datetime(self, series):
@@ -34,11 +34,8 @@ class YahooProvider(MarketDataProvider):
         if dt.isna().all():
             raise RuntimeError("Datetime parsing failed.")
 
-        # naive → localize
         if dt.dt.tz is None:
             dt = dt.dt.tz_localize("UTC")
-
-        # aware → convert
         else:
             dt = dt.dt.tz_convert("UTC")
 
@@ -58,6 +55,8 @@ class YahooProvider(MarketDataProvider):
             raise RuntimeError("Yahoo returned empty dataset.")
 
     ########################################################
+    # 🔥 INSTITUTIONAL NORMALIZER
+    ########################################################
 
     def _normalize(self, df, ticker, start_date, end_date):
 
@@ -65,7 +64,10 @@ class YahooProvider(MarketDataProvider):
 
         df = df.copy()
 
-        # HANDLE INDEX SAFELY
+        ####################################################
+        # HANDLE INDEX
+        ####################################################
+
         if "date" not in df.columns:
 
             if isinstance(df.index, pd.DatetimeIndex):
@@ -85,7 +87,6 @@ class YahooProvider(MarketDataProvider):
 
         df.columns = [c.lower().strip() for c in df.columns]
 
-        # Adjusted close
         if "adj close" in df.columns:
             df["close"] = df["adj close"]
 
@@ -99,18 +100,32 @@ class YahooProvider(MarketDataProvider):
         if missing:
             raise RuntimeError(f"Yahoo schema violation: {missing}")
 
-        # numeric safety
-        for col in ["open", "high", "low", "close", "volume"]:
+        ####################################################
+        # NUMERIC HARDENING
+        ####################################################
+
+        numeric_cols = ["open", "high", "low", "close", "volume"]
+
+        for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        df = df.replace([np.inf, -np.inf], np.nan)
-        df = df.dropna()
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        # Drop rows with missing price — SAFE
+        df.dropna(subset=["open", "high", "low", "close"], inplace=True)
 
         if df.empty:
             raise RuntimeError("Normalization produced empty dataset.")
 
-        # timezone fix
+        ####################################################
+        # TIMEZONE
+        ####################################################
+
         df["date"] = self._normalize_datetime(df["date"])
+
+        ####################################################
+        # SORT + DEDUPE
+        ####################################################
 
         df = (
             df
@@ -123,17 +138,46 @@ class YahooProvider(MarketDataProvider):
         if len(df) < self.MIN_ROWS:
             raise RuntimeError("Yahoo returned insufficient history.")
 
-        # price invariants
-        if (df[["open","high","low","close"]] <= 0).any().any():
-            raise RuntimeError("Non-positive price detected.")
+        ####################################################
+        # 🔥 SOFT PRICE REPAIR (CRITICAL)
+        ####################################################
 
-        if (df["high"] < df[["open","close"]].max(axis=1)).any():
-            raise RuntimeError("High invariant violated.")
+        # Remove non-positive prices safely
+        df = df[
+            (df["open"] > 0) &
+            (df["high"] > 0) &
+            (df["low"] > 0) &
+            (df["close"] > 0)
+        ]
 
-        if (df["low"] > df[["open","close"]].min(axis=1)).any():
-            raise RuntimeError("Low invariant violated.")
+        if df.empty:
+            raise RuntimeError("All rows invalid after price filter.")
+
+        # Repair high / low anomalies instead of crashing
+        df["high"] = df[["high", "open", "close"]].max(axis=1)
+        df["low"] = df[["low", "open", "close"]].min(axis=1)
+
+        ####################################################
+        # VOLUME REPAIR
+        ####################################################
+
+        df["volume"] = df["volume"].clip(lower=0)
+        df["volume"] = df["volume"].fillna(0)
+
+        ####################################################
+        # FINAL SAFETY
+        ####################################################
+
+        if len(df) < self.MIN_ROWS:
+            raise RuntimeError("Dataset collapsed after repair.")
 
         df["ticker"] = ticker
+
+        logger.info(
+            "Yahoo normalized | ticker=%s rows=%s",
+            ticker,
+            len(df)
+        )
 
         return df
 
@@ -156,12 +200,6 @@ class YahooProvider(MarketDataProvider):
             ticker,
             start_date,
             end_date
-        )
-
-        logger.debug(
-            "Yahoo served market data | %s rows=%s",
-            ticker,
-            len(df)
         )
 
         return self.validate_contract(df)
