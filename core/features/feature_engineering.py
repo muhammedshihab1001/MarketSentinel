@@ -239,7 +239,8 @@ class FeatureEngineer:
         )
 
         # ✅ FIXED — cast tuple to list
-        required = ["target"] + list(MODEL_FEATURES)
+        required = ["target", *MODEL_FEATURES]
+
 
         df = df.dropna(subset=required)
 
