@@ -1,6 +1,8 @@
 import os
 import logging
 import threading
+import hashlib
+import sys
 from dotenv import load_dotenv, dotenv_values
 
 
@@ -11,7 +13,7 @@ _ENV_LOCK = threading.Lock()
 
 
 ########################################################
-# INTERNAL HELPERS
+# HELPERS
 ########################################################
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
@@ -25,9 +27,14 @@ def _validate_not_empty(key: str) -> bool:
     return bool(val and val.strip())
 
 
+########################################################
+# DOTENV HARD SAFETY
+########################################################
+
 def _fail_fast_dotenv():
 
     if not os.path.exists(".env"):
+        logger.warning(".env not found — relying on system environment.")
         return
 
     try:
@@ -38,11 +45,16 @@ def _fail_fast_dotenv():
         )
 
 
+########################################################
+# PATH VALIDATION
+########################################################
+
 def _validate_paths():
 
     required_paths = [
         "MODEL_REGISTRY_PATH",
         "FEATURE_STORE_PATH",
+        "DATA_LAKE_PATH"
     ]
 
     missing = [p for p in required_paths if not _validate_not_empty(p)]
@@ -51,6 +63,7 @@ def _validate_paths():
         raise RuntimeError(f"Missing critical path env vars: {missing}")
 
     for key in required_paths:
+
         path = os.getenv(key)
 
         try:
@@ -62,7 +75,43 @@ def _validate_paths():
 
 
 ########################################################
-# PROVIDER SECRET VALIDATION (INSTITUTIONAL SAFE)
+# 🔥 MARKET PROVIDER VALIDATION (NEW — VERY IMPORTANT)
+########################################################
+
+def _validate_market_providers():
+
+    providers = {
+        "twelvedata": "TWELVEDATA_API_KEY",
+        "alphavantage": "ALPHAVANTAGE_API_KEY",
+    }
+
+    available = []
+
+    for provider, key in providers.items():
+
+        if _validate_not_empty(key) and len(os.getenv(key)) >= 8:
+            available.append(provider)
+
+    # Yahoo always exists (no key required)
+    available.append("yahoo")
+
+    if len(available) == 1 and available[0] == "yahoo":
+
+        logger.warning(
+            "⚠ ONLY Yahoo provider available. "
+            "Production reliability reduced."
+        )
+
+    logger.info(
+        "Market providers detected → %s",
+        available
+    )
+
+    os.environ["MARKET_PROVIDERS_ACTIVE"] = ",".join(available)
+
+
+########################################################
+# NEWS PROVIDER VALIDATION
 ########################################################
 
 def _validate_news_provider_secrets():
@@ -80,7 +129,7 @@ def _validate_news_provider_secrets():
     }
 
     ####################################################
-    # AUTO MODE (VERY IMPORTANT)
+    # AUTO MODE
     ####################################################
 
     if primary == "auto":
@@ -97,7 +146,6 @@ def _validate_news_provider_secrets():
                 os.environ["NEWS_PROVIDER_PRIMARY"] = provider
                 return
 
-        # No keys found → disable sentiment safely
         logger.warning(
             "No news provider keys detected — sentiment auto-disabled."
         )
@@ -106,7 +154,7 @@ def _validate_news_provider_secrets():
         return
 
     ####################################################
-    # EXPLICIT PROVIDER
+    # EXPLICIT MODE
     ####################################################
 
     if primary not in providers:
@@ -124,31 +172,30 @@ def _validate_news_provider_secrets():
         )
 
         os.environ["ENABLE_SENTIMENT"] = "0"
-
-        logger.warning(
-            "Sentiment automatically disabled due to missing provider key."
-        )
-
         return
 
     if len(os.getenv(primary_key)) < 10:
         raise RuntimeError(f"{primary_key} appears invalid.")
 
-    ####################################################
-    # OPTIONAL FAILOVER CHECK
-    ####################################################
 
-    if _as_bool(os.getenv("NEWS_PROVIDER_FAILOVER", "1")):
+########################################################
+# ENVIRONMENT FINGERPRINT (VERY HIGH VALUE)
+########################################################
 
-        optional_keys = [
-            v for k, v in providers.items()
-            if k != primary and _validate_not_empty(v)
-        ]
+def _environment_fingerprint():
 
-        if not optional_keys:
-            logger.warning(
-                "Failover enabled but no secondary provider keys detected."
-            )
+    payload = (
+        sys.version +
+        os.getenv("TWELVEDATA_API_KEY", "") +
+        os.getenv("ALPHAVANTAGE_API_KEY", "") +
+        os.getenv("ENABLE_SENTIMENT", "")
+    )
+
+    fp = hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    os.environ["ENV_FINGERPRINT"] = fp
+
+    logger.info("Environment fingerprint → %s", fp)
 
 
 ########################################################
@@ -167,7 +214,7 @@ def init_env() -> None:
             return
 
         ####################################################
-        # DOTENV SAFETY
+        # DOTENV
         ####################################################
 
         if _as_bool(os.getenv("DOTENV_ENABLED", "1")):
@@ -180,19 +227,15 @@ def init_env() -> None:
 
         defaults = {
 
-            # sentiment control
             "ENABLE_SENTIMENT": "0",
             "NEWS_PROVIDER_FAILOVER": "1",
             "NEWS_PROVIDER_PRIMARY": "auto",
 
-            # dotenv
             "DOTENV_ENABLED": "1",
 
-            # tokenizer / hf stability
             "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
             "TOKENIZERS_PARALLELISM": "false",
 
-            # deterministic hashing
             "PYTHONHASHSEED": "42",
         }
 
@@ -200,19 +243,16 @@ def init_env() -> None:
             os.environ.setdefault(k, v)
 
         ####################################################
-        # PATH SAFETY
+        # VALIDATIONS
         ####################################################
 
         _validate_paths()
-
-        ####################################################
-        # PROVIDER SAFETY
-        ####################################################
-
+        _validate_market_providers()
         _validate_news_provider_secrets()
+        _environment_fingerprint()
 
         ####################################################
-        # OFFLINE MODE CONTROL
+        # OFFLINE MODE SAFETY
         ####################################################
 
         if _as_bool(os.getenv("ALLOW_OFFLINE_MODE"), False):
@@ -222,7 +262,7 @@ def init_env() -> None:
                 or "PYTEST_CURRENT_TEST" in os.environ
             ):
                 raise RuntimeError(
-                    "ALLOW_OFFLINE_MODE is forbidden outside CI/tests."
+                    "ALLOW_OFFLINE_MODE forbidden outside CI/tests."
                 )
 
             logger.warning("Running in OFFLINE MODE.")
