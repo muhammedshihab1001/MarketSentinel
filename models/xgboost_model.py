@@ -13,7 +13,7 @@ MIN_CLASS_WEIGHT = 1.0
 
 
 ###################################################
-# LAZY GPU DETECTION (INSTITUTIONAL SAFE)
+# GPU DETECTION
 ###################################################
 
 _GPU_AVAILABLE = None
@@ -21,13 +21,6 @@ _GPU_LOCK = threading.Lock()
 
 
 def _gpu_verified():
-    """
-    Institutional GPU probe.
-
-    Runs ONCE.
-    Actually trains a tiny booster.
-    Prevents fake CUDA environments.
-    """
 
     global _GPU_AVAILABLE
 
@@ -73,34 +66,23 @@ def _device():
 
 def compute_class_weight(y):
 
-    if y is None or len(y) == 0:
-        raise RuntimeError("Empty labels provided to XGBoost.")
-
     y = np.asarray(y)
 
+    if len(y) == 0:
+        raise RuntimeError("Empty labels.")
+
     if not np.isfinite(y).all():
-        raise RuntimeError("Non-finite labels detected.")
+        raise RuntimeError("Non-finite labels.")
 
     pos = float(np.sum(y))
     neg = float(len(y) - pos)
 
     if pos == 0 or neg == 0:
-        raise RuntimeError(
-            "Label collapse detected — model cannot train."
-        )
+        raise RuntimeError("Label collapse detected.")
 
     weight = neg / pos
 
-    if not np.isfinite(weight):
-        raise RuntimeError("Invalid class weight.")
-
-    return float(
-        np.clip(
-            weight,
-            MIN_CLASS_WEIGHT,
-            MAX_CLASS_WEIGHT
-        )
-    )
+    return float(np.clip(weight, MIN_CLASS_WEIGHT, MAX_CLASS_WEIGHT))
 
 
 ###################################################
@@ -115,22 +97,18 @@ def _validate_features(X):
         )
 
     if not np.isfinite(X).all():
-        raise RuntimeError("Non-finite feature values detected.")
+        raise RuntimeError("Non-finite feature values.")
 
 
 ###################################################
 # BASE PARAMS
 ###################################################
 
-def _base_params(pos_weight):
+def _base_params(pos_weight, overrides=None):
 
     device = _device()
 
     params = dict(
-
-        ############################
-        # TREE STRUCTURE
-        ############################
 
         max_depth=5,
         learning_rate=0.03,
@@ -144,10 +122,6 @@ def _base_params(pos_weight):
         reg_alpha=0.7,
         reg_lambda=1.2,
 
-        ############################
-        # STABILITY
-        ############################
-
         eval_metric="logloss",
         random_state=SEED,
         n_jobs=1,
@@ -156,18 +130,9 @@ def _base_params(pos_weight):
         device=device,
 
         deterministic_histogram=True,
-
         sampling_method="uniform",
 
-        ############################
-        # IMBALANCE
-        ############################
-
         scale_pos_weight=pos_weight,
-
-        ############################
-        # PREVENT EXTREME TREES
-        ############################
 
         max_delta_step=1,
         grow_policy="depthwise",
@@ -180,6 +145,10 @@ def _base_params(pos_weight):
     if device == "cuda":
         params["predictor"] = "gpu_predictor"
 
+    # 🔥 SAFE PARAM OVERRIDE
+    if overrides:
+        params.update(overrides)
+
     return params
 
 
@@ -188,10 +157,6 @@ def _base_params(pos_weight):
 ###################################################
 
 class SafeXGBClassifier(XGBClassifier):
-    """
-    Enforces schema validation before training.
-    Prevents silent garbage models.
-    """
 
     def fit(self, X, y, **kwargs):
 
@@ -206,13 +171,13 @@ class SafeXGBClassifier(XGBClassifier):
 # TRAIN MODEL
 ###################################################
 
-def build_xgboost_model(y):
+def build_xgboost_model(y, **overrides):
 
     pos_weight = compute_class_weight(y)
 
-    params = _base_params(pos_weight)
+    params = _base_params(pos_weight, overrides)
 
-    params["n_estimators"] = 600
+    params.setdefault("n_estimators", 600)
 
     return SafeXGBClassifier(**params)
 
@@ -221,11 +186,11 @@ def build_xgboost_model(y):
 # FINAL MODEL
 ###################################################
 
-def build_final_xgboost_model(y):
+def build_final_xgboost_model(y, **overrides):
 
     pos_weight = compute_class_weight(y)
 
-    params = _base_params(pos_weight)
+    params = _base_params(pos_weight, overrides)
 
     params.update({
         "n_estimators": 800,
