@@ -1,10 +1,10 @@
 import os
 import logging
 import pandas as pd
+import time
 
 from core.data.providers.market.yahoo_provider import YahooProvider
 
-# THESE WILL EXIST SOON
 try:
     from core.data.providers.market.twelvedata_provider import TwelveDataProvider
 except Exception:
@@ -27,6 +27,11 @@ class MarketProviderRouter:
         1️⃣ TwelveData
         2️⃣ AlphaVantage
         3️⃣ Yahoo (fallback)
+
+    Design Goals:
+        ✔ Never over-reject
+        ✔ Never silently accept garbage
+        ✔ Prefer degraded data over crash
     """
 
     REQUIRED_COLUMNS = {
@@ -37,6 +42,10 @@ class MarketProviderRouter:
         "close",
         "volume"
     }
+
+    MIN_ACCEPTABLE_ROWS = 50
+    MAX_DAILY_MOVE = 0.90   # router-level poisoning guard
+    PROVIDER_TIMEOUT_WARN = 8.0  # seconds
 
     ALLOWED_INTERVALS = {
         "1d", "D",
@@ -67,13 +76,9 @@ class MarketProviderRouter:
     ############################################################
 
     def _register_providers(self):
-        """
-        Registers providers in PRIORITY ORDER.
-        """
 
         def register(name, builder, api_key_env=None):
 
-            # Skip provider if API key missing
             if api_key_env and not os.getenv(api_key_env):
                 logger.warning(
                     "Provider skipped → %s | missing %s",
@@ -90,13 +95,12 @@ class MarketProviderRouter:
                 return
 
             try:
+
                 provider = builder()
+
                 self.providers.append((name, provider))
 
-                logger.info(
-                    "Provider registered → %s",
-                    name
-                )
+                logger.info("Provider registered → %s", name)
 
             except Exception as e:
 
@@ -122,7 +126,7 @@ class MarketProviderRouter:
             "ALPHAVANTAGE_API_KEY"
         )
 
-        # Yahoo ALWAYS registers (no key needed)
+        # fallback
         register("yahoo", YahooProvider)
 
     ############################################################
@@ -133,6 +137,8 @@ class MarketProviderRouter:
         if interval not in cls.ALLOWED_INTERVALS:
             raise ValueError(f"Unsupported interval: {interval}")
 
+    ############################################################
+    # 🔥 INSTITUTIONAL SANITIZER
     ############################################################
 
     @classmethod
@@ -151,7 +157,7 @@ class MarketProviderRouter:
         df = df.copy()
 
         ####################################################
-        # SAFE datetime normalization
+        # datetime normalization
         ####################################################
 
         df["date"] = pd.to_datetime(
@@ -166,7 +172,7 @@ class MarketProviderRouter:
             raise RuntimeError("All datetime values invalid.")
 
         ####################################################
-        # Numeric enforcement
+        # numeric enforcement
         ####################################################
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
@@ -180,7 +186,7 @@ class MarketProviderRouter:
             raise RuntimeError("All numeric rows invalid.")
 
         ####################################################
-        # Soft invariants (DO NOT over-reject)
+        # soft invariants
         ####################################################
 
         df = df[df["high"] >= df["low"]]
@@ -189,6 +195,17 @@ class MarketProviderRouter:
             raise RuntimeError("Price invariant violation.")
 
         ####################################################
+        # 🔥 poisoning guard
+        ####################################################
+
+        jumps = df["close"].pct_change().abs()
+
+        if (jumps > cls.MAX_DAILY_MOVE).any():
+            raise RuntimeError("Extreme price jump detected.")
+
+        ####################################################
+        # ordering
+        ####################################################
 
         df = (
             df
@@ -196,6 +213,11 @@ class MarketProviderRouter:
             .sort_values("date")
             .reset_index(drop=True)
         )
+
+        if len(df) < cls.MIN_ACCEPTABLE_ROWS:
+            raise RuntimeError(
+                f"Too few rows from provider ({len(df)})"
+            )
 
         return df
 
@@ -209,6 +231,8 @@ class MarketProviderRouter:
 
         for name, provider in self.providers:
 
+            start_time = time.time()
+
             try:
 
                 df = provider.fetch(
@@ -217,6 +241,15 @@ class MarketProviderRouter:
                     end,
                     interval
                 )
+
+                latency = time.time() - start_time
+
+                if latency > self.PROVIDER_TIMEOUT_WARN:
+                    logger.warning(
+                        "Slow provider detected → %s (%.2fs)",
+                        name,
+                        latency
+                    )
 
                 df = self._sanitize_dataframe(df)
 
