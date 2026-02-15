@@ -8,37 +8,83 @@ logger = logging.getLogger(__name__)
 
 
 class StockPriceFetcher:
-    """
-    Institutional-grade Yahoo fetcher.
-
-    GUARANTEES:
-    ✔ always produces a date column
-    ✔ no timezone crashes
-    ✔ no schema drift
-    ✔ no silent NaT
-    ✔ retry-safe
-    ✔ leakage protected
-    """
 
     MAX_RETRIES = 3
     RETRY_SLEEP = 2
     MIN_ROWS = 100
 
     ########################################################
-    # SAFE UTC NORMALIZER
+    # BULLETPROOF DATE EXTRACTION
+    ########################################################
+
+    def _extract_date_column(self, df):
+
+        # CASE 1 — DatetimeIndex
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index()
+
+        # Normalize column names early
+        df.columns = [str(c).lower().strip() for c in df.columns]
+
+        possible = ["date", "datetime", "timestamp", "index"]
+
+        for col in possible:
+            if col in df.columns:
+                df.rename(columns={col: "date"}, inplace=True)
+                return df
+
+        raise RuntimeError("Yahoo failed to produce date column.")
+
     ########################################################
 
     @staticmethod
-    def _ensure_utc(series: pd.Series) -> pd.Series:
+    def _ensure_utc(series):
 
         s = pd.to_datetime(series, errors="coerce")
 
-        # naive → localize
         if getattr(s.dt, "tz", None) is None:
             return s.dt.tz_localize("UTC")
 
-        # tz-aware → convert
         return s.dt.tz_convert("UTC")
+
+    ########################################################
+
+    def _flatten_columns(self, df):
+
+        # Handles MultiIndex from Yahoo
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+
+        df.columns = [
+            str(c).lower().replace(" ", "_")
+            for c in df.columns
+        ]
+
+        return df
+
+    ########################################################
+
+    def _validate_prices(self, df):
+
+        numeric = ["open", "high", "low", "close", "volume"]
+
+        for col in numeric:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        df.dropna(subset=["open", "high", "low", "close"], inplace=True)
+
+        if df.empty:
+            raise RuntimeError("All price rows invalid.")
+
+        if (df[["open", "high", "low", "close"]] <= 0).any().any():
+            raise RuntimeError("Non-positive prices detected.")
+
+        if (df["volume"] < 0).any():
+            raise RuntimeError("Negative volume detected.")
+
+        return df
 
     ########################################################
 
@@ -82,13 +128,7 @@ class StockPriceFetcher:
 
     ########################################################
 
-    def fetch(
-        self,
-        ticker: str,
-        start_date: str,
-        end_date: str,
-        interval="1d"
-    ) -> pd.DataFrame:
+    def fetch(self, ticker, start_date, end_date, interval="1d"):
 
         df = self._download(
             ticker,
@@ -98,20 +138,19 @@ class StockPriceFetcher:
         )
 
         ####################################################
-        # 🔥 NEVER TRUST YAHOO COLUMN NAMES
+        # 🔥 FIX 1 — FLATTEN FIRST
         ####################################################
 
-        df = df.reset_index()
-
-        # ALWAYS rename first column blindly
-        first_col = df.columns[0]
-        df.rename(columns={first_col: "date"}, inplace=True)
-
-        if "date" not in df.columns:
-            raise RuntimeError("Yahoo failed to produce date column.")
+        df = self._flatten_columns(df)
 
         ####################################################
-        # UTC SAFE
+        # 🔥 FIX 2 — DATE EXTRACTION
+        ####################################################
+
+        df = self._extract_date_column(df)
+
+        ####################################################
+        # 🔥 FIX 3 — UTC SAFE
         ####################################################
 
         df["date"] = self._ensure_utc(df["date"])
@@ -119,13 +158,6 @@ class StockPriceFetcher:
         df.dropna(subset=["date"], inplace=True)
 
         ####################################################
-        # NORMALIZE SCHEMA
-        ####################################################
-
-        df.columns = [
-            str(c).lower().replace(" ", "_")
-            for c in df.columns
-        ]
 
         if "adj_close" in df.columns:
             df["close"] = df["adj_close"]
@@ -139,39 +171,7 @@ class StockPriceFetcher:
                 f"Yahoo schema drift detected. Missing={missing}"
             )
 
-        ####################################################
-        # NUMERIC SAFETY
-        ####################################################
-
-        numeric = ["open", "high", "low", "close", "volume"]
-
-        for col in numeric:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-        df.dropna(subset=["open", "high", "low", "close"], inplace=True)
-
-        if df.empty:
-            raise RuntimeError("All rows invalid after normalization.")
-
-        ####################################################
-        # PRICE INVARIANTS
-        ####################################################
-
-        if (df[["open", "high", "low", "close"]] <= 0).any().any():
-            raise RuntimeError("Non-positive price detected.")
-
-        if (df["volume"] < 0).any():
-            raise RuntimeError("Negative volume detected.")
-
-        if (df["high"] < df[["open", "close"]].max(axis=1)).any():
-            raise RuntimeError("High invariant violated.")
-
-        if (df["low"] > df[["open", "close"]].min(axis=1)).any():
-            raise RuntimeError("Low invariant violated.")
-
-        ####################################################
+        df = self._validate_prices(df)
 
         df = (
             df
@@ -196,7 +196,7 @@ class StockPriceFetcher:
 
         df["ticker"] = ticker
 
-        logger.debug(
+        logger.info(
             "Yahoo fetch success | %s rows=%s",
             ticker,
             len(df)
