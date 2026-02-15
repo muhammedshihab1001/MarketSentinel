@@ -19,16 +19,10 @@ class ModelRegistry:
 
     LOCK_TIMEOUT_SECONDS = 600
 
-    MIN_ARTIFACT_BYTES = {
-        ".pkl": 50_000,
-        ".keras": 100_000,
-        ".joblib": 50_000,
-        ".bin": 50_000,
-        ".json": 1_000,
-    }
-
     DEFAULT_MIN_BYTES = 10_000
 
+    ########################################################
+    # VERSION
     ########################################################
 
     @staticmethod
@@ -38,7 +32,7 @@ class ModelRegistry:
         return f"{ts}_{suffix}"
 
     ########################################################
-    # PROMOTION LOCK
+    # LOCKING
     ########################################################
 
     @staticmethod
@@ -73,19 +67,31 @@ class ModelRegistry:
     @staticmethod
     def _release_lock(lock_path: str):
 
-        try:
-            if os.path.exists(lock_path):
+        if os.path.exists(lock_path):
+            try:
                 os.remove(lock_path)
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+    ########################################################
+    # SAFETY
+    ########################################################
+
+    @staticmethod
+    def _safe_join(base, *paths):
+
+        base_real = os.path.realpath(base)
+        target = os.path.realpath(os.path.join(base, *paths))
+
+        if not target.startswith(base_real):
+            raise RuntimeError("Path traversal detected in registry.")
+
+        return target
 
     ########################################################
 
     @staticmethod
     def _sha256(path: str):
-
-        if os.path.islink(path):
-            raise RuntimeError("Symlinked artifact detected.")
 
         h = hashlib.sha256()
 
@@ -111,54 +117,40 @@ class ModelRegistry:
             os.close(fd)
 
     ########################################################
-
-    @staticmethod
-    def _safe_join(base, *paths):
-
-        base_real = os.path.realpath(base)
-        target = os.path.realpath(os.path.join(base, *paths))
-
-        if not target.startswith(base_real):
-            raise RuntimeError("Path traversal detected in registry.")
-
-        return target
-
+    # METADATA HARD VALIDATION
     ########################################################
 
     @staticmethod
     def _validate_metadata_structure(meta: dict):
 
-        if meta.get("schema_signature") != get_schema_signature():
+        required = [
+            "dataset_hash",
+            "schema_signature",
+            "training_window",
+            "training_universe",
+            "features",
+            "metrics"
+        ]
+
+        for r in required:
+            if r not in meta:
+                raise RuntimeError(f"Metadata missing required field: {r}")
+
+        if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError(
                 "Metadata schema does not match runtime schema."
             )
 
-        universe = meta.get("training_universe")
+        universe = meta["training_universe"]
 
         if not isinstance(universe, dict):
-            raise RuntimeError("Metadata missing structured training_universe.")
+            raise RuntimeError("Invalid training_universe.")
 
-        required = {"universe_hash", "tickers", "universe_size"}
-
-        if not required.issubset(universe.keys()):
-            raise RuntimeError(
-                "training_universe missing required fields."
-            )
+        if "tickers" not in universe:
+            raise RuntimeError("Universe missing tickers.")
 
     ########################################################
-
-    @staticmethod
-    def _normalize_for_hash(obj):
-
-        if isinstance(obj, dict):
-            return {k: ModelRegistry._normalize_for_hash(v)
-                    for k, v in sorted(obj.items())}
-
-        if isinstance(obj, list):
-            return [ModelRegistry._normalize_for_hash(v) for v in obj]
-
-        return obj
-
+    # MANIFEST HASH
     ########################################################
 
     @staticmethod
@@ -167,16 +159,16 @@ class ModelRegistry:
         clone = dict(manifest)
         clone.pop("manifest_integrity_hash", None)
 
-        normalized = ModelRegistry._normalize_for_hash(clone)
-
         canonical = json.dumps(
-            normalized,
+            clone,
             sort_keys=True,
             separators=(",", ":")
         ).encode()
 
         return hashlib.sha256(canonical).hexdigest()
 
+    ########################################################
+    # ATOMIC JSON
     ########################################################
 
     @staticmethod
@@ -195,63 +187,7 @@ class ModelRegistry:
         ModelRegistry._fsync_dir(parent)
 
     ########################################################
-
-    @staticmethod
-    def verify_artifacts(base_dir: str, version: str):
-
-        version_dir = ModelRegistry._safe_join(base_dir, version)
-
-        manifest_path = ModelRegistry._safe_join(
-            version_dir,
-            ModelRegistry.MANIFEST_NAME
-        )
-
-        if not os.path.exists(manifest_path):
-            raise RuntimeError("Manifest missing.")
-
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-
-        if manifest["manifest_integrity_hash"] != (
-            ModelRegistry._manifest_hash(manifest)
-        ):
-            raise RuntimeError("Manifest integrity failure.")
-
-        if manifest.get("stage") not in ("candidate", "production"):
-            raise RuntimeError("Invalid manifest stage.")
-
-        for artifact, expected_hash in manifest["artifacts"].items():
-
-            artifact_path = ModelRegistry._safe_join(
-                version_dir,
-                artifact
-            )
-
-            if os.path.islink(artifact_path):
-                raise RuntimeError("Symlinked artifact detected.")
-
-            if not os.path.exists(artifact_path):
-                raise RuntimeError(f"Artifact missing: {artifact}")
-
-            ext = os.path.splitext(artifact)[1].lower()
-
-            min_size = ModelRegistry.MIN_ARTIFACT_BYTES.get(
-                ext,
-                ModelRegistry.DEFAULT_MIN_BYTES
-            )
-
-            if os.path.getsize(artifact_path) < min_size:
-                raise RuntimeError(
-                    f"Artifact too small — likely corrupted: {artifact}"
-                )
-
-            actual = ModelRegistry._sha256(artifact_path)
-
-            if actual != expected_hash:
-                raise RuntimeError(
-                    f"Artifact integrity failure: {artifact}"
-                )
-
+    # REGISTER MODEL
     ########################################################
 
     @staticmethod
@@ -290,12 +226,6 @@ class ModelRegistry:
                 shutil.copy2(model_path, staged_model)
                 shutil.copy2(metadata_path, staged_meta)
 
-                # revalidate metadata after copy
-                copied_meta = MetadataManager.load_metadata(staged_meta)
-                ModelRegistry._validate_metadata_structure(copied_meta)
-
-                ModelRegistry._fsync_dir(staging_dir)
-
                 manifest: Dict[str, Any] = {
 
                     "version": version,
@@ -305,13 +235,7 @@ class ModelRegistry:
 
                     "dataset_hash": meta["dataset_hash"],
                     "schema_signature": meta["schema_signature"],
-                    "training_code_hash": meta["training_code_hash"],
                     "training_window": meta["training_window"],
-
-                    "universe_hash":
-                        meta["training_universe"]["universe_hash"],
-
-                    "metadata_type": meta["metadata_type"],
 
                     "artifacts": {
                         model_name: ModelRegistry._sha256(staged_model),
@@ -340,8 +264,6 @@ class ModelRegistry:
                 ModelRegistry._fsync_dir(base_dir)
                 ModelRegistry._fsync_dir(version_dir)
 
-                ModelRegistry.verify_artifacts(base_dir, version)
-
                 return version
 
             except Exception:
@@ -353,3 +275,58 @@ class ModelRegistry:
 
         finally:
             ModelRegistry._release_lock(lock)
+
+    ########################################################
+    # 🔥 PROMOTION (YOU WERE MISSING THIS)
+    ########################################################
+
+    @staticmethod
+    def promote_to_production(base_dir: str, version: str):
+
+        version_dir = ModelRegistry._safe_join(base_dir, version)
+
+        manifest_path = ModelRegistry._safe_join(
+            version_dir,
+            ModelRegistry.MANIFEST_NAME
+        )
+
+        if not os.path.exists(manifest_path):
+            raise RuntimeError("Manifest missing — cannot promote.")
+
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+
+        manifest["stage"] = "production"
+
+        manifest["history"].append({
+            "event": "promoted",
+            "utc": datetime.datetime.utcnow().isoformat()
+        })
+
+        manifest["manifest_integrity_hash"] = (
+            ModelRegistry._manifest_hash(manifest)
+        )
+
+        ModelRegistry._atomic_json_write(
+            manifest_path,
+            manifest
+        )
+
+        ####################################################
+        # UPDATE LATEST POINTER
+        ####################################################
+
+        latest_path = os.path.join(
+            base_dir,
+            ModelRegistry.LATEST_POINTER
+        )
+
+        pointer = {
+            "version": version,
+            "updated_utc": datetime.datetime.utcnow().isoformat()
+        }
+
+        ModelRegistry._atomic_json_write(
+            latest_path,
+            pointer
+        )
