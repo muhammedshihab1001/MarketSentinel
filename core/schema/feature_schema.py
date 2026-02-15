@@ -10,8 +10,16 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = "15.0"
+############################################################
+# SCHEMA VERSION
+############################################################
 
+SCHEMA_VERSION = "16.0"   # bump whenever features change
+
+
+############################################################
+# FEATURES (IMMUTABLE — DO NOT CHANGE TO LIST)
+############################################################
 
 MODEL_FEATURES: Tuple[str, ...] = (
     "return",
@@ -23,7 +31,7 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "news_count",
     "sentiment_std",
     "return_lag1",
-    "sentiment_lag1"
+    "sentiment_lag1",
 )
 
 FEATURE_COUNT = len(MODEL_FEATURES)
@@ -31,12 +39,21 @@ FEATURE_COUNT = len(MODEL_FEATURES)
 DTYPE = np.float32
 MIN_ROWS = 120
 
+
+############################################################
+# NAN + STABILITY CONTROLS
+############################################################
+
 MAX_NAN_RATIO_PER_FEATURE = 0.05
 MAX_ROW_NAN_RATIO = 0.10
 
 ABSOLUTE_FEATURE_LIMIT = 1e3
 MIN_VARIANCE = 1e-8
 
+
+############################################################
+# HARD FEATURE LIMITS
+############################################################
 
 FEATURE_LIMITS: Dict[str, tuple] = {
 
@@ -59,6 +76,10 @@ FEATURE_LIMITS: Dict[str, tuple] = {
 }
 
 
+############################################################
+# LOOKAHEAD GUARD
+############################################################
+
 FORBIDDEN_REGEX = re.compile(
     r"(future|next|forward|target|label|tomorrow|t\+|lead|horizon|shift|lookahead|outcome|response|y_)",
     re.IGNORECASE
@@ -78,6 +99,10 @@ def _check_forbidden_columns(df: pd.DataFrame):
             )
 
 
+############################################################
+# SCHEMA LOCK (CRITICAL FOR DRIFT DETECTION)
+############################################################
+
 def _build_feature_lock():
 
     contract = {
@@ -89,13 +114,13 @@ def _build_feature_lock():
         "abs_limit": ABSOLUTE_FEATURE_LIMIT,
         "variance_floor": MIN_VARIANCE,
         "count": FEATURE_COUNT,
-        "version": SCHEMA_VERSION
+        "version": SCHEMA_VERSION,
     }
 
     canonical = json.dumps(
         contract,
         sort_keys=True,
-        separators=(",", ":")
+        separators=(",", ":"),
     )
 
     return hashlib.sha256(canonical.encode()).hexdigest()
@@ -103,6 +128,10 @@ def _build_feature_lock():
 
 FEATURE_LOCK_HASH = _build_feature_lock()
 
+
+############################################################
+# MAIN VALIDATOR
+############################################################
 
 def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
@@ -126,18 +155,20 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     _check_forbidden_columns(df)
 
+    ########################################################
+    # NUMERIC CAST
+    ########################################################
+
     try:
         feature_df = df.astype(DTYPE, copy=True)
     except Exception as e:
-        raise RuntimeError(
-            f"Non-numeric feature detected → {e}"
-        )
+        raise RuntimeError(f"Non-numeric feature detected → {e}")
 
-    feature_df.replace(
-        [np.inf, -np.inf],
-        np.nan,
-        inplace=True
-    )
+    feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    ########################################################
+    # FEATURE STABILITY CHECKS
+    ########################################################
 
     for col in MODEL_FEATURES:
 
@@ -145,24 +176,20 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         finite_vals = series[np.isfinite(series)]
 
         if finite_vals.empty:
-            raise RuntimeError(
-                f"No finite values present in feature: {col}"
-            )
+            raise RuntimeError(f"No finite values present in feature: {col}")
 
         if finite_vals.nunique() <= 1:
-            raise RuntimeError(
-                f"Constant feature detected: {col}"
-            )
+            raise RuntimeError(f"Constant feature detected: {col}")
 
         if finite_vals.var(ddof=0) < MIN_VARIANCE:
-            raise RuntimeError(
-                f"Near-zero variance feature detected: {col}"
-            )
+            raise RuntimeError(f"Near-zero variance feature detected: {col}")
 
         if np.abs(finite_vals).max() > ABSOLUTE_FEATURE_LIMIT:
-            raise RuntimeError(
-                f"Feature explosion detected: {col}"
-            )
+            raise RuntimeError(f"Feature explosion detected: {col}")
+
+    ########################################################
+    # NAN CHECKS
+    ########################################################
 
     per_feature_nan = feature_df.isna().mean()
 
@@ -178,9 +205,11 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     row_nan_ratio = feature_df.isna().mean(axis=1)
 
     if (row_nan_ratio > MAX_ROW_NAN_RATIO).any():
-        logger.warning(
-            "Row-level NaN spike detected."
-        )
+        logger.warning("Row-level NaN spike detected.")
+
+    ########################################################
+    # SOFT LIMIT WARNINGS
+    ########################################################
 
     for col, (lo, hi) in FEATURE_LIMITS.items():
 
@@ -192,24 +221,28 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         if (finite < lo).any() or (finite > hi).any():
             logger.warning(
                 "Feature outside historical bounds → %s",
-                col
+                col,
             )
 
     return feature_df.astype(DTYPE, copy=False)
 
+
+############################################################
+# SIGNATURE
+############################################################
 
 def get_schema_signature() -> str:
 
     contract = {
         "lock": FEATURE_LOCK_HASH,
         "version": SCHEMA_VERSION,
-        "count": FEATURE_COUNT
+        "count": FEATURE_COUNT,
     }
 
     canonical = json.dumps(
         contract,
         sort_keys=True,
-        separators=(",", ":")
+        separators=(",", ":"),
     )
 
     return hashlib.sha256(canonical.encode()).hexdigest()
