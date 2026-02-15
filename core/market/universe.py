@@ -3,13 +3,12 @@ import hashlib
 import json
 import os
 import threading
+import re
 
 
 class MarketUniverse:
     """
     Institutional Universe Controller.
-
-    Universe is CONFIG — not code.
 
     Guarantees:
     ✔ deterministic
@@ -20,16 +19,22 @@ class MarketUniverse:
     ✔ thread safe
     ✔ tamper detected
     ✔ hot-reload safe
+    ✔ ticker validated
+    ✔ version monotonic
     """
 
     UNIVERSE_FILE = "config/universe.json"
+
     MIN_FILE_BYTES = 20
+    MIN_UNIVERSE_SIZE = 5
+
+    # exchange-safe ticker pattern
+    TICKER_REGEX = re.compile(r"^[A-Z0-9.\-]{1,10}$")
 
     _CACHE = None
     _LOCK = threading.RLock()
-
-    # NEW — detect file changes
     _FILE_HASH = None
+    _LAST_VERSION = None
 
     ###################################################
     # FILE HASH
@@ -47,7 +52,7 @@ class MarketUniverse:
         return h.hexdigest()
 
     ###################################################
-    # LOAD
+    # SAFE LOAD
     ###################################################
 
     @classmethod
@@ -59,14 +64,12 @@ class MarketUniverse:
             )
 
         if os.path.getsize(cls.UNIVERSE_FILE) < cls.MIN_FILE_BYTES:
-            raise RuntimeError(
-                "Universe file corrupted or truncated."
-            )
+            raise RuntimeError("Universe file corrupted.")
 
         try:
-            # atomic-style read
-            with open(cls.UNIVERSE_FILE, "r") as f:
-                payload = json.load(f)
+            # safer read
+            with open(cls.UNIVERSE_FILE, "rb") as f:
+                payload = json.loads(f.read().decode())
 
         except Exception as exc:
             raise RuntimeError(
@@ -80,28 +83,28 @@ class MarketUniverse:
         if not isinstance(payload, dict):
             raise RuntimeError("Universe payload must be dict.")
 
-        if "version" not in payload:
-            raise RuntimeError("Universe missing version.")
-
-        if "tickers" not in payload:
-            raise RuntimeError("Universe missing tickers.")
-
-        version = payload["version"]
+        version = payload.get("version")
+        tickers = payload.get("tickers")
 
         if not isinstance(version, str):
-            raise RuntimeError(
-                "Universe version must be string."
-            )
-
-        tickers = payload["tickers"]
+            raise RuntimeError("Universe version must be string.")
 
         if not isinstance(tickers, list):
+            raise RuntimeError("Universe tickers must be list.")
+
+        if len(tickers) < cls.MIN_UNIVERSE_SIZE:
             raise RuntimeError(
-                "Universe tickers must be list."
+                f"Universe too small (<{cls.MIN_UNIVERSE_SIZE})."
             )
 
-        if not tickers:
-            raise RuntimeError("Universe cannot be empty.")
+        #################################################
+        # VERSION MONOTONICITY
+        #################################################
+
+        if cls._LAST_VERSION and version < cls._LAST_VERSION:
+            raise RuntimeError(
+                "Universe version downgrade detected."
+            )
 
         #################################################
         # NORMALIZE + VALIDATE
@@ -116,16 +119,17 @@ class MarketUniverse:
 
             t = t.strip().upper()
 
-            if not t:
-                raise RuntimeError("Empty ticker detected.")
+            if not cls.TICKER_REGEX.match(t):
+                raise RuntimeError(
+                    f"Invalid ticker format: {t}"
+                )
 
             normalized.append(t)
 
         if len(normalized) != len(set(normalized)):
             raise RuntimeError("Duplicate tickers detected.")
 
-        if len(normalized) < 5:
-            raise RuntimeError("Universe too small.")
+        cls._LAST_VERSION = version
 
         return version, tuple(sorted(normalized))
 
@@ -142,7 +146,6 @@ class MarketUniverse:
 
             with cls._LOCK:
 
-                # double check after lock
                 if cls._CACHE is None or cls._FILE_HASH != current_hash:
 
                     version, tickers = cls._load_file()
@@ -150,7 +153,7 @@ class MarketUniverse:
                     cls._CACHE = {
                         "version": version,
                         "tickers": tickers,
-                        "ticker_set": set(tickers)  # NEW (perf)
+                        "ticker_set": set(tickers)
                     }
 
                     cls._FILE_HASH = current_hash
@@ -158,7 +161,7 @@ class MarketUniverse:
         return cls._CACHE
 
     ###################################################
-    # FORCE REFRESH (useful for training pipelines)
+    # FORCE REFRESH
     ###################################################
 
     @classmethod
@@ -176,13 +179,10 @@ class MarketUniverse:
 
     @classmethod
     def get_universe(cls) -> Tuple[str, ...]:
-        """
-        Immutable tuple — cannot be mutated.
-        """
         return cls._get_cached()["tickers"]
 
     ###################################################
-    # FINGERPRINT (CANONICAL)
+    # FINGERPRINT
     ###################################################
 
     @classmethod
