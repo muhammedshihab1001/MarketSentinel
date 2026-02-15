@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 import numpy as np
 import time
+import threading
 
 from core.data.providers.market.base import MarketDataProvider
 
@@ -13,16 +14,16 @@ logger = logging.getLogger(__name__)
 
 class TwelveDataProvider(MarketDataProvider):
     """
-    Institutional-grade TwelveData provider.
+    TIER-1 Institutional TwelveData Provider
 
-    Why TwelveData?
-        ✔ extremely stable
-        ✔ generous free tier
-        ✔ clean schema
-        ✔ excellent historical data
-        ✔ predictable rate limits
-
-    This provider is designed to NEVER crash training.
+    Features:
+        ✔ Hard rate limiting (8/min)
+        ✔ Adaptive throttling
+        ✔ Retry hardened
+        ✔ Vendor error parsing
+        ✔ Poison candle guard
+        ✔ Schema drift protection
+        ✔ Never-over-reject logic
     """
 
     BASE_URL = "https://api.twelvedata.com/time_series"
@@ -31,6 +32,19 @@ class TwelveDataProvider(MarketDataProvider):
     RETRY_SLEEP = 1.5
 
     MIN_ROWS = 120
+    MAX_DAILY_MOVE = 0.90
+
+    ###################################################
+    # 🔥 HARD RATE LIMITER
+    ###################################################
+
+    CALL_LOCK = threading.Lock()
+    CALL_TIMESTAMPS = []
+
+    MAX_CALLS_PER_MIN = 8
+    WINDOW_SECONDS = 60
+
+    ###################################################
 
     INTERVAL_MAP = {
         "1d": "1day",
@@ -53,7 +67,39 @@ class TwelveDataProvider(MarketDataProvider):
 
         self.session = requests.Session()
 
-        logger.info("TwelveData provider ready.")
+        logger.info("TwelveData provider ready (rate-aware).")
+
+    ########################################################
+    # 🔥 RATE LIMIT ENFORCER
+    ########################################################
+
+    @classmethod
+    def _respect_rate_limit(cls):
+
+        with cls.CALL_LOCK:
+
+            now = time.time()
+
+            cls.CALL_TIMESTAMPS = [
+                t for t in cls.CALL_TIMESTAMPS
+                if now - t < cls.WINDOW_SECONDS
+            ]
+
+            if len(cls.CALL_TIMESTAMPS) >= cls.MAX_CALLS_PER_MIN:
+
+                sleep_for = (
+                    cls.WINDOW_SECONDS -
+                    (now - cls.CALL_TIMESTAMPS[0])
+                ) + 0.25
+
+                logger.warning(
+                    "TwelveData rate limit reached → sleeping %.2fs",
+                    sleep_for
+                )
+
+                time.sleep(sleep_for)
+
+            cls.CALL_TIMESTAMPS.append(time.time())
 
     ########################################################
 
@@ -63,19 +109,42 @@ class TwelveDataProvider(MarketDataProvider):
 
             try:
 
+                self._respect_rate_limit()
+
+                start = time.time()
+
                 r = self.session.get(
                     self.BASE_URL,
                     params=params,
-                    timeout=(4, 10)
+                    timeout=(5, 15)
                 )
+
+                latency = time.time() - start
+
+                if latency > 6:
+                    logger.warning(
+                        "Slow TwelveData response (%.2fs)",
+                        latency
+                    )
 
                 r.raise_for_status()
 
                 data = r.json()
 
-                # TwelveData returns errors inside JSON
+                ################################################
+                # Vendor error inside JSON
+                ################################################
+
                 if "code" in data:
-                    raise RuntimeError(data.get("message"))
+
+                    msg = data.get("message", "Vendor error")
+
+                    # Rate limit from vendor
+                    if "frequency" in msg.lower():
+                        logger.warning("Vendor rate limit hit — backing off.")
+                        time.sleep(8)
+
+                    raise RuntimeError(msg)
 
                 return data
 
@@ -91,7 +160,7 @@ class TwelveDataProvider(MarketDataProvider):
                 if attempt == self.MAX_RETRIES:
                     raise
 
-                time.sleep(self.RETRY_SLEEP)
+                time.sleep(self.RETRY_SLEEP * attempt)
 
     ########################################################
 
@@ -126,10 +195,19 @@ class TwelveDataProvider(MarketDataProvider):
             raise RuntimeError("All rows invalid after normalization.")
 
         ####################################################
-        # SOFT invariants (do NOT over-reject)
+        # Soft invariant
         ####################################################
 
         df = df[df["high"] >= df["low"]]
+
+        ####################################################
+        # Poison candle guard
+        ####################################################
+
+        jumps = df["close"].pct_change().abs()
+
+        if (jumps > self.MAX_DAILY_MOVE).any():
+            raise RuntimeError("Extreme price jump detected.")
 
         ####################################################
 
