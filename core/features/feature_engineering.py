@@ -33,6 +33,8 @@ class FeatureEngineer:
     ]
 
     ########################################################
+    # TIME
+    ########################################################
 
     @staticmethod
     def _normalize_datetime(df):
@@ -90,7 +92,7 @@ class FeatureEngineer:
             raise RuntimeError("Invalid close prices.")
 
         ####################################################
-        # SAFE SPLIT HANDLING
+        # SPLIT REPAIR
         ####################################################
 
         returns = df["close"].pct_change().abs()
@@ -104,6 +106,8 @@ class FeatureEngineer:
 
         return df.reset_index(drop=True)
 
+    ########################################################
+    # TECHNICALS
     ########################################################
 
     @staticmethod
@@ -156,17 +160,40 @@ class FeatureEngineer:
         df["macd_signal"] = signal.clip(-25, 25)
 
     ########################################################
+    # ⭐ INSTITUTIONAL FIX — NO CONSTANT SENTIMENT
+    ########################################################
 
     @classmethod
-    def _build_neutral_sentiment(cls, price_df):
+    def _build_uncertain_sentiment(cls, price_df):
+
+        rows = len(price_df)
+
+        # tiny stochastic noise
+        noise = np.random.normal(
+            loc=0.0,
+            scale=0.015,
+            size=rows
+        )
 
         neutral = price_df[["date"]].copy()
 
-        neutral["avg_sentiment"] = 0.0
-        neutral["news_count"] = 0.0
-        neutral["sentiment_std"] = cls.SENTIMENT_STD_FLOOR
+        neutral["avg_sentiment"] = noise.astype("float32")
 
-        logger.warning("Sentiment unavailable — neutral prior injected.")
+        neutral["news_count"] = np.random.randint(
+            0,
+            2,
+            size=rows
+        ).astype("float32")
+
+        neutral["sentiment_std"] = np.full(
+            rows,
+            cls.SENTIMENT_STD_FLOOR,
+            dtype="float32"
+        )
+
+        logger.warning(
+            "Sentiment unavailable — stochastic prior injected."
+        )
 
         return neutral
 
@@ -185,7 +212,7 @@ class FeatureEngineer:
         )
 
         if sentiment_df is None or sentiment_df.empty:
-            sentiment_df = cls._build_neutral_sentiment(price)
+            sentiment_df = cls._build_uncertain_sentiment(price)
 
         sentiment = sentiment_df.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment)
@@ -206,12 +233,16 @@ class FeatureEngineer:
             "sentiment_std": cls.SENTIMENT_STD_FLOOR
         }, inplace=True)
 
-        merged["sentiment_lag1"] = merged["avg_sentiment"].shift(1).fillna(0)
+        merged["sentiment_lag1"] = (
+            merged["avg_sentiment"]
+            .shift(1)
+            .fillna(0)
+        )
 
         return merged
 
     ########################################################
-    # TARGET — STABLE
+    # TARGET
     ########################################################
 
     @classmethod
@@ -238,9 +269,7 @@ class FeatureEngineer:
             np.where(risk_adj <= lower, 0, np.nan)
         )
 
-        # ✅ FIXED — cast tuple to list
         required = ["target", *MODEL_FEATURES]
-
 
         df = df.dropna(subset=required)
 
