@@ -22,11 +22,15 @@ logger = logging.getLogger(__name__)
 
 class FeatureStore:
 
-    FEATURE_DIR = os.path.abspath("data/features")
+    ########################################################
+    # PATH FROM ENV (INSTITUTIONAL SAFE)
+    ########################################################
+
+    FEATURE_DIR = os.getenv("FEATURE_STORE_PATH", "data/features")
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v12"
+    CACHE_VERSION = "v13"
     MAX_CACHE_FILES_PER_TICKER = 6
 
     MIN_ROWS_REQUIRED = 100
@@ -34,6 +38,8 @@ class FeatureStore:
 
     ABS_FEATURE_LIMIT = 1e5
     MIN_ROW_STABILITY_RATIO = 0.65
+
+    ########################################################
 
     def __init__(self):
 
@@ -46,7 +52,7 @@ class FeatureStore:
         self.env_hash = self._environment_fingerprint()[:12]
 
     ########################################################
-    # SAFE HASH (NO PANDAS HASH)
+    # TRUE STABLE HASH
     ########################################################
 
     def _stable_hash_df(self, df: pd.DataFrame):
@@ -54,10 +60,10 @@ class FeatureStore:
         df = df.copy()
 
         df["date"] = pd.to_datetime(df["date"], utc=True)
+
         df = df.sort_values(list(df.columns)).reset_index(drop=True)
 
-        payload = df.to_csv(index=False).encode()
-
+        payload = df.to_parquet(index=False)
         return hashlib.sha256(payload).hexdigest()
 
     ########################################################
@@ -89,6 +95,8 @@ class FeatureStore:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     ########################################################
+    # STRONG DATASET HASH
+    ########################################################
 
     def _dataset_hash(
         self,
@@ -98,12 +106,19 @@ class FeatureStore:
 
         h = hashlib.sha256()
 
-        price_core = price_df[["date", "close"]].copy()
+        # include ticker now (CRITICAL)
+        price_core = price_df[["ticker", "date", "close"]].copy()
+
         h.update(self._stable_hash_df(price_core).encode())
 
         if sentiment_df is not None and not sentiment_df.empty:
 
-            sent_core = sentiment_df[["date"]].copy()
+            sent_core = sentiment_df.copy()
+
+            cols = [c for c in ["date", "avg_sentiment"] if c in sent_core]
+
+            sent_core = sent_core[cols]
+
             h.update(self._stable_hash_df(sent_core).encode())
 
         return h.hexdigest()[:20]
@@ -125,8 +140,8 @@ class FeatureStore:
         suffix = "train" if training else "infer"
         ticker = self._sanitize_ticker(ticker)
 
-        return (
-            f"{self.FEATURE_DIR}/"
+        return os.path.join(
+            self.FEATURE_DIR,
             f"{self.CACHE_VERSION}_"
             f"{ticker}_{suffix}_"
             f"{dataset_hash}_"
@@ -136,7 +151,7 @@ class FeatureStore:
         )
 
     ########################################################
-    # CACHE GC (VERY IMPORTANT)
+    # CACHE GC
     ########################################################
 
     def _cleanup_old_cache(self, ticker):
@@ -159,6 +174,8 @@ class FeatureStore:
                 pass
 
     ########################################################
+    # TRUE ATOMIC WRITE
+    ########################################################
 
     def _atomic_write(
         self,
@@ -175,9 +192,6 @@ class FeatureStore:
         validated = validate_feature_schema(
             df.loc[:, MODEL_FEATURES]
         )
-
-        if isinstance(validated, tuple):
-            validated = validated[0]
 
         arr = validated.to_numpy()
 
@@ -199,7 +213,14 @@ class FeatureStore:
             compression="zstd"
         )
 
+        # crash-safe replace
         os.replace(tmp_path, path)
+
+        # fsync (Linux safety)
+        if os.name != "nt":
+            fd = os.open(self.FEATURE_DIR, os.O_DIRECTORY)
+            os.fsync(fd)
+            os.close(fd)
 
         self._cleanup_old_cache(ticker)
 
