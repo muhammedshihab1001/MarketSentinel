@@ -17,8 +17,11 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "11.2"
+    METADATA_VERSION = "12.0"
     MIN_TRAINING_DAYS = 120
+    MIN_METADATA_BYTES = 800
+
+    #####################################################
 
     REQUIRED_METADATA_FIELDS = [
         "metadata_type",
@@ -34,10 +37,10 @@ class MetadataManager:
         "schema_signature",
         "schema_version",
         "training_code_hash",
-        "metadata_integrity_hash",
         "environment",
         "training_universe",
-        "universe_hash"
+        "universe_hash",
+        "metadata_integrity_hash"
     ]
 
     IMMUTABLE_KEYS = {
@@ -52,20 +55,7 @@ class MetadataManager:
     }
 
     #####################################################
-
-    @staticmethod
-    def _fsync_dir_safe(directory: str):
-
-        if os.name == "nt":
-            return
-
-        fd = os.open(directory, os.O_DIRECTORY)
-
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
+    # ATOMIC SAVE
     #####################################################
 
     @staticmethod
@@ -82,7 +72,6 @@ class MetadataManager:
             os.fsync(f.fileno())
 
         os.replace(tmp, path)
-        MetadataManager._fsync_dir_safe(directory)
 
     #####################################################
 
@@ -94,6 +83,9 @@ class MetadataManager:
 
         if not os.path.exists(path):
             raise RuntimeError(f"Metadata missing: {path}")
+
+        if os.path.getsize(path) < MetadataManager.MIN_METADATA_BYTES:
+            raise RuntimeError("Metadata file suspiciously small.")
 
         with open(path) as f:
             metadata = json.load(f)
@@ -116,14 +108,20 @@ class MetadataManager:
                 "Metadata integrity failure — possible tampering."
             )
 
-        if metadata["metadata_version"] not in ("11.0", "11.1", "11.2"):
-            raise RuntimeError("Metadata version mismatch.")
+        #################################################
+        # SCHEMA COMPATIBILITY
+        #################################################
 
         if metadata["schema_signature"] != get_schema_signature():
             raise RuntimeError("Schema mismatch with runtime.")
 
+        if metadata["schema_version"] != SCHEMA_VERSION:
+            raise RuntimeError("Schema version drift detected.")
+
         return metadata
 
+    #####################################################
+    # HASH HELPERS
     #####################################################
 
     @staticmethod
@@ -142,6 +140,8 @@ class MetadataManager:
         return hashlib.sha256(canonical).hexdigest()
 
     #####################################################
+    # FEATURE CONTRACT
+    #####################################################
 
     @staticmethod
     def _validate_feature_contract(features, metadata_type):
@@ -153,20 +153,6 @@ class MetadataManager:
             if frozen != MODEL_FEATURES:
                 raise RuntimeError(
                     "Tabular feature mismatch — schema drift."
-                )
-
-        elif metadata_type == "timeseries_manifest_v1":
-
-            if list(frozen) != ["close"]:
-                raise RuntimeError(
-                    "Timeseries models must declare ['close']."
-                )
-
-        elif metadata_type == "sequence_manifest_v1":
-
-            if list(frozen) != ["close_sequence"]:
-                raise RuntimeError(
-                    "Sequence models must declare ['close_sequence']."
                 )
 
         else:
@@ -186,11 +172,6 @@ class MetadataManager:
 
         for k, v in metrics.items():
 
-            if isinstance(v, (list, tuple, dict)):
-                raise RuntimeError(
-                    f"Metric must be scalar: {k}"
-                )
-
             try:
                 val = float(v)
             except Exception:
@@ -204,6 +185,8 @@ class MetadataManager:
                 )
 
     #####################################################
+    # FLOAT-STABLE DATASET HASH
+    #####################################################
 
     @staticmethod
     def fingerprint_dataset(df: pd.DataFrame) -> str:
@@ -211,43 +194,37 @@ class MetadataManager:
         if df is None or df.empty:
             raise RuntimeError("Cannot fingerprint empty dataset.")
 
-        df_copy = df.copy(deep=True)
+        df = df.copy()
 
-        if "ticker" in df_copy.columns:
-            df_copy = df_copy.sort_values(["ticker", "date"])
-        elif "date" in df_copy.columns:
-            df_copy = df_copy.sort_values("date")
+        if "ticker" in df.columns:
+            df = df.sort_values(["ticker", "date"])
+        else:
+            df = df.sort_values("date")
 
-        df_copy = df_copy.reset_index(drop=True)
+        df = df.reset_index(drop=True)
 
-        for col in df_copy.columns:
+        for col in df.columns:
 
             if col == "date":
-                df_copy[col] = pd.to_datetime(df_copy[col], utc=True)
+                df[col] = pd.to_datetime(df[col], utc=True)
                 continue
 
-            if df_copy[col].dtype == "object":
-                df_copy[col] = df_copy[col].astype(str)
+            if df[col].dtype == "object":
+                df[col] = df[col].astype(str)
                 continue
 
-            df_copy[col] = (
-                pd.to_numeric(df_copy[col], errors="raise")
+            df[col] = (
+                pd.to_numeric(df[col], errors="raise")
                 .astype("float64")
-                .round(10)
+                .round(8)
             )
 
-        if not np.isfinite(
-            df_copy.select_dtypes(include=[np.number]).to_numpy()
-        ).all():
-            raise RuntimeError("Non-finite values detected in dataset.")
+        arr = pd.util.hash_pandas_object(df, index=True).values
 
-        hashed = pd.util.hash_pandas_object(
-            df_copy,
-            index=True
-        ).values
+        return hashlib.sha256(arr.tobytes()).hexdigest()
 
-        return hashlib.sha256(hashed.tobytes()).hexdigest()
-
+    #####################################################
+    # TRAINING CODE HASH
     #####################################################
 
     @staticmethod
@@ -263,6 +240,8 @@ class MetadataManager:
             "core/data",
             "core/time",
             "core/market",
+            "core/artifacts",
+            "core/config",
         ]
 
         for root in sorted(CRITICAL_DIRS):
@@ -277,17 +256,17 @@ class MetadataManager:
 
                 for f in files:
 
-                    full_path = os.path.join(path, f)
+                    full = os.path.join(path, f)
 
-                    if os.path.islink(full_path):
+                    if os.path.islink(full):
                         raise RuntimeError(
-                            f"Symlink detected in training code: {full_path}"
+                            f"Symlink detected in training code: {full}"
                         )
 
-                    rel_path = os.path.relpath(full_path)
-                    hasher.update(rel_path.encode())
+                    rel = os.path.relpath(full)
+                    hasher.update(rel.encode())
 
-                    with open(full_path, "rb") as fh:
+                    with open(full, "rb") as fh:
                         hasher.update(fh.read())
 
         hasher.update(get_schema_signature().encode())
@@ -300,7 +279,7 @@ class MetadataManager:
     @staticmethod
     def capture_environment():
 
-        env = {
+        return {
             "python": platform.python_version(),
             "platform": platform.platform(),
             "machine": platform.machine(),
@@ -308,49 +287,7 @@ class MetadataManager:
             "pandas": pd.__version__,
         }
 
-        try:
-            import xgboost
-            env["xgboost"] = xgboost.__version__
-        except Exception:
-            pass
-
-        try:
-            import torch
-            env["torch"] = torch.__version__
-        except Exception:
-            pass
-
-        try:
-            import sklearn
-            env["sklearn"] = sklearn.__version__
-        except Exception:
-            pass
-
-        return env
-
     #####################################################
-    # FLOAT-STABLE HASH
-    #####################################################
-
-    @staticmethod
-    def _normalize_for_hash(obj):
-
-        if isinstance(obj, float):
-            return round(obj, 10)
-
-        if isinstance(obj, dict):
-            return {
-                k: MetadataManager._normalize_for_hash(v)
-                for k, v in sorted(obj.items())
-            }
-
-        if isinstance(obj, list):
-            return [
-                MetadataManager._normalize_for_hash(v)
-                for v in obj
-            ]
-
-        return obj
 
     @staticmethod
     def _compute_metadata_hash(metadata: dict):
@@ -358,10 +295,8 @@ class MetadataManager:
         clone = dict(metadata)
         clone.pop("metadata_integrity_hash", None)
 
-        normalized = MetadataManager._normalize_for_hash(clone)
-
         canonical = json.dumps(
-            normalized,
+            clone,
             sort_keys=True,
             separators=(",", ":")
         ).encode()
@@ -385,6 +320,8 @@ class MetadataManager:
             )
 
     #####################################################
+    # CREATE METADATA
+    #####################################################
 
     @staticmethod
     def create_metadata(
@@ -394,13 +331,10 @@ class MetadataManager:
         training_start,
         training_end,
         dataset_hash,
-        dataset_rows=None,
-        metadata_type=None,
+        dataset_rows,
+        metadata_type,
         extra_fields=None
     ):
-
-        if metadata_type is None:
-            raise RuntimeError("metadata_type is required.")
 
         MetadataManager._validate_feature_contract(
             features,
@@ -413,16 +347,6 @@ class MetadataManager:
             training_start,
             training_end
         )
-
-        if dataset_rows is None:
-            raise RuntimeError(
-                "dataset_rows must be supplied by training pipeline."
-            )
-
-        dataset_rows = int(dataset_rows)
-
-        if dataset_rows <= 0:
-            raise RuntimeError("dataset_rows must be > 0.")
 
         universe_snapshot = MarketUniverse.snapshot()
 
@@ -440,7 +364,7 @@ class MetadataManager:
             },
 
             "dataset_hash": dataset_hash,
-            "dataset_rows": dataset_rows,
+            "dataset_rows": int(dataset_rows),
 
             "features": list(features),
             "feature_count": len(features),
