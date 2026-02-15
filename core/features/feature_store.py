@@ -26,7 +26,7 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v11"
+    CACHE_VERSION = "v12"
     MAX_CACHE_FILES_PER_TICKER = 6
 
     MIN_ROWS_REQUIRED = 100
@@ -45,24 +45,38 @@ class FeatureStore:
         self.engineer_hash = self._fingerprint_engineer()[:12]
         self.env_hash = self._environment_fingerprint()[:12]
 
-    def _sanitize_ticker(self, ticker: str) -> str:
-        return re.sub(r"[^A-Za-z0-9_]", "_", ticker)
+    ########################################################
+    # SAFE HASH (NO PANDAS HASH)
+    ########################################################
 
-    def _module_hash(self, module) -> str:
+    def _stable_hash_df(self, df: pd.DataFrame):
 
-        path = sys.modules[module.__module__].__file__
+        df = df.copy()
 
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
+        df["date"] = pd.to_datetime(df["date"], utc=True)
+        df = df.sort_values(list(df.columns)).reset_index(drop=True)
+
+        payload = df.to_csv(index=False).encode()
+
+        return hashlib.sha256(payload).hexdigest()
+
+    ########################################################
 
     def _fingerprint_engineer(self) -> str:
 
-        engineer_hash = self._module_hash(FeatureEngineer)
-        indicators_hash = self._module_hash(TechnicalIndicators)
+        def module_hash(module):
+            path = sys.modules[module.__module__].__file__
+            with open(path, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
 
-        payload = engineer_hash + indicators_hash
+        payload = (
+            module_hash(FeatureEngineer)
+            + module_hash(TechnicalIndicators)
+        )
 
         return hashlib.sha256(payload.encode()).hexdigest()
+
+    ########################################################
 
     def _environment_fingerprint(self) -> str:
 
@@ -74,25 +88,7 @@ class FeatureStore:
 
         return hashlib.sha256(payload.encode()).hexdigest()
 
-    def _canonicalize_df(self, df: pd.DataFrame):
-
-        df = df.copy()
-
-        if df.empty:
-            raise RuntimeError("Cannot hash empty dataframe.")
-
-        df["date"] = (
-            pd.to_datetime(df["date"], utc=True)
-            .dt.tz_convert(None)
-        )
-
-        df["ticker"] = df["ticker"].astype(str)
-        df["close"] = pd.to_numeric(df["close"]).astype("float64")
-
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        df[numeric_cols] = df[numeric_cols].astype("float64")
-
-        return df.sort_values(["ticker", "date"]).reset_index(drop=True)
+    ########################################################
 
     def _dataset_hash(
         self,
@@ -102,31 +98,22 @@ class FeatureStore:
 
         h = hashlib.sha256()
 
-        price_df = self._canonicalize_df(price_df)
-
-        h.update(
-            pd.util.hash_pandas_object(
-                price_df,
-                index=True
-            ).values.tobytes()
-        )
+        price_core = price_df[["date", "close"]].copy()
+        h.update(self._stable_hash_df(price_core).encode())
 
         if sentiment_df is not None and not sentiment_df.empty:
 
-            sentiment_df = self._canonicalize_df(sentiment_df)
-
-            sentiment_df = sentiment_df[
-                sentiment_df["date"].isin(price_df["date"])
-            ]
-
-            h.update(
-                pd.util.hash_pandas_object(
-                    sentiment_df,
-                    index=True
-                ).values.tobytes()
-            )
+            sent_core = sentiment_df[["date"]].copy()
+            h.update(self._stable_hash_df(sent_core).encode())
 
         return h.hexdigest()[:20]
+
+    ########################################################
+
+    def _sanitize_ticker(self, ticker: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_]", "_", ticker)
+
+    ########################################################
 
     def _feature_path(
         self,
@@ -148,66 +135,56 @@ class FeatureStore:
             f"{self.env_hash}.parquet"
         )
 
-    def _validate_dataset_structure(self, df: pd.DataFrame):
+    ########################################################
+    # CACHE GC (VERY IMPORTANT)
+    ########################################################
 
-        missing = self.REQUIRED_COLUMNS - set(df.columns)
+    def _cleanup_old_cache(self, ticker):
 
-        if missing:
-            raise RuntimeError(f"Missing required columns: {missing}")
+        ticker = self._sanitize_ticker(ticker)
 
-        if not pd.api.types.is_datetime64_any_dtype(df["date"]):
-            raise RuntimeError("date must be datetime.")
+        files = sorted(
+            [
+                f for f in os.listdir(self.FEATURE_DIR)
+                if f"_{ticker}_" in f
+            ],
+            reverse=True
+        )
 
-        if not pd.api.types.is_float_dtype(df["close"]):
-            raise RuntimeError("close must be float.")
+        for f in files[self.MAX_CACHE_FILES_PER_TICKER:]:
 
-        if df.duplicated(subset=["ticker", "date"]).any():
-            raise RuntimeError("Duplicate ticker/date detected.")
+            try:
+                os.remove(os.path.join(self.FEATURE_DIR, f))
+            except Exception:
+                pass
 
-        if not df.sort_values(["ticker", "date"]) \
-                .reset_index(drop=True) \
-                .equals(df.reset_index(drop=True)):
-            raise RuntimeError("Dataset not strictly ordered.")
-
-    def _fsync_dir(self, directory):
-
-        if os.name == "nt":
-            return
-
-        fd = os.open(directory, os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+    ########################################################
 
     def _atomic_write(
         self,
         df: pd.DataFrame,
         path: str,
         dataset_hash: str,
+        ticker: str,
         training: bool
     ):
 
         if len(df) < self.MIN_ROWS_REQUIRED:
             raise RuntimeError("Feature collapse detected.")
 
-        base_cols = ["date", "close", "ticker"]
+        validated = validate_feature_schema(
+            df.loc[:, MODEL_FEATURES]
+        )
 
-        if training:
-            if "target" not in df.columns:
-                raise RuntimeError("Training dataset missing target.")
+        if isinstance(validated, tuple):
+            validated = validated[0]
 
-            base_cols.insert(2, "target")
-
-        df = df[base_cols + list(MODEL_FEATURES)]
-
-        self._validate_dataset_structure(df)
-        validate_feature_schema(df.loc[:, MODEL_FEATURES])
-
-        arr = df.loc[:, MODEL_FEATURES].to_numpy()
+        arr = validated.to_numpy()
 
         if arr.size > 0 and np.abs(arr).max() > self.ABS_FEATURE_LIMIT:
             raise RuntimeError("Feature explosion detected.")
+
+        df = df.copy()
 
         df["__dataset_hash"] = dataset_hash
         df["__schema_hash"] = self.schema_hash
@@ -215,18 +192,18 @@ class FeatureStore:
 
         tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
 
-        with open(tmp_path, "wb") as f:
-            df.to_parquet(
-                f,
-                index=False,
-                engine="pyarrow",
-                compression="zstd"
-            )
-            f.flush()
-            os.fsync(f.fileno())
+        df.to_parquet(
+            tmp_path,
+            index=False,
+            engine="pyarrow",
+            compression="zstd"
+        )
 
         os.replace(tmp_path, path)
-        self._fsync_dir(self.FEATURE_DIR)
+
+        self._cleanup_old_cache(ticker)
+
+    ########################################################
 
     def _load_features(self, path: str, dataset_hash: str):
 
@@ -255,18 +232,9 @@ class FeatureStore:
                 os.remove(path)
                 return None
 
-            if df["__engineer_hash"].iloc[0] != self.engineer_hash:
-                os.remove(path)
-                return None
-
             df.drop(columns=meta, inplace=True)
 
-            self._validate_dataset_structure(df)
             validate_feature_schema(df.loc[:, MODEL_FEATURES])
-
-            if len(df) < self.MIN_ROWS_REQUIRED * self.MIN_ROW_STABILITY_RATIO:
-                os.remove(path)
-                return None
 
             return df
 
@@ -280,6 +248,8 @@ class FeatureStore:
                 pass
 
             return None
+
+    ########################################################
 
     def get_features(
         self,
@@ -318,6 +288,7 @@ class FeatureStore:
             features,
             path,
             dataset_hash,
+            ticker,
             training
         )
 
