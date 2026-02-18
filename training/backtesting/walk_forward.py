@@ -11,8 +11,8 @@ logger = logging.getLogger("marketsentinel.walkforward")
 
 class WalkForwardValidator:
     """
-    Institutional Walk Forward Validator v3
-    Stable conviction + ranking + regime throttle.
+    Institutional Walk Forward Validator v4
+    Adaptive conviction + ranking + regime throttle.
     """
 
     MIN_TRADES_PER_WINDOW = 5
@@ -22,9 +22,10 @@ class WalkForwardValidator:
     MIN_ASSETS_PER_DAY = 3
     MIN_FEATURE_VARIANCE = 1e-8
 
-    MIN_PROBABILITY = 0.60
-    TOP_K_PERCENT = 0.20
+    # 🔥 Adaptive conviction instead of fixed 0.60
+    TOP_K_PERCENT = 0.30
     MAX_TRADES_PER_DAY = 12
+    MIN_EDGE_SPREAD = 0.02  # require minimal prob separation
 
     CRISIS_EXPOSURE_SCALE = 0.35
     DRIFT_WARN_Z = 10.0
@@ -52,7 +53,6 @@ class WalkForwardValidator:
     ########################################################
 
     def _apply_embargo(self, train_df, test_start):
-
         embargo_cut = pd.Timestamp(test_start) - pd.Timedelta(days=self.embargo_days)
         train_df = train_df[train_df["date"] < embargo_cut]
 
@@ -87,12 +87,13 @@ class WalkForwardValidator:
         train_std = train_df[cols].std(ddof=0) + 1e-9
 
         z = np.abs((test_df[cols] - train_mu) / train_std)
-
         max_z = float(np.nanmax(z.to_numpy()))
 
         if max_z > self.DRIFT_WARN_Z:
             logger.warning("Feature drift detected | max_z=%.2f", max_z)
 
+    ########################################################
+    # 🔥 ADAPTIVE CONVICTION FILTER
     ########################################################
 
     def _filter_conviction(self, tickers, probs, signals):
@@ -103,14 +104,23 @@ class WalkForwardValidator:
             "signal": signals
         })
 
-        df = df[df["prob"] >= self.MIN_PROBABILITY]
-
         if df.empty:
             return {}
 
-        k = max(1, int(len(df) * self.TOP_K_PERCENT))
-        df = df.sort_values("prob", ascending=False).head(k)
-        df = df.head(self.MAX_TRADES_PER_DAY)
+        # Remove flat predictions
+        spread = df["prob"].max() - df["prob"].min()
+
+        if spread < self.MIN_EDGE_SPREAD:
+            logger.info("Probability spread too small — skipping day.")
+            return {}
+
+        # Rank strongest probabilities
+        df = df.sort_values("prob", ascending=False)
+
+        k = max(self.MIN_ASSETS_PER_DAY, int(len(df) * self.TOP_K_PERCENT))
+        k = min(k, self.MAX_TRADES_PER_DAY)
+
+        df = df.head(k)
 
         return dict(zip(df["ticker"], df["signal"]))
 
@@ -163,8 +173,8 @@ class WalkForwardValidator:
 
             grouped_prices = {}
             grouped_signals = {}
-
             trade_counter = 0
+
             test_dates_sorted = sorted(test_df["date"].unique())
 
             for i in range(len(test_dates_sorted) - 1):
@@ -187,7 +197,6 @@ class WalkForwardValidator:
                 if not prices:
                     continue
 
-                # EXPECTS (signals, probs)
                 signals, probs = self.signal_generator(model, signal_slice)
 
                 filtered = self._filter_conviction(
@@ -202,7 +211,6 @@ class WalkForwardValidator:
                 regime = signal_slice["regime"].iloc[0]
 
                 if regime == "CRISIS":
-                    logger.warning("CRISIS regime detected — throttling exposure.")
                     cut = max(1, int(len(filtered) * self.CRISIS_EXPOSURE_SCALE))
                     filtered = dict(list(filtered.items())[:cut])
 
