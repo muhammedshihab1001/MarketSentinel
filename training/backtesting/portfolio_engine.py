@@ -63,7 +63,6 @@ class PortfolioBacktestEngine:
     ###################################################
 
     def _safe_price(self, price):
-
         try:
             price = float(price)
         except Exception:
@@ -75,7 +74,22 @@ class PortfolioBacktestEngine:
         return price
 
     ###################################################
-    # GAP CHECK
+    #  NEW — TRADABLE FILTER (CRITICAL FIX)
+    ###################################################
+
+    def _align_tradable_universe(self, prices, signals, positions):
+        """
+        Ensures we NEVER reference a ticker
+        that is not tradable today.
+        """
+
+        tradable = set(prices.keys())
+
+        signals = {t: s for t, s in signals.items() if t in tradable}
+        positions = {t: p for t, p in positions.items() if t in tradable}
+
+        return signals, positions
+
     ###################################################
 
     def _check_gap(self, prev_prices, prices):
@@ -121,8 +135,6 @@ class PortfolioBacktestEngine:
         return clean_prices, clean_signals
 
     ###################################################
-    # VOL BUFFER
-    ###################################################
 
     def _update_buffers(self, prev_prices, prices):
 
@@ -154,18 +166,13 @@ class PortfolioBacktestEngine:
         return vols
 
     ###################################################
-    # VOL KILL SWITCH
-    ###################################################
 
     def _portfolio_volatility(self, vols):
-
         if not vols:
             return 0.0
 
         return float(np.mean(list(vols.values())))
 
-    ###################################################
-    # WEIGHTS
     ###################################################
 
     def _compute_weights(self, signals, vols):
@@ -209,8 +216,6 @@ class PortfolioBacktestEngine:
 
         return weights
 
-    ###################################################
-    # SLIPPAGE
     ###################################################
 
     def _trade_slippage(self, notional, portfolio_value):
@@ -267,16 +272,17 @@ class PortfolioBacktestEngine:
                 continue
 
             ###################################################
-            # USE YESTERDAY SIGNALS
+            #  CRITICAL FIX — ALIGN UNIVERSE
             ###################################################
 
             signals = prev_signals
+            signals, positions = self._align_tradable_universe(
+                prices,
+                signals,
+                positions
+            )
 
             vols = self._update_buffers(prev_prices, prices)
-
-            ###################################################
-            # GLOBAL VOL KILL SWITCH
-            ###################################################
 
             if self._portfolio_volatility(vols) > self.VOL_KILL_SWITCH:
                 signals = {t: "HOLD" for t in signals}
@@ -293,9 +299,11 @@ class PortfolioBacktestEngine:
 
             deployable_capital = portfolio_value * (1 - self.CASH_BUFFER)
 
+            #  SAFE — no direct indexing
             target_positions = {
                 t: (deployable_capital * w) / prices[t]
                 for t, w in weights.items()
+                if t in prices
             }
 
             ###################################################
@@ -361,8 +369,6 @@ class PortfolioBacktestEngine:
             prev_prices = prices
             prev_signals = signals_today
 
-        ###################################################
-        # METRICS
         ###################################################
 
         curve = np.array(equity_curve, dtype=float)
