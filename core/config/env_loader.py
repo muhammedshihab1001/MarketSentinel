@@ -3,6 +3,7 @@ import logging
 import threading
 import hashlib
 import sys
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv, dotenv_values
 
 
@@ -10,6 +11,55 @@ logger = logging.getLogger("marketsentinel.env")
 
 _ENV_INITIALIZED = False
 _ENV_LOCK = threading.Lock()
+
+
+########################################################
+# 🔥 GLOBAL LOGGING CONFIG (CRITICAL)
+########################################################
+
+def _configure_logging():
+
+    if logging.getLogger().handlers:
+        return  # prevent double configuration
+
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+
+    level = getattr(logging, log_level, logging.INFO)
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+
+    ####################################################
+    # Console Handler
+    ####################################################
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+    root_logger.addHandler(console)
+
+    ####################################################
+    # File Handler (VERY HIGH VALUE)
+    ####################################################
+
+    log_dir = os.getenv("LOG_DIR", "logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    file_handler = RotatingFileHandler(
+        os.path.join(log_dir, "marketsentinel.log"),
+        maxBytes=10_000_000,   # 10MB
+        backupCount=5
+    )
+
+    file_handler.setFormatter(formatter)
+
+    root_logger.addHandler(file_handler)
+
+    logger.info("Logging configured | level=%s", log_level)
 
 
 ########################################################
@@ -75,7 +125,7 @@ def _validate_paths():
 
 
 ########################################################
-# 🔥 MARKET PROVIDER VALIDATION (NEW — VERY IMPORTANT)
+# MARKET PROVIDER VALIDATION
 ########################################################
 
 def _validate_market_providers():
@@ -92,20 +142,14 @@ def _validate_market_providers():
         if _validate_not_empty(key) and len(os.getenv(key)) >= 8:
             available.append(provider)
 
-    # Yahoo always exists (no key required)
     available.append("yahoo")
 
-    if len(available) == 1 and available[0] == "yahoo":
-
+    if len(available) == 1:
         logger.warning(
-            "⚠ ONLY Yahoo provider available. "
-            "Production reliability reduced."
+            "ONLY Yahoo provider available — reliability reduced."
         )
 
-    logger.info(
-        "Market providers detected → %s",
-        available
-    )
+    logger.info("Market providers detected → %s", available)
 
     os.environ["MARKET_PROVIDERS_ACTIVE"] = ",".join(available)
 
@@ -128,58 +172,34 @@ def _validate_news_provider_secrets():
         "gnews": "GNEWS_API_KEY",
     }
 
-    ####################################################
-    # AUTO MODE
-    ####################################################
-
     if primary == "auto":
 
         for provider, key in providers.items():
 
             if _validate_not_empty(key) and len(os.getenv(key)) >= 10:
 
-                logger.info(
-                    "Auto-selected news provider → %s",
-                    provider
-                )
-
+                logger.info("Auto-selected news provider → %s", provider)
                 os.environ["NEWS_PROVIDER_PRIMARY"] = provider
                 return
 
-        logger.warning(
-            "No news provider keys detected — sentiment auto-disabled."
-        )
-
+        logger.warning("No news provider keys detected — sentiment disabled.")
         os.environ["ENABLE_SENTIMENT"] = "0"
         return
-
-    ####################################################
-    # EXPLICIT MODE
-    ####################################################
 
     if primary not in providers:
         raise RuntimeError(
-            f"Invalid NEWS_PROVIDER_PRIMARY='{primary}'. "
-            f"Valid options: {list(providers.keys()) + ['auto']}"
+            f"Invalid NEWS_PROVIDER_PRIMARY='{primary}'."
         )
 
-    primary_key = providers[primary]
-
-    if not _validate_not_empty(primary_key):
-
+    if not _validate_not_empty(providers[primary]):
         logger.warning(
-            f"Primary news provider '{primary}' disabled — missing {primary_key}."
+            f"Primary news provider '{primary}' missing — disabling sentiment."
         )
-
         os.environ["ENABLE_SENTIMENT"] = "0"
-        return
-
-    if len(os.getenv(primary_key)) < 10:
-        raise RuntimeError(f"{primary_key} appears invalid.")
 
 
 ########################################################
-# ENVIRONMENT FINGERPRINT (VERY HIGH VALUE)
+# ENVIRONMENT FINGERPRINT
 ########################################################
 
 def _environment_fingerprint():
@@ -213,59 +233,29 @@ def init_env() -> None:
         if _ENV_INITIALIZED:
             return
 
-        ####################################################
-        # DOTENV
-        ####################################################
+        _configure_logging()
 
         if _as_bool(os.getenv("DOTENV_ENABLED", "1")):
             _fail_fast_dotenv()
             load_dotenv(override=False)
-
-        ####################################################
-        # SAFE DEFAULTS
-        ####################################################
 
         defaults = {
 
             "ENABLE_SENTIMENT": "0",
             "NEWS_PROVIDER_FAILOVER": "1",
             "NEWS_PROVIDER_PRIMARY": "auto",
-
-            "DOTENV_ENABLED": "1",
-
-            "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
-            "TOKENIZERS_PARALLELISM": "false",
-
+            "LOG_LEVEL": "INFO",
+            "LOG_DIR": "logs",
             "PYTHONHASHSEED": "42",
         }
 
         for k, v in defaults.items():
             os.environ.setdefault(k, v)
 
-        ####################################################
-        # VALIDATIONS
-        ####################################################
-
         _validate_paths()
         _validate_market_providers()
         _validate_news_provider_secrets()
         _environment_fingerprint()
-
-        ####################################################
-        # OFFLINE MODE SAFETY
-        ####################################################
-
-        if _as_bool(os.getenv("ALLOW_OFFLINE_MODE"), False):
-
-            if not (
-                _as_bool(os.getenv("CI"))
-                or "PYTEST_CURRENT_TEST" in os.environ
-            ):
-                raise RuntimeError(
-                    "ALLOW_OFFLINE_MODE forbidden outside CI/tests."
-                )
-
-            logger.warning("Running in OFFLINE MODE.")
 
         logger.info("Environment bootstrapped safely.")
 
@@ -291,10 +281,7 @@ def get_int(key: str, default: int) -> int:
     if val is None:
         return default
 
-    try:
-        return int(val)
-    except Exception:
-        raise RuntimeError(f"Invalid integer for env '{key}'")
+    return int(val)
 
 
 def get_float(key: str, default: float) -> float:
@@ -303,10 +290,7 @@ def get_float(key: str, default: float) -> float:
     if val is None:
         return default
 
-    try:
-        return float(val)
-    except Exception:
-        raise RuntimeError(f"Invalid float for env '{key}'")
+    return float(val)
 
 
 def get_bool(key: str, default: bool = False) -> bool:
