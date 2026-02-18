@@ -11,8 +11,8 @@ logger = logging.getLogger("marketsentinel.walkforward")
 
 class WalkForwardValidator:
     """
-    Institutional Walk Forward Validator v2
-    Now includes conviction filtering, ranking, and regime throttling.
+    Institutional Walk Forward Validator v3
+    Stable conviction + ranking + regime throttle.
     """
 
     MIN_TRADES_PER_WINDOW = 5
@@ -22,7 +22,6 @@ class WalkForwardValidator:
     MIN_ASSETS_PER_DAY = 3
     MIN_FEATURE_VARIANCE = 1e-8
 
-    # 🔥 NEW — institutional controls
     MIN_PROBABILITY = 0.60
     TOP_K_PERCENT = 0.20
     MAX_TRADES_PER_DAY = 12
@@ -55,7 +54,6 @@ class WalkForwardValidator:
     def _apply_embargo(self, train_df, test_start):
 
         embargo_cut = pd.Timestamp(test_start) - pd.Timedelta(days=self.embargo_days)
-
         train_df = train_df[train_df["date"] < embargo_cut]
 
         if len(train_df) < self.window_size * 0.70:
@@ -96,8 +94,6 @@ class WalkForwardValidator:
             logger.warning("Feature drift detected | max_z=%.2f", max_z)
 
     ########################################################
-    # 🔥 NEW — CONVICTION FILTER
-    ########################################################
 
     def _filter_conviction(self, tickers, probs, signals):
 
@@ -112,12 +108,8 @@ class WalkForwardValidator:
         if df.empty:
             return {}
 
-        # rank strongest edges
         k = max(1, int(len(df) * self.TOP_K_PERCENT))
-
         df = df.sort_values("prob", ascending=False).head(k)
-
-        # hard cap
         df = df.head(self.MAX_TRADES_PER_DAY)
 
         return dict(zip(df["ticker"], df["signal"]))
@@ -129,12 +121,9 @@ class WalkForwardValidator:
         logger.info("Walk-forward validation started.")
 
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
         df = self.regime_detector.detect(df)
 
-        unique_dates = pd.to_datetime(
-            df["date"].drop_duplicates()
-        ).sort_values()
+        unique_dates = pd.to_datetime(df["date"].drop_duplicates()).sort_values()
 
         results = []
         equity_curve = []
@@ -147,25 +136,20 @@ class WalkForwardValidator:
 
             logger.info("Running WF window #%s", window_id)
 
-            train_dates = unique_dates.iloc[
-                start_idx - self.window_size: start_idx
-            ]
-
-            test_dates = unique_dates.iloc[
-                start_idx: start_idx + self.step_size
-            ]
+            train_dates = unique_dates.iloc[start_idx - self.window_size:start_idx]
+            test_dates = unique_dates.iloc[start_idx:start_idx + self.step_size]
 
             if len(test_dates) < self.MIN_TEST_DAYS:
                 break
 
-            train_df = df.loc[
+            train_df = df[
                 (df["date"] >= train_dates.iloc[0]) &
                 (df["date"] <= train_dates.iloc[-1])
             ].copy()
 
             train_df = self._apply_embargo(train_df, test_dates.iloc[0])
 
-            test_df = df.loc[
+            test_df = df[
                 (df["date"] >= test_dates.iloc[0]) &
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
@@ -181,7 +165,6 @@ class WalkForwardValidator:
             grouped_signals = {}
 
             trade_counter = 0
-
             test_dates_sorted = sorted(test_df["date"].unique())
 
             for i in range(len(test_dates_sorted) - 1):
@@ -192,13 +175,19 @@ class WalkForwardValidator:
                 signal_slice = test_df[test_df["date"] == signal_date]
                 exec_slice = test_df[test_df["date"] == execution_date]
 
+                if signal_slice.empty or exec_slice.empty:
+                    continue
+
                 prices = {
                     t: float(p)
                     for t, p in zip(exec_slice["ticker"], exec_slice["close"])
                     if pd.notna(p) and np.isfinite(p) and p > 0
                 }
 
-                # 🔥 IMPORTANT — signal generator MUST return probs now
+                if not prices:
+                    continue
+
+                # EXPECTS (signals, probs)
                 signals, probs = self.signal_generator(model, signal_slice)
 
                 filtered = self._filter_conviction(
@@ -210,12 +199,12 @@ class WalkForwardValidator:
                 if len(filtered) < self.MIN_ASSETS_PER_DAY:
                     continue
 
-                # regime throttle
                 regime = signal_slice["regime"].iloc[0]
 
                 if regime == "CRISIS":
                     logger.warning("CRISIS regime detected — throttling exposure.")
-                    filtered = dict(list(filtered.items())[: max(1, int(len(filtered) * self.CRISIS_EXPOSURE_SCALE))])
+                    cut = max(1, int(len(filtered) * self.CRISIS_EXPOSURE_SCALE))
+                    filtered = dict(list(filtered.items())[:cut])
 
                 trade_counter += len(filtered)
 
@@ -240,12 +229,6 @@ class WalkForwardValidator:
             )
 
             curve = np.array(metrics["equity_curve"], dtype=float)
-
-            logger.info(
-                "Window result | Sharpe=%.3f Return=%.3f",
-                metrics["sharpe_ratio"],
-                metrics["strategy_return"]
-            )
 
             if equity_curve:
                 scale = equity_curve[-1] / curve[0]
@@ -276,9 +259,7 @@ class WalkForwardValidator:
         drawdowns = (curve - peak) / peak
 
         gains = df[df["strategy_return"] > 0]["strategy_return"].sum()
-        losses = abs(
-            df[df["strategy_return"] < 0]["strategy_return"].sum()
-        ) or 1e-6
+        losses = abs(df[df["strategy_return"] < 0]["strategy_return"].sum()) or 1e-6
 
         profit_factor = float(gains / losses)
 
