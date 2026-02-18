@@ -8,6 +8,9 @@ import numpy as np
 import logging
 import random
 
+from sklearn.model_selection import train_test_split
+from sklearn.calibration import CalibratedClassifierCV
+
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
 from core.features.feature_store import FeatureStore
@@ -41,6 +44,7 @@ TEMP_METADATA_PATH = os.path.join(TEMP_DIR, "metadata.json")
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_MODEL_BYTES = 50_000
+MIN_PROB_SPREAD = 0.03
 
 
 ############################################################
@@ -54,7 +58,7 @@ def enforce_determinism():
 
 
 ############################################################
-# SAVE MODEL SAFELY
+# SAFE MODEL SAVE
 ############################################################
 
 def save_model_atomic(model, path):
@@ -98,12 +102,12 @@ def cross_sectional_normalize(df):
 
 
 ############################################################
-# DATA LOADER WITH ALPHA PRUNING
+# DATA LOADER
 ############################################################
 
 def load_training_data(start_date, end_date):
 
-    logger.info("Loading institutional dataset...")
+    logger.info("Loading institutional dataset")
 
     market_data = MarketDataService()
     store = FeatureStore()
@@ -111,10 +115,8 @@ def load_training_data(start_date, end_date):
     universe = MarketUniverse.get_universe()
 
     datasets = []
-    ticker_scores = {}
 
     for ticker in universe:
-
         try:
             price_df = market_data.get_price_data(
                 ticker=ticker,
@@ -129,41 +131,15 @@ def load_training_data(start_date, end_date):
                 training=True
             )
 
-            # Simple information coefficient proxy
-            ic = abs(dataset["target"].corr(dataset["return_lag1"]))
-            ticker_scores[ticker] = ic if np.isfinite(ic) else 0
-
             datasets.append(dataset)
 
-            logger.info("Ticker accepted → %s | IC=%.3f", ticker, ic)
-
         except Exception as e:
-            logger.warning("Ticker rejected → %s | %s", ticker, str(e))
+            logger.warning("Ticker rejected %s | %s", ticker, str(e))
 
     if not datasets:
         raise RuntimeError("All tickers failed.")
 
-    ###################################################
-    # Alpha pruning
-    ###################################################
-
-    ranked = sorted(
-        ticker_scores.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )
-
-    keep_n = max(6, int(len(ranked) * 0.6))
-    keep = {t for t, _ in ranked[:keep_n]}
-
-    logger.warning("Alpha pruning active → keeping %s tickers", len(keep))
-
-    filtered = [
-        d for d in datasets
-        if d["ticker"].iloc[0] in keep
-    ]
-
-    df = pd.concat(filtered, ignore_index=True)
+    df = pd.concat(datasets, ignore_index=True)
 
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError("Dataset too small.")
@@ -190,7 +166,7 @@ def load_training_data(start_date, end_date):
 
 
 ############################################################
-# MAIN TRAINING PIPELINE
+# MAIN
 ############################################################
 
 def main(start_date=None, end_date=None):
@@ -200,7 +176,7 @@ def main(start_date=None, end_date=None):
     init_env()
     enforce_determinism()
 
-    logger.info("===== INSTITUTIONAL XGBOOST TRAINING =====")
+    logger.info("INSTITUTIONAL XGBOOST TRAINING STARTED")
 
     if not start_date:
         start_date, end_date = MarketTime.window_for("xgboost")
@@ -210,19 +186,39 @@ def main(start_date=None, end_date=None):
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     ########################################################
-    # MODEL TRAINER
+    # TRAINER WITH CALIBRATION
     ########################################################
 
     def trainer(d):
 
+        X = d.loc[:, MODEL_FEATURES]
         y = d["target"]
-        model = build_xgboost_model(y)
-        model.fit(d.loc[:, MODEL_FEATURES], y)
 
-        return model
+        model = build_xgboost_model(y)
+
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.15, random_state=SEED, stratify=y
+        )
+
+        model.fit(
+            X_train,
+            y_train,
+            eval_set=[(X_val, y_val)],
+            verbose=False
+        )
+
+        calibrated = CalibratedClassifierCV(
+            model,
+            method="isotonic",
+            cv="prefit"
+        )
+
+        calibrated.fit(X_val, y_val)
+
+        return calibrated
 
     ########################################################
-    # PROBABILITY SIGNAL GENERATOR (WF COMPATIBLE)
+    # SIGNAL GENERATOR
     ########################################################
 
     def wf_signal_generator(model, test_df):
@@ -231,9 +227,13 @@ def main(start_date=None, end_date=None):
             test_df.loc[:, MODEL_FEATURES]
         )[:, 1]
 
+        if np.std(probs) < MIN_PROB_SPREAD:
+            logger.info("Probability spread too small - skipping day.")
+            return ["HOLD"] * len(probs), probs
+
         signals = [
-            "BUY" if p > 0.58
-            else "SELL" if p < 0.42
+            "BUY" if p > 0.60
+            else "SELL" if p < 0.40
             else "HOLD"
             for p in probs
         ]
@@ -249,8 +249,6 @@ def main(start_date=None, end_date=None):
         signal_generator=wf_signal_generator
     )
 
-    logger.info("Running institutional walk-forward...")
-
     metrics = wf.run(df)
 
     logger.info(
@@ -260,21 +258,24 @@ def main(start_date=None, end_date=None):
     )
 
     ########################################################
-    # FINAL PRODUCTION MODEL
+    # FINAL MODEL (NO METRIC LISTS IN METADATA)
     ########################################################
 
     final_model = build_final_xgboost_model(df["target"])
-
-    final_model.fit(
-        df.loc[:, MODEL_FEATURES],
-        df["target"]
-    )
+    final_model.fit(df.loc[:, MODEL_FEATURES], df["target"])
 
     size = save_model_atomic(final_model, TEMP_MODEL_PATH)
 
+    # Remove non-numeric entries
+    clean_metrics = {
+        k: float(v)
+        for k, v in metrics.items()
+        if not isinstance(v, list)
+    }
+
     metadata = MetadataManager.create_metadata(
         model_name="xgboost_direction",
-        metrics=metrics,
+        metrics=clean_metrics,
         features=list(MODEL_FEATURES),
         training_start=start_date,
         training_end=end_date,
@@ -293,8 +294,8 @@ def main(start_date=None, end_date=None):
 
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
-    logger.info("MODEL VERSION → %s", version)
-    logger.info("TOTAL TIME → %.2f minutes", (time.time() - t0) / 60)
+    logger.info("MODEL VERSION %s", version)
+    logger.info("TOTAL TIME %.2f minutes", (time.time() - t0) / 60)
 
     return metrics
 
