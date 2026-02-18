@@ -1,14 +1,12 @@
 import numpy as np
-
 from core.signals.signal_engine import DecisionEngine
+from core.schema.feature_schema import MODEL_FEATURES
 
 
 class SignalGenerator:
     """
     Institutional signal adapter.
-
-    Ensures walk-forward uses the SAME logic
-    as live trading.
+    Walk-forward now uses production decision logic.
     """
 
     def __init__(self):
@@ -17,35 +15,30 @@ class SignalGenerator:
     ###################################################
 
     def generate(self, model, df_slice):
-        """
-        Returns:
-            signals_dict
-        """
 
-        probs = model.predict_proba(
-            df_slice.iloc[:, df_slice.columns.get_indexer(model.feature_names_in_)]
-        )[:, 1]
+        X = df_slice.loc[:, MODEL_FEATURES]
 
-        forecasts_up = probs * 0.04
-        forecasts_down = (1 - probs) * -0.03
+        probs = model.predict_proba(X)[:, 1]
+
+        # Conservative forecast assumptions
+        forecast_up = probs * 0.04
+        forecast_down = (1 - probs) * -0.03
 
         signals = {}
 
         for i, row in enumerate(df_slice.itertuples()):
 
-            ticker = row.ticker
-
             decision = self.engine.generate(
-                ticker=ticker,
-                price_df=None,  # optional for training
+                ticker=row.ticker,
+                price_df=None,
                 current_price=row.close,
-                forecast_up=forecasts_up[i],
-                forecast_down=forecasts_down[i],
+                forecast_up=float(forecast_up[i]),
+                forecast_down=float(forecast_down[i]),
                 prob_up=float(probs[i]),
                 volatility=getattr(row, "volatility", 0.02),
                 regime=getattr(row, "regime", None)
             )
 
-            signals[ticker] = decision["signal"]
+            signals[row.ticker] = decision["signal"]
 
         return signals
