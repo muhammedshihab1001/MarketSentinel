@@ -22,15 +22,11 @@ logger = logging.getLogger(__name__)
 
 class FeatureStore:
 
-    ########################################################
-    # PATH FROM ENV (INSTITUTIONAL SAFE)
-    ########################################################
-
     FEATURE_DIR = os.getenv("FEATURE_STORE_PATH", "data/features")
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v13"
+    CACHE_VERSION = "v14"   # bump → invalidate corrupted cache
     MAX_CACHE_FILES_PER_TICKER = 6
 
     MIN_ROWS_REQUIRED = 100
@@ -38,8 +34,7 @@ class FeatureStore:
 
     ABS_FEATURE_LIMIT = 1e5
     MIN_ROW_STABILITY_RATIO = 0.65
-
-    ########################################################
+    MIN_FEATURE_VARIANCE = 1e-10
 
     def __init__(self):
 
@@ -52,21 +47,56 @@ class FeatureStore:
         self.env_hash = self._environment_fingerprint()[:12]
 
     ########################################################
-    # TRUE STABLE HASH
+    # NUMERICAL FIREWALL
+    ########################################################
+
+    def _validate_numeric_integrity(self, df: pd.DataFrame):
+
+        features = df.loc[:, MODEL_FEATURES]
+
+        arr = features.to_numpy(dtype=float)
+
+        # -------- finite check
+        if not np.isfinite(arr).all():
+            raise RuntimeError(
+                "Non-finite feature values produced by FeatureEngineer."
+            )
+
+        # -------- row stability
+        row_valid = np.isfinite(arr).all(axis=1)
+        stability_ratio = row_valid.mean()
+
+        if stability_ratio < self.MIN_ROW_STABILITY_RATIO:
+            raise RuntimeError(
+                f"Row stability collapse detected: {stability_ratio:.2f}"
+            )
+
+        # -------- variance floor
+        variances = np.var(arr, axis=0)
+
+        if np.min(variances) < self.MIN_FEATURE_VARIANCE:
+            raise RuntimeError(
+                "Feature variance collapse detected."
+            )
+
+        # -------- explosion guard
+        if arr.size > 0 and np.abs(arr).max() > self.ABS_FEATURE_LIMIT:
+            raise RuntimeError(
+                "Feature explosion detected."
+            )
+
+    ########################################################
+    # HASHING (unchanged — institutional quality)
     ########################################################
 
     def _stable_hash_df(self, df: pd.DataFrame):
 
         df = df.copy()
-
         df["date"] = pd.to_datetime(df["date"], utc=True)
-
         df = df.sort_values(list(df.columns)).reset_index(drop=True)
 
         payload = df.to_parquet(index=False)
         return hashlib.sha256(payload).hexdigest()
-
-    ########################################################
 
     def _fingerprint_engineer(self) -> str:
 
@@ -82,8 +112,6 @@ class FeatureStore:
 
         return hashlib.sha256(payload.encode()).hexdigest()
 
-    ########################################################
-
     def _environment_fingerprint(self) -> str:
 
         payload = (
@@ -95,8 +123,6 @@ class FeatureStore:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     ########################################################
-    # STRONG DATASET HASH
-    ########################################################
 
     def _dataset_hash(
         self,
@@ -106,17 +132,13 @@ class FeatureStore:
 
         h = hashlib.sha256()
 
-        # include ticker now (CRITICAL)
         price_core = price_df[["ticker", "date", "close"]].copy()
-
         h.update(self._stable_hash_df(price_core).encode())
 
         if sentiment_df is not None and not sentiment_df.empty:
 
             sent_core = sentiment_df.copy()
-
             cols = [c for c in ["date", "avg_sentiment"] if c in sent_core]
-
             sent_core = sent_core[cols]
 
             h.update(self._stable_hash_df(sent_core).encode())
@@ -128,14 +150,7 @@ class FeatureStore:
     def _sanitize_ticker(self, ticker: str) -> str:
         return re.sub(r"[^A-Za-z0-9_]", "_", ticker)
 
-    ########################################################
-
-    def _feature_path(
-        self,
-        ticker: str,
-        dataset_hash: str,
-        training: bool
-    ):
+    def _feature_path(self, ticker, dataset_hash, training):
 
         suffix = "train" if training else "infer"
         ticker = self._sanitize_ticker(ticker)
@@ -151,31 +166,6 @@ class FeatureStore:
         )
 
     ########################################################
-    # CACHE GC
-    ########################################################
-
-    def _cleanup_old_cache(self, ticker):
-
-        ticker = self._sanitize_ticker(ticker)
-
-        files = sorted(
-            [
-                f for f in os.listdir(self.FEATURE_DIR)
-                if f"_{ticker}_" in f
-            ],
-            reverse=True
-        )
-
-        for f in files[self.MAX_CACHE_FILES_PER_TICKER:]:
-
-            try:
-                os.remove(os.path.join(self.FEATURE_DIR, f))
-            except Exception:
-                pass
-
-    ########################################################
-    # TRUE ATOMIC WRITE
-    ########################################################
 
     def _atomic_write(
         self,
@@ -189,14 +179,10 @@ class FeatureStore:
         if len(df) < self.MIN_ROWS_REQUIRED:
             raise RuntimeError("Feature collapse detected.")
 
-        validated = validate_feature_schema(
-            df.loc[:, MODEL_FEATURES]
-        )
+        validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
-        arr = validated.to_numpy()
-
-        if arr.size > 0 and np.abs(arr).max() > self.ABS_FEATURE_LIMIT:
-            raise RuntimeError("Feature explosion detected.")
+        # 🔥 NEW — numerical firewall
+        self._validate_numeric_integrity(df)
 
         df = df.copy()
 
@@ -213,16 +199,12 @@ class FeatureStore:
             compression="zstd"
         )
 
-        # crash-safe replace
         os.replace(tmp_path, path)
 
-        # fsync (Linux safety)
         if os.name != "nt":
             fd = os.open(self.FEATURE_DIR, os.O_DIRECTORY)
             os.fsync(fd)
             os.close(fd)
-
-        self._cleanup_old_cache(ticker)
 
     ########################################################
 
@@ -256,6 +238,9 @@ class FeatureStore:
             df.drop(columns=meta, inplace=True)
 
             validate_feature_schema(df.loc[:, MODEL_FEATURES])
+
+            # 🔥 enforce firewall on cached data too
+            self._validate_numeric_integrity(df)
 
             return df
 
