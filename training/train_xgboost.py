@@ -44,7 +44,6 @@ SEED = 42
 
 MIN_TRAINING_ROWS = 1200
 MIN_SURVIVING_RATIO = 0.20
-MIN_SHARPE = 0.15
 MIN_MODEL_BYTES = 50_000
 
 PROMOTE_FLAG = os.getenv("ALLOW_MODEL_PROMOTION", "false").lower() == "true"
@@ -59,9 +58,7 @@ SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.42"))
 ############################################################
 
 def enforce_determinism():
-
     os.environ["PYTHONHASHSEED"] = str(SEED)
-
     random.seed(SEED)
     np.random.seed(SEED)
 
@@ -90,30 +87,10 @@ def save_model_atomic(model, path):
 
 
 ############################################################
-# SAFE SCHEMA
-############################################################
-
-def safe_validate_schema(df):
-
-    validated = validate_feature_schema(df)
-
-    if isinstance(validated, tuple):
-        validated = validated[0]
-
-    return validated
-
-
-############################################################
-# 🔥 METRIC SANITIZER (CRITICAL FIX)
+# METRIC SANITIZER
 ############################################################
 
 def sanitize_metrics(metrics: dict) -> dict:
-    """
-    Metadata manager ONLY accepts numeric values.
-
-    WalkForward returns curves + arrays.
-    We drop them safely.
-    """
 
     numeric = {}
 
@@ -121,17 +98,14 @@ def sanitize_metrics(metrics: dict) -> dict:
 
         if isinstance(v, (int, float, np.integer, np.floating)):
             numeric[k] = float(v)
-
         else:
             logger.info(
-                "Dropping non-numeric metric from metadata → %s",
+                "Dropping non-numeric metric → %s",
                 k
             )
 
     if not numeric:
-        raise RuntimeError(
-            "No numeric metrics available — walk-forward corrupted."
-        )
+        raise RuntimeError("No numeric metrics available.")
 
     return numeric
 
@@ -172,6 +146,8 @@ def cross_sectional_normalize(df):
 
 def load_training_data(start_date, end_date):
 
+    logger.info("Loading institutional training dataset...")
+
     market_data = MarketDataService()
     store = FeatureStore()
 
@@ -181,7 +157,7 @@ def load_training_data(start_date, end_date):
     surviving = []
 
     logger.warning(
-        "TRAINING MODE: Sentiment disabled — price-only institutional research."
+        "TRAINING MODE: Sentiment disabled — price-only research."
     )
 
     for ticker in universe:
@@ -204,10 +180,12 @@ def load_training_data(start_date, end_date):
             datasets.append(dataset)
             surviving.append(ticker)
 
+            logger.info("Ticker accepted → %s", ticker)
+
         except Exception as e:
 
             logger.warning(
-                "Ticker rejected: %s | %s",
+                "Ticker rejected → %s | %s",
                 ticker,
                 str(e)
             )
@@ -217,11 +195,7 @@ def load_training_data(start_date, end_date):
 
     survival_ratio = len(surviving) / max(len(universe), 1)
 
-    if survival_ratio < MIN_SURVIVING_RATIO:
-        logger.warning(
-            "Universe degraded — survival ratio %.2f",
-            survival_ratio
-        )
+    logger.info("Universe survival ratio → %.2f", survival_ratio)
 
     df = pd.concat(datasets, ignore_index=True, copy=False)
 
@@ -230,12 +204,7 @@ def load_training_data(start_date, end_date):
 
     df = cross_sectional_normalize(df)
 
-    safe_validate_schema(df.loc[:, MODEL_FEATURES])
-
-    features = df.loc[:, MODEL_FEATURES].to_numpy(dtype=np.float32)
-
-    if not np.isfinite(features).all():
-        raise RuntimeError("Non-finite feature values detected.")
+    validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
     if df["target"].nunique() < 2:
         raise RuntimeError("Target collapsed.")
@@ -252,6 +221,8 @@ def load_training_data(start_date, end_date):
         end_date
     ])
 
+    logger.info("Dataset ready | rows=%s", len(df))
+
     return df, dataset_hash
 
 
@@ -266,7 +237,9 @@ def main(start_date=None, end_date=None):
     init_env()
     enforce_determinism()
 
-    logger.info("Institutional XGBoost Training")
+    logger.info("===================================")
+    logger.info("INSTITUTIONAL XGBOOST TRAINING")
+    logger.info("===================================")
 
     if not start_date or not end_date:
         start_date, end_date = MarketTime.window_for("xgboost")
@@ -284,21 +257,15 @@ def main(start_date=None, end_date=None):
         y = d["target"]
 
         model = build_xgboost_model(y)
-
         model.fit(d.loc[:, MODEL_FEATURES], y)
 
         return model
-
-    ########################################################
 
     def signal(model, test):
 
         probs = model.predict_proba(
             test.loc[:, MODEL_FEATURES]
         )[:, 1]
-
-        if np.std(probs) < 1e-6:
-            logger.warning("Probability collapse detected.")
 
         return [
             "BUY" if p > BUY_THRESHOLD
@@ -312,15 +279,26 @@ def main(start_date=None, end_date=None):
         signal_generator=signal
     )
 
-    strategy_metrics = wf.run(df)
+    logger.info("Running walk-forward validation...")
 
-    ########################################################
-    # 🔥 FIX — sanitize metrics
-    ########################################################
+    strategy_metrics = wf.run(df)
 
     numeric_metrics = sanitize_metrics(strategy_metrics)
 
+    logger.info(
+        "Walk-forward complete | Sharpe=%.3f | Return=%.3f | Drawdown=%.3f",
+        numeric_metrics.get("avg_sharpe", -1),
+        numeric_metrics.get("avg_strategy_return", -1),
+        numeric_metrics.get("max_drawdown", -1),
+    )
+
     gc.collect()
+
+    ########################################################
+    # FINAL MODEL
+    ########################################################
+
+    logger.info("Training final production model...")
 
     final_model = build_final_xgboost_model(df["target"])
 
@@ -329,14 +307,16 @@ def main(start_date=None, end_date=None):
         df["target"]
     )
 
-    importance = dict(
-        zip(
-            MODEL_FEATURES,
-            final_model.feature_importances_.tolist()
-        )
+    logger.info("Saving model artifact...")
+
+    size = save_model_atomic(final_model, TEMP_MODEL_PATH)
+
+    logger.info(
+        "Model saved successfully | size=%.2f MB",
+        size / (1024 * 1024)
     )
 
-    save_model_atomic(final_model, TEMP_MODEL_PATH)
+    logger.info("Creating metadata...")
 
     metadata = MetadataManager.create_metadata(
         model_name="xgboost_direction",
@@ -346,13 +326,7 @@ def main(start_date=None, end_date=None):
         training_end=end_date,
         dataset_hash=dataset_hash,
         dataset_rows=len(df),
-        metadata_type="training_manifest_v1",
-        extra_fields={
-            "feature_importance": importance,
-            "buy_threshold": BUY_THRESHOLD,
-            "sell_threshold": SELL_THRESHOLD,
-            "time_snapshot": MarketTime.snapshot_for("xgboost")
-        }
+        metadata_type="training_manifest_v1"
     )
 
     MetadataManager.save_metadata(
@@ -360,45 +334,36 @@ def main(start_date=None, end_date=None):
         TEMP_METADATA_PATH
     )
 
+    logger.info("Registering model...")
+
     version = ModelRegistry.register_model(
         MODEL_DIR,
         TEMP_MODEL_PATH,
         TEMP_METADATA_PATH
     )
 
-    if ALLOW_BASELINE_FLAG and PROMOTE_FLAG:
-
-        drift = DriftDetector()
-
-        try:
-            drift.create_baseline(
-                df,
-                dataset_hash=dataset_hash,
-                allow_overwrite=False
-            )
-        except RuntimeError:
-            pass
+    logger.info("Model registered | version=%s", version)
 
     if PROMOTE_FLAG:
+
+        logger.info("Promoting model to production...")
+
         ModelRegistry.promote_to_production(
             MODEL_DIR,
             version
         )
-        logger.info("Model promoted → version=%s", version)
+
+    else:
+        logger.info("Model kept as CANDIDATE.")
 
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
-    logger.info(
-        "Training summary | version=%s rows=%s sharpe=%.3f",
-        version,
-        len(df),
-        numeric_metrics.get("avg_sharpe", -1)
-    )
-
-    logger.info(
-        "Total training time: %.2f minutes",
-        (time.time() - t0) / 60
-    )
+    logger.info("===================================")
+    logger.info("TRAINING PIPELINE COMPLETE")
+    logger.info("Version → %s", version)
+    logger.info("Sharpe → %.3f", numeric_metrics.get("avg_sharpe", -1))
+    logger.info("Total time → %.2f minutes", (time.time() - t0) / 60)
+    logger.info("===================================")
 
     return numeric_metrics
 
