@@ -14,11 +14,11 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "17.0"   # bumped due to feature removal
+SCHEMA_VERSION = "18.0"   # bumped — sentiment fully removed
 
 
 ############################################################
-# FEATURES (IMMUTABLE)
+# FEATURES (TIER-1 PRICE ONLY — INSTITUTIONAL)
 ############################################################
 
 MODEL_FEATURES: Tuple[str, ...] = (
@@ -27,10 +27,7 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "rsi",
     "macd",
     "macd_signal",
-    "avg_sentiment",
-    "sentiment_std",
     "return_lag1",
-    "sentiment_lag1",
 )
 
 FEATURE_COUNT = len(MODEL_FEATURES)
@@ -65,11 +62,6 @@ FEATURE_LIMITS: Dict[str, tuple] = {
 
     "macd": (-500.0, 500.0),
     "macd_signal": (-500.0, 500.0),
-
-    "avg_sentiment": (-1.0, 1.0),
-    "sentiment_lag1": (-1.0, 1.0),
-
-    "sentiment_std": (0.0, 10.0),
 }
 
 
@@ -203,23 +195,6 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     if (row_nan_ratio > MAX_ROW_NAN_RATIO).any():
         logger.warning("Row-level NaN spike detected.")
-
-    ########################################################
-    # SOFT LIMIT WARNINGS
-    ########################################################
-
-    for col, (lo, hi) in FEATURE_LIMITS.items():
-
-        finite = feature_df[col][np.isfinite(feature_df[col])]
-
-        if finite.empty:
-            continue
-
-        if (finite < lo).any() or (finite > hi).any():
-            logger.warning(
-                "Feature outside historical bounds → %s",
-                col,
-            )
 
     return feature_df.astype(DTYPE, copy=False)
 
