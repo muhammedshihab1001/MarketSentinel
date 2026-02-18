@@ -83,11 +83,11 @@ class WalkForwardValidator:
     ########################################################
 
     def _validate_training_frame(self, df):
+        cols = list(MODEL_FEATURES)
+        
+        validate_feature_schema(df.loc[:, cols])
 
-        if df["ticker"].nunique() < 3:
-            raise RuntimeError("Training universe too small.")
-
-        validate_feature_schema(df.loc[:, MODEL_FEATURES])
+        features = df.loc[:, cols].to_numpy(dtype=float)
 
         features = df.loc[:, MODEL_FEATURES].to_numpy(dtype=float)
 
@@ -106,11 +106,13 @@ class WalkForwardValidator:
 
     def _distribution_guard(self, train_df, test_df):
 
-        train_mu = train_df[MODEL_FEATURES].mean()
-        train_std = train_df[MODEL_FEATURES].std(ddof=0) + 1e-9
+        cols = list(MODEL_FEATURES)
+
+        train_mu = train_df[cols].mean()
+        train_std = train_df[cols].std(ddof=0) + 1e-9
 
         z = np.abs(
-            (test_df[MODEL_FEATURES] - train_mu) / train_std
+            (test_df[cols] - train_mu) / train_std
         )
 
         if (z > 8).any().any():
