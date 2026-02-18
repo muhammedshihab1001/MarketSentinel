@@ -11,12 +11,9 @@ logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
 
-MAX_CLASS_WEIGHT = 30.0
-MIN_CLASS_WEIGHT = 1.0
-
 
 ###################################################
-# 🔥 REAL GPU DETECTION
+# GPU DETECTION
 ###################################################
 
 _GPU_AVAILABLE = None
@@ -37,35 +34,32 @@ def _gpu_verified():
 
         try:
 
-            # THIS is the correct GPU test
-            xgb.XGBClassifier(
-                tree_method="gpu_hist",
-                predictor="gpu_predictor",
-                max_depth=1,
-                n_estimators=1,
-                verbosity=0
-            ).fit(
-                np.random.rand(20, 4),
-                np.random.randint(0, 2, 20)
+            dtrain = xgb.DMatrix(
+                np.random.rand(50, 4),
+                label=np.random.randint(0, 2, 50)
             )
 
-            logger.info("GPU detected — using CUDA acceleration.")
+            params = {
+                "tree_method": "hist",
+                "device": "cuda",
+                "max_depth": 1,
+                "verbosity": 0
+            }
+
+            xgb.train(params, dtrain, num_boost_round=1)
+
             _GPU_AVAILABLE = True
+            logger.info("GPU detected.")
 
         except Exception:
-
-            logger.info("GPU not available — using CPU.")
             _GPU_AVAILABLE = False
+            logger.info("GPU not available - using CPU.")
 
         return _GPU_AVAILABLE
 
 
-def _tree_method():
-    return "gpu_hist" if _gpu_verified() else "hist"
-
-
-def _predictor():
-    return "gpu_predictor" if _gpu_verified() else "auto"
+def _device():
+    return "cuda" if _gpu_verified() else "cpu"
 
 
 ###################################################
@@ -76,12 +70,6 @@ def compute_class_weight(y):
 
     y = np.asarray(y)
 
-    if len(y) == 0:
-        raise RuntimeError("Empty labels.")
-
-    if not np.isfinite(y).all():
-        raise RuntimeError("Non-finite labels.")
-
     pos = float(np.sum(y))
     neg = float(len(y) - pos)
 
@@ -90,11 +78,9 @@ def compute_class_weight(y):
 
     weight = neg / pos
 
-    weight = float(np.clip(weight, MIN_CLASS_WEIGHT, MAX_CLASS_WEIGHT))
+    logger.info("Computed class weight - %.3f", weight)
 
-    logger.info("Computed class weight → %.3f", weight)
-
-    return weight
+    return float(np.clip(weight, 1.0, 30.0))
 
 
 ###################################################
@@ -113,13 +99,38 @@ def _validate_features(X):
 
 
 ###################################################
-# BASE PARAMS
+# SAFE CLASSIFIER (XGBoost 2.x Compatible)
 ###################################################
 
-def _base_params(pos_weight, overrides=None):
+class SafeXGBClassifier(XGBClassifier):
+
+    def fit(self, X, y, **kwargs):
+
+        X = np.asarray(X)
+        _validate_features(X)
+
+        logger.info(
+            "XGBoost training started | rows=%s",
+            len(X)
+        )
+
+        # 🚨 DO NOT PASS unsupported kwargs
+        kwargs.pop("early_stopping_rounds", None)
+
+        return super().fit(X, y, **kwargs)
+
+
+###################################################
+# PARAM BUILDER
+###################################################
+
+def _base_params(pos_weight):
+
+    device = _device()
 
     params = dict(
 
+        n_estimators=600,
         max_depth=5,
         learning_rate=0.03,
 
@@ -136,88 +147,44 @@ def _base_params(pos_weight, overrides=None):
         random_state=SEED,
         n_jobs=1,
 
-        tree_method=_tree_method(),
-        predictor=_predictor(),
+        tree_method="hist",
+        device=device,
 
         scale_pos_weight=pos_weight,
 
-        max_delta_step=1,
-        grow_policy="depthwise",
-        max_bin=192,
-
-        use_label_encoder=False,
-        verbosity=0,
+        verbosity=0
     )
 
-    if overrides:
-        params.update(overrides)
-
     logger.info(
-        "XGBoost params | device=%s estimators=%s lr=%.3f",
-        "GPU" if _gpu_verified() else "CPU",
-        params.get("n_estimators"),
-        params.get("learning_rate"),
+        "XGBoost params | device=%s lr=%.3f",
+        device.upper(),
+        params["learning_rate"]
     )
 
     return params
 
 
 ###################################################
-# SAFE WRAPPER
+# BUILD MODELS
 ###################################################
 
-class SafeXGBClassifier(XGBClassifier):
-
-    def fit(self, X, y, **kwargs):
-
-        X = np.asarray(X)
-
-        _validate_features(X)
-
-        logger.info("XGBoost training started | rows=%s", len(X))
-
-        # 🔥 Automatic early stopping split
-        split = int(len(X) * 0.90)
-
-        X_train, X_val = X[:split], X[split:]
-        y_train, y_val = y[:split], y[split:]
-
-        return super().fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            early_stopping_rounds=75,
-            verbose=False
-        )
-
-
-###################################################
-# TRAIN MODEL
-###################################################
-
-def build_xgboost_model(y, **overrides):
+def build_xgboost_model(y):
 
     pos_weight = compute_class_weight(y)
 
-    params = _base_params(pos_weight, overrides)
-
-    params.setdefault("n_estimators", 600)
+    params = _base_params(pos_weight)
 
     return SafeXGBClassifier(**params)
 
 
-###################################################
-# FINAL MODEL
-###################################################
-
-def build_final_xgboost_model(y, **overrides):
+def build_final_xgboost_model(y):
 
     pos_weight = compute_class_weight(y)
 
-    params = _base_params(pos_weight, overrides)
+    params = _base_params(pos_weight)
 
     params.update({
-        "n_estimators": 900,
+        "n_estimators": 800,
         "learning_rate": 0.025,
         "gamma": 0.20,
         "reg_alpha": 0.9,
