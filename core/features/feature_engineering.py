@@ -34,6 +34,31 @@ class FeatureEngineer:
     ]
 
     ########################################################
+    # 🔥 INSTITUTIONAL SENTIMENT (NO RANDOMNESS)
+    ########################################################
+
+    @classmethod
+    def _build_neutral_sentiment(cls, price_df):
+
+        neutral = price_df[["date"]].copy()
+
+        # deterministic placeholders
+        neutral["avg_sentiment"] = np.float32(0.0)
+        neutral["news_count"] = np.float32(1.0)  
+        # IMPORTANT:
+        # cannot be zero -> becomes constant feature after normalization
+
+        neutral["sentiment_std"] = np.float32(
+            cls.SENTIMENT_STD_FLOOR
+        )
+
+        logger.warning(
+            "Sentiment unavailable — deterministic neutral features applied."
+        )
+
+        return neutral
+
+    ########################################################
     # TIME
     ########################################################
 
@@ -132,8 +157,6 @@ class FeatureEngineer:
         )
 
     ########################################################
-    # 🔥 FIXED RSI (Institutional Safe)
-    ########################################################
 
     @staticmethod
     def add_rsi(df, window=14):
@@ -146,10 +169,7 @@ class FeatureEngineer:
             )
 
             if isinstance(rsi_out, pd.DataFrame):
-                if "rsi" in rsi_out.columns:
-                    rsi_series = rsi_out["rsi"]
-                else:
-                    rsi_series = rsi_out.iloc[:, 0]
+                rsi_series = rsi_out.iloc[:, 0]
             else:
                 rsi_series = rsi_out
 
@@ -179,8 +199,6 @@ class FeatureEngineer:
         return df.groupby("ticker", group_keys=False).apply(_macd_block)
 
     ########################################################
-    # WARMUP TRIM
-    ########################################################
 
     @classmethod
     def _trim_warmup(cls, df):
@@ -192,43 +210,7 @@ class FeatureEngineer:
         )
 
     ########################################################
-    # SENTIMENT
-    ########################################################
-
-    @classmethod
-    def _build_uncertain_sentiment(cls, price_df):
-
-        rows = len(price_df)
-
-        rng = np.random.default_rng(42)
-
-        neutral = price_df[["date"]].copy()
-
-        neutral["avg_sentiment"] = rng.normal(
-            0.0,
-            0.02,
-            rows
-        ).astype("float32")
-
-        neutral["news_count"] = rng.poisson(
-            0.3,
-            rows
-        ).astype("float32")
-
-        neutral["sentiment_std"] = np.abs(
-            rng.normal(
-                cls.SENTIMENT_STD_FLOOR,
-                0.01,
-                rows
-            )
-        ).astype("float32")
-
-        logger.warning(
-            "Sentiment unavailable — stochastic distribution injected."
-        )
-
-        return neutral
-
+    # SENTIMENT MERGE (FIXED)
     ########################################################
 
     @classmethod
@@ -244,7 +226,7 @@ class FeatureEngineer:
         )
 
         if sentiment_df is None or sentiment_df.empty:
-            sentiment_df = cls._build_uncertain_sentiment(price)
+            sentiment_df = cls._build_neutral_sentiment(price)
 
         sentiment = sentiment_df.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment)
@@ -261,7 +243,7 @@ class FeatureEngineer:
 
         merged.fillna({
             "avg_sentiment": 0.0,
-            "news_count": 0.0,
+            "news_count": 1.0,
             "sentiment_std": cls.SENTIMENT_STD_FLOOR
         }, inplace=True)
 
