@@ -29,31 +29,39 @@ class FeatureEngineer:
     SENTIMENT_COLUMNS = [
         "date",
         "avg_sentiment",
-        "news_count",
         "sentiment_std"
     ]
 
     ########################################################
-    # 🔥 INSTITUTIONAL SENTIMENT (NO RANDOMNESS)
+    # ⭐ INSTITUTIONAL SAFE SENTIMENT
     ########################################################
 
     @classmethod
-    def _build_neutral_sentiment(cls, price_df):
+    def _build_neutral_sentiment(cls, price_df, ticker):
+
+        rows = len(price_df)
+
+        # deterministic seed per ticker
+        seed = abs(hash(ticker)) % (2**32)
+        rng = np.random.default_rng(seed)
 
         neutral = price_df[["date"]].copy()
 
-        # deterministic placeholders
-        neutral["avg_sentiment"] = np.float32(0.0)
-        neutral["news_count"] = np.float32(1.0)  
-        # IMPORTANT:
-        # cannot be zero -> becomes constant feature after normalization
+        # micro gaussian noise (bounded)
+        neutral["avg_sentiment"] = np.clip(
+            rng.normal(0, 0.015, rows),
+            -0.05,
+            0.05
+        ).astype("float32")
 
-        neutral["sentiment_std"] = np.float32(
-            cls.SENTIMENT_STD_FLOOR
-        )
+        neutral["sentiment_std"] = np.clip(
+            rng.normal(cls.SENTIMENT_STD_FLOOR, 0.005, rows),
+            0.005,
+            0.05
+        ).astype("float32")
 
         logger.warning(
-            "Sentiment unavailable — deterministic neutral features applied."
+            "Sentiment unavailable — injected micro-variance neutral signal."
         )
 
         return neutral
@@ -210,7 +218,7 @@ class FeatureEngineer:
         )
 
     ########################################################
-    # SENTIMENT MERGE (FIXED)
+    # SENTIMENT MERGE
     ########################################################
 
     @classmethod
@@ -226,7 +234,7 @@ class FeatureEngineer:
         )
 
         if sentiment_df is None or sentiment_df.empty:
-            sentiment_df = cls._build_neutral_sentiment(price)
+            sentiment_df = cls._build_neutral_sentiment(price, ticker)
 
         sentiment = sentiment_df.loc[:, cls.SENTIMENT_COLUMNS]
         sentiment = cls._normalize_datetime(sentiment)
@@ -243,7 +251,6 @@ class FeatureEngineer:
 
         merged.fillna({
             "avg_sentiment": 0.0,
-            "news_count": 1.0,
             "sentiment_std": cls.SENTIMENT_STD_FLOOR
         }, inplace=True)
 
