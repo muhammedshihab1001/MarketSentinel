@@ -24,12 +24,12 @@ class MarketProviderRouter:
     Institutional Multi-Vendor Router.
 
     Priority:
-        1️⃣ TwelveData
-        2️⃣ AlphaVantage
-        3️⃣ Yahoo (fallback)
+        1️⃣ Yahoo (PRIMARY — most stable)
+        2️⃣ TwelveData (fallback)
+        3️⃣ AlphaVantage (last resort)
 
     Design Goals:
-        ✔ Never over-reject
+        ✔ Prefer statistical stability
         ✔ Never silently accept garbage
         ✔ Prefer degraded data over crash
     """
@@ -44,8 +44,8 @@ class MarketProviderRouter:
     }
 
     MIN_ACCEPTABLE_ROWS = 50
-    MAX_DAILY_MOVE = 0.90   # router-level poisoning guard
-    PROVIDER_TIMEOUT_WARN = 8.0  # seconds
+    MAX_DAILY_MOVE = 0.90
+    PROVIDER_TIMEOUT_WARN = 8.0
 
     ALLOWED_INTERVALS = {
         "1d", "D",
@@ -111,23 +111,25 @@ class MarketProviderRouter:
                 )
 
         ####################################################
-        # PRIORITY ORDER
+        # 🔥 NEW PRIORITY ORDER (CRITICAL FIX)
         ####################################################
 
+        # PRIMARY — MOST STABLE
+        register("yahoo", YahooProvider)
+
+        # fallback
         register(
             "twelvedata",
             TwelveDataProvider,
             "TWELVEDATA_API_KEY"
         )
 
+        # last resort
         register(
             "alphavantage",
             AlphaVantageProvider,
             "ALPHAVANTAGE_API_KEY"
         )
-
-        # fallback
-        register("yahoo", YahooProvider)
 
     ############################################################
 
@@ -138,7 +140,7 @@ class MarketProviderRouter:
             raise ValueError(f"Unsupported interval: {interval}")
 
     ############################################################
-    # 🔥 INSTITUTIONAL SANITIZER
+    # INSTITUTIONAL SANITIZER
     ############################################################
 
     @classmethod
@@ -156,10 +158,6 @@ class MarketProviderRouter:
 
         df = df.copy()
 
-        ####################################################
-        # datetime normalization
-        ####################################################
-
         df["date"] = pd.to_datetime(
             df["date"],
             utc=True,
@@ -171,10 +169,6 @@ class MarketProviderRouter:
         if df.empty:
             raise RuntimeError("All datetime values invalid.")
 
-        ####################################################
-        # numeric enforcement
-        ####################################################
-
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
         for col in numeric_cols:
@@ -185,27 +179,15 @@ class MarketProviderRouter:
         if df.empty:
             raise RuntimeError("All numeric rows invalid.")
 
-        ####################################################
-        # soft invariants
-        ####################################################
-
         df = df[df["high"] >= df["low"]]
 
         if df.empty:
             raise RuntimeError("Price invariant violation.")
 
-        ####################################################
-        # 🔥 poisoning guard
-        ####################################################
-
         jumps = df["close"].pct_change().abs()
 
         if (jumps > cls.MAX_DAILY_MOVE).any():
             raise RuntimeError("Extreme price jump detected.")
-
-        ####################################################
-        # ordering
-        ####################################################
 
         df = (
             df
