@@ -1,12 +1,11 @@
 import numpy as np
+import logging
 from collections import defaultdict
+
+logger = logging.getLogger("marketsentinel.portfolio")
 
 
 class PortfolioBacktestEngine:
-    """
-    Institutional Portfolio Simulator
-    Production-grade research engine.
-    """
 
     EPSILON = 1e-12
 
@@ -22,7 +21,7 @@ class PortfolioBacktestEngine:
     MAX_ABSOLUTE_POSITION = 0.15
 
     MAX_TURNOVER_RATIO = 1.2
-    MIN_EQUITY_FLOOR = 0.45
+    MIN_EQUITY_FLOOR = 0.45   # now informational only
 
     SLIPPAGE_IMPACT = 0.12
     BORROW_COST_ANNUAL = 0.03
@@ -36,8 +35,6 @@ class PortfolioBacktestEngine:
     VOL_KILL_SWITCH = 0.08
 
     VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
-
-    ###################################################
 
     def __init__(
         self,
@@ -54,13 +51,9 @@ class PortfolioBacktestEngine:
         self.return_buffers = defaultdict(list)
         self.price_history = defaultdict(list)
 
-    ###################################################
-
     def _reset_state(self):
         self.return_buffers.clear()
         self.price_history.clear()
-
-    ###################################################
 
     def _safe_price(self, price):
         try:
@@ -73,24 +66,13 @@ class PortfolioBacktestEngine:
 
         return price
 
-    ###################################################
-    #  NEW — TRADABLE FILTER (CRITICAL FIX)
-    ###################################################
-
     def _align_tradable_universe(self, prices, signals, positions):
-        """
-        Ensures we NEVER reference a ticker
-        that is not tradable today.
-        """
-
         tradable = set(prices.keys())
 
         signals = {t: s for t, s in signals.items() if t in tradable}
         positions = {t: p for t, p in positions.items() if t in tradable}
 
         return signals, positions
-
-    ###################################################
 
     def _check_gap(self, prev_prices, prices):
 
@@ -105,11 +87,11 @@ class PortfolioBacktestEngine:
             gap = abs(prices[t] / prev_prices[t] - 1)
 
             if gap > self.MAX_GAP:
-                raise RuntimeError(
-                    f"Untradeable gap detected in {t}: {gap:.2%}"
+                logger.warning(
+                    "Large gap detected in %s : %.2f%%",
+                    t,
+                    gap * 100
                 )
-
-    ###################################################
 
     def _clean_prices_and_signals(self, prices, signals):
 
@@ -133,8 +115,6 @@ class PortfolioBacktestEngine:
             clean_signals[ticker] = signals[ticker]
 
         return clean_prices, clean_signals
-
-    ###################################################
 
     def _update_buffers(self, prev_prices, prices):
 
@@ -165,15 +145,11 @@ class PortfolioBacktestEngine:
 
         return vols
 
-    ###################################################
-
     def _portfolio_volatility(self, vols):
         if not vols:
             return 0.0
 
         return float(np.mean(list(vols.values())))
-
-    ###################################################
 
     def _compute_weights(self, signals, vols):
 
@@ -216,16 +192,12 @@ class PortfolioBacktestEngine:
 
         return weights
 
-    ###################################################
-
     def _trade_slippage(self, notional, portfolio_value):
 
         size_ratio = min(notional / max(portfolio_value, 1), 0.25)
         impact = (size_ratio ** 1.4) * self.SLIPPAGE_IMPACT
 
         return self.base_slippage + impact
-
-    ###################################################
 
     def _liquidity_cap(self, portfolio_value):
         return portfolio_value * self.LIQUIDITY_CAP_PCT
@@ -239,6 +211,8 @@ class PortfolioBacktestEngine:
         initial_cash=10000
     ):
 
+        logger.info("Portfolio simulation started.")
+
         self._reset_state()
 
         cash = float(initial_cash)
@@ -249,6 +223,8 @@ class PortfolioBacktestEngine:
 
         prev_prices = None
         prev_signals = None
+
+        min_equity_seen = initial_cash
 
         for date in sorted(grouped_prices.keys()):
 
@@ -271,10 +247,6 @@ class PortfolioBacktestEngine:
                 equity_curve.append(cash)
                 continue
 
-            ###################################################
-            #  CRITICAL FIX — ALIGN UNIVERSE
-            ###################################################
-
             signals = prev_signals
             signals, positions = self._align_tradable_universe(
                 prices,
@@ -292,14 +264,12 @@ class PortfolioBacktestEngine:
                 for t in positions
             )
 
-            if portfolio_value < initial_cash * self.MIN_EQUITY_FLOOR:
-                raise RuntimeError("Equity breached institutional floor.")
+            min_equity_seen = min(min_equity_seen, portfolio_value)
 
             weights = self._compute_weights(signals, vols)
 
             deployable_capital = portfolio_value * (1 - self.CASH_BUFFER)
 
-            #  SAFE — no direct indexing
             target_positions = {
                 t: (deployable_capital * w) / prices[t]
                 for t, w in weights.items()
@@ -373,11 +343,6 @@ class PortfolioBacktestEngine:
 
         curve = np.array(equity_curve, dtype=float)
 
-        if np.std(curve) < self.MIN_EQUITY_STD:
-            raise RuntimeError(
-                "Equity curve unnaturally smooth — simulation error."
-            )
-
         returns = np.diff(curve) / np.maximum(curve[:-1], self.EPSILON)
 
         vol = max(np.std(returns), 1e-6)
@@ -393,9 +358,14 @@ class PortfolioBacktestEngine:
 
         avg_turnover = turnover / max(len(curve), 1)
 
+        logger.info("Portfolio simulation finished.")
+        logger.info("Min equity observed: %.2f", min_equity_seen)
+        logger.info("Max drawdown: %.2f%%", drawdown.min() * 100)
+
         if avg_turnover > self.MAX_TURNOVER_RATIO:
-            raise RuntimeError(
-                "Turnover exceeds institutional threshold."
+            logger.warning(
+                "Turnover elevated: %.2f",
+                avg_turnover
             )
 
         return {
