@@ -14,11 +14,11 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "16.0"   # bump whenever features change
+SCHEMA_VERSION = "17.0"   # bumped due to feature removal
 
 
 ############################################################
-# FEATURES (IMMUTABLE — DO NOT CHANGE TO LIST)
+# FEATURES (IMMUTABLE)
 ############################################################
 
 MODEL_FEATURES: Tuple[str, ...] = (
@@ -28,7 +28,6 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "macd",
     "macd_signal",
     "avg_sentiment",
-    "news_count",
     "sentiment_std",
     "return_lag1",
     "sentiment_lag1",
@@ -70,8 +69,6 @@ FEATURE_LIMITS: Dict[str, tuple] = {
     "avg_sentiment": (-1.0, 1.0),
     "sentiment_lag1": (-1.0, 1.0),
 
-    "news_count": (0, 5000),
-
     "sentiment_std": (0.0, 10.0),
 }
 
@@ -100,7 +97,7 @@ def _check_forbidden_columns(df: pd.DataFrame):
 
 
 ############################################################
-# SCHEMA LOCK (CRITICAL FOR DRIFT DETECTION)
+# SCHEMA LOCK
 ############################################################
 
 def _build_feature_lock():
