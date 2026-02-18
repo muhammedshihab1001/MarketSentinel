@@ -11,8 +11,6 @@ import gc
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
-from core.data.news_fetcher import NewsFetcher
-from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_store import FeatureStore
 from core.schema.feature_schema import (
     MODEL_FEATURES,
@@ -107,14 +105,13 @@ def safe_validate_schema(df):
 
 
 ############################################################
-# 🔥 INSTITUTIONAL CROSS-SECTIONAL NORMALIZATION
+# CROSS-SECTIONAL NORMALIZATION
 ############################################################
 
 def cross_sectional_normalize(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
 
-    # ⭐ REQUIRE TRUE CROSS SECTION
     counts = df.groupby("date")["ticker"].transform("count")
 
     if (counts < 2).any():
@@ -130,7 +127,6 @@ def cross_sectional_normalize(df):
         mean = grouped[col].transform("mean")
         std = grouped[col].transform("std")
 
-        # ⭐ CRITICAL FIX
         std = std.fillna(1.0).clip(lower=1e-6)
 
         df[col] = (df[col] - mean) / std
@@ -139,20 +135,22 @@ def cross_sectional_normalize(df):
 
 
 ############################################################
-# DATA LOADER
+# DATA LOADER — INSTITUTIONAL PRICE-ONLY MODE
 ############################################################
 
 def load_training_data(start_date, end_date):
 
     market_data = MarketDataService()
-    news_fetcher = NewsFetcher()
-    sentiment_analyzer = SentimentAnalyzer()
     store = FeatureStore()
 
     universe = MarketUniverse.get_universe()
 
     datasets = []
     surviving = []
+
+    logger.warning(
+        "TRAINING MODE: Sentiment disabled — price-only institutional research."
+    )
 
     for ticker in universe:
 
@@ -164,32 +162,13 @@ def load_training_data(start_date, end_date):
                 end_date=end_date
             )
 
-            sentiment_df = None
-
-            try:
-
-                news_df = news_fetcher.fetch(
-                    f"{ticker} stock",
-                    max_items=250
-                )
-
-                if news_df is not None and not news_df.empty:
-
-                    scored = sentiment_analyzer.analyze_dataframe(news_df)
-
-                    sentiment_df = sentiment_analyzer.aggregate_daily_sentiment(
-                        scored
-                    )
-
-            except Exception:
-                logger.info(
-                    "Sentiment disabled for %s — continuing.",
-                    ticker
-                )
+            ##################################################
+            # 🔥 CRITICAL — DO NOT FETCH NEWS
+            ##################################################
 
             dataset = store.get_features(
                 price_df,
-                sentiment_df,
+                sentiment_df=None,  # intentional
                 ticker=ticker,
                 training=True
             )
@@ -216,7 +195,6 @@ def load_training_data(start_date, end_date):
             survival_ratio
         )
 
-    # ⭐ SAFE CONCAT
     df = pd.concat(datasets, ignore_index=True, copy=False)
 
     if len(df) < MIN_TRAINING_ROWS:
@@ -228,17 +206,12 @@ def load_training_data(start_date, end_date):
 
     df = cross_sectional_normalize(df)
 
-    ########################################################
-
     safe_validate_schema(df.loc[:, MODEL_FEATURES])
 
     features = df.loc[:, MODEL_FEATURES].to_numpy(dtype=np.float32)
 
     if not np.isfinite(features).all():
         raise RuntimeError("Non-finite feature values detected.")
-
-    if (np.var(features, axis=0) < 1e-7).any():
-        logger.warning("Low feature variance detected.")
 
     if df["target"].nunique() < 2:
         raise RuntimeError("Target collapsed.")
