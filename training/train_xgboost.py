@@ -7,7 +7,6 @@ import pandas as pd
 import numpy as np
 import logging
 import random
-import gc
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
@@ -22,8 +21,6 @@ from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
 
 from training.backtesting.walk_forward import WalkForwardValidator
-from training.inference.signal_generator import SignalGenerator
-
 from models.xgboost_model import (
     build_xgboost_model,
     build_final_xgboost_model
@@ -57,7 +54,7 @@ def enforce_determinism():
 
 
 ############################################################
-# SAVE
+# SAVE MODEL SAFELY
 ############################################################
 
 def save_model_atomic(model, path):
@@ -88,23 +85,20 @@ def cross_sectional_normalize(df):
     df = df.sort_values(["date", "ticker"]).copy()
 
     counts = df.groupby("date")["ticker"].transform("count")
-
     df = df[counts >= 2]
 
     grouped = df.groupby("date")
 
     for col in MODEL_FEATURES:
-
         mean = grouped[col].transform("mean")
         std = grouped[col].transform("std").fillna(1).clip(lower=1e-6)
-
         df[col] = (df[col] - mean) / std
 
     return df.reset_index(drop=True)
 
 
 ############################################################
-# DATA LOADER + ALPHA SCAN
+# DATA LOADER WITH ALPHA PRUNING
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -122,7 +116,6 @@ def load_training_data(start_date, end_date):
     for ticker in universe:
 
         try:
-
             price_df = market_data.get_price_data(
                 ticker=ticker,
                 start_date=start_date,
@@ -136,7 +129,7 @@ def load_training_data(start_date, end_date):
                 training=True
             )
 
-            # SIMPLE ALPHA SCORE
+            # Simple information coefficient proxy
             ic = abs(dataset["target"].corr(dataset["return_lag1"]))
             ticker_scores[ticker] = ic if np.isfinite(ic) else 0
 
@@ -145,14 +138,13 @@ def load_training_data(start_date, end_date):
             logger.info("Ticker accepted → %s | IC=%.3f", ticker, ic)
 
         except Exception as e:
-
             logger.warning("Ticker rejected → %s | %s", ticker, str(e))
 
     if not datasets:
         raise RuntimeError("All tickers failed.")
 
     ###################################################
-    # 🔥 AUTO PRUNE GARBAGE TICKERS
+    # Alpha pruning
     ###################################################
 
     ranked = sorted(
@@ -162,7 +154,6 @@ def load_training_data(start_date, end_date):
     )
 
     keep_n = max(6, int(len(ranked) * 0.6))
-
     keep = {t for t, _ in ranked[:keep_n]}
 
     logger.warning("Alpha pruning active → keeping %s tickers", len(keep))
@@ -199,7 +190,7 @@ def load_training_data(start_date, end_date):
 
 
 ############################################################
-# MAIN
+# MAIN TRAINING PIPELINE
 ############################################################
 
 def main(start_date=None, end_date=None):
@@ -219,28 +210,43 @@ def main(start_date=None, end_date=None):
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     ########################################################
-    # TRAINER
+    # MODEL TRAINER
     ########################################################
 
     def trainer(d):
 
         y = d["target"]
-
         model = build_xgboost_model(y)
-
         model.fit(d.loc[:, MODEL_FEATURES], y)
 
         return model
 
     ########################################################
-    # WALK FORWARD (PRODUCTION SIGNALS)
+    # PROBABILITY SIGNAL GENERATOR (WF COMPATIBLE)
     ########################################################
 
-    generator = SignalGenerator()
+    def wf_signal_generator(model, test_df):
+
+        probs = model.predict_proba(
+            test_df.loc[:, MODEL_FEATURES]
+        )[:, 1]
+
+        signals = [
+            "BUY" if p > 0.58
+            else "SELL" if p < 0.42
+            else "HOLD"
+            for p in probs
+        ]
+
+        return signals, probs
+
+    ########################################################
+    # WALK FORWARD
+    ########################################################
 
     wf = WalkForwardValidator(
         model_trainer=trainer,
-        signal_generator=generator.generate
+        signal_generator=wf_signal_generator
     )
 
     logger.info("Running institutional walk-forward...")
@@ -254,7 +260,7 @@ def main(start_date=None, end_date=None):
     )
 
     ########################################################
-    # FINAL MODEL
+    # FINAL PRODUCTION MODEL
     ########################################################
 
     final_model = build_final_xgboost_model(df["target"])
@@ -277,10 +283,7 @@ def main(start_date=None, end_date=None):
         metadata_type="training_manifest_v1"
     )
 
-    MetadataManager.save_metadata(
-        metadata,
-        TEMP_METADATA_PATH
-    )
+    MetadataManager.save_metadata(metadata, TEMP_METADATA_PATH)
 
     version = ModelRegistry.register_model(
         MODEL_DIR,
@@ -291,7 +294,7 @@ def main(start_date=None, end_date=None):
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
     logger.info("MODEL VERSION → %s", version)
-    logger.info("TOTAL TIME → %.2f minutes", (time.time()-t0)/60)
+    logger.info("TOTAL TIME → %.2f minutes", (time.time() - t0) / 60)
 
     return metrics
 
