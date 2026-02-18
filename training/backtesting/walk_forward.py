@@ -84,12 +84,10 @@ class WalkForwardValidator:
 
     def _validate_training_frame(self, df):
         cols = list(MODEL_FEATURES)
-        
+
         validate_feature_schema(df.loc[:, cols])
 
         features = df.loc[:, cols].to_numpy(dtype=float)
-
-        features = df.loc[:, MODEL_FEATURES].to_numpy(dtype=float)
 
         if not np.isfinite(features).all():
             raise RuntimeError("Non-finite feature values detected.")
@@ -165,24 +163,19 @@ class WalkForwardValidator:
 
         regimes = df["regime"].dropna().unique()
 
-        # fallback detection
         if len(regimes) == 1:
 
             regime = regimes[0]
 
-            # SAFE fallback allowance
             if regime == "SIDEWAYS":
-
                 import logging
                 logger = logging.getLogger("marketsentinel.walkforward")
 
                 logger.warning(
                     "Regime diversity unavailable — continuing in research mode."
                 )
-
                 return
 
-            # if only crisis -> still dangerous
             if regime == "CRISIS":
                 raise RuntimeError(
                     "Training occurred only during crisis regime."
@@ -190,12 +183,12 @@ class WalkForwardValidator:
 
         if len(regimes) < self.MIN_REGIME_COUNT:
 
+            import logging
             logger = logging.getLogger("marketsentinel.walkforward")
 
             logger.warning(
                 "Low regime diversity detected — results may be unstable."
             )
-
 
     ########################################################
 
@@ -204,6 +197,9 @@ class WalkForwardValidator:
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
         self._assert_monotonic(df)
+
+        # ✅ CRITICAL FIX — compute regime ONCE globally
+        df = self.regime_detector.detect(df)
 
         unique_dates = pd.to_datetime(
             df["date"].drop_duplicates()
@@ -242,9 +238,6 @@ class WalkForwardValidator:
                 (df["date"] >= test_dates.iloc[0]) &
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
-
-            train_df = self.regime_detector.detect(train_df.copy())
-            test_df = self.regime_detector.detect(test_df.copy())
 
             self._regime_guard(train_df)
 
