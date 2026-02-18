@@ -45,7 +45,6 @@ SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_SURVIVING_RATIO = 0.20
 MIN_SHARPE = 0.15
-MAX_DRAWDOWN = -0.55
 MIN_MODEL_BYTES = 50_000
 
 PROMOTE_FLAG = os.getenv("ALLOW_MODEL_PROMOTION", "false").lower() == "true"
@@ -105,6 +104,39 @@ def safe_validate_schema(df):
 
 
 ############################################################
+# 🔥 METRIC SANITIZER (CRITICAL FIX)
+############################################################
+
+def sanitize_metrics(metrics: dict) -> dict:
+    """
+    Metadata manager ONLY accepts numeric values.
+
+    WalkForward returns curves + arrays.
+    We drop them safely.
+    """
+
+    numeric = {}
+
+    for k, v in metrics.items():
+
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            numeric[k] = float(v)
+
+        else:
+            logger.info(
+                "Dropping non-numeric metric from metadata → %s",
+                k
+            )
+
+    if not numeric:
+        raise RuntimeError(
+            "No numeric metrics available — walk-forward corrupted."
+        )
+
+    return numeric
+
+
+############################################################
 # CROSS-SECTIONAL NORMALIZATION
 ############################################################
 
@@ -135,7 +167,7 @@ def cross_sectional_normalize(df):
 
 
 ############################################################
-# DATA LOADER — INSTITUTIONAL PRICE-ONLY MODE
+# DATA LOADER — PRICE ONLY MODE
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -162,13 +194,9 @@ def load_training_data(start_date, end_date):
                 end_date=end_date
             )
 
-            ##################################################
-            # 🔥 CRITICAL — DO NOT FETCH NEWS
-            ##################################################
-
             dataset = store.get_features(
                 price_df,
-                sentiment_df=None,  # intentional
+                sentiment_df=None,
                 ticker=ticker,
                 training=True
             )
@@ -199,10 +227,6 @@ def load_training_data(start_date, end_date):
 
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError("Training aborted — dataset too small.")
-
-    ########################################################
-    # NORMALIZE AFTER CONCAT
-    ########################################################
 
     df = cross_sectional_normalize(df)
 
@@ -290,14 +314,13 @@ def main(start_date=None, end_date=None):
 
     strategy_metrics = wf.run(df)
 
+    ########################################################
+    # 🔥 FIX — sanitize metrics
+    ########################################################
+
+    numeric_metrics = sanitize_metrics(strategy_metrics)
+
     gc.collect()
-
-    if strategy_metrics["avg_sharpe"] < MIN_SHARPE:
-        logger.warning("Sharpe below ideal threshold.")
-
-    ########################################################
-    # FINAL MODEL
-    ########################################################
 
     final_model = build_final_xgboost_model(df["target"])
 
@@ -317,7 +340,7 @@ def main(start_date=None, end_date=None):
 
     metadata = MetadataManager.create_metadata(
         model_name="xgboost_direction",
-        metrics={**strategy_metrics},
+        metrics=numeric_metrics,
         features=list(MODEL_FEATURES),
         training_start=start_date,
         training_end=end_date,
@@ -369,7 +392,7 @@ def main(start_date=None, end_date=None):
         "Training summary | version=%s rows=%s sharpe=%.3f",
         version,
         len(df),
-        strategy_metrics["avg_sharpe"]
+        numeric_metrics.get("avg_sharpe", -1)
     )
 
     logger.info(
@@ -377,7 +400,7 @@ def main(start_date=None, end_date=None):
         (time.time() - t0) / 60
     )
 
-    return strategy_metrics
+    return numeric_metrics
 
 
 if __name__ == "__main__":
