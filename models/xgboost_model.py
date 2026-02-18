@@ -2,9 +2,12 @@ from xgboost import XGBClassifier
 import numpy as np
 import xgboost as xgb
 import threading
+import logging
 
 from core.schema.feature_schema import FEATURE_COUNT
 
+
+logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
 
@@ -13,7 +16,7 @@ MIN_CLASS_WEIGHT = 1.0
 
 
 ###################################################
-# GPU DETECTION
+# 🔥 REAL GPU DETECTION
 ###################################################
 
 _GPU_AVAILABLE = None
@@ -34,30 +37,35 @@ def _gpu_verified():
 
         try:
 
-            dtrain = xgb.DMatrix(
-                np.random.rand(50, 4),
-                label=np.random.randint(0, 2, 50)
+            # THIS is the correct GPU test
+            xgb.XGBClassifier(
+                tree_method="gpu_hist",
+                predictor="gpu_predictor",
+                max_depth=1,
+                n_estimators=1,
+                verbosity=0
+            ).fit(
+                np.random.rand(20, 4),
+                np.random.randint(0, 2, 20)
             )
 
-            params = {
-                "tree_method": "hist",
-                "device": "cuda",
-                "max_depth": 1,
-                "verbosity": 0
-            }
-
-            xgb.train(params, dtrain, num_boost_round=1)
-
+            logger.info("GPU detected — using CUDA acceleration.")
             _GPU_AVAILABLE = True
 
         except Exception:
+
+            logger.info("GPU not available — using CPU.")
             _GPU_AVAILABLE = False
 
         return _GPU_AVAILABLE
 
 
-def _device():
-    return "cuda" if _gpu_verified() else "cpu"
+def _tree_method():
+    return "gpu_hist" if _gpu_verified() else "hist"
+
+
+def _predictor():
+    return "gpu_predictor" if _gpu_verified() else "auto"
 
 
 ###################################################
@@ -82,7 +90,11 @@ def compute_class_weight(y):
 
     weight = neg / pos
 
-    return float(np.clip(weight, MIN_CLASS_WEIGHT, MAX_CLASS_WEIGHT))
+    weight = float(np.clip(weight, MIN_CLASS_WEIGHT, MAX_CLASS_WEIGHT))
+
+    logger.info("Computed class weight → %.3f", weight)
+
+    return weight
 
 
 ###################################################
@@ -106,15 +118,13 @@ def _validate_features(X):
 
 def _base_params(pos_weight, overrides=None):
 
-    device = _device()
-
     params = dict(
 
         max_depth=5,
         learning_rate=0.03,
 
-        subsample=0.80,
-        colsample_bytree=0.80,
+        subsample=0.8,
+        colsample_bytree=0.8,
 
         min_child_weight=3,
         gamma=0.15,
@@ -126,11 +136,8 @@ def _base_params(pos_weight, overrides=None):
         random_state=SEED,
         n_jobs=1,
 
-        tree_method="hist",
-        device=device,
-
-        deterministic_histogram=True,
-        sampling_method="uniform",
+        tree_method=_tree_method(),
+        predictor=_predictor(),
 
         scale_pos_weight=pos_weight,
 
@@ -139,15 +146,18 @@ def _base_params(pos_weight, overrides=None):
         max_bin=192,
 
         use_label_encoder=False,
-        verbosity=0
+        verbosity=0,
     )
 
-    if device == "cuda":
-        params["predictor"] = "gpu_predictor"
-
-    # 🔥 SAFE PARAM OVERRIDE
     if overrides:
         params.update(overrides)
+
+    logger.info(
+        "XGBoost params | device=%s estimators=%s lr=%.3f",
+        "GPU" if _gpu_verified() else "CPU",
+        params.get("n_estimators"),
+        params.get("learning_rate"),
+    )
 
     return params
 
@@ -164,7 +174,21 @@ class SafeXGBClassifier(XGBClassifier):
 
         _validate_features(X)
 
-        return super().fit(X, y, **kwargs)
+        logger.info("XGBoost training started | rows=%s", len(X))
+
+        # 🔥 Automatic early stopping split
+        split = int(len(X) * 0.90)
+
+        X_train, X_val = X[:split], X[split:]
+        y_train, y_val = y[:split], y[split:]
+
+        return super().fit(
+            X_train,
+            y_train,
+            eval_set=[(X_val, y_val)],
+            early_stopping_rounds=75,
+            verbose=False
+        )
 
 
 ###################################################
@@ -193,7 +217,7 @@ def build_final_xgboost_model(y, **overrides):
     params = _base_params(pos_weight, overrides)
 
     params.update({
-        "n_estimators": 800,
+        "n_estimators": 900,
         "learning_rate": 0.025,
         "gamma": 0.20,
         "reg_alpha": 0.9,
