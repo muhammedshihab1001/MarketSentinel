@@ -107,12 +107,21 @@ def safe_validate_schema(df):
 
 
 ############################################################
-#  CROSS SECTIONAL NORMALIZATION (CRITICAL FIX)
+# 🔥 INSTITUTIONAL CROSS-SECTIONAL NORMALIZATION
 ############################################################
 
 def cross_sectional_normalize(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
+
+    # ⭐ REQUIRE TRUE CROSS SECTION
+    counts = df.groupby("date")["ticker"].transform("count")
+
+    if (counts < 2).any():
+        logger.warning(
+            "Dropping single-asset dates before normalization."
+        )
+        df = df[counts >= 2]
 
     grouped = df.groupby("date")
 
@@ -121,11 +130,12 @@ def cross_sectional_normalize(df):
         mean = grouped[col].transform("mean")
         std = grouped[col].transform("std")
 
-        std = std.replace(0, 1e-6)
+        # ⭐ CRITICAL FIX
+        std = std.fillna(1.0).clip(lower=1e-6)
 
         df[col] = (df[col] - mean) / std
 
-    return df
+    return df.reset_index(drop=True)
 
 
 ############################################################
@@ -206,24 +216,23 @@ def load_training_data(start_date, end_date):
             survival_ratio
         )
 
-    df = pd.concat(datasets, ignore_index=True)
+    # ⭐ SAFE CONCAT
+    df = pd.concat(datasets, ignore_index=True, copy=False)
 
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError("Training aborted — dataset too small.")
 
     ########################################################
-    #  FIX — PREVENT DISTRIBUTION SHIFT
+    # NORMALIZE AFTER CONCAT
     ########################################################
 
     df = cross_sectional_normalize(df)
-
-    df.reset_index(drop=True, inplace=True)
 
     ########################################################
 
     safe_validate_schema(df.loc[:, MODEL_FEATURES])
 
-    features = df.loc[:, MODEL_FEATURES].to_numpy()
+    features = df.loc[:, MODEL_FEATURES].to_numpy(dtype=np.float32)
 
     if not np.isfinite(features).all():
         raise RuntimeError("Non-finite feature values detected.")
