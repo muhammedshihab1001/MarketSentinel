@@ -14,7 +14,11 @@ from core.data.market_data_service import MarketDataService
 from core.data.news_fetcher import NewsFetcher
 from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_store import FeatureStore
-from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema, get_schema_signature
+from core.schema.feature_schema import (
+    MODEL_FEATURES,
+    validate_feature_schema,
+    get_schema_signature
+)
 
 from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
@@ -40,9 +44,9 @@ TEMP_METADATA_PATH = os.path.join(TEMP_DIR, "metadata.json")
 
 SEED = 42
 
-MIN_TRAINING_ROWS = 1200      # lowered
-MIN_SURVIVING_RATIO = 0.20    # 🔥 institutional value
-MIN_SHARPE = 0.15            # realistic
+MIN_TRAINING_ROWS = 1200
+MIN_SURVIVING_RATIO = 0.20
+MIN_SHARPE = 0.15
 MAX_DRAWDOWN = -0.55
 MIN_MODEL_BYTES = 50_000
 
@@ -103,6 +107,28 @@ def safe_validate_schema(df):
 
 
 ############################################################
+#  CROSS SECTIONAL NORMALIZATION (CRITICAL FIX)
+############################################################
+
+def cross_sectional_normalize(df):
+
+    df = df.sort_values(["date", "ticker"]).copy()
+
+    grouped = df.groupby("date")
+
+    for col in MODEL_FEATURES:
+
+        mean = grouped[col].transform("mean")
+        std = grouped[col].transform("std")
+
+        std = std.replace(0, 1e-6)
+
+        df[col] = (df[col] - mean) / std
+
+    return df
+
+
+############################################################
 # DATA LOADER
 ############################################################
 
@@ -122,19 +148,11 @@ def load_training_data(start_date, end_date):
 
         try:
 
-            ####################################################
-            # PRICE — MUST SUCCEED
-            ####################################################
-
             price_df = market_data.get_price_data(
                 ticker=ticker,
                 start_date=start_date,
                 end_date=end_date
             )
-
-            ####################################################
-            # SENTIMENT — OPTIONAL
-            ####################################################
 
             sentiment_df = None
 
@@ -158,10 +176,6 @@ def load_training_data(start_date, end_date):
                     "Sentiment disabled for %s — continuing.",
                     ticker
                 )
-
-            ####################################################
-            # FEATURES
-            ####################################################
 
             dataset = store.get_features(
                 price_df,
@@ -197,8 +211,15 @@ def load_training_data(start_date, end_date):
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError("Training aborted — dataset too small.")
 
-    df.sort_values(["date", "ticker"], inplace=True)
+    ########################################################
+    #  FIX — PREVENT DISTRIBUTION SHIFT
+    ########################################################
+
+    df = cross_sectional_normalize(df)
+
     df.reset_index(drop=True, inplace=True)
+
+    ########################################################
 
     safe_validate_schema(df.loc[:, MODEL_FEATURES])
 
@@ -206,10 +227,6 @@ def load_training_data(start_date, end_date):
 
     if not np.isfinite(features).all():
         raise RuntimeError("Non-finite feature values detected.")
-
-    ####################################################
-    # SOFT VARIANCE CHECK
-    ####################################################
 
     if (np.var(features, axis=0) < 1e-7).any():
         logger.warning("Low feature variance detected.")
@@ -260,13 +277,7 @@ def main(start_date=None, end_date=None):
 
         y = d["target"]
 
-        model = build_xgboost_model(
-            y,
-            random_state=SEED,
-            seed=SEED,
-            nthread=1,
-            tree_method="hist"
-        )
+        model = build_xgboost_model(y)
 
         model.fit(d.loc[:, MODEL_FEATURES], y)
 
@@ -306,13 +317,7 @@ def main(start_date=None, end_date=None):
     # FINAL MODEL
     ########################################################
 
-    final_model = build_final_xgboost_model(
-        df["target"],
-        random_state=SEED,
-        seed=SEED,
-        nthread=1,
-        tree_method="hist"
-    )
+    final_model = build_final_xgboost_model(df["target"])
 
     final_model.fit(
         df.loc[:, MODEL_FEATURES],
