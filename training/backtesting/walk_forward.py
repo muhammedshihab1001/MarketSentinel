@@ -2,21 +2,17 @@ import numpy as np
 import pandas as pd
 import logging
 
-from core.schema.feature_schema import (
-    MODEL_FEATURES,
-    validate_feature_schema
-)
-
+from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema
 from training.backtesting.portfolio_engine import PortfolioBacktestEngine
 from training.backtesting.regime import MarketRegimeDetector
-
 
 logger = logging.getLogger("marketsentinel.walkforward")
 
 
 class WalkForwardValidator:
     """
-    Institutional Walk Forward Validator
+    Institutional Walk Forward Validator v2
+    Now includes conviction filtering, ranking, and regime throttling.
     """
 
     MIN_TRADES_PER_WINDOW = 5
@@ -26,15 +22,13 @@ class WalkForwardValidator:
     MIN_ASSETS_PER_DAY = 3
     MIN_FEATURE_VARIANCE = 1e-8
 
-    MAX_TURNOVER = 0.65
-    MAX_CAPITAL_MULTIPLE = 50
-    MAX_SHARPE_REALITY = 4.0
-    MIN_EQUITY_STD = 1e-4
+    # 🔥 NEW — institutional controls
+    MIN_PROBABILITY = 0.60
+    TOP_K_PERCENT = 0.20
+    MAX_TRADES_PER_DAY = 12
 
-    MAX_SIGNAL_CONCENTRATION = 0.35
-    MIN_REGIME_COUNT = 2
-
-    DRIFT_WARN_Z = 10.0   # 🔥 upgraded from crash → warn
+    CRISIS_EXPOSURE_SCALE = 0.35
+    DRIFT_WARN_Z = 10.0
 
     ########################################################
 
@@ -86,8 +80,6 @@ class WalkForwardValidator:
             raise RuntimeError("Training labels collapsed.")
 
     ########################################################
-    # 🔥 DRIFT GUARD (NO CRASH)
-    ########################################################
 
     def _distribution_guard(self, train_df, test_df):
 
@@ -101,10 +93,34 @@ class WalkForwardValidator:
         max_z = float(np.nanmax(z.to_numpy()))
 
         if max_z > self.DRIFT_WARN_Z:
-            logger.warning(
-                "Feature drift detected | max_z=%.2f",
-                max_z
-            )
+            logger.warning("Feature drift detected | max_z=%.2f", max_z)
+
+    ########################################################
+    # 🔥 NEW — CONVICTION FILTER
+    ########################################################
+
+    def _filter_conviction(self, tickers, probs, signals):
+
+        df = pd.DataFrame({
+            "ticker": tickers,
+            "prob": probs,
+            "signal": signals
+        })
+
+        df = df[df["prob"] >= self.MIN_PROBABILITY]
+
+        if df.empty:
+            return {}
+
+        # rank strongest edges
+        k = max(1, int(len(df) * self.TOP_K_PERCENT))
+
+        df = df.sort_values("prob", ascending=False).head(k)
+
+        # hard cap
+        df = df.head(self.MAX_TRADES_PER_DAY)
+
+        return dict(zip(df["ticker"], df["signal"]))
 
     ########################################################
 
@@ -147,21 +163,14 @@ class WalkForwardValidator:
                 (df["date"] <= train_dates.iloc[-1])
             ].copy()
 
-            train_df = self._apply_embargo(
-                train_df,
-                test_dates.iloc[0]
-            )
+            train_df = self._apply_embargo(train_df, test_dates.iloc[0])
 
             test_df = df.loc[
                 (df["date"] >= test_dates.iloc[0]) &
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
-            logger.info(
-                "Train rows=%s | Test rows=%s",
-                len(train_df),
-                len(test_df)
-            )
+            logger.info("Train rows=%s | Test rows=%s", len(train_df), len(test_df))
 
             self._validate_training_frame(train_df)
             self._distribution_guard(train_df, test_df)
@@ -189,24 +198,32 @@ class WalkForwardValidator:
                     if pd.notna(p) and np.isfinite(p) and p > 0
                 }
 
-                signals_list = self.signal_generator(model, signal_slice)
+                # 🔥 IMPORTANT — signal generator MUST return probs now
+                signals, probs = self.signal_generator(model, signal_slice)
 
-                signals = dict(zip(signal_slice["ticker"], signals_list))
-
-                shared = set(prices) & set(signals)
-
-                if len(shared) < self.MIN_ASSETS_PER_DAY:
-                    continue
-
-                prices = {t: prices[t] for t in shared}
-                signals = {t: signals[t] for t in shared}
-
-                trade_counter += sum(
-                    1 for s in signals.values() if s != "HOLD"
+                filtered = self._filter_conviction(
+                    signal_slice["ticker"].values,
+                    probs,
+                    signals
                 )
 
-                grouped_prices[execution_date] = prices
-                grouped_signals[execution_date] = signals
+                if len(filtered) < self.MIN_ASSETS_PER_DAY:
+                    continue
+
+                # regime throttle
+                regime = signal_slice["regime"].iloc[0]
+
+                if regime == "CRISIS":
+                    logger.warning("CRISIS regime detected — throttling exposure.")
+                    filtered = dict(list(filtered.items())[: max(1, int(len(filtered) * self.CRISIS_EXPOSURE_SCALE))])
+
+                trade_counter += len(filtered)
+
+                grouped_prices[execution_date] = {
+                    t: prices[t] for t in filtered if t in prices
+                }
+
+                grouped_signals[execution_date] = filtered
 
             if trade_counter < self.MIN_TRADES_PER_WINDOW:
                 logger.warning("Window skipped — insufficient trades.")
@@ -214,7 +231,7 @@ class WalkForwardValidator:
                 window_id += 1
                 continue
 
-            logger.info("Trades executed → %s", trade_counter)
+            logger.info("Trades executed -> %s", trade_counter)
 
             metrics = self.engine.run(
                 grouped_prices,
