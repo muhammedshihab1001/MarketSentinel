@@ -25,6 +25,9 @@ class FeatureEngineer:
 
     MIN_CLASS_RATIO = 0.15
 
+    # ⭐ institutional warmup
+    MAX_INDICATOR_WINDOW = 20
+
     SENTIMENT_COLUMNS = [
         "date",
         "avg_sentiment",
@@ -91,18 +94,14 @@ class FeatureEngineer:
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices.")
 
-        ####################################################
-        # SPLIT REPAIR
-        ####################################################
-
-        returns = df["close"].pct_change().abs()
+        returns = df.groupby("ticker")["close"].pct_change().abs()
 
         extreme = returns > cls.SPLIT_THRESHOLD
 
         if extreme.any():
             logger.warning("Split detected — repairing price path.")
             df.loc[extreme, "close"] = np.nan
-            df["close"] = df["close"].ffill()
+            df["close"] = df.groupby("ticker")["close"].ffill()
 
         return df.reset_index(drop=True)
 
@@ -113,12 +112,12 @@ class FeatureEngineer:
     @staticmethod
     def add_returns(df):
 
-        returns = df["close"].pct_change()
+        returns = df.groupby("ticker")["close"].pct_change()
 
         lo, hi = FeatureEngineer.RETURN_CLAMP
 
         df["return"] = returns.clip(lo, hi)
-        df["return_lag1"] = df["return"].shift(1)
+        df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
 
     ########################################################
 
@@ -126,15 +125,16 @@ class FeatureEngineer:
     def add_volatility(df, window=5):
 
         vol = (
-            df["return"]
+            df.groupby("ticker")["return"]
             .rolling(window, min_periods=window)
             .std(ddof=0)
+            .reset_index(level=0, drop=True)
         )
 
         df["volatility"] = (
-            vol.shift(1)
+            vol.groupby(df["ticker"])
+            .shift(1)
             .clip(lower=FeatureEngineer.VOL_FLOOR)
-            .fillna(FeatureEngineer.VOL_FLOOR)
         )
 
     ########################################################
@@ -142,25 +142,50 @@ class FeatureEngineer:
     @staticmethod
     def add_rsi(df, window=14):
 
-        df["rsi"] = TechnicalIndicators.rsi(
-            df[["date", "close"]],
-            window=window
-        ).clip(0, 100)
+        df["rsi"] = (
+            df.groupby("ticker", group_keys=False)
+            .apply(lambda x: TechnicalIndicators.rsi(
+                x[["date", "close"]],
+                window=window
+            ))
+            .clip(0, 100)
+        )
 
     ########################################################
 
     @staticmethod
     def add_macd(df):
 
-        macd, signal = TechnicalIndicators.macd(
-            df[["date", "close"]]
-        )
+        def _macd_block(x):
+            macd, signal = TechnicalIndicators.macd(
+                x[["date", "close"]]
+            )
+            x["macd"] = macd.clip(-25, 25)
+            x["macd_signal"] = signal.clip(-25, 25)
+            return x
 
-        df["macd"] = macd.clip(-25, 25)
-        df["macd_signal"] = signal.clip(-25, 25)
+        df = df.groupby("ticker", group_keys=False).apply(_macd_block)
+
+        return df
 
     ########################################################
-    # ⭐ INSTITUTIONAL FIX — NO CONSTANT SENTIMENT
+    # WARMUP TRIM (CRITICAL)
+    ########################################################
+
+    @classmethod
+    def _trim_warmup(cls, df):
+
+        def trim(group):
+            return group.iloc[cls.MAX_INDICATOR_WINDOW:]
+
+        return (
+            df.groupby("ticker", group_keys=False)
+            .apply(trim)
+            .reset_index(drop=True)
+        )
+
+    ########################################################
+    # SENTIMENT
     ########################################################
 
     @classmethod
@@ -168,25 +193,21 @@ class FeatureEngineer:
 
         rows = len(price_df)
 
-        rng = np.random.default_rng(42)  
-        # fixed seed = reproducible training
+        rng = np.random.default_rng(42)
 
         neutral = price_df[["date"]].copy()
 
-        # small mean-zero noise
         neutral["avg_sentiment"] = rng.normal(
             0.0,
             0.02,
             rows
         ).astype("float32")
 
-        # simulate sparse news arrival
         neutral["news_count"] = rng.poisson(
             0.3,
             rows
         ).astype("float32")
 
-        # ⭐ FIX — NO CONSTANT STD
         neutral["sentiment_std"] = np.abs(
             rng.normal(
                 cls.SENTIMENT_STD_FLOOR,
@@ -200,7 +221,6 @@ class FeatureEngineer:
         )
 
         return neutral
-
 
     ########################################################
 
@@ -239,7 +259,7 @@ class FeatureEngineer:
         }, inplace=True)
 
         merged["sentiment_lag1"] = (
-            merged["avg_sentiment"]
+            merged.groupby("ticker")["avg_sentiment"]
             .shift(1)
             .fillna(0)
         )
@@ -247,7 +267,7 @@ class FeatureEngineer:
         return merged
 
     ########################################################
-    # TARGET
+    # TARGET (FIXED)
     ########################################################
 
     @classmethod
@@ -255,16 +275,21 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"]).copy()
 
+        # ⭐ group-safe forward return
         log_close = np.log(df["close"])
 
-        forward = log_close.shift(-1) - log_close
+        forward = (
+            log_close.groupby(df["ticker"])
+            .shift(-1) - log_close
+        )
 
-        df = df.iloc[:-1].copy()
-        forward = forward.iloc[:-1]
+        df["forward_return"] = forward
+
+        df = df.dropna(subset=["forward_return"])
 
         safe_vol = df["volatility"].clip(lower=cls.VOL_FLOOR)
 
-        risk_adj = (forward / safe_vol).clip(-5, 5)
+        risk_adj = (df["forward_return"] / safe_vol).clip(-5, 5)
 
         upper = risk_adj.quantile(0.66)
         lower = risk_adj.quantile(0.34)
@@ -319,13 +344,17 @@ class FeatureEngineer:
         cls.add_returns(df)
         cls.add_volatility(df)
         cls.add_rsi(df)
-        cls.add_macd(df)
+
+        df = cls.add_macd(df)
 
         df = cls.merge_price_sentiment(
             df,
             sentiment_df,
             ticker
         )
+
+        # ⭐ CRITICAL
+        df = cls._trim_warmup(df)
 
         df = cls.create_training_dataset(df)
 
