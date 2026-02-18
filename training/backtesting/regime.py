@@ -24,11 +24,9 @@ class RegimeConfig:
     EPSILON: float = 1e-8
     MAX_DAILY_RETURN: float = 0.60
 
-    # 🔥 LOWERED for small universes
     MIN_SURVIVAL_RATIO: float = 0.35
     MAX_CRISIS_RATIO: float = 0.65
 
-    # hysteresis
     HYSTERESIS_BUFFER: float = 0.003
 
 
@@ -49,23 +47,28 @@ class MarketRegimeDetector:
             )
 
     ########################################################
-    # SAFE FALLBACK (VERY IMPORTANT)
+    # SAFE FALLBACK — DO NOT DESTROY STRUCTURE
     ########################################################
 
-    def _fallback_regime(self, df: pd.DataFrame):
+    def _neutral_regime(self, df: pd.DataFrame):
 
         logger.warning(
-            "Regime detector fallback activated — assigning SIDEWAYS."
+            "Regime detector degraded — assigning neutral SIDEWAYS without overwriting dataset."
         )
 
         df = df.copy()
 
+        if "regime" not in df.columns:
+            df["regime"] = "SIDEWAYS"
+
+        df["regime"] = df["regime"].fillna("SIDEWAYS")
+
         df["regime"] = pd.Categorical(
-            ["SIDEWAYS"] * len(df),
+            df["regime"],
             categories=self.VALID_REGIMES
         )
 
-        df["market_regime"] = "SIDEWAYS"
+        df["market_regime"] = df["regime"]
 
         return df
 
@@ -124,7 +127,7 @@ class MarketRegimeDetector:
         return confirmed
 
     ########################################################
-    # SINGLE ASSET
+    # SINGLE ASSET — NEVER DROP TICKER
     ########################################################
 
     def _detect_single_asset(self, df: pd.DataFrame):
@@ -193,24 +196,20 @@ class MarketRegimeDetector:
                 categories=self.VALID_REGIMES
             )
 
-            warmup = max(
-                cfg.trend_window,
-                cfg.volatility_window
-            ) + cfg.persistence_days + 5
+            # ⭐ DO NOT DROP WARMUP
+            df["regime"] = df["regime"].fillna("SIDEWAYS")
 
-            if len(df) <= warmup:
-                return None
-
-            return df.iloc[warmup:].copy()
+            return df
 
         except Exception as e:
 
             logger.warning(
-                "Regime detection rejected ticker — %s",
+                "Regime detection degraded for ticker — %s",
                 str(e)
             )
 
-            return None
+            df["regime"] = "SIDEWAYS"
+            return df
 
     ########################################################
     # MULTI ASSET
@@ -218,30 +217,14 @@ class MarketRegimeDetector:
 
     def detect(self, df: pd.DataFrame):
 
-        tickers_total = df["ticker"].nunique()
-
         grouped = []
 
-        for ticker, slice_df in df.sort_values(
+        for _, slice_df in df.sort_values(
             ["ticker", "date"]
         ).groupby("ticker", sort=False):
 
             detected = self._detect_single_asset(slice_df)
-
-            if detected is not None and not detected.empty:
-                grouped.append(detected)
-
-        survivors = len(grouped)
-
-        ###################################################
-        # 🔥 INSTITUTIONAL FIX — NEVER CRASH TRAINING
-        ###################################################
-
-        if survivors < 3:
-            return self._fallback_regime(df)
-
-        if survivors / tickers_total < self.config.MIN_SURVIVAL_RATIO:
-            return self._fallback_regime(df)
+            grouped.append(detected)
 
         result = (
             pd.concat(grouped)
@@ -252,6 +235,6 @@ class MarketRegimeDetector:
         counts = result.groupby("date")["ticker"].nunique()
 
         if counts.min() < 2:
-            return self._fallback_regime(df)
+            return self._neutral_regime(result)
 
         return result
