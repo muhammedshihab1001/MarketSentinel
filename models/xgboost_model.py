@@ -1,6 +1,8 @@
 from xgboost import XGBClassifier
+import xgboost as xgb
 import numpy as np
 import logging
+import threading
 
 from core.schema.feature_schema import FEATURE_COUNT
 
@@ -8,6 +10,55 @@ from core.schema.feature_schema import FEATURE_COUNT
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
+
+
+###################################################
+# GPU DETECTION (SAFE ONCE)
+###################################################
+
+_GPU_AVAILABLE = None
+_GPU_LOCK = threading.Lock()
+
+
+def _gpu_available():
+
+    global _GPU_AVAILABLE
+
+    if _GPU_AVAILABLE is not None:
+        return _GPU_AVAILABLE
+
+    with _GPU_LOCK:
+
+        if _GPU_AVAILABLE is not None:
+            return _GPU_AVAILABLE
+
+        try:
+            dtrain = xgb.DMatrix(
+                np.random.rand(50, 4),
+                label=np.random.randint(0, 2, 50)
+            )
+
+            params = {
+                "tree_method": "hist",
+                "device": "cuda",
+                "max_depth": 1,
+                "verbosity": 0
+            }
+
+            xgb.train(params, dtrain, num_boost_round=1)
+
+            _GPU_AVAILABLE = True
+            logger.info("GPU detected.")
+
+        except Exception:
+            _GPU_AVAILABLE = False
+            logger.info("GPU not available - using CPU.")
+
+        return _GPU_AVAILABLE
+
+
+def _device():
+    return "cuda" if _gpu_available() else "cpu"
 
 
 ###################################################
@@ -28,7 +79,6 @@ def compute_class_weight(y):
         raise RuntimeError("Label collapse detected.")
 
     weight = neg / pos
-
     weight = float(np.clip(weight, 1.0, 30.0))
 
     logger.info("Computed class weight = %.3f", weight)
@@ -37,7 +87,7 @@ def compute_class_weight(y):
 
 
 ###################################################
-# FEATURE SAFETY
+# FEATURE VALIDATION
 ###################################################
 
 def _validate_features(X):
@@ -52,7 +102,7 @@ def _validate_features(X):
 
 
 ###################################################
-# SAFE CLASSIFIER
+# SAFE CLASSIFIER (EARLY STOPPING SAFE)
 ###################################################
 
 class SafeXGBClassifier(XGBClassifier):
@@ -68,41 +118,43 @@ class SafeXGBClassifier(XGBClassifier):
             X.shape[1]
         )
 
-        # Remove unsupported kwargs (XGBoost 2.x safety)
-        kwargs.pop("early_stopping_rounds", None)
-        kwargs.pop("eval_set", None)
-
         return super().fit(X, y, **kwargs)
 
 
 ###################################################
-# PARAM BUILDER (STRICT CPU SAFE)
+# PARAM BUILDER
 ###################################################
 
 def _base_params(pos_weight):
 
+    device = _device()
+
     params = dict(
 
         # CORE
-        n_estimators=600,
-        max_depth=5,
+        n_estimators=900,
+        max_depth=6,
         learning_rate=0.03,
 
-        # REGULARIZATION
+        # STRUCTURE
         subsample=0.85,
         colsample_bytree=0.85,
-        min_child_weight=3,
-        gamma=0.15,
-        reg_alpha=0.7,
-        reg_lambda=1.2,
+        min_child_weight=4,
+        gamma=0.20,
+
+        # REGULARIZATION
+        reg_alpha=1.0,
+        reg_lambda=1.5,
 
         # SAFETY
         eval_metric="logloss",
         random_state=SEED,
         n_jobs=-1,
+        max_bin=256,
 
-        # FORCE CPU SAFE
+        # TREE
         tree_method="hist",
+        device=device,
 
         # IMBALANCE
         scale_pos_weight=pos_weight,
@@ -111,15 +163,17 @@ def _base_params(pos_weight):
     )
 
     logger.info(
-        "XGBoost params | CPU hist | lr=%.3f",
-        params["learning_rate"]
+        "XGBoost params | %s hist | lr=%.3f depth=%s",
+        device.upper(),
+        params["learning_rate"],
+        params["max_depth"]
     )
 
     return params
 
 
 ###################################################
-# BUILD MODELS
+# BUILD TRAIN MODEL
 ###################################################
 
 def build_xgboost_model(y):
@@ -130,17 +184,22 @@ def build_xgboost_model(y):
     return SafeXGBClassifier(**params)
 
 
+###################################################
+# BUILD FINAL PRODUCTION MODEL
+###################################################
+
 def build_final_xgboost_model(y):
 
     pos_weight = compute_class_weight(y)
     params = _base_params(pos_weight)
 
     params.update({
-        "n_estimators": 800,
-        "learning_rate": 0.025,
-        "gamma": 0.20,
-        "reg_alpha": 0.9,
-        "reg_lambda": 1.4,
+        "n_estimators": 1100,
+        "learning_rate": 0.02,
+        "gamma": 0.25,
+        "reg_alpha": 1.2,
+        "reg_lambda": 1.8,
+        "max_depth": 7,
     })
 
     logger.info("Building final production model.")
