@@ -24,8 +24,6 @@ class FeatureEngineer:
     MERGE_TOLERANCE = pd.Timedelta("3D")
 
     MIN_CLASS_RATIO = 0.15
-
-    # ⭐ institutional warmup
     MAX_INDICATOR_WINDOW = 20
 
     SENTIMENT_COLUMNS = [
@@ -124,32 +122,46 @@ class FeatureEngineer:
     @staticmethod
     def add_volatility(df, window=5):
 
-        vol = (
+        df["volatility"] = (
             df.groupby("ticker")["return"]
             .rolling(window, min_periods=window)
             .std(ddof=0)
-            .reset_index(level=0, drop=True)
-        )
-
-        df["volatility"] = (
-            vol.groupby(df["ticker"])
             .shift(1)
+            .reset_index(level=0, drop=True)
             .clip(lower=FeatureEngineer.VOL_FLOOR)
         )
 
+    ########################################################
+    # 🔥 FIXED RSI (Institutional Safe)
     ########################################################
 
     @staticmethod
     def add_rsi(df, window=14):
 
-        df["rsi"] = (
-            df.groupby("ticker", group_keys=False)
-            .apply(lambda x: TechnicalIndicators.rsi(
-                x[["date", "close"]],
+        def _compute_rsi(group):
+
+            rsi_out = TechnicalIndicators.rsi(
+                group[["date", "close"]],
                 window=window
-            ))
-            .clip(0, 100)
-        )
+            )
+
+            if isinstance(rsi_out, pd.DataFrame):
+                if "rsi" in rsi_out.columns:
+                    rsi_series = rsi_out["rsi"]
+                else:
+                    rsi_series = rsi_out.iloc[:, 0]
+            else:
+                rsi_series = rsi_out
+
+            group["rsi"] = rsi_series.values
+
+            return group
+
+        df = df.groupby("ticker", group_keys=False).apply(_compute_rsi)
+
+        df["rsi"] = df["rsi"].clip(0, 100)
+
+        return df
 
     ########################################################
 
@@ -164,23 +176,18 @@ class FeatureEngineer:
             x["macd_signal"] = signal.clip(-25, 25)
             return x
 
-        df = df.groupby("ticker", group_keys=False).apply(_macd_block)
-
-        return df
+        return df.groupby("ticker", group_keys=False).apply(_macd_block)
 
     ########################################################
-    # WARMUP TRIM (CRITICAL)
+    # WARMUP TRIM
     ########################################################
 
     @classmethod
     def _trim_warmup(cls, df):
 
-        def trim(group):
-            return group.iloc[cls.MAX_INDICATOR_WINDOW:]
-
         return (
             df.groupby("ticker", group_keys=False)
-            .apply(trim)
+            .apply(lambda g: g.iloc[cls.MAX_INDICATOR_WINDOW:])
             .reset_index(drop=True)
         )
 
@@ -267,7 +274,7 @@ class FeatureEngineer:
         return merged
 
     ########################################################
-    # TARGET (FIXED)
+    # TARGET
     ########################################################
 
     @classmethod
@@ -275,15 +282,12 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"]).copy()
 
-        # ⭐ group-safe forward return
-        log_close = np.log(df["close"])
-
-        forward = (
-            log_close.groupby(df["ticker"])
-            .shift(-1) - log_close
+        df["forward_return"] = (
+            np.log(df["close"])
+            .groupby(df["ticker"])
+            .diff()
+            .shift(-1)
         )
-
-        df["forward_return"] = forward
 
         df = df.dropna(subset=["forward_return"])
 
@@ -299,20 +303,10 @@ class FeatureEngineer:
             np.where(risk_adj <= lower, 0, np.nan)
         )
 
-        required = ["target", *MODEL_FEATURES]
-
-        df = df.dropna(subset=required)
+        df = df.dropna(subset=["target", *MODEL_FEATURES])
 
         if len(df) < cls.MIN_ROWS_REQUIRED:
             raise RuntimeError("Feature collapse — dataset too small.")
-
-        class_ratio = df["target"].mean()
-
-        if not (cls.MIN_CLASS_RATIO < class_ratio < 1 - cls.MIN_CLASS_RATIO):
-            logger.warning(
-                "Class imbalance detected — continuing (%.2f)",
-                class_ratio
-            )
 
         df["target"] = df["target"].astype("int8")
 
@@ -343,8 +337,8 @@ class FeatureEngineer:
 
         cls.add_returns(df)
         cls.add_volatility(df)
-        cls.add_rsi(df)
 
+        df = cls.add_rsi(df)
         df = cls.add_macd(df)
 
         df = cls.merge_price_sentiment(
@@ -353,7 +347,6 @@ class FeatureEngineer:
             ticker
         )
 
-        # ⭐ CRITICAL
         df = cls._trim_warmup(df)
 
         df = cls.create_training_dataset(df)
