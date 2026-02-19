@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 import math
 import os
 import time
@@ -48,6 +48,8 @@ class SignalConfig:
     flip_cooldown_seconds: int
     global_kill_switch: bool
 
+    enable_risk_engine: bool
+
     @staticmethod
     def load():
 
@@ -66,6 +68,11 @@ class SignalConfig:
 
             global_kill_switch=_env_bool(
                 "GLOBAL_TRADING_DISABLED",
+                False
+            ),
+
+            enable_risk_engine=_env_bool(
+                "ENABLE_RISK_ENGINE",
                 False
             )
         )
@@ -101,12 +108,12 @@ def _clamp(v, lo, hi):
 
 
 ###################################################
-# DECISION ENGINE (ALIGNED WITH CURRENT PIPELINE)
+# DECISION ENGINE
 ###################################################
 
 class DecisionEngine:
 
-    def __init__(self, config: SignalConfig | None = None):
+    def __init__(self, config: Optional[SignalConfig] = None):
 
         self.config = config or SignalConfig.load()
 
@@ -147,7 +154,8 @@ class DecisionEngine:
             "allocation": 0.0,
             "position_pct": 0.0,
             "expected_value": 0.0,
-            "risk_score": 0.0
+            "risk_score": 0.0,
+            "regime": None
         }
 
     ###################################################
@@ -158,8 +166,8 @@ class DecisionEngine:
         predicted_return: float,
         prob_up: float,
         volatility: float,
-        regime: str | None = None,
-        **kwargs
+        regime: Optional[str] = None,
+        price_df=None  # optional future hybrid support
     ) -> Dict:
 
         with self._lock:
@@ -167,6 +175,7 @@ class DecisionEngine:
             if self.config.global_kill_switch:
                 return self._hold(0.0)
 
+            prob_up = _safe(prob_up, 0.5)
             volatility = max(_safe(volatility, 0.02), 1e-6)
 
             ###################################################
@@ -177,7 +186,7 @@ class DecisionEngine:
                 return self._hold(0.2)
 
             ###################################################
-            # PROBABILITY THRESHOLD
+            # PROBABILITY DECISION
             ###################################################
 
             if prob_up > self.config.prob_threshold:
@@ -194,6 +203,21 @@ class DecisionEngine:
 
             if not self._flip_guard(ticker, signal):
                 return self._hold(confidence)
+
+            ###################################################
+            # OPTIONAL RISK ENGINE
+            ###################################################
+
+            risk_score = 0.0
+
+            if self.config.enable_risk_engine and price_df is not None:
+
+                risk = RiskEngine.analyze(price_df, signal)
+
+                if risk["capital_multiplier"] == 0:
+                    return self._hold(confidence)
+
+                risk_score = risk["risk_score"]
 
             ###################################################
             # POSITION SIZING
@@ -224,6 +248,6 @@ class DecisionEngine:
                 "allocation": round(allocation, 2),
                 "position_pct": round(position_pct, 4),
                 "expected_value": round(predicted_return, 5),
-                "risk_score": 0.0,
+                "risk_score": round(risk_score, 4),
                 "regime": regime
             }
