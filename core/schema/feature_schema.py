@@ -14,26 +14,42 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "18.0"   # bumped — sentiment fully removed
+SCHEMA_VERSION = "19.0"   # upgraded — alpha expansion
 
 
 ############################################################
-# FEATURES (TIER-1 PRICE ONLY — INSTITUTIONAL)
+# FEATURES (TIER-1 INSTITUTIONAL PRICE STACK)
 ############################################################
 
 MODEL_FEATURES: Tuple[str, ...] = (
+
+    # Core return
     "return",
+    "return_lag1",
+    "return_lag5",
+    "return_lag10",
+
+    # Volatility
     "volatility",
+    "volatility_5",
+    "volatility_20",
+
+    # Momentum / Oscillator
     "rsi",
     "macd",
     "macd_signal",
-    "return_lag1",
+
+    # Trend strength
+    "ema_10",
+    "ema_50",
+    "ema_ratio",
+
 )
 
 FEATURE_COUNT = len(MODEL_FEATURES)
 
 DTYPE = np.float32
-MIN_ROWS = 120
+MIN_ROWS = 200
 
 
 ############################################################
@@ -55,13 +71,21 @@ FEATURE_LIMITS: Dict[str, tuple] = {
 
     "return": (-3.0, 3.0),
     "return_lag1": (-3.0, 3.0),
+    "return_lag5": (-3.0, 3.0),
+    "return_lag10": (-3.0, 3.0),
 
     "volatility": (0.0, 10.0),
+    "volatility_5": (0.0, 10.0),
+    "volatility_20": (0.0, 10.0),
 
     "rsi": (0.0, 100.0),
 
     "macd": (-500.0, 500.0),
     "macd_signal": (-500.0, 500.0),
+
+    "ema_10": (0.0, 1e5),
+    "ema_50": (0.0, 1e5),
+    "ema_ratio": (-5.0, 5.0),
 }
 
 
