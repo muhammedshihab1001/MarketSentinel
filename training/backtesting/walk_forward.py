@@ -11,8 +11,8 @@ logger = logging.getLogger("marketsentinel.walkforward")
 
 class WalkForwardValidator:
     """
-    Institutional Walk Forward Validator v4
-    Adaptive conviction + ranking + regime throttle.
+    Institutional Walk Forward Validator v5
+    Adaptive conviction + balanced ranking + regime throttle.
     """
 
     MIN_TRADES_PER_WINDOW = 5
@@ -22,10 +22,8 @@ class WalkForwardValidator:
     MIN_ASSETS_PER_DAY = 3
     MIN_FEATURE_VARIANCE = 1e-8
 
-    # 🔥 Adaptive conviction instead of fixed 0.60
     TOP_K_PERCENT = 0.30
     MAX_TRADES_PER_DAY = 12
-    MIN_EDGE_SPREAD = 0.02  # require minimal prob separation
 
     CRISIS_EXPOSURE_SCALE = 0.35
     DRIFT_WARN_Z = 10.0
@@ -93,7 +91,7 @@ class WalkForwardValidator:
             logger.warning("Feature drift detected | max_z=%.2f", max_z)
 
     ########################################################
-    # 🔥 ADAPTIVE CONVICTION FILTER
+    # 🔥 INSTITUTIONAL CONVICTION FILTER (BALANCED)
     ########################################################
 
     def _filter_conviction(self, tickers, probs, signals):
@@ -107,15 +105,35 @@ class WalkForwardValidator:
         if df.empty:
             return {}
 
-        # Remove flat predictions
-        spread = df["prob"].max() - df["prob"].min()
+        ###################################################
+        # Conviction strength
+        ###################################################
 
-        if spread < self.MIN_EDGE_SPREAD:
-            logger.info("Probability spread too small — skipping day.")
+        df["edge"] = np.abs(df["prob"] - 0.5)
+
+        edge_std = float(df["edge"].std())
+        dynamic_min_edge = max(0.005, edge_std * 0.5)
+
+        df = df[df["edge"] >= dynamic_min_edge]
+
+        if df.empty:
+            logger.info("Conviction too weak — skipping day.")
             return {}
 
-        # Rank strongest probabilities
-        df = df.sort_values("prob", ascending=False)
+        ###################################################
+        # Soft dispersion check
+        ###################################################
+
+        spread = df["prob"].max() - df["prob"].min()
+
+        if spread < 0.01:
+            logger.info("Low probability dispersion — reducing exposure.")
+
+        ###################################################
+        # Rank by conviction strength
+        ###################################################
+
+        df = df.sort_values("edge", ascending=False)
 
         k = max(self.MIN_ASSETS_PER_DAY, int(len(df) * self.TOP_K_PERCENT))
         k = min(k, self.MAX_TRADES_PER_DAY)
