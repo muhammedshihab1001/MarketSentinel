@@ -17,15 +17,11 @@ from core.portfolio.risk_engine import RiskEngine
 def _env_float(key: str, default: float) -> float:
     try:
         v = float(os.getenv(key, str(default)))
-
         if not math.isfinite(v):
             return default
-
         if abs(v) > 1e6:
             return default
-
         return v
-
     except Exception:
         return default
 
@@ -53,23 +49,20 @@ class SignalConfig:
     flip_cooldown_seconds: int
     global_kill_switch: bool
 
-    ###################################################
-
     @staticmethod
     def load():
 
         cfg = SignalConfig(
-            prob_threshold=_env_float("PROB_THRESHOLD", 0.60),
-            min_confidence=_env_float("MIN_CONFIDENCE", 0.40),
-
-            crisis_volatility=_env_float("CRISIS_VOL", 0.12),
+            prob_threshold=_env_float("PROB_THRESHOLD", 0.55),  # relaxed
+            min_confidence=_env_float("MIN_CONFIDENCE", 0.30),  # relaxed
+            crisis_volatility=_env_float("CRISIS_VOL", 0.18),   # less strict
 
             portfolio_value=_env_float("PORTFOLIO_VALUE", 100000),
-            max_position_pct=_env_float("MAX_POSITION_PCT", 0.06),
-            min_position_pct=_env_float("MIN_POSITION_PCT", 0.01),
+            max_position_pct=_env_float("MAX_POSITION_PCT", 0.07),
+            min_position_pct=_env_float("MIN_POSITION_PCT", 0.005),
 
             flip_cooldown_seconds=int(
-                _env_float("FLIP_COOLDOWN_SECONDS", 300)
+                _env_float("FLIP_COOLDOWN_SECONDS", 60)  # shorter cooldown
             ),
 
             global_kill_switch=_env_bool(
@@ -84,7 +77,7 @@ class SignalConfig:
         if cfg.portfolio_value <= 0:
             raise RuntimeError("Invalid portfolio_value")
 
-        if cfg.max_position_pct > 0.20:
+        if cfg.max_position_pct > 0.25:
             raise RuntimeError("Position cap too large.")
 
         return cfg
@@ -95,18 +88,14 @@ class SignalConfig:
 ###################################################
 
 def _safe(v, fallback=0.0):
-
     if v is None:
         return fallback
-
     try:
         v = float(v)
     except Exception:
         return fallback
-
     if not math.isfinite(v):
         return fallback
-
     return v
 
 
@@ -141,6 +130,7 @@ class DecisionEngine:
         last_signal = self._last_signal.get(ticker, "HOLD")
         last_flip = self._last_flip_time.get(ticker, 0)
 
+        # Only block extreme flip spam
         if (
             new_signal != last_signal
             and now - last_flip
@@ -156,7 +146,6 @@ class DecisionEngine:
     ###################################################
 
     def _hold(self, confidence: float) -> Dict:
-
         return {
             "signal": "HOLD",
             "confidence": round(confidence, 3),
@@ -187,8 +176,9 @@ class DecisionEngine:
 
             volatility = max(_safe(volatility, 0.02), 1e-6)
 
-            if volatility > self.config.crisis_volatility:
-                return self._hold(0.15)
+            # Only block extreme volatility
+            if volatility > self.config.crisis_volatility * 1.5:
+                return self._hold(0.2)
 
             ###################################################
             # EXPECTED VALUE
@@ -201,20 +191,25 @@ class DecisionEngine:
                 forecast_down
             )
 
-            # Prevent nonsense edges
-            if abs(ev) > 0.25:
-                return self._hold(0.2)
+            # Remove extreme EV clamp (was killing trades)
+            if not math.isfinite(ev):
+                return self._hold(0.1)
 
-            if not self.ev_engine.worthy_trade(ev):
-                return self._hold(0.25)
+            ###################################################
+            # PROBABILITY FILTER (NEW)
+            ###################################################
+
+            if abs(prob_up - 0.5) < 0.03:
+                return self._hold(0.2)
 
             ###################################################
             # SIGNAL
             ###################################################
 
-            signal = "BUY" if ev > 0 else "SELL"
+            signal = "BUY" if prob_up > 0.5 else "SELL"
 
-            confidence = _clamp(abs(ev) * 7, 0.2, 0.95)
+            # Better confidence scaling
+            confidence = _clamp(abs(prob_up - 0.5) * 3.5, 0.25, 0.95)
 
             if confidence < self.config.min_confidence:
                 return self._hold(confidence)
@@ -223,7 +218,7 @@ class DecisionEngine:
                 return self._hold(confidence)
 
             ###################################################
-            # 🔥 RISK ENGINE (MOST IMPORTANT STEP)
+            # RISK ENGINE
             ###################################################
 
             risk = RiskEngine.analyze(price_df, signal)
@@ -235,7 +230,7 @@ class DecisionEngine:
             # POSITION SIZING
             ###################################################
 
-            edge_boost = min(abs(ev) * 5, 2.0)
+            edge_boost = min(abs(prob_up - 0.5) * 6, 2.0)
 
             allocation = self.position_sizer.size_position(
                 signal=signal,
