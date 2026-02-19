@@ -66,7 +66,6 @@ def save_model_atomic(model, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     tmp_path = f"{path}.tmp"
-
     joblib.dump(model, tmp_path)
     os.replace(tmp_path, path)
 
@@ -102,7 +101,7 @@ def cross_sectional_normalize(df):
 
 
 ############################################################
-# DATA LOADER
+# DATA LOADER (FIXED VERSION)
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -131,6 +130,9 @@ def load_training_data(start_date, end_date):
                 training=True
             )
 
+            # ✅ VALIDATE RAW FEATURES BEFORE NORMALIZATION
+            validate_feature_schema(dataset.loc[:, MODEL_FEATURES])
+
             datasets.append(dataset)
 
         except Exception as e:
@@ -144,9 +146,12 @@ def load_training_data(start_date, end_date):
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError("Dataset too small.")
 
+    logger.info("Raw dataset rows=%s", len(df))
+
+    # ✅ Apply normalization AFTER validation
     df = cross_sectional_normalize(df)
 
-    validate_feature_schema(df.loc[:, MODEL_FEATURES])
+    logger.info("Final normalized dataset rows=%s", len(df))
 
     hash_df = df[
         ["ticker", "date", "target", *MODEL_FEATURES]
@@ -159,8 +164,6 @@ def load_training_data(start_date, end_date):
         start_date,
         end_date
     ])
-
-    logger.info("Final dataset rows=%s", len(df))
 
     return df, dataset_hash
 
@@ -258,7 +261,7 @@ def main(start_date=None, end_date=None):
     )
 
     ########################################################
-    # FINAL MODEL (NO METRIC LISTS IN METADATA)
+    # FINAL MODEL
     ########################################################
 
     final_model = build_final_xgboost_model(df["target"])
@@ -266,7 +269,6 @@ def main(start_date=None, end_date=None):
 
     size = save_model_atomic(final_model, TEMP_MODEL_PATH)
 
-    # Remove non-numeric entries
     clean_metrics = {
         k: float(v)
         for k, v in metrics.items()
