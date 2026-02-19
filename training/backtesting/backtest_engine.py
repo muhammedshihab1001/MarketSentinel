@@ -12,16 +12,16 @@ class BacktestEngine:
     MIN_HOLD_BARS = 2
     REENTRY_COOLDOWN = 1
 
-    MAX_POSITION_SIZE = 0.30      # 🔥 institutional cap
-    MAX_SINGLE_BAR_RETURN = 0.40  # gap / bug protection
-    MAX_GAP = 0.35               # overnight crash guard
-    MAX_TURNOVER = 8.0          # institutional sanity
+    MAX_POSITION_SIZE = 0.30
+    MAX_SINGLE_BAR_RETURN = 0.40
+    MAX_GAP = 0.35
+    MAX_TURNOVER = 8.0
 
     ############################################################
 
     def _validate_inputs(self, prices, signals, position_size):
 
-        if position_size <= 0 or position_size > self.MAX_POSITION_SIZE:
+        if not (0 < position_size <= self.MAX_POSITION_SIZE):
             raise RuntimeError(
                 f"position_size must be within (0, {self.MAX_POSITION_SIZE}]"
             )
@@ -45,17 +45,12 @@ class BacktestEngine:
             raise RuntimeError(f"Unknown signals detected: {unknown}")
 
     ############################################################
-    # GAP GUARD
-    ############################################################
 
-    def _check_gap(self, prev_price, price):
+    def _gap_ok(self, prev_price, price):
 
         gap = abs(price / prev_price - 1)
 
-        if gap > self.MAX_GAP:
-            raise RuntimeError(
-                f"Untradeable gap detected: {gap:.2%}"
-            )
+        return gap <= self.MAX_GAP
 
     ############################################################
 
@@ -66,7 +61,7 @@ class BacktestEngine:
         initial_cash=10_000,
         transaction_cost=0.001,
         slippage=0.0005,
-        position_size=0.25   # safer default
+        position_size=0.25
     ):
 
         self._validate_inputs(prices, signals, position_size)
@@ -92,18 +87,19 @@ class BacktestEngine:
         peak_equity = initial_cash
 
         prev_price = prices[0]
-
-        ####################################################
-        # EXECUTION LAG — institutional realism
-        ####################################################
-
         prev_signal = "HOLD"
+
+        ####################################################
+        # MAIN LOOP
+        ####################################################
 
         for i in range(1, len(prices)):
 
             price = prices[i]
 
-            self._check_gap(prev_price, price)
+            if not self._gap_ok(prev_price, price):
+                # Skip trading on extreme gap
+                prev_signal = "HOLD"
 
             ####################################################
             # EXECUTE PREVIOUS SIGNAL (t → t+1)
@@ -115,6 +111,7 @@ class BacktestEngine:
             if cooldown > 0:
                 cooldown -= 1
 
+            # BUY
             if (
                 prev_signal == "BUY"
                 and cash > self.MIN_CAPITAL
@@ -137,6 +134,7 @@ class BacktestEngine:
                 trade_count += 1
                 hold_bars = 0
 
+            # SELL
             elif (
                 prev_signal == "SELL"
                 and position > 0
@@ -160,7 +158,7 @@ class BacktestEngine:
                 cooldown = self.REENTRY_COOLDOWN
 
             ####################################################
-            # EQUITY
+            # MARK TO MARKET
             ####################################################
 
             portfolio_value = cash + position * price
@@ -171,9 +169,7 @@ class BacktestEngine:
 
             peak_equity = max(peak_equity, portfolio_value)
 
-            drawdown = (
-                portfolio_value - peak_equity
-            ) / peak_equity
+            drawdown = (portfolio_value - peak_equity) / peak_equity
 
             if drawdown < self.MAX_DRAWDOWN_KILL:
                 portfolio_values.append(portfolio_value)
@@ -203,20 +199,26 @@ class BacktestEngine:
             prev_price = price
 
         ####################################################
-        # FORCE LIQUIDATION
+        # FORCE LIQUIDATION SAFELY
         ####################################################
 
-        if position > 0:
+        if position > 0 and portfolio_values:
 
-            final_price = prices[len(portfolio_values)] * (1 - slippage)
+            final_price = prices[min(len(prices) - 1, len(portfolio_values))]
 
-            cash += position * final_price * (1 - transaction_cost)
+            liquidation_price = final_price * (1 - slippage)
+
+            cash += position * liquidation_price * (1 - transaction_cost)
+
             position = 0
-
             portfolio_values[-1] = cash
+
             trade_count += 1
 
         ####################################################
+
+        if not portfolio_values:
+            return self._empty_result(initial_cash)
 
         portfolio_values = np.array(portfolio_values, dtype=float)
         portfolio_values = np.maximum(portfolio_values, self.MIN_CAPITAL)
@@ -242,7 +244,9 @@ class BacktestEngine:
         else:
             sharpe = 0.0
 
-        exposure = time_in_market / len(portfolio_values)
+        exposure = (
+            time_in_market / max(len(portfolio_values) - 1, 1)
+        )
 
         turnover = (
             capital_rotated / initial_cash
