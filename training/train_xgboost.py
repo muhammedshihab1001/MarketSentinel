@@ -75,7 +75,7 @@ def save_model_atomic(model, path):
 
 
 ############################################################
-# MARKET-NEUTRAL LABELING
+# ENHANCED MARKET-NEUTRAL LABELING
 ############################################################
 
 def apply_cross_sectional_target(df):
@@ -98,11 +98,25 @@ def apply_cross_sectional_target(df):
 
     for date, group in df.groupby("date"):
 
-        if len(group) < 5:
+        if len(group) < 6:
             continue
 
-        upper = group["risk_adj"].quantile(0.80)
-        lower = group["risk_adj"].quantile(0.20)
+        dispersion = group["risk_adj"].std()
+
+        # Skip flat dispersion days
+        if dispersion < 0.15:
+            continue
+
+        # Adaptive quantiles
+        if dispersion > 0.6:
+            upper_q = 0.85
+            lower_q = 0.15
+        else:
+            upper_q = 0.80
+            lower_q = 0.20
+
+        upper = group["risk_adj"].quantile(upper_q)
+        lower = group["risk_adj"].quantile(lower_q)
 
         group = group.copy()
 
@@ -112,6 +126,9 @@ def apply_cross_sectional_target(df):
         )
 
         labeled.append(group)
+
+    if not labeled:
+        raise RuntimeError("No valid cross-sectional labels generated.")
 
     df = pd.concat(labeled, ignore_index=True)
     df = df.dropna(subset=["target"])
@@ -232,10 +249,6 @@ def main(start_date=None, end_date=None):
     df, dataset_hash = load_training_data(start_date, end_date)
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    ########################################################
-    # TRAINER
-    ########################################################
-
     def trainer(d):
 
         d = d.sort_values("date")
@@ -243,7 +256,6 @@ def main(start_date=None, end_date=None):
         X = d.loc[:, MODEL_FEATURES]
         y = d["target"]
 
-        # Proper time-based split (last 15% for validation)
         split_index = int(len(d) * 0.85)
 
         X_train = X.iloc[:split_index]
@@ -252,11 +264,7 @@ def main(start_date=None, end_date=None):
         X_val = X.iloc[split_index:]
         y_val = y.iloc[split_index:]
 
-        logger.info(
-            "Train size=%s | Val size=%s",
-            len(X_train),
-            len(X_val)
-        )
+        logger.info("Train size=%s | Val size=%s", len(X_train), len(X_val))
 
         model = build_xgboost_model(y_train)
 
@@ -267,7 +275,6 @@ def main(start_date=None, end_date=None):
             verbose=False
         )
 
-        # Calibrate AFTER early stopping
         calibrated = CalibratedClassifierCV(
             model,
             method="isotonic",
@@ -277,11 +284,6 @@ def main(start_date=None, end_date=None):
         calibrated.fit(X_val, y_val)
 
         return calibrated
-
-
-    ########################################################
-    # SIGNAL GENERATOR
-    ########################################################
 
     def signal_generator(model, test_df):
 
@@ -307,11 +309,6 @@ def main(start_date=None, end_date=None):
 
         return df_local["signal"].tolist(), probs
 
-
-    ########################################################
-    # WALK FORWARD
-    ########################################################
-
     wf = WalkForwardValidator(
         model_trainer=trainer,
         signal_generator=signal_generator
@@ -324,10 +321,6 @@ def main(start_date=None, end_date=None):
         metrics["avg_sharpe"],
         metrics["avg_strategy_return"]
     )
-
-    ########################################################
-    # FINAL MODEL
-    ########################################################
 
     final_model = build_final_xgboost_model(df["target"])
     final_model.fit(df.loc[:, MODEL_FEATURES], df["target"])
