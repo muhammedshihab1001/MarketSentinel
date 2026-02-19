@@ -5,6 +5,7 @@ import logging
 from core.schema.feature_schema import MODEL_FEATURES
 from training.backtesting.portfolio_engine import PortfolioBacktestEngine
 from training.backtesting.regime import MarketRegimeDetector
+from core.signals.signal_engine import DecisionEngine
 
 logger = logging.getLogger("marketsentinel.walkforward")
 
@@ -18,10 +19,6 @@ class WalkForwardValidator:
     MIN_ASSETS_PER_DAY = 3
     MIN_FEATURE_VARIANCE = 1e-8
 
-    TOP_K_PERCENT = 0.30
-    MAX_TRADES_PER_DAY = 12
-
-    CRISIS_EXPOSURE_SCALE = 0.35
     DRIFT_WARN_Z = 10.0
 
     ########################################################
@@ -29,13 +26,11 @@ class WalkForwardValidator:
     def __init__(
         self,
         model_trainer,
-        signal_generator,
         window_size=252,
         step_size=63,
         embargo_days=14
     ):
         self.model_trainer = model_trainer
-        self.signal_generator = signal_generator
 
         self.window_size = window_size
         self.step_size = step_size
@@ -43,6 +38,7 @@ class WalkForwardValidator:
 
         self.engine = PortfolioBacktestEngine()
         self.regime_detector = MarketRegimeDetector()
+        self.decision_engine = DecisionEngine()
 
     ########################################################
 
@@ -88,63 +84,6 @@ class WalkForwardValidator:
 
     ########################################################
 
-    def _filter_conviction(self, tickers, probs, signals):
-
-        df = pd.DataFrame({
-            "ticker": tickers,
-            "prob": probs,
-            "signal": signals
-        })
-
-        if df.empty:
-            return {}
-
-        df["edge"] = np.abs(df["prob"] - 0.5)
-
-        edge_std = float(df["edge"].std())
-        dynamic_min_edge = max(0.005, edge_std * 0.5)
-
-        df = df[df["edge"] >= dynamic_min_edge]
-
-        if df.empty:
-            return {}
-
-        df = df.sort_values("edge", ascending=False)
-
-        k = max(self.MIN_ASSETS_PER_DAY, int(len(df) * self.TOP_K_PERCENT))
-        k = min(k, self.MAX_TRADES_PER_DAY)
-
-        df = df.head(k)
-
-        return dict(zip(df["ticker"], df["signal"]))
-
-    ########################################################
-
-    def _apply_crisis_scaling(self, filtered, regime_map):
-        """
-        Deterministic exposure reduction during crisis.
-        """
-        crisis_assets = [
-            t for t in filtered
-            if regime_map.get(t) == "CRISIS"
-        ]
-
-        if not crisis_assets:
-            return filtered
-
-        keep_n = max(1, int(len(crisis_assets) * self.CRISIS_EXPOSURE_SCALE))
-
-        crisis_sorted = sorted(crisis_assets)  # deterministic
-
-        keep_set = set(crisis_sorted[:keep_n])
-
-        return {
-            t: s for t, s in filtered.items()
-            if regime_map.get(t) != "CRISIS" or t in keep_set
-        }
-
-    ########################################################
-
     def run(self, df: pd.DataFrame):
 
         logger.info("Walk-forward validation started.")
@@ -158,8 +97,6 @@ class WalkForwardValidator:
         equity_curve = []
 
         initial_capital = 10_000.0
-        rolling_capital = initial_capital
-
         start_idx = self.window_size
         window_id = 1
 
@@ -207,44 +144,52 @@ class WalkForwardValidator:
                 if signal_slice.empty or exec_slice.empty:
                     continue
 
+                features = signal_slice.loc[:, MODEL_FEATURES]
+                probs = model.predict_proba(features)[:, 1]
+
+                daily_signals = {}
+
+                for idx, row in signal_slice.iterrows():
+
+                    ticker = row["ticker"]
+
+                    decision = self.decision_engine.generate(
+                        ticker=ticker,
+                        predicted_return=float(probs[list(signal_slice.index).index(idx)] - 0.5),
+                        prob_up=float(probs[list(signal_slice.index).index(idx)]),
+                        volatility=float(row.get("volatility", 0.02)),
+                        regime=row.get("regime"),
+                        price_df=test_df[test_df["ticker"] == ticker]
+                    )
+
+                    if decision["signal"] in {"BUY", "SELL"}:
+                        daily_signals[ticker] = decision["signal"]
+
+                if len(daily_signals) < self.MIN_ASSETS_PER_DAY:
+                    continue
+
                 prices = {
                     t: float(p)
                     for t, p in zip(exec_slice["ticker"], exec_slice["close"])
                     if pd.notna(p) and np.isfinite(p) and p > 0
                 }
 
-                if len(prices) < self.MIN_ASSETS_PER_DAY:
-                    continue
-
-                signals, probs = self.signal_generator(model, signal_slice)
-
-                filtered = self._filter_conviction(
-                    signal_slice["ticker"].values,
-                    probs,
-                    signals
-                )
-
-                if len(filtered) < self.MIN_ASSETS_PER_DAY:
-                    continue
-
-                regime_map = dict(
-                    zip(signal_slice["ticker"], signal_slice["regime"])
-                )
-
-                filtered = self._apply_crisis_scaling(filtered, regime_map)
+                filtered = {
+                    t: daily_signals[t]
+                    for t in daily_signals
+                    if t in prices
+                }
 
                 if not filtered:
                     continue
 
+                grouped_prices[execution_date] = {
+                    t: prices[t] for t in filtered
+                }
+
+                grouped_signals[execution_date] = filtered
+
                 trade_counter += len(filtered)
-
-                grouped_prices.setdefault(execution_date, {})
-                grouped_signals.setdefault(execution_date, {})
-
-                for t in filtered:
-                    if t in prices:
-                        grouped_prices[execution_date][t] = prices[t]
-                        grouped_signals[execution_date][t] = filtered[t]
 
             if trade_counter < self.MIN_TRADES_PER_WINDOW:
                 start_idx += self.step_size
@@ -254,15 +199,17 @@ class WalkForwardValidator:
             metrics = self.engine.run(
                 grouped_prices,
                 grouped_signals,
-                initial_cash=rolling_capital
+                initial_cash=initial_capital
             )
 
             curve = np.array(metrics["equity_curve"], dtype=float)
 
-            if len(curve) > 0:
-                rolling_capital = curve[-1]
+            if equity_curve:
+                scale = equity_curve[-1] / curve[0]
+                equity_curve.extend((curve * scale)[1:].tolist())
+            else:
+                equity_curve.extend(curve.tolist())
 
-            equity_curve.extend(curve.tolist())
             results.append(metrics)
 
             start_idx += self.step_size
@@ -270,6 +217,8 @@ class WalkForwardValidator:
 
         if len(results) < self.MIN_WINDOWS:
             raise RuntimeError("Walk-forward produced insufficient windows.")
+
+        logger.info("Walk-forward completed successfully.")
 
         return self.aggregate_results(results, equity_curve)
 
