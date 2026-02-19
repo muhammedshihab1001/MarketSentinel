@@ -30,21 +30,34 @@ from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
 
 
+# ============================================================
+# LOGGING CONFIG (CRITICAL FIX)
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
 
 MODEL_DIR = os.path.abspath("artifacts/xgboost")
 
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_MODEL_BYTES = 50_000
-
 TOP_K_PERCENT = 0.20
 BENCHMARK_TICKER = "SPY"
 
 
-############################################################
+# ============================================================
 # DETERMINISM
-############################################################
+# ============================================================
 
 def enforce_determinism():
     os.environ["PYTHONHASHSEED"] = str(SEED)
@@ -52,9 +65,9 @@ def enforce_determinism():
     np.random.seed(SEED)
 
 
-############################################################
+# ============================================================
 # SAFE MODEL SAVE
-############################################################
+# ============================================================
 
 def save_model_atomic(model, path):
 
@@ -74,17 +87,14 @@ def save_model_atomic(model, path):
     return size
 
 
-############################################################
-# INSTITUTIONAL CROSS-SECTIONAL LABELING
-############################################################
+# ============================================================
+# CROSS SECTION TARGET
+# ============================================================
 
 def apply_cross_sectional_target(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
 
-    # ---------------------------------------------
-    # Benchmark merge (optional but preferred)
-    # ---------------------------------------------
     if BENCHMARK_TICKER in df["ticker"].unique():
 
         benchmark = df[df["ticker"] == BENCHMARK_TICKER][
@@ -100,7 +110,6 @@ def apply_cross_sectional_target(df):
 
     df["alpha"] = df["forward_return"] - df["benchmark_return"]
 
-    # Risk adjust
     safe_vol = df["volatility"].clip(lower=1e-4)
     df["risk_adj"] = (df["alpha"] / safe_vol).clip(-5, 5)
 
@@ -113,15 +122,11 @@ def apply_cross_sectional_target(df):
 
         dispersion = group["risk_adj"].std()
 
-        # Skip flat days
         if not np.isfinite(dispersion) or dispersion < 0.10:
             continue
 
-        upper_q = 0.80
-        lower_q = 0.20
-
-        upper = group["risk_adj"].quantile(upper_q)
-        lower = group["risk_adj"].quantile(lower_q)
+        upper = group["risk_adj"].quantile(0.80)
+        lower = group["risk_adj"].quantile(0.20)
 
         group = group.copy()
 
@@ -150,9 +155,9 @@ def apply_cross_sectional_target(df):
     return df.reset_index(drop=True)
 
 
-############################################################
-# CROSS SECTION NORMALIZATION
-############################################################
+# ============================================================
+# NORMALIZATION
+# ============================================================
 
 def cross_sectional_normalize(df):
 
@@ -167,9 +172,9 @@ def cross_sectional_normalize(df):
     return df.reset_index(drop=True)
 
 
-############################################################
+# ============================================================
 # DATA LOADER
-############################################################
+# ============================================================
 
 def load_training_data(start_date, end_date):
 
@@ -222,19 +227,47 @@ def load_training_data(start_date, end_date):
 
     logger.info("Final normalized rows=%s", len(df))
 
-    hash_df = df[
-        ["ticker", "date", "target", *MODEL_FEATURES]
-    ].sort_values(["date", "ticker"]).reset_index(drop=True)
+    return df
 
-    dataset_hash = MetadataManager.hash_list([
-        MetadataManager.fingerprint_dataset(hash_df),
-        get_schema_signature(),
-        list(MODEL_FEATURES),
-        start_date,
-        end_date
-    ])
 
-    return df, dataset_hash
+# ============================================================
+# MAIN FUNCTION (RESTORED)
+# ============================================================
+
+def main(start_date=None, end_date=None):
+
+    t0 = time.time()
+
+    init_env()
+    enforce_determinism()
+
+    logger.info("INSTITUTIONAL XGBOOST TRAINING STARTED")
+
+    if not start_date:
+        start_date, end_date = MarketTime.window_for("xgboost")
+
+    df = load_training_data(start_date, end_date)
+
+    X = df.loc[:, MODEL_FEATURES]
+    y = df["target"]
+
+    model = build_final_xgboost_model(y)
+
+    model.fit(X, y)
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    model_path = os.path.join(MODEL_DIR, "model.pkl")
+
+    save_model_atomic(model, model_path)
+
+    logger.info("Model saved successfully.")
+    logger.info("TOTAL TIME %.2f minutes", (time.time() - t0) / 60)
+
+
+# ============================================================
+# ENTRYPOINT
+# ============================================================
 
 if __name__ == "__main__":
     print("TRAINING ENTRYPOINT TRIGGERED")
