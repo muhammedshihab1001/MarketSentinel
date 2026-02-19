@@ -12,7 +12,7 @@ SEED = 42
 
 
 ###################################################
-# SAFE GPU DETECTION (XGBoost 2.x Compatible)
+# SAFE GPU DETECTION
 ###################################################
 
 _GPU_AVAILABLE = None
@@ -20,18 +20,12 @@ _GPU_LOCK = threading.Lock()
 
 
 def _gpu_available():
-    """
-    Reliable CUDA detection for XGBoost.
-    Only returns True if CUDA build is actually available.
-    """
-
     global _GPU_AVAILABLE
 
     if _GPU_AVAILABLE is not None:
         return _GPU_AVAILABLE
 
     with _GPU_LOCK:
-
         if _GPU_AVAILABLE is not None:
             return _GPU_AVAILABLE
 
@@ -78,7 +72,6 @@ def _device():
 ###################################################
 
 def compute_class_weight(y):
-
     y = np.asarray(y)
 
     if len(y) == 0:
@@ -91,7 +84,6 @@ def compute_class_weight(y):
         raise RuntimeError("Label collapse detected.")
 
     weight = neg / pos
-
     weight = float(np.clip(weight, 0.8, 12.0))
 
     logger.info("Computed class weight = %.3f", weight)
@@ -115,7 +107,7 @@ def _validate_features(X):
 
 
 ###################################################
-# SAFE CLASSIFIER
+# SAFE CLASSIFIER (FIXED)
 ###################################################
 
 class SafeXGBClassifier(XGBClassifier):
@@ -131,14 +123,11 @@ class SafeXGBClassifier(XGBClassifier):
             X.shape[1]
         )
 
-        kwargs.pop("early_stopping_rounds", None)
-        kwargs.pop("eval_set", None)
-
         return super().fit(X, y, **kwargs)
 
 
 ###################################################
-# PARAM BUILDER (IMPROVED DISPERSION VERSION)
+# PARAM BUILDER
 ###################################################
 
 def _base_params(pos_weight):
@@ -146,35 +135,22 @@ def _base_params(pos_weight):
     device = _device()
 
     params = dict(
-
-        # CORE (increase separation strength)
         n_estimators=550,
         max_depth=5,
         learning_rate=0.035,
-
-        # STRUCTURE (less restrictive)
         subsample=0.90,
         colsample_bytree=0.85,
         min_child_weight=3,
         gamma=0.10,
-
-        # REGULARIZATION (still safe)
         reg_alpha=0.8,
         reg_lambda=1.5,
-
-        # TREE
         tree_method="hist",
         device=device,
         max_bin=256,
-
-        # SAFETY
         eval_metric="logloss",
         random_state=SEED,
         n_jobs=-1,
-
-        # IMBALANCE
         scale_pos_weight=pos_weight,
-
         verbosity=0
     )
 
@@ -194,19 +170,16 @@ def _base_params(pos_weight):
 ###################################################
 
 def build_xgboost_model(y):
-
     pos_weight = compute_class_weight(y)
     params = _base_params(pos_weight)
-
     return SafeXGBClassifier(**params)
 
 
 ###################################################
-# BUILD FINAL PRODUCTION MODEL
+# BUILD FINAL MODEL
 ###################################################
 
 def build_final_xgboost_model(y):
-
     pos_weight = compute_class_weight(y)
     params = _base_params(pos_weight)
 
