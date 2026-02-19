@@ -80,6 +80,13 @@ class FeatureEngineer:
         df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
         df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
 
+        # Cross-sectional momentum booster
+        df["momentum_20"] = (
+            df.groupby("ticker")["close"]
+            .transform(lambda x: x.pct_change(20))
+            .clip(-1, 1)
+        )
+
     ########################################################
     # VOLATILITY
     ########################################################
@@ -113,13 +120,12 @@ class FeatureEngineer:
             )
 
     ########################################################
-    # REGIME FEATURE (NEW — FIX)
+    # REGIME FEATURE
     ########################################################
 
     @classmethod
     def add_regime_feature(cls, df):
 
-        # simple rolling volatility regime proxy
         rolling_vol = (
             df.groupby("ticker")["volatility_20"]
             .transform(lambda x: x.rolling(40, min_periods=20).mean())
@@ -131,6 +137,18 @@ class FeatureEngineer:
             rolling_vol > median_vol,
             1.0,
             0.0
+        )
+
+    ########################################################
+    # CROSS-SECTIONAL RANK FEATURE (KEY FIX)
+    ########################################################
+
+    @classmethod
+    def add_cross_section_rank(cls, df):
+
+        df["rank_return"] = (
+            df.groupby("date")["return"]
+            .rank(pct=True)
         )
 
     ########################################################
@@ -238,13 +256,12 @@ class FeatureEngineer:
 
         cls.add_returns(df)
         cls.add_volatility(df)
+        cls.add_regime_feature(df)
+        cls.add_cross_section_rank(df)
 
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
         cls.add_ema(df)
-
-        # 🔥 FIX — ADD REGIME FEATURE
-        cls.add_regime_feature(df)
 
         df = cls.create_training_dataset(df)
 
