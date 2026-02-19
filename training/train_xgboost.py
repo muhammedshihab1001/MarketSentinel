@@ -87,7 +87,9 @@ def apply_cross_sectional_target(df):
     ].rename(columns={"forward_return": "benchmark_return"})
 
     df = df.merge(benchmark, on="date", how="left")
-    df["benchmark_return"] = df["benchmark_return"].fillna(0.0)
+
+    # Drop days where benchmark missing
+    df = df.dropna(subset=["benchmark_return"])
 
     df["alpha"] = df["forward_return"] - df["benchmark_return"]
 
@@ -95,25 +97,25 @@ def apply_cross_sectional_target(df):
     df["risk_adj"] = (df["alpha"] / safe_vol).clip(-5, 5)
 
     labeled = []
+    skipped_days = 0
 
     for date, group in df.groupby("date"):
 
         if len(group) < 6:
+            skipped_days += 1
             continue
 
         dispersion = group["risk_adj"].std()
 
-        # Skip flat dispersion days
-        if dispersion < 0.15:
+        # Skip flat days
+        if dispersion < 0.12:
+            skipped_days += 1
             continue
 
-        # Adaptive quantiles
         if dispersion > 0.6:
-            upper_q = 0.85
-            lower_q = 0.15
+            upper_q, lower_q = 0.85, 0.15
         else:
-            upper_q = 0.80
-            lower_q = 0.20
+            upper_q, lower_q = 0.80, 0.20
 
         upper = group["risk_adj"].quantile(upper_q)
         lower = group["risk_adj"].quantile(lower_q)
@@ -135,9 +137,10 @@ def apply_cross_sectional_target(df):
     df["target"] = df["target"].astype("int8")
 
     logger.info(
-        "Class balance | pos=%s neg=%s",
+        "Labeling complete | pos=%s neg=%s skipped_days=%s",
         int(np.sum(df["target"] == 1)),
-        int(np.sum(df["target"] == 0))
+        int(np.sum(df["target"] == 0)),
+        skipped_days
     )
 
     return df.reset_index(drop=True)
@@ -154,7 +157,7 @@ def cross_sectional_normalize(df):
 
     for col in MODEL_FEATURES:
         mean = grouped[col].transform("mean")
-        std = grouped[col].transform("std").fillna(1).clip(lower=1e-6)
+        std = grouped[col].transform("std").clip(lower=1e-6)
         df[col] = (df[col] - mean) / std
 
     return df.reset_index(drop=True)
@@ -175,6 +178,7 @@ def load_training_data(start_date, end_date):
     datasets = []
 
     for ticker in universe:
+
         try:
             price_df = market_data.get_price_data(
                 ticker=ticker,
@@ -208,8 +212,6 @@ def load_training_data(start_date, end_date):
 
     if df["target"].nunique() < 2:
         raise RuntimeError("Label collapse after labeling.")
-
-    logger.info("Post-label rows=%s", len(df))
 
     df = cross_sectional_normalize(df)
 
@@ -249,6 +251,10 @@ def main(start_date=None, end_date=None):
     df, dataset_hash = load_training_data(start_date, end_date)
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
+    ########################################################
+    # TRAINER
+    ########################################################
+
     def trainer(d):
 
         d = d.sort_values("date")
@@ -264,7 +270,7 @@ def main(start_date=None, end_date=None):
         X_val = X.iloc[split_index:]
         y_val = y.iloc[split_index:]
 
-        logger.info("Train size=%s | Val size=%s", len(X_train), len(X_val))
+        logger.info("Train=%s | Val=%s", len(X_train), len(X_val))
 
         model = build_xgboost_model(y_train)
 
@@ -284,6 +290,11 @@ def main(start_date=None, end_date=None):
         calibrated.fit(X_val, y_val)
 
         return calibrated
+
+
+    ########################################################
+    # SIGNAL GENERATOR
+    ########################################################
 
     def signal_generator(model, test_df):
 
@@ -309,6 +320,11 @@ def main(start_date=None, end_date=None):
 
         return df_local["signal"].tolist(), probs
 
+
+    ########################################################
+    # WALK FORWARD
+    ########################################################
+
     wf = WalkForwardValidator(
         model_trainer=trainer,
         signal_generator=signal_generator
@@ -321,6 +337,10 @@ def main(start_date=None, end_date=None):
         metrics["avg_sharpe"],
         metrics["avg_strategy_return"]
     )
+
+    ########################################################
+    # FINAL MODEL
+    ########################################################
 
     final_model = build_final_xgboost_model(df["target"])
     final_model.fit(df.loc[:, MODEL_FEATURES], df["target"])
