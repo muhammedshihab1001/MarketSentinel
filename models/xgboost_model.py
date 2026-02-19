@@ -10,9 +10,8 @@ logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
 
-
 ###################################################
-# ROBUST GPU DETECTION
+# GPU DETECTION
 ###################################################
 
 _GPU_AVAILABLE = None
@@ -26,6 +25,7 @@ def _gpu_available():
         return _GPU_AVAILABLE
 
     with _GPU_LOCK:
+
         if _GPU_AVAILABLE is not None:
             return _GPU_AVAILABLE
 
@@ -36,17 +36,13 @@ def _gpu_available():
             )
 
             xgb.train(
-                {
-                    "tree_method": "gpu_hist",
-                    "max_depth": 1,
-                    "verbosity": 0
-                },
+                {"tree_method": "gpu_hist", "max_depth": 1, "verbosity": 0},
                 dtrain,
                 num_boost_round=1
             )
 
             _GPU_AVAILABLE = True
-            logger.info("CUDA backend verified successfully.")
+            logger.info("CUDA backend verified.")
 
         except Exception:
             _GPU_AVAILABLE = False
@@ -64,6 +60,7 @@ def _tree_method():
 ###################################################
 
 def compute_class_weight(y):
+
     y = np.asarray(y)
 
     if len(y) == 0:
@@ -76,7 +73,9 @@ def compute_class_weight(y):
         raise RuntimeError("Label collapse detected.")
 
     weight = neg / pos
-    weight = float(np.clip(weight, 0.5, 15.0))
+
+    # More stable clipping
+    weight = float(np.clip(weight, 0.8, 10.0))
 
     logger.info("Computed class weight = %.3f", weight)
 
@@ -84,7 +83,7 @@ def compute_class_weight(y):
 
 
 ###################################################
-# SAFE CLASSIFIER WITH EARLY STOPPING
+# SAFE CLASSIFIER
 ###################################################
 
 class SafeXGBClassifier(XGBClassifier):
@@ -92,7 +91,7 @@ class SafeXGBClassifier(XGBClassifier):
     def fit(self, X, y, **kwargs):
 
         if not hasattr(X, "shape"):
-            raise RuntimeError("Invalid feature matrix passed to XGBoost.")
+            raise RuntimeError("Invalid feature matrix.")
 
         if X.shape[1] != FEATURE_COUNT:
             raise RuntimeError(
@@ -100,23 +99,36 @@ class SafeXGBClassifier(XGBClassifier):
             )
 
         if hasattr(X, "to_numpy"):
-            if not np.isfinite(X.to_numpy()).all():
-                raise RuntimeError("Non-finite feature values detected.")
+            arr = X.to_numpy()
         else:
-            if not np.isfinite(X).all():
-                raise RuntimeError("Non-finite feature values detected.")
+            arr = X
+
+        if not np.isfinite(arr).all():
+            raise RuntimeError("Non-finite feature values detected.")
 
         logger.info(
-            "XGBoost training started | rows=%s cols=%s",
+            "XGBoost training | rows=%s cols=%s",
             X.shape[0],
             X.shape[1]
         )
 
-        return super().fit(X, y, **kwargs)
+        model = super().fit(X, y, **kwargs)
+
+        # 🔥 Log probability dispersion after training
+        preds = model.predict_proba(X)[:, 1]
+        logger.info(
+            "Train prob stats | mean=%.4f std=%.4f min=%.4f max=%.4f",
+            float(np.mean(preds)),
+            float(np.std(preds)),
+            float(np.min(preds)),
+            float(np.max(preds))
+        )
+
+        return model
 
 
 ###################################################
-# PARAM BUILDER (ALPHA DISCOVERY MODE)
+# PARAM BUILDER (BALANCED ALPHA MODE)
 ###################################################
 
 def _base_params(pos_weight):
@@ -124,21 +136,24 @@ def _base_params(pos_weight):
     tree_method = _tree_method()
 
     params = dict(
-        n_estimators=1200,
-        max_depth=7,
-        learning_rate=0.05,
 
-        subsample=0.80,
-        colsample_bytree=0.70,
-        colsample_bylevel=0.70,
+        # Trees
+        n_estimators=900,
+        max_depth=5,
+        learning_rate=0.04,
 
-        min_child_weight=2,
+        # Randomization (IMPORTANT for cross-sectional ML)
+        subsample=0.85,
+        colsample_bytree=0.75,
+        colsample_bylevel=0.75,
+
+        # Regularization (reduced to avoid flattening)
+        min_child_weight=1,
         gamma=0.0,
+        reg_alpha=0.3,
+        reg_lambda=1.2,
 
-        reg_alpha=0.5,
-        reg_lambda=1.0,
-
-        max_bin=384,
+        max_bin=256,
 
         tree_method=tree_method,
         eval_metric="logloss",
@@ -149,8 +164,7 @@ def _base_params(pos_weight):
     )
 
     logger.info(
-        "XGBoost params | tree_method=%s depth=%s trees=%s lr=%.3f",
-        tree_method.upper(),
+        "XGBoost params | depth=%s trees=%s lr=%.3f",
         params["max_depth"],
         params["n_estimators"],
         params["learning_rate"]
@@ -164,14 +178,11 @@ def _base_params(pos_weight):
 ###################################################
 
 def build_xgboost_model(y):
+
     pos_weight = compute_class_weight(y)
     params = _base_params(pos_weight)
 
     model = SafeXGBClassifier(**params)
-
-    model.set_params(
-        early_stopping_rounds=75
-    )
 
     return model
 
@@ -181,15 +192,17 @@ def build_xgboost_model(y):
 ###################################################
 
 def build_final_xgboost_model(y):
+
     pos_weight = compute_class_weight(y)
     params = _base_params(pos_weight)
 
+    # Slightly stronger but controlled
     params.update({
-        "n_estimators": 1400,
-        "learning_rate": 0.04,
-        "max_depth": 8,
-        "reg_alpha": 0.6,
-        "reg_lambda": 1.2,
+        "n_estimators": 1100,
+        "learning_rate": 0.035,
+        "max_depth": 6,
+        "reg_alpha": 0.4,
+        "reg_lambda": 1.4,
     })
 
     logger.info("Building final production model.")
