@@ -171,7 +171,7 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # 🚀 FIXED TARGET (CROSS-SECTIONAL)
+    # DATASET BUILDER (FEATURES ONLY — NO TARGET)
     ########################################################
 
     @classmethod
@@ -187,34 +187,10 @@ class FeatureEngineer:
         )
 
         df = df.dropna(subset=["forward_return"])
-
-        safe_vol = df["volatility"].clip(lower=cls.VOL_FLOOR)
-        df["risk_adj"] = (df["forward_return"] / safe_vol).clip(-5, 5)
-
-        # 🔥 CROSS-SECTIONAL labeling per date
-        def label_date(group):
-            if len(group) < 4:
-                group["target"] = np.nan
-                return group
-
-            upper = group["risk_adj"].quantile(0.75)
-            lower = group["risk_adj"].quantile(0.25)
-
-            group["target"] = np.where(
-                group["risk_adj"] >= upper, 1,
-                np.where(group["risk_adj"] <= lower, 0, np.nan)
-            )
-
-            return group
-
-        df = df.groupby("date", group_keys=False).apply(label_date)
-
-        df = df.dropna(subset=["target", *MODEL_FEATURES])
+        df = df.dropna(subset=[*MODEL_FEATURES])
 
         if len(df) < cls.MIN_ROWS_REQUIRED:
             raise RuntimeError("Feature collapse — dataset too small.")
-
-        df["target"] = df["target"].astype("int8")
 
         float_cols = df.select_dtypes("float64").columns
         df[float_cols] = df[float_cols].astype("float32")
@@ -268,7 +244,7 @@ class FeatureEngineer:
 
         final = pd.concat(
             [
-                df[["date", "close", "target", "ticker"]].reset_index(drop=True),
+                df[["date", "close", "forward_return", "ticker"]].reset_index(drop=True),
                 validated.reset_index(drop=True)
             ],
             axis=1
