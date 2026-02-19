@@ -22,6 +22,8 @@ from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
 
 from training.backtesting.walk_forward import WalkForwardValidator
+from training.backtesting.regime import MarketRegimeDetector
+
 from models.xgboost_model import (
     build_xgboost_model,
     build_final_xgboost_model
@@ -76,6 +78,31 @@ def save_model_atomic(model, path):
 
 
 ############################################################
+# ADD REGIME FEATURE
+############################################################
+
+def add_regime_feature(df: pd.DataFrame) -> pd.DataFrame:
+
+    detector = MarketRegimeDetector()
+    df = detector.detect(df)
+
+    mapping = {
+        "BULL": 1.0,
+        "NEUTRAL": 0.0,
+        "CRISIS": -1.0
+    }
+
+    df["regime_feature"] = (
+        df["regime"]
+        .map(mapping)
+        .fillna(0.0)
+        .astype(np.float32)
+    )
+
+    return df
+
+
+############################################################
 # CROSS SECTION LABELING (MARKET NEUTRAL)
 ############################################################
 
@@ -83,20 +110,13 @@ def apply_cross_sectional_target(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
 
-    # ----------------------------------------------------
-    # 1️⃣ Extract benchmark return
-    # ----------------------------------------------------
     benchmark = df[df["ticker"] == BENCHMARK_TICKER][
         ["date", "forward_return"]
     ].rename(columns={"forward_return": "benchmark_return"})
 
     df = df.merge(benchmark, on="date", how="left")
-
     df["benchmark_return"] = df["benchmark_return"].fillna(0.0)
 
-    # ----------------------------------------------------
-    # 2️⃣ Market-neutral alpha
-    # ----------------------------------------------------
     df["alpha"] = df["forward_return"] - df["benchmark_return"]
 
     safe_vol = df["volatility"].clip(lower=1e-4)
@@ -181,7 +201,6 @@ def load_training_data(start_date, end_date):
                 training=True
             )
 
-            validate_feature_schema(dataset.loc[:, MODEL_FEATURES])
             datasets.append(dataset)
 
         except Exception as e:
@@ -197,16 +216,17 @@ def load_training_data(start_date, end_date):
 
     logger.info("Raw dataset rows=%s", len(df))
 
+    # 🔥 ADD REGIME FEATURE BEFORE LABELING
+    df = add_regime_feature(df)
+
     df = apply_cross_sectional_target(df)
 
     if df["target"].nunique() < 2:
         raise RuntimeError("Label collapse after labeling.")
 
-    logger.info("Post-label rows=%s", len(df))
-
     df = cross_sectional_normalize(df)
 
-    logger.info("Final normalized rows=%s", len(df))
+    validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
     hash_df = df[
         ["ticker", "date", "target", *MODEL_FEATURES]
@@ -242,10 +262,6 @@ def main(start_date=None, end_date=None):
     df, dataset_hash = load_training_data(start_date, end_date)
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    ########################################################
-    # TRAINER
-    ########################################################
-
     def trainer(d):
 
         d = d.sort_values("date")
@@ -280,41 +296,9 @@ def main(start_date=None, end_date=None):
 
         return calibrated
 
-    ########################################################
-    # FIXED RANK-BASED SIGNAL GENERATOR
-    ########################################################
-
-    def signal_generator(model, test_df):
-
-        probs = model.predict_proba(
-            test_df.loc[:, MODEL_FEATURES]
-        )[:, 1]
-
-        df_local = test_df.copy()
-        df_local["prob"] = probs
-        df_local["signal"] = "HOLD"
-
-        for date, group in df_local.groupby("date"):
-
-            k = max(1, int(len(group) * TOP_K_PERCENT))
-
-            sorted_group = group.sort_values("prob", ascending=False)
-
-            long_idx = sorted_group.head(k).index
-            short_idx = sorted_group.tail(k).index
-
-            df_local.loc[long_idx, "signal"] = "BUY"
-            df_local.loc[short_idx, "signal"] = "SELL"
-
-        return df_local["signal"].tolist(), probs
-
-    ########################################################
-    # WALK FORWARD
-    ########################################################
-
     wf = WalkForwardValidator(
         model_trainer=trainer,
-        signal_generator=signal_generator
+        signal_generator=None  # using internal rank logic
     )
 
     metrics = wf.run(df)
@@ -325,16 +309,8 @@ def main(start_date=None, end_date=None):
         metrics["avg_strategy_return"]
     )
 
-    ########################################################
-    # FINAL MODEL
-    ########################################################
-
     final_model = build_final_xgboost_model(df["target"])
     final_model.fit(df.loc[:, MODEL_FEATURES], df["target"])
-
-    importances = final_model.feature_importances_
-    for name, val in zip(MODEL_FEATURES, importances):
-        logger.info("Feature importance | %s = %.6f", name, float(val))
 
     with tempfile.TemporaryDirectory(prefix="xgb_train_") as tmpdir:
 
@@ -343,15 +319,9 @@ def main(start_date=None, end_date=None):
 
         save_model_atomic(final_model, model_path)
 
-        clean_metrics = {
-            k: float(v)
-            for k, v in metrics.items()
-            if not isinstance(v, list)
-        }
-
         metadata = MetadataManager.create_metadata(
             model_name="xgboost_direction",
-            metrics=clean_metrics,
+            metrics=metrics,
             features=list(MODEL_FEATURES),
             training_start=start_date,
             training_end=end_date,
