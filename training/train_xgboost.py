@@ -39,7 +39,8 @@ SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_MODEL_BYTES = 50_000
 
-TOP_K_PERCENT = 0.20   # 🔥 top/bottom 20% cross-sectional
+TOP_K_PERCENT = 0.20
+BENCHMARK_TICKER = "SPY"
 
 
 ############################################################
@@ -75,15 +76,31 @@ def save_model_atomic(model, path):
 
 
 ############################################################
-# CROSS SECTION LABELING
+# CROSS SECTION LABELING (MARKET NEUTRAL)
 ############################################################
 
 def apply_cross_sectional_target(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
 
+    # ----------------------------------------------------
+    # 1️⃣ Extract benchmark return
+    # ----------------------------------------------------
+    benchmark = df[df["ticker"] == BENCHMARK_TICKER][
+        ["date", "forward_return"]
+    ].rename(columns={"forward_return": "benchmark_return"})
+
+    df = df.merge(benchmark, on="date", how="left")
+
+    df["benchmark_return"] = df["benchmark_return"].fillna(0.0)
+
+    # ----------------------------------------------------
+    # 2️⃣ Market-neutral alpha
+    # ----------------------------------------------------
+    df["alpha"] = df["forward_return"] - df["benchmark_return"]
+
     safe_vol = df["volatility"].clip(lower=1e-4)
-    df["risk_adj"] = (df["forward_return"] / safe_vol).clip(-5, 5)
+    df["risk_adj"] = (df["alpha"] / safe_vol).clip(-5, 5)
 
     labeled = []
 
@@ -105,6 +122,7 @@ def apply_cross_sectional_target(df):
         labeled.append(group)
 
     df = pd.concat(labeled, ignore_index=True)
+
     df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype("int8")
 
@@ -262,9 +280,8 @@ def main(start_date=None, end_date=None):
 
         return calibrated
 
-
     ########################################################
-    # NEW SIGNAL GENERATOR (RANK-BASED)
+    # FIXED RANK-BASED SIGNAL GENERATOR
     ########################################################
 
     def signal_generator(model, test_df):
@@ -275,26 +292,21 @@ def main(start_date=None, end_date=None):
 
         df_local = test_df.copy()
         df_local["prob"] = probs
-
-        signals = []
+        df_local["signal"] = "HOLD"
 
         for date, group in df_local.groupby("date"):
 
             k = max(1, int(len(group) * TOP_K_PERCENT))
 
-            group = group.sort_values("prob", ascending=False)
+            sorted_group = group.sort_values("prob", ascending=False)
 
-            longs = group.head(k).index
-            shorts = group.tail(k).index
+            long_idx = sorted_group.head(k).index
+            short_idx = sorted_group.tail(k).index
 
-            date_signals = pd.Series("HOLD", index=group.index)
-            date_signals.loc[longs] = "BUY"
-            date_signals.loc[shorts] = "SELL"
+            df_local.loc[long_idx, "signal"] = "BUY"
+            df_local.loc[short_idx, "signal"] = "SELL"
 
-            signals.extend(date_signals.sort_index().tolist())
-
-        return signals, probs
-
+        return df_local["signal"].tolist(), probs
 
     ########################################################
     # WALK FORWARD
