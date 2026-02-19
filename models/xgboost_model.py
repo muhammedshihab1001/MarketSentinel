@@ -6,14 +6,13 @@ import threading
 
 from core.schema.feature_schema import FEATURE_COUNT
 
-
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
 
 
 ###################################################
-# GPU DETECTION (SAFE ONCE)
+# SAFE GPU DETECTION (XGBoost 2.x Compatible)
 ###################################################
 
 _GPU_AVAILABLE = None
@@ -21,6 +20,10 @@ _GPU_LOCK = threading.Lock()
 
 
 def _gpu_available():
+    """
+    Reliable CUDA detection for XGBoost.
+    Only returns True if CUDA build is actually available.
+    """
 
     global _GPU_AVAILABLE
 
@@ -33,26 +36,37 @@ def _gpu_available():
             return _GPU_AVAILABLE
 
         try:
+            build_info = xgb.build_info()
+
+            # CUDA only valid if compiled with it
+            if not build_info.get("USE_CUDA", False):
+                _GPU_AVAILABLE = False
+                logger.info("XGBoost built without CUDA support.")
+                return _GPU_AVAILABLE
+
+            # Try minimal CUDA train
             dtrain = xgb.DMatrix(
-                np.random.rand(50, 4),
-                label=np.random.randint(0, 2, 50)
+                np.random.rand(20, 4),
+                label=np.random.randint(0, 2, 20)
             )
 
-            params = {
-                "tree_method": "hist",
-                "device": "cuda",
-                "max_depth": 1,
-                "verbosity": 0
-            }
-
-            xgb.train(params, dtrain, num_boost_round=1)
+            xgb.train(
+                {
+                    "tree_method": "hist",
+                    "device": "cuda",
+                    "max_depth": 1,
+                    "verbosity": 0
+                },
+                dtrain,
+                num_boost_round=1
+            )
 
             _GPU_AVAILABLE = True
-            logger.info("GPU detected.")
+            logger.info("CUDA backend verified.")
 
         except Exception:
             _GPU_AVAILABLE = False
-            logger.info("GPU not available - using CPU.")
+            logger.info("CUDA unavailable - using CPU.")
 
         return _GPU_AVAILABLE
 
@@ -62,7 +76,7 @@ def _device():
 
 
 ###################################################
-# CLASS WEIGHT (STABLE)
+# CLASS WEIGHT (STABLE & SAFE)
 ###################################################
 
 def compute_class_weight(y):
@@ -80,8 +94,8 @@ def compute_class_weight(y):
 
     weight = neg / pos
 
-    # Prevent over-scaling
-    weight = float(np.clip(weight, 0.8, 20.0))
+    # Prevent extreme scaling
+    weight = float(np.clip(weight, 0.8, 15.0))
 
     logger.info("Computed class weight = %.3f", weight)
 
@@ -128,7 +142,7 @@ class SafeXGBClassifier(XGBClassifier):
 
 
 ###################################################
-# PARAM BUILDER (INSTITUTIONAL STABLE)
+# PARAM BUILDER (STABLE ALPHA VERSION)
 ###################################################
 
 def _base_params(pos_weight):
@@ -137,25 +151,25 @@ def _base_params(pos_weight):
 
     params = dict(
 
-        # CORE (LESS OVERFITTING)
-        n_estimators=500,
+        # CORE
+        n_estimators=400,
         max_depth=4,
-        learning_rate=0.025,
+        learning_rate=0.03,
 
         # STRUCTURE
-        subsample=0.80,
-        colsample_bytree=0.75,
-        min_child_weight=6,
-        gamma=0.30,
+        subsample=0.85,
+        colsample_bytree=0.8,
+        min_child_weight=4,
+        gamma=0.2,
 
-        # REGULARIZATION (STRONGER)
-        reg_alpha=1.5,
-        reg_lambda=2.0,
+        # REGULARIZATION
+        reg_alpha=1.0,
+        reg_lambda=1.5,
 
-        # TREE CONTROL
-        max_bin=256,
+        # TREE
         tree_method="hist",
         device=device,
+        max_bin=256,
 
         # SAFETY
         eval_metric="logloss",
@@ -169,11 +183,11 @@ def _base_params(pos_weight):
     )
 
     logger.info(
-        "XGBoost params | %s hist | lr=%.3f depth=%s trees=%s",
+        "XGBoost params | device=%s depth=%s trees=%s lr=%.3f",
         device.upper(),
-        params["learning_rate"],
         params["max_depth"],
-        params["n_estimators"]
+        params["n_estimators"],
+        params["learning_rate"]
     )
 
     return params
@@ -200,14 +214,13 @@ def build_final_xgboost_model(y):
     pos_weight = compute_class_weight(y)
     params = _base_params(pos_weight)
 
-    # Slightly stronger but still safe
     params.update({
-        "n_estimators": 650,
-        "learning_rate": 0.02,
-        "gamma": 0.35,
-        "reg_alpha": 1.8,
-        "reg_lambda": 2.2,
+        "n_estimators": 550,
+        "learning_rate": 0.025,
         "max_depth": 5,
+        "gamma": 0.25,
+        "reg_alpha": 1.2,
+        "reg_lambda": 1.8,
     })
 
     logger.info("Building final production model.")
