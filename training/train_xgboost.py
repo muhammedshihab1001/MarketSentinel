@@ -38,7 +38,7 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_MODEL_BYTES = 50_000
-MIN_PROB_SPREAD = 0.015
+MIN_PROB_SPREAD = 0.02  # slightly stronger dispersion requirement
 
 
 ############################################################
@@ -74,33 +74,39 @@ def save_model_atomic(model, path):
 
 
 ############################################################
-# CROSS SECTION LABELING
+# CROSS SECTION LABELING (STRONGER 80 / 20)
 ############################################################
 
 def apply_cross_sectional_target(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
 
+    safe_vol = df["volatility"].clip(lower=1e-4)
+    df["risk_adj"] = (df["forward_return"] / safe_vol).clip(-5, 5)
+
     def label_date(group):
 
-        if len(group) < 4:
-            group["target"] = np.nan
-            return group
+        if len(group) < 5:
+            return None
 
-        safe_vol = group["volatility"].clip(lower=1e-4)
-        risk_adj = (group["forward_return"] / safe_vol).clip(-5, 5)
+        upper = group["risk_adj"].quantile(0.80)
+        lower = group["risk_adj"].quantile(0.20)
 
-        upper = risk_adj.quantile(0.75)
-        lower = risk_adj.quantile(0.25)
-
+        group = group.copy()
         group["target"] = np.where(
-            risk_adj >= upper, 1,
-            np.where(risk_adj <= lower, 0, np.nan)
+            group["risk_adj"] >= upper, 1,
+            np.where(group["risk_adj"] <= lower, 0, np.nan)
         )
 
         return group
 
-    df = df.groupby("date", group_keys=False).apply(label_date)
+    labeled = []
+    for _, g in df.groupby("date"):
+        res = label_date(g)
+        if res is not None:
+            labeled.append(res)
+
+    df = pd.concat(labeled, ignore_index=True)
 
     df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype("int8")
@@ -170,10 +176,6 @@ def load_training_data(start_date, end_date):
         raise RuntimeError("Dataset too small before labeling.")
 
     logger.info("Raw dataset rows=%s", len(df))
-
-    ########################################################
-    # APPLY TARGET HERE (FIXED ARCHITECTURE)
-    ########################################################
 
     df = apply_cross_sectional_target(df)
 
@@ -260,16 +262,34 @@ def main(start_date=None, end_date=None):
         return calibrated
 
     ########################################################
+    # SIGNAL GENERATOR WITH DISPERSION LOGGING
+    ########################################################
+
+    def signal_generator(model, test_df):
+
+        probs = model.predict_proba(
+            test_df.loc[:, MODEL_FEATURES]
+        )[:, 1]
+
+        prob_std = float(np.std(probs))
+        logger.info("Probability std=%.4f", prob_std)
+
+        signals = [
+            "BUY" if p > 0.60
+            else "SELL" if p < 0.40
+            else "HOLD"
+            for p in probs
+        ]
+
+        return signals, probs
+
+    ########################################################
     # WALK FORWARD
     ########################################################
 
     wf = WalkForwardValidator(
         model_trainer=trainer,
-        signal_generator=lambda m, t: (
-            ["BUY" if p > 0.55 else "SELL" if p < 0.45 else "HOLD"
-             for p in m.predict_proba(t.loc[:, MODEL_FEATURES])[:, 1]],
-            m.predict_proba(t.loc[:, MODEL_FEATURES])[:, 1]
-        )
+        signal_generator=signal_generator
     )
 
     metrics = wf.run(df)
