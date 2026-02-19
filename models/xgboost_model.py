@@ -62,7 +62,7 @@ def _device():
 
 
 ###################################################
-# CLASS WEIGHT
+# CLASS WEIGHT (STABLE)
 ###################################################
 
 def compute_class_weight(y):
@@ -79,7 +79,9 @@ def compute_class_weight(y):
         raise RuntimeError("Label collapse detected.")
 
     weight = neg / pos
-    weight = float(np.clip(weight, 1.0, 30.0))
+
+    # Prevent over-scaling
+    weight = float(np.clip(weight, 0.8, 20.0))
 
     logger.info("Computed class weight = %.3f", weight)
 
@@ -102,7 +104,7 @@ def _validate_features(X):
 
 
 ###################################################
-# SAFE CLASSIFIER (EARLY STOPPING SAFE)
+# SAFE CLASSIFIER
 ###################################################
 
 class SafeXGBClassifier(XGBClassifier):
@@ -118,11 +120,15 @@ class SafeXGBClassifier(XGBClassifier):
             X.shape[1]
         )
 
+        # Remove dangerous kwargs
+        kwargs.pop("early_stopping_rounds", None)
+        kwargs.pop("eval_set", None)
+
         return super().fit(X, y, **kwargs)
 
 
 ###################################################
-# PARAM BUILDER
+# PARAM BUILDER (INSTITUTIONAL STABLE)
 ###################################################
 
 def _base_params(pos_weight):
@@ -131,30 +137,30 @@ def _base_params(pos_weight):
 
     params = dict(
 
-        # CORE
-        n_estimators=900,
-        max_depth=6,
-        learning_rate=0.03,
+        # CORE (LESS OVERFITTING)
+        n_estimators=500,
+        max_depth=4,
+        learning_rate=0.025,
 
         # STRUCTURE
-        subsample=0.85,
-        colsample_bytree=0.85,
-        min_child_weight=4,
-        gamma=0.20,
+        subsample=0.80,
+        colsample_bytree=0.75,
+        min_child_weight=6,
+        gamma=0.30,
 
-        # REGULARIZATION
-        reg_alpha=1.0,
-        reg_lambda=1.5,
+        # REGULARIZATION (STRONGER)
+        reg_alpha=1.5,
+        reg_lambda=2.0,
+
+        # TREE CONTROL
+        max_bin=256,
+        tree_method="hist",
+        device=device,
 
         # SAFETY
         eval_metric="logloss",
         random_state=SEED,
         n_jobs=-1,
-        max_bin=256,
-
-        # TREE
-        tree_method="hist",
-        device=device,
 
         # IMBALANCE
         scale_pos_weight=pos_weight,
@@ -163,10 +169,11 @@ def _base_params(pos_weight):
     )
 
     logger.info(
-        "XGBoost params | %s hist | lr=%.3f depth=%s",
+        "XGBoost params | %s hist | lr=%.3f depth=%s trees=%s",
         device.upper(),
         params["learning_rate"],
-        params["max_depth"]
+        params["max_depth"],
+        params["n_estimators"]
     )
 
     return params
@@ -193,13 +200,14 @@ def build_final_xgboost_model(y):
     pos_weight = compute_class_weight(y)
     params = _base_params(pos_weight)
 
+    # Slightly stronger but still safe
     params.update({
-        "n_estimators": 1100,
+        "n_estimators": 650,
         "learning_rate": 0.02,
-        "gamma": 0.25,
-        "reg_alpha": 1.2,
-        "reg_lambda": 1.8,
-        "max_depth": 7,
+        "gamma": 0.35,
+        "reg_alpha": 1.8,
+        "reg_lambda": 2.2,
+        "max_depth": 5,
     })
 
     logger.info("Building final production model.")
