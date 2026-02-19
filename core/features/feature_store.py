@@ -26,7 +26,7 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v14"   # bump → invalidate corrupted cache
+    CACHE_VERSION = "v15"
     MAX_CACHE_FILES_PER_TICKER = 6
 
     MIN_ROWS_REQUIRED = 100
@@ -37,7 +37,6 @@ class FeatureStore:
     MIN_FEATURE_VARIANCE = 1e-10
 
     def __init__(self):
-
         os.makedirs(self.FEATURE_DIR, exist_ok=True)
 
         self.engineer = FeatureEngineer()
@@ -53,16 +52,11 @@ class FeatureStore:
     def _validate_numeric_integrity(self, df: pd.DataFrame):
 
         features = df.loc[:, MODEL_FEATURES]
-
         arr = features.to_numpy(dtype=float)
 
-        # -------- finite check
         if not np.isfinite(arr).all():
-            raise RuntimeError(
-                "Non-finite feature values produced by FeatureEngineer."
-            )
+            raise RuntimeError("Non-finite feature values detected.")
 
-        # -------- row stability
         row_valid = np.isfinite(arr).all(axis=1)
         stability_ratio = row_valid.mean()
 
@@ -71,31 +65,26 @@ class FeatureStore:
                 f"Row stability collapse detected: {stability_ratio:.2f}"
             )
 
-        # -------- variance floor
         variances = np.var(arr, axis=0)
 
         if np.min(variances) < self.MIN_FEATURE_VARIANCE:
-            raise RuntimeError(
-                "Feature variance collapse detected."
-            )
+            raise RuntimeError("Feature variance collapse detected.")
 
-        # -------- explosion guard
         if arr.size > 0 and np.abs(arr).max() > self.ABS_FEATURE_LIMIT:
-            raise RuntimeError(
-                "Feature explosion detected."
-            )
+            raise RuntimeError("Feature explosion detected.")
 
     ########################################################
-    # HASHING (unchanged — institutional quality)
+    # DETERMINISTIC HASHING
     ########################################################
 
-    def _stable_hash_df(self, df: pd.DataFrame):
+    def _stable_hash_df(self, df: pd.DataFrame) -> str:
 
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"], utc=True)
-        df = df.sort_values(list(df.columns)).reset_index(drop=True)
+        df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-        payload = df.to_parquet(index=False)
+        # deterministic CSV-based hash
+        payload = df.to_csv(index=False).encode()
         return hashlib.sha256(payload).hexdigest()
 
     def _fingerprint_engineer(self) -> str:
@@ -136,124 +125,43 @@ class FeatureStore:
         h.update(self._stable_hash_df(price_core).encode())
 
         if sentiment_df is not None and not sentiment_df.empty:
-
             sent_core = sentiment_df.copy()
-            cols = [c for c in ["date", "avg_sentiment"] if c in sent_core]
-            sent_core = sent_core[cols]
 
-            h.update(self._stable_hash_df(sent_core).encode())
+            if "avg_sentiment" in sent_core.columns:
+                sent_core = sent_core[["date", "avg_sentiment"]]
+
+                sent_core["date"] = pd.to_datetime(
+                    sent_core["date"], utc=True
+                )
+
+                sent_core = sent_core.sort_values("date").reset_index(drop=True)
+
+                h.update(sent_core.to_csv(index=False).encode())
 
         return h.hexdigest()[:20]
 
     ########################################################
-
-    def _sanitize_ticker(self, ticker: str) -> str:
-        return re.sub(r"[^A-Za-z0-9_]", "_", ticker)
-
-    def _feature_path(self, ticker, dataset_hash, training):
-
-        suffix = "train" if training else "infer"
-        ticker = self._sanitize_ticker(ticker)
-
-        return os.path.join(
-            self.FEATURE_DIR,
-            f"{self.CACHE_VERSION}_"
-            f"{ticker}_{suffix}_"
-            f"{dataset_hash}_"
-            f"{self.schema_hash}_"
-            f"{self.engineer_hash}_"
-            f"{self.env_hash}.parquet"
-        )
-
+    # CACHE CLEANUP
     ########################################################
 
-    def _atomic_write(
-        self,
-        df: pd.DataFrame,
-        path: str,
-        dataset_hash: str,
-        ticker: str,
-        training: bool
-    ):
+    def _cleanup_old_cache(self, ticker: str):
 
-        if len(df) < self.MIN_ROWS_REQUIRED:
-            raise RuntimeError("Feature collapse detected.")
+        ticker = re.sub(r"[^A-Za-z0-9_]", "_", ticker)
 
-        validate_feature_schema(df.loc[:, MODEL_FEATURES])
+        files = [
+            f for f in os.listdir(self.FEATURE_DIR)
+            if f.startswith(self.CACHE_VERSION + "_" + ticker)
+        ]
 
-        # 🔥 NEW — numerical firewall
-        self._validate_numeric_integrity(df)
+        if len(files) <= self.MAX_CACHE_FILES_PER_TICKER:
+            return
 
-        df = df.copy()
-
-        df["__dataset_hash"] = dataset_hash
-        df["__schema_hash"] = self.schema_hash
-        df["__engineer_hash"] = self.engineer_hash
-
-        tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
-
-        df.to_parquet(
-            tmp_path,
-            index=False,
-            engine="pyarrow",
-            compression="zstd"
-        )
-
-        os.replace(tmp_path, path)
-
-        if os.name != "nt":
-            fd = os.open(self.FEATURE_DIR, os.O_DIRECTORY)
-            os.fsync(fd)
-            os.close(fd)
-
-    ########################################################
-
-    def _load_features(self, path: str, dataset_hash: str):
-
-        if not os.path.exists(path):
-            return None
-
-        if os.path.getsize(path) < self.MIN_FILE_BYTES:
-            os.remove(path)
-            return None
-
-        try:
-
-            df = pd.read_parquet(path, engine="pyarrow")
-
-            meta = [
-                "__dataset_hash",
-                "__schema_hash",
-                "__engineer_hash"
-            ]
-
-            if not all(c in df.columns for c in meta):
-                os.remove(path)
-                return None
-
-            if df["__dataset_hash"].iloc[0] != dataset_hash:
-                os.remove(path)
-                return None
-
-            df.drop(columns=meta, inplace=True)
-
-            validate_feature_schema(df.loc[:, MODEL_FEATURES])
-
-            # 🔥 enforce firewall on cached data too
-            self._validate_numeric_integrity(df)
-
-            return df
-
-        except Exception:
-
-            logger.exception("Feature corruption detected — rebuilding.")
-
+        files.sort()
+        for f in files[:-self.MAX_CACHE_FILES_PER_TICKER]:
             try:
-                os.remove(path)
+                os.remove(os.path.join(self.FEATURE_DIR, f))
             except Exception:
                 pass
-
-            return None
 
     ########################################################
 
@@ -265,21 +173,36 @@ class FeatureStore:
         training: bool = False
     ):
 
-        dataset_hash = self._dataset_hash(
-            price_df,
-            sentiment_df
+        # structural validation
+        if not self.REQUIRED_COLUMNS.issubset(price_df.columns):
+            raise RuntimeError("Price dataframe missing required columns.")
+
+        if price_df.duplicated(subset=["ticker", "date"]).any():
+            raise RuntimeError("Duplicate rows detected in price data.")
+
+        dataset_hash = self._dataset_hash(price_df, sentiment_df)
+
+        suffix = "train" if training else "infer"
+        ticker_safe = re.sub(r"[^A-Za-z0-9_]", "_", ticker)
+
+        path = os.path.join(
+            self.FEATURE_DIR,
+            f"{self.CACHE_VERSION}_"
+            f"{ticker_safe}_{suffix}_"
+            f"{dataset_hash}_"
+            f"{self.schema_hash}_"
+            f"{self.engineer_hash}_"
+            f"{self.env_hash}.parquet"
         )
 
-        path = self._feature_path(
-            ticker,
-            dataset_hash,
-            training
-        )
-
-        stored = self._load_features(path, dataset_hash)
-
-        if stored is not None:
-            return stored
+        if os.path.exists(path) and os.path.getsize(path) >= self.MIN_FILE_BYTES:
+            try:
+                df = pd.read_parquet(path)
+                validate_feature_schema(df.loc[:, MODEL_FEATURES])
+                self._validate_numeric_integrity(df)
+                return df
+            except Exception:
+                os.remove(path)
 
         logger.info("Feature cache miss — rebuilding.")
 
@@ -290,12 +213,18 @@ class FeatureStore:
             ticker=ticker
         )
 
-        self._atomic_write(
-            features,
-            path,
-            dataset_hash,
-            ticker,
-            training
+        validate_feature_schema(features.loc[:, MODEL_FEATURES])
+        self._validate_numeric_integrity(features)
+
+        tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+        features.to_parquet(
+            tmp_path,
+            index=False,
+            engine="pyarrow",
+            compression="zstd"
         )
+        os.replace(tmp_path, path)
+
+        self._cleanup_old_cache(ticker)
 
         return features
