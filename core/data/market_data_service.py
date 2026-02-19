@@ -28,12 +28,11 @@ class MarketDataService:
         "volume"
     }
 
-    MIN_HISTORY_ROWS = 60          # 🔥 lowered (institutional)
+    MIN_HISTORY_ROWS = 60
     SAFE_LAG_DAYS = 2
     MAX_ROWS = 15000
     MIN_FILE_BYTES = 5_000
-
-    MAX_DAILY_MOVE = 0.85         # 🔥 data poisoning guard
+    MAX_DAILY_MOVE = 0.85
 
     _PROVIDER = None
 
@@ -100,24 +99,23 @@ class MarketDataService:
 
         df = df.copy()
 
-        df["date"] = (
-            pd.to_datetime(
-                df["date"],
-                utc=True,
-                errors="raise"
-            ).dt.tz_convert(None)
-        )
+        df["date"] = pd.to_datetime(
+            df["date"],
+            utc=True,
+            errors="raise"
+        ).dt.tz_convert(None)
 
         return df
 
     ########################################################
+    # DETERMINISTIC HASH
+    ########################################################
 
     def _dataset_hash(self, df: pd.DataFrame):
 
-        payload = pd.util.hash_pandas_object(
-            df.sort_values(["ticker", "date"]),
-            index=True
-        ).values.tobytes()
+        df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+        payload = df.to_csv(index=False).encode()
 
         return hashlib.sha256(payload).hexdigest()[:16]
 
@@ -151,7 +149,7 @@ class MarketDataService:
         return self.DATA_DIR / f"{ticker}_{key}.parquet"
 
     ########################################################
-    # 🔥 INSTITUTIONAL DATA VALIDATOR
+    # INSTITUTIONAL VALIDATOR
     ########################################################
 
     def _validate_dataset(self, df: pd.DataFrame, ticker: str):
@@ -164,7 +162,6 @@ class MarketDataService:
         df["ticker"] = ticker
 
         missing = self.REQUIRED_COLUMNS - set(df.columns)
-
         if missing:
             raise RuntimeError(f"Schema violation. Missing={missing}")
 
@@ -181,18 +178,24 @@ class MarketDataService:
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices.")
 
-        # 🔥 split / glitch guard
-        jumps = df["close"].pct_change().abs()
+        # enforce strict ordering
+        df = df.sort_values("date").reset_index(drop=True)
 
-        if (jumps > self.MAX_DAILY_MOVE).any():
+        if not df["date"].is_monotonic_increasing:
+            raise RuntimeError("Non-monotonic timestamps detected.")
+
+        if df.duplicated(subset=["ticker", "date"]).any():
+            raise RuntimeError("Duplicate (ticker,date) rows detected.")
+
+        # safe jump detection
+        pct = df["close"].pct_change().abs().fillna(0)
+
+        if (pct > self.MAX_DAILY_MOVE).any():
             raise RuntimeError("Extreme price jump detected.")
 
-        if df["date"].duplicated().any():
-            raise RuntimeError("Duplicate timestamps detected.")
+        if len(df) > self.MAX_ROWS:
+            df = df.tail(self.MAX_ROWS)
 
-        df = df.sort_values("date")
-
-        # 🔥 DO NOT HARD FAIL — warn instead
         if len(df) < self.MIN_HISTORY_ROWS:
             logger.warning(
                 "Short history for %s (%d rows)",
@@ -200,15 +203,8 @@ class MarketDataService:
                 len(df)
             )
 
-        if len(df) > self.MAX_ROWS:
-            df = df.tail(self.MAX_ROWS)
-
-        df["__dataset_hash"] = self._dataset_hash(df)
-
         return df.reset_index(drop=True)
 
-    ########################################################
-    # 🔥 SMART RETRY (EXPONENTIAL + JITTER)
     ########################################################
 
     def _fetch_with_retry(
@@ -233,7 +229,11 @@ class MarketDataService:
                     interval
                 )
 
-                return self._validate_dataset(df, ticker)
+                validated = self._validate_dataset(df, ticker)
+
+                validated["__dataset_hash"] = self._dataset_hash(validated)
+
+                return validated
 
             except Exception as e:
 
@@ -277,16 +277,16 @@ class MarketDataService:
 
             expected = df["__dataset_hash"].iloc[0]
 
-            df = self._validate_dataset(df, ticker)
+            validated = self._validate_dataset(df, ticker)
 
-            actual = self._dataset_hash(df)
+            actual = self._dataset_hash(validated)
 
             if expected != actual:
                 logger.warning("Dataset hash mismatch — rebuilding cache.")
                 path.unlink(missing_ok=True)
                 return None
 
-            return df
+            return validated
 
         except Exception:
 
