@@ -38,7 +38,7 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_MODEL_BYTES = 50_000
-MIN_PROB_SPREAD = 0.02  # slightly stronger dispersion requirement
+MIN_PROB_STD = 0.025   # stronger signal requirement
 
 
 ############################################################
@@ -74,7 +74,7 @@ def save_model_atomic(model, path):
 
 
 ############################################################
-# CROSS SECTION LABELING (STRONGER 80 / 20)
+# CROSS SECTION LABELING (80/20)
 ############################################################
 
 def apply_cross_sectional_target(df):
@@ -84,32 +84,35 @@ def apply_cross_sectional_target(df):
     safe_vol = df["volatility"].clip(lower=1e-4)
     df["risk_adj"] = (df["forward_return"] / safe_vol).clip(-5, 5)
 
-    def label_date(group):
+    labeled = []
+
+    for date, group in df.groupby("date"):
 
         if len(group) < 5:
-            return None
+            continue
 
         upper = group["risk_adj"].quantile(0.80)
         lower = group["risk_adj"].quantile(0.20)
 
         group = group.copy()
+
         group["target"] = np.where(
             group["risk_adj"] >= upper, 1,
             np.where(group["risk_adj"] <= lower, 0, np.nan)
         )
 
-        return group
-
-    labeled = []
-    for _, g in df.groupby("date"):
-        res = label_date(g)
-        if res is not None:
-            labeled.append(res)
+        labeled.append(group)
 
     df = pd.concat(labeled, ignore_index=True)
 
     df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype("int8")
+
+    logger.info(
+        "Class balance | pos=%s neg=%s",
+        int(np.sum(df["target"] == 1)),
+        int(np.sum(df["target"] == 0))
+    )
 
     return df.reset_index(drop=True)
 
@@ -121,7 +124,6 @@ def apply_cross_sectional_target(df):
 def cross_sectional_normalize(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
-
     grouped = df.groupby("date")
 
     for col in MODEL_FEATURES:
@@ -142,8 +144,8 @@ def load_training_data(start_date, end_date):
 
     market_data = MarketDataService()
     store = FeatureStore()
-
     universe = MarketUniverse.get_universe()
+
     datasets = []
 
     for ticker in universe:
@@ -180,13 +182,13 @@ def load_training_data(start_date, end_date):
     df = apply_cross_sectional_target(df)
 
     if df["target"].nunique() < 2:
-        raise RuntimeError("Label collapse after cross-sectional labeling.")
+        raise RuntimeError("Label collapse after labeling.")
 
     logger.info("Post-label rows=%s", len(df))
 
     df = cross_sectional_normalize(df)
 
-    logger.info("Final normalized dataset rows=%s", len(df))
+    logger.info("Final normalized rows=%s", len(df))
 
     hash_df = df[
         ["ticker", "date", "target", *MODEL_FEATURES]
@@ -261,8 +263,9 @@ def main(start_date=None, end_date=None):
 
         return calibrated
 
+
     ########################################################
-    # SIGNAL GENERATOR WITH DISPERSION LOGGING
+    # SIGNAL GENERATOR (WITH HARD DISPERSION CHECK)
     ########################################################
 
     def signal_generator(model, test_df):
@@ -274,6 +277,11 @@ def main(start_date=None, end_date=None):
         prob_std = float(np.std(probs))
         logger.info("Probability std=%.4f", prob_std)
 
+        if prob_std < MIN_PROB_STD:
+            logger.info("Weak signal detected — forcing HOLD.")
+            signals = ["HOLD"] * len(probs)
+            return signals, probs
+
         signals = [
             "BUY" if p > 0.60
             else "SELL" if p < 0.40
@@ -282,6 +290,7 @@ def main(start_date=None, end_date=None):
         ]
 
         return signals, probs
+
 
     ########################################################
     # WALK FORWARD
@@ -306,6 +315,11 @@ def main(start_date=None, end_date=None):
 
     final_model = build_final_xgboost_model(df["target"])
     final_model.fit(df.loc[:, MODEL_FEATURES], df["target"])
+
+    # 🔍 FEATURE IMPORTANCE LOGGING
+    importances = final_model.feature_importances_
+    for name, val in zip(MODEL_FEATURES, importances):
+        logger.info("Feature importance | %s = %.6f", name, float(val))
 
     with tempfile.TemporaryDirectory(prefix="xgb_train_") as tmpdir:
 
