@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import logging
 
-from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema
+from core.schema.feature_schema import MODEL_FEATURES
 from training.backtesting.portfolio_engine import PortfolioBacktestEngine
 from training.backtesting.regime import MarketRegimeDetector
 
@@ -65,9 +65,14 @@ class WalkForwardValidator:
 
         cols = list(MODEL_FEATURES)
 
-        validate_feature_schema(df.loc[:, cols])
+        # 🚫 Removed schema validation here
+        # Schema validation already happens before normalization
+        # in load_training_data()
 
         features = df.loc[:, cols].to_numpy(dtype=float)
+
+        if not np.isfinite(features).all():
+            raise RuntimeError("Non-finite values detected in training features.")
 
         if np.min(np.var(features, axis=0)) < self.MIN_FEATURE_VARIANCE:
             raise RuntimeError("Feature variance collapsed.")
@@ -91,8 +96,6 @@ class WalkForwardValidator:
             logger.warning("Feature drift detected | max_z=%.2f", max_z)
 
     ########################################################
-    # 🔥 INSTITUTIONAL CONVICTION FILTER (BALANCED)
-    ########################################################
 
     def _filter_conviction(self, tickers, probs, signals):
 
@@ -105,10 +108,6 @@ class WalkForwardValidator:
         if df.empty:
             return {}
 
-        ###################################################
-        # Conviction strength
-        ###################################################
-
         df["edge"] = np.abs(df["prob"] - 0.5)
 
         edge_std = float(df["edge"].std())
@@ -120,18 +119,10 @@ class WalkForwardValidator:
             logger.info("Conviction too weak — skipping day.")
             return {}
 
-        ###################################################
-        # Soft dispersion check
-        ###################################################
-
         spread = df["prob"].max() - df["prob"].min()
 
         if spread < 0.01:
             logger.info("Low probability dispersion — reducing exposure.")
-
-        ###################################################
-        # Rank by conviction strength
-        ###################################################
 
         df = df.sort_values("edge", ascending=False)
 
