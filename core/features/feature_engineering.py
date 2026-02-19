@@ -66,12 +66,12 @@ class FeatureEngineer:
     # RETURNS
     ########################################################
 
-    @staticmethod
-    def add_returns(df):
+    @classmethod
+    def add_returns(cls, df):
 
         returns = df.groupby("ticker")["close"].pct_change()
 
-        lo, hi = FeatureEngineer.RETURN_CLAMP
+        lo, hi = cls.RETURN_CLAMP
         df["return"] = returns.clip(lo, hi)
 
         df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
@@ -79,11 +79,11 @@ class FeatureEngineer:
         df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
 
     ########################################################
-    # VOLATILITY
+    # VOLATILITY (FIXED + SAFE)
     ########################################################
 
-    @staticmethod
-    def add_volatility(df):
+    @classmethod
+    def add_volatility(cls, df):
 
         grp = df.groupby("ticker")["return"]
 
@@ -103,17 +103,31 @@ class FeatureEngineer:
 
         df["volatility"] = df["volatility_5"]
 
-        # floor + fill early NaNs safely
-        df["volatility"] = df["volatility"].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
-        df["volatility_5"] = df["volatility_5"].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
-        df["volatility_20"] = df["volatility_20"].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
+        # SAFE FILL
+        df["volatility"] = (
+            df["volatility"]
+            .fillna(cls.VOL_FLOOR)
+            .clip(lower=cls.VOL_FLOOR)
+        )
+
+        df["volatility_5"] = (
+            df["volatility_5"]
+            .fillna(cls.VOL_FLOOR)
+            .clip(lower=cls.VOL_FLOOR)
+        )
+
+        df["volatility_20"] = (
+            df["volatility_20"]
+            .fillna(cls.VOL_FLOOR)
+            .clip(lower=cls.VOL_FLOOR)
+        )
 
     ########################################################
     # RSI
     ########################################################
 
-    @staticmethod
-    def add_rsi(df):
+    @classmethod
+    def add_rsi(cls, df):
 
         def _compute_rsi(group):
             rsi_series = TechnicalIndicators.rsi(
@@ -133,8 +147,8 @@ class FeatureEngineer:
     # MACD
     ########################################################
 
-    @staticmethod
-    def add_macd(df):
+    @classmethod
+    def add_macd(cls, df):
 
         def _macd_block(x):
             macd, signal = TechnicalIndicators.macd(
@@ -151,8 +165,8 @@ class FeatureEngineer:
     # EMA
     ########################################################
 
-    @staticmethod
-    def add_ema(df):
+    @classmethod
+    def add_ema(cls, df):
 
         df["ema_10"] = (
             df.groupby("ticker")["close"]
