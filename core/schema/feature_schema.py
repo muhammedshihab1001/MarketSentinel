@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "21.0"  # relaxed variance guard for cross-sectional normalization
+SCHEMA_VERSION = "22.0"  # canonical ordering + stable validation
 
 
 ############################################################
@@ -173,11 +173,18 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     if df.columns.duplicated().any():
         raise RuntimeError("Duplicate columns detected.")
 
-    if tuple(df.columns) != MODEL_FEATURES:
-        raise RuntimeError("Feature order drift detected.")
+    # 🔥 SAFE FEATURE CHECK (ORDER-INDEPENDENT)
+    if set(df.columns) != set(MODEL_FEATURES):
 
-    if len(df.columns) != FEATURE_COUNT:
-        raise RuntimeError("Feature count mismatch detected.")
+        missing = set(MODEL_FEATURES) - set(df.columns)
+        extra = set(df.columns) - set(MODEL_FEATURES)
+
+        raise RuntimeError(
+            f"Feature mismatch | missing={missing} extra={extra}"
+        )
+
+    # 🔥 ENFORCE CANONICAL ORDER
+    df = df.loc[:, MODEL_FEATURES]
 
     _check_forbidden_columns(df)
 
