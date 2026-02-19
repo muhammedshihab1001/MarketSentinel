@@ -8,7 +8,6 @@ import numpy as np
 import logging
 import random
 
-from sklearn.model_selection import train_test_split
 from sklearn.calibration import CalibratedClassifierCV
 
 from core.config.env_loader import init_env
@@ -101,7 +100,7 @@ def cross_sectional_normalize(df):
 
 
 ############################################################
-# DATA LOADER (FIXED VERSION)
+# DATA LOADER
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -130,7 +129,6 @@ def load_training_data(start_date, end_date):
                 training=True
             )
 
-            # ✅ VALIDATE RAW FEATURES BEFORE NORMALIZATION
             validate_feature_schema(dataset.loc[:, MODEL_FEATURES])
 
             datasets.append(dataset)
@@ -148,7 +146,6 @@ def load_training_data(start_date, end_date):
 
     logger.info("Raw dataset rows=%s", len(df))
 
-    # ✅ Apply normalization AFTER validation
     df = cross_sectional_normalize(df)
 
     logger.info("Final normalized dataset rows=%s", len(df))
@@ -189,19 +186,25 @@ def main(start_date=None, end_date=None):
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     ########################################################
-    # TRAINER WITH CALIBRATION
+    # TRAINER WITH CHRONOLOGICAL SPLIT
     ########################################################
 
     def trainer(d):
 
+        d = d.sort_values("date")
+
         X = d.loc[:, MODEL_FEATURES]
         y = d["target"]
 
-        model = build_xgboost_model(y)
+        split_index = int(len(d) * 0.85)
 
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y, test_size=0.15, random_state=SEED, stratify=y
-        )
+        X_train = X.iloc[:split_index]
+        y_train = y.iloc[:split_index]
+
+        X_val = X.iloc[split_index:]
+        y_val = y.iloc[split_index:]
+
+        model = build_xgboost_model(y_train)
 
         model.fit(
             X_train,
