@@ -13,21 +13,15 @@ class PortfolioBacktestEngine:
     CASH_BUFFER = 0.08
 
     MAX_INV_VOL = 3.0
-    MAX_POSITION_WEIGHT = 0.06
-    MAX_GROSS_EXPOSURE = 0.75
+    MAX_POSITION_WEIGHT = 0.05
+    MAX_GROSS_EXPOSURE = 0.70
 
-    MAX_SINGLE_STEP_RETURN = 0.20
-    MAX_GAP = 0.20
-
-    MAX_TURNOVER_RATIO = 1.0
-    MIN_EQUITY_FLOOR = 0.60  # Hard kill switch
+    MIN_EQUITY_FLOOR = 0.60  # Hard stop
 
     VOL_KILL_SWITCH = 0.07
-    DRAWDOWN_REDUCTION_START = -0.20
-    DRAWDOWN_MAX_REDUCTION = -0.40
 
-    SLIPPAGE_IMPACT = 0.10
-    BORROW_COST_ANNUAL = 0.02
+    DRAWDOWN_REDUCTION_START = -0.15
+    DRAWDOWN_MAX_REDUCTION = -0.35
 
     VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
 
@@ -44,13 +38,11 @@ class PortfolioBacktestEngine:
         self.target_vol = target_vol
 
         self.return_buffers = defaultdict(list)
-        self.price_history = defaultdict(list)
 
     ###################################################
 
     def _reset_state(self):
         self.return_buffers.clear()
-        self.price_history.clear()
 
     ###################################################
     # VOL TRACKING
@@ -81,25 +73,7 @@ class PortfolioBacktestEngine:
         return vols
 
     ###################################################
-    # VOL TARGET SCALER
-    ###################################################
-
-    def _volatility_scaler(self, portfolio_returns):
-
-        if len(portfolio_returns) < 10:
-            return 1.0
-
-        realized = np.std(portfolio_returns)
-
-        if realized < 1e-6:
-            return 1.0
-
-        scale = self.target_vol / realized
-
-        return float(np.clip(scale, 0.5, 1.5))
-
-    ###################################################
-    # DRAWDOWN CONTROL
+    # DRAWDOWN SCALER
     ###################################################
 
     def _drawdown_scaler(self, curve):
@@ -113,28 +87,29 @@ class PortfolioBacktestEngine:
         if dd < self.DRAWDOWN_MAX_REDUCTION:
             return 0.4
 
-        # linear scaling
         span = self.DRAWDOWN_MAX_REDUCTION - self.DRAWDOWN_REDUCTION_START
         pos = dd - self.DRAWDOWN_REDUCTION_START
+
         return 1.0 + (pos / span) * (0.4 - 1.0)
 
     ###################################################
     # WEIGHT ENGINE
     ###################################################
 
-    def _compute_weights(self, signals, vols):
+    def _compute_weights(self, signals, vols, exposure_scale):
 
         raw = {}
 
         for t, s in signals.items():
 
-            if s == "HOLD":
+            if s not in self.VALID_SIGNALS or s == "HOLD":
                 continue
 
             direction = 1 if s == "BUY" else -1
             vol = vols.get(t, self.target_vol)
 
             inv_vol = min(1 / max(vol, 1e-4), self.MAX_INV_VOL)
+
             raw[t] = direction * inv_vol
 
         if not raw:
@@ -143,7 +118,11 @@ class PortfolioBacktestEngine:
         total = sum(abs(v) for v in raw.values())
 
         weights = {
-            t: np.clip(v / total, -self.MAX_POSITION_WEIGHT, self.MAX_POSITION_WEIGHT)
+            t: np.clip(
+                (v / total) * exposure_scale,
+                -self.MAX_POSITION_WEIGHT,
+                self.MAX_POSITION_WEIGHT
+            )
             for t, v in raw.items()
         }
 
@@ -185,19 +164,44 @@ class PortfolioBacktestEngine:
                 equity_curve.append(cash)
                 continue
 
-            vols = self._update_buffers(prev_prices, prices)
+            ###################################################
+            # MARK TO MARKET FIRST
+            ###################################################
 
             portfolio_value = cash + sum(
                 positions.get(t, 0) * prices.get(t, 0)
                 for t in positions
             )
 
-            # HARD FLOOR STOP
+            equity_curve.append(float(portfolio_value))
+
+            if len(equity_curve) > 1:
+                r = (equity_curve[-1] / equity_curve[-2]) - 1
+                portfolio_returns.append(r)
+
+            ###################################################
+            # HARD EQUITY FLOOR
+            ###################################################
+
             if portfolio_value < initial_cash * self.MIN_EQUITY_FLOOR:
                 logger.warning("Equity floor breached — stopping simulation.")
                 break
 
-            weights = self._compute_weights(signals, vols)
+            ###################################################
+            # VOL & DD SCALING (BEFORE TRADE)
+            ###################################################
+
+            vols = self._update_buffers(prev_prices, prices)
+
+            dd_scale = self._drawdown_scaler(np.array(equity_curve))
+
+            exposure_scale = dd_scale
+
+            ###################################################
+            # COMPUTE TARGET WEIGHTS
+            ###################################################
+
+            weights = self._compute_weights(signals, vols, exposure_scale)
 
             deployable = portfolio_value * (1 - self.CASH_BUFFER)
 
@@ -243,27 +247,6 @@ class PortfolioBacktestEngine:
                 else:
                     positions[ticker] = new_position
 
-            equity = cash + sum(
-                positions.get(t, 0) * prices.get(t, 0)
-                for t in positions
-            )
-
-            equity_curve.append(float(equity))
-
-            if len(equity_curve) > 1:
-                r = (equity_curve[-1] / equity_curve[-2]) - 1
-                portfolio_returns.append(r)
-
-            # APPLY VOL SCALING
-            vol_scale = self._volatility_scaler(portfolio_returns)
-            dd_scale = self._drawdown_scaler(np.array(equity_curve))
-
-            exposure_scale = vol_scale * dd_scale
-
-            # scale positions
-            for t in positions:
-                positions[t] *= exposure_scale
-
             prev_prices = prices
 
         ###################################################
@@ -283,6 +266,7 @@ class PortfolioBacktestEngine:
         returns = np.diff(curve) / np.maximum(curve[:-1], self.EPSILON)
 
         vol = max(np.std(returns), 1e-6)
+
         sharpe = np.clip(
             np.mean(returns) / vol * np.sqrt(252),
             -3,
