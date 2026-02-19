@@ -20,17 +20,12 @@ _GPU_LOCK = threading.Lock()
 
 
 def _gpu_available():
-    """
-    Detect GPU support by attempting a tiny training
-    using GPU tree_method. This is the only reliable method.
-    """
     global _GPU_AVAILABLE
 
     if _GPU_AVAILABLE is not None:
         return _GPU_AVAILABLE
 
     with _GPU_LOCK:
-
         if _GPU_AVAILABLE is not None:
             return _GPU_AVAILABLE
 
@@ -81,7 +76,7 @@ def compute_class_weight(y):
         raise RuntimeError("Label collapse detected.")
 
     weight = neg / pos
-    weight = float(np.clip(weight, 0.8, 12.0))
+    weight = float(np.clip(weight, 0.5, 15.0))
 
     logger.info("Computed class weight = %.3f", weight)
 
@@ -89,7 +84,7 @@ def compute_class_weight(y):
 
 
 ###################################################
-# SAFE CLASSIFIER
+# SAFE CLASSIFIER WITH EARLY STOPPING
 ###################################################
 
 class SafeXGBClassifier(XGBClassifier):
@@ -117,13 +112,11 @@ class SafeXGBClassifier(XGBClassifier):
             X.shape[1]
         )
 
-        kwargs.pop("early_stopping_rounds", None)
-
         return super().fit(X, y, **kwargs)
 
 
 ###################################################
-# PARAM BUILDER
+# PARAM BUILDER (ALPHA DISCOVERY MODE)
 ###################################################
 
 def _base_params(pos_weight):
@@ -131,17 +124,23 @@ def _base_params(pos_weight):
     tree_method = _tree_method()
 
     params = dict(
-        n_estimators=550,
-        max_depth=5,
-        learning_rate=0.035,
-        subsample=0.90,
-        colsample_bytree=0.85,
-        min_child_weight=3,
-        gamma=0.10,
-        reg_alpha=0.8,
-        reg_lambda=1.5,
+        n_estimators=1200,
+        max_depth=7,
+        learning_rate=0.05,
+
+        subsample=0.80,
+        colsample_bytree=0.70,
+        colsample_bylevel=0.70,
+
+        min_child_weight=2,
+        gamma=0.0,
+
+        reg_alpha=0.5,
+        reg_lambda=1.0,
+
+        max_bin=384,
+
         tree_method=tree_method,
-        max_bin=256,
         eval_metric="logloss",
         random_state=SEED,
         n_jobs=-1,
@@ -167,7 +166,14 @@ def _base_params(pos_weight):
 def build_xgboost_model(y):
     pos_weight = compute_class_weight(y)
     params = _base_params(pos_weight)
-    return SafeXGBClassifier(**params)
+
+    model = SafeXGBClassifier(**params)
+
+    model.set_params(
+        early_stopping_rounds=75
+    )
+
+    return model
 
 
 ###################################################
@@ -179,12 +185,11 @@ def build_final_xgboost_model(y):
     params = _base_params(pos_weight)
 
     params.update({
-        "n_estimators": 700,
-        "learning_rate": 0.03,
-        "max_depth": 6,
-        "gamma": 0.15,
-        "reg_alpha": 1.0,
-        "reg_lambda": 1.6,
+        "n_estimators": 1400,
+        "learning_rate": 0.04,
+        "max_depth": 8,
+        "reg_alpha": 0.6,
+        "reg_lambda": 1.2,
     })
 
     logger.info("Building final production model.")
