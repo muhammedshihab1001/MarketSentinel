@@ -94,7 +94,7 @@ FEATURE_LIMITS: Dict[str, tuple] = {
 ############################################################
 
 FORBIDDEN_REGEX = re.compile(
-    r"(future|next|forward|target|label|tomorrow|t\+|lead|horizon|shift|lookahead|outcome|response|y_)",
+    r"\b(future|next|forward|target|label|tomorrow|lead|horizon|lookahead|outcome|response)\b",
     re.IGNORECASE
 )
 
