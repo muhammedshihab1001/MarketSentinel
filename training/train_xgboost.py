@@ -37,8 +37,6 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_MODEL_BYTES = 50_000
-
-TOP_K_PERCENT = 0.20
 BENCHMARK_TICKER = "SPY"
 
 
@@ -75,96 +73,7 @@ def save_model_atomic(model, path):
 
 
 ############################################################
-# ENHANCED MARKET-NEUTRAL LABELING
-############################################################
-
-def apply_cross_sectional_target(df):
-
-    df = df.sort_values(["date", "ticker"]).copy()
-
-    benchmark = df[df["ticker"] == BENCHMARK_TICKER][
-        ["date", "forward_return"]
-    ].rename(columns={"forward_return": "benchmark_return"})
-
-    df = df.merge(benchmark, on="date", how="left")
-
-    # Drop days where benchmark missing
-    df = df.dropna(subset=["benchmark_return"])
-
-    df["alpha"] = df["forward_return"] - df["benchmark_return"]
-
-    safe_vol = df["volatility"].clip(lower=1e-4)
-    df["risk_adj"] = (df["alpha"] / safe_vol).clip(-5, 5)
-
-    labeled = []
-    skipped_days = 0
-
-    for date, group in df.groupby("date"):
-
-        if len(group) < 6:
-            skipped_days += 1
-            continue
-
-        dispersion = group["risk_adj"].std()
-
-        # Skip flat days
-        if dispersion < 0.12:
-            skipped_days += 1
-            continue
-
-        if dispersion > 0.6:
-            upper_q, lower_q = 0.85, 0.15
-        else:
-            upper_q, lower_q = 0.80, 0.20
-
-        upper = group["risk_adj"].quantile(upper_q)
-        lower = group["risk_adj"].quantile(lower_q)
-
-        group = group.copy()
-
-        group["target"] = np.where(
-            group["risk_adj"] >= upper, 1,
-            np.where(group["risk_adj"] <= lower, 0, np.nan)
-        )
-
-        labeled.append(group)
-
-    if not labeled:
-        raise RuntimeError("No valid cross-sectional labels generated.")
-
-    df = pd.concat(labeled, ignore_index=True)
-    df = df.dropna(subset=["target"])
-    df["target"] = df["target"].astype("int8")
-
-    logger.info(
-        "Labeling complete | pos=%s neg=%s skipped_days=%s",
-        int(np.sum(df["target"] == 1)),
-        int(np.sum(df["target"] == 0)),
-        skipped_days
-    )
-
-    return df.reset_index(drop=True)
-
-
-############################################################
-# CROSS SECTION NORMALIZATION
-############################################################
-
-def cross_sectional_normalize(df):
-
-    df = df.sort_values(["date", "ticker"]).copy()
-    grouped = df.groupby("date")
-
-    for col in MODEL_FEATURES:
-        mean = grouped[col].transform("mean")
-        std = grouped[col].transform("std").clip(lower=1e-6)
-        df[col] = (df[col] - mean) / std
-
-    return df.reset_index(drop=True)
-
-
-############################################################
-# DATA LOADER
+# TRAINING DATA LOADER
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -178,7 +87,6 @@ def load_training_data(start_date, end_date):
     datasets = []
 
     for ticker in universe:
-
         try:
             price_df = market_data.get_price_data(
                 ticker=ticker,
@@ -204,32 +112,11 @@ def load_training_data(start_date, end_date):
     df = pd.concat(datasets, ignore_index=True)
 
     if len(df) < MIN_TRAINING_ROWS:
-        raise RuntimeError("Dataset too small before labeling.")
+        raise RuntimeError("Dataset too small.")
 
-    logger.info("Raw dataset rows=%s", len(df))
+    logger.info("Final dataset rows=%s", len(df))
 
-    df = apply_cross_sectional_target(df)
-
-    if df["target"].nunique() < 2:
-        raise RuntimeError("Label collapse after labeling.")
-
-    df = cross_sectional_normalize(df)
-
-    logger.info("Final normalized rows=%s", len(df))
-
-    hash_df = df[
-        ["ticker", "date", "target", *MODEL_FEATURES]
-    ].sort_values(["date", "ticker"]).reset_index(drop=True)
-
-    dataset_hash = MetadataManager.hash_list([
-        MetadataManager.fingerprint_dataset(hash_df),
-        get_schema_signature(),
-        list(MODEL_FEATURES),
-        start_date,
-        end_date
-    ])
-
-    return df, dataset_hash
+    return df.reset_index(drop=True)
 
 
 ############################################################
@@ -248,12 +135,11 @@ def main(start_date=None, end_date=None):
     if not start_date:
         start_date, end_date = MarketTime.window_for("xgboost")
 
-    df, dataset_hash = load_training_data(start_date, end_date)
-    df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+    df = load_training_data(start_date, end_date)
 
-    ########################################################
-    # TRAINER
-    ########################################################
+    ############################################################
+    # MODEL TRAINER FOR WALK FORWARD
+    ############################################################
 
     def trainer(d):
 
@@ -269,8 +155,6 @@ def main(start_date=None, end_date=None):
 
         X_val = X.iloc[split_index:]
         y_val = y.iloc[split_index:]
-
-        logger.info("Train=%s | Val=%s", len(X_train), len(X_val))
 
         model = build_xgboost_model(y_train)
 
@@ -291,43 +175,12 @@ def main(start_date=None, end_date=None):
 
         return calibrated
 
-
-    ########################################################
-    # SIGNAL GENERATOR
-    ########################################################
-
-    def signal_generator(model, test_df):
-
-        probs = model.predict_proba(
-            test_df.loc[:, MODEL_FEATURES]
-        )[:, 1]
-
-        df_local = test_df.copy()
-        df_local["prob"] = probs
-        df_local["signal"] = "HOLD"
-
-        for date, group in df_local.groupby("date"):
-
-            k = max(1, int(len(group) * TOP_K_PERCENT))
-
-            sorted_group = group.sort_values("prob", ascending=False)
-
-            long_idx = sorted_group.head(k).index
-            short_idx = sorted_group.tail(k).index
-
-            df_local.loc[long_idx, "signal"] = "BUY"
-            df_local.loc[short_idx, "signal"] = "SELL"
-
-        return df_local["signal"].tolist(), probs
-
-
-    ########################################################
+    ############################################################
     # WALK FORWARD
-    ########################################################
+    ############################################################
 
     wf = WalkForwardValidator(
-        model_trainer=trainer,
-        signal_generator=signal_generator
+        model_trainer=trainer
     )
 
     metrics = wf.run(df)
@@ -338,12 +191,16 @@ def main(start_date=None, end_date=None):
         metrics["avg_strategy_return"]
     )
 
-    ########################################################
-    # FINAL MODEL
-    ########################################################
+    ############################################################
+    # FINAL PRODUCTION MODEL
+    ############################################################
 
     final_model = build_final_xgboost_model(df["target"])
-    final_model.fit(df.loc[:, MODEL_FEATURES], df["target"])
+
+    final_model.fit(
+        df.loc[:, MODEL_FEATURES],
+        df["target"]
+    )
 
     with tempfile.TemporaryDirectory(prefix="xgb_train_") as tmpdir:
 
@@ -364,9 +221,9 @@ def main(start_date=None, end_date=None):
             features=list(MODEL_FEATURES),
             training_start=start_date,
             training_end=end_date,
-            dataset_hash=dataset_hash,
+            dataset_hash=get_schema_signature(),
             dataset_rows=len(df),
-            metadata_type="training_manifest_v1"
+            metadata_type="training_manifest_v2"
         )
 
         MetadataManager.save_metadata(metadata, metadata_path)
