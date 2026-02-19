@@ -6,40 +6,34 @@ import json
 import re
 import logging
 
-
 logger = logging.getLogger(__name__)
-
 
 ############################################################
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "20.0"  # hard enforcement + stability upgrade
+SCHEMA_VERSION = "21.0"  # relaxed variance guard for cross-sectional normalization
 
 
 ############################################################
-# FEATURES (TIER-1 INSTITUTIONAL PRICE STACK)
+# FEATURES
 ############################################################
 
 MODEL_FEATURES: Tuple[str, ...] = (
 
-    # Core return
     "return",
     "return_lag1",
     "return_lag5",
     "return_lag10",
 
-    # Volatility
     "volatility",
     "volatility_5",
     "volatility_20",
 
-    # Momentum
     "rsi",
     "macd",
     "macd_signal",
 
-    # Trend
     "ema_10",
     "ema_50",
     "ema_ratio",
@@ -205,7 +199,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     feature_df = _enforce_feature_limits(feature_df)
 
     ########################################################
-    # STABILITY CHECKS
+    # STABILITY CHECKS (RELAXED)
     ########################################################
 
     for col in MODEL_FEATURES:
@@ -219,8 +213,14 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         if finite_vals.nunique() <= 1:
             raise RuntimeError(f"Constant feature detected: {col}")
 
-        if finite_vals.var(ddof=0) < MIN_VARIANCE:
-            raise RuntimeError(f"Near-zero variance feature detected: {col}")
+        var = finite_vals.var(ddof=0)
+
+        if var < MIN_VARIANCE:
+            logger.warning(
+                "Low variance feature detected: %s | variance=%.12f",
+                col,
+                var
+            )
 
         if np.abs(finite_vals).max() > ABSOLUTE_FEATURE_LIMIT:
             raise RuntimeError(f"Feature explosion detected: {col}")
