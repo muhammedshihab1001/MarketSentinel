@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "23.0"  # walk-forward normalized safe limits
+SCHEMA_VERSION = "24.0"  # regime-aware upgrade
 
 
 ############################################################
@@ -37,6 +37,9 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "ema_10",
     "ema_50",
     "ema_ratio",
+
+    # 🔥 NEW REGIME FEATURE
+    "regime_feature",
 )
 
 FEATURE_COUNT = len(MODEL_FEATURES)
@@ -52,12 +55,12 @@ MIN_ROWS = 200
 MAX_NAN_RATIO_PER_FEATURE = 0.05
 MAX_ROW_NAN_RATIO = 0.10
 
-ABSOLUTE_FEATURE_LIMIT = 1e4  # widened for normalized values
+ABSOLUTE_FEATURE_LIMIT = 1e4
 MIN_VARIANCE = 1e-8
 
 
 ############################################################
-# HARD FEATURE LIMITS (RELAXED FOR NORMALIZED DATA)
+# HARD FEATURE LIMITS
 ############################################################
 
 FEATURE_LIMITS: Dict[str, tuple] = {
@@ -79,6 +82,9 @@ FEATURE_LIMITS: Dict[str, tuple] = {
     "ema_10": (0.0, 1e6),
     "ema_50": (0.0, 1e6),
     "ema_ratio": (-20.0, 20.0),
+
+    # 🔥 regime bounds
+    "regime_feature": (-2.0, 2.0),
 }
 
 
