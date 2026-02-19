@@ -60,9 +60,7 @@ class WalkForwardValidator:
 
     def _validate_training_frame(self, df):
 
-        cols = list(MODEL_FEATURES)
-
-        features = df.loc[:, cols].to_numpy(dtype=float)
+        features = df.loc[:, MODEL_FEATURES].to_numpy(dtype=float)
 
         if not np.isfinite(features).all():
             raise RuntimeError("Non-finite values detected in training features.")
@@ -79,12 +77,10 @@ class WalkForwardValidator:
 
     def _distribution_guard(self, train_df, test_df):
 
-        cols = list(MODEL_FEATURES)
+        train_mu = train_df[MODEL_FEATURES].mean()
+        train_std = train_df[MODEL_FEATURES].std(ddof=0) + 1e-9
 
-        train_mu = train_df[cols].mean()
-        train_std = train_df[cols].std(ddof=0) + 1e-9
-
-        z = np.abs((test_df[cols] - train_mu) / train_std)
+        z = np.abs((test_df[MODEL_FEATURES] - train_mu) / train_std)
         max_z = float(np.nanmax(z.to_numpy()))
 
         if max_z > self.DRIFT_WARN_Z:
@@ -111,13 +107,7 @@ class WalkForwardValidator:
         df = df[df["edge"] >= dynamic_min_edge]
 
         if df.empty:
-            logger.info("Conviction too weak — skipping day.")
             return {}
-
-        spread = df["prob"].max() - df["prob"].min()
-
-        if spread < 0.01:
-            logger.info("Low probability dispersion — reducing exposure.")
 
         df = df.sort_values("edge", ascending=False)
 
@@ -198,7 +188,7 @@ class WalkForwardValidator:
                     if pd.notna(p) and np.isfinite(p) and p > 0
                 }
 
-                if not prices:
+                if len(prices) < self.MIN_ASSETS_PER_DAY:
                     continue
 
                 signals, probs = self.signal_generator(model, signal_slice)
@@ -212,19 +202,32 @@ class WalkForwardValidator:
                 if len(filtered) < self.MIN_ASSETS_PER_DAY:
                     continue
 
-                regime = signal_slice["regime"].iloc[0]
+                ###################################################
+                # PER-TICKER REGIME SCALING
+                ###################################################
 
-                if regime == "CRISIS":
-                    cut = max(1, int(len(filtered) * self.CRISIS_EXPOSURE_SCALE))
-                    filtered = dict(list(filtered.items())[:cut])
+                regime_map = dict(
+                    zip(signal_slice["ticker"], signal_slice["regime"])
+                )
+
+                for t in list(filtered.keys()):
+                    if regime_map.get(t) == "CRISIS":
+                        if np.random.rand() > self.CRISIS_EXPOSURE_SCALE:
+                            filtered.pop(t)
+
+                if not filtered:
+                    continue
 
                 trade_counter += len(filtered)
 
-                grouped_prices[execution_date] = {
-                    t: prices[t] for t in filtered if t in prices
-                }
+                if execution_date not in grouped_prices:
+                    grouped_prices[execution_date] = {}
+                    grouped_signals[execution_date] = {}
 
-                grouped_signals[execution_date] = filtered
+                for t in filtered:
+                    if t in prices:
+                        grouped_prices[execution_date][t] = prices[t]
+                        grouped_signals[execution_date][t] = filtered[t]
 
             if trade_counter < self.MIN_TRADES_PER_WINDOW:
                 logger.warning("Window skipped — insufficient trades.")
@@ -244,7 +247,8 @@ class WalkForwardValidator:
 
             if equity_curve:
                 scale = equity_curve[-1] / curve[0]
-                equity_curve.extend((curve * scale)[1:].tolist())
+                stitched = (curve * scale)[1:]
+                equity_curve.extend(stitched.tolist())
             else:
                 equity_curve.extend(curve.tolist())
 
