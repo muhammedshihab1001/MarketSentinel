@@ -235,3 +235,7 @@ def load_training_data(start_date, end_date):
     ])
 
     return df, dataset_hash
+
+if __name__ == "__main__":
+    print("TRAINING ENTRYPOINT TRIGGERED")
+    main()
