@@ -12,21 +12,23 @@ from core.schema.feature_schema import (
     MODEL_FEATURES
 )
 
+from core.market.universe import MarketUniverse
 from training.backtesting.backtest_engine import BacktestEngine
+from training.backtesting.regime import MarketRegimeDetector
 
 
 class StrategyRunner:
     """
-    Institutional strategy orchestration layer.
+    Institutional single-asset strategy runner.
 
     Guarantees:
     ✔ zero lookahead
+    ✔ inference-only feature mode
     ✔ schema-locked
-    ✔ neutral sentiment fallback
-    ✔ deterministic signals
-    ✔ no engine state carryover
+    ✔ deterministic signal flow
+    ✔ fresh engine state
     ✔ probability sanity
-    ✔ temporal boundary enforcement
+    ✔ regime-aware execution
     """
 
     MIN_PROB_STD = 1e-5
@@ -38,6 +40,7 @@ class StrategyRunner:
         self.feature_store = FeatureStore()
         self.sentiment = SentimentAnalyzer()
         self.news_fetcher = NewsFetcher()
+        self.regime_detector = MarketRegimeDetector()
 
     ###################################################
 
@@ -93,13 +96,12 @@ class StrategyRunner:
             raise RuntimeError("No market data returned.")
 
         ############################################
-        # NEWS — NEVER BLOCK
+        # NEWS — SAFE FALLBACK
         ############################################
 
         sentiment_df = None
 
         try:
-
             news_df = self.news_fetcher.fetch(
                 f"{ticker} stock",
                 max_items=200
@@ -111,35 +113,45 @@ class StrategyRunner:
                 sentiment_df = self.sentiment.aggregate_daily_sentiment(scored)
 
         except Exception:
-            pass  # fallback handled in feature store
+            sentiment_df = None  # Never block execution
 
         ############################################
-        # FEATURES
+        # FEATURES (INFERENCE MODE)
         ############################################
 
         dataset = self.feature_store.get_features(
             price_df,
             sentiment_df,
             ticker=ticker,
-            training=True
+            training=False  # 🔥 FIX — inference mode
         )
 
         if dataset.empty:
-            raise RuntimeError("Feature pipeline returned empty dataset")
+            raise RuntimeError("Feature pipeline returned empty dataset.")
 
         ############################################
-        # SCHEMA LOCK
+        # REGIME DETECTION (SINGLE ASSET SAFE)
         ############################################
 
-        validate_feature_schema(dataset.loc[:, MODEL_FEATURES])
+        dataset = self.regime_detector.detect(dataset)
 
         ############################################
-        # STRICT NO LOOKAHEAD
+        # SORT + VALIDATE
         ############################################
 
         dataset = dataset.sort_values("date").reset_index(drop=True)
 
         self._assert_temporal_integrity(dataset)
+
+        validated_features = validate_feature_schema(
+            dataset.loc[:, MODEL_FEATURES]
+        )
+
+        dataset.loc[:, MODEL_FEATURES] = validated_features
+
+        ############################################
+        # MODEL INFERENCE
+        ############################################
 
         features = dataset.loc[:, MODEL_FEATURES].to_numpy(dtype=np.float32)
 
@@ -148,13 +160,18 @@ class StrategyRunner:
         self._validate_probabilities(probs)
 
         ################################################
-        # SAFE SHIFT — NO np.roll EVER
+        # SAFE SHIFT — EXECUTION LAG
         ################################################
 
-        probs = pd.Series(probs).shift(1).fillna(0.5).to_numpy()
+        probs = (
+            pd.Series(probs)
+            .shift(1)
+            .fillna(0.5)
+            .to_numpy()
+        )
 
         ############################################
-        # FRESH ENGINES (NO STATE LEAK)
+        # FRESH ENGINE INSTANCES
         ############################################
 
         decision_engine = DecisionEngine()
@@ -170,7 +187,7 @@ class StrategyRunner:
             predicted_return = prob_up - 0.5
 
             signal_dict = decision_engine.generate(
-                ticker=ticker,   # <<< CRITICAL FIX
+                ticker=ticker,
                 predicted_return=predicted_return,
                 sentiment=float(row.get("avg_sentiment", 0.0)),
                 rsi=float(row.get("rsi", 50.0)),
@@ -178,18 +195,18 @@ class StrategyRunner:
                 volatility=float(row.get("volatility", 0.02)),
                 lstm_prices=np.array([row["close"]]),
                 macro_trend="NEUTRAL",
-                regime=row.get("regime", None)
+                regime=row.get("regime", "SIDEWAYS")
             )
 
             signals.append(signal_dict["signal"])
 
-        prices = dataset["close"].to_numpy(dtype=float)
-
-        self._assert_prices(prices)
-
         ############################################
         # BACKTEST
         ############################################
+
+        prices = dataset["close"].to_numpy(dtype=float)
+
+        self._assert_prices(prices)
 
         results = backtest_engine.run(
             prices=prices,
