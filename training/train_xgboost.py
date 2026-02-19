@@ -14,7 +14,6 @@ from core.data.market_data_service import MarketDataService
 from core.features.feature_store import FeatureStore
 from core.schema.feature_schema import (
     MODEL_FEATURES,
-    validate_feature_schema,
     get_schema_signature
 )
 
@@ -22,8 +21,6 @@ from core.artifacts.metadata_manager import MetadataManager
 from core.artifacts.model_registry import ModelRegistry
 
 from training.backtesting.walk_forward import WalkForwardValidator
-from training.backtesting.regime import MarketRegimeDetector
-
 from models.xgboost_model import (
     build_xgboost_model,
     build_final_xgboost_model
@@ -78,38 +75,14 @@ def save_model_atomic(model, path):
 
 
 ############################################################
-# ADD REGIME FEATURE
-############################################################
-
-def add_regime_feature(df: pd.DataFrame) -> pd.DataFrame:
-
-    detector = MarketRegimeDetector()
-    df = detector.detect(df)
-
-    mapping = {
-        "BULL": 1.0,
-        "NEUTRAL": 0.0,
-        "CRISIS": -1.0
-    }
-
-    df["regime_feature"] = (
-        df["regime"]
-        .map(mapping)
-        .fillna(0.0)
-        .astype(np.float32)
-    )
-
-    return df
-
-
-############################################################
-# CROSS SECTION LABELING (MARKET NEUTRAL)
+# MARKET-NEUTRAL CROSS-SECTION LABELING
 ############################################################
 
 def apply_cross_sectional_target(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
 
+    # Extract benchmark return
     benchmark = df[df["ticker"] == BENCHMARK_TICKER][
         ["date", "forward_return"]
     ].rename(columns={"forward_return": "benchmark_return"})
@@ -117,6 +90,7 @@ def apply_cross_sectional_target(df):
     df = df.merge(benchmark, on="date", how="left")
     df["benchmark_return"] = df["benchmark_return"].fillna(0.0)
 
+    # Market-neutral alpha
     df["alpha"] = df["forward_return"] - df["benchmark_return"]
 
     safe_vol = df["volatility"].clip(lower=1e-4)
@@ -194,6 +168,7 @@ def load_training_data(start_date, end_date):
                 end_date=end_date
             )
 
+            # FeatureStore already validates RAW features
             dataset = store.get_features(
                 price_df,
                 sentiment_df=None,
@@ -216,18 +191,20 @@ def load_training_data(start_date, end_date):
 
     logger.info("Raw dataset rows=%s", len(df))
 
-    # 🔥 ADD REGIME FEATURE BEFORE LABELING
-    df = add_regime_feature(df)
-
+    # Label
     df = apply_cross_sectional_target(df)
 
     if df["target"].nunique() < 2:
         raise RuntimeError("Label collapse after labeling.")
 
+    logger.info("Post-label rows=%s", len(df))
+
+    # Normalize (MODEL DOMAIN)
     df = cross_sectional_normalize(df)
 
-    validate_feature_schema(df.loc[:, MODEL_FEATURES])
+    logger.info("Final normalized rows=%s", len(df))
 
+    # Dataset hash
     hash_df = df[
         ["ticker", "date", "target", *MODEL_FEATURES]
     ].sort_values(["date", "ticker"]).reset_index(drop=True)
@@ -261,6 +238,10 @@ def main(start_date=None, end_date=None):
 
     df, dataset_hash = load_training_data(start_date, end_date)
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    ########################################################
+    # TRAINER
+    ########################################################
 
     def trainer(d):
 
@@ -296,9 +277,43 @@ def main(start_date=None, end_date=None):
 
         return calibrated
 
+
+    ########################################################
+    # SIGNAL GENERATOR
+    ########################################################
+
+    def signal_generator(model, test_df):
+
+        probs = model.predict_proba(
+            test_df.loc[:, MODEL_FEATURES]
+        )[:, 1]
+
+        df_local = test_df.copy()
+        df_local["prob"] = probs
+        df_local["signal"] = "HOLD"
+
+        for date, group in df_local.groupby("date"):
+
+            k = max(1, int(len(group) * TOP_K_PERCENT))
+
+            sorted_group = group.sort_values("prob", ascending=False)
+
+            long_idx = sorted_group.head(k).index
+            short_idx = sorted_group.tail(k).index
+
+            df_local.loc[long_idx, "signal"] = "BUY"
+            df_local.loc[short_idx, "signal"] = "SELL"
+
+        return df_local["signal"].tolist(), probs
+
+
+    ########################################################
+    # WALK FORWARD
+    ########################################################
+
     wf = WalkForwardValidator(
         model_trainer=trainer,
-        signal_generator=None  # using internal rank logic
+        signal_generator=signal_generator
     )
 
     metrics = wf.run(df)
@@ -308,6 +323,10 @@ def main(start_date=None, end_date=None):
         metrics["avg_sharpe"],
         metrics["avg_strategy_return"]
     )
+
+    ########################################################
+    # FINAL MODEL
+    ########################################################
 
     final_model = build_final_xgboost_model(df["target"])
     final_model.fit(df.loc[:, MODEL_FEATURES], df["target"])
@@ -319,9 +338,15 @@ def main(start_date=None, end_date=None):
 
         save_model_atomic(final_model, model_path)
 
+        clean_metrics = {
+            k: float(v)
+            for k, v in metrics.items()
+            if not isinstance(v, list)
+        }
+
         metadata = MetadataManager.create_metadata(
             model_name="xgboost_direction",
-            metrics=metrics,
+            metrics=clean_metrics,
             features=list(MODEL_FEATURES),
             training_start=start_date,
             training_end=end_date,
