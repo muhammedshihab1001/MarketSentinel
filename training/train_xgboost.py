@@ -1,6 +1,5 @@
 import os
 import tempfile
-import shutil
 import time
 import joblib
 import pandas as pd
@@ -75,15 +74,47 @@ def save_model_atomic(model, path):
 
 
 ############################################################
+# CROSS SECTION LABELING
+############################################################
+
+def apply_cross_sectional_target(df):
+
+    df = df.sort_values(["date", "ticker"]).copy()
+
+    def label_date(group):
+
+        if len(group) < 4:
+            group["target"] = np.nan
+            return group
+
+        safe_vol = group["volatility"].clip(lower=1e-4)
+        risk_adj = (group["forward_return"] / safe_vol).clip(-5, 5)
+
+        upper = risk_adj.quantile(0.75)
+        lower = risk_adj.quantile(0.25)
+
+        group["target"] = np.where(
+            risk_adj >= upper, 1,
+            np.where(risk_adj <= lower, 0, np.nan)
+        )
+
+        return group
+
+    df = df.groupby("date", group_keys=False).apply(label_date)
+
+    df = df.dropna(subset=["target"])
+    df["target"] = df["target"].astype("int8")
+
+    return df.reset_index(drop=True)
+
+
+############################################################
 # CROSS SECTION NORMALIZATION
 ############################################################
 
 def cross_sectional_normalize(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
-
-    counts = df.groupby("date")["ticker"].transform("count")
-    df = df[counts >= 2]
 
     grouped = df.groupby("date")
 
@@ -136,9 +167,20 @@ def load_training_data(start_date, end_date):
     df = pd.concat(datasets, ignore_index=True)
 
     if len(df) < MIN_TRAINING_ROWS:
-        raise RuntimeError("Dataset too small.")
+        raise RuntimeError("Dataset too small before labeling.")
 
     logger.info("Raw dataset rows=%s", len(df))
+
+    ########################################################
+    # APPLY TARGET HERE (FIXED ARCHITECTURE)
+    ########################################################
+
+    df = apply_cross_sectional_target(df)
+
+    if df["target"].nunique() < 2:
+        raise RuntimeError("Label collapse after cross-sectional labeling.")
+
+    logger.info("Post-label rows=%s", len(df))
 
     df = cross_sectional_normalize(df)
 
@@ -190,22 +232,13 @@ def main(start_date=None, end_date=None):
         X = d.loc[:, MODEL_FEATURES]
         y = d["target"]
 
-        if y.nunique() < 2:
-            raise RuntimeError("Label collapse before training.")
-
         split_index = int(len(d) * 0.85)
-
-        if split_index < 100:
-            raise RuntimeError("Training split too small.")
 
         X_train = X.iloc[:split_index]
         y_train = y.iloc[:split_index]
 
         X_val = X.iloc[split_index:]
         y_val = y.iloc[split_index:]
-
-        if y_val.nunique() < 2:
-            raise RuntimeError("Validation label collapse.")
 
         model = build_xgboost_model(y_train)
 
@@ -227,48 +260,16 @@ def main(start_date=None, end_date=None):
         return calibrated
 
     ########################################################
-    # SIGNAL GENERATOR
-    ########################################################
-
-    def wf_signal_generator(model, test_df):
-
-        probs = model.predict_proba(
-            test_df.loc[:, MODEL_FEATURES]
-        )[:, 1]
-
-        if not np.isfinite(probs).all():
-            raise RuntimeError("Non-finite probabilities detected.")
-
-        prob_std = float(np.std(probs))
-        prob_min = float(np.min(probs))
-        prob_max = float(np.max(probs))
-
-        logger.info(
-            "Prob stats | std=%.4f min=%.3f max=%.3f",
-            prob_std,
-            prob_min,
-            prob_max
-        )
-
-        if prob_std < MIN_PROB_SPREAD:
-            logger.info("Probability dispersion weak but allowed.")
-
-        signals = [
-            "BUY" if p > 0.55
-            else "SELL" if p < 0.45
-            else "HOLD"
-            for p in probs
-        ]
-
-        return signals, probs
-
-    ########################################################
     # WALK FORWARD
     ########################################################
 
     wf = WalkForwardValidator(
         model_trainer=trainer,
-        signal_generator=wf_signal_generator
+        signal_generator=lambda m, t: (
+            ["BUY" if p > 0.55 else "SELL" if p < 0.45 else "HOLD"
+             for p in m.predict_proba(t.loc[:, MODEL_FEATURES])[:, 1]],
+            m.predict_proba(t.loc[:, MODEL_FEATURES])[:, 1]
+        )
     )
 
     metrics = wf.run(df)
@@ -282,9 +283,6 @@ def main(start_date=None, end_date=None):
     ########################################################
     # FINAL MODEL
     ########################################################
-
-    if df["target"].nunique() < 2:
-        raise RuntimeError("Final training label collapse.")
 
     final_model = build_final_xgboost_model(df["target"])
     final_model.fit(df.loc[:, MODEL_FEATURES], df["target"])
