@@ -92,36 +92,43 @@ def compute_class_weight(y):
 
 
 ###################################################
-# FEATURE VALIDATION
-###################################################
-
-def _validate_features(X):
-
-    if X.shape[1] != FEATURE_COUNT:
-        raise RuntimeError(
-            f"Feature schema mismatch. Expected {FEATURE_COUNT}, got {X.shape[1]}"
-        )
-
-    if not np.isfinite(X).all():
-        raise RuntimeError("Non-finite feature values detected.")
-
-
-###################################################
-# SAFE CLASSIFIER (FIXED)
+# SAFE CLASSIFIER (FEATURE-NAME SAFE)
 ###################################################
 
 class SafeXGBClassifier(XGBClassifier):
 
     def fit(self, X, y, **kwargs):
+        """
+        IMPORTANT:
+        - Do NOT convert to numpy.
+        - Preserve pandas column names.
+        - Validate safely.
+        """
 
-        X = np.asarray(X)
-        _validate_features(X)
+        if not hasattr(X, "shape"):
+            raise RuntimeError("Invalid feature matrix passed to XGBoost.")
+
+        if X.shape[1] != FEATURE_COUNT:
+            raise RuntimeError(
+                f"Feature schema mismatch. Expected {FEATURE_COUNT}, got {X.shape[1]}"
+            )
+
+        # Validate finiteness safely
+        if hasattr(X, "to_numpy"):
+            if not np.isfinite(X.to_numpy()).all():
+                raise RuntimeError("Non-finite feature values detected.")
+        else:
+            if not np.isfinite(X).all():
+                raise RuntimeError("Non-finite feature values detected.")
 
         logger.info(
             "XGBoost training started | rows=%s cols=%s",
             X.shape[0],
             X.shape[1]
         )
+
+        # Remove early stopping if accidentally passed
+        kwargs.pop("early_stopping_rounds", None)
 
         return super().fit(X, y, **kwargs)
 
