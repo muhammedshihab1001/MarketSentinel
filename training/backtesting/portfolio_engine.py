@@ -16,14 +16,9 @@ class PortfolioBacktestEngine:
     MAX_POSITION_WEIGHT = 0.05
     MAX_GROSS_EXPOSURE = 0.70
 
-    MIN_EQUITY_FLOOR = 0.60  # Hard stop
+    MIN_EQUITY_FLOOR = 0.60
 
-    VOL_KILL_SWITCH = 0.07
-
-    DRAWDOWN_REDUCTION_START = -0.15
-    DRAWDOWN_MAX_REDUCTION = -0.35
-
-    VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
+    VALID_SIGNALS = {"BUY", "SELL"}
 
     ###################################################
 
@@ -31,11 +26,9 @@ class PortfolioBacktestEngine:
         self,
         transaction_cost=0.001,
         base_slippage=0.0006,
-        target_vol=0.015
     ):
         self.transaction_cost = transaction_cost
         self.base_slippage = base_slippage
-        self.target_vol = target_vol
 
         self.return_buffers = defaultdict(list)
 
@@ -48,7 +41,7 @@ class PortfolioBacktestEngine:
     # VOL TRACKING
     ###################################################
 
-    def _update_buffers(self, prev_prices, prices):
+    def _update_volatility(self, prev_prices, prices):
 
         vols = {}
 
@@ -64,49 +57,29 @@ class PortfolioBacktestEngine:
                 if len(buf) > self.VOL_WINDOW:
                     buf.pop(0)
 
-                vol = np.std(buf) if len(buf) > 5 else self.target_vol
+                vol = np.std(buf) if len(buf) > 5 else 0.02
                 vols[ticker] = max(vol, 1e-4)
 
             else:
-                vols[ticker] = self.target_vol
+                vols[ticker] = 0.02
 
         return vols
-
-    ###################################################
-    # DRAWDOWN SCALER
-    ###################################################
-
-    def _drawdown_scaler(self, curve):
-
-        peak = np.maximum.accumulate(curve)
-        dd = (curve[-1] - peak[-1]) / peak[-1]
-
-        if dd > self.DRAWDOWN_REDUCTION_START:
-            return 1.0
-
-        if dd < self.DRAWDOWN_MAX_REDUCTION:
-            return 0.4
-
-        span = self.DRAWDOWN_MAX_REDUCTION - self.DRAWDOWN_REDUCTION_START
-        pos = dd - self.DRAWDOWN_REDUCTION_START
-
-        return 1.0 + (pos / span) * (0.4 - 1.0)
 
     ###################################################
     # WEIGHT ENGINE
     ###################################################
 
-    def _compute_weights(self, signals, vols, exposure_scale):
+    def _compute_weights(self, signals, vols):
 
         raw = {}
 
         for t, s in signals.items():
 
-            if s not in self.VALID_SIGNALS or s == "HOLD":
+            if s not in self.VALID_SIGNALS:
                 continue
 
             direction = 1 if s == "BUY" else -1
-            vol = vols.get(t, self.target_vol)
+            vol = vols.get(t, 0.02)
 
             inv_vol = min(1 / max(vol, 1e-4), self.MAX_INV_VOL)
 
@@ -119,7 +92,7 @@ class PortfolioBacktestEngine:
 
         weights = {
             t: np.clip(
-                (v / total) * exposure_scale,
+                v / total,
                 -self.MAX_POSITION_WEIGHT,
                 self.MAX_POSITION_WEIGHT
             )
@@ -135,7 +108,7 @@ class PortfolioBacktestEngine:
         return weights
 
     ###################################################
-    # EXECUTION
+    # MAIN BACKTEST
     ###################################################
 
     def run(self, grouped_prices, grouped_signals, initial_cash=10000):
@@ -147,9 +120,9 @@ class PortfolioBacktestEngine:
         cash = float(initial_cash)
         positions = {}
         equity_curve = []
+        turnover = []
 
         prev_prices = None
-        portfolio_returns = []
 
         for date in sorted(grouped_prices.keys()):
 
@@ -159,49 +132,29 @@ class PortfolioBacktestEngine:
             if not prices:
                 continue
 
-            if prev_prices is None:
-                prev_prices = prices
-                equity_curve.append(cash)
-                continue
-
             ###################################################
-            # MARK TO MARKET FIRST
+            # 1️⃣ MARK TO MARKET USING PREVIOUS POSITIONS
             ###################################################
 
             portfolio_value = cash + sum(
                 positions.get(t, 0) * prices.get(t, 0)
                 for t in positions
+                if t in prices
             )
 
             equity_curve.append(float(portfolio_value))
-
-            if len(equity_curve) > 1:
-                r = (equity_curve[-1] / equity_curve[-2]) - 1
-                portfolio_returns.append(r)
-
-            ###################################################
-            # HARD EQUITY FLOOR
-            ###################################################
 
             if portfolio_value < initial_cash * self.MIN_EQUITY_FLOOR:
                 logger.warning("Equity floor breached — stopping simulation.")
                 break
 
             ###################################################
-            # VOL & DD SCALING (BEFORE TRADE)
+            # 2️⃣ COMPUTE TARGET WEIGHTS
             ###################################################
 
-            vols = self._update_buffers(prev_prices, prices)
+            vols = self._update_volatility(prev_prices, prices)
 
-            dd_scale = self._drawdown_scaler(np.array(equity_curve))
-
-            exposure_scale = dd_scale
-
-            ###################################################
-            # COMPUTE TARGET WEIGHTS
-            ###################################################
-
-            weights = self._compute_weights(signals, vols, exposure_scale)
+            weights = self._compute_weights(signals, vols)
 
             deployable = portfolio_value * (1 - self.CASH_BUFFER)
 
@@ -212,24 +165,38 @@ class PortfolioBacktestEngine:
             }
 
             ###################################################
-            # TRADE EXECUTION
+            # 3️⃣ FORCE LIQUIDATION OF REMOVED POSITIONS
             ###################################################
 
-            for ticker in set(positions) | set(target_positions):
+            for t in list(positions.keys()):
+                if t not in target_positions:
+                    delta = -positions[t]
+                    trade_notional = abs(delta) * prices.get(t, 0)
 
-                if ticker not in prices:
-                    continue
+                    cost = trade_notional * (
+                        self.transaction_cost + self.base_slippage
+                    )
+
+                    cash -= delta * prices.get(t, 0)
+                    cash -= cost
+
+                    positions.pop(t)
+
+            ###################################################
+            # 4️⃣ EXECUTE NEW TARGETS
+            ###################################################
+
+            day_turnover = 0.0
+
+            for ticker, target in target_positions.items():
 
                 current = positions.get(ticker, 0)
-                target = target_positions.get(ticker, 0)
-
                 delta = target - current
 
                 if abs(delta) < self.EPSILON:
                     continue
 
                 trade_notional = abs(delta) * prices[ticker]
-
                 cost = trade_notional * (
                     self.transaction_cost + self.base_slippage
                 )
@@ -240,12 +207,11 @@ class PortfolioBacktestEngine:
                 cash -= delta * prices[ticker]
                 cash -= cost
 
-                new_position = current + delta
+                positions[ticker] = current + delta
 
-                if abs(new_position) < self.EPSILON:
-                    positions.pop(ticker, None)
-                else:
-                    positions[ticker] = new_position
+                day_turnover += trade_notional
+
+            turnover.append(day_turnover / portfolio_value if portfolio_value > 0 else 0)
 
             prev_prices = prices
 
@@ -263,7 +229,7 @@ class PortfolioBacktestEngine:
                 "equity_curve": curve.tolist()
             }
 
-        returns = np.diff(curve) / np.maximum(curve[:-1], self.EPSILON)
+        returns = np.diff(curve) / np.maximum(curve[:-1], 1e-12)
 
         vol = max(np.std(returns), 1e-6)
 
@@ -284,6 +250,6 @@ class PortfolioBacktestEngine:
             "strategy_return": float(curve[-1] / initial_cash - 1),
             "max_drawdown": float(drawdown.min()),
             "sharpe_ratio": float(sharpe),
-            "avg_turnover": 0.0,
+            "avg_turnover": float(np.mean(turnover)),
             "equity_curve": curve.tolist()
         }
