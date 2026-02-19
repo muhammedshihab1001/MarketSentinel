@@ -79,7 +79,7 @@ class FeatureEngineer:
         df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
 
     ########################################################
-    # VOLATILITY (FIXED + SAFE)
+    # VOLATILITY
     ########################################################
 
     @classmethod
@@ -103,24 +103,12 @@ class FeatureEngineer:
 
         df["volatility"] = df["volatility_5"]
 
-        # SAFE FILL
-        df["volatility"] = (
-            df["volatility"]
-            .fillna(cls.VOL_FLOOR)
-            .clip(lower=cls.VOL_FLOOR)
-        )
-
-        df["volatility_5"] = (
-            df["volatility_5"]
-            .fillna(cls.VOL_FLOOR)
-            .clip(lower=cls.VOL_FLOOR)
-        )
-
-        df["volatility_20"] = (
-            df["volatility_20"]
-            .fillna(cls.VOL_FLOOR)
-            .clip(lower=cls.VOL_FLOOR)
-        )
+        for col in ["volatility", "volatility_5", "volatility_20"]:
+            df[col] = (
+                df[col]
+                .fillna(cls.VOL_FLOOR)
+                .clip(lower=cls.VOL_FLOOR)
+            )
 
     ########################################################
     # RSI
@@ -183,7 +171,7 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # TARGET
+    # 🚀 FIXED TARGET (CROSS-SECTIONAL)
     ########################################################
 
     @classmethod
@@ -201,15 +189,25 @@ class FeatureEngineer:
         df = df.dropna(subset=["forward_return"])
 
         safe_vol = df["volatility"].clip(lower=cls.VOL_FLOOR)
-        risk_adj = (df["forward_return"] / safe_vol).clip(-5, 5)
+        df["risk_adj"] = (df["forward_return"] / safe_vol).clip(-5, 5)
 
-        upper = risk_adj.quantile(0.75)
-        lower = risk_adj.quantile(0.25)
+        # 🔥 CROSS-SECTIONAL labeling per date
+        def label_date(group):
+            if len(group) < 4:
+                group["target"] = np.nan
+                return group
 
-        df["target"] = np.where(
-            risk_adj >= upper, 1,
-            np.where(risk_adj <= lower, 0, np.nan)
-        )
+            upper = group["risk_adj"].quantile(0.75)
+            lower = group["risk_adj"].quantile(0.25)
+
+            group["target"] = np.where(
+                group["risk_adj"] >= upper, 1,
+                np.where(group["risk_adj"] <= lower, 0, np.nan)
+            )
+
+            return group
+
+        df = df.groupby("date", group_keys=False).apply(label_date)
 
         df = df.dropna(subset=["target", *MODEL_FEATURES])
 
