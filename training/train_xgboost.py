@@ -111,7 +111,6 @@ def load_training_data(start_date, end_date):
     store = FeatureStore()
 
     universe = MarketUniverse.get_universe()
-
     datasets = []
 
     for ticker in universe:
@@ -186,7 +185,7 @@ def main(start_date=None, end_date=None):
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     ########################################################
-    # TRAINER WITH CHRONOLOGICAL SPLIT
+    # TRAINER (STRICT CHRONO SPLIT)
     ########################################################
 
     def trainer(d):
@@ -196,13 +195,22 @@ def main(start_date=None, end_date=None):
         X = d.loc[:, MODEL_FEATURES]
         y = d["target"]
 
+        if y.nunique() < 2:
+            raise RuntimeError("Label collapse before training.")
+
         split_index = int(len(d) * 0.85)
+
+        if split_index < 100:
+            raise RuntimeError("Training split too small.")
 
         X_train = X.iloc[:split_index]
         y_train = y.iloc[:split_index]
 
         X_val = X.iloc[split_index:]
         y_val = y.iloc[split_index:]
+
+        if y_val.nunique() < 2:
+            raise RuntimeError("Validation label collapse.")
 
         model = build_xgboost_model(y_train)
 
@@ -232,6 +240,9 @@ def main(start_date=None, end_date=None):
         probs = model.predict_proba(
             test_df.loc[:, MODEL_FEATURES]
         )[:, 1]
+
+        if not np.isfinite(probs).all():
+            raise RuntimeError("Non-finite probabilities detected.")
 
         if np.std(probs) < MIN_PROB_SPREAD:
             logger.info("Probability spread too small - skipping day.")
@@ -264,13 +275,20 @@ def main(start_date=None, end_date=None):
     )
 
     ########################################################
-    # FINAL MODEL
+    # FINAL MODEL (FULL DATA)
     ########################################################
 
-    final_model = build_final_xgboost_model(df["target"])
-    final_model.fit(df.loc[:, MODEL_FEATURES], df["target"])
+    if df["target"].nunique() < 2:
+        raise RuntimeError("Final training label collapse.")
 
-    size = save_model_atomic(final_model, TEMP_MODEL_PATH)
+    final_model = build_final_xgboost_model(df["target"])
+
+    final_model.fit(
+        df.loc[:, MODEL_FEATURES],
+        df["target"]
+    )
+
+    save_model_atomic(final_model, TEMP_MODEL_PATH)
 
     clean_metrics = {
         k: float(v)
