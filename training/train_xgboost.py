@@ -38,7 +38,8 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_MODEL_BYTES = 50_000
-MIN_PROB_STD = 0.025   # stronger signal requirement
+
+TOP_K_PERCENT = 0.20   # 🔥 top/bottom 20% cross-sectional
 
 
 ############################################################
@@ -74,7 +75,7 @@ def save_model_atomic(model, path):
 
 
 ############################################################
-# CROSS SECTION LABELING (80/20)
+# CROSS SECTION LABELING
 ############################################################
 
 def apply_cross_sectional_target(df):
@@ -104,7 +105,6 @@ def apply_cross_sectional_target(df):
         labeled.append(group)
 
     df = pd.concat(labeled, ignore_index=True)
-
     df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype("int8")
 
@@ -222,7 +222,6 @@ def main(start_date=None, end_date=None):
         start_date, end_date = MarketTime.window_for("xgboost")
 
     df, dataset_hash = load_training_data(start_date, end_date)
-
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     ########################################################
@@ -265,7 +264,7 @@ def main(start_date=None, end_date=None):
 
 
     ########################################################
-    # SIGNAL GENERATOR (WITH HARD DISPERSION CHECK)
+    # NEW SIGNAL GENERATOR (RANK-BASED)
     ########################################################
 
     def signal_generator(model, test_df):
@@ -274,20 +273,25 @@ def main(start_date=None, end_date=None):
             test_df.loc[:, MODEL_FEATURES]
         )[:, 1]
 
-        prob_std = float(np.std(probs))
-        logger.info("Probability std=%.4f", prob_std)
+        df_local = test_df.copy()
+        df_local["prob"] = probs
 
-        if prob_std < MIN_PROB_STD:
-            logger.info("Weak signal detected — forcing HOLD.")
-            signals = ["HOLD"] * len(probs)
-            return signals, probs
+        signals = []
 
-        signals = [
-            "BUY" if p > 0.60
-            else "SELL" if p < 0.40
-            else "HOLD"
-            for p in probs
-        ]
+        for date, group in df_local.groupby("date"):
+
+            k = max(1, int(len(group) * TOP_K_PERCENT))
+
+            group = group.sort_values("prob", ascending=False)
+
+            longs = group.head(k).index
+            shorts = group.tail(k).index
+
+            date_signals = pd.Series("HOLD", index=group.index)
+            date_signals.loc[longs] = "BUY"
+            date_signals.loc[shorts] = "SELL"
+
+            signals.extend(date_signals.sort_index().tolist())
 
         return signals, probs
 
@@ -316,7 +320,6 @@ def main(start_date=None, end_date=None):
     final_model = build_final_xgboost_model(df["target"])
     final_model.fit(df.loc[:, MODEL_FEATURES], df["target"])
 
-    # 🔍 FEATURE IMPORTANCE LOGGING
     importances = final_model.feature_importances_
     for name, val in zip(MODEL_FEATURES, importances):
         logger.info("Feature importance | %s = %.6f", name, float(val))
