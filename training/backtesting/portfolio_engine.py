@@ -45,11 +45,16 @@ class PortfolioBacktestEngine:
 
         vols = {}
 
-        for ticker in prices:
+        for ticker, price in prices.items():
 
             if prev_prices and ticker in prev_prices:
 
-                ret = prices[ticker] / prev_prices[ticker] - 1
+                prev = prev_prices[ticker]
+                if prev <= 0:
+                    vols[ticker] = 0.02
+                    continue
+
+                ret = price / prev - 1
 
                 buf = self.return_buffers[ticker]
                 buf.append(ret)
@@ -88,17 +93,21 @@ class PortfolioBacktestEngine:
         if not raw:
             return {}
 
-        total = sum(abs(v) for v in raw.values())
+        total_abs = sum(abs(v) for v in raw.values())
+
+        if total_abs < self.EPSILON:
+            return {}
 
         weights = {
             t: np.clip(
-                v / total,
+                (v / total_abs) * self.MAX_GROSS_EXPOSURE,
                 -self.MAX_POSITION_WEIGHT,
                 self.MAX_POSITION_WEIGHT
             )
             for t, v in raw.items()
         }
 
+        # Re-normalize if clipping distorted exposure
         gross = sum(abs(w) for w in weights.values())
 
         if gross > self.MAX_GROSS_EXPOSURE:
@@ -122,25 +131,27 @@ class PortfolioBacktestEngine:
         equity_curve = []
         turnover = []
 
-        prev_prices = None
+        prev_prices = {}
 
         for date in sorted(grouped_prices.keys()):
 
-            prices = grouped_prices[date]
-            signals = grouped_signals[date]
+            prices = grouped_prices.get(date, {})
+            signals = grouped_signals.get(date, {})
 
             if not prices:
                 continue
 
             ###################################################
-            # 1️⃣ MARK TO MARKET USING PREVIOUS POSITIONS
+            # 1️⃣ SAFE MARK TO MARKET
             ###################################################
 
-            portfolio_value = cash + sum(
-                positions.get(t, 0) * prices.get(t, 0)
-                for t in positions
-                if t in prices
-            )
+            portfolio_value = cash
+
+            for t, qty in positions.items():
+                price = prices.get(t, prev_prices.get(t))
+                if price is None:
+                    continue
+                portfolio_value += qty * price
 
             equity_curve.append(float(portfolio_value))
 
@@ -149,7 +160,7 @@ class PortfolioBacktestEngine:
                 break
 
             ###################################################
-            # 2️⃣ COMPUTE TARGET WEIGHTS
+            # 2️⃣ TARGET WEIGHTS
             ###################################################
 
             vols = self._update_volatility(prev_prices, prices)
@@ -161,29 +172,35 @@ class PortfolioBacktestEngine:
             target_positions = {
                 t: (deployable * w) / prices[t]
                 for t, w in weights.items()
-                if t in prices
+                if t in prices and prices[t] > 0
             }
 
             ###################################################
-            # 3️⃣ FORCE LIQUIDATION OF REMOVED POSITIONS
+            # 3️⃣ LIQUIDATE REMOVED POSITIONS SAFELY
             ###################################################
 
             for t in list(positions.keys()):
+
                 if t not in target_positions:
+
+                    price = prices.get(t)
+                    if price is None:
+                        continue
+
                     delta = -positions[t]
-                    trade_notional = abs(delta) * prices.get(t, 0)
+                    trade_notional = abs(delta) * price
 
                     cost = trade_notional * (
                         self.transaction_cost + self.base_slippage
                     )
 
-                    cash -= delta * prices.get(t, 0)
+                    cash -= delta * price
                     cash -= cost
 
                     positions.pop(t)
 
             ###################################################
-            # 4️⃣ EXECUTE NEW TARGETS
+            # 4️⃣ EXECUTE TARGETS
             ###################################################
 
             day_turnover = 0.0
@@ -196,24 +213,29 @@ class PortfolioBacktestEngine:
                 if abs(delta) < self.EPSILON:
                     continue
 
-                trade_notional = abs(delta) * prices[ticker]
+                price = prices[ticker]
+                trade_notional = abs(delta) * price
+
                 cost = trade_notional * (
                     self.transaction_cost + self.base_slippage
                 )
 
-                if delta > 0 and (delta * prices[ticker] + cost) > cash:
+                if delta > 0 and (delta * price + cost) > cash:
                     continue
 
-                cash -= delta * prices[ticker]
+                cash -= delta * price
                 cash -= cost
 
                 positions[ticker] = current + delta
 
                 day_turnover += trade_notional
 
-            turnover.append(day_turnover / portfolio_value if portfolio_value > 0 else 0)
+            turnover.append(
+                day_turnover / portfolio_value
+                if portfolio_value > self.EPSILON else 0
+            )
 
-            prev_prices = prices
+            prev_prices = prices.copy()
 
         ###################################################
 
