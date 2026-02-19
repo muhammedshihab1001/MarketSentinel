@@ -21,7 +21,7 @@ class FeatureEngineer:
     MAX_INDICATOR_WINDOW = 60
     SPLIT_THRESHOLD = 3.5
 
-    FORWARD_DAYS = 5  # 🔥 UPGRADE: 5-day horizon
+    FORWARD_DAYS = 5  # 5-day prediction horizon
 
     ########################################################
     # PRICE VALIDATION
@@ -173,7 +173,7 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # DATASET BUILDER (5-DAY FORWARD RETURN)
+    # DATASET BUILDER (SAFE 5-DAY FORWARD RETURN)
     ########################################################
 
     @classmethod
@@ -181,10 +181,11 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"]).copy()
 
-        # 🔥 5-day forward log return
         df["forward_return"] = (
-            np.log(df["close"].shift(-cls.FORWARD_DAYS))
-            - np.log(df["close"])
+            df.groupby("ticker")["close"]
+            .transform(lambda x:
+                np.log(x.shift(-cls.FORWARD_DAYS)) - np.log(x)
+            )
         )
 
         df = df.dropna(subset=["forward_return"])
