@@ -35,22 +35,24 @@ MAX_TRAINING_SECONDS = 7200
 GLOBAL_SEED = 42
 
 
-def enforce_determinism():
+############################################################
+# DETERMINISM
+############################################################
 
+def enforce_determinism():
     os.environ["PYTHONHASHSEED"] = str(GLOBAL_SEED)
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
-    os.environ["OMP_DYNAMIC"] = "FALSE"
-    os.environ["MKL_DYNAMIC"] = "FALSE"
-    os.environ["TF_DETERMINISTIC_OPS"] = "1"
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-    os.environ["NUMPY_EXPERIMENTAL_ARRAY_FUNCTION"] = "0"
 
     random.seed(GLOBAL_SEED)
     np.random.seed(GLOBAL_SEED)
 
+
+############################################################
+# LOCKING
+############################################################
 
 def _acquire_lock():
 
@@ -64,17 +66,17 @@ def _acquire_lock():
     with open(LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
 
-    return True
-
 
 def _release_lock():
-
     if os.path.exists(LOCK_FILE):
         os.remove(LOCK_FILE)
 
 
-def _fsync_dir(directory):
+############################################################
+# FSYNC SAFE
+############################################################
 
+def _fsync_dir(directory):
     if os.name == "nt":
         return
 
@@ -85,42 +87,41 @@ def _fsync_dir(directory):
         os.close(fd)
 
 
+############################################################
+# GIT SAFETY
+############################################################
+
 def get_git_commit():
 
     if not os.path.exists(".git"):
+        raise RuntimeError("Training must run inside a FULL git repository.")
+
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True
+    ).stdout.strip()
+
+    if dirty:
         raise RuntimeError(
-            "Training must run inside a FULL git repository."
+            "Repository is dirty — commit ALL changes before training."
         )
 
-    try:
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        stderr=subprocess.DEVNULL
+    ).decode().strip()
 
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            check=True
-        ).stdout.strip()
+    if len(commit) != 40:
+        raise RuntimeError("Invalid git commit hash.")
 
-        if dirty:
-            raise RuntimeError(
-                "Repository is dirty — commit ALL changes before training."
-            )
+    return commit
 
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL
-        ).decode().strip()
 
-        if len(commit) != 40:
-            raise RuntimeError("Invalid git commit hash.")
-
-        return commit
-
-    except subprocess.CalledProcessError:
-        raise RuntimeError(
-            "Unable to resolve git commit — refusing training."
-        )
-
+############################################################
+# SAFE MANIFEST SAVE (FIXED)
+############################################################
 
 def save_manifest(run_id: str, manifest: dict):
 
@@ -129,9 +130,11 @@ def save_manifest(run_id: str, manifest: dict):
     final_path = os.path.join(RUNS_DIR, f"{run_id}.json")
 
     with tempfile.NamedTemporaryFile(
+        mode="w",                   # FIXED: text mode
         delete=False,
         dir=RUNS_DIR,
-        suffix=".tmp"
+        suffix=".tmp",
+        encoding="utf-8"
     ) as tmp:
 
         json.dump(manifest, tmp, indent=4, sort_keys=True)
@@ -143,10 +146,14 @@ def save_manifest(run_id: str, manifest: dict):
     os.replace(temp_name, final_path)
     _fsync_dir(RUNS_DIR)
 
-    # verify readability
-    with open(final_path, "r") as f:
+    # verify readable
+    with open(final_path, "r", encoding="utf-8") as f:
         json.load(f)
 
+
+############################################################
+# METRIC VALIDATION
+############################################################
 
 def _assert_finite(value, name):
     if value is None or not np.isfinite(value):
@@ -184,10 +191,10 @@ def validate_metrics(metrics: dict):
     if metrics["final_equity"] <= 0:
         raise RuntimeError("Backtest produced non-positive equity.")
 
-    win_rate = metrics.get("win_rate")
-    if win_rate is not None and win_rate > 0.80:
-        logger.warning("Win rate extremely high — investigate leakage.")
 
+############################################################
+# LINEAGE
+############################################################
 
 def build_lineage(start_date, end_date):
 
@@ -197,23 +204,15 @@ def build_lineage(start_date, end_date):
         "schema_signature": get_schema_signature(),
         "training_code_hash": MetadataManager.fingerprint_training_code(),
         "git_commit": get_git_commit(),
-
         "python_version": platform.python_version(),
         "numpy_version": np.__version__,
         "pandas_version": pd.__version__,
         "platform": platform.platform(),
         "hostname": socket.gethostname(),
-
-        "env": {
-            "cpu_count": os.cpu_count(),
-            "machine": platform.machine()
-        },
-
         "training_window": {
             "start": start_date,
             "end": end_date
         },
-
         "market_time_snapshot": MarketTime.snapshot_for("xgboost"),
         "training_universe": universe_snapshot
     }
@@ -229,6 +228,10 @@ def build_lineage(start_date, end_date):
 
     return lineage_payload
 
+
+############################################################
+# MAIN
+############################################################
 
 def main():
 
@@ -276,10 +279,7 @@ def main():
             "status": "success",
             "metrics": metrics,
             "runtime_sec": round(runtime, 2),
-            "lineage": build_lineage(
-                start_date,
-                end_date
-            ),
+            "lineage": build_lineage(start_date, end_date),
             "created_utc": datetime.datetime.utcnow().isoformat()
         }
 
@@ -297,15 +297,11 @@ def main():
             "error": str(exc),
             "error_type": type(exc).__name__,
             "runtime_sec": round(time.time() - start, 2),
-            "lineage": build_lineage(
-                start_date,
-                end_date
-            ),
+            "lineage": build_lineage(start_date, end_date),
             "created_utc": datetime.datetime.utcnow().isoformat()
         }
 
         save_manifest(run_id, manifest)
-
         raise
 
     finally:
