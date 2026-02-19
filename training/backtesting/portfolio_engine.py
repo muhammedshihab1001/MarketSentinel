@@ -107,7 +107,6 @@ class PortfolioBacktestEngine:
             for t, v in raw.items()
         }
 
-        # Re-normalize if clipping distorted exposure
         gross = sum(abs(w) for w in weights.values())
 
         if gross > self.MAX_GROSS_EXPOSURE:
@@ -126,6 +125,8 @@ class PortfolioBacktestEngine:
 
         self._reset_state()
 
+        window_start_cash = float(initial_cash)
+
         cash = float(initial_cash)
         positions = {}
         equity_curve = []
@@ -142,7 +143,7 @@ class PortfolioBacktestEngine:
                 continue
 
             ###################################################
-            # 1️⃣ SAFE MARK TO MARKET
+            # MARK TO MARKET
             ###################################################
 
             portfolio_value = cash
@@ -155,12 +156,16 @@ class PortfolioBacktestEngine:
 
             equity_curve.append(float(portfolio_value))
 
-            if portfolio_value < initial_cash * self.MIN_EQUITY_FLOOR:
+            ###################################################
+            # EQUITY FLOOR — FIXED
+            ###################################################
+
+            if portfolio_value < window_start_cash * self.MIN_EQUITY_FLOOR:
                 logger.warning("Equity floor breached — stopping simulation.")
                 break
 
             ###################################################
-            # 2️⃣ TARGET WEIGHTS
+            # TARGET WEIGHTS
             ###################################################
 
             vols = self._update_volatility(prev_prices, prices)
@@ -176,7 +181,7 @@ class PortfolioBacktestEngine:
             }
 
             ###################################################
-            # 3️⃣ LIQUIDATE REMOVED POSITIONS SAFELY
+            # LIQUIDATE REMOVED
             ###################################################
 
             for t in list(positions.keys()):
@@ -200,7 +205,7 @@ class PortfolioBacktestEngine:
                     positions.pop(t)
 
             ###################################################
-            # 4️⃣ EXECUTE TARGETS
+            # EXECUTE TARGETS
             ###################################################
 
             day_turnover = 0.0
@@ -243,7 +248,7 @@ class PortfolioBacktestEngine:
 
         if len(curve) < 2:
             return {
-                "final_portfolio": initial_cash,
+                "final_portfolio": window_start_cash,
                 "strategy_return": 0.0,
                 "max_drawdown": 0.0,
                 "sharpe_ratio": 0.0,
@@ -269,7 +274,7 @@ class PortfolioBacktestEngine:
 
         return {
             "final_portfolio": float(curve[-1]),
-            "strategy_return": float(curve[-1] / initial_cash - 1),
+            "strategy_return": float(curve[-1] / window_start_cash - 1),
             "max_drawdown": float(drawdown.min()),
             "sharpe_ratio": float(sharpe),
             "avg_turnover": float(np.mean(turnover)),
