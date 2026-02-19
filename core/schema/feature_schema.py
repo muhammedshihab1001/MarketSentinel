@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "19.0"   # upgraded — alpha expansion
+SCHEMA_VERSION = "20.0"  # hard enforcement + stability upgrade
 
 
 ############################################################
@@ -34,16 +34,15 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "volatility_5",
     "volatility_20",
 
-    # Momentum / Oscillator
+    # Momentum
     "rsi",
     "macd",
     "macd_signal",
 
-    # Trend strength
+    # Trend
     "ema_10",
     "ema_50",
     "ema_ratio",
-
 )
 
 FEATURE_COUNT = len(MODEL_FEATURES)
@@ -102,7 +101,6 @@ FORBIDDEN_REGEX = re.compile(
 def _check_forbidden_columns(df: pd.DataFrame):
 
     for col in df.columns:
-
         if not isinstance(col, str):
             raise RuntimeError("Non-string column detected.")
 
@@ -110,6 +108,27 @@ def _check_forbidden_columns(df: pd.DataFrame):
             raise RuntimeError(
                 f"Potential lookahead column detected: {col}"
             )
+
+
+############################################################
+# HARD LIMIT ENFORCEMENT
+############################################################
+
+def _enforce_feature_limits(df: pd.DataFrame) -> pd.DataFrame:
+
+    for col in MODEL_FEATURES:
+
+        if col not in FEATURE_LIMITS:
+            continue
+
+        lo, hi = FEATURE_LIMITS[col]
+
+        if (df[col] < lo).any() or (df[col] > hi).any():
+            raise RuntimeError(
+                f"Feature limit breach detected in {col}"
+            )
+
+    return df
 
 
 ############################################################
@@ -180,7 +199,13 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
     ########################################################
-    # FEATURE STABILITY CHECKS
+    # HARD LIMIT CHECK
+    ########################################################
+
+    feature_df = _enforce_feature_limits(feature_df)
+
+    ########################################################
+    # STABILITY CHECKS
     ########################################################
 
     for col in MODEL_FEATURES:
