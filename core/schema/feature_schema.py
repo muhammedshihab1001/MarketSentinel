@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "24.0"  # regime-aware upgrade
+SCHEMA_VERSION = "25.0"  # cross-sectional alpha upgrade
 
 
 ############################################################
@@ -21,24 +21,34 @@ SCHEMA_VERSION = "24.0"  # regime-aware upgrade
 
 MODEL_FEATURES: Tuple[str, ...] = (
 
+    # returns
     "return",
     "return_lag1",
     "return_lag5",
     "return_lag10",
 
+    # volatility
     "volatility",
     "volatility_5",
     "volatility_20",
 
+    # momentum booster
+    "momentum_20",
+
+    # cross-sectional rank
+    "rank_return",
+
+    # technical
     "rsi",
     "macd",
     "macd_signal",
 
+    # trend
     "ema_10",
     "ema_50",
     "ema_ratio",
 
-    # 🔥 NEW REGIME FEATURE
+    # regime
     "regime_feature",
 )
 
@@ -65,25 +75,35 @@ MIN_VARIANCE = 1e-8
 
 FEATURE_LIMITS: Dict[str, tuple] = {
 
+    # returns
     "return": (-15.0, 15.0),
     "return_lag1": (-15.0, 15.0),
     "return_lag5": (-15.0, 15.0),
     "return_lag10": (-15.0, 15.0),
 
+    # volatility
     "volatility": (0.0, 20.0),
     "volatility_5": (0.0, 20.0),
     "volatility_20": (0.0, 20.0),
 
+    # momentum
+    "momentum_20": (-5.0, 5.0),
+
+    # cross-sectional rank
+    "rank_return": (0.0, 1.0),
+
+    # technical
     "rsi": (-10.0, 110.0),
 
     "macd": (-2000.0, 2000.0),
     "macd_signal": (-2000.0, 2000.0),
 
+    # trend
     "ema_10": (0.0, 1e6),
     "ema_50": (0.0, 1e6),
     "ema_ratio": (-20.0, 20.0),
 
-    # 🔥 regime bounds
+    # regime
     "regime_feature": (-2.0, 2.0),
 }
 
@@ -187,10 +207,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     _check_forbidden_columns(df)
 
-    try:
-        feature_df = df.astype(DTYPE, copy=True)
-    except Exception as e:
-        raise RuntimeError(f"Non-numeric feature detected → {e}")
+    feature_df = df.astype(DTYPE, copy=True)
 
     feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
@@ -229,11 +246,6 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         raise RuntimeError(
             f"Unsafe NaN ratio detected: {unsafe.to_dict()}"
         )
-
-    row_nan_ratio = feature_df.isna().mean(axis=1)
-
-    if (row_nan_ratio > MAX_ROW_NAN_RATIO).any():
-        logger.warning("Row-level NaN spike detected.")
 
     return feature_df.astype(DTYPE, copy=False)
 
