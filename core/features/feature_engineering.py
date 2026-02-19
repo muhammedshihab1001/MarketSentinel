@@ -93,14 +93,6 @@ class FeatureEngineer:
             .clip(lower=FeatureEngineer.VOL_FLOOR)
         )
 
-        df["volatility_5"] = (
-            grp.rolling(5, min_periods=5)
-            .std(ddof=0)
-            .shift(1)
-            .reset_index(level=0, drop=True)
-            .clip(lower=FeatureEngineer.VOL_FLOOR)
-        )
-
         df["volatility_20"] = (
             grp.rolling(20, min_periods=20)
             .std(ddof=0)
@@ -166,18 +158,7 @@ class FeatureEngineer:
         ).clip(0.5, 1.5)
 
     ########################################################
-
-    @classmethod
-    def _trim_warmup(cls, df):
-
-        return (
-            df.groupby("ticker", group_keys=False)
-            .apply(lambda g: g.iloc[cls.MAX_INDICATOR_WINDOW:])
-            .reset_index(drop=True)
-        )
-
-    ########################################################
-    # TARGET
+    # TARGET (INSTITUTIONAL VERSION)
     ########################################################
 
     @classmethod
@@ -185,20 +166,35 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"]).copy()
 
+        # Log forward return
         df["forward_return"] = (
-            df.groupby("ticker")["close"]
-            .pct_change()
+            np.log(df["close"])
+            .groupby(df["ticker"])
+            .diff()
             .shift(-1)
         )
 
         df = df.dropna(subset=["forward_return"])
 
-        df["target"] = (df["forward_return"] > 0).astype("int8")
+        # Risk adjustment
+        safe_vol = df["volatility"].clip(lower=cls.VOL_FLOOR)
+        risk_adj = (df["forward_return"] / safe_vol).clip(-5, 5)
+
+        # Strong percentile separation
+        upper = risk_adj.quantile(0.75)
+        lower = risk_adj.quantile(0.25)
+
+        df["target"] = np.where(
+            risk_adj >= upper, 1,
+            np.where(risk_adj <= lower, 0, np.nan)
+        )
 
         df = df.dropna(subset=["target", *MODEL_FEATURES])
 
         if len(df) < cls.MIN_ROWS_REQUIRED:
             raise RuntimeError("Feature collapse — dataset too small.")
+
+        df["target"] = df["target"].astype("int8")
 
         float_cols = df.select_dtypes("float64").columns
         df[float_cols] = df[float_cols].astype("float32")
@@ -226,7 +222,6 @@ class FeatureEngineer:
 
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
-
         cls.add_ema(df)
 
         df = cls._trim_warmup(df)
@@ -247,3 +242,14 @@ class FeatureEngineer:
         logger.info("Feature pipeline built | rows=%s", len(final))
 
         return final.reset_index(drop=True)
+
+    ########################################################
+
+    @classmethod
+    def _trim_warmup(cls, df):
+
+        return (
+            df.groupby("ticker", group_keys=False)
+            .apply(lambda g: g.iloc[cls.MAX_INDICATOR_WINDOW:])
+            .reset_index(drop=True)
+        )
