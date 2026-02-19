@@ -38,13 +38,11 @@ def _gpu_available():
         try:
             build_info = xgb.build_info()
 
-            # CUDA only valid if compiled with it
             if not build_info.get("USE_CUDA", False):
                 _GPU_AVAILABLE = False
                 logger.info("XGBoost built without CUDA support.")
                 return _GPU_AVAILABLE
 
-            # Try minimal CUDA train
             dtrain = xgb.DMatrix(
                 np.random.rand(20, 4),
                 label=np.random.randint(0, 2, 20)
@@ -76,7 +74,7 @@ def _device():
 
 
 ###################################################
-# CLASS WEIGHT (STABLE & SAFE)
+# CLASS WEIGHT
 ###################################################
 
 def compute_class_weight(y):
@@ -94,8 +92,7 @@ def compute_class_weight(y):
 
     weight = neg / pos
 
-    # Prevent extreme scaling
-    weight = float(np.clip(weight, 0.8, 15.0))
+    weight = float(np.clip(weight, 0.8, 12.0))
 
     logger.info("Computed class weight = %.3f", weight)
 
@@ -134,7 +131,6 @@ class SafeXGBClassifier(XGBClassifier):
             X.shape[1]
         )
 
-        # Remove dangerous kwargs
         kwargs.pop("early_stopping_rounds", None)
         kwargs.pop("eval_set", None)
 
@@ -142,7 +138,7 @@ class SafeXGBClassifier(XGBClassifier):
 
 
 ###################################################
-# PARAM BUILDER (STABLE ALPHA VERSION)
+# PARAM BUILDER (IMPROVED DISPERSION VERSION)
 ###################################################
 
 def _base_params(pos_weight):
@@ -151,19 +147,19 @@ def _base_params(pos_weight):
 
     params = dict(
 
-        # CORE
-        n_estimators=400,
-        max_depth=4,
-        learning_rate=0.03,
+        # CORE (increase separation strength)
+        n_estimators=550,
+        max_depth=5,
+        learning_rate=0.035,
 
-        # STRUCTURE
-        subsample=0.85,
-        colsample_bytree=0.8,
-        min_child_weight=4,
-        gamma=0.2,
+        # STRUCTURE (less restrictive)
+        subsample=0.90,
+        colsample_bytree=0.85,
+        min_child_weight=3,
+        gamma=0.10,
 
-        # REGULARIZATION
-        reg_alpha=1.0,
+        # REGULARIZATION (still safe)
+        reg_alpha=0.8,
         reg_lambda=1.5,
 
         # TREE
@@ -215,12 +211,12 @@ def build_final_xgboost_model(y):
     params = _base_params(pos_weight)
 
     params.update({
-        "n_estimators": 550,
-        "learning_rate": 0.025,
-        "max_depth": 5,
-        "gamma": 0.25,
-        "reg_alpha": 1.2,
-        "reg_lambda": 1.8,
+        "n_estimators": 700,
+        "learning_rate": 0.03,
+        "max_depth": 6,
+        "gamma": 0.15,
+        "reg_alpha": 1.0,
+        "reg_lambda": 1.6,
     })
 
     logger.info("Building final production model.")
