@@ -120,6 +120,31 @@ class WalkForwardValidator:
 
     ########################################################
 
+    def _apply_crisis_scaling(self, filtered, regime_map):
+        """
+        Deterministic exposure reduction during crisis.
+        """
+        crisis_assets = [
+            t for t in filtered
+            if regime_map.get(t) == "CRISIS"
+        ]
+
+        if not crisis_assets:
+            return filtered
+
+        keep_n = max(1, int(len(crisis_assets) * self.CRISIS_EXPOSURE_SCALE))
+
+        crisis_sorted = sorted(crisis_assets)  # deterministic
+
+        keep_set = set(crisis_sorted[:keep_n])
+
+        return {
+            t: s for t, s in filtered.items()
+            if regime_map.get(t) != "CRISIS" or t in keep_set
+        }
+
+    ########################################################
+
     def run(self, df: pd.DataFrame):
 
         logger.info("Walk-forward validation started.")
@@ -133,6 +158,8 @@ class WalkForwardValidator:
         equity_curve = []
 
         initial_capital = 10_000.0
+        rolling_capital = initial_capital
+
         start_idx = self.window_size
         window_id = 1
 
@@ -157,8 +184,6 @@ class WalkForwardValidator:
                 (df["date"] >= test_dates.iloc[0]) &
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
-
-            logger.info("Train rows=%s | Test rows=%s", len(train_df), len(test_df))
 
             self._validate_training_frame(train_df)
             self._distribution_guard(train_df, test_df)
@@ -202,27 +227,19 @@ class WalkForwardValidator:
                 if len(filtered) < self.MIN_ASSETS_PER_DAY:
                     continue
 
-                ###################################################
-                # PER-TICKER REGIME SCALING
-                ###################################################
-
                 regime_map = dict(
                     zip(signal_slice["ticker"], signal_slice["regime"])
                 )
 
-                for t in list(filtered.keys()):
-                    if regime_map.get(t) == "CRISIS":
-                        if np.random.rand() > self.CRISIS_EXPOSURE_SCALE:
-                            filtered.pop(t)
+                filtered = self._apply_crisis_scaling(filtered, regime_map)
 
                 if not filtered:
                     continue
 
                 trade_counter += len(filtered)
 
-                if execution_date not in grouped_prices:
-                    grouped_prices[execution_date] = {}
-                    grouped_signals[execution_date] = {}
+                grouped_prices.setdefault(execution_date, {})
+                grouped_signals.setdefault(execution_date, {})
 
                 for t in filtered:
                     if t in prices:
@@ -230,28 +247,22 @@ class WalkForwardValidator:
                         grouped_signals[execution_date][t] = filtered[t]
 
             if trade_counter < self.MIN_TRADES_PER_WINDOW:
-                logger.warning("Window skipped — insufficient trades.")
                 start_idx += self.step_size
                 window_id += 1
                 continue
 
-            logger.info("Trades executed -> %s", trade_counter)
-
             metrics = self.engine.run(
                 grouped_prices,
                 grouped_signals,
-                initial_cash=initial_capital
+                initial_cash=rolling_capital
             )
 
             curve = np.array(metrics["equity_curve"], dtype=float)
 
-            if equity_curve:
-                scale = equity_curve[-1] / curve[0]
-                stitched = (curve * scale)[1:]
-                equity_curve.extend(stitched.tolist())
-            else:
-                equity_curve.extend(curve.tolist())
+            if len(curve) > 0:
+                rolling_capital = curve[-1]
 
+            equity_curve.extend(curve.tolist())
             results.append(metrics)
 
             start_idx += self.step_size
@@ -259,8 +270,6 @@ class WalkForwardValidator:
 
         if len(results) < self.MIN_WINDOWS:
             raise RuntimeError("Walk-forward produced insufficient windows.")
-
-        logger.info("Walk-forward completed successfully.")
 
         return self.aggregate_results(results, equity_curve)
 
