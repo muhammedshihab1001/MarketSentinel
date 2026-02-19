@@ -14,16 +14,15 @@ _ENV_LOCK = threading.Lock()
 
 
 ########################################################
-# 🔥 GLOBAL LOGGING CONFIG (CRITICAL)
+# GLOBAL LOGGING CONFIG (WINDOWS SAFE)
 ########################################################
 
 def _configure_logging():
 
     if logging.getLogger().handlers:
-        return  # prevent double configuration
+        return  # Prevent double configuration
 
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-
     level = getattr(logging, log_level, logging.INFO)
 
     formatter = logging.Formatter(
@@ -35,15 +34,20 @@ def _configure_logging():
     root_logger.setLevel(level)
 
     ####################################################
-    # Console Handler
+    # Console Handler (UTF-8 SAFE)
     ####################################################
+
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass  # Not supported on some environments
 
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
     root_logger.addHandler(console)
 
     ####################################################
-    # File Handler (VERY HIGH VALUE)
+    # Rotating File Handler
     ####################################################
 
     log_dir = os.getenv("LOG_DIR", "logs")
@@ -51,12 +55,12 @@ def _configure_logging():
 
     file_handler = RotatingFileHandler(
         os.path.join(log_dir, "marketsentinel.log"),
-        maxBytes=10_000_000,   # 10MB
-        backupCount=5
+        maxBytes=10_000_000,
+        backupCount=5,
+        encoding="utf-8"
     )
 
     file_handler.setFormatter(formatter)
-
     root_logger.addHandler(file_handler)
 
     logger.info("Logging configured | level=%s", log_level)
@@ -78,13 +82,13 @@ def _validate_not_empty(key: str) -> bool:
 
 
 ########################################################
-# DOTENV HARD SAFETY
+# DOTENV SAFETY
 ########################################################
 
 def _fail_fast_dotenv():
 
     if not os.path.exists(".env"):
-        logger.warning(".env not found — relying on system environment.")
+        logger.warning(".env not found - relying on system environment.")
         return
 
     try:
@@ -120,7 +124,7 @@ def _validate_paths():
             os.makedirs(path, exist_ok=True)
         except Exception as e:
             raise RuntimeError(
-                f"Failed to create/access path '{path}' from {key}. Error: {e}"
+                f"Failed to access/create path '{path}' from {key}. Error: {e}"
             )
 
 
@@ -142,14 +146,13 @@ def _validate_market_providers():
         if _validate_not_empty(key) and len(os.getenv(key)) >= 8:
             available.append(provider)
 
+    # Yahoo fallback always available
     available.append("yahoo")
 
     if len(available) == 1:
-        logger.warning(
-            "ONLY Yahoo provider available — reliability reduced."
-        )
+        logger.warning("Only Yahoo provider available - reliability reduced.")
 
-    logger.info("Market providers detected → %s", available)
+    logger.info("Market providers detected -> %s", available)
 
     os.environ["MARKET_PROVIDERS_ACTIVE"] = ",".join(available)
 
@@ -178,11 +181,11 @@ def _validate_news_provider_secrets():
 
             if _validate_not_empty(key) and len(os.getenv(key)) >= 10:
 
-                logger.info("Auto-selected news provider → %s", provider)
+                logger.info("Auto-selected news provider -> %s", provider)
                 os.environ["NEWS_PROVIDER_PRIMARY"] = provider
                 return
 
-        logger.warning("No news provider keys detected — sentiment disabled.")
+        logger.warning("No news provider keys detected - disabling sentiment.")
         os.environ["ENABLE_SENTIMENT"] = "0"
         return
 
@@ -193,7 +196,7 @@ def _validate_news_provider_secrets():
 
     if not _validate_not_empty(providers[primary]):
         logger.warning(
-            f"Primary news provider '{primary}' missing — disabling sentiment."
+            f"Primary news provider '{primary}' missing - disabling sentiment."
         )
         os.environ["ENABLE_SENTIMENT"] = "0"
 
@@ -208,14 +211,15 @@ def _environment_fingerprint():
         sys.version +
         os.getenv("TWELVEDATA_API_KEY", "") +
         os.getenv("ALPHAVANTAGE_API_KEY", "") +
-        os.getenv("ENABLE_SENTIMENT", "")
+        os.getenv("ENABLE_SENTIMENT", "") +
+        os.getenv("MODEL_REGISTRY_PATH", "")
     )
 
-    fp = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    fp = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
     os.environ["ENV_FINGERPRINT"] = fp
 
-    logger.info("Environment fingerprint → %s", fp)
+    logger.info("Environment fingerprint -> %s", fp)
 
 
 ########################################################
@@ -240,7 +244,6 @@ def init_env() -> None:
             load_dotenv(override=False)
 
         defaults = {
-
             "ENABLE_SENTIMENT": "0",
             "NEWS_PROVIDER_FAILOVER": "1",
             "NEWS_PROVIDER_PRIMARY": "auto",
@@ -277,20 +280,12 @@ def get_env(key: str, default=None, required: bool = False):
 
 def get_int(key: str, default: int) -> int:
     val = os.getenv(key)
-
-    if val is None:
-        return default
-
-    return int(val)
+    return int(val) if val is not None else default
 
 
 def get_float(key: str, default: float) -> float:
     val = os.getenv(key)
-
-    if val is None:
-        return default
-
-    return float(val)
+    return float(val) if val is not None else default
 
 
 def get_bool(key: str, default: bool = False) -> bool:
