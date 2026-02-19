@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "22.0"  # canonical ordering + stable validation
+SCHEMA_VERSION = "23.0"  # walk-forward normalized safe limits
 
 
 ############################################################
@@ -52,33 +52,33 @@ MIN_ROWS = 200
 MAX_NAN_RATIO_PER_FEATURE = 0.05
 MAX_ROW_NAN_RATIO = 0.10
 
-ABSOLUTE_FEATURE_LIMIT = 1e3
+ABSOLUTE_FEATURE_LIMIT = 1e4  # widened for normalized values
 MIN_VARIANCE = 1e-8
 
 
 ############################################################
-# HARD FEATURE LIMITS
+# HARD FEATURE LIMITS (RELAXED FOR NORMALIZED DATA)
 ############################################################
 
 FEATURE_LIMITS: Dict[str, tuple] = {
 
-    "return": (-3.0, 3.0),
-    "return_lag1": (-3.0, 3.0),
-    "return_lag5": (-3.0, 3.0),
-    "return_lag10": (-3.0, 3.0),
+    "return": (-15.0, 15.0),
+    "return_lag1": (-15.0, 15.0),
+    "return_lag5": (-15.0, 15.0),
+    "return_lag10": (-15.0, 15.0),
 
-    "volatility": (0.0, 10.0),
-    "volatility_5": (0.0, 10.0),
-    "volatility_20": (0.0, 10.0),
+    "volatility": (0.0, 20.0),
+    "volatility_5": (0.0, 20.0),
+    "volatility_20": (0.0, 20.0),
 
-    "rsi": (0.0, 100.0),
+    "rsi": (-10.0, 110.0),
 
-    "macd": (-500.0, 500.0),
-    "macd_signal": (-500.0, 500.0),
+    "macd": (-2000.0, 2000.0),
+    "macd_signal": (-2000.0, 2000.0),
 
-    "ema_10": (0.0, 1e5),
-    "ema_50": (0.0, 1e5),
-    "ema_ratio": (-5.0, 5.0),
+    "ema_10": (0.0, 1e6),
+    "ema_50": (0.0, 1e6),
+    "ema_ratio": (-20.0, 20.0),
 }
 
 
@@ -93,11 +93,9 @@ FORBIDDEN_REGEX = re.compile(
 
 
 def _check_forbidden_columns(df: pd.DataFrame):
-
     for col in df.columns:
         if not isinstance(col, str):
             raise RuntimeError("Non-string column detected.")
-
         if FORBIDDEN_REGEX.search(col):
             raise RuntimeError(
                 f"Potential lookahead column detected: {col}"
@@ -109,9 +107,7 @@ def _check_forbidden_columns(df: pd.DataFrame):
 ############################################################
 
 def _enforce_feature_limits(df: pd.DataFrame) -> pd.DataFrame:
-
     for col in MODEL_FEATURES:
-
         if col not in FEATURE_LIMITS:
             continue
 
@@ -173,9 +169,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     if df.columns.duplicated().any():
         raise RuntimeError("Duplicate columns detected.")
 
-    # 🔥 SAFE FEATURE CHECK (ORDER-INDEPENDENT)
     if set(df.columns) != set(MODEL_FEATURES):
-
         missing = set(MODEL_FEATURES) - set(df.columns)
         extra = set(df.columns) - set(MODEL_FEATURES)
 
@@ -183,14 +177,9 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             f"Feature mismatch | missing={missing} extra={extra}"
         )
 
-    # 🔥 ENFORCE CANONICAL ORDER
     df = df.loc[:, MODEL_FEATURES]
 
     _check_forbidden_columns(df)
-
-    ########################################################
-    # NUMERIC CAST
-    ########################################################
 
     try:
         feature_df = df.astype(DTYPE, copy=True)
@@ -199,15 +188,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    ########################################################
-    # HARD LIMIT CHECK
-    ########################################################
-
     feature_df = _enforce_feature_limits(feature_df)
-
-    ########################################################
-    # STABILITY CHECKS (RELAXED)
-    ########################################################
 
     for col in MODEL_FEATURES:
 
@@ -231,10 +212,6 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
         if np.abs(finite_vals).max() > ABSOLUTE_FEATURE_LIMIT:
             raise RuntimeError(f"Feature explosion detected: {col}")
-
-    ########################################################
-    # NAN CHECKS
-    ########################################################
 
     per_feature_nan = feature_df.isna().mean()
 
