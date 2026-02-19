@@ -3,7 +3,6 @@ import numpy as np
 from dataclasses import dataclass
 import logging
 
-
 logger = logging.getLogger("marketsentinel.regime")
 
 
@@ -24,10 +23,7 @@ class RegimeConfig:
     EPSILON: float = 1e-8
     MAX_DAILY_RETURN: float = 0.60
 
-    MIN_SURVIVAL_RATIO: float = 0.35
-    MAX_CRISIS_RATIO: float = 0.65
-
-    HYSTERESIS_BUFFER: float = 0.003
+    HYSTERESIS_BUFFER: float = 0.005
 
 
 class MarketRegimeDetector:
@@ -42,32 +38,16 @@ class MarketRegimeDetector:
     def _assert_monotonic(self, df):
 
         if not df["date"].is_monotonic_increasing:
-            raise RuntimeError(
-                "Non-monotonic timestamps detected."
-            )
+            raise RuntimeError("Non-monotonic timestamps detected.")
 
-    ########################################################
-    # SAFE FALLBACK — DO NOT DESTROY STRUCTURE
     ########################################################
 
     def _neutral_regime(self, df: pd.DataFrame):
 
-        logger.warning(
-            "Regime detector degraded — assigning neutral SIDEWAYS without overwriting dataset."
-        )
+        logger.warning("Regime fallback → assigning SIDEWAYS")
 
         df = df.copy()
-
-        if "regime" not in df.columns:
-            df["regime"] = "SIDEWAYS"
-
-        df["regime"] = df["regime"].fillna("SIDEWAYS")
-
-        df["regime"] = pd.Categorical(
-            df["regime"],
-            categories=self.VALID_REGIMES
-        )
-
+        df["regime"] = "SIDEWAYS"
         df["market_regime"] = df["regime"]
 
         return df
@@ -83,51 +63,28 @@ class MarketRegimeDetector:
 
         confirmed = regimes.copy()
 
-        current = None
-        candidate = None
+        current = regimes[0]
         streak = 0
 
-        for i in range(len(regimes)):
+        for i in range(1, len(regimes)):
 
-            new = regimes[i]
-
-            if new not in self.VALID_REGIMES:
-                new = "SIDEWAYS"
-
-            if new == "CRISIS":
-                current = "CRISIS"
-                candidate = None
+            if regimes[i] == current:
                 streak = 0
                 confirmed[i] = current
                 continue
 
-            if current is None:
-                current = new
-                confirmed[i] = current
-                continue
+            streak += 1
 
-            if new != current:
-
-                if candidate == new:
-                    streak += 1
-                else:
-                    candidate = new
-                    streak = 1
-
-                if streak >= cfg.persistence_days:
-                    current = candidate
-                    candidate = None
-                    streak = 0
-
-                confirmed[i] = current
-                continue
+            if streak >= cfg.persistence_days:
+                current = regimes[i]
+                streak = 0
 
             confirmed[i] = current
 
         return confirmed
 
     ########################################################
-    # SINGLE ASSET — NEVER DROP TICKER
+    # SINGLE ASSET
     ########################################################
 
     def _detect_single_asset(self, df: pd.DataFrame):
@@ -141,35 +98,56 @@ class MarketRegimeDetector:
 
             close = pd.to_numeric(df["close"], errors="raise")
 
-            shifted_close = close.shift(1)
-            returns = shifted_close.pct_change()
+            ################################################
+            # CORRECT RETURN COMPUTATION
+            ################################################
+
+            returns = close.pct_change()
+
+            if returns.abs().max() > cfg.MAX_DAILY_RETURN:
+                logger.warning("Extreme return detected — fallback.")
+                df["regime"] = "SIDEWAYS"
+                return df
+
+            ################################################
+            # TREND
+            ################################################
 
             ma_long = (
-                shifted_close
-                .rolling(cfg.trend_window,
-                         min_periods=cfg.trend_window)
+                close.rolling(cfg.trend_window,
+                              min_periods=cfg.trend_window)
                 .mean()
-                .shift(1)
             )
 
-            volatility = (
+            trend_dev = (
+                (close - ma_long) /
+                (ma_long + cfg.EPSILON)
+            )
+
+            ################################################
+            # VOLATILITY (SMOOTHED)
+            ################################################
+
+            raw_vol = (
                 returns
                 .rolling(cfg.volatility_window,
                          min_periods=cfg.volatility_window)
                 .std()
-                .shift(1)
-            ).clip(lower=cfg.EPSILON)
-
-            trend_dev = (
-                (shifted_close - ma_long) /
-                (ma_long + cfg.EPSILON)
             )
+
+            volatility = raw_vol.ewm(span=10, adjust=False).mean()
+
+            ################################################
+            # REGIME CLASSIFICATION
+            ################################################
 
             regime = np.full(len(df), "SIDEWAYS", dtype=object)
 
             ready = ma_long.notna() & volatility.notna()
 
-            crisis = ready & (volatility > cfg.crash_vol_threshold)
+            crisis = ready & (
+                volatility > (cfg.crash_vol_threshold + cfg.HYSTERESIS_BUFFER)
+            )
 
             bull = (
                 ready &
@@ -189,6 +167,10 @@ class MarketRegimeDetector:
             regime[bull] = "BULL"
             regime[bear] = "BEAR"
 
+            ################################################
+            # PERSISTENCE CONTROL
+            ################################################
+
             regime = self._apply_persistence(regime)
 
             df["regime"] = pd.Categorical(
@@ -196,17 +178,13 @@ class MarketRegimeDetector:
                 categories=self.VALID_REGIMES
             )
 
-            # ⭐ DO NOT DROP WARMUP
             df["regime"] = df["regime"].fillna("SIDEWAYS")
 
             return df
 
         except Exception as e:
 
-            logger.warning(
-                "Regime detection degraded for ticker — %s",
-                str(e)
-            )
+            logger.warning("Regime degraded → %s", str(e))
 
             df["regime"] = "SIDEWAYS"
             return df
