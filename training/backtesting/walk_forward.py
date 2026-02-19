@@ -10,10 +10,6 @@ logger = logging.getLogger("marketsentinel.walkforward")
 
 
 class WalkForwardValidator:
-    """
-    Institutional Walk Forward Validator v5
-    Adaptive conviction + balanced ranking + regime throttle.
-    """
 
     MIN_TRADES_PER_WINDOW = 5
     MIN_WINDOWS = 6
@@ -51,10 +47,11 @@ class WalkForwardValidator:
     ########################################################
 
     def _apply_embargo(self, train_df, test_start):
+
         embargo_cut = pd.Timestamp(test_start) - pd.Timedelta(days=self.embargo_days)
         train_df = train_df[train_df["date"] < embargo_cut]
 
-        if len(train_df) < self.window_size * 0.70:
+        if len(train_df) < int(self.window_size * 0.70):
             raise RuntimeError("Embargo removed too much training data.")
 
         return train_df
@@ -65,16 +62,14 @@ class WalkForwardValidator:
 
         cols = list(MODEL_FEATURES)
 
-        # 🚫 Removed schema validation here
-        # Schema validation already happens before normalization
-        # in load_training_data()
-
         features = df.loc[:, cols].to_numpy(dtype=float)
 
         if not np.isfinite(features).all():
             raise RuntimeError("Non-finite values detected in training features.")
 
-        if np.min(np.var(features, axis=0)) < self.MIN_FEATURE_VARIANCE:
+        variances = np.var(features, axis=0)
+
+        if np.min(variances) < self.MIN_FEATURE_VARIANCE:
             raise RuntimeError("Feature variance collapsed.")
 
         if df["target"].nunique() < 2:
