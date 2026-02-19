@@ -14,92 +14,23 @@ logger = logging.getLogger(__name__)
 
 class FeatureEngineer:
 
-    MIN_ROWS_REQUIRED = 180
+    MIN_ROWS_REQUIRED = 200
     VOL_FLOOR = 1e-4
-    SENTIMENT_STD_FLOOR = 0.02
-
     RETURN_CLAMP = (-0.5, 0.5)
 
+    MAX_INDICATOR_WINDOW = 50
     SPLIT_THRESHOLD = 3.5
-    MERGE_TOLERANCE = pd.Timedelta("3D")
-
-    MIN_CLASS_RATIO = 0.15
-    MAX_INDICATOR_WINDOW = 20
-
-    SENTIMENT_COLUMNS = [
-        "date",
-        "avg_sentiment",
-        "sentiment_std"
-    ]
 
     ########################################################
-    # ⭐ INSTITUTIONAL SAFE SENTIMENT
-    ########################################################
-
-    @classmethod
-    def _build_neutral_sentiment(cls, price_df, ticker):
-
-        rows = len(price_df)
-
-        # deterministic seed per ticker
-        seed = abs(hash(ticker)) % (2**32)
-        rng = np.random.default_rng(seed)
-
-        neutral = price_df[["date"]].copy()
-
-        # micro gaussian noise (bounded)
-        neutral["avg_sentiment"] = np.clip(
-            rng.normal(0, 0.015, rows),
-            -0.05,
-            0.05
-        ).astype("float32")
-
-        neutral["sentiment_std"] = np.clip(
-            rng.normal(cls.SENTIMENT_STD_FLOOR, 0.005, rows),
-            0.005,
-            0.05
-        ).astype("float32")
-
-        logger.warning(
-            "Sentiment unavailable — injected micro-variance neutral signal."
-        )
-
-        return neutral
-
-    ########################################################
-    # TIME
+    # PRICE VALIDATION
     ########################################################
 
     @staticmethod
     def _normalize_datetime(df):
-
         df = df.copy()
-
-        df["date"] = pd.to_datetime(
-            df["date"],
-            utc=True,
-            errors="coerce"
-        )
-
+        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
         df = df.dropna(subset=["date"])
-
         return df.sort_values("date").reset_index(drop=True)
-
-    ########################################################
-
-    @staticmethod
-    def _enforce_ticker(df, ticker=None):
-
-        df = df.copy()
-
-        if "ticker" not in df.columns:
-            df["ticker"] = ticker or "unknown"
-
-        df["ticker"] = df["ticker"].astype(str)
-
-        return df
-
-    ########################################################
 
     @classmethod
     def _validate_price_frame(cls, df, ticker=None):
@@ -107,14 +38,10 @@ class FeatureEngineer:
         if df is None or df.empty:
             raise RuntimeError("Price dataframe empty.")
 
-        df = cls._enforce_ticker(df, ticker)
         df = cls._normalize_datetime(df)
 
-        required = {"date", "close", "ticker"}
-        missing = required - set(df.columns)
-
-        if missing:
-            raise RuntimeError(f"Price schema violation: {missing}")
+        if "ticker" not in df.columns:
+            df["ticker"] = ticker or "unknown"
 
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
         df = df.dropna(subset=["close"])
@@ -126,18 +53,17 @@ class FeatureEngineer:
             raise RuntimeError("Invalid close prices.")
 
         returns = df.groupby("ticker")["close"].pct_change().abs()
-
         extreme = returns > cls.SPLIT_THRESHOLD
 
         if extreme.any():
-            logger.warning("Split detected — repairing price path.")
+            logger.warning("Split detected — repairing.")
             df.loc[extreme, "close"] = np.nan
             df["close"] = df.groupby("ticker")["close"].ffill()
 
         return df.reset_index(drop=True)
 
     ########################################################
-    # TECHNICALS
+    # FEATURE BUILDERS
     ########################################################
 
     @staticmethod
@@ -146,18 +72,37 @@ class FeatureEngineer:
         returns = df.groupby("ticker")["close"].pct_change()
 
         lo, hi = FeatureEngineer.RETURN_CLAMP
-
         df["return"] = returns.clip(lo, hi)
+
         df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
+        df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
+        df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
 
     ########################################################
 
     @staticmethod
-    def add_volatility(df, window=5):
+    def add_volatility(df):
+
+        grp = df.groupby("ticker")["return"]
 
         df["volatility"] = (
-            df.groupby("ticker")["return"]
-            .rolling(window, min_periods=window)
+            grp.rolling(5, min_periods=5)
+            .std(ddof=0)
+            .shift(1)
+            .reset_index(level=0, drop=True)
+            .clip(lower=FeatureEngineer.VOL_FLOOR)
+        )
+
+        df["volatility_5"] = (
+            grp.rolling(5, min_periods=5)
+            .std(ddof=0)
+            .shift(1)
+            .reset_index(level=0, drop=True)
+            .clip(lower=FeatureEngineer.VOL_FLOOR)
+        )
+
+        df["volatility_20"] = (
+            grp.rolling(20, min_periods=20)
             .std(ddof=0)
             .shift(1)
             .reset_index(level=0, drop=True)
@@ -167,13 +112,13 @@ class FeatureEngineer:
     ########################################################
 
     @staticmethod
-    def add_rsi(df, window=14):
+    def add_rsi(df):
 
         def _compute_rsi(group):
 
             rsi_out = TechnicalIndicators.rsi(
                 group[["date", "close"]],
-                window=window
+                window=14
             )
 
             if isinstance(rsi_out, pd.DataFrame):
@@ -181,15 +126,10 @@ class FeatureEngineer:
             else:
                 rsi_series = rsi_out
 
-            group["rsi"] = rsi_series.values
-
+            group["rsi"] = rsi_series.clip(0, 100).values
             return group
 
-        df = df.groupby("ticker", group_keys=False).apply(_compute_rsi)
-
-        df["rsi"] = df["rsi"].clip(0, 100)
-
-        return df
+        return df.groupby("ticker", group_keys=False).apply(_compute_rsi)
 
     ########################################################
 
@@ -200,11 +140,30 @@ class FeatureEngineer:
             macd, signal = TechnicalIndicators.macd(
                 x[["date", "close"]]
             )
-            x["macd"] = macd.clip(-25, 25)
-            x["macd_signal"] = signal.clip(-25, 25)
+            x["macd"] = macd.clip(-500, 500)
+            x["macd_signal"] = signal.clip(-500, 500)
             return x
 
         return df.groupby("ticker", group_keys=False).apply(_macd_block)
+
+    ########################################################
+
+    @staticmethod
+    def add_ema(df):
+
+        df["ema_10"] = (
+            df.groupby("ticker")["close"]
+            .transform(lambda x: x.ewm(span=10, adjust=False).mean())
+        )
+
+        df["ema_50"] = (
+            df.groupby("ticker")["close"]
+            .transform(lambda x: x.ewm(span=50, adjust=False).mean())
+        )
+
+        df["ema_ratio"] = (
+            df["ema_10"] / df["ema_50"]
+        ).clip(0.5, 1.5)
 
     ########################################################
 
@@ -218,51 +177,6 @@ class FeatureEngineer:
         )
 
     ########################################################
-    # SENTIMENT MERGE
-    ########################################################
-
-    @classmethod
-    def merge_price_sentiment(
-        cls,
-        price_df,
-        sentiment_df,
-        ticker=None
-    ):
-
-        price = cls._normalize_datetime(
-            cls._enforce_ticker(price_df, ticker)
-        )
-
-        if sentiment_df is None or sentiment_df.empty:
-            sentiment_df = cls._build_neutral_sentiment(price, ticker)
-
-        sentiment = sentiment_df.loc[:, cls.SENTIMENT_COLUMNS]
-        sentiment = cls._normalize_datetime(sentiment)
-
-        sentiment["date"] += pd.Timedelta(days=1)
-
-        merged = pd.merge_asof(
-            price,
-            sentiment,
-            on="date",
-            direction="backward",
-            tolerance=cls.MERGE_TOLERANCE
-        )
-
-        merged.fillna({
-            "avg_sentiment": 0.0,
-            "sentiment_std": cls.SENTIMENT_STD_FLOOR
-        }, inplace=True)
-
-        merged["sentiment_lag1"] = (
-            merged.groupby("ticker")["avg_sentiment"]
-            .shift(1)
-            .fillna(0)
-        )
-
-        return merged
-
-    ########################################################
     # TARGET
     ########################################################
 
@@ -272,32 +186,19 @@ class FeatureEngineer:
         df = df.sort_values(["ticker", "date"]).copy()
 
         df["forward_return"] = (
-            np.log(df["close"])
-            .groupby(df["ticker"])
-            .diff()
+            df.groupby("ticker")["close"]
+            .pct_change()
             .shift(-1)
         )
 
         df = df.dropna(subset=["forward_return"])
 
-        safe_vol = df["volatility"].clip(lower=cls.VOL_FLOOR)
-
-        risk_adj = (df["forward_return"] / safe_vol).clip(-5, 5)
-
-        upper = risk_adj.quantile(0.66)
-        lower = risk_adj.quantile(0.34)
-
-        df["target"] = np.where(
-            risk_adj >= upper, 1,
-            np.where(risk_adj <= lower, 0, np.nan)
-        )
+        df["target"] = (df["forward_return"] > 0).astype("int8")
 
         df = df.dropna(subset=["target", *MODEL_FEATURES])
 
         if len(df) < cls.MIN_ROWS_REQUIRED:
             raise RuntimeError("Feature collapse — dataset too small.")
-
-        df["target"] = df["target"].astype("int8")
 
         float_cols = df.select_dtypes("float64").columns
         df[float_cols] = df[float_cols].astype("float32")
@@ -316,13 +217,9 @@ class FeatureEngineer:
     ):
 
         if not training:
-            raise RuntimeError(
-                "Inference pipeline must be separate from training."
-            )
+            raise RuntimeError("Inference pipeline separate.")
 
-        price_df = cls._validate_price_frame(price_df, ticker)
-
-        df = price_df.copy()
+        df = cls._validate_price_frame(price_df, ticker)
 
         cls.add_returns(df)
         cls.add_volatility(df)
@@ -330,14 +227,9 @@ class FeatureEngineer:
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
 
-        df = cls.merge_price_sentiment(
-            df,
-            sentiment_df,
-            ticker
-        )
+        cls.add_ema(df)
 
         df = cls._trim_warmup(df)
-
         df = cls.create_training_dataset(df)
 
         validated = validate_feature_schema(
