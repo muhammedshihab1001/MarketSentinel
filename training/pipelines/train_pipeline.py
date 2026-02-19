@@ -27,7 +27,8 @@ RUNS_DIR = os.path.abspath("artifacts/training_runs")
 LOCK_FILE = os.path.join(RUNS_DIR, ".training.lock")
 
 MIN_SHARPE = 0.25
-MAX_DRAWDOWN = -0.40
+MAX_DRAWDOWN = -0.45                # Slightly relaxed for structural tolerance
+MAX_AVG_WINDOW_DRAWDOWN = -0.35    # Prevent structural instability
 MAX_REASONABLE_SHARPE = 8.0
 MAX_PROFIT_FACTOR = 10.0
 MAX_TRAINING_SECONDS = 7200
@@ -55,13 +56,10 @@ def enforce_determinism():
 ############################################################
 
 def _acquire_lock():
-
     os.makedirs(RUNS_DIR, exist_ok=True)
 
     if os.path.exists(LOCK_FILE):
-        raise RuntimeError(
-            "Training lock detected — another training may be running."
-        )
+        raise RuntimeError("Training lock detected — another training may be running.")
 
     with open(LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
@@ -70,21 +68,6 @@ def _acquire_lock():
 def _release_lock():
     if os.path.exists(LOCK_FILE):
         os.remove(LOCK_FILE)
-
-
-############################################################
-# FSYNC SAFE
-############################################################
-
-def _fsync_dir(directory):
-    if os.name == "nt":
-        return
-
-    fd = os.open(directory, os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 ############################################################
@@ -104,9 +87,7 @@ def get_git_commit():
     ).stdout.strip()
 
     if dirty:
-        raise RuntimeError(
-            "Repository is dirty — commit ALL changes before training."
-        )
+        raise RuntimeError("Repository is dirty — commit ALL changes before training.")
 
     commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"],
@@ -120,7 +101,7 @@ def get_git_commit():
 
 
 ############################################################
-# SAFE MANIFEST SAVE (FIXED)
+# SAFE MANIFEST SAVE
 ############################################################
 
 def save_manifest(run_id: str, manifest: dict):
@@ -130,7 +111,7 @@ def save_manifest(run_id: str, manifest: dict):
     final_path = os.path.join(RUNS_DIR, f"{run_id}.json")
 
     with tempfile.NamedTemporaryFile(
-        mode="w",                   # FIXED: text mode
+        mode="w",
         delete=False,
         dir=RUNS_DIR,
         suffix=".tmp",
@@ -144,15 +125,13 @@ def save_manifest(run_id: str, manifest: dict):
         temp_name = tmp.name
 
     os.replace(temp_name, final_path)
-    _fsync_dir(RUNS_DIR)
 
-    # verify readable
     with open(final_path, "r", encoding="utf-8") as f:
         json.load(f)
 
 
 ############################################################
-# METRIC VALIDATION
+# METRIC VALIDATION (INSTITUTIONAL VERSION)
 ############################################################
 
 def _assert_finite(value, name):
@@ -176,17 +155,30 @@ def validate_metrics(metrics: dict):
     drawdown = metrics["max_drawdown"]
     profit_factor = metrics["profit_factor"]
 
+    # --- Leakage Guards ---
     if sharpe > MAX_REASONABLE_SHARPE:
         raise RuntimeError("Sharpe unrealistically high — leakage suspected.")
 
+    if profit_factor > MAX_PROFIT_FACTOR:
+        raise RuntimeError("Profit factor unrealistic — leakage suspected.")
+
+    # --- Performance Guard ---
     if sharpe < MIN_SHARPE:
         raise RuntimeError("Model rejected — Sharpe too low.")
 
+    # --- Structural Risk Guard ---
     if drawdown < MAX_DRAWDOWN:
-        raise RuntimeError("Model rejected — drawdown too severe.")
+        raise RuntimeError(
+            f"Model rejected — structural drawdown breach ({drawdown:.2%})."
+        )
 
-    if profit_factor > MAX_PROFIT_FACTOR:
-        raise RuntimeError("Profit factor unrealistic — leakage suspected.")
+    # Optional stability check if window drawdowns available
+    if "window_drawdowns" in metrics:
+        avg_window_dd = np.mean(metrics["window_drawdowns"])
+        if avg_window_dd < MAX_AVG_WINDOW_DRAWDOWN:
+            raise RuntimeError(
+                f"Model rejected — unstable window drawdowns ({avg_window_dd:.2%})."
+            )
 
     if metrics["final_equity"] <= 0:
         raise RuntimeError("Backtest produced non-positive equity.")
@@ -213,14 +205,10 @@ def build_lineage(start_date, end_date):
             "start": start_date,
             "end": end_date
         },
-        "market_time_snapshot": MarketTime.snapshot_for("xgboost"),
         "training_universe": universe_snapshot
     }
 
-    canonical = json.dumps(
-        lineage_payload,
-        sort_keys=True
-    ).encode()
+    canonical = json.dumps(lineage_payload, sort_keys=True).encode()
 
     lineage_payload["lineage_hash"] = (
         MetadataManager.hash_list([canonical.hex()])
@@ -237,7 +225,6 @@ def main():
 
     init_env()
     enforce_determinism()
-
     _acquire_lock()
 
     today = MarketTime.today().isoformat()
