@@ -18,7 +18,8 @@ class FeatureEngineer:
     VOL_FLOOR = 1e-4
     RETURN_CLAMP = (-0.5, 0.5)
 
-    MAX_INDICATOR_WINDOW = 50
+    # Increased for stability (RSI + MACD + Vol20 + Lags)
+    MAX_INDICATOR_WINDOW = 60
     SPLIT_THRESHOLD = 3.5
 
     ########################################################
@@ -63,7 +64,7 @@ class FeatureEngineer:
         return df.reset_index(drop=True)
 
     ########################################################
-    # FEATURE BUILDERS
+    # RETURNS
     ########################################################
 
     @staticmethod
@@ -79,28 +80,40 @@ class FeatureEngineer:
         df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
 
     ########################################################
+    # VOLATILITY (FIXED)
+    ########################################################
 
     @staticmethod
     def add_volatility(df):
 
         grp = df.groupby("ticker")["return"]
 
-        df["volatility"] = (
+        # 5-day volatility
+        df["volatility_5"] = (
             grp.rolling(5, min_periods=5)
             .std(ddof=0)
             .shift(1)
             .reset_index(level=0, drop=True)
-            .clip(lower=FeatureEngineer.VOL_FLOOR)
         )
 
+        # 20-day volatility
         df["volatility_20"] = (
             grp.rolling(20, min_periods=20)
             .std(ddof=0)
             .shift(1)
             .reset_index(level=0, drop=True)
-            .clip(lower=FeatureEngineer.VOL_FLOOR)
         )
 
+        # Primary volatility = 5-day
+        df["volatility"] = df["volatility_5"]
+
+        # Stability floor
+        df["volatility"] = df["volatility"].clip(lower=FeatureEngineer.VOL_FLOOR)
+        df["volatility_5"] = df["volatility_5"].clip(lower=FeatureEngineer.VOL_FLOOR)
+        df["volatility_20"] = df["volatility_20"].clip(lower=FeatureEngineer.VOL_FLOOR)
+
+    ########################################################
+    # RSI
     ########################################################
 
     @staticmethod
@@ -124,6 +137,8 @@ class FeatureEngineer:
         return df.groupby("ticker", group_keys=False).apply(_compute_rsi)
 
     ########################################################
+    # MACD
+    ########################################################
 
     @staticmethod
     def add_macd(df):
@@ -138,6 +153,8 @@ class FeatureEngineer:
 
         return df.groupby("ticker", group_keys=False).apply(_macd_block)
 
+    ########################################################
+    # EMA
     ########################################################
 
     @staticmethod
@@ -158,7 +175,7 @@ class FeatureEngineer:
         ).clip(0.5, 1.5)
 
     ########################################################
-    # TARGET (INSTITUTIONAL VERSION)
+    # TARGET
     ########################################################
 
     @classmethod
@@ -166,7 +183,6 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"]).copy()
 
-        # Log forward return
         df["forward_return"] = (
             np.log(df["close"])
             .groupby(df["ticker"])
@@ -176,17 +192,21 @@ class FeatureEngineer:
 
         df = df.dropna(subset=["forward_return"])
 
-        # Risk adjustment
         safe_vol = df["volatility"].clip(lower=cls.VOL_FLOOR)
         risk_adj = (df["forward_return"] / safe_vol).clip(-5, 5)
 
-        # Strong percentile separation
         upper = risk_adj.quantile(0.75)
         lower = risk_adj.quantile(0.25)
 
         df["target"] = np.where(
             risk_adj >= upper, 1,
             np.where(risk_adj <= lower, 0, np.nan)
+        )
+
+        # Debug visibility
+        logger.info(
+            "NaN ratios before drop:\n%s",
+            df[MODEL_FEATURES].isna().mean()
         )
 
         df = df.dropna(subset=["target", *MODEL_FEATURES])
@@ -200,6 +220,17 @@ class FeatureEngineer:
         df[float_cols] = df[float_cols].astype("float32")
 
         return df
+
+    ########################################################
+
+    @classmethod
+    def _trim_warmup(cls, df):
+
+        return (
+            df.groupby("ticker", group_keys=False)
+            .apply(lambda g: g.iloc[cls.MAX_INDICATOR_WINDOW:])
+            .reset_index(drop=True)
+        )
 
     ########################################################
 
@@ -242,14 +273,3 @@ class FeatureEngineer:
         logger.info("Feature pipeline built | rows=%s", len(final))
 
         return final.reset_index(drop=True)
-
-    ########################################################
-
-    @classmethod
-    def _trim_warmup(cls, df):
-
-        return (
-            df.groupby("ticker", group_keys=False)
-            .apply(lambda g: g.iloc[cls.MAX_INDICATOR_WINDOW:])
-            .reset_index(drop=True)
-        )
