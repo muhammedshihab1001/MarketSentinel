@@ -18,7 +18,6 @@ class FeatureEngineer:
     VOL_FLOOR = 1e-4
     RETURN_CLAMP = (-0.5, 0.5)
 
-    # Increased for stability (RSI + MACD + Vol20 + Lags)
     MAX_INDICATOR_WINDOW = 60
     SPLIT_THRESHOLD = 3.5
 
@@ -80,7 +79,7 @@ class FeatureEngineer:
         df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
 
     ########################################################
-    # VOLATILITY (FIXED)
+    # VOLATILITY
     ########################################################
 
     @staticmethod
@@ -88,7 +87,6 @@ class FeatureEngineer:
 
         grp = df.groupby("ticker")["return"]
 
-        # 5-day volatility
         df["volatility_5"] = (
             grp.rolling(5, min_periods=5)
             .std(ddof=0)
@@ -96,7 +94,6 @@ class FeatureEngineer:
             .reset_index(level=0, drop=True)
         )
 
-        # 20-day volatility
         df["volatility_20"] = (
             grp.rolling(20, min_periods=20)
             .std(ddof=0)
@@ -104,13 +101,12 @@ class FeatureEngineer:
             .reset_index(level=0, drop=True)
         )
 
-        # Primary volatility = 5-day
         df["volatility"] = df["volatility_5"]
 
-        # Stability floor
-        df["volatility"] = df["volatility"].clip(lower=FeatureEngineer.VOL_FLOOR)
-        df["volatility_5"] = df["volatility_5"].clip(lower=FeatureEngineer.VOL_FLOOR)
-        df["volatility_20"] = df["volatility_20"].clip(lower=FeatureEngineer.VOL_FLOOR)
+        # floor + fill early NaNs safely
+        df["volatility"] = df["volatility"].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
+        df["volatility_5"] = df["volatility_5"].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
+        df["volatility_20"] = df["volatility_20"].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
 
     ########################################################
     # RSI
@@ -120,18 +116,15 @@ class FeatureEngineer:
     def add_rsi(df):
 
         def _compute_rsi(group):
-
-            rsi_out = TechnicalIndicators.rsi(
+            rsi_series = TechnicalIndicators.rsi(
                 group[["date", "close"]],
                 window=14
             )
 
-            if isinstance(rsi_out, pd.DataFrame):
-                rsi_series = rsi_out.iloc[:, 0]
-            else:
-                rsi_series = rsi_out
+            if isinstance(rsi_series, pd.DataFrame):
+                rsi_series = rsi_series.iloc[:, 0]
 
-            group["rsi"] = rsi_series.clip(0, 100).values
+            group["rsi"] = rsi_series.clip(0, 100).fillna(50).values
             return group
 
         return df.groupby("ticker", group_keys=False).apply(_compute_rsi)
@@ -147,8 +140,9 @@ class FeatureEngineer:
             macd, signal = TechnicalIndicators.macd(
                 x[["date", "close"]]
             )
-            x["macd"] = macd.clip(-500, 500)
-            x["macd_signal"] = signal.clip(-500, 500)
+
+            x["macd"] = macd.clip(-500, 500).fillna(0)
+            x["macd_signal"] = signal.clip(-500, 500).fillna(0)
             return x
 
         return df.groupby("ticker", group_keys=False).apply(_macd_block)
@@ -172,7 +166,7 @@ class FeatureEngineer:
 
         df["ema_ratio"] = (
             df["ema_10"] / df["ema_50"]
-        ).clip(0.5, 1.5)
+        ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
     # TARGET
@@ -203,12 +197,6 @@ class FeatureEngineer:
             np.where(risk_adj <= lower, 0, np.nan)
         )
 
-        # Debug visibility
-        logger.info(
-            "NaN ratios before drop:\n%s",
-            df[MODEL_FEATURES].isna().mean()
-        )
-
         df = df.dropna(subset=["target", *MODEL_FEATURES])
 
         if len(df) < cls.MIN_ROWS_REQUIRED:
@@ -222,6 +210,8 @@ class FeatureEngineer:
         return df
 
     ########################################################
+    # TRIM WARMUP
+    ########################################################
 
     @classmethod
     def _trim_warmup(cls, df):
@@ -232,6 +222,8 @@ class FeatureEngineer:
             .reset_index(drop=True)
         )
 
+    ########################################################
+    # MAIN PIPELINE
     ########################################################
 
     @classmethod
