@@ -21,7 +21,7 @@ class FeatureEngineer:
     MAX_INDICATOR_WINDOW = 60
     SPLIT_THRESHOLD = 3.5
 
-    FORWARD_DAYS = 5  # 5-day prediction horizon
+    FORWARD_DAYS = 5
 
     ########################################################
     # PRICE VALIDATION
@@ -113,6 +113,27 @@ class FeatureEngineer:
             )
 
     ########################################################
+    # REGIME FEATURE (NEW — FIX)
+    ########################################################
+
+    @classmethod
+    def add_regime_feature(cls, df):
+
+        # simple rolling volatility regime proxy
+        rolling_vol = (
+            df.groupby("ticker")["volatility_20"]
+            .transform(lambda x: x.rolling(40, min_periods=20).mean())
+        )
+
+        median_vol = rolling_vol.median()
+
+        df["regime_feature"] = np.where(
+            rolling_vol > median_vol,
+            1.0,
+            0.0
+        )
+
+    ########################################################
     # RSI
     ########################################################
 
@@ -173,7 +194,7 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # DATASET BUILDER (SAFE 5-DAY FORWARD RETURN)
+    # DATASET BUILDER
     ########################################################
 
     @classmethod
@@ -182,10 +203,8 @@ class FeatureEngineer:
         df = df.sort_values(["ticker", "date"]).copy()
 
         df["forward_return"] = (
-            df.groupby("ticker")["close"]
-            .transform(lambda x:
-                np.log(x.shift(-cls.FORWARD_DAYS)) - np.log(x)
-            )
+            np.log(df["close"].shift(-cls.FORWARD_DAYS))
+            - np.log(df["close"])
         )
 
         df = df.dropna(subset=["forward_return"])
@@ -198,19 +217,6 @@ class FeatureEngineer:
         df[float_cols] = df[float_cols].astype("float32")
 
         return df
-
-    ########################################################
-    # TRIM WARMUP
-    ########################################################
-
-    @classmethod
-    def _trim_warmup(cls, df):
-
-        return (
-            df.groupby("ticker", group_keys=False)
-            .apply(lambda g: g.iloc[cls.MAX_INDICATOR_WINDOW:])
-            .reset_index(drop=True)
-        )
 
     ########################################################
     # MAIN PIPELINE
@@ -237,7 +243,9 @@ class FeatureEngineer:
         df = cls.add_macd(df)
         cls.add_ema(df)
 
-        df = cls._trim_warmup(df)
+        # 🔥 FIX — ADD REGIME FEATURE
+        cls.add_regime_feature(df)
+
         df = cls.create_training_dataset(df)
 
         validated = validate_feature_schema(
