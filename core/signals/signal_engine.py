@@ -53,16 +53,16 @@ class SignalConfig:
     def load():
 
         cfg = SignalConfig(
-            prob_threshold=_env_float("PROB_THRESHOLD", 0.55),  # relaxed
-            min_confidence=_env_float("MIN_CONFIDENCE", 0.30),  # relaxed
-            crisis_volatility=_env_float("CRISIS_VOL", 0.18),   # less strict
+            prob_threshold=_env_float("PROB_THRESHOLD", 0.58),
+            min_confidence=_env_float("MIN_CONFIDENCE", 0.35),
+            crisis_volatility=_env_float("CRISIS_VOL", 0.18),
 
             portfolio_value=_env_float("PORTFOLIO_VALUE", 100000),
-            max_position_pct=_env_float("MAX_POSITION_PCT", 0.07),
+            max_position_pct=_env_float("MAX_POSITION_PCT", 0.06),
             min_position_pct=_env_float("MIN_POSITION_PCT", 0.005),
 
             flip_cooldown_seconds=int(
-                _env_float("FLIP_COOLDOWN_SECONDS", 60)  # shorter cooldown
+                _env_float("FLIP_COOLDOWN_SECONDS", 120)
             ),
 
             global_kill_switch=_env_bool(
@@ -77,7 +77,7 @@ class SignalConfig:
         if cfg.portfolio_value <= 0:
             raise RuntimeError("Invalid portfolio_value")
 
-        if cfg.max_position_pct > 0.25:
+        if cfg.max_position_pct > 0.20:
             raise RuntimeError("Position cap too large.")
 
         return cfg
@@ -88,15 +88,13 @@ class SignalConfig:
 ###################################################
 
 def _safe(v, fallback=0.0):
-    if v is None:
-        return fallback
     try:
         v = float(v)
+        if not math.isfinite(v):
+            return fallback
+        return v
     except Exception:
         return fallback
-    if not math.isfinite(v):
-        return fallback
-    return v
 
 
 def _clamp(v, lo, hi):
@@ -130,7 +128,6 @@ class DecisionEngine:
         last_signal = self._last_signal.get(ticker, "HOLD")
         last_flip = self._last_flip_time.get(ticker, 0)
 
-        # Only block extreme flip spam
         if (
             new_signal != last_signal
             and now - last_flip
@@ -176,12 +173,15 @@ class DecisionEngine:
 
             volatility = max(_safe(volatility, 0.02), 1e-6)
 
-            # Only block extreme volatility
-            if volatility > self.config.crisis_volatility * 1.5:
+            ###################################################
+            # CRISIS FILTER
+            ###################################################
+
+            if volatility > self.config.crisis_volatility:
                 return self._hold(0.2)
 
             ###################################################
-            # EXPECTED VALUE
+            # EXPECTED VALUE (PRIMARY DRIVER)
             ###################################################
 
             ev = self.ev_engine.compute(
@@ -191,25 +191,22 @@ class DecisionEngine:
                 forecast_down
             )
 
-            # Remove extreme EV clamp (was killing trades)
             if not math.isfinite(ev):
                 return self._hold(0.1)
 
-            ###################################################
-            # PROBABILITY FILTER (NEW)
-            ###################################################
-
-            if abs(prob_up - 0.5) < 0.03:
-                return self._hold(0.2)
+            if not self.ev_engine.worthy_trade(ev):
+                return self._hold(0.25)
 
             ###################################################
-            # SIGNAL
+            # PROBABILITY CONFIRMATION
             ###################################################
 
-            signal = "BUY" if prob_up > 0.5 else "SELL"
+            if abs(prob_up - 0.5) < 0.04:
+                return self._hold(0.25)
 
-            # Better confidence scaling
-            confidence = _clamp(abs(prob_up - 0.5) * 3.5, 0.25, 0.95)
+            signal = "BUY" if ev > 0 else "SELL"
+
+            confidence = _clamp(abs(ev) * 6, 0.30, 0.95)
 
             if confidence < self.config.min_confidence:
                 return self._hold(confidence)
@@ -230,21 +227,15 @@ class DecisionEngine:
             # POSITION SIZING
             ###################################################
 
-            edge_boost = min(abs(prob_up - 0.5) * 6, 2.0)
-
             allocation = self.position_sizer.size_position(
                 signal=signal,
-                confidence=confidence * edge_boost,
+                confidence=confidence,
                 volatility=volatility,
                 portfolio_value=self.config.portfolio_value
             )
 
             if not math.isfinite(allocation) or allocation <= 0:
                 return self._hold(confidence)
-
-            ###################################################
-            # CAPITAL THROTTLE
-            ###################################################
 
             allocation *= risk["capital_multiplier"]
 
