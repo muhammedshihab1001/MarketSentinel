@@ -12,7 +12,7 @@ SEED = 42
 
 
 ###################################################
-# SAFE GPU DETECTION
+# ROBUST GPU DETECTION
 ###################################################
 
 _GPU_AVAILABLE = None
@@ -20,32 +20,29 @@ _GPU_LOCK = threading.Lock()
 
 
 def _gpu_available():
+    """
+    Detect GPU support by attempting a tiny training
+    using GPU tree_method. This is the only reliable method.
+    """
     global _GPU_AVAILABLE
 
     if _GPU_AVAILABLE is not None:
         return _GPU_AVAILABLE
 
     with _GPU_LOCK:
+
         if _GPU_AVAILABLE is not None:
             return _GPU_AVAILABLE
 
         try:
-            build_info = xgb.build_info()
-
-            if not build_info.get("USE_CUDA", False):
-                _GPU_AVAILABLE = False
-                logger.info("XGBoost built without CUDA support.")
-                return _GPU_AVAILABLE
-
             dtrain = xgb.DMatrix(
-                np.random.rand(20, 4),
-                label=np.random.randint(0, 2, 20)
+                np.random.rand(16, 4),
+                label=np.random.randint(0, 2, 16)
             )
 
             xgb.train(
                 {
-                    "tree_method": "hist",
-                    "device": "cuda",
+                    "tree_method": "gpu_hist",
                     "max_depth": 1,
                     "verbosity": 0
                 },
@@ -54,17 +51,17 @@ def _gpu_available():
             )
 
             _GPU_AVAILABLE = True
-            logger.info("CUDA backend verified.")
+            logger.info("CUDA backend verified successfully.")
 
         except Exception:
             _GPU_AVAILABLE = False
-            logger.info("CUDA unavailable - using CPU.")
+            logger.info("CUDA unavailable — using CPU.")
 
         return _GPU_AVAILABLE
 
 
-def _device():
-    return "cuda" if _gpu_available() else "cpu"
+def _tree_method():
+    return "gpu_hist" if _gpu_available() else "hist"
 
 
 ###################################################
@@ -92,18 +89,12 @@ def compute_class_weight(y):
 
 
 ###################################################
-# SAFE CLASSIFIER (FEATURE-NAME SAFE)
+# SAFE CLASSIFIER
 ###################################################
 
 class SafeXGBClassifier(XGBClassifier):
 
     def fit(self, X, y, **kwargs):
-        """
-        IMPORTANT:
-        - Do NOT convert to numpy.
-        - Preserve pandas column names.
-        - Validate safely.
-        """
 
         if not hasattr(X, "shape"):
             raise RuntimeError("Invalid feature matrix passed to XGBoost.")
@@ -113,7 +104,6 @@ class SafeXGBClassifier(XGBClassifier):
                 f"Feature schema mismatch. Expected {FEATURE_COUNT}, got {X.shape[1]}"
             )
 
-        # Validate finiteness safely
         if hasattr(X, "to_numpy"):
             if not np.isfinite(X.to_numpy()).all():
                 raise RuntimeError("Non-finite feature values detected.")
@@ -127,7 +117,6 @@ class SafeXGBClassifier(XGBClassifier):
             X.shape[1]
         )
 
-        # Remove early stopping if accidentally passed
         kwargs.pop("early_stopping_rounds", None)
 
         return super().fit(X, y, **kwargs)
@@ -139,7 +128,7 @@ class SafeXGBClassifier(XGBClassifier):
 
 def _base_params(pos_weight):
 
-    device = _device()
+    tree_method = _tree_method()
 
     params = dict(
         n_estimators=550,
@@ -151,8 +140,7 @@ def _base_params(pos_weight):
         gamma=0.10,
         reg_alpha=0.8,
         reg_lambda=1.5,
-        tree_method="hist",
-        device=device,
+        tree_method=tree_method,
         max_bin=256,
         eval_metric="logloss",
         random_state=SEED,
@@ -162,8 +150,8 @@ def _base_params(pos_weight):
     )
 
     logger.info(
-        "XGBoost params | device=%s depth=%s trees=%s lr=%.3f",
-        device.upper(),
+        "XGBoost params | tree_method=%s depth=%s trees=%s lr=%.3f",
+        tree_method.upper(),
         params["max_depth"],
         params["n_estimators"],
         params["learning_rate"]
