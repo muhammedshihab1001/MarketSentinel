@@ -37,6 +37,8 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_MODEL_BYTES = 50_000
+
+TOP_K_PERCENT = 0.20
 BENCHMARK_TICKER = "SPY"
 
 
@@ -73,7 +75,100 @@ def save_model_atomic(model, path):
 
 
 ############################################################
-# TRAINING DATA LOADER
+# INSTITUTIONAL CROSS-SECTIONAL LABELING
+############################################################
+
+def apply_cross_sectional_target(df):
+
+    df = df.sort_values(["date", "ticker"]).copy()
+
+    # ---------------------------------------------
+    # Benchmark merge (optional but preferred)
+    # ---------------------------------------------
+    if BENCHMARK_TICKER in df["ticker"].unique():
+
+        benchmark = df[df["ticker"] == BENCHMARK_TICKER][
+            ["date", "forward_return"]
+        ].rename(columns={"forward_return": "benchmark_return"})
+
+        df = df.merge(benchmark, on="date", how="left")
+        df["benchmark_return"] = df["benchmark_return"].fillna(0.0)
+
+    else:
+        logger.warning("Benchmark missing — fallback to raw forward_return.")
+        df["benchmark_return"] = 0.0
+
+    df["alpha"] = df["forward_return"] - df["benchmark_return"]
+
+    # Risk adjust
+    safe_vol = df["volatility"].clip(lower=1e-4)
+    df["risk_adj"] = (df["alpha"] / safe_vol).clip(-5, 5)
+
+    labeled = []
+
+    for date, group in df.groupby("date"):
+
+        if len(group) < 6:
+            continue
+
+        dispersion = group["risk_adj"].std()
+
+        # Skip flat days
+        if not np.isfinite(dispersion) or dispersion < 0.10:
+            continue
+
+        upper_q = 0.80
+        lower_q = 0.20
+
+        upper = group["risk_adj"].quantile(upper_q)
+        lower = group["risk_adj"].quantile(lower_q)
+
+        group = group.copy()
+
+        group["target"] = np.where(
+            group["risk_adj"] >= upper, 1,
+            np.where(group["risk_adj"] <= lower, 0, np.nan)
+        )
+
+        labeled.append(group)
+
+    if not labeled:
+        raise RuntimeError("No valid cross-sectional labels generated.")
+
+    df = pd.concat(labeled, ignore_index=True)
+    df = df.dropna(subset=["target"])
+    df["target"] = df["target"].astype("int8")
+
+    pos = int((df["target"] == 1).sum())
+    neg = int((df["target"] == 0).sum())
+
+    logger.info("Class balance | pos=%s neg=%s", pos, neg)
+
+    if pos == 0 or neg == 0:
+        raise RuntimeError("Label collapse detected.")
+
+    return df.reset_index(drop=True)
+
+
+############################################################
+# CROSS SECTION NORMALIZATION
+############################################################
+
+def cross_sectional_normalize(df):
+
+    df = df.sort_values(["date", "ticker"]).copy()
+    grouped = df.groupby("date")
+
+    for col in MODEL_FEATURES:
+        mean = grouped[col].transform("mean")
+        std = grouped[col].transform("std").fillna(1).clip(lower=1e-6)
+        df[col] = (df[col] - mean) / std
+
+    return df.reset_index(drop=True)
+
+
+############################################################
+# DATA LOADER
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -87,7 +182,9 @@ def load_training_data(start_date, end_date):
     datasets = []
 
     for ticker in universe:
+
         try:
+
             price_df = market_data.get_price_data(
                 ticker=ticker,
                 start_date=start_date,
@@ -104,6 +201,7 @@ def load_training_data(start_date, end_date):
             datasets.append(dataset)
 
         except Exception as e:
+
             logger.warning("Ticker rejected %s | %s", ticker, str(e))
 
     if not datasets:
@@ -112,133 +210,28 @@ def load_training_data(start_date, end_date):
     df = pd.concat(datasets, ignore_index=True)
 
     if len(df) < MIN_TRAINING_ROWS:
-        raise RuntimeError("Dataset too small.")
+        raise RuntimeError("Dataset too small before labeling.")
 
-    logger.info("Final dataset rows=%s", len(df))
+    logger.info("Raw dataset rows=%s", len(df))
 
-    return df.reset_index(drop=True)
+    df = apply_cross_sectional_target(df)
 
+    logger.info("Post-label rows=%s", len(df))
 
-############################################################
-# MAIN
-############################################################
+    df = cross_sectional_normalize(df)
 
-def main(start_date=None, end_date=None):
+    logger.info("Final normalized rows=%s", len(df))
 
-    t0 = time.time()
+    hash_df = df[
+        ["ticker", "date", "target", *MODEL_FEATURES]
+    ].sort_values(["date", "ticker"]).reset_index(drop=True)
 
-    init_env()
-    enforce_determinism()
+    dataset_hash = MetadataManager.hash_list([
+        MetadataManager.fingerprint_dataset(hash_df),
+        get_schema_signature(),
+        list(MODEL_FEATURES),
+        start_date,
+        end_date
+    ])
 
-    logger.info("INSTITUTIONAL XGBOOST TRAINING STARTED")
-
-    if not start_date:
-        start_date, end_date = MarketTime.window_for("xgboost")
-
-    df = load_training_data(start_date, end_date)
-
-    ############################################################
-    # MODEL TRAINER FOR WALK FORWARD
-    ############################################################
-
-    def trainer(d):
-
-        d = d.sort_values("date")
-
-        X = d.loc[:, MODEL_FEATURES]
-        y = d["target"]
-
-        split_index = int(len(d) * 0.85)
-
-        X_train = X.iloc[:split_index]
-        y_train = y.iloc[:split_index]
-
-        X_val = X.iloc[split_index:]
-        y_val = y.iloc[split_index:]
-
-        model = build_xgboost_model(y_train)
-
-        model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            verbose=False
-        )
-
-        calibrated = CalibratedClassifierCV(
-            model,
-            method="isotonic",
-            cv="prefit"
-        )
-
-        calibrated.fit(X_val, y_val)
-
-        return calibrated
-
-    ############################################################
-    # WALK FORWARD
-    ############################################################
-
-    wf = WalkForwardValidator(
-        model_trainer=trainer
-    )
-
-    metrics = wf.run(df)
-
-    logger.info(
-        "WF complete | Sharpe=%.3f Return=%.3f",
-        metrics["avg_sharpe"],
-        metrics["avg_strategy_return"]
-    )
-
-    ############################################################
-    # FINAL PRODUCTION MODEL
-    ############################################################
-
-    final_model = build_final_xgboost_model(df["target"])
-
-    final_model.fit(
-        df.loc[:, MODEL_FEATURES],
-        df["target"]
-    )
-
-    with tempfile.TemporaryDirectory(prefix="xgb_train_") as tmpdir:
-
-        model_path = os.path.join(tmpdir, "model.pkl")
-        metadata_path = os.path.join(tmpdir, "metadata.json")
-
-        save_model_atomic(final_model, model_path)
-
-        clean_metrics = {
-            k: float(v)
-            for k, v in metrics.items()
-            if not isinstance(v, list)
-        }
-
-        metadata = MetadataManager.create_metadata(
-            model_name="xgboost_direction",
-            metrics=clean_metrics,
-            features=list(MODEL_FEATURES),
-            training_start=start_date,
-            training_end=end_date,
-            dataset_hash=get_schema_signature(),
-            dataset_rows=len(df),
-            metadata_type="training_manifest_v2"
-        )
-
-        MetadataManager.save_metadata(metadata, metadata_path)
-
-        version = ModelRegistry.register_model(
-            MODEL_DIR,
-            model_path,
-            metadata_path
-        )
-
-    logger.info("MODEL VERSION %s", version)
-    logger.info("TOTAL TIME %.2f minutes", (time.time() - t0) / 60)
-
-    return metrics
-
-
-if __name__ == "__main__":
-    main()
+    return df, dataset_hash
