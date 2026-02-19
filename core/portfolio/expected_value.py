@@ -3,50 +3,53 @@ import math
 
 class ExpectedValueEngine:
     """
-    Institutional Expected Value calculator.
+    Institutional Expected Value calculator (Return-Space Corrected).
 
-    EV = (p * gain) - ((1-p) * loss)
+    EV = p * expected_up_return + (1 - p) * expected_down_return
 
-    We normalize by price so edge becomes comparable
-    across tickers.
+    All inputs are treated as RETURNS (not prices).
     """
 
-    MIN_EDGE = 0.002  # 0.2% required edge
+    MIN_EDGE = 0.0008  # 0.08% minimum edge (was too strict)
 
     ###################################################
 
     @staticmethod
     def compute(
         prob_up: float,
-        current_price: float,
-        forecast_up: float,
-        forecast_down: float
+        current_price: float,   # kept for compatibility (not used)
+        forecast_up: float,     # expected positive return (e.g. +0.02)
+        forecast_down: float    # expected negative return (e.g. -0.015)
     ) -> float:
 
+        # Basic numeric safety
         if not all(map(math.isfinite, [
             prob_up,
-            current_price,
             forecast_up,
             forecast_down
         ])):
-            return -1.0
+            return 0.0
 
-        if current_price <= 0:
-            return -1.0
+        # Probability bounds
+        prob_up = max(0.0, min(prob_up, 1.0))
 
-        gain = max(forecast_up - current_price, 0.0)
-        loss = max(current_price - forecast_down, 0.0)
+        ###################################################
+        # EV IN RETURN SPACE
+        ###################################################
 
-        # asymmetric protection
-        if gain == 0 or loss == 0:
-            return -1.0
+        ev = (
+            prob_up * forecast_up
+            + (1.0 - prob_up) * forecast_down
+        )
 
-        ev = (prob_up * gain) - ((1 - prob_up) * loss)
+        # Clamp extreme nonsense
+        if abs(ev) > 0.20:
+            return 0.0
 
-        return ev / current_price
+        return ev
 
     ###################################################
 
     @classmethod
     def worthy_trade(cls, ev: float) -> bool:
-        return math.isfinite(ev) and ev > cls.MIN_EDGE
+        return math.isfinite(ev) and abs(ev) > cls.MIN_EDGE
