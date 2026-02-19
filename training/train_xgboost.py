@@ -75,14 +75,13 @@ def save_model_atomic(model, path):
 
 
 ############################################################
-# MARKET-NEUTRAL CROSS-SECTION LABELING
+# MARKET-NEUTRAL LABELING
 ############################################################
 
 def apply_cross_sectional_target(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
 
-    # Extract benchmark return
     benchmark = df[df["ticker"] == BENCHMARK_TICKER][
         ["date", "forward_return"]
     ].rename(columns={"forward_return": "benchmark_return"})
@@ -90,7 +89,6 @@ def apply_cross_sectional_target(df):
     df = df.merge(benchmark, on="date", how="left")
     df["benchmark_return"] = df["benchmark_return"].fillna(0.0)
 
-    # Market-neutral alpha
     df["alpha"] = df["forward_return"] - df["benchmark_return"]
 
     safe_vol = df["volatility"].clip(lower=1e-4)
@@ -116,7 +114,6 @@ def apply_cross_sectional_target(df):
         labeled.append(group)
 
     df = pd.concat(labeled, ignore_index=True)
-
     df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype("int8")
 
@@ -168,7 +165,6 @@ def load_training_data(start_date, end_date):
                 end_date=end_date
             )
 
-            # FeatureStore already validates RAW features
             dataset = store.get_features(
                 price_df,
                 sentiment_df=None,
@@ -191,7 +187,6 @@ def load_training_data(start_date, end_date):
 
     logger.info("Raw dataset rows=%s", len(df))
 
-    # Label
     df = apply_cross_sectional_target(df)
 
     if df["target"].nunique() < 2:
@@ -199,12 +194,10 @@ def load_training_data(start_date, end_date):
 
     logger.info("Post-label rows=%s", len(df))
 
-    # Normalize (MODEL DOMAIN)
     df = cross_sectional_normalize(df)
 
     logger.info("Final normalized rows=%s", len(df))
 
-    # Dataset hash
     hash_df = df[
         ["ticker", "date", "target", *MODEL_FEATURES]
     ].sort_values(["date", "ticker"]).reset_index(drop=True)
@@ -250,6 +243,7 @@ def main(start_date=None, end_date=None):
         X = d.loc[:, MODEL_FEATURES]
         y = d["target"]
 
+        # Proper time-based split (last 15% for validation)
         split_index = int(len(d) * 0.85)
 
         X_train = X.iloc[:split_index]
@@ -257,6 +251,12 @@ def main(start_date=None, end_date=None):
 
         X_val = X.iloc[split_index:]
         y_val = y.iloc[split_index:]
+
+        logger.info(
+            "Train size=%s | Val size=%s",
+            len(X_train),
+            len(X_val)
+        )
 
         model = build_xgboost_model(y_train)
 
@@ -267,6 +267,7 @@ def main(start_date=None, end_date=None):
             verbose=False
         )
 
+        # Calibrate AFTER early stopping
         calibrated = CalibratedClassifierCV(
             model,
             method="isotonic",
