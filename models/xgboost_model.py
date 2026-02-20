@@ -81,7 +81,7 @@ def compute_class_weight(y):
 
 
 ###################################################
-# SAFE CLASSIFIER
+# SAFE CLASSIFIER (VERSION SAFE)
 ###################################################
 
 class SafeXGBClassifier(XGBClassifier):
@@ -102,7 +102,7 @@ class SafeXGBClassifier(XGBClassifier):
             X.shape[1]
         )
 
-        # 🔥 Internal validation split
+        # Validation split
         X_train, X_val, y_train, y_val = train_test_split(
             X,
             y,
@@ -111,11 +111,19 @@ class SafeXGBClassifier(XGBClassifier):
             stratify=y
         )
 
+        # VERSION-SAFE EARLY STOPPING
+        callbacks = [
+            xgb.callback.EarlyStopping(
+                rounds=EARLY_STOPPING_ROUNDS,
+                save_best=True
+            )
+        ]
+
         model = super().fit(
             X_train,
             y_train,
             eval_set=[(X_val, y_val)],
-            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+            callbacks=callbacks,
             verbose=False
         )
 
@@ -172,7 +180,7 @@ def _base_params(pos_weight):
 
     params = dict(
 
-        n_estimators=800,  # allow early stopping to choose
+        n_estimators=800,
         max_depth=3,
         learning_rate=0.03,
 
