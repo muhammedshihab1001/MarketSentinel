@@ -27,7 +27,6 @@ def _gpu_available():
         return _GPU_AVAILABLE
 
     with _GPU_LOCK:
-
         if _GPU_AVAILABLE is not None:
             return _GPU_AVAILABLE
 
@@ -75,7 +74,7 @@ def compute_class_weight(y):
         raise RuntimeError("Label collapse detected.")
 
     weight = neg / pos
-    weight = float(np.clip(weight, 0.8, 10.0))
+    weight = float(np.clip(weight, 0.9, 5.0))
 
     logger.info("Computed class weight = %.3f", weight)
 
@@ -131,25 +130,27 @@ class SafeXGBClassifier(XGBClassifier):
 
 
 ###################################################
-# PARAM BUILDER
+# PARAM BUILDER (REDUCED CAPACITY VERSION)
 ###################################################
 
 def _base_params(pos_weight):
 
     params = dict(
 
-        n_estimators=1000,
-        max_depth=5,
-        learning_rate=0.04,
+        # ↓↓↓ MUCH LOWER CAPACITY
+        n_estimators=300,
+        max_depth=3,
+        learning_rate=0.03,
 
-        subsample=0.85,
-        colsample_bytree=0.75,
-        colsample_bylevel=0.75,
+        # Stronger regularization
+        subsample=0.65,
+        colsample_bytree=0.6,
+        colsample_bylevel=0.6,
 
-        min_child_weight=1,
-        gamma=0.0,
-        reg_alpha=0.3,
-        reg_lambda=1.2,
+        min_child_weight=5,
+        gamma=0.2,
+        reg_alpha=0.8,
+        reg_lambda=2.5,
 
         max_bin=256,
 
@@ -172,7 +173,7 @@ def _base_params(pos_weight):
 
 
 ###################################################
-# BUILD MODEL (NO SCALER)
+# BUILD MODEL
 ###################################################
 
 def build_xgboost_pipeline(y):
@@ -182,6 +183,6 @@ def build_xgboost_pipeline(y):
 
     model = SafeXGBClassifier(**params)
 
-    logger.info("XGBoost model built successfully (no scaler).")
+    logger.info("XGBoost model built successfully (regularized).")
 
     return model
