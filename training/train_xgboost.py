@@ -40,30 +40,54 @@ def enforce_determinism():
 
 
 ############################################################
-# CROSS-SECTIONAL TARGET (CORRECT IMPLEMENTATION)
+# CROSS-SECTIONAL FEATURES (CORRECT PLACE)
+############################################################
+
+def build_cross_sectional_features(df: pd.DataFrame):
+
+    cross_cols = [
+        "momentum_20",
+        "return_lag5",
+        "rsi",
+        "volatility",
+        "ema_ratio"
+    ]
+
+    for col in cross_cols:
+
+        df[f"{col}_z"] = (
+            df.groupby("date")[col]
+            .transform(lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9))
+        ).clip(-5, 5)
+
+        df[f"{col}_rank"] = (
+            df.groupby("date")[col]
+            .transform(lambda x: x.rank(pct=True))
+        )
+
+    return df
+
+
+############################################################
+# CROSS-SECTIONAL TARGET
 ############################################################
 
 def build_cross_sectional_target(df: pd.DataFrame):
 
     df = df.sort_values(["ticker", "date"]).copy()
 
-    # Forward log return per ticker
     df["forward_log_return"] = (
         df.groupby("ticker")["close"]
         .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
     )
 
-    # Remove rows without forward return
     df = df.dropna(subset=["forward_log_return"])
 
-    # Percentile rank per date across ALL tickers
     df["alpha_rank_pct"] = (
         df.groupby("date")["forward_log_return"]
         .rank(pct=True)
     )
 
-    # Top 30% = 1
-    # Bottom 30% = 0
     df["target"] = np.nan
     df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
     df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
@@ -75,7 +99,7 @@ def build_cross_sectional_target(df: pd.DataFrame):
 
 
 ############################################################
-# LOAD DATA (FEATURES ONLY)
+# LOAD DATA
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -100,7 +124,7 @@ def load_training_data(start_date, end_date):
             price_df,
             sentiment_df=None,
             ticker=ticker,
-            training=False  # IMPORTANT
+            training=False
         )
 
         if dataset is None or dataset.empty:
@@ -116,7 +140,10 @@ def load_training_data(start_date, end_date):
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError("Dataset too small.")
 
-    # Build target AFTER concatenation
+    # 🔥 FIX 1: build cross-sectional features
+    df = build_cross_sectional_features(df)
+
+    # 🔥 FIX 2: build cross-sectional target
     df = build_cross_sectional_target(df)
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
@@ -128,7 +155,7 @@ def load_training_data(start_date, end_date):
     )
 
     if df["target"].nunique() < 2:
-        raise RuntimeError("Training labels collapsed after target build.")
+        raise RuntimeError("Training labels collapsed.")
 
     return df.reset_index(drop=True)
 
