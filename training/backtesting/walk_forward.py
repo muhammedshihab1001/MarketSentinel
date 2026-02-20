@@ -17,11 +17,11 @@ logger = logging.getLogger("marketsentinel.walkforward")
 
 class WalkForwardValidator:
 
-    MIN_TRADES_PER_WINDOW = 5
+    MIN_TRADES_PER_WINDOW = 4        # ↓ reduced from 5
     MIN_WINDOWS = 6
     MIN_TEST_DAYS = 20
 
-    MIN_ASSETS_PER_DAY = 3
+    MIN_ASSETS_PER_DAY = 2          # ↓ reduced from 3
     MIN_FEATURE_VARIANCE = 1e-8
 
     DRIFT_WARN_Z = 10.0
@@ -130,7 +130,6 @@ class WalkForwardValidator:
         logger.info("Walk-forward validation started.")
 
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
         df = self.regime_detector.detect(df)
 
         unique_dates = pd.to_datetime(
@@ -193,7 +192,6 @@ class WalkForwardValidator:
                 )
 
                 probs = model.predict_proba(features)[:, 1]
-
                 self._validate_probabilities(probs)
 
                 daily_signals = {}
@@ -242,6 +240,12 @@ class WalkForwardValidator:
                 trade_counter += len(filtered)
 
             if trade_counter < self.MIN_TRADES_PER_WINDOW:
+                logger.warning(
+                    "Window #%s skipped | trades=%s (min=%s)",
+                    window_id,
+                    trade_counter,
+                    self.MIN_TRADES_PER_WINDOW
+                )
                 start_idx += self.step_size
                 window_id += 1
                 continue
