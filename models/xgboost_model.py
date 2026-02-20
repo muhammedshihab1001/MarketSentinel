@@ -4,6 +4,9 @@ import numpy as np
 import logging
 import threading
 
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
 from core.schema.feature_schema import FEATURE_COUNT
 
 logger = logging.getLogger("marketsentinel.xgboost")
@@ -88,7 +91,7 @@ def compute_class_weight(y):
 
 class SafeXGBClassifier(XGBClassifier):
 
-    def fit(self, X, y, eval_set=None, **kwargs):
+    def fit(self, X, y, **kwargs):
 
         if not hasattr(X, "shape"):
             raise RuntimeError("Invalid feature matrix.")
@@ -98,10 +101,7 @@ class SafeXGBClassifier(XGBClassifier):
                 f"Feature schema mismatch. Expected {FEATURE_COUNT}, got {X.shape[1]}"
             )
 
-        if hasattr(X, "to_numpy"):
-            arr = X.to_numpy()
-        else:
-            arr = X
+        arr = X.to_numpy() if hasattr(X, "to_numpy") else X
 
         if not np.isfinite(arr).all():
             raise RuntimeError("Non-finite feature values detected.")
@@ -112,14 +112,7 @@ class SafeXGBClassifier(XGBClassifier):
             X.shape[1]
         )
 
-        model = super().fit(
-            X,
-            y,
-            eval_set=eval_set,
-            early_stopping_rounds=50 if eval_set else None,
-            verbose=False,
-            **kwargs
-        )
+        model = super().fit(X, y, **kwargs)
 
         preds = model.predict_proba(X)[:, 1]
 
@@ -182,12 +175,21 @@ def _base_params(pos_weight):
 
 
 ###################################################
-# BUILD MODEL
+# BUILD PIPELINE
 ###################################################
 
-def build_xgboost_model(y):
+def build_xgboost_pipeline(y):
 
     pos_weight = compute_class_weight(y)
     params = _base_params(pos_weight)
 
-    return SafeXGBClassifier(**params)
+    model = SafeXGBClassifier(**params)
+
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", model)
+    ])
+
+    logger.info("XGBoost pipeline built successfully.")
+
+    return pipeline
