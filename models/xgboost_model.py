@@ -1,4 +1,3 @@
-from xgboost import XGBClassifier
 import xgboost as xgb
 import numpy as np
 import logging
@@ -37,7 +36,7 @@ def _gpu_available():
             )
 
             xgb.train(
-                {"tree_method": "gpu_hist", "max_depth": 1, "verbosity": 0},
+                {"tree_method": "gpu_hist", "max_depth": 1},
                 dtrain,
                 num_boost_round=1
             )
@@ -63,9 +62,6 @@ def compute_class_weight(y):
 
     y = np.asarray(y)
 
-    if len(y) == 0:
-        raise RuntimeError("Empty labels passed to XGBoost.")
-
     pos = float(np.sum(y == 1))
     neg = float(np.sum(y == 0))
 
@@ -81,20 +77,17 @@ def compute_class_weight(y):
 
 
 ###################################################
-# SAFE CLASSIFIER (VERSION SAFE)
+# SAFE LEGACY MODEL
 ###################################################
 
-class SafeXGBClassifier(XGBClassifier):
+class SafeXGBClassifier:
 
-    def fit(self, X, y, **kwargs):
+    def __init__(self, pos_weight):
+        self.pos_weight = pos_weight
+        self.model = None
+        self.feature_names = None
 
-        if not hasattr(X, "shape"):
-            raise RuntimeError("Invalid feature matrix.")
-
-        arr = X.to_numpy() if hasattr(X, "to_numpy") else X
-
-        if not np.isfinite(arr).all():
-            raise RuntimeError("Non-finite feature values detected.")
+    def fit(self, X, y):
 
         logger.info(
             "XGBoost training | rows=%s cols=%s",
@@ -102,7 +95,6 @@ class SafeXGBClassifier(XGBClassifier):
             X.shape[1]
         )
 
-        # Validation split
         X_train, X_val, y_train, y_val = train_test_split(
             X,
             y,
@@ -111,23 +103,40 @@ class SafeXGBClassifier(XGBClassifier):
             stratify=y
         )
 
-        # VERSION-SAFE EARLY STOPPING
-        callbacks = [
-            xgb.callback.EarlyStopping(
-                rounds=EARLY_STOPPING_ROUNDS,
-                save_best=True
-            )
-        ]
+        self.feature_names = list(X.columns)
 
-        model = super().fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            callbacks=callbacks,
-            verbose=False
+        dtrain = xgb.DMatrix(X_train, label=y_train)
+        dval = xgb.DMatrix(X_val, label=y_val)
+
+        params = {
+            "max_depth": 3,
+            "eta": 0.03,
+            "subsample": 0.65,
+            "colsample_bytree": 0.6,
+            "min_child_weight": 6,
+            "gamma": 0.25,
+            "reg_alpha": 1.2,
+            "reg_lambda": 3.5,
+            "objective": "binary:logistic",
+            "eval_metric": "logloss",
+            "tree_method": _tree_method(),
+            "scale_pos_weight": self.pos_weight,
+            "seed": SEED,
+            "verbosity": 0
+        }
+
+        evals = [(dtrain, "train"), (dval, "validation")]
+
+        self.model = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=800,
+            evals=evals,
+            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+            verbose_eval=False
         )
 
-        preds = model.predict_proba(X)[:, 1]
+        preds = self.model.predict(xgb.DMatrix(X))
 
         mean = float(np.mean(preds))
         std = float(np.std(preds))
@@ -141,26 +150,21 @@ class SafeXGBClassifier(XGBClassifier):
         )
 
         if std < MIN_PROB_STD:
-            raise RuntimeError("Probability collapse detected after training.")
+            raise RuntimeError("Probability collapse detected.")
 
-        return model
+        return self
 
-    ###################################################
-    # FEATURE IMPORTANCE EXPORT
-    ###################################################
+    def predict_proba(self, X):
+        dmatrix = xgb.DMatrix(X)
+        probs = self.model.predict(dmatrix)
+        return np.column_stack([1 - probs, probs])
 
-    def export_feature_importance(self, feature_names):
+    def export_feature_importance(self):
 
-        booster = self.get_booster()
-        score = booster.get_score(importance_type="gain")
-
-        importances = {
-            feature_names[int(k[1:])] if k.startswith("f") else k: v
-            for k, v in score.items()
-        }
+        score = self.model.get_score(importance_type="gain")
 
         sorted_imp = sorted(
-            importances.items(),
+            score.items(),
             key=lambda x: x[1],
             reverse=True
         )
@@ -173,56 +177,13 @@ class SafeXGBClassifier(XGBClassifier):
 
 
 ###################################################
-# PARAM BUILDER
-###################################################
-
-def _base_params(pos_weight):
-
-    params = dict(
-
-        n_estimators=800,
-        max_depth=3,
-        learning_rate=0.03,
-
-        subsample=0.65,
-        colsample_bytree=0.6,
-        colsample_bylevel=0.6,
-
-        min_child_weight=6,
-        gamma=0.25,
-        reg_alpha=1.2,
-        reg_lambda=3.5,
-
-        max_bin=256,
-
-        tree_method=_tree_method(),
-        eval_metric="logloss",
-        random_state=SEED,
-        n_jobs=1,
-        scale_pos_weight=pos_weight,
-        verbosity=0
-    )
-
-    logger.info(
-        "XGBoost params | depth=%s trees=%s lr=%.3f",
-        params["max_depth"],
-        params["n_estimators"],
-        params["learning_rate"]
-    )
-
-    return params
-
-
-###################################################
 # BUILD MODEL
 ###################################################
 
 def build_xgboost_pipeline(y):
 
     pos_weight = compute_class_weight(y)
-    params = _base_params(pos_weight)
-
-    model = SafeXGBClassifier(**params)
+    model = SafeXGBClassifier(pos_weight)
 
     logger.info("XGBoost model built successfully.")
 
