@@ -4,11 +4,12 @@ import json
 import os
 import threading
 import re
+from datetime import datetime
 
 
 class MarketUniverse:
     """
-    Institutional Universe Controller.
+    Institutional Universe Controller (v6 hardened)
 
     Guarantees:
     ✔ deterministic
@@ -21,6 +22,8 @@ class MarketUniverse:
     ✔ hot-reload safe
     ✔ ticker validated
     ✔ version monotonic
+    ✔ metadata validated
+    ✔ min_history_days enforced
     """
 
     UNIVERSE_FILE = "config/universe.json"
@@ -28,7 +31,6 @@ class MarketUniverse:
     MIN_FILE_BYTES = 20
     MIN_UNIVERSE_SIZE = 5
 
-    # exchange-safe ticker pattern
     TICKER_REGEX = re.compile(r"^[A-Z0-9.\-]{1,10}$")
 
     _CACHE = None
@@ -67,10 +69,8 @@ class MarketUniverse:
             raise RuntimeError("Universe file corrupted.")
 
         try:
-            # safer read
             with open(cls.UNIVERSE_FILE, "rb") as f:
                 payload = json.loads(f.read().decode())
-
         except Exception as exc:
             raise RuntimeError(
                 "Universe config unreadable."
@@ -80,14 +80,39 @@ class MarketUniverse:
         # STRICT SCHEMA
         #################################################
 
-        if not isinstance(payload, dict):
-            raise RuntimeError("Universe payload must be dict.")
+        required_fields = {
+            "version",
+            "created_utc",
+            "description",
+            "min_history_days",
+            "tickers"
+        }
 
-        version = payload.get("version")
-        tickers = payload.get("tickers")
+        missing = required_fields - set(payload.keys())
+        if missing:
+            raise RuntimeError(
+                f"Universe config missing fields: {missing}"
+            )
+
+        version = payload["version"]
+        created_utc = payload["created_utc"]
+        description = payload["description"]
+        min_history_days = payload["min_history_days"]
+        tickers = payload["tickers"]
 
         if not isinstance(version, str):
             raise RuntimeError("Universe version must be string.")
+
+        if not isinstance(description, str):
+            raise RuntimeError("Universe description must be string.")
+
+        if not isinstance(min_history_days, int) or min_history_days <= 0:
+            raise RuntimeError("min_history_days must be positive int.")
+
+        try:
+            datetime.fromisoformat(created_utc.replace("Z", "+00:00"))
+        except Exception:
+            raise RuntimeError("created_utc must be ISO format.")
 
         if not isinstance(tickers, list):
             raise RuntimeError("Universe tickers must be list.")
@@ -131,7 +156,14 @@ class MarketUniverse:
 
         cls._LAST_VERSION = version
 
-        return version, tuple(sorted(normalized))
+        return {
+            "version": version,
+            "created_utc": created_utc,
+            "description": description,
+            "min_history_days": min_history_days,
+            "tickers": tuple(sorted(normalized)),
+            "ticker_set": set(normalized)
+        }
 
     ###################################################
     # CACHE (THREAD SAFE + HOT RELOAD)
@@ -148,14 +180,7 @@ class MarketUniverse:
 
                 if cls._CACHE is None or cls._FILE_HASH != current_hash:
 
-                    version, tickers = cls._load_file()
-
-                    cls._CACHE = {
-                        "version": version,
-                        "tickers": tickers,
-                        "ticker_set": set(tickers)
-                    }
-
+                    cls._CACHE = cls._load_file()
                     cls._FILE_HASH = current_hash
 
         return cls._CACHE
@@ -174,12 +199,20 @@ class MarketUniverse:
         return cls._get_cached()
 
     ###################################################
-    # PUBLIC
+    # PUBLIC API
     ###################################################
 
     @classmethod
     def get_universe(cls) -> Tuple[str, ...]:
         return cls._get_cached()["tickers"]
+
+    @classmethod
+    def get_min_history_days(cls) -> int:
+        return cls._get_cached()["min_history_days"]
+
+    @classmethod
+    def get_version(cls) -> str:
+        return cls._get_cached()["version"]
 
     ###################################################
     # FINGERPRINT
@@ -190,7 +223,8 @@ class MarketUniverse:
 
         contract = {
             "tickers": list(cls.get_universe()),
-            "version": cls._get_cached()["version"],
+            "version": cls.get_version(),
+            "min_history_days": cls.get_min_history_days()
         }
 
         canonical = json.dumps(
@@ -210,13 +244,14 @@ class MarketUniverse:
 
         cache = cls._get_cached()
 
-        tickers = list(cache["tickers"])
-
         return {
             "universe_version": cache["version"],
+            "created_utc": cache["created_utc"],
+            "description": cache["description"],
+            "min_history_days": cache["min_history_days"],
             "universe_hash": cls.fingerprint(),
-            "universe_size": len(tickers),
-            "tickers": tickers
+            "universe_size": len(cache["tickers"]),
+            "tickers": list(cache["tickers"])
         }
 
     ###################################################
