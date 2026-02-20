@@ -9,6 +9,8 @@ from core.schema.feature_schema import FEATURE_COUNT
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
+MIN_PROB_STD = 1e-5
+
 
 ###################################################
 # GPU DETECTION
@@ -73,8 +75,6 @@ def compute_class_weight(y):
         raise RuntimeError("Label collapse detected.")
 
     weight = neg / pos
-
-    # More stable clipping
     weight = float(np.clip(weight, 0.8, 10.0))
 
     logger.info("Computed class weight = %.3f", weight)
@@ -88,7 +88,7 @@ def compute_class_weight(y):
 
 class SafeXGBClassifier(XGBClassifier):
 
-    def fit(self, X, y, **kwargs):
+    def fit(self, X, y, eval_set=None, **kwargs):
 
         if not hasattr(X, "shape"):
             raise RuntimeError("Invalid feature matrix.")
@@ -112,42 +112,50 @@ class SafeXGBClassifier(XGBClassifier):
             X.shape[1]
         )
 
-        model = super().fit(X, y, **kwargs)
+        model = super().fit(
+            X,
+            y,
+            eval_set=eval_set,
+            early_stopping_rounds=50 if eval_set else None,
+            verbose=False,
+            **kwargs
+        )
 
-        # 🔥 Log probability dispersion after training
         preds = model.predict_proba(X)[:, 1]
+
+        mean = float(np.mean(preds))
+        std = float(np.std(preds))
+
         logger.info(
             "Train prob stats | mean=%.4f std=%.4f min=%.4f max=%.4f",
-            float(np.mean(preds)),
-            float(np.std(preds)),
+            mean,
+            std,
             float(np.min(preds)),
             float(np.max(preds))
         )
+
+        if std < MIN_PROB_STD:
+            raise RuntimeError("Probability collapse detected after training.")
 
         return model
 
 
 ###################################################
-# PARAM BUILDER (BALANCED ALPHA MODE)
+# PARAM BUILDER
 ###################################################
 
 def _base_params(pos_weight):
 
-    tree_method = _tree_method()
-
     params = dict(
 
-        # Trees
-        n_estimators=900,
+        n_estimators=1000,
         max_depth=5,
         learning_rate=0.04,
 
-        # Randomization (IMPORTANT for cross-sectional ML)
         subsample=0.85,
         colsample_bytree=0.75,
         colsample_bylevel=0.75,
 
-        # Regularization (reduced to avoid flattening)
         min_child_weight=1,
         gamma=0.0,
         reg_alpha=0.3,
@@ -155,10 +163,10 @@ def _base_params(pos_weight):
 
         max_bin=256,
 
-        tree_method=tree_method,
+        tree_method=_tree_method(),
         eval_metric="logloss",
         random_state=SEED,
-        n_jobs=-1,
+        n_jobs=1,
         scale_pos_weight=pos_weight,
         verbosity=0
     )
@@ -174,37 +182,12 @@ def _base_params(pos_weight):
 
 
 ###################################################
-# BUILD TRAIN MODEL
+# BUILD MODEL
 ###################################################
 
 def build_xgboost_model(y):
 
     pos_weight = compute_class_weight(y)
     params = _base_params(pos_weight)
-
-    model = SafeXGBClassifier(**params)
-
-    return model
-
-
-###################################################
-# BUILD FINAL MODEL
-###################################################
-
-def build_final_xgboost_model(y):
-
-    pos_weight = compute_class_weight(y)
-    params = _base_params(pos_weight)
-
-    # Slightly stronger but controlled
-    params.update({
-        "n_estimators": 1100,
-        "learning_rate": 0.035,
-        "max_depth": 6,
-        "reg_alpha": 0.4,
-        "reg_lambda": 1.4,
-    })
-
-    logger.info("Building final production model.")
 
     return SafeXGBClassifier(**params)
