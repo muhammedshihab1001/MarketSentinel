@@ -1,12 +1,8 @@
-from dataclasses import dataclass
 import math
 import os
 import numpy as np
+from dataclasses import dataclass
 
-
-###################################################
-# SAFE ENV LOADER
-###################################################
 
 def _env_float(key: str, default: float) -> float:
     try:
@@ -20,22 +16,15 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
-###################################################
-# RISK CONFIG
-###################################################
-
 @dataclass(frozen=True)
 class RiskConfig:
 
     max_position_size: float
     min_position_size: float
-
     volatility_target: float
     fractional_kelly: float
-
     max_gross_exposure_pct: float
     max_single_trade_dollars: float
-
     max_drawdown_kill: float
 
     @staticmethod
@@ -44,13 +33,10 @@ class RiskConfig:
         cfg = RiskConfig(
             max_position_size=_env_float("MAX_POSITION_SIZE", 0.06),
             min_position_size=_env_float("MIN_POSITION_SIZE", 0.005),
-
             volatility_target=_env_float("VOL_TARGET", 0.02),
             fractional_kelly=_env_float("FRACTIONAL_KELLY", 0.15),
-
             max_gross_exposure_pct=_env_float("MAX_GROSS_EXPOSURE", 0.70),
             max_single_trade_dollars=_env_float("MAX_SINGLE_TRADE", 25_000),
-
             max_drawdown_kill=_env_float("MAX_DRAWDOWN_KILL", 0.35),
         )
 
@@ -66,26 +52,16 @@ class RiskConfig:
         return cfg
 
 
-###################################################
-# POSITION SIZER (ALIGNED WITH LONG/SHORT PIPELINE)
-###################################################
-
 class PositionSizer:
 
     ABSOLUTE_MAX_POSITION = 0.15
     MIN_DEPLOYABLE_CAPITAL = 10_000
-
     VOL_FLOOR = 0.008
     VOL_CEILING = 0.12
-
     MAX_KELLY_FRACTION = 0.05
-
-    ###################################################
 
     def __init__(self, config: RiskConfig | None = None):
         self.config = config or RiskConfig.load()
-
-    ###################################################
 
     @staticmethod
     def _safe(v, fallback):
@@ -97,14 +73,8 @@ class PositionSizer:
         except Exception:
             return fallback
 
-    ###################################################
-    # DRAWdown CONTROL
-    ###################################################
-
     def _drawdown_scalar(self):
-
         raw = os.getenv("PORTFOLIO_DRAWDOWN_PCT", "0")
-
         try:
             dd = float(raw)
         except Exception:
@@ -126,27 +96,18 @@ class PositionSizer:
 
         return 0.0
 
-    ###################################################
-    # STABILIZED KELLY
-    ###################################################
-
     def _kelly_cap(self, edge, volatility, portfolio_value):
 
         if edge <= 0:
             return 0
 
         volatility = max(volatility, self.VOL_FLOOR)
-
         variance = volatility ** 2
 
         kelly_fraction = (edge / variance) * self.config.fractional_kelly
         kelly_fraction = min(kelly_fraction, self.MAX_KELLY_FRACTION)
 
         return portfolio_value * kelly_fraction
-
-    ###################################################
-    # POSITION SIZING
-    ###################################################
 
     def size_position(
         self,
@@ -169,33 +130,17 @@ class PositionSizer:
         )
 
         dd_scalar = self._drawdown_scalar()
-
         if dd_scalar == 0:
             return 0.0
 
-        ###################################################
-        # LONG / SHORT SUPPORT
-        ###################################################
-
         direction = 1 if signal == "BUY" else -1
 
-        ###################################################
-        # EDGE PROXY FROM CONFIDENCE
-        ###################################################
-
-        edge = abs(confidence - 0.5)
-
-        ###################################################
-        # VOL SCALING
-        ###################################################
+        # 🔐 FIXED EDGE CALCULATION
+        edge = confidence
 
         vol_scalar = math.sqrt(
             self.config.volatility_target / volatility
         )
-
-        ###################################################
-        # RAW SIZE
-        ###################################################
 
         raw_size = (
             portfolio_value *
@@ -205,10 +150,6 @@ class PositionSizer:
             dd_scalar
         )
 
-        ###################################################
-        # KELLY CAP
-        ###################################################
-
         kelly_cap = self._kelly_cap(
             edge,
             volatility,
@@ -217,10 +158,6 @@ class PositionSizer:
 
         if kelly_cap > 0:
             raw_size = min(raw_size, kelly_cap)
-
-        ###################################################
-        # HARD CAPS
-        ###################################################
 
         config_cap = portfolio_value * self.config.max_position_size
         absolute_cap = portfolio_value * self.ABSOLUTE_MAX_POSITION
