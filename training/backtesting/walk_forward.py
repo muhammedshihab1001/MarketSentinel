@@ -25,7 +25,6 @@ class WalkForwardValidator:
     DRIFT_WARN_Z = 10.0
     MIN_PROB_STD = 1e-5
 
-    # 🔥 ALIGN WITH TRAINING
     TOP_K = 2
     BOTTOM_K = 2
 
@@ -110,21 +109,6 @@ class WalkForwardValidator:
 
     ########################################################
 
-    def _distribution_guard(self, train_df, test_df):
-
-        available_features = [c for c in MODEL_FEATURES if c in train_df.columns]
-
-        train_mu = train_df[available_features].mean()
-        train_std = train_df[available_features].std(ddof=0) + 1e-9
-
-        z = np.abs((test_df[available_features] - train_mu) / train_std)
-        max_z = float(np.nanmax(z.to_numpy()))
-
-        if max_z > self.DRIFT_WARN_Z:
-            logger.warning("Feature drift detected | max_z=%.2f", max_z)
-
-    ########################################################
-
     def run(self, df: pd.DataFrame):
 
         logger.info("Walk-forward validation started.")
@@ -159,14 +143,12 @@ class WalkForwardValidator:
             ].copy()
 
             train_df = self._apply_embargo(train_df, test_dates.iloc[0])
-
             test_df = df[
                 (df["date"] >= test_dates.iloc[0]) &
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
             self._validate_training_frame(train_df)
-            self._distribution_guard(train_df, test_df)
 
             model = self.model_trainer(train_df)
 
@@ -193,10 +175,10 @@ class WalkForwardValidator:
                 self._validate_probabilities(probs)
 
                 signal_slice = signal_slice.copy()
-                signal_slice["prob"] = probs
+                signal_slice["score"] = probs
 
-                # 🔥 TRUE CROSS-SECTIONAL SELECTION
-                signal_slice = signal_slice.sort_values("prob")
+                # Cross-sectional ranking
+                signal_slice = signal_slice.sort_values("score")
 
                 bottom = signal_slice.head(self.BOTTOM_K)
                 top = signal_slice.tail(self.TOP_K)
@@ -207,12 +189,10 @@ class WalkForwardValidator:
 
                 for row in selected.itertuples(index=False):
 
-                    prob = float(row.prob)
-
                     decision = self.decision_engine.generate(
                         ticker=row.ticker,
-                        predicted_return=float(prob - 0.5),
-                        prob_up=prob,
+                        predicted_return=float(row.score),
+                        prob_up=float(row.score),
                         volatility=float(getattr(row, "volatility", 0.02)),
                         regime=getattr(row, "regime", "SIDEWAYS"),
                         price_df=test_df[test_df["ticker"] == row.ticker]
