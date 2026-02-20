@@ -2,6 +2,8 @@ import logging
 import time
 import gc
 import asyncio
+import os
+import hashlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Response, Request
@@ -11,6 +13,7 @@ from prometheus_client import generate_latest
 from app.api.routes import health, predict
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
+from core.schema.feature_schema import get_schema_signature
 
 
 # =====================================================
@@ -26,16 +29,19 @@ logger = logging.getLogger("marketsentinel")
 
 
 # =====================================================
-# GLOBAL INFERENCE LIMITER
-# Prevent CPU death spirals
+# SYSTEM FINGERPRINT
 # =====================================================
 
+BOOT_ID = hashlib.sha256(
+    str(time.time()).encode()
+).hexdigest()[:12]
+
+STARTUP_TIMEOUT_SEC = 120
 MAX_CONCURRENT_INFERENCE = 4
-inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCE)
 
 
 # =====================================================
-# READINESS
+# GLOBAL STATE
 # =====================================================
 
 class ReadinessState:
@@ -43,6 +49,10 @@ class ReadinessState:
     def __init__(self):
         self.models_loaded = False
         self.redis_connected = False
+        self.schema_signature = None
+        self.model_version = None
+        self.boot_id = BOOT_ID
+        self.start_time = int(time.time())
 
     @property
     def ready(self):
@@ -50,6 +60,8 @@ class ReadinessState:
 
 
 readiness = ReadinessState()
+
+inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCE)
 
 
 # =====================================================
@@ -70,9 +82,6 @@ async def global_exception_handler(request: Request, exc: Exception):
 # LIFESPAN
 # =====================================================
 
-STARTUP_TIMEOUT_SEC = 120
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
@@ -82,12 +91,27 @@ async def lifespan(app: FastAPI):
 
         logger.info("===================================")
         logger.info(" MarketSentinel Boot Sequence Start ")
+        logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("===================================")
+
+        # -------------------------------------------------
+        # MODEL LOADING
+        # -------------------------------------------------
 
         loader = ModelLoader()
         loader.warmup()
 
         readiness.models_loaded = True
+        readiness.schema_signature = get_schema_signature()
+
+        try:
+            readiness.model_version = loader.xgb_version
+        except Exception:
+            readiness.model_version = "latest"
+
+        # -------------------------------------------------
+        # REDIS CHECK
+        # -------------------------------------------------
 
         cache = RedisCache()
 
@@ -97,7 +121,10 @@ async def lifespan(app: FastAPI):
         else:
             logger.warning("Redis unavailable — degraded mode.")
 
-        # GC AFTER everything is loaded
+        # -------------------------------------------------
+        # GC CLEANUP
+        # -------------------------------------------------
+
         gc.collect()
 
         boot_time = round(time.time() - start_time, 2)
@@ -105,24 +132,32 @@ async def lifespan(app: FastAPI):
         if boot_time > STARTUP_TIMEOUT_SEC:
             raise RuntimeError("Startup exceeded timeout.")
 
-        logger.info(f"System ready in {boot_time}s")
+        logger.info("System ready in %.2fs", boot_time)
+        logger.info("Schema signature: %s", readiness.schema_signature)
+        logger.info("Model version: %s", readiness.model_version)
 
         yield
+
+        # -------------------------------------------------
+        # SHUTDOWN
+        # -------------------------------------------------
+
+        logger.info("Shutting down MarketSentinel...")
+        gc.collect()
 
     except Exception:
 
         logger.exception("CRITICAL STARTUP FAILURE")
-
         raise
 
 
 # =====================================================
-# FASTAPI
+# FASTAPI APP
 # =====================================================
 
 app = FastAPI(
     title="MarketSentinel API",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -146,6 +181,7 @@ async def root():
     return {
         "service": "MarketSentinel API",
         "status": "running",
+        "boot_id": readiness.boot_id,
         "docs": "/docs",
         "metrics": "/metrics"
     }
@@ -172,8 +208,12 @@ def readiness_probe():
 
     return {
         "status": "ready",
+        "boot_id": readiness.boot_id,
+        "model_version": readiness.model_version,
+        "schema_signature": readiness.schema_signature,
         "redis_connected": readiness.redis_connected,
-        "mode": "degraded" if not readiness.redis_connected else "normal"
+        "mode": "degraded" if not readiness.redis_connected else "normal",
+        "uptime_seconds": int(time.time()) - readiness.start_time
     }
 
 
@@ -183,4 +223,7 @@ def readiness_probe():
 
 @app.get("/live")
 def liveness_probe():
-    return {"status": "alive"}
+    return {
+        "status": "alive",
+        "boot_id": readiness.boot_id
+    }
