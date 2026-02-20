@@ -96,7 +96,6 @@ class WalkForwardValidator:
                 if (df_slice[col] < lo).any() or (df_slice[col] > hi).any():
                     raise RuntimeError(f"Inference feature limit breach: {col}")
 
-        # 🔐 RETURN DATAFRAME — NOT NUMPY
         return df_slice
 
     ########################################################
@@ -272,3 +271,33 @@ class WalkForwardValidator:
         logger.info("Walk-forward completed successfully.")
 
         return self.aggregate_results(results, equity_curve)
+
+    ########################################################
+
+    def aggregate_results(self, results, equity_curve):
+
+        df = pd.DataFrame(results)
+
+        if df.empty:
+            raise RuntimeError("No valid walk-forward results to aggregate.")
+
+        curve = np.array(equity_curve, dtype=float)
+
+        peak = np.maximum.accumulate(curve)
+        drawdowns = (curve - peak) / peak
+
+        gains = df[df["strategy_return"] > 0]["strategy_return"].sum()
+        losses = abs(df[df["strategy_return"] < 0]["strategy_return"].sum()) or 1e-6
+
+        profit_factor = float(gains / losses)
+
+        return {
+            "avg_strategy_return": float(df["strategy_return"].mean()),
+            "avg_sharpe": float(df["sharpe_ratio"].mean()),
+            "profit_factor": profit_factor,
+            "max_drawdown": float(drawdowns.min()),
+            "return_volatility": float(df["strategy_return"].std()),
+            "final_equity": float(curve[-1]),
+            "equity_curve": curve.tolist(),
+            "num_windows": int(len(df))
+        }
