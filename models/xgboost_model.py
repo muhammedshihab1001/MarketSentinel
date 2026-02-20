@@ -4,9 +4,6 @@ import numpy as np
 import logging
 import threading
 
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-
 from core.schema.feature_schema import FEATURE_COUNT
 
 logger = logging.getLogger("marketsentinel.xgboost")
@@ -175,7 +172,7 @@ def _base_params(pos_weight):
 
 
 ###################################################
-# BUILD PIPELINE
+# BUILD MODEL (NO SCALER)
 ###################################################
 
 def build_xgboost_pipeline(y):
@@ -185,11 +182,6 @@ def build_xgboost_pipeline(y):
 
     model = SafeXGBClassifier(**params)
 
-    pipeline = Pipeline([
-        ("scaler", StandardScaler()),
-        ("model", model)
-    ])
+    logger.info("XGBoost model built successfully (no scaler).")
 
-    logger.info("XGBoost pipeline built successfully.")
-
-    return pipeline
+    return model
