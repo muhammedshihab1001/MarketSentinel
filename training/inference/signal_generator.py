@@ -13,19 +13,24 @@ logger = logging.getLogger("marketsentinel.signal_generator")
 
 class SignalGenerator:
     """
-    Institutional Signal Generator
+    Institutional Signal Generator v2
 
-    Guarantees:
-    - schema validation
-    - probability sanity
-    - spread guard
-    - conviction filter
-    - deterministic output
+    Improvements:
+    - Hard probability band
+    - Symmetric long/short selection
+    - Cross-sectional z normalization
+    - Spread guard
+    - Conviction filter
+    - Deterministic output
     """
 
-    MIN_SPREAD = 0.04
-    MIN_Z_SCORE = 0.5
-    TOP_K_PERCENT = 0.30
+    MIN_SPREAD = 0.05
+    MIN_Z_SCORE = 0.75
+
+    PROB_BUY = 0.65
+    PROB_SELL = 0.35
+
+    TOP_K_PERCENT = 0.25
     MIN_PROB_STD = 1e-5
 
     ###################################################
@@ -51,7 +56,7 @@ class SignalGenerator:
         return True
 
     ###################################################
-    # CROSS-SECTION NORMALIZATION
+    # NORMALIZATION
     ###################################################
 
     def _normalize_probs(self, probs):
@@ -107,15 +112,39 @@ class SignalGenerator:
             "z": z_scores
         })
 
+        # Hard probability band
+        df["direction"] = np.where(
+            df["prob"] >= self.PROB_BUY, 1,
+            np.where(df["prob"] <= self.PROB_SELL, -1, 0)
+        )
+
+        # Remove neutral
+        df = df[df["direction"] != 0]
+
+        if df.empty:
+            return ["HOLD"] * len(probs), probs
+
+        # Conviction filter
         df = df[np.abs(df["z"]) >= self.MIN_Z_SCORE]
 
         if df.empty:
             return ["HOLD"] * len(probs), probs
 
         k = max(1, int(len(df) * self.TOP_K_PERCENT))
-        df = df.sort_values("z", ascending=False).head(k)
 
-        selected = set(df["ticker"].values)
+        # Long side
+        longs = df[df["direction"] == 1] \
+            .sort_values("z", ascending=False) \
+            .head(k)
+
+        # Short side
+        shorts = df[df["direction"] == -1] \
+            .sort_values("z", ascending=True) \
+            .head(k)
+
+        selected = set(longs["ticker"]).union(
+            set(shorts["ticker"])
+        )
 
         signals = []
 
@@ -127,18 +156,17 @@ class SignalGenerator:
 
             prob = float(probs[i])
 
-            forecast_up = prob * 0.05
-            forecast_down = (1 - prob) * -0.04
+            direction = 1 if prob >= self.PROB_BUY else -1
 
             decision = self.engine.generate(
                 ticker=row.ticker,
                 price_df=None,
                 current_price=row.close,
-                forecast_up=forecast_up,
-                forecast_down=forecast_down,
+                forecast_up=prob,
+                forecast_down=1 - prob,
                 prob_up=prob,
                 volatility=float(getattr(row, "volatility", 0.02)),
-                regime=getattr(row, "regime", None)
+                regime=getattr(row, "regime_feature", None)
             )
 
             signals.append(decision["signal"])
