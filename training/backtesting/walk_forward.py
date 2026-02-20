@@ -2,7 +2,11 @@ import numpy as np
 import pandas as pd
 import logging
 
-from core.schema.feature_schema import MODEL_FEATURES
+from core.schema.feature_schema import (
+    MODEL_FEATURES,
+    validate_feature_schema
+)
+
 from training.backtesting.portfolio_engine import PortfolioBacktestEngine
 from training.backtesting.regime import MarketRegimeDetector
 from core.signals.signal_engine import DecisionEngine
@@ -20,6 +24,7 @@ class WalkForwardValidator:
     MIN_FEATURE_VARIANCE = 1e-8
 
     DRIFT_WARN_Z = 10.0
+    MIN_PROB_STD = 1e-5
 
     ########################################################
 
@@ -39,6 +44,22 @@ class WalkForwardValidator:
         self.engine = PortfolioBacktestEngine()
         self.regime_detector = MarketRegimeDetector()
         self.decision_engine = DecisionEngine()
+
+    ########################################################
+    # NORMALIZATION (MATCH TRAINING)
+    ########################################################
+
+    def _cross_sectional_normalize(self, df):
+
+        df = df.sort_values(["date", "ticker"]).copy()
+        grouped = df.groupby("date")
+
+        for col in MODEL_FEATURES:
+            mean = grouped[col].transform("mean")
+            std = grouped[col].transform("std").fillna(1).clip(lower=1e-6)
+            df[col] = (df[col] - mean) / std
+
+        return df
 
     ########################################################
 
@@ -71,6 +92,16 @@ class WalkForwardValidator:
 
     ########################################################
 
+    def _validate_probabilities(self, probs):
+
+        if not np.isfinite(probs).all():
+            raise RuntimeError("Non-finite probabilities.")
+
+        if np.std(probs) < self.MIN_PROB_STD:
+            raise RuntimeError("Probability collapse detected.")
+
+    ########################################################
+
     def _distribution_guard(self, train_df, test_df):
 
         train_mu = train_df[MODEL_FEATURES].mean()
@@ -89,9 +120,12 @@ class WalkForwardValidator:
         logger.info("Walk-forward validation started.")
 
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
         df = self.regime_detector.detect(df)
 
-        unique_dates = pd.to_datetime(df["date"].drop_duplicates()).sort_values()
+        unique_dates = pd.to_datetime(
+            df["date"].drop_duplicates()
+        ).sort_values()
 
         results = []
         equity_curve = []
@@ -122,6 +156,10 @@ class WalkForwardValidator:
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
+            # Apply normalization to both (critical fix)
+            train_df = self._cross_sectional_normalize(train_df)
+            test_df = self._cross_sectional_normalize(test_df)
+
             self._validate_training_frame(train_df)
             self._distribution_guard(train_df, test_df)
 
@@ -144,26 +182,34 @@ class WalkForwardValidator:
                 if signal_slice.empty or exec_slice.empty:
                     continue
 
-                features = signal_slice.loc[:, MODEL_FEATURES]
-                probs = model.predict_proba(features)[:, 1]
+                features = validate_feature_schema(
+                    signal_slice.loc[:, MODEL_FEATURES]
+                )
+
+                probs = model.predict_proba(
+                    features.to_numpy(dtype=np.float32)
+                )[:, 1]
+
+                self._validate_probabilities(probs)
 
                 daily_signals = {}
 
-                for idx, row in signal_slice.iterrows():
-
-                    ticker = row["ticker"]
+                for row, prob in zip(
+                    signal_slice.itertuples(index=False),
+                    probs
+                ):
 
                     decision = self.decision_engine.generate(
-                        ticker=ticker,
-                        predicted_return=float(probs[list(signal_slice.index).index(idx)] - 0.5),
-                        prob_up=float(probs[list(signal_slice.index).index(idx)]),
-                        volatility=float(row.get("volatility", 0.02)),
-                        regime=row.get("regime"),
-                        price_df=test_df[test_df["ticker"] == ticker]
+                        ticker=row.ticker,
+                        predicted_return=float(prob - 0.5),
+                        prob_up=float(prob),
+                        volatility=float(getattr(row, "volatility", 0.02)),
+                        regime=getattr(row, "regime", "SIDEWAYS"),
+                        price_df=test_df[test_df["ticker"] == row.ticker]
                     )
 
                     if decision["signal"] in {"BUY", "SELL"}:
-                        daily_signals[ticker] = decision["signal"]
+                        daily_signals[row.ticker] = decision["signal"]
 
                 if len(daily_signals) < self.MIN_ASSETS_PER_DAY:
                     continue
