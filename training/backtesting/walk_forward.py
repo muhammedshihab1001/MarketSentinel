@@ -219,7 +219,7 @@ class WalkForwardValidator:
                     )
 
                     if decision["signal"] in {"BUY", "SELL"}:
-                        daily_signals[row.ticker] = decision["signal"]
+                        daily_signals[row.ticker] = decision
 
                 if not daily_signals:
                     continue

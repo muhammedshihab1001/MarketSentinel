@@ -10,26 +10,23 @@ class PortfolioBacktestEngine:
     EPSILON = 1e-12
 
     VOL_WINDOW = 20
-    CASH_BUFFER = 0.08
+    CASH_BUFFER = 0.10
 
     MAX_INV_VOL = 5.0
-    MAX_POSITION_WEIGHT = 0.15
-    MAX_GROSS_EXPOSURE = 0.90
+    MAX_POSITION_WEIGHT = 0.20
+    MAX_GROSS_EXPOSURE = 0.70
 
-    MIN_EQUITY_FLOOR = 0.60
-
-    VALID_SIGNALS = {"BUY", "SELL"}
+    MIN_EQUITY_FLOOR = 0.40
 
     ###################################################
 
     def __init__(
         self,
-        transaction_cost=0.001,
-        base_slippage=0.0006,
+        transaction_cost=0.0005,
+        base_slippage=0.0004,
     ):
         self.transaction_cost = transaction_cost
         self.base_slippage = base_slippage
-
         self.return_buffers = defaultdict(list)
 
     ###################################################
@@ -71,28 +68,29 @@ class PortfolioBacktestEngine:
         return vols
 
     ###################################################
-    # WEIGHT ENGINE (UPGRADED)
+    # WEIGHT ENGINE (FIXED)
     ###################################################
 
     def _compute_weights(self, signals, vols):
 
         raw = {}
 
-        for t, signal_data in signals.items():
+        for t, decision in signals.items():
 
-            if isinstance(signal_data, dict):
-                direction = 1 if signal_data["signal"] == "BUY" else -1
-                edge = abs(signal_data.get("edge", 0.05))
-            else:
-                direction = 1 if signal_data == "BUY" else -1
-                edge = 0.05
+            if not isinstance(decision, dict):
+                continue
+
+            direction = 1 if decision["signal"] == "BUY" else -1
+            confidence = float(decision.get("confidence", 0.0))
+
+            if confidence <= 0:
+                continue
 
             vol = vols.get(t, 0.02)
 
             inv_vol = min(1 / max(vol, 1e-4), self.MAX_INV_VOL)
 
-            # 🔥 KEY CHANGE: EDGE-SCALED WEIGHT
-            raw_weight = direction * edge * inv_vol
+            raw_weight = direction * confidence * inv_vol
 
             raw[t] = raw_weight
 
@@ -104,13 +102,12 @@ class PortfolioBacktestEngine:
         if total_abs < self.EPSILON:
             return {}
 
-        # Normalize to target gross exposure
         weights = {
             t: (v / total_abs) * self.MAX_GROSS_EXPOSURE
             for t, v in raw.items()
         }
 
-        # Soft cap individual positions
+        # Clip individual exposure
         for t in weights:
             weights[t] = np.clip(
                 weights[t],
@@ -118,7 +115,6 @@ class PortfolioBacktestEngine:
                 self.MAX_POSITION_WEIGHT
             )
 
-        # Re-normalize if clipping changed exposure
         gross = sum(abs(w) for w in weights.values())
         if gross > self.MAX_GROSS_EXPOSURE:
             scale = self.MAX_GROSS_EXPOSURE / gross
