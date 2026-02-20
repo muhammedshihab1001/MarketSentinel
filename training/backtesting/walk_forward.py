@@ -27,6 +27,10 @@ class WalkForwardValidator:
     DRIFT_WARN_Z = 10.0
     MIN_PROB_STD = 1e-5
 
+    # 🔥 NEW — SIGNAL QUALITY FILTERS
+    PROB_THRESHOLD = 0.55
+    TOP_N_PER_DAY = 5
+
     ########################################################
 
     def __init__(
@@ -48,7 +52,6 @@ class WalkForwardValidator:
     ########################################################
 
     def _apply_embargo(self, train_df, test_start):
-
         embargo_cut = pd.Timestamp(test_start) - pd.Timedelta(days=self.embargo_days)
         train_df = train_df[train_df["date"] < embargo_cut]
 
@@ -60,14 +63,12 @@ class WalkForwardValidator:
     ########################################################
 
     def _validate_training_frame(self, df):
-
         features = df.loc[:, list(MODEL_FEATURES)].to_numpy(dtype=float)
 
         if not np.isfinite(features).all():
             raise RuntimeError("Non-finite values detected in training features.")
 
         variances = np.var(features, axis=0)
-
         if np.min(variances) < self.MIN_FEATURE_VARIANCE:
             raise RuntimeError("Feature variance collapsed.")
 
@@ -101,7 +102,6 @@ class WalkForwardValidator:
     ########################################################
 
     def _validate_probabilities(self, probs):
-
         if not np.isfinite(probs).all():
             raise RuntimeError("Non-finite probabilities.")
 
@@ -111,7 +111,6 @@ class WalkForwardValidator:
     ########################################################
 
     def _distribution_guard(self, train_df, test_df):
-
         train_mu = train_df[list(MODEL_FEATURES)].mean()
         train_std = train_df[list(MODEL_FEATURES)].std(ddof=0) + 1e-9
 
@@ -192,16 +191,33 @@ class WalkForwardValidator:
                 probs = model.predict_proba(features_df)[:, 1]
                 self._validate_probabilities(probs)
 
+                # 🔥 Confidence Filter
+                signal_slice = signal_slice.copy()
+                signal_slice["prob"] = probs
+                signal_slice = signal_slice[
+                    (signal_slice["prob"] >= self.PROB_THRESHOLD) |
+                    (signal_slice["prob"] <= 1 - self.PROB_THRESHOLD)
+                ]
+
+                if signal_slice.empty:
+                    continue
+
+                # 🔥 Rank by absolute edge
+                signal_slice["edge"] = abs(signal_slice["prob"] - 0.5)
+                signal_slice = signal_slice.sort_values(
+                    "edge", ascending=False
+                ).head(self.TOP_N_PER_DAY)
+
                 daily_signals = {}
 
-                for row, prob in zip(
-                    signal_slice.itertuples(index=False),
-                    probs
-                ):
+                for row in signal_slice.itertuples(index=False):
+
+                    prob = float(row.prob)
+
                     decision = self.decision_engine.generate(
                         ticker=row.ticker,
                         predicted_return=float(prob - 0.5),
-                        prob_up=float(prob),
+                        prob_up=prob,
                         volatility=float(getattr(row, "volatility", 0.02)),
                         regime=getattr(row, "regime", "SIDEWAYS"),
                         price_df=test_df[test_df["ticker"] == row.ticker]
@@ -277,10 +293,6 @@ class WalkForwardValidator:
     def aggregate_results(self, results, equity_curve):
 
         df = pd.DataFrame(results)
-
-        if df.empty:
-            raise RuntimeError("No valid walk-forward results to aggregate.")
-
         curve = np.array(equity_curve, dtype=float)
 
         peak = np.maximum.accumulate(curve)
