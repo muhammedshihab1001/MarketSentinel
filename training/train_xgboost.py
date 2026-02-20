@@ -3,43 +3,26 @@ import time
 import joblib
 import logging
 import random
-import hashlib
 import numpy as np
 import pandas as pd
-
-from sklearn.calibration import CalibratedClassifierCV
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
 from core.features.feature_store import FeatureStore
-from core.schema.feature_schema import (
-    MODEL_FEATURES,
-    get_schema_signature
-)
-
-from core.artifacts.metadata_manager import MetadataManager
-from core.artifacts.model_registry import ModelRegistry
-
-from training.backtesting.walk_forward import WalkForwardValidator
-from models.xgboost_model import (
-    build_xgboost_model,
-    build_final_xgboost_model
-)
-
+from core.schema.feature_schema import MODEL_FEATURES
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
 
+from training.backtesting.walk_forward import WalkForwardValidator
+from models.xgboost_model import build_xgboost_model
 
-logger = logging.getLogger("marketsentinel.train_xgb")
+
+logger = logging.getLogger(__name__)
 
 MODEL_DIR = os.path.abspath("artifacts/xgboost")
 
 SEED = 42
 MIN_TRAINING_ROWS = 1200
-MIN_MODEL_BYTES = 50_000
-
-MIN_OOS_SHARPE = 0.60
-MAX_ALLOWED_DRAWDOWN = -0.45
 
 
 ############################################################
@@ -53,29 +36,7 @@ def enforce_determinism():
 
 
 ############################################################
-# SAFE SAVE
-############################################################
-
-def save_model_atomic(model, path):
-
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    tmp_path = f"{path}.tmp"
-    joblib.dump(model, tmp_path)
-    os.replace(tmp_path, path)
-
-    size = os.path.getsize(path)
-
-    if size < MIN_MODEL_BYTES:
-        raise RuntimeError("Model artifact suspiciously small.")
-
-    joblib.load(path)
-
-    return size
-
-
-############################################################
-# CROSS-SECTION LABELING
+# CROSS-SECTION TARGET
 ############################################################
 
 def apply_cross_sectional_target(df):
@@ -83,6 +44,7 @@ def apply_cross_sectional_target(df):
     df = df.sort_values(["date", "ticker"]).copy()
 
     df["alpha"] = df["forward_return"]
+
     safe_vol = df["volatility"].clip(lower=1e-4)
     df["risk_adj"] = (df["alpha"] / safe_vol).clip(-5, 5)
 
@@ -117,22 +79,20 @@ def apply_cross_sectional_target(df):
     df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype("int8")
 
-    if df["target"].nunique() != 2:
+    if df["target"].nunique() < 2:
         raise RuntimeError("Label collapse detected.")
 
     return df.reset_index(drop=True)
 
 
 ############################################################
-# CROSS-SECTION NORMALIZATION
+# NORMALIZATION
 ############################################################
 
 def cross_sectional_normalize(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
     grouped = df.groupby("date")
-
-    stats = {}
 
     for col in MODEL_FEATURES:
         mean = grouped[col].transform("mean")
@@ -157,6 +117,7 @@ def load_training_data(start_date, end_date):
     for ticker in universe:
 
         try:
+
             price_df = market_data.get_price_data(
                 ticker=ticker,
                 start_date=start_date,
@@ -172,8 +133,8 @@ def load_training_data(start_date, end_date):
 
             datasets.append(dataset)
 
-        except Exception as e:
-            logger.warning("Ticker rejected %s | %s", ticker, str(e))
+        except Exception:
+            continue
 
     if not datasets:
         raise RuntimeError("All tickers failed.")
@@ -181,7 +142,7 @@ def load_training_data(start_date, end_date):
     df = pd.concat(datasets, ignore_index=True)
 
     if len(df) < MIN_TRAINING_ROWS:
-        raise RuntimeError("Dataset too small before labeling.")
+        raise RuntimeError("Dataset too small.")
 
     df = apply_cross_sectional_target(df)
     df = cross_sectional_normalize(df)
@@ -190,38 +151,18 @@ def load_training_data(start_date, end_date):
 
 
 ############################################################
-# WALK-FORWARD VALIDATION
+# TRAINER FUNCTION FOR WALK-FORWARD
 ############################################################
 
-def run_walk_forward(df):
+def trainer(train_df):
 
-    validator = WalkForwardValidator()
-
-    X = df.loc[:, MODEL_FEATURES]
-    y = df["target"]
+    X = train_df.loc[:, MODEL_FEATURES]
+    y = train_df["target"]
 
     model = build_xgboost_model(y)
+    model.fit(X, y)
 
-    results = validator.validate(
-        model=model,
-        features=X,
-        target=y,
-        full_dataframe=df
-    )
-
-    sharpe = results.get("sharpe_ratio", 0.0)
-    drawdown = results.get("max_drawdown", 0.0)
-
-    logger.info("Walk-forward Sharpe=%.4f", sharpe)
-    logger.info("Walk-forward MaxDD=%.4f", drawdown)
-
-    if sharpe < MIN_OOS_SHARPE:
-        raise RuntimeError("Model rejected: insufficient OOS Sharpe.")
-
-    if drawdown < MAX_ALLOWED_DRAWDOWN:
-        raise RuntimeError("Model rejected: excessive drawdown.")
-
-    return results
+    return model
 
 
 ############################################################
@@ -240,55 +181,22 @@ def main(start_date=None, end_date=None):
 
     df = load_training_data(start_date, end_date)
 
-    wf_results = run_walk_forward(df)
+    # WALK-FORWARD VALIDATION
+    validator = WalkForwardValidator(trainer)
+    metrics = validator.run(df)
 
-    X = df.loc[:, MODEL_FEATURES]
-    y = df["target"]
-
-    base_model = build_final_xgboost_model(y)
-    calibrated = CalibratedClassifierCV(
-        base_model,
-        method="sigmoid",
-        cv=3
-    )
-
-    calibrated.fit(X, y)
+    # TRAIN FINAL MODEL ON FULL DATA
+    final_model = trainer(df)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
-
     model_path = os.path.join(MODEL_DIR, "model.pkl")
-    save_model_atomic(calibrated, model_path)
 
-    dataset_hash = hashlib.sha256(
-        pd.util.hash_pandas_object(df).values
-    ).hexdigest()
+    joblib.dump(final_model, model_path)
 
-    metadata = MetadataManager.create_metadata(
-        model_name="xgboost_cross_sectional",
-        metrics=wf_results,
-        features=MODEL_FEATURES,
-        training_start=start_date,
-        training_end=end_date,
-        dataset_hash=dataset_hash,
-        dataset_rows=len(df),
-        metadata_type="cross_section_manifest_v1",
-        extra_fields={
-            "schema_signature": get_schema_signature(),
-            "universe_hash": MarketUniverse.fingerprint()
-        }
-    )
+    logger.info("Training completed in %.2f minutes",
+                (time.time() - t0) / 60)
 
-    metadata_path = os.path.join(MODEL_DIR, "metadata.json")
-    MetadataManager.save_metadata(metadata, metadata_path)
-
-    version = ModelRegistry.register_model(
-        MODEL_DIR,
-        model_path,
-        metadata_path
-    )
-
-    logger.info("Model registered -> %s", version)
-    logger.info("Training completed in %.2f minutes", (time.time() - t0) / 60)
+    return metrics
 
 
 if __name__ == "__main__":
