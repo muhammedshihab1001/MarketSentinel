@@ -9,6 +9,8 @@ import re
 import logging
 
 from app.inference.pipeline import InferencePipeline
+from app.inference.model_loader import ModelLoader
+from core.schema.feature_schema import get_schema_signature
 from core.signals.signal_engine import StrategyEngine
 
 from app.monitoring.metrics import (
@@ -26,6 +28,7 @@ logger = logging.getLogger("marketsentinel.api")
 
 _pipeline = None
 _strategy_engine = None
+_model_loader = None
 
 
 def get_pipeline():
@@ -40,6 +43,13 @@ def get_strategy_engine():
     if _strategy_engine is None:
         _strategy_engine = StrategyEngine()
     return _strategy_engine
+
+
+def get_loader():
+    global _model_loader
+    if _model_loader is None:
+        _model_loader = ModelLoader()
+    return _model_loader
 
 
 # ------------------------------------------------
@@ -64,18 +74,13 @@ MAX_BATCH_SIZE = int(
 
 TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,10}$")
 
+
 # ----------------------------------------
 # REQUEST SCHEMAS
 # ----------------------------------------
 
 class PredictionRequest(BaseModel):
-
     ticker: str = Field(default="AAPL")
-
-    forecast_days: int = Field(default=30, ge=1, le=90)
-
-    start_date: datetime.date | None = None
-    end_date: datetime.date | None = None
 
     @field_validator("ticker")
     @classmethod
@@ -87,23 +92,9 @@ class PredictionRequest(BaseModel):
 
         return v
 
-    @field_validator("end_date")
-    @classmethod
-    def validate_dates(cls, v, info):
-
-        start = info.data.get("start_date")
-
-        if start and v and v <= start:
-            raise ValueError("end_date must be after start_date")
-
-        return v
-
 
 class BatchPredictionRequest(BaseModel):
-
     tickers: list[str] = Field(..., min_length=1, max_length=50)
-
-    forecast_days: int = Field(default=30, ge=1, le=90)
 
     @field_validator("tickers")
     @classmethod
@@ -119,7 +110,6 @@ class BatchPredictionRequest(BaseModel):
 
             cleaned.append(t)
 
-        # remove duplicates
         return list(set(cleaned))
 
 
@@ -142,20 +132,26 @@ async def predict(req: PredictionRequest):
             result = await asyncio.wait_for(
                 run_in_threadpool(
                     get_pipeline().run,
-                    req.ticker,
-                    req.start_date,
-                    req.end_date,
-                    req.forecast_days
+                    req.ticker
                 ),
                 timeout=REQUEST_TIMEOUT
             )
 
-        return result
+        # Attach model metadata
+        loader = get_loader()
+
+        return {
+            "meta": {
+                "model_version": loader.xgb_version if hasattr(loader, "xgb_version") else "latest",
+                "schema_signature": get_schema_signature(),
+                "timestamp": int(time.time())
+            },
+            "data": result
+        }
 
     except asyncio.TimeoutError:
 
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-
         logger.error("Inference timeout")
 
         raise HTTPException(
@@ -166,7 +162,6 @@ async def predict(req: PredictionRequest):
     except Exception:
 
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-
         logger.exception("Inference failure")
 
         raise HTTPException(
@@ -199,33 +194,32 @@ async def predict_batch(req: BatchPredictionRequest):
             detail=f"Batch size exceeds limit ({MAX_BATCH_SIZE})"
         )
 
-    async def infer_one(ticker):
-
-        async with inference_semaphore:
-
-            try:
-
-                return await asyncio.wait_for(
-                    run_in_threadpool(
-                        get_pipeline().run,
-                        ticker,
-                        None,
-                        None,
-                        req.forecast_days
-                    ),
-                    timeout=REQUEST_TIMEOUT
-                )
-
-            except Exception:
-                logger.exception(f"Batch inference failed for {ticker}")
-                return {"ticker": ticker, "error": "inference_failed"}
+    results = []
 
     try:
 
-        results = []
-
         for ticker in req.tickers:
-            results.append(await infer_one(ticker))
+
+            async with inference_semaphore:
+
+                try:
+
+                    result = await asyncio.wait_for(
+                        run_in_threadpool(
+                            get_pipeline().run,
+                            ticker
+                        ),
+                        timeout=REQUEST_TIMEOUT
+                    )
+
+                    results.append(result)
+
+                except Exception:
+                    logger.exception(f"Batch inference failed for {ticker}")
+                    results.append({
+                        "ticker": ticker,
+                        "error": "inference_failed"
+                    })
 
         return {
             "count": len(results),
@@ -239,9 +233,9 @@ async def predict_batch(req: BatchPredictionRequest):
         )
 
 
-# ===================================================
+# ----------------------------------------
 # STRATEGY ENDPOINT
-# ===================================================
+# ----------------------------------------
 
 @router.post("/strategy/top")
 async def top_opportunities(req: BatchPredictionRequest):
@@ -270,10 +264,7 @@ async def top_opportunities(req: BatchPredictionRequest):
                     result = await asyncio.wait_for(
                         run_in_threadpool(
                             get_pipeline().run,
-                            ticker,
-                            None,
-                            None,
-                            req.forecast_days
+                            ticker
                         ),
                         timeout=REQUEST_TIMEOUT
                     )
@@ -297,3 +288,33 @@ async def top_opportunities(req: BatchPredictionRequest):
         API_LATENCY.labels(endpoint=endpoint).observe(
             time.time() - start_time
         )
+
+
+# ----------------------------------------
+# HEALTH ENDPOINT
+# ----------------------------------------
+
+@router.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "timestamp": int(time.time())
+    }
+
+
+# ----------------------------------------
+# READINESS ENDPOINT
+# ----------------------------------------
+
+@router.get("/ready")
+async def readiness():
+
+    try:
+        _ = get_loader().xgb
+        return {
+            "status": "ready",
+            "schema_signature": get_schema_signature()
+        }
+
+    except Exception:
+        raise HTTPException(status_code=503, detail="Model not ready")
