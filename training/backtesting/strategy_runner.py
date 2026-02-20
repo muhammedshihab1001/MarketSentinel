@@ -18,18 +18,6 @@ from training.backtesting.regime import MarketRegimeDetector
 
 
 class StrategyRunner:
-    """
-    Institutional single-asset strategy runner.
-
-    Guarantees:
-    ✔ zero lookahead
-    ✔ inference-only feature mode
-    ✔ schema-locked
-    ✔ deterministic signal flow
-    ✔ fresh engine state
-    ✔ probability sanity
-    ✔ regime-aware execution
-    """
 
     MIN_PROB_STD = 1e-5
     EPSILON = 1e-12
@@ -43,6 +31,8 @@ class StrategyRunner:
         self.regime_detector = MarketRegimeDetector()
 
     ###################################################
+    # SAFETY
+    ###################################################
 
     def _assert_prices(self, prices):
 
@@ -52,14 +42,10 @@ class StrategyRunner:
         if (prices <= 0).any():
             raise RuntimeError("Non-positive prices detected.")
 
-    ###################################################
-
     def _assert_temporal_integrity(self, df):
 
         if not df["date"].is_monotonic_increasing:
             raise RuntimeError("Non-monotonic timestamps detected.")
-
-    ###################################################
 
     def _validate_probabilities(self, probs):
 
@@ -73,6 +59,69 @@ class StrategyRunner:
             raise RuntimeError("Degenerate classifier detected.")
 
     ###################################################
+    # CROSS-SECTION NORMALIZATION (MATCH TRAINING)
+    ###################################################
+
+    def _cross_sectional_normalize(self, df):
+
+        df = df.sort_values(["date", "ticker"]).copy()
+        grouped = df.groupby("date")
+
+        for col in MODEL_FEATURES:
+            mean = grouped[col].transform("mean")
+            std = grouped[col].transform("std").fillna(1).clip(lower=1e-6)
+            df[col] = (df[col] - mean) / std
+
+        return df
+
+    ###################################################
+    # LOAD FULL UNIVERSE FEATURES (CRITICAL FIX)
+    ###################################################
+
+    def _build_cross_section_dataset(
+        self,
+        start_date,
+        end_date
+    ):
+
+        universe = MarketUniverse.get_universe()
+
+        datasets = []
+
+        for ticker in universe:
+
+            try:
+
+                price_df = self.market_data.get_price_data(
+                    ticker=ticker,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+
+                dataset = self.feature_store.get_features(
+                    price_df,
+                    sentiment_df=None,
+                    ticker=ticker,
+                    training=False
+                )
+
+                datasets.append(dataset)
+
+            except Exception:
+                continue
+
+        if not datasets:
+            raise RuntimeError("Universe feature build failed.")
+
+        df = pd.concat(datasets, ignore_index=True)
+
+        df = self._cross_sectional_normalize(df)
+
+        return df
+
+    ###################################################
+    # MAIN
+    ###################################################
 
     def run(
         self,
@@ -82,86 +131,53 @@ class StrategyRunner:
         end_date: str
     ):
 
-        ############################################
-        # FETCH PRICE
-        ############################################
+        ################################################
+        # BUILD FULL CROSS-SECTION DATASET
+        ################################################
 
-        price_df = self.market_data.get_price_data(
-            ticker=ticker,
-            start_date=start_date,
-            end_date=end_date
+        full_df = self._build_cross_section_dataset(
+            start_date,
+            end_date
         )
 
-        if price_df is None or price_df.empty:
-            raise RuntimeError("No market data returned.")
+        ################################################
+        # EXTRACT TARGET TICKER
+        ################################################
 
-        ############################################
-        # NEWS — SAFE FALLBACK
-        ############################################
-
-        sentiment_df = None
-
-        try:
-            news_df = self.news_fetcher.fetch(
-                f"{ticker} stock",
-                max_items=200
-            )
-
-            if news_df is not None and not news_df.empty:
-
-                scored = self.sentiment.analyze_dataframe(news_df)
-                sentiment_df = self.sentiment.aggregate_daily_sentiment(scored)
-
-        except Exception:
-            sentiment_df = None  # Never block execution
-
-        ############################################
-        # FEATURES (INFERENCE MODE)
-        ############################################
-
-        dataset = self.feature_store.get_features(
-            price_df,
-            sentiment_df,
-            ticker=ticker,
-            training=False  # 🔥 FIX — inference mode
-        )
+        dataset = full_df[full_df["ticker"] == ticker].copy()
 
         if dataset.empty:
-            raise RuntimeError("Feature pipeline returned empty dataset.")
+            raise RuntimeError("Ticker missing after normalization.")
 
-        ############################################
-        # REGIME DETECTION (SINGLE ASSET SAFE)
-        ############################################
+        ################################################
+        # REGIME DETECTION
+        ################################################
 
         dataset = self.regime_detector.detect(dataset)
-
-        ############################################
-        # SORT + VALIDATE
-        ############################################
 
         dataset = dataset.sort_values("date").reset_index(drop=True)
 
         self._assert_temporal_integrity(dataset)
 
-        validated_features = validate_feature_schema(
+        ################################################
+        # SCHEMA VALIDATION
+        ################################################
+
+        validated = validate_feature_schema(
             dataset.loc[:, MODEL_FEATURES]
         )
 
-        dataset.loc[:, MODEL_FEATURES] = validated_features
+        dataset.loc[:, MODEL_FEATURES] = validated
 
-        ############################################
+        ################################################
         # MODEL INFERENCE
-        ############################################
+        ################################################
 
         features = dataset.loc[:, MODEL_FEATURES].to_numpy(dtype=np.float32)
 
         probs = model.predict_proba(features)[:, 1]
 
         self._validate_probabilities(probs)
-
-        ################################################
-        # SAFE SHIFT — EXECUTION LAG
-        ################################################
 
         probs = (
             pd.Series(probs)
@@ -170,9 +186,9 @@ class StrategyRunner:
             .to_numpy()
         )
 
-        ############################################
-        # FRESH ENGINE INSTANCES
-        ############################################
+        ################################################
+        # SIGNAL GENERATION
+        ################################################
 
         decision_engine = DecisionEngine()
         backtest_engine = BacktestEngine()
@@ -200,9 +216,9 @@ class StrategyRunner:
 
             signals.append(signal_dict["signal"])
 
-        ############################################
+        ################################################
         # BACKTEST
-        ############################################
+        ################################################
 
         prices = dataset["close"].to_numpy(dtype=float)
 
