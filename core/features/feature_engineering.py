@@ -67,12 +67,12 @@ class FeatureEngineer:
         returns = df.groupby("ticker")["close"].pct_change()
         lo, hi = cls.RETURN_CLAMP
 
-        df["return"] = returns.clip(lo, hi)
-        df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
-        df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
-        df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
+        df.loc[:, "return"] = returns.clip(lo, hi)
+        df.loc[:, "return_lag1"] = df.groupby("ticker")["return"].shift(1)
+        df.loc[:, "return_lag5"] = df.groupby("ticker")["return"].shift(5)
+        df.loc[:, "return_lag10"] = df.groupby("ticker")["return"].shift(10)
 
-        df["momentum_20"] = (
+        df.loc[:, "momentum_20"] = (
             df.groupby("ticker")["close"]
             .transform(lambda x: x.pct_change(20))
             .clip(-1, 1)
@@ -87,24 +87,24 @@ class FeatureEngineer:
 
         grp = df.groupby("ticker")["return"]
 
-        df["volatility_5"] = (
+        df.loc[:, "volatility_5"] = (
             grp.rolling(5, min_periods=5)
             .std(ddof=0)
             .shift(1)
             .reset_index(level=0, drop=True)
         )
 
-        df["volatility_20"] = (
+        df.loc[:, "volatility_20"] = (
             grp.rolling(20, min_periods=20)
             .std(ddof=0)
             .shift(1)
             .reset_index(level=0, drop=True)
         )
 
-        df["volatility"] = df["volatility_5"]
+        df.loc[:, "volatility"] = df["volatility_5"]
 
         for col in ["volatility", "volatility_5", "volatility_20"]:
-            df[col] = df[col].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
+            df.loc[:, col] = df[col].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
 
     ########################################################
     # REGIME FEATURE
@@ -120,7 +120,7 @@ class FeatureEngineer:
 
         median_vol = rolling_vol.median()
 
-        df["regime_feature"] = np.where(
+        df.loc[:, "regime_feature"] = np.where(
             rolling_vol > median_vol,
             1.0,
             0.0
@@ -139,7 +139,7 @@ class FeatureEngineer:
             )
             if isinstance(rsi_series, pd.DataFrame):
                 rsi_series = rsi_series.iloc[:, 0]
-            group["rsi"] = rsi_series.clip(0, 100).fillna(50).values
+            group.loc[:, "rsi"] = rsi_series.clip(0, 100).fillna(50).values
             return group
         return df.groupby("ticker", group_keys=False).apply(_compute_rsi)
 
@@ -149,30 +149,30 @@ class FeatureEngineer:
             macd, signal = TechnicalIndicators.macd(
                 x[["date", "close"]]
             )
-            x["macd"] = macd.clip(-500, 500).fillna(0)
-            x["macd_signal"] = signal.clip(-500, 500).fillna(0)
+            x.loc[:, "macd"] = macd.clip(-500, 500).fillna(0)
+            x.loc[:, "macd_signal"] = signal.clip(-500, 500).fillna(0)
             return x
         return df.groupby("ticker", group_keys=False).apply(_macd_block)
 
     @classmethod
     def add_ema(cls, df):
 
-        df["ema_10"] = (
+        df.loc[:, "ema_10"] = (
             df.groupby("ticker")["close"]
             .transform(lambda x: x.ewm(span=10, adjust=False).mean())
         )
 
-        df["ema_50"] = (
+        df.loc[:, "ema_50"] = (
             df.groupby("ticker")["close"]
             .transform(lambda x: x.ewm(span=50, adjust=False).mean())
         )
 
-        df["ema_ratio"] = (
+        df.loc[:, "ema_ratio"] = (
             df["ema_10"] / df["ema_50"]
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # CROSS-SECTIONAL FEATURES
+    # CROSS-SECTIONAL FEATURES ONLY (NO TARGET HERE)
     ########################################################
 
     @classmethod
@@ -188,51 +188,15 @@ class FeatureEngineer:
 
         for col in cross_cols:
 
-            df[f"{col}_z"] = (
+            df.loc[:, f"{col}_z"] = (
                 df.groupby("date")[col]
                 .transform(lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9))
             ).clip(-5, 5)
 
-            df[f"{col}_rank"] = (
+            df.loc[:, f"{col}_rank"] = (
                 df.groupby("date")[col]
                 .transform(lambda x: x.rank(pct=True))
             )
-
-        return df
-
-    ########################################################
-    # CROSS-SECTIONAL TARGET
-    ########################################################
-
-    @classmethod
-    def add_cross_sectional_target(cls, df):
-
-        # forward log return
-        fwd_log = (
-            np.log(df["close"].shift(-cls.FORWARD_DAYS))
-            - np.log(df["close"])
-        )
-
-        df["forward_vol_adjusted"] = (
-            fwd_log / (df["volatility_20"] + 1e-6)
-        )
-
-        df = df.dropna(subset=["forward_vol_adjusted"])
-
-        # percentile rank per date
-        df["alpha_rank_pct"] = (
-            df.groupby("date")["forward_vol_adjusted"]
-            .rank(pct=True)
-        )
-
-        # top 30% → 1
-        # bottom 30% → 0
-        df["target"] = np.nan
-        df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
-        df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
-
-        df = df.dropna(subset=["target"])
-        df["target"] = df["target"].astype(int)
 
         return df
 
@@ -260,27 +224,19 @@ class FeatureEngineer:
         cls.add_ema(df)
         df = cls.add_cross_sectional_features(df)
 
-        if training:
-            df = cls.add_cross_sectional_target(df)
-
         df = df.dropna(subset=[*MODEL_FEATURES])
 
         if len(df) < cls.MIN_ROWS_REQUIRED:
             raise RuntimeError("Feature collapse — dataset too small.")
 
         float_cols = df.select_dtypes("float64").columns
-        df[float_cols] = df[float_cols].astype("float32")
+        df.loc[:, float_cols] = df[float_cols].astype("float32")
 
-        base_cols = ["date", "close", "ticker"]
-        if training:
-            base_cols.append("target")
-
-        final = df[base_cols + list(MODEL_FEATURES)].reset_index(drop=True)
+        final = df[["date", "close", "ticker"] + list(MODEL_FEATURES)].reset_index(drop=True)
 
         logger.info(
-            "Feature pipeline built | rows=%s | training=%s",
-            len(final),
-            training
+            "Feature pipeline built | rows=%s",
+            len(final)
         )
 
         return final
