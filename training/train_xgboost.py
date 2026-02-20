@@ -9,7 +9,10 @@ import pandas as pd
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
 from core.features.feature_store import FeatureStore
-from core.schema.feature_schema import MODEL_FEATURES
+from core.schema.feature_schema import (
+    MODEL_FEATURES,
+    validate_feature_schema,
+)
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
 
@@ -86,7 +89,7 @@ def apply_cross_sectional_target(df):
 
 
 ############################################################
-# LOAD DATA (NO SILENT FAILURE)
+# LOAD DATA
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -138,6 +141,14 @@ def load_training_data(start_date, end_date):
         raise RuntimeError(
             f"Dataset too small after feature build. Rows={len(df)}"
         )
+
+    ########################################################
+    # 🔐 SCHEMA VALIDATION (MULTI-ASSET LEVEL)
+    ########################################################
+
+    validate_feature_schema(df.loc[:, MODEL_FEATURES])
+
+    ########################################################
 
     df = apply_cross_sectional_target(df)
 
