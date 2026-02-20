@@ -27,7 +27,7 @@ class WalkForwardValidator:
     DRIFT_WARN_Z = 10.0
     MIN_PROB_STD = 1e-5
 
-    PROB_THRESHOLD = 0.55
+    # 🔐 REMOVED hard PROB_THRESHOLD gating
     TOP_N_PER_DAY = 5
 
     ########################################################
@@ -63,17 +63,12 @@ class WalkForwardValidator:
 
     def _validate_training_frame(self, df):
 
-        # Use only available features (optional may have been dropped)
         available_features = [c for c in MODEL_FEATURES if c in df.columns]
-
         features = df.loc[:, available_features].to_numpy(dtype=float)
 
         if not np.isfinite(features).all():
             raise RuntimeError("Non-finite values detected in training features.")
 
-        variances = np.var(features, axis=0)
-
-        # Only enforce strict variance on CORE features
         for col in CORE_FEATURES:
             if col not in df.columns:
                 raise RuntimeError(f"Missing core feature during training: {col}")
@@ -193,9 +188,7 @@ class WalkForwardValidator:
                 if signal_slice.empty or exec_slice.empty:
                     continue
 
-                features_df = self._validate_inference_slice(
-                    signal_slice
-                )
+                features_df = self._validate_inference_slice(signal_slice)
 
                 probs = model.predict_proba(features_df)[:, 1]
                 self._validate_probabilities(probs)
@@ -203,14 +196,7 @@ class WalkForwardValidator:
                 signal_slice = signal_slice.copy()
                 signal_slice["prob"] = probs
 
-                signal_slice = signal_slice[
-                    (signal_slice["prob"] >= self.PROB_THRESHOLD) |
-                    (signal_slice["prob"] <= 1 - self.PROB_THRESHOLD)
-                ]
-
-                if signal_slice.empty:
-                    continue
-
+                # 🔐 NEW: Pure ranking (no hard threshold)
                 signal_slice["edge"] = abs(signal_slice["prob"] - 0.5)
 
                 signal_slice = signal_slice.sort_values(
