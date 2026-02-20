@@ -127,64 +127,6 @@ class FeatureEngineer:
         )
 
     ########################################################
-    # SENTIMENT
-    ########################################################
-
-    @classmethod
-    def add_sentiment_features(cls, df, sentiment_df):
-
-        if sentiment_df is None or sentiment_df.empty:
-            df["avg_sentiment"] = 0.0
-            df["sentiment_std"] = 0.05
-            df["news_count"] = 0.0
-        else:
-            sent = sentiment_df.copy()
-            sent["date"] = pd.to_datetime(sent["date"], utc=True)
-
-            df = df.merge(
-                sent[["date", "avg_sentiment", "sentiment_std", "news_count"]],
-                on="date",
-                how="left"
-            )
-
-            df["avg_sentiment"] = df["avg_sentiment"].fillna(0.0)
-            df["sentiment_std"] = df["sentiment_std"].fillna(0.05)
-            df["news_count"] = df["news_count"].fillna(0.0)
-
-        df["avg_sentiment"] = df.groupby("ticker")["avg_sentiment"].shift(1)
-        df["sentiment_std"] = df.groupby("ticker")["sentiment_std"].shift(1)
-        df["news_count"] = df.groupby("ticker")["news_count"].shift(1)
-
-        df["sentiment_ema_3"] = (
-            df.groupby("ticker")["avg_sentiment"]
-            .transform(lambda x: x.ewm(span=3, adjust=False).mean())
-        )
-
-        df["sentiment_momentum"] = (
-            df.groupby("ticker")["avg_sentiment"].diff(3)
-        )
-
-        df[
-            [
-                "avg_sentiment",
-                "sentiment_std",
-                "news_count",
-                "sentiment_ema_3",
-                "sentiment_momentum",
-            ]
-        ] = df[
-            [
-                "avg_sentiment",
-                "sentiment_std",
-                "news_count",
-                "sentiment_ema_3",
-                "sentiment_momentum",
-            ]
-        ].fillna(0.0)
-
-        return df
-
-    ########################################################
     # TECHNICALS
     ########################################################
 
@@ -230,7 +172,7 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # CROSS SECTIONAL
+    # CROSS-SECTIONAL FEATURES
     ########################################################
 
     @classmethod
@@ -259,29 +201,38 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # IMPROVED TARGET ENGINEERING
+    # CROSS-SECTIONAL TARGET
     ########################################################
 
     @classmethod
-    def add_forward_return(cls, df):
+    def add_cross_sectional_target(cls, df):
 
+        # forward log return
         fwd_log = (
             np.log(df["close"].shift(-cls.FORWARD_DAYS))
             - np.log(df["close"])
         )
 
-        df["forward_return"] = fwd_log
-
         df["forward_vol_adjusted"] = (
             fwd_log / (df["volatility_20"] + 1e-6)
         )
 
-        # remove micro noise
-        threshold = 0.002
-        mask = fwd_log.abs() >= threshold
+        df = df.dropna(subset=["forward_vol_adjusted"])
 
-        df.loc[~mask, "forward_return"] = np.nan
-        df.loc[~mask, "forward_vol_adjusted"] = np.nan
+        # percentile rank per date
+        df["alpha_rank_pct"] = (
+            df.groupby("date")["forward_vol_adjusted"]
+            .rank(pct=True)
+        )
+
+        # top 30% → 1
+        # bottom 30% → 0
+        df["target"] = np.nan
+        df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
+        df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
+
+        df = df.dropna(subset=["target"])
+        df["target"] = df["target"].astype(int)
 
         return df
 
@@ -304,15 +255,13 @@ class FeatureEngineer:
         cls.add_volatility(df)
         cls.add_regime_feature(df)
 
-        df = cls.add_sentiment_features(df, sentiment_df)
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
         cls.add_ema(df)
         df = cls.add_cross_sectional_features(df)
 
         if training:
-            df = cls.add_forward_return(df)
-            df = df.dropna(subset=["forward_return"])
+            df = cls.add_cross_sectional_target(df)
 
         df = df.dropna(subset=[*MODEL_FEATURES])
 
@@ -324,7 +273,7 @@ class FeatureEngineer:
 
         base_cols = ["date", "close", "ticker"]
         if training:
-            base_cols.append("forward_return")
+            base_cols.append("target")
 
         final = df[base_cols + list(MODEL_FEATURES)].reset_index(drop=True)
 
