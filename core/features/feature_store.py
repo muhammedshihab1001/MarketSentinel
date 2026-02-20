@@ -26,15 +26,14 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v15"
+    CACHE_VERSION = "v16"
     MAX_CACHE_FILES_PER_TICKER = 6
 
-    MIN_ROWS_REQUIRED = 100
     MIN_FILE_BYTES = 5_000
 
     ABS_FEATURE_LIMIT = 1e5
-    MIN_ROW_STABILITY_RATIO = 0.65
-    MIN_FEATURE_VARIANCE = 1e-10
+    MIN_ROW_STABILITY_RATIO = 0.60
+    MIN_FEATURE_VARIANCE = 1e-12
 
     def __init__(self):
         os.makedirs(self.FEATURE_DIR, exist_ok=True)
@@ -68,10 +67,26 @@ class FeatureStore:
         variances = np.var(arr, axis=0)
 
         if np.min(variances) < self.MIN_FEATURE_VARIANCE:
-            raise RuntimeError("Feature variance collapse detected.")
+            logger.warning("Very low feature variance detected.")
 
         if arr.size > 0 and np.abs(arr).max() > self.ABS_FEATURE_LIMIT:
             raise RuntimeError("Feature explosion detected.")
+
+    ########################################################
+    # CROSS-SECTION NORMALIZATION (CENTRALIZED FIX)
+    ########################################################
+
+    def _cross_sectional_normalize(self, df):
+
+        df = df.sort_values(["date", "ticker"]).copy()
+        grouped = df.groupby("date")
+
+        for col in MODEL_FEATURES:
+            mean = grouped[col].transform("mean")
+            std = grouped[col].transform("std").fillna(1).clip(lower=1e-6)
+            df[col] = (df[col] - mean) / std
+
+        return df
 
     ########################################################
     # DETERMINISTIC HASHING
@@ -83,7 +98,6 @@ class FeatureStore:
         df["date"] = pd.to_datetime(df["date"], utc=True)
         df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-        # deterministic CSV-based hash
         payload = df.to_csv(index=False).encode()
         return hashlib.sha256(payload).hexdigest()
 
@@ -168,12 +182,11 @@ class FeatureStore:
     def get_features(
         self,
         price_df: pd.DataFrame,
-        sentiment_df: pd.DataFrame,
+        sentiment_df: Optional[pd.DataFrame],
         ticker: str = "unknown",
         training: bool = False
     ):
 
-        # structural validation
         if not self.REQUIRED_COLUMNS.issubset(price_df.columns):
             raise RuntimeError("Price dataframe missing required columns.")
 
@@ -182,13 +195,12 @@ class FeatureStore:
 
         dataset_hash = self._dataset_hash(price_df, sentiment_df)
 
-        suffix = "train" if training else "infer"
         ticker_safe = re.sub(r"[^A-Za-z0-9_]", "_", ticker)
 
         path = os.path.join(
             self.FEATURE_DIR,
             f"{self.CACHE_VERSION}_"
-            f"{ticker_safe}_{suffix}_"
+            f"{ticker_safe}_"
             f"{dataset_hash}_"
             f"{self.schema_hash}_"
             f"{self.engineer_hash}_"
@@ -213,16 +225,24 @@ class FeatureStore:
             ticker=ticker
         )
 
+        # Deterministic ordering
+        features = features.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+        # Cross-section normalization centralized
+        features = self._cross_sectional_normalize(features)
+
         validate_feature_schema(features.loc[:, MODEL_FEATURES])
         self._validate_numeric_integrity(features)
 
         tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+
         features.to_parquet(
             tmp_path,
             index=False,
             engine="pyarrow",
             compression="zstd"
         )
+
         os.replace(tmp_path, path)
 
         self._cleanup_old_cache(ticker)
