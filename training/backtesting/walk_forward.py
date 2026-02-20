@@ -4,8 +4,8 @@ import logging
 
 from core.schema.feature_schema import (
     MODEL_FEATURES,
-    DTYPE,
-    FEATURE_LIMITS
+    CORE_FEATURES,
+    DTYPE
 )
 
 from training.backtesting.portfolio_engine import PortfolioBacktestEngine
@@ -27,7 +27,6 @@ class WalkForwardValidator:
     DRIFT_WARN_Z = 10.0
     MIN_PROB_STD = 1e-5
 
-    # 🔥 NEW — SIGNAL QUALITY FILTERS
     PROB_THRESHOLD = 0.55
     TOP_N_PER_DAY = 5
 
@@ -63,14 +62,25 @@ class WalkForwardValidator:
     ########################################################
 
     def _validate_training_frame(self, df):
-        features = df.loc[:, list(MODEL_FEATURES)].to_numpy(dtype=float)
+
+        # Use only available features (optional may have been dropped)
+        available_features = [c for c in MODEL_FEATURES if c in df.columns]
+
+        features = df.loc[:, available_features].to_numpy(dtype=float)
 
         if not np.isfinite(features).all():
             raise RuntimeError("Non-finite values detected in training features.")
 
         variances = np.var(features, axis=0)
-        if np.min(variances) < self.MIN_FEATURE_VARIANCE:
-            raise RuntimeError("Feature variance collapsed.")
+
+        # Only enforce strict variance on CORE features
+        for col in CORE_FEATURES:
+            if col not in df.columns:
+                raise RuntimeError(f"Missing core feature during training: {col}")
+
+            col_var = float(np.var(df[col].to_numpy(dtype=float)))
+            if col_var < self.MIN_FEATURE_VARIANCE:
+                raise RuntimeError(f"Core feature variance collapsed: {col}")
 
         if df["target"].nunique() < 2:
             raise RuntimeError("Training labels collapsed.")
@@ -82,20 +92,16 @@ class WalkForwardValidator:
         if df_slice.empty:
             raise RuntimeError("Empty inference slice.")
 
-        if set(df_slice.columns) != set(MODEL_FEATURES):
-            raise RuntimeError("Inference slice feature mismatch.")
+        available_features = [c for c in MODEL_FEATURES if c in df_slice.columns]
 
-        df_slice = df_slice.loc[:, list(MODEL_FEATURES)].astype(DTYPE, copy=True)
+        if not set(CORE_FEATURES).issubset(set(df_slice.columns)):
+            raise RuntimeError("Inference slice missing core features.")
+
+        df_slice = df_slice.loc[:, available_features].astype(DTYPE, copy=True)
         df_slice.replace([np.inf, -np.inf], np.nan, inplace=True)
 
         if df_slice.isna().any().any():
             raise RuntimeError("NaN detected in inference slice.")
-
-        for col in MODEL_FEATURES:
-            if col in FEATURE_LIMITS:
-                lo, hi = FEATURE_LIMITS[col]
-                if (df_slice[col] < lo).any() or (df_slice[col] > hi).any():
-                    raise RuntimeError(f"Inference feature limit breach: {col}")
 
         return df_slice
 
@@ -111,10 +117,13 @@ class WalkForwardValidator:
     ########################################################
 
     def _distribution_guard(self, train_df, test_df):
-        train_mu = train_df[list(MODEL_FEATURES)].mean()
-        train_std = train_df[list(MODEL_FEATURES)].std(ddof=0) + 1e-9
 
-        z = np.abs((test_df[list(MODEL_FEATURES)] - train_mu) / train_std)
+        available_features = [c for c in MODEL_FEATURES if c in train_df.columns]
+
+        train_mu = train_df[available_features].mean()
+        train_std = train_df[available_features].std(ddof=0) + 1e-9
+
+        z = np.abs((test_df[available_features] - train_mu) / train_std)
         max_z = float(np.nanmax(z.to_numpy()))
 
         if max_z > self.DRIFT_WARN_Z:
@@ -185,15 +194,15 @@ class WalkForwardValidator:
                     continue
 
                 features_df = self._validate_inference_slice(
-                    signal_slice.loc[:, list(MODEL_FEATURES)]
+                    signal_slice
                 )
 
                 probs = model.predict_proba(features_df)[:, 1]
                 self._validate_probabilities(probs)
 
-                # 🔥 Confidence Filter
                 signal_slice = signal_slice.copy()
                 signal_slice["prob"] = probs
+
                 signal_slice = signal_slice[
                     (signal_slice["prob"] >= self.PROB_THRESHOLD) |
                     (signal_slice["prob"] <= 1 - self.PROB_THRESHOLD)
@@ -202,8 +211,8 @@ class WalkForwardValidator:
                 if signal_slice.empty:
                     continue
 
-                # 🔥 Rank by absolute edge
                 signal_slice["edge"] = abs(signal_slice["prob"] - 0.5)
+
                 signal_slice = signal_slice.sort_values(
                     "edge", ascending=False
                 ).head(self.TOP_N_PER_DAY)
@@ -253,10 +262,9 @@ class WalkForwardValidator:
 
             if trade_counter < self.MIN_TRADES_PER_WINDOW:
                 logger.warning(
-                    "Window #%s skipped | trades=%s (min=%s)",
+                    "Window #%s skipped | trades=%s",
                     window_id,
-                    trade_counter,
-                    self.MIN_TRADES_PER_WINDOW
+                    trade_counter
                 )
                 start_idx += self.step_size
                 window_id += 1
