@@ -4,8 +4,6 @@ import numpy as np
 import logging
 import threading
 
-from core.schema.feature_schema import FEATURE_COUNT
-
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
@@ -82,7 +80,7 @@ def compute_class_weight(y):
 
 
 ###################################################
-# SAFE CLASSIFIER
+# SAFE CLASSIFIER (DYNAMIC FEATURE SAFE)
 ###################################################
 
 class SafeXGBClassifier(XGBClassifier):
@@ -91,11 +89,6 @@ class SafeXGBClassifier(XGBClassifier):
 
         if not hasattr(X, "shape"):
             raise RuntimeError("Invalid feature matrix.")
-
-        if X.shape[1] != FEATURE_COUNT:
-            raise RuntimeError(
-                f"Feature schema mismatch. Expected {FEATURE_COUNT}, got {X.shape[1]}"
-            )
 
         arr = X.to_numpy() if hasattr(X, "to_numpy") else X
 
@@ -130,27 +123,25 @@ class SafeXGBClassifier(XGBClassifier):
 
 
 ###################################################
-# PARAM BUILDER (REDUCED CAPACITY VERSION)
+# PARAM BUILDER (REGULARIZED INSTITUTIONAL VERSION)
 ###################################################
 
 def _base_params(pos_weight):
 
     params = dict(
 
-        # ↓↓↓ MUCH LOWER CAPACITY
-        n_estimators=300,
+        n_estimators=350,
         max_depth=3,
         learning_rate=0.03,
 
-        # Stronger regularization
         subsample=0.65,
         colsample_bytree=0.6,
         colsample_bylevel=0.6,
 
-        min_child_weight=5,
-        gamma=0.2,
-        reg_alpha=0.8,
-        reg_lambda=2.5,
+        min_child_weight=6,
+        gamma=0.25,
+        reg_alpha=1.0,
+        reg_lambda=3.0,
 
         max_bin=256,
 
@@ -183,6 +174,6 @@ def build_xgboost_pipeline(y):
 
     model = SafeXGBClassifier(**params)
 
-    logger.info("XGBoost model built successfully (regularized).")
+    logger.info("XGBoost model built successfully.")
 
     return model
