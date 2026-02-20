@@ -26,6 +26,7 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 
 SEED = 42
 MIN_TRAINING_ROWS = 1200
+FORWARD_DAYS = 5
 
 
 ############################################################
@@ -39,7 +40,42 @@ def enforce_determinism():
 
 
 ############################################################
-# LOAD DATA (TARGET BUILT IN FEATURE ENGINEER)
+# CROSS-SECTIONAL TARGET (CORRECT IMPLEMENTATION)
+############################################################
+
+def build_cross_sectional_target(df: pd.DataFrame):
+
+    df = df.sort_values(["ticker", "date"]).copy()
+
+    # Forward log return per ticker
+    df["forward_log_return"] = (
+        df.groupby("ticker")["close"]
+        .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
+    )
+
+    # Remove rows without forward return
+    df = df.dropna(subset=["forward_log_return"])
+
+    # Percentile rank per date across ALL tickers
+    df["alpha_rank_pct"] = (
+        df.groupby("date")["forward_log_return"]
+        .rank(pct=True)
+    )
+
+    # Top 30% = 1
+    # Bottom 30% = 0
+    df["target"] = np.nan
+    df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
+    df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
+
+    df = df.dropna(subset=["target"])
+    df["target"] = df["target"].astype(int)
+
+    return df
+
+
+############################################################
+# LOAD DATA (FEATURES ONLY)
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -64,14 +100,11 @@ def load_training_data(start_date, end_date):
             price_df,
             sentiment_df=None,
             ticker=ticker,
-            training=True
+            training=False  # IMPORTANT
         )
 
         if dataset is None or dataset.empty:
             continue
-
-        if "target" not in dataset.columns:
-            raise RuntimeError("Target missing from feature pipeline.")
 
         datasets.append(dataset)
 
@@ -83,6 +116,9 @@ def load_training_data(start_date, end_date):
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError("Dataset too small.")
 
+    # Build target AFTER concatenation
+    df = build_cross_sectional_target(df)
+
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
     logger.info(
@@ -90,6 +126,9 @@ def load_training_data(start_date, end_date):
         (df["target"] == 0).sum(),
         (df["target"] == 1).sum()
     )
+
+    if df["target"].nunique() < 2:
+        raise RuntimeError("Training labels collapsed after target build.")
 
     return df.reset_index(drop=True)
 
