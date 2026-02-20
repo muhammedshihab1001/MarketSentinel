@@ -1,6 +1,7 @@
 {
   "version": "5.0",
-  "description": "Optimized institutional core US liquid equities + macro ETFs",
+  "created_utc": "2026-02-20T12:00:00Z",
+  "description": "Optimized institutional core US liquid equities + macro ETFs (balanced cross-sectional set)",
   "min_history_days": 400,
   "tickers": [
     "AAPL",
