@@ -8,8 +8,6 @@ import pandas as pd
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
-from core.data.news_fetcher import NewsFetcher
-from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_store import FeatureStore
 from core.schema.feature_schema import (
     MODEL_FEATURES,
@@ -41,43 +39,53 @@ def enforce_determinism():
 
 
 ############################################################
-# SENTIMENT (OPTIONAL)
+# CROSS-SECTIONAL TARGET (INSTITUTIONAL FIXED VERSION)
 ############################################################
 
-def build_sentiment_frame(ticker, start_date, end_date):
+def apply_cross_sectional_target(df):
 
-    news_fetcher = NewsFetcher()
-    analyzer = SentimentAnalyzer()
+    df = df.sort_values(["date", "ticker"]).copy()
 
-    try:
-        news_df = news_fetcher.fetch(query=ticker, max_items=150)
+    labeled_frames = []
 
-        if news_df.empty:
-            return None
+    for date, group in df.groupby("date"):
 
-        analyzed = analyzer.analyze_dataframe(news_df)
+        if len(group) < 6:
+            continue
 
-        analyzed["date"] = pd.to_datetime(
-            analyzed["published_at"]
-        ).dt.normalize()
+        group = group.copy()
 
-        grouped = analyzed.groupby("date").agg(
-            avg_sentiment=("score", "mean"),
-            sentiment_std=("score", "std"),
-            news_count=("score", "count")
-        ).reset_index()
+        # risk-adjusted return
+        safe_vol = group["volatility"].clip(lower=1e-4)
+        group["risk_adj"] = group["forward_return"] / safe_vol
 
-        grouped["sentiment_std"] = grouped["sentiment_std"].fillna(0.0)
+        # require dispersion
+        if group["risk_adj"].std() < 0.05:
+            continue
 
-        return grouped
+        lower_q = group["risk_adj"].quantile(0.3)
+        upper_q = group["risk_adj"].quantile(0.7)
 
-    except Exception as e:
-        logger.warning("Sentiment build failed for %s: %s", ticker, str(e))
-        return None
+        group["target"] = np.nan
+        group.loc[group["risk_adj"] <= lower_q, "target"] = 0
+        group.loc[group["risk_adj"] >= upper_q, "target"] = 1
+
+        labeled = group.dropna(subset=["target"])
+
+        if labeled["target"].nunique() == 2:
+            labeled_frames.append(labeled)
+
+    if not labeled_frames:
+        raise RuntimeError("Cross-sectional labeling failed.")
+
+    df = pd.concat(labeled_frames, ignore_index=True)
+    df["target"] = df["target"].astype("int8")
+
+    return df
 
 
 ############################################################
-# LOAD DATA (TARGET ALREADY BUILT IN FEATURE ENGINEER)
+# LOAD DATA
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -87,59 +95,41 @@ def load_training_data(start_date, end_date):
     universe = MarketUniverse.get_universe()
 
     datasets = []
-    failed = []
 
     for ticker in universe:
 
-        try:
-            logger.info("Building features for %s", ticker)
+        logger.info("Building features for %s", ticker)
 
-            price_df = market_data.get_price_data(
-                ticker=ticker,
-                start_date=start_date,
-                end_date=end_date
-            )
+        price_df = market_data.get_price_data(
+            ticker=ticker,
+            start_date=start_date,
+            end_date=end_date
+        )
 
-            sentiment_df = build_sentiment_frame(
-                ticker,
-                start_date,
-                end_date
-            )
+        dataset = store.get_features(
+            price_df,
+            sentiment_df=None,
+            ticker=ticker,
+            training=True
+        )
 
-            dataset = store.get_features(
-                price_df,
-                sentiment_df=sentiment_df,
-                ticker=ticker,
-                training=True
-            )
+        if dataset is None or dataset.empty:
+            continue
 
-            if dataset is None or dataset.empty:
-                raise RuntimeError("Empty feature dataset.")
-
-            if "target" not in dataset.columns:
-                raise RuntimeError("Target missing from feature pipeline.")
-
-            datasets.append(dataset)
-
-        except Exception as e:
-            logger.error("Ticker failed: %s | %s", ticker, str(e))
-            failed.append(ticker)
+        datasets.append(dataset)
 
     if not datasets:
-        raise RuntimeError(
-            f"All tickers failed. Failed tickers: {failed}"
-        )
+        raise RuntimeError("All tickers failed.")
 
     df = pd.concat(datasets, ignore_index=True)
 
-    logger.info("Dataset rows after feature build: %s", len(df))
-
     if len(df) < MIN_TRAINING_ROWS:
-        raise RuntimeError(
-            f"Dataset too small after feature build. Rows={len(df)}"
-        )
+        raise RuntimeError("Dataset too small.")
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
+
+    # 🔥 APPLY TARGET HERE
+    df = apply_cross_sectional_target(df)
 
     logger.info(
         "Target distribution | class_0=%s class_1=%s",
