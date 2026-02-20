@@ -13,9 +13,7 @@ import threading
 def _env_float(key: str, default: float) -> float:
     try:
         v = float(os.getenv(key, str(default)))
-        if not math.isfinite(v):
-            return default
-        if abs(v) > 1e6:
+        if not math.isfinite(v) or abs(v) > 1e6:
             return default
         return v
     except Exception:
@@ -37,7 +35,8 @@ class SignalConfig:
     crisis_volatility: float
     flip_cooldown_seconds: int
     global_kill_switch: bool
-    min_probability_edge: float
+    base_min_edge: float
+    smoothing_alpha: float
 
     @staticmethod
     def load():
@@ -51,7 +50,8 @@ class SignalConfig:
                 "GLOBAL_TRADING_DISABLED",
                 False
             ),
-            min_probability_edge=_env_float("MIN_PROB_EDGE", 0.08)
+            base_min_edge=_env_float("MIN_PROB_EDGE", 0.08),
+            smoothing_alpha=_env_float("PROB_SMOOTHING_ALPHA", 0.4)
         )
 
 
@@ -74,7 +74,7 @@ def _clamp(v, lo, hi):
 
 
 ###################################################
-# DECISION ENGINE (IMPROVED)
+# DECISION ENGINE (INSTITUTIONAL VERSION)
 ###################################################
 
 class DecisionEngine:
@@ -86,6 +86,22 @@ class DecisionEngine:
         self._lock = threading.RLock()
         self._last_signal = {}
         self._last_flip_time = {}
+        self._smoothed_prob = {}
+
+    ###################################################
+
+    def _regime_adjusted_edge(self, regime: Optional[str]) -> float:
+
+        base = self.config.base_min_edge
+
+        if regime == "BULL":
+            return base * 0.8
+        if regime == "BEAR":
+            return base * 1.3
+        if regime == "CRISIS":
+            return 1.0
+
+        return base
 
     ###################################################
 
@@ -113,12 +129,24 @@ class DecisionEngine:
 
     ###################################################
 
+    def _smooth_probability(self, ticker, prob):
+
+        prev = self._smoothed_prob.get(ticker, prob)
+
+        alpha = self.config.smoothing_alpha
+        smoothed = alpha * prob + (1 - alpha) * prev
+
+        self._smoothed_prob[ticker] = smoothed
+
+        return smoothed
+
+    ###################################################
+
     def _hold(self, confidence: float) -> Dict:
         return {
             "signal": "HOLD",
             "confidence": round(float(confidence), 3),
             "edge": 0.0,
-            "expected_value": 0.0,
             "regime": None
         }
 
@@ -127,7 +155,7 @@ class DecisionEngine:
     def generate(
         self,
         ticker: str,
-        predicted_return: float,
+        predicted_return: float,  # kept for compatibility (ignored)
         prob_up: float,
         volatility: float,
         regime: Optional[str] = None,
@@ -141,57 +169,55 @@ class DecisionEngine:
 
             prob_up = _clamp(_safe(prob_up, 0.5), 0.0, 1.0)
             volatility = max(_safe(volatility, 0.02), 1e-6)
-            predicted_return = _safe(predicted_return, 0.0)
 
             ###################################################
             # CRISIS FILTER
             ###################################################
 
             if regime == "CRISIS" or volatility > self.config.crisis_volatility:
-                return self._hold(0.1)
+                return self._hold(0.05)
 
             ###################################################
-            # PROBABILITY EDGE FILTER
+            # SMOOTH PROBABILITY
+            ###################################################
+
+            prob_up = self._smooth_probability(ticker, prob_up)
+
+            ###################################################
+            # EDGE CHECK (REGIME ADAPTIVE)
             ###################################################
 
             edge = abs(prob_up - 0.5)
+            required_edge = self._regime_adjusted_edge(regime)
 
-            if edge < self.config.min_probability_edge:
+            if edge < required_edge:
                 return self._hold(edge)
 
             ###################################################
-            # DIRECTION
+            # LONG-ONLY SIGNAL
             ###################################################
 
-            signal = "BUY" if prob_up > 0.5 else "SELL"
+            if prob_up <= 0.5:
+                return self._hold(edge)
 
             ###################################################
-            # CONFIDENCE MODEL (IMPROVED)
+            # CONFIDENCE MODEL
             ###################################################
 
-            # Base probability strength
-            prob_strength = edge * 2.0  # 0 to 1
+            prob_strength = edge * 2.0
+            vol_penalty = 1.0 / (1.0 + volatility * 4.0)
 
-            # Penalize high volatility
-            vol_penalty = 1.0 / (1.0 + volatility * 5.0)
-
-            # Include predicted_return magnitude
-            return_strength = min(abs(predicted_return) * 10.0, 1.0)
-
-            confidence = prob_strength * 0.6 + return_strength * 0.4
-            confidence *= vol_penalty
-
+            confidence = prob_strength * vol_penalty
             confidence = _clamp(confidence, 0.05, 0.95)
 
-            if not self._flip_guard(ticker, signal):
+            if not self._flip_guard(ticker, "BUY"):
                 return self._hold(confidence)
 
-            self._last_signal[ticker] = signal
+            self._last_signal[ticker] = "BUY"
 
             return {
-                "signal": signal,
+                "signal": "BUY",
                 "confidence": round(confidence, 3),
                 "edge": round(edge, 5),
-                "expected_value": round(predicted_return, 6),
                 "regime": regime
             }
