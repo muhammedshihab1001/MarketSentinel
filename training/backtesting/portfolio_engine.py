@@ -13,10 +13,15 @@ class PortfolioBacktestEngine:
     CASH_BUFFER = 0.10
 
     MAX_INV_VOL = 5.0
-    MAX_POSITION_WEIGHT = 0.20
-    MAX_GROSS_EXPOSURE = 0.70
+    MAX_POSITION_WEIGHT = 0.15
+    MAX_GROSS_EXPOSURE = 0.60
 
     MIN_EQUITY_FLOOR = 0.40
+
+    # NEW CONTROLS
+    MIN_CONFIDENCE = 0.60
+    MAX_POSITIONS = 3
+    LONG_ONLY = True
 
     ###################################################
 
@@ -68,57 +73,64 @@ class PortfolioBacktestEngine:
         return vols
 
     ###################################################
-    # WEIGHT ENGINE (FIXED)
+    # IMPROVED WEIGHT ENGINE
     ###################################################
 
     def _compute_weights(self, signals, vols):
 
-        raw = {}
+        candidates = []
 
+        # Step 1: Filter signals
         for t, decision in signals.items():
 
             if not isinstance(decision, dict):
                 continue
 
-            direction = 1 if decision["signal"] == "BUY" else -1
             confidence = float(decision.get("confidence", 0.0))
 
-            if confidence <= 0:
+            if confidence < self.MIN_CONFIDENCE:
                 continue
 
-            vol = vols.get(t, 0.02)
+            if decision["signal"] != "BUY":
+                continue  # long-only for stability
 
-            inv_vol = min(1 / max(vol, 1e-4), self.MAX_INV_VOL)
+            candidates.append((t, confidence))
 
-            raw_weight = direction * confidence * inv_vol
-
-            raw[t] = raw_weight
-
-        if not raw:
+        if not candidates:
             return {}
 
-        total_abs = sum(abs(v) for v in raw.values())
+        # Step 2: Keep top-K
+        candidates = sorted(
+            candidates,
+            key=lambda x: x[1],
+            reverse=True
+        )[:self.MAX_POSITIONS]
 
-        if total_abs < self.EPSILON:
+        raw = {}
+
+        for t, confidence in candidates:
+
+            vol = vols.get(t, 0.02)
+            inv_vol = min(1 / max(vol, 1e-4), self.MAX_INV_VOL)
+
+            raw_weight = confidence * inv_vol
+            raw[t] = raw_weight
+
+        total = sum(raw.values())
+
+        if total < self.EPSILON:
             return {}
 
         weights = {
-            t: (v / total_abs) * self.MAX_GROSS_EXPOSURE
+            t: (v / total) * self.MAX_GROSS_EXPOSURE
             for t, v in raw.items()
         }
 
-        # Clip individual exposure
         for t in weights:
-            weights[t] = np.clip(
+            weights[t] = min(
                 weights[t],
-                -self.MAX_POSITION_WEIGHT,
                 self.MAX_POSITION_WEIGHT
             )
-
-        gross = sum(abs(w) for w in weights.values())
-        if gross > self.MAX_GROSS_EXPOSURE:
-            scale = self.MAX_GROSS_EXPOSURE / gross
-            weights = {t: w * scale for t, w in weights.items()}
 
         return weights
 
@@ -176,7 +188,6 @@ class PortfolioBacktestEngine:
             ###################################################
 
             vols = self._update_volatility(prev_prices, prices)
-
             weights = self._compute_weights(signals, vols)
 
             deployable = portfolio_value * (1 - self.CASH_BUFFER)
