@@ -46,22 +46,6 @@ class WalkForwardValidator:
         self.decision_engine = DecisionEngine()
 
     ########################################################
-    # NORMALIZATION (MATCH TRAINING)
-    ########################################################
-
-    def _cross_sectional_normalize(self, df):
-
-        df = df.sort_values(["date", "ticker"]).copy()
-        grouped = df.groupby("date")
-
-        for col in MODEL_FEATURES:
-            mean = grouped[col].transform("mean")
-            std = grouped[col].transform("std").fillna(1).clip(lower=1e-6)
-            df[col] = (df[col] - mean) / std
-
-        return df
-
-    ########################################################
 
     def _apply_embargo(self, train_df, test_start):
 
@@ -156,10 +140,6 @@ class WalkForwardValidator:
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
-            # Apply normalization to both (critical fix)
-            train_df = self._cross_sectional_normalize(train_df)
-            test_df = self._cross_sectional_normalize(test_df)
-
             self._validate_training_frame(train_df)
             self._distribution_guard(train_df, test_df)
 
@@ -186,9 +166,7 @@ class WalkForwardValidator:
                     signal_slice.loc[:, MODEL_FEATURES]
                 )
 
-                probs = model.predict_proba(
-                    features.to_numpy(dtype=np.float32)
-                )[:, 1]
+                probs = model.predict_proba(features)[:, 1]
 
                 self._validate_probabilities(probs)
 
