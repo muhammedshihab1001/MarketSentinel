@@ -132,8 +132,6 @@ class InferencePipeline:
             raise RuntimeError("Loaded model is not a classifier.")
 
     ############################################################
-    # DATA FRESHNESS (VERY IMPORTANT)
-    ############################################################
 
     def _assert_data_freshness(self, price_df):
 
@@ -158,13 +156,15 @@ class InferencePipeline:
 
         df = validate_feature_schema(df)
 
-        null_ratio = df.isna().mean().mean()
-        MISSING_FEATURE_RATIO.set(float(null_ratio))
+        null_ratio = float(df.isna().mean().mean())
+        MISSING_FEATURE_RATIO.set(null_ratio)
 
         if null_ratio > self.MAX_NULL_RATIO:
             raise RuntimeError("Feature null ratio exceeded.")
 
-        arr = df.to_numpy(dtype="float32")
+        df = df.astype("float32")
+
+        arr = df.to_numpy()
 
         if not np.isfinite(arr).all():
             raise RuntimeError("Non-finite feature vector detected.")
@@ -184,9 +184,12 @@ class InferencePipeline:
 
     def _dataset_hash(self, latest_row):
 
-        canonical = latest_row[list(MODEL_FEATURES)] \
-            .round(10) \
+        canonical = (
+            latest_row[list(MODEL_FEATURES)]
+            .astype(float)
+            .round(10)
             .to_json()
+        )
 
         return hashlib.sha256(
             canonical.encode()
@@ -224,10 +227,11 @@ class InferencePipeline:
             self._assert_data_freshness(price_df)
 
             ####################################################
-            # FEATURES
+            # FEATURE GENERATION
             ####################################################
 
             sentiment_df = None
+
             try:
                 news = self.news_fetcher.fetch(f"{ticker} stock")
                 scored = self.sentiment.analyze_dataframe(news)
@@ -249,10 +253,10 @@ class InferencePipeline:
             features = self._extract_features(latest)
 
             ####################################################
-            # CACHE (stampede-safe)
+            # CACHE
             ####################################################
 
-            model_version = self.models.xgb_version
+            model_version = self.models.xgb_version if hasattr(self.models, "xgb_version") else "latest"
             dataset_hash = self._dataset_hash(latest)
 
             cache_key = self.cache.build_key({
@@ -268,125 +272,79 @@ class InferencePipeline:
                 CACHE_HITS.inc()
                 return cached
 
-            lock = self.cache.get_lock(
-                cache_key,
-                timeout=self.LOCK_TIMEOUT
-            )
+            CACHE_MISSES.inc()
 
-            if not lock.acquire(blocking=False):
-                time.sleep(0.15)
-                cached = self.cache.get(cache_key)
-                if cached:
-                    return cached
-                raise RuntimeError("Inference contention detected.")
+            ####################################################
+            # DRIFT CHECK
+            ####################################################
 
             try:
-
-                ####################################################
-                # DRIFT CHECK
-                ####################################################
-
-                try:
-                    drift = self.drift_detector.detect(
-                        dataset[MODEL_FEATURES]
-                    )
-
-                    if drift.get("drift_detected"):
-                        logger.warning(
-                            "Drift detected | score=%.4f",
-                            drift.get("drift_score", -1)
-                        )
-
-                except Exception:
-                    logger.exception("Drift detector failure.")
-
-                ####################################################
-                # MODEL
-                ####################################################
-
-                t0 = time.time()
-
-                preds = self.models.xgb.predict_proba(features)
-                prob_up = self._safe_probability(preds[0][1])
-
-                latency = time.time() - t0
-
-                if latency > self.LATENCY_GUARD_SECONDS:
-                    raise RuntimeError("Inference latency breach.")
-
-                MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-                MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
-                PREDICTION_CLASS_PROBABILITY.set(prob_up)
-
-                ####################################################
-                # DISTRIBUTION
-                ####################################################
-
-                current_price = float(latest["close"])
-                volatility = float(latest.get("volatility", 0.02))
-
-                try:
-
-                    recent_prices = price_df["close"].tail(60).tolist()
-                    lstm_forecast = self.models.lstm_forecast(recent_prices)
-
-                    surface = self.distribution.from_lstm(
-                        current_price,
-                        lstm_forecast
-                    )
-
-                except Exception:
-                    logger.warning("Falling back to volatility distribution.")
-
-                    surface = self.distribution.from_volatility(
-                        current_price,
-                        volatility,
-                        prob_up
-                    )
-
-                ####################################################
-                # DECISION — PASS FULL PRICE DF
-                ####################################################
-
-                decision = self.decision_engine.generate(
-                    ticker=ticker,
-                    price_df=price_df,
-                    current_price=current_price,
-                    forecast_up=surface["p90"],
-                    forecast_down=surface["p10"],
-                    prob_up=prob_up,
-                    volatility=volatility,
-                    regime=None
+                drift = self.drift_detector.detect(
+                    dataset[MODEL_FEATURES]
                 )
 
-                SIGNAL_DISTRIBUTION.labels(
-                    signal=decision["signal"]
-                ).inc()
+                if drift.get("drift_detected"):
+                    logger.warning(
+                        "Drift detected | score=%.4f",
+                        drift.get("drift_score", -1)
+                    )
+            except Exception:
+                logger.exception("Drift detector failure.")
 
-                CONFIDENCE_SCORE.set(float(decision["confidence"]))
+            ####################################################
+            # MODEL INFERENCE
+            ####################################################
 
-                response = {
-                    "ticker": ticker,
-                    "signal_today": decision["signal"],
-                    "confidence": decision["confidence"],
-                    "probability_up": prob_up,
-                    "expected_value": decision.get("expected_value"),
-                    "risk_score": decision.get("risk_score"),
-                    "allocation": decision["allocation"],
-                    "position_pct": decision["position_pct"]
-                }
+            t0 = time.time()
 
-                self.cache.set(cache_key, response, ttl=self.CACHE_TTL)
+            preds = self.models.xgb.predict_proba(features)
+            prob_up = self._safe_probability(preds[0][1])
 
-                self.breaker.record_success()
+            latency = time.time() - t0
 
-                return response
+            if latency > self.LATENCY_GUARD_SECONDS:
+                raise RuntimeError("Inference latency breach.")
 
-            finally:
-                try:
-                    lock.release()
-                except Exception:
-                    pass
+            MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
+            MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
+            PREDICTION_CLASS_PROBABILITY.set(prob_up)
+
+            ####################################################
+            # DECISION ENGINE (MATCH UPDATED SIGNATURE)
+            ####################################################
+
+            volatility = float(latest.get("volatility", 0.02))
+
+            decision = self.decision_engine.generate(
+                ticker=ticker,
+                predicted_return=0.0,
+                prob_up=prob_up,
+                volatility=volatility,
+                regime=None
+            )
+
+            SIGNAL_DISTRIBUTION.labels(
+                signal=decision["signal"]
+            ).inc()
+
+            CONFIDENCE_SCORE.set(float(decision["confidence"]))
+
+            response = {
+                "ticker": ticker,
+                "signal_today": decision["signal"],
+                "confidence": decision["confidence"],
+                "probability_up": prob_up,
+                "edge": decision.get("edge"),
+                "expected_value": decision.get("expected_value"),
+                "regime": decision.get("regime"),
+                "model_version": model_version
+            }
+
+            self.cache.set(cache_key, response, ttl=self.CACHE_TTL)
+
+            self.breaker.record_success()
+
+            return response
 
         except Exception as e:
 
