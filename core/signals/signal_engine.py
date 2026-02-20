@@ -37,6 +37,7 @@ class SignalConfig:
     crisis_volatility: float
     flip_cooldown_seconds: int
     global_kill_switch: bool
+    min_probability_edge: float
 
     @staticmethod
     def load():
@@ -49,7 +50,8 @@ class SignalConfig:
             global_kill_switch=_env_bool(
                 "GLOBAL_TRADING_DISABLED",
                 False
-            )
+            ),
+            min_probability_edge=_env_float("MIN_PROB_EDGE", 0.08)
         )
 
 
@@ -72,7 +74,7 @@ def _clamp(v, lo, hi):
 
 
 ###################################################
-# DECISION ENGINE (RANK-ALIGNED VERSION)
+# DECISION ENGINE (IMPROVED)
 ###################################################
 
 class DecisionEngine:
@@ -149,18 +151,37 @@ class DecisionEngine:
                 return self._hold(0.1)
 
             ###################################################
-            # PURE RANK-BASED DIRECTION
+            # PROBABILITY EDGE FILTER
             ###################################################
 
-            if prob_up > 0.5:
-                signal = "BUY"
-            elif prob_up < 0.5:
-                signal = "SELL"
-            else:
-                return self._hold(0.0)
+            edge = abs(prob_up - 0.5)
 
-            confidence = abs(prob_up - 0.5) * 2.0
-            confidence = _clamp(confidence, 0.01, 0.99)
+            if edge < self.config.min_probability_edge:
+                return self._hold(edge)
+
+            ###################################################
+            # DIRECTION
+            ###################################################
+
+            signal = "BUY" if prob_up > 0.5 else "SELL"
+
+            ###################################################
+            # CONFIDENCE MODEL (IMPROVED)
+            ###################################################
+
+            # Base probability strength
+            prob_strength = edge * 2.0  # 0 to 1
+
+            # Penalize high volatility
+            vol_penalty = 1.0 / (1.0 + volatility * 5.0)
+
+            # Include predicted_return magnitude
+            return_strength = min(abs(predicted_return) * 10.0, 1.0)
+
+            confidence = prob_strength * 0.6 + return_strength * 0.4
+            confidence *= vol_penalty
+
+            confidence = _clamp(confidence, 0.05, 0.95)
 
             if not self._flip_guard(ticker, signal):
                 return self._hold(confidence)
@@ -170,7 +191,7 @@ class DecisionEngine:
             return {
                 "signal": signal,
                 "confidence": round(confidence, 3),
-                "edge": round(abs(prob_up - 0.5), 5),
+                "edge": round(edge, 5),
                 "expected_value": round(predicted_return, 6),
                 "regime": regime
             }
