@@ -1,11 +1,11 @@
 import os
-import tempfile
 import time
 import joblib
-import pandas as pd
-import numpy as np
 import logging
 import random
+import hashlib
+import numpy as np
+import pandas as pd
 
 from sklearn.calibration import CalibratedClassifierCV
 
@@ -30,34 +30,21 @@ from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
 
 
-# ============================================================
-# LOGGING CONFIG (CRITICAL FIX)
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-
-logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# CONSTANTS
-# ============================================================
+logger = logging.getLogger("marketsentinel.train_xgb")
 
 MODEL_DIR = os.path.abspath("artifacts/xgboost")
 
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_MODEL_BYTES = 50_000
-TOP_K_PERCENT = 0.20
-BENCHMARK_TICKER = "SPY"
+
+MIN_OOS_SHARPE = 0.60
+MAX_ALLOWED_DRAWDOWN = -0.45
 
 
-# ============================================================
+############################################################
 # DETERMINISM
-# ============================================================
+############################################################
 
 def enforce_determinism():
     os.environ["PYTHONHASHSEED"] = str(SEED)
@@ -65,9 +52,9 @@ def enforce_determinism():
     np.random.seed(SEED)
 
 
-# ============================================================
-# SAFE MODEL SAVE
-# ============================================================
+############################################################
+# SAFE SAVE
+############################################################
 
 def save_model_atomic(model, path):
 
@@ -87,29 +74,15 @@ def save_model_atomic(model, path):
     return size
 
 
-# ============================================================
-# CROSS SECTION TARGET
-# ============================================================
+############################################################
+# CROSS-SECTION LABELING
+############################################################
 
 def apply_cross_sectional_target(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
 
-    if BENCHMARK_TICKER in df["ticker"].unique():
-
-        benchmark = df[df["ticker"] == BENCHMARK_TICKER][
-            ["date", "forward_return"]
-        ].rename(columns={"forward_return": "benchmark_return"})
-
-        df = df.merge(benchmark, on="date", how="left")
-        df["benchmark_return"] = df["benchmark_return"].fillna(0.0)
-
-    else:
-        logger.warning("Benchmark missing — fallback to raw forward_return.")
-        df["benchmark_return"] = 0.0
-
-    df["alpha"] = df["forward_return"] - df["benchmark_return"]
-
+    df["alpha"] = df["forward_return"]
     safe_vol = df["volatility"].clip(lower=1e-4)
     df["risk_adj"] = (df["alpha"] / safe_vol).clip(-5, 5)
 
@@ -144,25 +117,22 @@ def apply_cross_sectional_target(df):
     df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype("int8")
 
-    pos = int((df["target"] == 1).sum())
-    neg = int((df["target"] == 0).sum())
-
-    logger.info("Class balance | pos=%s neg=%s", pos, neg)
-
-    if pos == 0 or neg == 0:
+    if df["target"].nunique() != 2:
         raise RuntimeError("Label collapse detected.")
 
     return df.reset_index(drop=True)
 
 
-# ============================================================
-# NORMALIZATION
-# ============================================================
+############################################################
+# CROSS-SECTION NORMALIZATION
+############################################################
 
 def cross_sectional_normalize(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
     grouped = df.groupby("date")
+
+    stats = {}
 
     for col in MODEL_FEATURES:
         mean = grouped[col].transform("mean")
@@ -172,13 +142,11 @@ def cross_sectional_normalize(df):
     return df.reset_index(drop=True)
 
 
-# ============================================================
-# DATA LOADER
-# ============================================================
+############################################################
+# LOAD DATA
+############################################################
 
 def load_training_data(start_date, end_date):
-
-    logger.info("Loading institutional dataset")
 
     market_data = MarketDataService()
     store = FeatureStore()
@@ -189,7 +157,6 @@ def load_training_data(start_date, end_date):
     for ticker in universe:
 
         try:
-
             price_df = market_data.get_price_data(
                 ticker=ticker,
                 start_date=start_date,
@@ -206,7 +173,6 @@ def load_training_data(start_date, end_date):
             datasets.append(dataset)
 
         except Exception as e:
-
             logger.warning("Ticker rejected %s | %s", ticker, str(e))
 
     if not datasets:
@@ -217,22 +183,50 @@ def load_training_data(start_date, end_date):
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError("Dataset too small before labeling.")
 
-    logger.info("Raw dataset rows=%s", len(df))
-
     df = apply_cross_sectional_target(df)
-
-    logger.info("Post-label rows=%s", len(df))
-
     df = cross_sectional_normalize(df)
-
-    logger.info("Final normalized rows=%s", len(df))
 
     return df
 
 
-# ============================================================
-# MAIN FUNCTION (RESTORED)
-# ============================================================
+############################################################
+# WALK-FORWARD VALIDATION
+############################################################
+
+def run_walk_forward(df):
+
+    validator = WalkForwardValidator()
+
+    X = df.loc[:, MODEL_FEATURES]
+    y = df["target"]
+
+    model = build_xgboost_model(y)
+
+    results = validator.validate(
+        model=model,
+        features=X,
+        target=y,
+        full_dataframe=df
+    )
+
+    sharpe = results.get("sharpe_ratio", 0.0)
+    drawdown = results.get("max_drawdown", 0.0)
+
+    logger.info("Walk-forward Sharpe=%.4f", sharpe)
+    logger.info("Walk-forward MaxDD=%.4f", drawdown)
+
+    if sharpe < MIN_OOS_SHARPE:
+        raise RuntimeError("Model rejected: insufficient OOS Sharpe.")
+
+    if drawdown < MAX_ALLOWED_DRAWDOWN:
+        raise RuntimeError("Model rejected: excessive drawdown.")
+
+    return results
+
+
+############################################################
+# MAIN
+############################################################
 
 def main(start_date=None, end_date=None):
 
@@ -241,34 +235,61 @@ def main(start_date=None, end_date=None):
     init_env()
     enforce_determinism()
 
-    logger.info("INSTITUTIONAL XGBOOST TRAINING STARTED")
-
     if not start_date:
         start_date, end_date = MarketTime.window_for("xgboost")
 
     df = load_training_data(start_date, end_date)
 
+    wf_results = run_walk_forward(df)
+
     X = df.loc[:, MODEL_FEATURES]
     y = df["target"]
 
-    model = build_final_xgboost_model(y)
+    base_model = build_final_xgboost_model(y)
+    calibrated = CalibratedClassifierCV(
+        base_model,
+        method="sigmoid",
+        cv=3
+    )
 
-    model.fit(X, y)
+    calibrated.fit(X, y)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     model_path = os.path.join(MODEL_DIR, "model.pkl")
+    save_model_atomic(calibrated, model_path)
 
-    save_model_atomic(model, model_path)
+    dataset_hash = hashlib.sha256(
+        pd.util.hash_pandas_object(df).values
+    ).hexdigest()
 
-    logger.info("Model saved successfully.")
-    logger.info("TOTAL TIME %.2f minutes", (time.time() - t0) / 60)
+    metadata = MetadataManager.create_metadata(
+        model_name="xgboost_cross_sectional",
+        metrics=wf_results,
+        features=MODEL_FEATURES,
+        training_start=start_date,
+        training_end=end_date,
+        dataset_hash=dataset_hash,
+        dataset_rows=len(df),
+        metadata_type="cross_section_manifest_v1",
+        extra_fields={
+            "schema_signature": get_schema_signature(),
+            "universe_hash": MarketUniverse.fingerprint()
+        }
+    )
 
+    metadata_path = os.path.join(MODEL_DIR, "metadata.json")
+    MetadataManager.save_metadata(metadata, metadata_path)
 
-# ============================================================
-# ENTRYPOINT
-# ============================================================
+    version = ModelRegistry.register_model(
+        MODEL_DIR,
+        model_path,
+        metadata_path
+    )
+
+    logger.info("Model registered -> %s", version)
+    logger.info("Training completed in %.2f minutes", (time.time() - t0) / 60)
+
 
 if __name__ == "__main__":
-    print("TRAINING ENTRYPOINT TRIGGERED")
     main()
