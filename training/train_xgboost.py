@@ -41,7 +41,7 @@ def enforce_determinism():
 
 
 ############################################################
-# SENTIMENT AGGREGATION
+# SENTIMENT (OPTIONAL)
 ############################################################
 
 def build_sentiment_frame(ticker, start_date, end_date):
@@ -50,10 +50,7 @@ def build_sentiment_frame(ticker, start_date, end_date):
     analyzer = SentimentAnalyzer()
 
     try:
-        news_df = news_fetcher.fetch(
-            query=ticker,
-            max_items=150
-        )
+        news_df = news_fetcher.fetch(query=ticker, max_items=150)
 
         if news_df.empty:
             return None
@@ -80,65 +77,7 @@ def build_sentiment_frame(ticker, start_date, end_date):
 
 
 ############################################################
-# CROSS-SECTION TARGET (DISPERSION-GATED + DYNAMIC QUANTILE)
-############################################################
-
-def apply_cross_sectional_target(df):
-
-    df = df.sort_values(["date", "ticker"]).copy()
-
-    df["alpha"] = df["forward_return"]
-
-    safe_vol = df["volatility"].clip(lower=1e-4)
-    df["risk_adj"] = (df["alpha"] / safe_vol).clip(-5, 5)
-
-    labeled_frames = []
-
-    for date, group in df.groupby("date"):
-
-        if len(group) < 6:
-            continue
-
-        group = group.copy()
-
-        dispersion = group["risk_adj"].std()
-
-        # 🔥 Dispersion filter — skip weak days
-        if not np.isfinite(dispersion) or dispersion < 0.15:
-            continue
-
-        group = group.sort_values("risk_adj")
-
-        lower_q = group["risk_adj"].quantile(0.30)
-        upper_q = group["risk_adj"].quantile(0.70)
-
-        group["target"] = np.nan
-
-        group.loc[group["risk_adj"] <= lower_q, "target"] = 0
-        group.loc[group["risk_adj"] >= upper_q, "target"] = 1
-
-        labeled = group.loc[group["target"].notna()].copy()
-
-        if labeled["target"].nunique() == 2:
-            labeled_frames.append(labeled)
-
-    if not labeled_frames:
-        raise RuntimeError("No valid cross-sectional labels generated.")
-
-    df = pd.concat(labeled_frames, ignore_index=True)
-    df["target"] = df["target"].astype("int8")
-
-    logger.info(
-        "Target distribution | class_0=%s class_1=%s",
-        (df["target"] == 0).sum(),
-        (df["target"] == 1).sum()
-    )
-
-    return df.reset_index(drop=True)
-
-
-############################################################
-# LOAD DATA
+# LOAD DATA (TARGET ALREADY BUILT IN FEATURE ENGINEER)
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -177,6 +116,9 @@ def load_training_data(start_date, end_date):
             if dataset is None or dataset.empty:
                 raise RuntimeError("Empty feature dataset.")
 
+            if "target" not in dataset.columns:
+                raise RuntimeError("Target missing from feature pipeline.")
+
             datasets.append(dataset)
 
         except Exception as e:
@@ -190,7 +132,7 @@ def load_training_data(start_date, end_date):
 
     df = pd.concat(datasets, ignore_index=True)
 
-    logger.info("Raw dataset rows: %s", len(df))
+    logger.info("Dataset rows after feature build: %s", len(df))
 
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError(
@@ -199,11 +141,13 @@ def load_training_data(start_date, end_date):
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
 
-    df = apply_cross_sectional_target(df)
+    logger.info(
+        "Target distribution | class_0=%s class_1=%s",
+        (df["target"] == 0).sum(),
+        (df["target"] == 1).sum()
+    )
 
-    logger.info("Final labeled dataset rows: %s", len(df))
-
-    return df
+    return df.reset_index(drop=True)
 
 
 ############################################################
