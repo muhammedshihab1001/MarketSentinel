@@ -29,7 +29,6 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 
-# 🔐 NEW: deterministic cross-sectional selection size
 TOP_K = 2
 BOTTOM_K = 2
 
@@ -84,7 +83,7 @@ def build_sentiment_frame(ticker, start_date, end_date):
 
 
 ############################################################
-# CROSS-SECTION TARGET (STABILIZED)
+# CROSS-SECTION TARGET (FIXED SAFE VERSION)
 ############################################################
 
 def apply_cross_sectional_target(df):
@@ -96,7 +95,7 @@ def apply_cross_sectional_target(df):
     safe_vol = df["volatility"].clip(lower=1e-4)
     df["risk_adj"] = (df["alpha"] / safe_vol).clip(-5, 5)
 
-    labeled = []
+    labeled_frames = []
 
     for date, group in df.groupby("date"):
 
@@ -105,21 +104,25 @@ def apply_cross_sectional_target(df):
 
         group = group.copy()
 
-        # 🔐 Deterministic ranking
         group = group.sort_values("risk_adj")
 
-        bottom = group.head(BOTTOM_K)
-        top = group.tail(TOP_K)
+        # Get index positions safely
+        bottom_idx = group.index[:BOTTOM_K]
+        top_idx = group.index[-TOP_K:]
 
-        bottom["target"] = 0
-        top["target"] = 1
+        group["target"] = np.nan
+        group.loc[bottom_idx, "target"] = 0
+        group.loc[top_idx, "target"] = 1
 
-        labeled.append(pd.concat([top, bottom]))
+        labeled = group.loc[group["target"].notna()].copy()
 
-    if not labeled:
+        labeled_frames.append(labeled)
+
+    if not labeled_frames:
         raise RuntimeError("No valid cross-sectional labels generated.")
 
-    df = pd.concat(labeled, ignore_index=True)
+    df = pd.concat(labeled_frames, ignore_index=True)
+
     df["target"] = df["target"].astype("int8")
 
     if df["target"].nunique() < 2:
