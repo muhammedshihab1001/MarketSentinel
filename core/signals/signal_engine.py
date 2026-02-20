@@ -5,9 +5,6 @@ import os
 import time
 import threading
 
-from core.risk.position_sizer import PositionSizer
-from core.portfolio.risk_engine import RiskEngine
-
 
 ###################################################
 # SAFE ENV
@@ -37,56 +34,23 @@ def _env_bool(key: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class SignalConfig:
 
-    prob_threshold: float
-    min_confidence: float
     crisis_volatility: float
-
-    portfolio_value: float
-    max_position_pct: float
-    min_position_pct: float
-
     flip_cooldown_seconds: int
     global_kill_switch: bool
-
-    enable_risk_engine: bool
 
     @staticmethod
     def load():
 
-        cfg = SignalConfig(
-            prob_threshold=_env_float("PROB_THRESHOLD", 0.55),
-            min_confidence=_env_float("MIN_CONFIDENCE", 0.30),
-            crisis_volatility=_env_float("CRISIS_VOL", 0.20),
-
-            portfolio_value=_env_float("PORTFOLIO_VALUE", 100000),
-            max_position_pct=_env_float("MAX_POSITION_PCT", 0.06),
-            min_position_pct=_env_float("MIN_POSITION_PCT", 0.005),
-
+        return SignalConfig(
+            crisis_volatility=_env_float("CRISIS_VOL", 0.25),
             flip_cooldown_seconds=int(
-                _env_float("FLIP_COOLDOWN_SECONDS", 60)
+                _env_float("FLIP_COOLDOWN_SECONDS", 0)
             ),
-
             global_kill_switch=_env_bool(
                 "GLOBAL_TRADING_DISABLED",
                 False
-            ),
-
-            enable_risk_engine=_env_bool(
-                "ENABLE_RISK_ENGINE",
-                False
             )
         )
-
-        if not (0.5 <= cfg.prob_threshold <= 0.9):
-            raise RuntimeError("Unsafe prob_threshold")
-
-        if cfg.portfolio_value <= 0:
-            raise RuntimeError("Invalid portfolio_value")
-
-        if cfg.max_position_pct > 0.20:
-            raise RuntimeError("Position cap too large.")
-
-        return cfg
 
 
 ###################################################
@@ -108,7 +72,7 @@ def _clamp(v, lo, hi):
 
 
 ###################################################
-# DECISION ENGINE
+# DECISION ENGINE (RANK-ALIGNED VERSION)
 ###################################################
 
 class DecisionEngine:
@@ -117,16 +81,16 @@ class DecisionEngine:
 
         self.config = config or SignalConfig.load()
 
-        self.position_sizer = PositionSizer()
-
         self._lock = threading.RLock()
-
         self._last_signal = {}
         self._last_flip_time = {}
 
     ###################################################
 
     def _flip_guard(self, ticker, new_signal):
+
+        if self.config.flip_cooldown_seconds == 0:
+            return True
 
         now = time.time()
 
@@ -151,10 +115,8 @@ class DecisionEngine:
         return {
             "signal": "HOLD",
             "confidence": round(float(confidence), 3),
-            "allocation": 0.0,
-            "position_pct": 0.0,
+            "edge": 0.0,
             "expected_value": 0.0,
-            "risk_score": 0.0,
             "regime": None
         }
 
@@ -184,74 +146,31 @@ class DecisionEngine:
             ###################################################
 
             if regime == "CRISIS" or volatility > self.config.crisis_volatility:
-                return self._hold(0.2)
+                return self._hold(0.1)
 
             ###################################################
-            # PROBABILITY DECISION
+            # PURE RANK-BASED DIRECTION
             ###################################################
 
-            if prob_up > self.config.prob_threshold:
+            if prob_up > 0.5:
                 signal = "BUY"
-            elif prob_up < (1 - self.config.prob_threshold):
+            elif prob_up < 0.5:
                 signal = "SELL"
             else:
-                return self._hold(abs(prob_up - 0.5))
+                return self._hold(0.0)
 
-            confidence = _clamp(abs(prob_up - 0.5) * 2, 0.25, 0.95)
-
-            if confidence < self.config.min_confidence:
-                return self._hold(confidence)
+            confidence = abs(prob_up - 0.5) * 2.0
+            confidence = _clamp(confidence, 0.01, 0.99)
 
             if not self._flip_guard(ticker, signal):
                 return self._hold(confidence)
 
-            ###################################################
-            # OPTIONAL RISK ENGINE
-            ###################################################
-
-            risk_score = 0.0
-
-            if self.config.enable_risk_engine and price_df is not None:
-
-                risk = RiskEngine.analyze(price_df, signal)
-
-                if risk["capital_multiplier"] == 0:
-                    return self._hold(confidence)
-
-                risk_score = _safe(risk.get("risk_score", 0.0), 0.0)
-
-            ###################################################
-            # POSITION SIZING
-            ###################################################
-
-            allocation = self.position_sizer.size_position(
-                signal=signal,
-                confidence=confidence,
-                volatility=volatility,
-                portfolio_value=self.config.portfolio_value
-            )
-
-            if not math.isfinite(allocation) or allocation <= 0:
-                return self._hold(confidence)
-
-            max_alloc = self.config.portfolio_value * self.config.max_position_pct
-            min_alloc = self.config.portfolio_value * self.config.min_position_pct
-
-            allocation = _clamp(allocation, min_alloc, max_alloc)
-
             self._last_signal[ticker] = signal
-
-            position_pct = allocation / self.config.portfolio_value
-
-            if not math.isfinite(position_pct):
-                return self._hold(confidence)
 
             return {
                 "signal": signal,
                 "confidence": round(confidence, 3),
-                "allocation": round(allocation, 2),
-                "position_pct": round(position_pct, 4),
-                "expected_value": round(predicted_return, 5),
-                "risk_score": round(risk_score, 4),
+                "edge": round(abs(prob_up - 0.5), 5),
+                "expected_value": round(predicted_return, 6),
                 "regime": regime
             }
