@@ -29,9 +29,6 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 
-TOP_K = 2
-BOTTOM_K = 2
-
 
 ############################################################
 # DETERMINISM
@@ -83,7 +80,7 @@ def build_sentiment_frame(ticker, start_date, end_date):
 
 
 ############################################################
-# CROSS-SECTION TARGET (FIXED SAFE VERSION)
+# CROSS-SECTION TARGET (DISPERSION-GATED + DYNAMIC QUANTILE)
 ############################################################
 
 def apply_cross_sectional_target(df):
@@ -99,34 +96,43 @@ def apply_cross_sectional_target(df):
 
     for date, group in df.groupby("date"):
 
-        if len(group) < (TOP_K + BOTTOM_K):
+        if len(group) < 6:
             continue
 
         group = group.copy()
 
+        dispersion = group["risk_adj"].std()
+
+        # 🔥 Dispersion filter — skip weak days
+        if not np.isfinite(dispersion) or dispersion < 0.15:
+            continue
+
         group = group.sort_values("risk_adj")
 
-        # Get index positions safely
-        bottom_idx = group.index[:BOTTOM_K]
-        top_idx = group.index[-TOP_K:]
+        lower_q = group["risk_adj"].quantile(0.30)
+        upper_q = group["risk_adj"].quantile(0.70)
 
         group["target"] = np.nan
-        group.loc[bottom_idx, "target"] = 0
-        group.loc[top_idx, "target"] = 1
+
+        group.loc[group["risk_adj"] <= lower_q, "target"] = 0
+        group.loc[group["risk_adj"] >= upper_q, "target"] = 1
 
         labeled = group.loc[group["target"].notna()].copy()
 
-        labeled_frames.append(labeled)
+        if labeled["target"].nunique() == 2:
+            labeled_frames.append(labeled)
 
     if not labeled_frames:
         raise RuntimeError("No valid cross-sectional labels generated.")
 
     df = pd.concat(labeled_frames, ignore_index=True)
-
     df["target"] = df["target"].astype("int8")
 
-    if df["target"].nunique() < 2:
-        raise RuntimeError("Label collapse detected.")
+    logger.info(
+        "Target distribution | class_0=%s class_1=%s",
+        (df["target"] == 0).sum(),
+        (df["target"] == 1).sum()
+    )
 
     return df.reset_index(drop=True)
 
