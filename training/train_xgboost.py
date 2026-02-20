@@ -8,6 +8,8 @@ import pandas as pd
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
+from core.data.news_fetcher import NewsFetcher
+from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_store import FeatureStore
 from core.schema.feature_schema import (
     MODEL_FEATURES,
@@ -36,6 +38,45 @@ def enforce_determinism():
     os.environ["PYTHONHASHSEED"] = str(SEED)
     random.seed(SEED)
     np.random.seed(SEED)
+
+
+############################################################
+# SENTIMENT AGGREGATION
+############################################################
+
+def build_sentiment_frame(ticker, start_date, end_date):
+
+    news_fetcher = NewsFetcher()
+    analyzer = SentimentAnalyzer()
+
+    try:
+        news_df = news_fetcher.fetch(
+            query=ticker,
+            max_items=150
+        )
+
+        if news_df.empty:
+            return None
+
+        analyzed = analyzer.analyze_dataframe(news_df)
+
+        analyzed["date"] = pd.to_datetime(
+            analyzed["published_at"]
+        ).dt.normalize()
+
+        grouped = analyzed.groupby("date").agg(
+            avg_sentiment=("score", "mean"),
+            sentiment_std=("score", "std"),
+            news_count=("score", "count")
+        ).reset_index()
+
+        grouped["sentiment_std"] = grouped["sentiment_std"].fillna(0.0)
+
+        return grouped
+
+    except Exception as e:
+        logger.warning("Sentiment build failed for %s: %s", ticker, str(e))
+        return None
 
 
 ############################################################
@@ -112,9 +153,16 @@ def load_training_data(start_date, end_date):
                 end_date=end_date
             )
 
+            # 🔥 SENTIMENT BUILD
+            sentiment_df = build_sentiment_frame(
+                ticker,
+                start_date,
+                end_date
+            )
+
             dataset = store.get_features(
                 price_df,
-                sentiment_df=None,
+                sentiment_df=sentiment_df,
                 ticker=ticker,
                 training=True
             )
@@ -143,7 +191,7 @@ def load_training_data(start_date, end_date):
         )
 
     ########################################################
-    # 🔐 SCHEMA VALIDATION (MULTI-ASSET LEVEL)
+    # 🔐 SCHEMA VALIDATION
     ########################################################
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
@@ -167,7 +215,6 @@ def trainer(train_df):
     y = train_df["target"]
 
     pipeline = build_xgboost_pipeline(y)
-
     pipeline.fit(X, y)
 
     return pipeline
