@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import joblib
 import logging
 import random
@@ -12,6 +13,7 @@ from core.features.feature_store import FeatureStore
 from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
+    get_schema_signature,
 )
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
@@ -40,7 +42,7 @@ def enforce_determinism():
 
 
 ############################################################
-# CROSS-SECTIONAL FEATURES (CORRECT PLACE)
+# CROSS-SECTIONAL FEATURES
 ############################################################
 
 def build_cross_sectional_features(df: pd.DataFrame):
@@ -140,13 +142,12 @@ def load_training_data(start_date, end_date):
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError("Dataset too small.")
 
-    # 🔥 FIX 1: build cross-sectional features
     df = build_cross_sectional_features(df)
-
-    # 🔥 FIX 2: build cross-sectional target
     df = build_cross_sectional_target(df)
 
-    validate_feature_schema(df.loc[:, MODEL_FEATURES])
+    # 🔥 Ensure feature alignment
+    feature_df = validate_feature_schema(df.loc[:, MODEL_FEATURES])
+    df = df.loc[feature_df.index]
 
     logger.info(
         "Target distribution | class_0=%s class_1=%s",
@@ -176,6 +177,50 @@ def trainer(train_df):
 
 
 ############################################################
+# ARTIFACT EXPORT
+############################################################
+
+def export_artifacts(model, metrics):
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    timestamp = int(time.time())
+
+    model_path = os.path.join(MODEL_DIR, f"model_{timestamp}.pkl")
+    joblib.dump(model, model_path)
+
+    # Feature importance
+    importance = model.export_feature_importance()
+
+    importance_path = os.path.join(
+        MODEL_DIR,
+        f"feature_importance_{timestamp}.json"
+    )
+
+    with open(importance_path, "w") as f:
+        json.dump(importance, f, indent=2)
+
+    # Metadata
+    metadata = {
+        "schema_signature": get_schema_signature(),
+        "seed": SEED,
+        "timestamp": timestamp,
+        "metrics": metrics,
+        "model_path": model_path
+    }
+
+    metadata_path = os.path.join(
+        MODEL_DIR,
+        f"metadata_{timestamp}.json"
+    )
+
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    logger.info("Artifacts exported successfully.")
+
+
+############################################################
 # MAIN
 ############################################################
 
@@ -198,17 +243,13 @@ def main(start_date=None, end_date=None):
     df = load_training_data(start_date, end_date)
 
     validator = WalkForwardValidator(trainer)
-
     metrics = validator.run(df)
 
     logger.info("Walk-forward metrics: %s", metrics)
 
     final_model = trainer(df)
 
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    model_path = os.path.join(MODEL_DIR, "model.pkl")
-
-    joblib.dump(final_model, model_path)
+    export_artifacts(final_model, metrics)
 
     logger.info(
         "Training completed in %.2f minutes",
