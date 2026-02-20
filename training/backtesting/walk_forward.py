@@ -17,11 +17,11 @@ logger = logging.getLogger("marketsentinel.walkforward")
 
 class WalkForwardValidator:
 
-    MIN_TRADES_PER_WINDOW = 4        # ↓ reduced from 5
+    MIN_TRADES_PER_WINDOW = 4
     MIN_WINDOWS = 6
     MIN_TEST_DAYS = 20
 
-    MIN_ASSETS_PER_DAY = 2          # ↓ reduced from 3
+    MIN_ASSETS_PER_DAY = 2
     MIN_FEATURE_VARIANCE = 1e-8
 
     DRIFT_WARN_Z = 10.0
@@ -37,7 +37,6 @@ class WalkForwardValidator:
         embargo_days=14
     ):
         self.model_trainer = model_trainer
-
         self.window_size = window_size
         self.step_size = step_size
         self.embargo_days = embargo_days
@@ -77,7 +76,7 @@ class WalkForwardValidator:
 
     ########################################################
 
-    def _validate_inference_slice(self, df_slice: pd.DataFrame) -> np.ndarray:
+    def _validate_inference_slice(self, df_slice: pd.DataFrame) -> pd.DataFrame:
 
         if df_slice.empty:
             raise RuntimeError("Empty inference slice.")
@@ -86,7 +85,6 @@ class WalkForwardValidator:
             raise RuntimeError("Inference slice feature mismatch.")
 
         df_slice = df_slice.loc[:, list(MODEL_FEATURES)].astype(DTYPE, copy=True)
-
         df_slice.replace([np.inf, -np.inf], np.nan, inplace=True)
 
         if df_slice.isna().any().any():
@@ -98,7 +96,8 @@ class WalkForwardValidator:
                 if (df_slice[col] < lo).any() or (df_slice[col] > hi).any():
                     raise RuntimeError(f"Inference feature limit breach: {col}")
 
-        return df_slice.to_numpy(dtype=DTYPE)
+        # 🔐 RETURN DATAFRAME — NOT NUMPY
+        return df_slice
 
     ########################################################
 
@@ -187,11 +186,11 @@ class WalkForwardValidator:
                 if signal_slice.empty or exec_slice.empty:
                     continue
 
-                features = self._validate_inference_slice(
+                features_df = self._validate_inference_slice(
                     signal_slice.loc[:, list(MODEL_FEATURES)]
                 )
 
-                probs = model.predict_proba(features)[:, 1]
+                probs = model.predict_proba(features_df)[:, 1]
                 self._validate_probabilities(probs)
 
                 daily_signals = {}
@@ -200,7 +199,6 @@ class WalkForwardValidator:
                     signal_slice.itertuples(index=False),
                     probs
                 ):
-
                     decision = self.decision_engine.generate(
                         ticker=row.ticker,
                         predicted_return=float(prob - 0.5),
@@ -236,7 +234,6 @@ class WalkForwardValidator:
                 }
 
                 grouped_signals[execution_date] = filtered
-
                 trade_counter += len(filtered)
 
             if trade_counter < self.MIN_TRADES_PER_WINDOW:
