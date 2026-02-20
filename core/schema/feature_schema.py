@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "26.0"  # removed obsolete rank_return
+SCHEMA_VERSION = "27.0"  # added sentiment features
 
 
 ############################################################
@@ -47,6 +47,13 @@ MODEL_FEATURES: Tuple[str, ...] = (
 
     # regime
     "regime_feature",
+
+    # sentiment (NEW)
+    "avg_sentiment",
+    "sentiment_std",
+    "news_count",
+    "sentiment_ema_3",
+    "sentiment_momentum",
 )
 
 FEATURE_COUNT = len(MODEL_FEATURES)
@@ -98,6 +105,13 @@ FEATURE_LIMITS: Dict[str, tuple] = {
 
     # regime
     "regime_feature": (-2.0, 2.0),
+
+    # sentiment
+    "avg_sentiment": (-1.0, 1.0),
+    "sentiment_std": (0.0, 1.0),
+    "news_count": (0.0, 500.0),
+    "sentiment_ema_3": (-1.0, 1.0),
+    "sentiment_momentum": (-2.0, 2.0),
 }
 
 
