@@ -39,53 +39,7 @@ def enforce_determinism():
 
 
 ############################################################
-# CROSS-SECTIONAL TARGET (INSTITUTIONAL FIXED VERSION)
-############################################################
-
-def apply_cross_sectional_target(df):
-
-    df = df.sort_values(["date", "ticker"]).copy()
-
-    labeled_frames = []
-
-    for date, group in df.groupby("date"):
-
-        if len(group) < 6:
-            continue
-
-        group = group.copy()
-
-        # risk-adjusted return
-        safe_vol = group["volatility"].clip(lower=1e-4)
-        group["risk_adj"] = group["forward_return"] / safe_vol
-
-        # require dispersion
-        if group["risk_adj"].std() < 0.05:
-            continue
-
-        lower_q = group["risk_adj"].quantile(0.3)
-        upper_q = group["risk_adj"].quantile(0.7)
-
-        group["target"] = np.nan
-        group.loc[group["risk_adj"] <= lower_q, "target"] = 0
-        group.loc[group["risk_adj"] >= upper_q, "target"] = 1
-
-        labeled = group.dropna(subset=["target"])
-
-        if labeled["target"].nunique() == 2:
-            labeled_frames.append(labeled)
-
-    if not labeled_frames:
-        raise RuntimeError("Cross-sectional labeling failed.")
-
-    df = pd.concat(labeled_frames, ignore_index=True)
-    df["target"] = df["target"].astype("int8")
-
-    return df
-
-
-############################################################
-# LOAD DATA
+# LOAD DATA (TARGET BUILT IN FEATURE ENGINEER)
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -116,6 +70,9 @@ def load_training_data(start_date, end_date):
         if dataset is None or dataset.empty:
             continue
 
+        if "target" not in dataset.columns:
+            raise RuntimeError("Target missing from feature pipeline.")
+
         datasets.append(dataset)
 
     if not datasets:
@@ -127,9 +84,6 @@ def load_training_data(start_date, end_date):
         raise RuntimeError("Dataset too small.")
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
-
-    # 🔥 APPLY TARGET HERE
-    df = apply_cross_sectional_target(df)
 
     logger.info(
         "Target distribution | class_0=%s class_1=%s",
