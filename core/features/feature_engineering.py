@@ -13,7 +13,6 @@ class FeatureEngineer:
     MIN_ROWS_REQUIRED = 200
     VOL_FLOOR = 1e-4
     RETURN_CLAMP = (-0.5, 0.5)
-
     SPLIT_THRESHOLD = 3.5
     FORWARD_DAYS = 5
 
@@ -109,6 +108,84 @@ class FeatureEngineer:
             df[col] = df[col].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
 
     ########################################################
+    # REGIME FEATURE (RESTORED)
+    ########################################################
+
+    @classmethod
+    def add_regime_feature(cls, df):
+
+        rolling_vol = (
+            df.groupby("ticker")["volatility_20"]
+            .transform(lambda x: x.rolling(40, min_periods=20).mean())
+        )
+
+        median_vol = rolling_vol.median()
+
+        df["regime_feature"] = np.where(
+            rolling_vol > median_vol,
+            1.0,
+            0.0
+        )
+
+    ########################################################
+    # SENTIMENT (SAFE DEFAULTS IF DISABLED)
+    ########################################################
+
+    @classmethod
+    def add_sentiment_features(cls, df, sentiment_df):
+
+        if sentiment_df is None or sentiment_df.empty:
+            df["avg_sentiment"] = 0.0
+            df["sentiment_std"] = 0.05
+            df["news_count"] = 0.0
+        else:
+            sent = sentiment_df.copy()
+            sent["date"] = pd.to_datetime(sent["date"], utc=True)
+
+            df = df.merge(
+                sent[["date", "avg_sentiment", "sentiment_std", "news_count"]],
+                on="date",
+                how="left"
+            )
+
+            df["avg_sentiment"] = df["avg_sentiment"].fillna(0.0)
+            df["sentiment_std"] = df["sentiment_std"].fillna(0.05)
+            df["news_count"] = df["news_count"].fillna(0.0)
+
+        df["avg_sentiment"] = df.groupby("ticker")["avg_sentiment"].shift(1)
+        df["sentiment_std"] = df.groupby("ticker")["sentiment_std"].shift(1)
+        df["news_count"] = df.groupby("ticker")["news_count"].shift(1)
+
+        df["sentiment_ema_3"] = (
+            df.groupby("ticker")["avg_sentiment"]
+            .transform(lambda x: x.ewm(span=3, adjust=False).mean())
+        )
+
+        df["sentiment_momentum"] = (
+            df.groupby("ticker")["avg_sentiment"].diff(3)
+        )
+
+        df[
+            [
+                "avg_sentiment",
+                "sentiment_std",
+                "news_count",
+                "sentiment_ema_3",
+                "sentiment_momentum",
+            ]
+        ] = df[
+            [
+                "avg_sentiment",
+                "sentiment_std",
+                "news_count",
+                "sentiment_ema_3",
+                "sentiment_momentum",
+            ]
+        ].fillna(0.0)
+
+        return df
+
+    ########################################################
     # RSI / MACD / EMA
     ########################################################
 
@@ -154,7 +231,7 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # CROSS-SECTIONAL FEATURES (NEW)
+    # CROSS-SECTIONAL FEATURES
     ########################################################
 
     @classmethod
@@ -170,13 +247,11 @@ class FeatureEngineer:
 
         for col in cross_cols:
 
-            # Z-score per date
             df[f"{col}_z"] = (
                 df.groupby("date")[col]
                 .transform(lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9))
             ).clip(-5, 5)
 
-            # Percentile rank per date
             df[f"{col}_rank"] = (
                 df.groupby("date")[col]
                 .transform(lambda x: x.rank(pct=True))
@@ -213,12 +288,14 @@ class FeatureEngineer:
 
         cls.add_returns(df)
         cls.add_volatility(df)
+        cls.add_regime_feature(df)
+
+        df = cls.add_sentiment_features(df, sentiment_df)
 
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
         cls.add_ema(df)
 
-        # 🔐 CROSS-SECTIONAL FEATURES
         df = cls.add_cross_sectional_features(df)
 
         if training:
