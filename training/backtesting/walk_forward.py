@@ -27,8 +27,8 @@ class WalkForwardValidator:
     DRIFT_WARN_Z = 10.0
     MIN_PROB_STD = 1e-5
 
-    # 🔐 REMOVED hard PROB_THRESHOLD gating
     TOP_N_PER_DAY = 5
+    MIN_EDGE_THRESHOLD = 0.08   # 🔥 NEW confidence filter
 
     ########################################################
 
@@ -195,9 +195,15 @@ class WalkForwardValidator:
 
                 signal_slice = signal_slice.copy()
                 signal_slice["prob"] = probs
-
-                # 🔐 NEW: Pure ranking (no hard threshold)
                 signal_slice["edge"] = abs(signal_slice["prob"] - 0.5)
+
+                # 🔥 CONFIDENCE FILTER
+                signal_slice = signal_slice[
+                    signal_slice["edge"] >= self.MIN_EDGE_THRESHOLD
+                ]
+
+                if signal_slice.empty:
+                    continue
 
                 signal_slice = signal_slice.sort_values(
                     "edge", ascending=False
