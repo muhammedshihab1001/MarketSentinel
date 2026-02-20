@@ -59,6 +59,63 @@ class FeatureEngineer:
         return df.reset_index(drop=True)
 
     ########################################################
+    # SENTIMENT INTEGRATION (NEW)
+    ########################################################
+
+    @classmethod
+    def add_sentiment_features(cls, df, sentiment_df):
+
+        if sentiment_df is None or sentiment_df.empty:
+            df["avg_sentiment"] = 0.0
+            df["sentiment_std"] = 0.05
+            df["news_count"] = 0.0
+        else:
+            sent = sentiment_df.copy()
+            sent["date"] = pd.to_datetime(sent["date"], utc=True)
+
+            df = df.merge(
+                sent[["date", "avg_sentiment", "sentiment_std", "news_count"]],
+                on="date",
+                how="left"
+            )
+
+            df["avg_sentiment"] = df["avg_sentiment"].fillna(0.0)
+            df["sentiment_std"] = df["sentiment_std"].fillna(0.05)
+            df["news_count"] = df["news_count"].fillna(0.0)
+
+        # 🔒 LAG TO PREVENT LOOKAHEAD
+        df["avg_sentiment"] = df.groupby("ticker")["avg_sentiment"].shift(1)
+        df["sentiment_std"] = df.groupby("ticker")["sentiment_std"].shift(1)
+        df["news_count"] = df.groupby("ticker")["news_count"].shift(1)
+
+        # Rolling smooth
+        df["sentiment_ema_3"] = (
+            df.groupby("ticker")["avg_sentiment"]
+            .transform(lambda x: x.ewm(span=3, adjust=False).mean())
+        )
+
+        df["sentiment_momentum"] = (
+            df.groupby("ticker")["avg_sentiment"]
+            .diff(3)
+        )
+
+        df[[
+            "avg_sentiment",
+            "sentiment_std",
+            "news_count",
+            "sentiment_ema_3",
+            "sentiment_momentum"
+        ]] = df[[
+            "avg_sentiment",
+            "sentiment_std",
+            "news_count",
+            "sentiment_ema_3",
+            "sentiment_momentum"
+        ]].fillna(0.0)
+
+        return df
+
+    ########################################################
     # RETURNS
     ########################################################
 
@@ -106,11 +163,7 @@ class FeatureEngineer:
         df["volatility"] = df["volatility_5"]
 
         for col in ["volatility", "volatility_5", "volatility_20"]:
-            df[col] = (
-                df[col]
-                .fillna(cls.VOL_FLOOR)
-                .clip(lower=cls.VOL_FLOOR)
-            )
+            df[col] = df[col].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
 
     ########################################################
     # REGIME FEATURE
@@ -133,47 +186,32 @@ class FeatureEngineer:
         )
 
     ########################################################
-    # RSI
+    # RSI / MACD / EMA (unchanged)
     ########################################################
 
     @classmethod
     def add_rsi(cls, df):
-
         def _compute_rsi(group):
             rsi_series = TechnicalIndicators.rsi(
                 group[["date", "close"]],
                 window=14
             )
-
             if isinstance(rsi_series, pd.DataFrame):
                 rsi_series = rsi_series.iloc[:, 0]
-
             group["rsi"] = rsi_series.clip(0, 100).fillna(50).values
             return group
-
         return df.groupby("ticker", group_keys=False).apply(_compute_rsi)
-
-    ########################################################
-    # MACD
-    ########################################################
 
     @classmethod
     def add_macd(cls, df):
-
         def _macd_block(x):
             macd, signal = TechnicalIndicators.macd(
                 x[["date", "close"]]
             )
-
             x["macd"] = macd.clip(-500, 500).fillna(0)
             x["macd_signal"] = signal.clip(-500, 500).fillna(0)
             return x
-
         return df.groupby("ticker", group_keys=False).apply(_macd_block)
-
-    ########################################################
-    # EMA
-    ########################################################
 
     @classmethod
     def add_ema(cls, df):
@@ -193,17 +231,15 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # FORWARD RETURN (TRAINING ONLY)
+    # FORWARD RETURN
     ########################################################
 
     @classmethod
     def add_forward_return(cls, df):
-
         df["forward_return"] = (
             np.log(df["close"].shift(-cls.FORWARD_DAYS))
             - np.log(df["close"])
         )
-
         return df
 
     ########################################################
@@ -224,6 +260,8 @@ class FeatureEngineer:
         cls.add_returns(df)
         cls.add_volatility(df)
         cls.add_regime_feature(df)
+
+        df = cls.add_sentiment_features(df, sentiment_df)
 
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
