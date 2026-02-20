@@ -12,11 +12,11 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "25.0"  # cross-sectional alpha upgrade
+SCHEMA_VERSION = "26.0"  # removed obsolete rank_return
 
 
 ############################################################
-# FEATURES
+# FEATURES (PER-TICKER ONLY)
 ############################################################
 
 MODEL_FEATURES: Tuple[str, ...] = (
@@ -32,11 +32,8 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "volatility_5",
     "volatility_20",
 
-    # momentum booster
+    # momentum
     "momentum_20",
-
-    # cross-sectional rank
-    "rank_return",
 
     # technical
     "rsi",
@@ -89,12 +86,8 @@ FEATURE_LIMITS: Dict[str, tuple] = {
     # momentum
     "momentum_20": (-5.0, 5.0),
 
-    # cross-sectional rank
-    "rank_return": (0.0, 1.0),
-
     # technical
     "rsi": (-10.0, 110.0),
-
     "macd": (-2000.0, 2000.0),
     "macd_signal": (-2000.0, 2000.0),
 
