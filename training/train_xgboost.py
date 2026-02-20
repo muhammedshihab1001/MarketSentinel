@@ -29,6 +29,10 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 
+# 🔐 NEW: deterministic cross-sectional selection size
+TOP_K = 2
+BOTTOM_K = 2
+
 
 ############################################################
 # DETERMINISM
@@ -80,7 +84,7 @@ def build_sentiment_frame(ticker, start_date, end_date):
 
 
 ############################################################
-# CROSS-SECTION TARGET
+# CROSS-SECTION TARGET (STABILIZED)
 ############################################################
 
 def apply_cross_sectional_target(df):
@@ -96,31 +100,26 @@ def apply_cross_sectional_target(df):
 
     for date, group in df.groupby("date"):
 
-        if len(group) < 6:
+        if len(group) < (TOP_K + BOTTOM_K):
             continue
-
-        dispersion = group["risk_adj"].std()
-
-        if not np.isfinite(dispersion) or dispersion < 0.10:
-            continue
-
-        upper = group["risk_adj"].quantile(0.80)
-        lower = group["risk_adj"].quantile(0.20)
 
         group = group.copy()
 
-        group["target"] = np.where(
-            group["risk_adj"] >= upper, 1,
-            np.where(group["risk_adj"] <= lower, 0, np.nan)
-        )
+        # 🔐 Deterministic ranking
+        group = group.sort_values("risk_adj")
 
-        labeled.append(group)
+        bottom = group.head(BOTTOM_K)
+        top = group.tail(TOP_K)
+
+        bottom["target"] = 0
+        top["target"] = 1
+
+        labeled.append(pd.concat([top, bottom]))
 
     if not labeled:
         raise RuntimeError("No valid cross-sectional labels generated.")
 
     df = pd.concat(labeled, ignore_index=True)
-    df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype("int8")
 
     if df["target"].nunique() < 2:
@@ -153,7 +152,6 @@ def load_training_data(start_date, end_date):
                 end_date=end_date
             )
 
-            # 🔥 SENTIMENT BUILD
             sentiment_df = build_sentiment_frame(
                 ticker,
                 start_date,
@@ -190,13 +188,7 @@ def load_training_data(start_date, end_date):
             f"Dataset too small after feature build. Rows={len(df)}"
         )
 
-    ########################################################
-    # 🔐 SCHEMA VALIDATION
-    ########################################################
-
     validate_feature_schema(df.loc[:, MODEL_FEATURES])
-
-    ########################################################
 
     df = apply_cross_sectional_target(df)
 
