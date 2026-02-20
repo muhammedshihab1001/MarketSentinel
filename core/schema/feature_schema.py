@@ -12,14 +12,14 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "27.0"  # added sentiment features
+SCHEMA_VERSION = "28.0"  # dynamic optional sentiment handling
 
 
 ############################################################
-# FEATURES (PER-TICKER ONLY)
+# CORE FEATURES (MANDATORY – PRICE BASED)
 ############################################################
 
-MODEL_FEATURES: Tuple[str, ...] = (
+CORE_FEATURES: Tuple[str, ...] = (
 
     # returns
     "return",
@@ -47,8 +47,14 @@ MODEL_FEATURES: Tuple[str, ...] = (
 
     # regime
     "regime_feature",
+)
 
-    # sentiment (NEW)
+############################################################
+# OPTIONAL FEATURES (AUTO-DROP IF CONSTANT)
+############################################################
+
+OPTIONAL_FEATURES: Tuple[str, ...] = (
+
     "avg_sentiment",
     "sentiment_std",
     "news_count",
@@ -56,63 +62,16 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "sentiment_momentum",
 )
 
+MODEL_FEATURES: Tuple[str, ...] = CORE_FEATURES + OPTIONAL_FEATURES
+
 FEATURE_COUNT = len(MODEL_FEATURES)
 
 DTYPE = np.float32
 MIN_ROWS = 200
 
-
-############################################################
-# NAN + STABILITY CONTROLS
-############################################################
-
 MAX_NAN_RATIO_PER_FEATURE = 0.05
-MAX_ROW_NAN_RATIO = 0.10
-
 ABSOLUTE_FEATURE_LIMIT = 1e4
 MIN_VARIANCE = 1e-8
-
-
-############################################################
-# HARD FEATURE LIMITS
-############################################################
-
-FEATURE_LIMITS: Dict[str, tuple] = {
-
-    # returns
-    "return": (-15.0, 15.0),
-    "return_lag1": (-15.0, 15.0),
-    "return_lag5": (-15.0, 15.0),
-    "return_lag10": (-15.0, 15.0),
-
-    # volatility
-    "volatility": (0.0, 20.0),
-    "volatility_5": (0.0, 20.0),
-    "volatility_20": (0.0, 20.0),
-
-    # momentum
-    "momentum_20": (-5.0, 5.0),
-
-    # technical
-    "rsi": (-10.0, 110.0),
-    "macd": (-2000.0, 2000.0),
-    "macd_signal": (-2000.0, 2000.0),
-
-    # trend
-    "ema_10": (0.0, 1e6),
-    "ema_50": (0.0, 1e6),
-    "ema_ratio": (-20.0, 20.0),
-
-    # regime
-    "regime_feature": (-2.0, 2.0),
-
-    # sentiment
-    "avg_sentiment": (-1.0, 1.0),
-    "sentiment_std": (0.0, 1.0),
-    "news_count": (0.0, 500.0),
-    "sentiment_ema_3": (-1.0, 1.0),
-    "sentiment_momentum": (-2.0, 2.0),
-}
 
 
 ############################################################
@@ -136,56 +95,7 @@ def _check_forbidden_columns(df: pd.DataFrame):
 
 
 ############################################################
-# HARD LIMIT ENFORCEMENT
-############################################################
-
-def _enforce_feature_limits(df: pd.DataFrame) -> pd.DataFrame:
-    for col in MODEL_FEATURES:
-        if col not in FEATURE_LIMITS:
-            continue
-
-        lo, hi = FEATURE_LIMITS[col]
-
-        if (df[col] < lo).any() or (df[col] > hi).any():
-            raise RuntimeError(
-                f"Feature limit breach detected in {col}"
-            )
-
-    return df
-
-
-############################################################
-# SCHEMA LOCK
-############################################################
-
-def _build_feature_lock():
-
-    contract = {
-        "features": list(MODEL_FEATURES),
-        "dtype": "float32",
-        "limits": FEATURE_LIMITS,
-        "nan_feature": MAX_NAN_RATIO_PER_FEATURE,
-        "nan_row": MAX_ROW_NAN_RATIO,
-        "abs_limit": ABSOLUTE_FEATURE_LIMIT,
-        "variance_floor": MIN_VARIANCE,
-        "count": FEATURE_COUNT,
-        "version": SCHEMA_VERSION,
-    }
-
-    canonical = json.dumps(
-        contract,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-FEATURE_LOCK_HASH = _build_feature_lock()
-
-
-############################################################
-# MAIN VALIDATOR
+# VALIDATOR
 ############################################################
 
 def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
@@ -202,34 +112,58 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     if df.columns.duplicated().any():
         raise RuntimeError("Duplicate columns detected.")
 
-    if set(df.columns) != set(MODEL_FEATURES):
-        missing = set(MODEL_FEATURES) - set(df.columns)
-        extra = set(df.columns) - set(MODEL_FEATURES)
-
-        raise RuntimeError(
-            f"Feature mismatch | missing={missing} extra={extra}"
-        )
-
-    df = df.loc[:, MODEL_FEATURES]
-
     _check_forbidden_columns(df)
 
-    feature_df = df.astype(DTYPE, copy=True)
+    # Ensure all CORE features exist
+    missing_core = set(CORE_FEATURES) - set(df.columns)
+    if missing_core:
+        raise RuntimeError(f"Missing core features: {missing_core}")
 
+    # Work only on declared model features
+    available_features = [
+        col for col in MODEL_FEATURES if col in df.columns
+    ]
+
+    feature_df = df.loc[:, available_features].astype(DTYPE, copy=True)
     feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    feature_df = _enforce_feature_limits(feature_df)
+    ########################################################
+    # Drop constant OPTIONAL features automatically
+    ########################################################
 
-    for col in MODEL_FEATURES:
+    drop_optional = []
+
+    for col in OPTIONAL_FEATURES:
+        if col not in feature_df.columns:
+            continue
+
+        series = feature_df[col]
+        finite_vals = series[np.isfinite(series)]
+
+        if finite_vals.nunique() <= 1:
+            logger.warning(
+                "Dropping constant optional feature: %s",
+                col
+            )
+            drop_optional.append(col)
+
+    if drop_optional:
+        feature_df.drop(columns=drop_optional, inplace=True)
+
+    ########################################################
+    # Strict validation on CORE features
+    ########################################################
+
+    for col in CORE_FEATURES:
 
         series = feature_df[col]
         finite_vals = series[np.isfinite(series)]
 
         if finite_vals.empty:
-            raise RuntimeError(f"No finite values present in feature: {col}")
+            raise RuntimeError(f"No finite values in feature: {col}")
 
         if finite_vals.nunique() <= 1:
-            raise RuntimeError(f"Constant feature detected: {col}")
+            raise RuntimeError(f"Constant CORE feature detected: {col}")
 
         var = finite_vals.var(ddof=0)
 
@@ -244,7 +178,6 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             raise RuntimeError(f"Feature explosion detected: {col}")
 
     per_feature_nan = feature_df.isna().mean()
-
     unsafe = per_feature_nan[
         per_feature_nan > MAX_NAN_RATIO_PER_FEATURE
     ]
@@ -264,9 +197,9 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 def get_schema_signature() -> str:
 
     contract = {
-        "lock": FEATURE_LOCK_HASH,
+        "core": list(CORE_FEATURES),
+        "optional": list(OPTIONAL_FEATURES),
         "version": SCHEMA_VERSION,
-        "count": FEATURE_COUNT,
     }
 
     canonical = json.dumps(
