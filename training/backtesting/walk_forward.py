@@ -61,7 +61,7 @@ class WalkForwardValidator:
 
     def _validate_training_frame(self, df):
 
-        features = df.loc[:, MODEL_FEATURES].to_numpy(dtype=float)
+        features = df.loc[:, list(MODEL_FEATURES)].to_numpy(dtype=float)
 
         if not np.isfinite(features).all():
             raise RuntimeError("Non-finite values detected in training features.")
@@ -88,10 +88,10 @@ class WalkForwardValidator:
 
     def _distribution_guard(self, train_df, test_df):
 
-        train_mu = train_df[MODEL_FEATURES].mean()
-        train_std = train_df[MODEL_FEATURES].std(ddof=0) + 1e-9
+        train_mu = train_df[list(MODEL_FEATURES)].mean()
+        train_std = train_df[list(MODEL_FEATURES)].std(ddof=0) + 1e-9
 
-        z = np.abs((test_df[MODEL_FEATURES] - train_mu) / train_std)
+        z = np.abs((test_df[list(MODEL_FEATURES)] - train_mu) / train_std)
         max_z = float(np.nanmax(z.to_numpy()))
 
         if max_z > self.DRIFT_WARN_Z:
@@ -163,7 +163,7 @@ class WalkForwardValidator:
                     continue
 
                 features = validate_feature_schema(
-                    signal_slice.loc[:, MODEL_FEATURES]
+                    signal_slice.loc[:, list(MODEL_FEATURES)]
                 )
 
                 probs = model.predict_proba(features)[:, 1]
