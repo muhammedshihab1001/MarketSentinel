@@ -3,12 +3,14 @@ import xgboost as xgb
 import numpy as np
 import logging
 import threading
+from sklearn.model_selection import train_test_split
 
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
 MIN_PROB_STD = 1e-5
-
+VALIDATION_SPLIT = 0.15
+EARLY_STOPPING_ROUNDS = 40
 
 ###################################################
 # GPU DETECTION
@@ -42,7 +44,6 @@ def _gpu_available():
 
             _GPU_AVAILABLE = True
             logger.info("CUDA backend verified.")
-
         except Exception:
             _GPU_AVAILABLE = False
             logger.info("CUDA unavailable — using CPU.")
@@ -80,7 +81,7 @@ def compute_class_weight(y):
 
 
 ###################################################
-# SAFE CLASSIFIER (DYNAMIC FEATURE SAFE)
+# SAFE CLASSIFIER
 ###################################################
 
 class SafeXGBClassifier(XGBClassifier):
@@ -101,7 +102,22 @@ class SafeXGBClassifier(XGBClassifier):
             X.shape[1]
         )
 
-        model = super().fit(X, y, **kwargs)
+        # 🔥 Internal validation split
+        X_train, X_val, y_train, y_val = train_test_split(
+            X,
+            y,
+            test_size=VALIDATION_SPLIT,
+            random_state=SEED,
+            stratify=y
+        )
+
+        model = super().fit(
+            X_train,
+            y_train,
+            eval_set=[(X_val, y_val)],
+            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+            verbose=False
+        )
 
         preds = model.predict_proba(X)[:, 1]
 
@@ -121,16 +137,42 @@ class SafeXGBClassifier(XGBClassifier):
 
         return model
 
+    ###################################################
+    # FEATURE IMPORTANCE EXPORT
+    ###################################################
+
+    def export_feature_importance(self, feature_names):
+
+        booster = self.get_booster()
+        score = booster.get_score(importance_type="gain")
+
+        importances = {
+            feature_names[int(k[1:])] if k.startswith("f") else k: v
+            for k, v in score.items()
+        }
+
+        sorted_imp = sorted(
+            importances.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        logger.info("Top 5 features:")
+        for name, val in sorted_imp[:5]:
+            logger.info("  %s : %.4f", name, val)
+
+        return sorted_imp
+
 
 ###################################################
-# PARAM BUILDER (REGULARIZED INSTITUTIONAL VERSION)
+# PARAM BUILDER
 ###################################################
 
 def _base_params(pos_weight):
 
     params = dict(
 
-        n_estimators=350,
+        n_estimators=800,  # allow early stopping to choose
         max_depth=3,
         learning_rate=0.03,
 
@@ -140,8 +182,8 @@ def _base_params(pos_weight):
 
         min_child_weight=6,
         gamma=0.25,
-        reg_alpha=1.0,
-        reg_lambda=3.0,
+        reg_alpha=1.2,
+        reg_lambda=3.5,
 
         max_bin=256,
 
