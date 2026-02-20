@@ -14,7 +14,7 @@ from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
 
 from training.backtesting.walk_forward import WalkForwardValidator
-from models.xgboost_model import build_xgboost_model
+from models.xgboost_model import build_xgboost_pipeline
 
 
 logger = logging.getLogger(__name__)
@@ -86,23 +86,6 @@ def apply_cross_sectional_target(df):
 
 
 ############################################################
-# NORMALIZATION
-############################################################
-
-def cross_sectional_normalize(df):
-
-    df = df.sort_values(["date", "ticker"]).copy()
-    grouped = df.groupby("date")
-
-    for col in MODEL_FEATURES:
-        mean = grouped[col].transform("mean")
-        std = grouped[col].transform("std").fillna(1).clip(lower=1e-6)
-        df[col] = (df[col] - mean) / std
-
-    return df.reset_index(drop=True)
-
-
-############################################################
 # LOAD DATA
 ############################################################
 
@@ -117,7 +100,6 @@ def load_training_data(start_date, end_date):
     for ticker in universe:
 
         try:
-
             price_df = market_data.get_price_data(
                 ticker=ticker,
                 start_date=start_date,
@@ -145,7 +127,6 @@ def load_training_data(start_date, end_date):
         raise RuntimeError("Dataset too small.")
 
     df = apply_cross_sectional_target(df)
-    df = cross_sectional_normalize(df)
 
     return df
 
@@ -159,10 +140,10 @@ def trainer(train_df):
     X = train_df.loc[:, MODEL_FEATURES]
     y = train_df["target"]
 
-    model = build_xgboost_model(y)
-    model.fit(X, y)
+    pipeline = build_xgboost_pipeline(y)
+    pipeline.fit(X, y)
 
-    return model
+    return pipeline
 
 
 ############################################################
@@ -181,11 +162,9 @@ def main(start_date=None, end_date=None):
 
     df = load_training_data(start_date, end_date)
 
-    # WALK-FORWARD VALIDATION
     validator = WalkForwardValidator(trainer)
     metrics = validator.run(df)
 
-    # TRAIN FINAL MODEL ON FULL DATA
     final_model = trainer(df)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -193,8 +172,10 @@ def main(start_date=None, end_date=None):
 
     joblib.dump(final_model, model_path)
 
-    logger.info("Training completed in %.2f minutes",
-                (time.time() - t0) / 60)
+    logger.info(
+        "Training completed in %.2f minutes",
+        (time.time() - t0) / 60
+    )
 
     return metrics
 
