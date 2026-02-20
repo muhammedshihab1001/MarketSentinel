@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import logging
 
-from core.schema.feature_schema import MODEL_FEATURES, CORE_FEATURES, DTYPE
+from core.schema.feature_schema import MODEL_FEATURES, DTYPE
 from training.backtesting.regime import MarketRegimeDetector
 
 logger = logging.getLogger("marketsentinel.walkforward")
@@ -15,8 +15,7 @@ class WalkForwardValidator:
 
     TOP_K = 2
     BOTTOM_K = 2
-
-    ########################################################
+    TARGET_GROSS_EXPOSURE = 1.0
 
     def __init__(
         self,
@@ -102,7 +101,6 @@ class WalkForwardValidator:
                 signal_slice = signal_slice.copy()
                 signal_slice["score"] = probs
 
-                # Rank cross-section
                 ranked = signal_slice.sort_values("score")
 
                 longs = ranked.tail(self.TOP_K)
@@ -110,16 +108,25 @@ class WalkForwardValidator:
 
                 positions = {}
 
-                weight_long = 1.0 / self.TOP_K
-                weight_short = -1.0 / self.BOTTOM_K
+                # --- Volatility scaling ---
+                long_vol = longs["volatility"].replace(0, 1e-6)
+                short_vol = shorts["volatility"].replace(0, 1e-6)
 
-                for row in longs.itertuples():
-                    positions[row.ticker] = weight_long
+                long_weights = 1.0 / long_vol
+                short_weights = 1.0 / short_vol
 
-                for row in shorts.itertuples():
-                    positions[row.ticker] = weight_short
+                long_weights /= long_weights.sum()
+                short_weights /= short_weights.sum()
 
-                # Compute next-day returns
+                long_weights *= self.TARGET_GROSS_EXPOSURE / 2
+                short_weights *= self.TARGET_GROSS_EXPOSURE / 2
+
+                for t, w in zip(longs["ticker"], long_weights):
+                    positions[t] = float(w)
+
+                for t, w in zip(shorts["ticker"], short_weights):
+                    positions[t] = -float(w)
+
                 merged = pd.merge(
                     signal_slice[["ticker", "close"]],
                     next_slice[["ticker", "close"]],
@@ -147,7 +154,6 @@ class WalkForwardValidator:
 
             window_returns = np.array(window_returns)
 
-            # Compound capital
             for r in window_returns:
                 capital *= (1 + r)
                 equity_curve.append(capital)
@@ -184,12 +190,10 @@ class WalkForwardValidator:
         gains = df[df["strategy_return"] > 0]["strategy_return"].sum()
         losses = abs(df[df["strategy_return"] < 0]["strategy_return"].sum()) or 1e-6
 
-        profit_factor = float(gains / losses)
-
         return {
             "avg_strategy_return": float(df["strategy_return"].mean()),
             "avg_sharpe": float(df["sharpe_ratio"].mean()),
-            "profit_factor": profit_factor,
+            "profit_factor": float(gains / losses),
             "max_drawdown": float(drawdowns.min()),
             "return_volatility": float(df["strategy_return"].std()),
             "final_equity": float(curve[-1]) if len(curve) else 0.0,
