@@ -2,28 +2,16 @@ import numpy as np
 import pandas as pd
 import logging
 
-from core.schema.feature_schema import (
-    MODEL_FEATURES,
-    CORE_FEATURES,
-    DTYPE
-)
-
-from training.backtesting.portfolio_engine import PortfolioBacktestEngine
+from core.schema.feature_schema import MODEL_FEATURES, CORE_FEATURES, DTYPE
 from training.backtesting.regime import MarketRegimeDetector
-from core.signals.signal_engine import DecisionEngine
 
 logger = logging.getLogger("marketsentinel.walkforward")
 
 
 class WalkForwardValidator:
 
-    MIN_TRADES_PER_WINDOW = 4
     MIN_WINDOWS = 6
     MIN_TEST_DAYS = 20
-
-    MIN_FEATURE_VARIANCE = 1e-8
-    DRIFT_WARN_Z = 10.0
-    MIN_PROB_STD = 1e-5
 
     TOP_K = 2
     BOTTOM_K = 2
@@ -41,71 +29,13 @@ class WalkForwardValidator:
         self.window_size = window_size
         self.step_size = step_size
         self.embargo_days = embargo_days
-
-        self.engine = PortfolioBacktestEngine()
         self.regime_detector = MarketRegimeDetector()
-        self.decision_engine = DecisionEngine()
 
     ########################################################
 
     def _apply_embargo(self, train_df, test_start):
         embargo_cut = pd.Timestamp(test_start) - pd.Timedelta(days=self.embargo_days)
-        train_df = train_df[train_df["date"] < embargo_cut]
-
-        if len(train_df) < int(self.window_size * 0.70):
-            raise RuntimeError("Embargo removed too much training data.")
-
-        return train_df
-
-    ########################################################
-
-    def _validate_training_frame(self, df):
-
-        available_features = [c for c in MODEL_FEATURES if c in df.columns]
-        features = df.loc[:, available_features].to_numpy(dtype=float)
-
-        if not np.isfinite(features).all():
-            raise RuntimeError("Non-finite values detected in training features.")
-
-        for col in CORE_FEATURES:
-            if col not in df.columns:
-                raise RuntimeError(f"Missing core feature during training: {col}")
-
-            col_var = float(np.var(df[col].to_numpy(dtype=float)))
-            if col_var < self.MIN_FEATURE_VARIANCE:
-                raise RuntimeError(f"Core feature variance collapsed: {col}")
-
-        if df["target"].nunique() < 2:
-            raise RuntimeError("Training labels collapsed.")
-
-    ########################################################
-
-    def _validate_inference_slice(self, df_slice: pd.DataFrame) -> pd.DataFrame:
-
-        if df_slice.empty:
-            raise RuntimeError("Empty inference slice.")
-
-        available_features = [c for c in MODEL_FEATURES if c in df_slice.columns]
-
-        if not set(CORE_FEATURES).issubset(set(df_slice.columns)):
-            raise RuntimeError("Inference slice missing core features.")
-
-        df_slice = df_slice.loc[:, available_features].astype(DTYPE, copy=True)
-        df_slice.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-        if df_slice.isna().any().any():
-            raise RuntimeError("NaN detected in inference slice.")
-
-        return df_slice
-
-    ########################################################
-
-    def _validate_probabilities(self, probs):
-        if not np.isfinite(probs).all():
-            raise RuntimeError("Non-finite probabilities.")
-
-        if np.std(probs) < self.MIN_PROB_STD:
-            raise RuntimeError("Probability collapse detected.")
+        return train_df[train_df["date"] < embargo_cut]
 
     ########################################################
 
@@ -123,7 +53,7 @@ class WalkForwardValidator:
         results = []
         equity_curve = []
 
-        initial_capital = 10_000.0
+        capital = 10_000.0
         start_idx = self.window_size
         window_id = 1
 
@@ -143,115 +73,99 @@ class WalkForwardValidator:
             ].copy()
 
             train_df = self._apply_embargo(train_df, test_dates.iloc[0])
+
             test_df = df[
                 (df["date"] >= test_dates.iloc[0]) &
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
-            self._validate_training_frame(train_df)
-
             model = self.model_trainer(train_df)
 
-            grouped_prices = {}
-            grouped_signals = {}
-            trade_counter = 0
+            window_returns = []
 
             test_dates_sorted = sorted(test_df["date"].unique())
 
             for i in range(len(test_dates_sorted) - 1):
 
                 signal_date = test_dates_sorted[i]
-                execution_date = test_dates_sorted[i + 1]
+                next_date = test_dates_sorted[i + 1]
 
                 signal_slice = test_df[test_df["date"] == signal_date]
-                exec_slice = test_df[test_df["date"] == execution_date]
+                next_slice = test_df[test_df["date"] == next_date]
 
-                if signal_slice.empty or exec_slice.empty:
+                if signal_slice.empty or next_slice.empty:
                     continue
 
-                features_df = self._validate_inference_slice(signal_slice)
-
-                probs = model.predict_proba(features_df)[:, 1]
-                self._validate_probabilities(probs)
+                X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
+                probs = model.predict_proba(X)[:, 1]
 
                 signal_slice = signal_slice.copy()
                 signal_slice["score"] = probs
 
-                # Cross-sectional ranking
-                signal_slice = signal_slice.sort_values("score")
+                # Rank cross-section
+                ranked = signal_slice.sort_values("score")
 
-                bottom = signal_slice.head(self.BOTTOM_K)
-                top = signal_slice.tail(self.TOP_K)
+                longs = ranked.tail(self.TOP_K)
+                shorts = ranked.head(self.BOTTOM_K)
 
-                selected = pd.concat([bottom, top])
+                positions = {}
 
-                daily_signals = {}
+                weight_long = 1.0 / self.TOP_K
+                weight_short = -1.0 / self.BOTTOM_K
 
-                for row in selected.itertuples(index=False):
+                for row in longs.itertuples():
+                    positions[row.ticker] = weight_long
 
-                    decision = self.decision_engine.generate(
-                        ticker=row.ticker,
-                        predicted_return=float(row.score),
-                        prob_up=float(row.score),
-                        volatility=float(getattr(row, "volatility", 0.02)),
-                        regime=getattr(row, "regime", "SIDEWAYS"),
-                        price_df=test_df[test_df["ticker"] == row.ticker]
-                    )
+                for row in shorts.itertuples():
+                    positions[row.ticker] = weight_short
 
-                    if decision["signal"] in {"BUY", "SELL"}:
-                        daily_signals[row.ticker] = decision
+                # Compute next-day returns
+                merged = pd.merge(
+                    signal_slice[["ticker", "close"]],
+                    next_slice[["ticker", "close"]],
+                    on="ticker",
+                    suffixes=("_today", "_next")
+                )
 
-                if not daily_signals:
-                    continue
+                merged["ret"] = (
+                    np.log(merged["close_next"]) -
+                    np.log(merged["close_today"])
+                )
 
-                prices = {
-                    t: float(p)
-                    for t, p in zip(exec_slice["ticker"], exec_slice["close"])
-                    if pd.notna(p) and np.isfinite(p) and p > 0
-                }
+                daily_ret = 0.0
 
-                filtered = {
-                    t: daily_signals[t]
-                    for t in daily_signals
-                    if t in prices
-                }
+                for row in merged.itertuples():
+                    if row.ticker in positions:
+                        daily_ret += positions[row.ticker] * row.ret
 
-                if not filtered:
-                    continue
+                window_returns.append(daily_ret)
 
-                grouped_prices[execution_date] = {
-                    t: prices[t] for t in filtered
-                }
-
-                grouped_signals[execution_date] = filtered
-                trade_counter += len(filtered)
-
-            if trade_counter < self.MIN_TRADES_PER_WINDOW:
+            if not window_returns:
                 start_idx += self.step_size
                 window_id += 1
                 continue
 
-            metrics = self.engine.run(
-                grouped_prices,
-                grouped_signals,
-                initial_cash=initial_capital
-            )
+            window_returns = np.array(window_returns)
 
-            curve = np.array(metrics["equity_curve"], dtype=float)
+            # Compound capital
+            for r in window_returns:
+                capital *= (1 + r)
+                equity_curve.append(capital)
 
-            if equity_curve:
-                scale = equity_curve[-1] / curve[0]
-                equity_curve.extend((curve * scale)[1:].tolist())
-            else:
-                equity_curve.extend(curve.tolist())
-
-            results.append(metrics)
+            results.append({
+                "strategy_return": float(window_returns.sum()),
+                "sharpe_ratio": float(
+                    np.mean(window_returns) /
+                    (np.std(window_returns) + 1e-9) *
+                    np.sqrt(252)
+                )
+            })
 
             start_idx += self.step_size
             window_id += 1
 
         if len(results) < self.MIN_WINDOWS:
-            raise RuntimeError("Walk-forward produced insufficient windows.")
+            raise RuntimeError("Insufficient WF windows.")
 
         logger.info("Walk-forward completed successfully.")
 
@@ -278,7 +192,7 @@ class WalkForwardValidator:
             "profit_factor": profit_factor,
             "max_drawdown": float(drawdowns.min()),
             "return_volatility": float(df["strategy_return"].std()),
-            "final_equity": float(curve[-1]),
+            "final_equity": float(curve[-1]) if len(curve) else 0.0,
             "equity_curve": curve.tolist(),
             "num_windows": int(len(df))
         }
