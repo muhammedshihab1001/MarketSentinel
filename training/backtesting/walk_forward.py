@@ -4,7 +4,8 @@ import logging
 
 from core.schema.feature_schema import (
     MODEL_FEATURES,
-    validate_feature_schema
+    DTYPE,
+    FEATURE_LIMITS
 )
 
 from training.backtesting.portfolio_engine import PortfolioBacktestEngine
@@ -73,6 +74,31 @@ class WalkForwardValidator:
 
         if df["target"].nunique() < 2:
             raise RuntimeError("Training labels collapsed.")
+
+    ########################################################
+
+    def _validate_inference_slice(self, df_slice: pd.DataFrame) -> np.ndarray:
+
+        if df_slice.empty:
+            raise RuntimeError("Empty inference slice.")
+
+        if set(df_slice.columns) != set(MODEL_FEATURES):
+            raise RuntimeError("Inference slice feature mismatch.")
+
+        df_slice = df_slice.loc[:, list(MODEL_FEATURES)].astype(DTYPE, copy=True)
+
+        df_slice.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        if df_slice.isna().any().any():
+            raise RuntimeError("NaN detected in inference slice.")
+
+        for col in MODEL_FEATURES:
+            if col in FEATURE_LIMITS:
+                lo, hi = FEATURE_LIMITS[col]
+                if (df_slice[col] < lo).any() or (df_slice[col] > hi).any():
+                    raise RuntimeError(f"Inference feature limit breach: {col}")
+
+        return df_slice.to_numpy(dtype=DTYPE)
 
     ########################################################
 
@@ -162,7 +188,7 @@ class WalkForwardValidator:
                 if signal_slice.empty or exec_slice.empty:
                     continue
 
-                features = validate_feature_schema(
+                features = self._validate_inference_slice(
                     signal_slice.loc[:, list(MODEL_FEATURES)]
                 )
 
@@ -245,29 +271,3 @@ class WalkForwardValidator:
         logger.info("Walk-forward completed successfully.")
 
         return self.aggregate_results(results, equity_curve)
-
-    ########################################################
-
-    def aggregate_results(self, results, equity_curve):
-
-        df = pd.DataFrame(results)
-        curve = np.array(equity_curve, dtype=float)
-
-        peak = np.maximum.accumulate(curve)
-        drawdowns = (curve - peak) / peak
-
-        gains = df[df["strategy_return"] > 0]["strategy_return"].sum()
-        losses = abs(df[df["strategy_return"] < 0]["strategy_return"].sum()) or 1e-6
-
-        profit_factor = float(gains / losses)
-
-        return {
-            "avg_strategy_return": float(df["strategy_return"].mean()),
-            "avg_sharpe": float(df["sharpe_ratio"].mean()),
-            "profit_factor": profit_factor,
-            "max_drawdown": float(drawdowns.min()),
-            "return_volatility": float(df["strategy_return"].std()),
-            "final_equity": float(curve[-1]),
-            "equity_curve": curve.tolist(),
-            "num_windows": len(df)
-        }
