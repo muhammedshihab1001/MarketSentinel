@@ -65,10 +65,9 @@ class FeatureEngineer:
     def add_returns(cls, df):
 
         returns = df.groupby("ticker")["close"].pct_change()
-
         lo, hi = cls.RETURN_CLAMP
-        df["return"] = returns.clip(lo, hi)
 
+        df["return"] = returns.clip(lo, hi)
         df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
         df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
         df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
@@ -108,7 +107,7 @@ class FeatureEngineer:
             df[col] = df[col].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
 
     ########################################################
-    # REGIME FEATURE (RESTORED)
+    # REGIME FEATURE
     ########################################################
 
     @classmethod
@@ -128,7 +127,7 @@ class FeatureEngineer:
         )
 
     ########################################################
-    # SENTIMENT (SAFE DEFAULTS IF DISABLED)
+    # SENTIMENT
     ########################################################
 
     @classmethod
@@ -186,7 +185,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # RSI / MACD / EMA
+    # TECHNICALS
     ########################################################
 
     @classmethod
@@ -231,7 +230,7 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # CROSS-SECTIONAL FEATURES
+    # CROSS SECTIONAL
     ########################################################
 
     @classmethod
@@ -260,15 +259,30 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # FORWARD RETURN
+    # IMPROVED TARGET ENGINEERING
     ########################################################
 
     @classmethod
     def add_forward_return(cls, df):
-        df["forward_return"] = (
+
+        fwd_log = (
             np.log(df["close"].shift(-cls.FORWARD_DAYS))
             - np.log(df["close"])
         )
+
+        df["forward_return"] = fwd_log
+
+        df["forward_vol_adjusted"] = (
+            fwd_log / (df["volatility_20"] + 1e-6)
+        )
+
+        # remove micro noise
+        threshold = 0.002
+        mask = fwd_log.abs() >= threshold
+
+        df.loc[~mask, "forward_return"] = np.nan
+        df.loc[~mask, "forward_vol_adjusted"] = np.nan
+
         return df
 
     ########################################################
@@ -291,11 +305,9 @@ class FeatureEngineer:
         cls.add_regime_feature(df)
 
         df = cls.add_sentiment_features(df, sentiment_df)
-
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
         cls.add_ema(df)
-
         df = cls.add_cross_sectional_features(df)
 
         if training:
