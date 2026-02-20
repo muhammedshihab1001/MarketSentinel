@@ -2,11 +2,7 @@ import pandas as pd
 import numpy as np
 import logging
 
-from core.schema.feature_schema import (
-    validate_feature_schema,
-    MODEL_FEATURES
-)
-
+from core.schema.feature_schema import MODEL_FEATURES
 from core.indicators.technical_indicators import TechnicalIndicators
 
 logger = logging.getLogger(__name__)
@@ -211,7 +207,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # MAIN PIPELINE (UNIFIED)
+    # MAIN PIPELINE
     ########################################################
 
     @classmethod
@@ -245,21 +241,11 @@ class FeatureEngineer:
         float_cols = df.select_dtypes("float64").columns
         df[float_cols] = df[float_cols].astype("float32")
 
-        validated = validate_feature_schema(
-            df.loc[:, MODEL_FEATURES]
-        )
-
         base_cols = ["date", "close", "ticker"]
         if training:
             base_cols.append("forward_return")
 
-        final = pd.concat(
-            [
-                df[base_cols].reset_index(drop=True),
-                validated.reset_index(drop=True)
-            ],
-            axis=1
-        )
+        final = df[base_cols + list(MODEL_FEATURES)].reset_index(drop=True)
 
         logger.info(
             "Feature pipeline built | rows=%s | training=%s",
@@ -267,4 +253,4 @@ class FeatureEngineer:
             training
         )
 
-        return final.reset_index(drop=True)
+        return final
