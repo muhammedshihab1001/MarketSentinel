@@ -21,14 +21,13 @@ class WalkForwardValidator:
     MIN_WINDOWS = 6
     MIN_TEST_DAYS = 20
 
-    MIN_ASSETS_PER_DAY = 2
     MIN_FEATURE_VARIANCE = 1e-8
-
     DRIFT_WARN_Z = 10.0
     MIN_PROB_STD = 1e-5
 
-    TOP_N_PER_DAY = 5
-    MIN_EDGE_THRESHOLD = 0.08   # 🔥 NEW confidence filter
+    # 🔥 ALIGN WITH TRAINING
+    TOP_K = 2
+    BOTTOM_K = 2
 
     ########################################################
 
@@ -195,23 +194,18 @@ class WalkForwardValidator:
 
                 signal_slice = signal_slice.copy()
                 signal_slice["prob"] = probs
-                signal_slice["edge"] = abs(signal_slice["prob"] - 0.5)
 
-                # 🔥 CONFIDENCE FILTER
-                signal_slice = signal_slice[
-                    signal_slice["edge"] >= self.MIN_EDGE_THRESHOLD
-                ]
+                # 🔥 TRUE CROSS-SECTIONAL SELECTION
+                signal_slice = signal_slice.sort_values("prob")
 
-                if signal_slice.empty:
-                    continue
+                bottom = signal_slice.head(self.BOTTOM_K)
+                top = signal_slice.tail(self.TOP_K)
 
-                signal_slice = signal_slice.sort_values(
-                    "edge", ascending=False
-                ).head(self.TOP_N_PER_DAY)
+                selected = pd.concat([bottom, top])
 
                 daily_signals = {}
 
-                for row in signal_slice.itertuples(index=False):
+                for row in selected.itertuples(index=False):
 
                     prob = float(row.prob)
 
@@ -227,7 +221,7 @@ class WalkForwardValidator:
                     if decision["signal"] in {"BUY", "SELL"}:
                         daily_signals[row.ticker] = decision["signal"]
 
-                if len(daily_signals) < self.MIN_ASSETS_PER_DAY:
+                if not daily_signals:
                     continue
 
                 prices = {
@@ -253,11 +247,6 @@ class WalkForwardValidator:
                 trade_counter += len(filtered)
 
             if trade_counter < self.MIN_TRADES_PER_WINDOW:
-                logger.warning(
-                    "Window #%s skipped | trades=%s",
-                    window_id,
-                    trade_counter
-                )
                 start_idx += self.step_size
                 window_id += 1
                 continue
