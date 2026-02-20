@@ -1,21 +1,15 @@
 {
-  "version": "4.0",
-  "created_utc": "2026-02-15T09:30:00Z",
-  "description": "Institutional core US liquid equities + macro ETFs",
+  "version": "5.0",
+  "created_utc": "2026-02-20T12:00:00Z",
+  "description": "Optimized institutional core US liquid equities + macro ETFs (balanced cross-sectional set)",
   "min_history_days": 400,
   "tickers": [
     "AAPL",
     "MSFT",
     "NVDA",
-    "AMZN",
-    "GOOGL",
-    "META",
-    "TSLA",
     "JPM",
-    "GS",
     "XOM",
-    "AMD",
-    "AVGO",
+    "UNH",
     "SPY",
     "QQQ"
   ]
