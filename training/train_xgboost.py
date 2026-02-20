@@ -17,7 +17,7 @@ from training.backtesting.walk_forward import WalkForwardValidator
 from models.xgboost_model import build_xgboost_pipeline
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("marketsentinel.train_xgb")
 
 MODEL_DIR = os.path.abspath("artifacts/xgboost")
 
@@ -86,7 +86,7 @@ def apply_cross_sectional_target(df):
 
 
 ############################################################
-# LOAD DATA
+# LOAD DATA (NO SILENT FAILURE)
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -96,10 +96,13 @@ def load_training_data(start_date, end_date):
     universe = MarketUniverse.get_universe()
 
     datasets = []
+    failed = []
 
     for ticker in universe:
 
         try:
+            logger.info("Building features for %s", ticker)
+
             price_df = market_data.get_price_data(
                 ticker=ticker,
                 start_date=start_date,
@@ -113,26 +116,38 @@ def load_training_data(start_date, end_date):
                 training=True
             )
 
+            if dataset is None or dataset.empty:
+                raise RuntimeError("Empty feature dataset.")
+
             datasets.append(dataset)
 
-        except Exception:
-            continue
+        except Exception as e:
+            logger.error("Ticker failed: %s | %s", ticker, str(e))
+            failed.append(ticker)
 
     if not datasets:
-        raise RuntimeError("All tickers failed.")
+        raise RuntimeError(
+            f"All tickers failed. Failed tickers: {failed}"
+        )
 
     df = pd.concat(datasets, ignore_index=True)
 
+    logger.info("Raw dataset rows: %s", len(df))
+
     if len(df) < MIN_TRAINING_ROWS:
-        raise RuntimeError("Dataset too small.")
+        raise RuntimeError(
+            f"Dataset too small after feature build. Rows={len(df)}"
+        )
 
     df = apply_cross_sectional_target(df)
+
+    logger.info("Final labeled dataset rows: %s", len(df))
 
     return df
 
 
 ############################################################
-# TRAINER FUNCTION FOR WALK-FORWARD
+# TRAINER
 ############################################################
 
 def trainer(train_df):
@@ -141,6 +156,7 @@ def trainer(train_df):
     y = train_df["target"]
 
     pipeline = build_xgboost_pipeline(y)
+
     pipeline.fit(X, y)
 
     return pipeline
@@ -160,10 +176,19 @@ def main(start_date=None, end_date=None):
     if not start_date:
         start_date, end_date = MarketTime.window_for("xgboost")
 
+    logger.info(
+        "Training window | %s -> %s",
+        start_date,
+        end_date
+    )
+
     df = load_training_data(start_date, end_date)
 
     validator = WalkForwardValidator(trainer)
+
     metrics = validator.run(df)
+
+    logger.info("Walk-forward metrics: %s", metrics)
 
     final_model = trainer(df)
 
