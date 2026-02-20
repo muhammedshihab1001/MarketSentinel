@@ -18,12 +18,13 @@ class PortfolioBacktestEngine:
 
     MIN_EQUITY_FLOOR = 0.40
 
-    # NEW CONTROLS
     MIN_CONFIDENCE = 0.60
     MAX_POSITIONS = 3
     LONG_ONLY = True
 
-    ###################################################
+    # NEW CONTROLS
+    MAX_DAILY_TURNOVER = 0.40
+    MIN_POSITION_CHANGE = 0.10
 
     def __init__(
         self,
@@ -73,14 +74,13 @@ class PortfolioBacktestEngine:
         return vols
 
     ###################################################
-    # IMPROVED WEIGHT ENGINE
+    # WEIGHT ENGINE
     ###################################################
 
     def _compute_weights(self, signals, vols):
 
         candidates = []
 
-        # Step 1: Filter signals
         for t, decision in signals.items():
 
             if not isinstance(decision, dict):
@@ -92,14 +92,13 @@ class PortfolioBacktestEngine:
                 continue
 
             if decision["signal"] != "BUY":
-                continue  # long-only for stability
+                continue
 
             candidates.append((t, confidence))
 
         if not candidates:
             return {}
 
-        # Step 2: Keep top-K
         candidates = sorted(
             candidates,
             key=lambda x: x[1],
@@ -113,8 +112,7 @@ class PortfolioBacktestEngine:
             vol = vols.get(t, 0.02)
             inv_vol = min(1 / max(vol, 1e-4), self.MAX_INV_VOL)
 
-            raw_weight = confidence * inv_vol
-            raw[t] = raw_weight
+            raw[t] = confidence * inv_vol
 
         total = sum(raw.values())
 
@@ -122,15 +120,10 @@ class PortfolioBacktestEngine:
             return {}
 
         weights = {
-            t: (v / total) * self.MAX_GROSS_EXPOSURE
+            t: min((v / total) * self.MAX_GROSS_EXPOSURE,
+                   self.MAX_POSITION_WEIGHT)
             for t, v in raw.items()
         }
-
-        for t in weights:
-            weights[t] = min(
-                weights[t],
-                self.MAX_POSITION_WEIGHT
-            )
 
         return weights
 
@@ -199,45 +192,34 @@ class PortfolioBacktestEngine:
             }
 
             ###################################################
-            # LIQUIDATE REMOVED
-            ###################################################
-
-            for t in list(positions.keys()):
-
-                if t not in target_positions:
-
-                    price = prices.get(t)
-                    if price is None:
-                        continue
-
-                    delta = -positions[t]
-                    trade_notional = abs(delta) * price
-
-                    cost = trade_notional * (
-                        self.transaction_cost + self.base_slippage
-                    )
-
-                    cash -= delta * price
-                    cash -= cost
-
-                    positions.pop(t)
-
-            ###################################################
-            # EXECUTE TARGETS
+            # EXECUTE WITH TURNOVER CONTROL
             ###################################################
 
             day_turnover = 0.0
 
-            for ticker, target in target_positions.items():
+            for ticker in set(list(positions.keys()) + list(target_positions.keys())):
 
                 current = positions.get(ticker, 0)
+                target = target_positions.get(ticker, 0)
+
                 delta = target - current
 
                 if abs(delta) < self.EPSILON:
                     continue
 
-                price = prices[ticker]
+                # Skip tiny rebalance
+                if abs(delta) / (abs(current) + self.EPSILON) < self.MIN_POSITION_CHANGE:
+                    continue
+
+                price = prices.get(ticker)
+                if price is None:
+                    continue
+
                 trade_notional = abs(delta) * price
+
+                # Turnover cap
+                if (day_turnover + trade_notional) / portfolio_value > self.MAX_DAILY_TURNOVER:
+                    continue
 
                 cost = trade_notional * (
                     self.transaction_cost + self.base_slippage
@@ -249,7 +231,10 @@ class PortfolioBacktestEngine:
                 cash -= delta * price
                 cash -= cost
 
-                positions[ticker] = current + delta
+                if abs(target) < self.EPSILON:
+                    positions.pop(ticker, None)
+                else:
+                    positions[ticker] = target
 
                 day_turnover += trade_notional
 
