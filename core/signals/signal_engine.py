@@ -150,7 +150,7 @@ class DecisionEngine:
     def _hold(self, confidence: float) -> Dict:
         return {
             "signal": "HOLD",
-            "confidence": round(confidence, 3),
+            "confidence": round(float(confidence), 3),
             "allocation": 0.0,
             "position_pct": 0.0,
             "expected_value": 0.0,
@@ -167,7 +167,7 @@ class DecisionEngine:
         prob_up: float,
         volatility: float,
         regime: Optional[str] = None,
-        price_df=None  # optional future hybrid support
+        price_df=None
     ) -> Dict:
 
         with self._lock:
@@ -175,8 +175,9 @@ class DecisionEngine:
             if self.config.global_kill_switch:
                 return self._hold(0.0)
 
-            prob_up = _safe(prob_up, 0.5)
+            prob_up = _clamp(_safe(prob_up, 0.5), 0.0, 1.0)
             volatility = max(_safe(volatility, 0.02), 1e-6)
+            predicted_return = _safe(predicted_return, 0.0)
 
             ###################################################
             # CRISIS FILTER
@@ -217,7 +218,7 @@ class DecisionEngine:
                 if risk["capital_multiplier"] == 0:
                     return self._hold(confidence)
 
-                risk_score = risk["risk_score"]
+                risk_score = _safe(risk.get("risk_score", 0.0), 0.0)
 
             ###################################################
             # POSITION SIZING
@@ -241,6 +242,9 @@ class DecisionEngine:
             self._last_signal[ticker] = signal
 
             position_pct = allocation / self.config.portfolio_value
+
+            if not math.isfinite(position_pct):
+                return self._hold(confidence)
 
             return {
                 "signal": signal,
