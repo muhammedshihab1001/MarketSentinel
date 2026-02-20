@@ -18,9 +18,7 @@ class FeatureEngineer:
     VOL_FLOOR = 1e-4
     RETURN_CLAMP = (-0.5, 0.5)
 
-    MAX_INDICATOR_WINDOW = 60
     SPLIT_THRESHOLD = 3.5
-
     FORWARD_DAYS = 5
 
     ########################################################
@@ -32,7 +30,7 @@ class FeatureEngineer:
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
         df = df.dropna(subset=["date"])
-        return df.sort_values("date").reset_index(drop=True)
+        return df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     @classmethod
     def _validate_price_frame(cls, df, ticker=None):
@@ -199,32 +197,21 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # DATASET BUILDER
+    # FORWARD RETURN (TRAINING ONLY)
     ########################################################
 
     @classmethod
-    def create_training_dataset(cls, df):
-
-        df = df.sort_values(["ticker", "date"]).copy()
+    def add_forward_return(cls, df):
 
         df["forward_return"] = (
             np.log(df["close"].shift(-cls.FORWARD_DAYS))
             - np.log(df["close"])
         )
 
-        df = df.dropna(subset=["forward_return"])
-        df = df.dropna(subset=[*MODEL_FEATURES])
-
-        if len(df) < cls.MIN_ROWS_REQUIRED:
-            raise RuntimeError("Feature collapse — dataset too small.")
-
-        float_cols = df.select_dtypes("float64").columns
-        df[float_cols] = df[float_cols].astype("float32")
-
         return df
 
     ########################################################
-    # MAIN PIPELINE
+    # MAIN PIPELINE (UNIFIED)
     ########################################################
 
     @classmethod
@@ -236,35 +223,48 @@ class FeatureEngineer:
         ticker=None
     ):
 
-        if not training:
-            raise RuntimeError("Inference pipeline separate.")
-
         df = cls._validate_price_frame(price_df, ticker)
 
         cls.add_returns(df)
         cls.add_volatility(df)
         cls.add_regime_feature(df)
 
-        # 🚫 REMOVED CROSS-SECTIONAL RANK HERE
-
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
         cls.add_ema(df)
 
-        df = cls.create_training_dataset(df)
+        if training:
+            df = cls.add_forward_return(df)
+            df = df.dropna(subset=["forward_return"])
+
+        df = df.dropna(subset=[*MODEL_FEATURES])
+
+        if len(df) < cls.MIN_ROWS_REQUIRED:
+            raise RuntimeError("Feature collapse — dataset too small.")
+
+        float_cols = df.select_dtypes("float64").columns
+        df[float_cols] = df[float_cols].astype("float32")
 
         validated = validate_feature_schema(
             df.loc[:, MODEL_FEATURES]
         )
 
+        base_cols = ["date", "close", "ticker"]
+        if training:
+            base_cols.append("forward_return")
+
         final = pd.concat(
             [
-                df[["date", "close", "forward_return", "ticker"]].reset_index(drop=True),
+                df[base_cols].reset_index(drop=True),
                 validated.reset_index(drop=True)
             ],
             axis=1
         )
 
-        logger.info("Feature pipeline built | rows=%s", len(final))
+        logger.info(
+            "Feature pipeline built | rows=%s | training=%s",
+            len(final),
+            training
+        )
 
         return final.reset_index(drop=True)
