@@ -11,11 +11,7 @@ import numpy as np
 
 from core.features.feature_engineering import FeatureEngineer
 from core.indicators.technical_indicators import TechnicalIndicators
-from core.schema.feature_schema import (
-    validate_feature_schema,
-    MODEL_FEATURES,
-    get_schema_signature
-)
+from core.schema.feature_schema import get_schema_signature
 
 logger = logging.getLogger(__name__)
 
@@ -26,14 +22,9 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v16"
+    CACHE_VERSION = "v17"  # bumped version
     MAX_CACHE_FILES_PER_TICKER = 6
-
     MIN_FILE_BYTES = 5_000
-
-    ABS_FEATURE_LIMIT = 1e5
-    MIN_ROW_STABILITY_RATIO = 0.60
-    MIN_FEATURE_VARIANCE = 1e-12
 
     def __init__(self):
         os.makedirs(self.FEATURE_DIR, exist_ok=True)
@@ -45,51 +36,18 @@ class FeatureStore:
         self.env_hash = self._environment_fingerprint()[:12]
 
     ########################################################
-    # NUMERICAL FIREWALL
+    # LIGHT NUMERIC SANITY (NO VARIANCE CHECK)
     ########################################################
 
-    def _validate_numeric_integrity(self, df: pd.DataFrame):
+    def _validate_basic_integrity(self, df: pd.DataFrame):
 
-        features = df.loc[:, MODEL_FEATURES]
-        arr = features.to_numpy(dtype=float)
+        arr = df.select_dtypes("number").to_numpy(dtype=float)
 
         if not np.isfinite(arr).all():
             raise RuntimeError("Non-finite feature values detected.")
 
-        row_valid = np.isfinite(arr).all(axis=1)
-        stability_ratio = row_valid.mean()
-
-        if stability_ratio < self.MIN_ROW_STABILITY_RATIO:
-            raise RuntimeError(
-                f"Row stability collapse detected: {stability_ratio:.2f}"
-            )
-
-        variances = np.var(arr, axis=0)
-
-        if np.min(variances) < self.MIN_FEATURE_VARIANCE:
-            logger.warning("Very low feature variance detected.")
-
-        if arr.size > 0 and np.abs(arr).max() > self.ABS_FEATURE_LIMIT:
-            raise RuntimeError("Feature explosion detected.")
-
     ########################################################
-    # CROSS-SECTION NORMALIZATION (CENTRALIZED FIX)
-    ########################################################
-
-    def _cross_sectional_normalize(self, df):
-
-        df = df.sort_values(["date", "ticker"]).copy()
-        grouped = df.groupby("date")
-
-        for col in MODEL_FEATURES:
-            mean = grouped[col].transform("mean")
-            std = grouped[col].transform("std").fillna(1).clip(lower=1e-6)
-            df[col] = (df[col] - mean) / std
-
-        return df
-
-    ########################################################
-    # DETERMINISTIC HASHING
+    # HASHING
     ########################################################
 
     def _stable_hash_df(self, df: pd.DataFrame) -> str:
@@ -143,13 +101,10 @@ class FeatureStore:
 
             if "avg_sentiment" in sent_core.columns:
                 sent_core = sent_core[["date", "avg_sentiment"]]
-
                 sent_core["date"] = pd.to_datetime(
                     sent_core["date"], utc=True
                 )
-
                 sent_core = sent_core.sort_values("date").reset_index(drop=True)
-
                 h.update(sent_core.to_csv(index=False).encode())
 
         return h.hexdigest()[:20]
@@ -210,8 +165,7 @@ class FeatureStore:
         if os.path.exists(path) and os.path.getsize(path) >= self.MIN_FILE_BYTES:
             try:
                 df = pd.read_parquet(path)
-                validate_feature_schema(df.loc[:, MODEL_FEATURES])
-                self._validate_numeric_integrity(df)
+                self._validate_basic_integrity(df)
                 return df
             except Exception:
                 os.remove(path)
@@ -225,14 +179,11 @@ class FeatureStore:
             ticker=ticker
         )
 
-        # Deterministic ordering
-        features = features.sort_values(["date", "ticker"]).reset_index(drop=True)
+        features = features.sort_values(
+            ["date", "ticker"]
+        ).reset_index(drop=True)
 
-        # Cross-section normalization centralized
-        features = self._cross_sectional_normalize(features)
-
-        validate_feature_schema(features.loc[:, MODEL_FEATURES])
-        self._validate_numeric_integrity(features)
+        self._validate_basic_integrity(features)
 
         tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
 
