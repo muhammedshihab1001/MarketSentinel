@@ -1,219 +1,176 @@
 """
-Institutional Model Evaluation Runner
+Institutional XGBoost Evaluation Runner
 
 Guarantees:
-✅ Loads ONLY registry models
-✅ Rebuilds dataset canonically
-✅ Prevents training/inference drift
-✅ Enforces quality gates
-✅ CI-safe failure
+- Uses FeatureStore (canonical pipeline)
+- Uses trained sklearn Pipeline model
+- Rebuilds cross-sectional target
+- Prevents training/inference drift
+- CI-safe
 """
 
 import datetime
-import numpy as np
-import tensorflow as tf
+import os
 import joblib
+import numpy as np
+import pandas as pd
 
-from core.data.data_fetcher import StockPriceFetcher
-from core.data.news_fetcher import NewsFetcher
-from core.sentiment.sentiment import SentimentAnalyzer
-from core.features.feature_engineering import FeatureEngineer
+from sklearn.metrics import accuracy_score, roc_auc_score
 
-from training.evaluate import (
-    evaluate_xgboost,
-    evaluate_lstm,
-    evaluate_prophet
-)
+from core.config.env_loader import init_env
+from core.data.market_data_service import MarketDataService
+from core.features.feature_store import FeatureStore
+from core.schema.feature_schema import MODEL_FEATURES
+from core.market.universe import MarketUniverse
+from core.time.market_time import MarketTime
 
-from sklearn.metrics import accuracy_score
-from sklearn.preprocessing import MinMaxScaler
-
-
-# ---------------------------------------------------
-# CONFIG — QUALITY GATES
-# ---------------------------------------------------
 
 XGB_MIN_ACCURACY = 0.55
 XGB_MIN_AUC = 0.60
 
-LSTM_MAX_RMSE = 5.0
-PROPHET_MAX_MAE = 5.0
+
+############################################################
+# CROSS-SECTION TARGET (MATCH TRAINING)
+############################################################
+
+def apply_cross_sectional_target(df):
+
+    df = df.sort_values(["date", "ticker"]).copy()
+
+    df["alpha"] = df["forward_return"]
+
+    safe_vol = df["volatility"].clip(lower=1e-4)
+    df["risk_adj"] = (df["alpha"] / safe_vol).clip(-5, 5)
+
+    labeled = []
+
+    for date, group in df.groupby("date"):
+
+        if len(group) < 6:
+            continue
+
+        dispersion = group["risk_adj"].std()
+
+        if not np.isfinite(dispersion) or dispersion < 0.10:
+            continue
+
+        upper = group["risk_adj"].quantile(0.80)
+        lower = group["risk_adj"].quantile(0.20)
+
+        group = group.copy()
+
+        group["target"] = np.where(
+            group["risk_adj"] >= upper, 1,
+            np.where(group["risk_adj"] <= lower, 0, np.nan)
+        )
+
+        labeled.append(group)
+
+    if not labeled:
+        raise RuntimeError("No valid labels generated.")
+
+    df = pd.concat(labeled, ignore_index=True)
+    df = df.dropna(subset=["target"])
+    df["target"] = df["target"].astype("int8")
+
+    return df.reset_index(drop=True)
 
 
-# ---------------------------------------------------
-# LOAD DATASET (CANONICAL)
-# ---------------------------------------------------
+############################################################
+# BUILD DATASET
+############################################################
 
 def build_dataset():
 
-    fetcher = StockPriceFetcher()
-    news_fetcher = NewsFetcher()
-    sentiment = SentimentAnalyzer()
+    market_data = MarketDataService()
+    store = FeatureStore()
+    universe = MarketUniverse.get_universe()
 
-    end_date = datetime.date.today().isoformat()
+    start_date, end_date = MarketTime.window_for("xgboost")
 
-    price_df = fetcher.fetch(
-        ticker="AAPL",
-        start_date="2018-01-01",
-        end_date=end_date
-    )
+    datasets = []
 
-    news_df = news_fetcher.fetch("Apple stock", max_items=200)
+    for ticker in universe:
 
-    scored = sentiment.analyze_dataframe(news_df)
-    sentiment_df = sentiment.aggregate_daily_sentiment(scored)
+        try:
+            price_df = market_data.get_price_data(
+                ticker=ticker,
+                start_date=start_date,
+                end_date=end_date
+            )
 
-    dataset = FeatureEngineer.build_feature_pipeline(
-        price_df,
-        sentiment_df
-    )
+            dataset = store.get_features(
+                price_df,
+                sentiment_df=None,
+                ticker=ticker,
+                training=True
+            )
 
-    return dataset, price_df
+            datasets.append(dataset)
 
+        except Exception:
+            continue
 
-# ---------------------------------------------------
-# LOAD REGISTRY ARTIFACT
-# ---------------------------------------------------
+    if not datasets:
+        raise RuntimeError("No valid datasets built.")
 
-def latest_path(model_dir, filename):
-    import os
+    df = pd.concat(datasets, ignore_index=True)
 
-    latest = os.path.join(model_dir, "latest")
+    df = apply_cross_sectional_target(df)
 
-    if not os.path.exists(latest):
-        raise RuntimeError(f"No latest model in {model_dir}")
-
-    version_dir = os.path.realpath(latest)
-
-    return os.path.join(version_dir, filename)
+    return df
 
 
-# ---------------------------------------------------
-# XGBOOST
-# ---------------------------------------------------
+############################################################
+# EVALUATION
+############################################################
 
-def evaluate_xgb(dataset):
+def evaluate_xgb():
 
-    model_path = latest_path(
-        "artifacts/xgboost",
-        "model.pkl"
-    )
+    model_path = os.path.join("artifacts", "xgboost", "model.pkl")
+
+    if not os.path.exists(model_path):
+        raise RuntimeError("Trained XGBoost model not found.")
 
     model = joblib.load(model_path)
 
-    X = dataset[model.feature_names_in_]
-    y = dataset["target"]
+    df = build_dataset()
+
+    X = df.loc[:, MODEL_FEATURES]
+    y = df["target"]
 
     probs = model.predict_proba(X)[:, 1]
     preds = (probs > 0.5).astype(int)
 
-    metrics = evaluate_xgboost(y, preds, probs)
+    accuracy = float(accuracy_score(y, preds))
+    auc = float(roc_auc_score(y, probs))
 
-    assert metrics["accuracy"] >= XGB_MIN_ACCURACY, \
-        f"XGB accuracy below gate: {metrics}"
+    metrics = {
+        "accuracy": accuracy,
+        "roc_auc": auc
+    }
 
-    assert metrics["roc_auc"] >= XGB_MIN_AUC, \
-        f"XGB AUC below gate: {metrics}"
+    if accuracy < XGB_MIN_ACCURACY:
+        raise RuntimeError(f"Accuracy below gate: {metrics}")
 
-    return metrics
-
-
-# ---------------------------------------------------
-# LSTM
-# ---------------------------------------------------
-
-def evaluate_lstm_model(price_df):
-
-    model_path = latest_path(
-        "artifacts/lstm",
-        "model.keras"
-    )
-
-    scaler_path = latest_path(
-        "artifacts/lstm",
-        "scaler.pkl"
-    )
-
-    model = tf.keras.models.load_model(
-        model_path,
-        compile=False
-    )
-
-    scaler = joblib.load(scaler_path)
-
-    prices = price_df[["close"]].values
-    scaled = scaler.transform(prices)
-
-    LOOKBACK = 60
-
-    X, y = [], []
-
-    for i in range(len(scaled) - LOOKBACK):
-        X.append(scaled[i:i+LOOKBACK])
-        y.append(scaled[i+LOOKBACK])
-
-    X = np.array(X)
-    y = np.array(y)
-
-    preds = model.predict(X, verbose=0)
-
-    y_inv = scaler.inverse_transform(y)
-    preds_inv = scaler.inverse_transform(preds)
-
-    metrics = evaluate_lstm(y_inv, preds_inv)
-
-    assert metrics["rmse"] <= LSTM_MAX_RMSE, \
-        f"LSTM RMSE too high: {metrics}"
+    if auc < XGB_MIN_AUC:
+        raise RuntimeError(f"AUC below gate: {metrics}")
 
     return metrics
 
 
-# ---------------------------------------------------
-# PROPHET
-# ---------------------------------------------------
-
-def evaluate_prophet_model(price_df):
-
-    model_path = latest_path(
-        "artifacts/prophet",
-        "prophet_trend.pkl"
-    )
-
-    model = joblib.load(model_path)
-
-    future = model.make_future_dataframe(periods=30)
-    forecast = model.predict(future)
-
-    actual = price_df["close"].tail(30).values
-    predicted = forecast["yhat"].tail(30).values
-
-    metrics = evaluate_prophet(actual, predicted)
-
-    assert metrics["mae"] <= PROPHET_MAX_MAE, \
-        f"Prophet MAE too high: {metrics}"
-
-    return metrics
-
-
-# ---------------------------------------------------
-# MASTER
-# ---------------------------------------------------
+############################################################
+# MAIN
+############################################################
 
 def main():
 
-    print("\n🔎 Running institutional model evaluation...\n")
+    init_env()
 
-    dataset, price_df = build_dataset()
+    metrics = evaluate_xgb()
 
-    xgb_metrics = evaluate_xgb(dataset)
-    lstm_metrics = evaluate_lstm_model(price_df)
-    prophet_metrics = evaluate_prophet_model(price_df)
-
-    print("\n✅ ALL QUALITY GATES PASSED\n")
-
-    print("XGBoost:", xgb_metrics)
-    print("LSTM:", lstm_metrics)
-    print("Prophet:", prophet_metrics)
+    print("Evaluation passed.")
+    print(metrics)
 
 
 if __name__ == "__main__":
