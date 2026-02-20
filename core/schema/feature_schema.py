@@ -1,4 +1,4 @@
-from typing import Tuple, Dict
+from typing import Tuple
 import pandas as pd
 import hashlib
 import numpy as np
@@ -12,11 +12,11 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 ############################################################
 
-SCHEMA_VERSION = "28.0"  # dynamic optional sentiment handling
+SCHEMA_VERSION = "29.0"  # sentiment removed / cross-sectional model
 
 
 ############################################################
-# CORE FEATURES (MANDATORY – PRICE BASED)
+# CORE FEATURES (PRICE + TECHNICAL + CROSS-SECTIONAL)
 ############################################################
 
 CORE_FEATURES: Tuple[str, ...] = (
@@ -47,22 +47,23 @@ CORE_FEATURES: Tuple[str, ...] = (
 
     # regime
     "regime_feature",
+
+    # cross-sectional z
+    "momentum_20_z",
+    "return_lag5_z",
+    "rsi_z",
+    "volatility_z",
+    "ema_ratio_z",
+
+    # cross-sectional rank
+    "momentum_20_rank",
+    "return_lag5_rank",
+    "rsi_rank",
+    "volatility_rank",
+    "ema_ratio_rank",
 )
 
-############################################################
-# OPTIONAL FEATURES (AUTO-DROP IF CONSTANT)
-############################################################
-
-OPTIONAL_FEATURES: Tuple[str, ...] = (
-
-    "avg_sentiment",
-    "sentiment_std",
-    "news_count",
-    "sentiment_ema_3",
-    "sentiment_momentum",
-)
-
-MODEL_FEATURES: Tuple[str, ...] = CORE_FEATURES + OPTIONAL_FEATURES
+MODEL_FEATURES: Tuple[str, ...] = CORE_FEATURES
 
 FEATURE_COUNT = len(MODEL_FEATURES)
 
@@ -114,44 +115,15 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     _check_forbidden_columns(df)
 
-    # Ensure all CORE features exist
     missing_core = set(CORE_FEATURES) - set(df.columns)
     if missing_core:
         raise RuntimeError(f"Missing core features: {missing_core}")
 
-    # Work only on declared model features
-    available_features = [
-        col for col in MODEL_FEATURES if col in df.columns
-    ]
-
-    feature_df = df.loc[:, available_features].astype(DTYPE, copy=True)
+    feature_df = df.loc[:, CORE_FEATURES].astype(DTYPE, copy=True)
     feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
     ########################################################
-    # Drop constant OPTIONAL features automatically
-    ########################################################
-
-    drop_optional = []
-
-    for col in OPTIONAL_FEATURES:
-        if col not in feature_df.columns:
-            continue
-
-        series = feature_df[col]
-        finite_vals = series[np.isfinite(series)]
-
-        if finite_vals.nunique() <= 1:
-            logger.warning(
-                "Dropping constant optional feature: %s",
-                col
-            )
-            drop_optional.append(col)
-
-    if drop_optional:
-        feature_df.drop(columns=drop_optional, inplace=True)
-
-    ########################################################
-    # Strict validation on CORE features
+    # Strict validation
     ########################################################
 
     for col in CORE_FEATURES:
@@ -163,7 +135,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
             raise RuntimeError(f"No finite values in feature: {col}")
 
         if finite_vals.nunique() <= 1:
-            raise RuntimeError(f"Constant CORE feature detected: {col}")
+            raise RuntimeError(f"Constant feature detected: {col}")
 
         var = finite_vals.var(ddof=0)
 
@@ -198,7 +170,6 @@ def get_schema_signature() -> str:
 
     contract = {
         "core": list(CORE_FEATURES),
-        "optional": list(OPTIONAL_FEATURES),
         "version": SCHEMA_VERSION,
     }
 
