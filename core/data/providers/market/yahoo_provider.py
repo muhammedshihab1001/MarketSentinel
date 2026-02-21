@@ -20,14 +20,17 @@ class YahooProvider(MarketDataProvider):
         "1m", "5m", "15m"
     }
 
+    ########################################################
+
     def __init__(self):
         self.fetcher = StockPriceFetcher()
 
     ########################################################
-    # SAFE DATETIME
+    # SAFE DATETIME NORMALIZATION
     ########################################################
 
-    def _normalize_datetime(self, series):
+    @staticmethod
+    def _normalize_datetime(series):
 
         dt = pd.to_datetime(series, errors="coerce")
 
@@ -42,8 +45,11 @@ class YahooProvider(MarketDataProvider):
         return dt
 
     ########################################################
+    # FETCH OUTPUT VALIDATION
+    ########################################################
 
-    def _validate_fetch_output(self, df):
+    @staticmethod
+    def _validate_fetch_output(df):
 
         if df is None:
             raise RuntimeError("Yahoo fetcher returned None.")
@@ -55,17 +61,22 @@ class YahooProvider(MarketDataProvider):
             raise RuntimeError("Yahoo returned empty dataset.")
 
     ########################################################
-    # 🔥 NORMALIZER WITH CONFIGURABLE MIN_HISTORY
+    # CORE NORMALIZER
     ########################################################
 
-    def _normalize(self, df, ticker, start_date, end_date, min_rows):
+    def _normalize(
+        self,
+        df,
+        ticker,
+        min_rows
+    ):
 
         self._validate_fetch_output(df)
 
         df = df.copy()
 
         ####################################################
-        # HANDLE INDEX
+        # HANDLE INDEX → date column
         ####################################################
 
         if "date" not in df.columns:
@@ -85,6 +96,10 @@ class YahooProvider(MarketDataProvider):
             else:
                 raise RuntimeError("Yahoo index is not datetime.")
 
+        ####################################################
+        # COLUMN STANDARDIZATION
+        ####################################################
+
         df.columns = [c.lower().strip() for c in df.columns]
 
         if "adj close" in df.columns:
@@ -96,7 +111,6 @@ class YahooProvider(MarketDataProvider):
         }
 
         missing = required - set(df.columns)
-
         if missing:
             raise RuntimeError(f"Yahoo schema violation: {missing}")
 
@@ -110,19 +124,20 @@ class YahooProvider(MarketDataProvider):
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
         df.dropna(subset=["open", "high", "low", "close"], inplace=True)
 
         if df.empty:
             raise RuntimeError("Normalization produced empty dataset.")
 
         ####################################################
-        # TIMEZONE
+        # DATE NORMALIZATION
         ####################################################
 
         df["date"] = self._normalize_datetime(df["date"])
 
         ####################################################
-        # SORT + DEDUPE
+        # SORT + DEDUPE + ROW CAP
         ####################################################
 
         df = (
@@ -134,7 +149,7 @@ class YahooProvider(MarketDataProvider):
         )
 
         ####################################################
-        # 🔥 PRICE REPAIR
+        # PRICE SAFETY FILTER
         ####################################################
 
         df = df[
@@ -147,17 +162,19 @@ class YahooProvider(MarketDataProvider):
         if df.empty:
             raise RuntimeError("All rows invalid after price filter.")
 
+        # Repair high/low invariants
         df["high"] = df[["high", "open", "close"]].max(axis=1)
         df["low"] = df[["low", "open", "close"]].min(axis=1)
 
         ####################################################
-        # VOLUME REPAIR
+        # VOLUME SAFETY
         ####################################################
 
-        df["volume"] = df["volume"].clip(lower=0).fillna(0)
+        df["volume"] = df["volume"].clip(lower=0)
+        df["volume"] = df["volume"].fillna(0)
 
         ####################################################
-        # 🔥 CONFIGURABLE MIN HISTORY
+        # CONFIGURABLE MIN HISTORY
         ####################################################
 
         if len(df) < min_rows:
@@ -165,6 +182,10 @@ class YahooProvider(MarketDataProvider):
                 f"Insufficient history for {ticker} "
                 f"({len(df)} < {min_rows})"
             )
+
+        ####################################################
+        # FINALIZE
+        ####################################################
 
         df["ticker"] = ticker
 
@@ -177,8 +198,17 @@ class YahooProvider(MarketDataProvider):
         return df
 
     ########################################################
+    # PUBLIC FETCH
+    ########################################################
 
-    def fetch(self, ticker, start_date, end_date, interval, min_rows=None):
+    def fetch(
+        self,
+        ticker,
+        start_date,
+        end_date,
+        interval,
+        min_rows=None
+    ):
 
         if interval not in self.ALLOWED_INTERVALS:
             raise ValueError(f"Unsupported interval: {interval}")
@@ -194,10 +224,8 @@ class YahooProvider(MarketDataProvider):
         )
 
         df = self._normalize(
-            df,
-            ticker,
-            start_date,
-            end_date,
+            df=df,
+            ticker=ticker,
             min_rows=min_rows
         )
 
