@@ -117,7 +117,7 @@ class TechnicalIndicators:
         return ma.astype("float32")
 
     ####################################################
-    # RSI — WILDER SMOOTHING (FIXED)
+    # RSI — WILDER SMOOTHING (FIXED + SAFE)
     ####################################################
 
     @classmethod
@@ -126,7 +126,8 @@ class TechnicalIndicators:
         cls._validate_window(window)
         df = cls._normalize_columns(df)
 
-        close = df["close"]
+        # Compute in float64 for stability
+        close = df["close"].astype("float64")
 
         delta = close.diff()
 
@@ -145,31 +146,29 @@ class TechnicalIndicators:
             min_periods=window
         ).mean()
 
-        rsi = pd.Series(index=close.index, dtype="float32")
+        # Use float64 during assignment to avoid pandas dtype warning
+        rsi = pd.Series(np.nan, index=close.index, dtype="float64")
 
-        # Normal case
         mask_normal = (avg_gain > 0) & (avg_loss > 0)
         rs = avg_gain[mask_normal] / avg_loss[mask_normal]
         rsi.loc[mask_normal] = 100 - (100 / (1 + rs))
 
-        # Gain only
         mask_gain_only = (avg_gain > 0) & (avg_loss == 0)
         rsi.loc[mask_gain_only] = 100.0
 
-        # Loss only
         mask_loss_only = (avg_gain == 0) & (avg_loss > 0)
         rsi.loc[mask_loss_only] = 0.0
 
-        # Flat market
         mask_flat = (avg_gain == 0) & (avg_loss == 0)
         rsi.loc[mask_flat] = 50.0
 
-        rsi.fillna(50.0, inplace=True)
+        rsi = rsi.fillna(50.0).clip(0, 100)
 
-        return rsi.clip(0, 100).astype("float32")
+        # Downcast once at the end
+        return rsi.astype("float32")
 
     ####################################################
-    # BOLLINGER
+    # BOLLINGER BANDS
     ####################################################
 
     @classmethod
