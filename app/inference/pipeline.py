@@ -4,22 +4,16 @@ import numpy as np
 import pandas as pd
 import logging
 import os
-import hashlib
 
 from core.data.market_data_service import MarketDataService
-from core.data.news_fetcher import NewsFetcher
-from core.sentiment.sentiment import SentimentAnalyzer
 from core.features.feature_store import FeatureStore
-from core.signals.signal_engine import DecisionEngine
 from core.monitoring.drift_detector import DriftDetector
 from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
     get_schema_signature
 )
-
 from core.market.universe import MarketUniverse
-from core.portfolio.distribution_forecaster import DistributionForecaster
 
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
@@ -27,11 +21,7 @@ from app.inference.cache import RedisCache
 from app.monitoring.metrics import (
     MODEL_INFERENCE_COUNT,
     MODEL_INFERENCE_LATENCY,
-    SIGNAL_DISTRIBUTION,
-    CONFIDENCE_SCORE,
-    MISSING_FEATURE_RATIO,
     PIPELINE_FAILURES,
-    PREDICTION_CLASS_PROBABILITY,
     CACHE_HITS,
     CACHE_MISSES,
     INFERENCE_IN_PROGRESS
@@ -54,9 +44,7 @@ class CircuitBreaker:
         self._lock = threading.Lock()
 
     def allow(self):
-
         with self._lock:
-
             if self.failures < self.threshold:
                 return True
 
@@ -69,54 +57,38 @@ class CircuitBreaker:
             return False
 
     def record_failure(self):
-
         with self._lock:
             self.failures += 1
             self.last_failure = time.time()
 
     def record_success(self):
-
         with self._lock:
             self.failures = 0
 
 
 ############################################################
-# INFERENCE PIPELINE
+# PORTFOLIO INFERENCE PIPELINE
 ############################################################
 
 class InferencePipeline:
+
+    TARGET_GROSS_EXPOSURE = 1.0
+    MAX_NET_EXPOSURE = 0.2
+    TOP_K = 3
+    BOTTOM_K = 3
 
     LATENCY_GUARD_SECONDS = float(
         os.getenv("HARD_LATENCY_LIMIT_SECONDS", "5.0")
     )
 
-    CACHE_TTL = int(
-        os.getenv("INFERENCE_CACHE_TTL_SECONDS", "900")
-    )
-
-    MAX_NULL_RATIO = float(
-        os.getenv("MAX_FEATURE_NULL_RATIO", "0.02")
-    )
-
-    LOCK_TIMEOUT = 5
-
-    ############################################################
-
     def __init__(self):
 
         self.market_data = MarketDataService()
-        self.news_fetcher = NewsFetcher()
-        self.sentiment = SentimentAnalyzer()
-        self.models = ModelLoader()
-
-        self.decision_engine = DecisionEngine()
         self.feature_store = FeatureStore()
-
+        self.models = ModelLoader()
         self.cache = RedisCache()
         self.drift_detector = DriftDetector()
         self.breaker = CircuitBreaker()
-
-        self.distribution = DistributionForecaster()
 
         self.schema_sig = get_schema_signature()
 
@@ -125,83 +97,80 @@ class InferencePipeline:
     ############################################################
 
     def _validate_models_loaded(self):
-
         model = self.models.xgb
-
         if not hasattr(model, "predict_proba"):
             raise RuntimeError("Loaded model is not a classifier.")
 
     ############################################################
 
-    def _assert_data_freshness(self, price_df):
+    def _build_cross_sectional_features(self, df):
 
-        latest_date = pd.to_datetime(price_df["date"].max(), utc=True)
-        now = pd.Timestamp.utcnow()
+        cross_cols = [
+            "momentum_20",
+            "return_lag5",
+            "rsi",
+            "volatility",
+            "ema_ratio"
+        ]
 
-        age_hours = (now - latest_date).total_seconds() / 3600
+        for col in cross_cols:
+            df[f"{col}_z"] = (
+                df.groupby("date")[col]
+                .transform(lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9))
+            ).clip(-5, 5)
 
-        if age_hours > 36:
-            raise RuntimeError(
-                f"Market data stale: {age_hours:.1f}h old."
+            df[f"{col}_rank"] = (
+                df.groupby("date")[col]
+                .transform(lambda x: x.rank(pct=True))
             )
 
-    ############################################################
-
-    def _extract_features(self, latest_row):
-
-        df = pd.DataFrame(
-            [latest_row.loc[list(MODEL_FEATURES)].values],
-            columns=MODEL_FEATURES
-        )
-
-        df = validate_feature_schema(df)
-
-        null_ratio = float(df.isna().mean().mean())
-        MISSING_FEATURE_RATIO.set(null_ratio)
-
-        if null_ratio > self.MAX_NULL_RATIO:
-            raise RuntimeError("Feature null ratio exceeded.")
-
-        df = df.astype("float32")
-
-        arr = df.to_numpy()
-
-        if not np.isfinite(arr).all():
-            raise RuntimeError("Non-finite feature vector detected.")
-
-        return arr
+        return df
 
     ############################################################
 
-    def _safe_probability(self, prob):
+    def _construct_portfolio(self, latest_df):
 
-        if not np.isfinite(prob):
-            raise RuntimeError("Model produced invalid probability.")
+        ranked = latest_df.sort_values("score")
 
-        return float(np.clip(prob, 0.001, 0.999))
+        longs = ranked.tail(self.TOP_K)
+        shorts = ranked.head(self.BOTTOM_K)
+
+        long_vol = longs["volatility"].replace(0, 1e-6)
+        short_vol = shorts["volatility"].replace(0, 1e-6)
+
+        long_weights = 1.0 / long_vol
+        short_weights = 1.0 / short_vol
+
+        long_weights /= long_weights.sum()
+        short_weights /= short_weights.sum()
+
+        long_weights *= self.TARGET_GROSS_EXPOSURE / 2
+        short_weights *= self.TARGET_GROSS_EXPOSURE / 2
+
+        weights = {}
+
+        for t, w in zip(longs["ticker"], long_weights):
+            weights[t] = float(w)
+
+        for t, w in zip(shorts["ticker"], short_weights):
+            weights[t] = -float(w)
+
+        net_exposure = sum(weights.values())
+
+        if abs(net_exposure) > self.MAX_NET_EXPOSURE:
+            scale = self.MAX_NET_EXPOSURE / abs(net_exposure)
+            for k in weights:
+                weights[k] *= scale
+
+        return weights
 
     ############################################################
-
-    def _dataset_hash(self, latest_row):
-
-        canonical = (
-            latest_row[list(MODEL_FEATURES)]
-            .astype(float)
-            .round(10)
-            .to_json()
-        )
-
-        return hashlib.sha256(
-            canonical.encode()
-        ).hexdigest()[:12]
-
-    ############################################################
-    # MAIN RUN
+    # MAIN ENTRY
     ############################################################
 
-    def run(self, ticker="AAPL"):
+    def run_batch(self, tickers: list[str]):
 
-        MarketUniverse.validate_subset([ticker])
+        MarketUniverse.validate_subset(tickers)
 
         if not self.breaker.allow():
             PIPELINE_FAILURES.labels(stage="circuit_open").inc()
@@ -211,94 +180,39 @@ class InferencePipeline:
 
         try:
 
-            ####################################################
-            # LOAD DATA
-            ####################################################
+            datasets = []
 
-            price_df = self.market_data.get_price_data(
-                ticker=ticker,
-                start_date="2018-01-01",
-                end_date=pd.Timestamp.utcnow().date().isoformat()
-            )
+            for ticker in tickers:
 
-            if price_df is None or price_df.empty:
-                raise RuntimeError("Market data unavailable.")
-
-            self._assert_data_freshness(price_df)
-
-            ####################################################
-            # FEATURE GENERATION
-            ####################################################
-
-            sentiment_df = None
-
-            try:
-                news = self.news_fetcher.fetch(f"{ticker} stock")
-                scored = self.sentiment.analyze_dataframe(news)
-                sentiment_df = self.sentiment.aggregate_daily_sentiment(scored)
-            except Exception:
-                logger.warning("Sentiment fallback used.")
-
-            dataset = self.feature_store.get_features(
-                price_df,
-                sentiment_df,
-                ticker=ticker,
-                training=False
-            )
-
-            if dataset.empty:
-                raise RuntimeError("Feature pipeline returned empty dataset.")
-
-            latest = dataset.iloc[-1]
-            features = self._extract_features(latest)
-
-            ####################################################
-            # CACHE
-            ####################################################
-
-            model_version = self.models.xgb_version if hasattr(self.models, "xgb_version") else "latest"
-            dataset_hash = self._dataset_hash(latest)
-
-            cache_key = self.cache.build_key({
-                "ticker": ticker,
-                "model_version": model_version,
-                "dataset": dataset_hash,
-                "schema": self.schema_sig
-            })
-
-            cached = self.cache.get(cache_key)
-
-            if cached:
-                CACHE_HITS.inc()
-                return cached
-
-            CACHE_MISSES.inc()
-
-            ####################################################
-            # DRIFT CHECK
-            ####################################################
-
-            try:
-                drift = self.drift_detector.detect(
-                    dataset[MODEL_FEATURES]
+                price_df = self.market_data.get_price_data(
+                    ticker=ticker,
+                    start_date="2018-01-01",
+                    end_date=pd.Timestamp.utcnow().date().isoformat()
                 )
 
-                if drift.get("drift_detected"):
-                    logger.warning(
-                        "Drift detected | score=%.4f",
-                        drift.get("drift_score", -1)
-                    )
-            except Exception:
-                logger.exception("Drift detector failure.")
+                dataset = self.feature_store.get_features(
+                    price_df,
+                    sentiment_df=None,
+                    ticker=ticker,
+                    training=False
+                )
 
-            ####################################################
-            # MODEL INFERENCE
-            ####################################################
+                datasets.append(dataset)
+
+            df = pd.concat(datasets, ignore_index=True)
+
+            df = self._build_cross_sectional_features(df)
+
+            latest_date = df["date"].max()
+            latest_df = df[df["date"] == latest_date].copy()
+
+            feature_df = validate_feature_schema(
+                latest_df.loc[:, MODEL_FEATURES]
+            )
 
             t0 = time.time()
 
-            preds = self.models.xgb.predict_proba(features)
-            prob_up = self._safe_probability(preds[0][1])
+            probs = self.models.xgb.predict_proba(feature_df)[:, 1]
 
             latency = time.time() - t0
 
@@ -307,51 +221,28 @@ class InferencePipeline:
 
             MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
             MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
-            PREDICTION_CLASS_PROBABILITY.set(prob_up)
 
-            ####################################################
-            # DECISION ENGINE (MATCH UPDATED SIGNATURE)
-            ####################################################
+            latest_df["score"] = probs
 
-            volatility = float(latest.get("volatility", 0.02))
-
-            decision = self.decision_engine.generate(
-                ticker=ticker,
-                predicted_return=0.0,
-                prob_up=prob_up,
-                volatility=volatility,
-                regime=None
-            )
-
-            SIGNAL_DISTRIBUTION.labels(
-                signal=decision["signal"]
-            ).inc()
-
-            CONFIDENCE_SCORE.set(float(decision["confidence"]))
+            weights = self._construct_portfolio(latest_df)
 
             response = {
-                "ticker": ticker,
-                "signal_today": decision["signal"],
-                "confidence": decision["confidence"],
-                "probability_up": prob_up,
-                "edge": decision.get("edge"),
-                "expected_value": decision.get("expected_value"),
-                "regime": decision.get("regime"),
-                "model_version": model_version
+                "date": str(latest_date),
+                "portfolio_weights": weights,
+                "gross_exposure": float(sum(abs(w) for w in weights.values())),
+                "net_exposure": float(sum(weights.values())),
+                "num_longs": int(sum(1 for w in weights.values() if w > 0)),
+                "num_shorts": int(sum(1 for w in weights.values() if w < 0))
             }
-
-            self.cache.set(cache_key, response, ttl=self.CACHE_TTL)
 
             self.breaker.record_success()
 
             return response
 
         except Exception as e:
-
             self.breaker.record_failure()
             PIPELINE_FAILURES.labels(stage="inference").inc()
-
-            logger.exception("Inference failure: %s", str(e))
+            logger.exception("Batch inference failure: %s", str(e))
             raise
 
         finally:
