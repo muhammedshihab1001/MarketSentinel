@@ -1,0 +1,208 @@
+"""
+MarketSentinel Evaluation Runner
+
+Used by CI pipeline.
+
+Guarantees:
+- Loads latest XGBoost artifact
+- Validates schema signature
+- Rebuilds evaluation dataset
+- Enforces production thresholds
+"""
+
+import os
+import glob
+import json
+import joblib
+import numpy as np
+import pandas as pd
+
+from core.config.env_loader import init_env
+from core.data.market_data_service import MarketDataService
+from core.features.feature_store import FeatureStore
+from core.schema.feature_schema import (
+    MODEL_FEATURES,
+    validate_feature_schema,
+    get_schema_signature,
+)
+from core.market.universe import MarketUniverse
+from core.time.market_time import MarketTime
+
+from training.evaluate import evaluate_xgboost
+
+
+# ---------------------------------------------------------
+# THRESHOLDS (CI Gate)
+# ---------------------------------------------------------
+
+MIN_ACCURACY = 0.50
+MIN_ROC_AUC = 0.51
+
+FORWARD_DAYS = 5
+
+
+# ---------------------------------------------------------
+# LOAD LATEST MODEL
+# ---------------------------------------------------------
+
+def load_latest_model():
+
+    base_dir = os.path.join("artifacts", "xgboost")
+
+    model_files = glob.glob(os.path.join(base_dir, "model_*.pkl"))
+
+    if not model_files:
+        raise RuntimeError("No trained model artifacts found.")
+
+    latest = max(model_files, key=os.path.getmtime)
+
+    timestamp = os.path.basename(latest).split("_")[1].split(".")[0]
+
+    metadata_path = os.path.join(
+        base_dir,
+        f"metadata_{timestamp}.json"
+    )
+
+    if not os.path.exists(metadata_path):
+        raise RuntimeError("Metadata file missing.")
+
+    with open(metadata_path, encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    if metadata.get("schema_signature") != get_schema_signature():
+        raise RuntimeError("Schema signature mismatch during evaluation.")
+
+    model = joblib.load(latest)
+
+    if not hasattr(model, "predict_proba"):
+        raise RuntimeError("Loaded artifact is not a classifier.")
+
+    print(f"Loaded model version: {timestamp}")
+
+    return model
+
+
+# ---------------------------------------------------------
+# CROSS-SECTIONAL TARGET (MUST MATCH TRAINING)
+# ---------------------------------------------------------
+
+def apply_cross_sectional_target(df):
+
+    df = df.sort_values(["ticker", "date"]).copy()
+
+    df["forward_log_return"] = (
+        df.groupby("ticker")["close"]
+        .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
+    )
+
+    df = df.dropna(subset=["forward_log_return"])
+
+    df["alpha_rank_pct"] = (
+        df.groupby("date")["forward_log_return"]
+        .rank(pct=True)
+    )
+
+    df["target"] = np.nan
+    df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
+    df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
+
+    df = df.dropna(subset=["target"])
+    df["target"] = df["target"].astype("int8")
+
+    return df.reset_index(drop=True)
+
+
+# ---------------------------------------------------------
+# BUILD EVALUATION DATASET
+# ---------------------------------------------------------
+
+def build_dataset():
+
+    market_data = MarketDataService()
+    store = FeatureStore()
+    universe = MarketUniverse.get_universe()
+
+    start_date, end_date = MarketTime.window_for("xgboost")
+
+    datasets = []
+
+    for ticker in universe:
+
+        try:
+            price_df = market_data.get_price_data(
+                ticker=ticker,
+                start_date=start_date,
+                end_date=end_date
+            )
+
+            dataset = store.get_features(
+                price_df,
+                sentiment_df=None,
+                ticker=ticker,
+                training=False
+            )
+
+            if dataset is not None and not dataset.empty:
+                datasets.append(dataset)
+
+        except Exception:
+            continue
+
+    if not datasets:
+        raise RuntimeError("No evaluation datasets built.")
+
+    df = pd.concat(datasets, ignore_index=True)
+
+    df = apply_cross_sectional_target(df)
+
+    feature_df = validate_feature_schema(
+        df.loc[:, MODEL_FEATURES]
+    )
+
+    df = df.loc[feature_df.index]
+
+    if df["target"].nunique() < 2:
+        raise RuntimeError("Evaluation labels collapsed.")
+
+    return df.reset_index(drop=True)
+
+
+# ---------------------------------------------------------
+# MAIN EVALUATION
+# ---------------------------------------------------------
+
+def main():
+
+    init_env()
+
+    model = load_latest_model()
+
+    df = build_dataset()
+
+    X = df.loc[:, MODEL_FEATURES]
+    y = df["target"]
+
+    probs = model.predict_proba(X)[:, 1]
+    preds = (probs > 0.5).astype(int)
+
+    metrics = evaluate_xgboost(
+        y_true=y,
+        y_pred=preds,
+        y_prob=probs,
+        enforce_thresholds=False
+    )
+
+    print("Evaluation metrics:", metrics)
+
+    if metrics["accuracy"] < MIN_ACCURACY:
+        raise RuntimeError("Accuracy below CI gate.")
+
+    if metrics["roc_auc"] is not None and metrics["roc_auc"] < MIN_ROC_AUC:
+        raise RuntimeError("ROC AUC below CI gate.")
+
+    print("Evaluation passed.")
+    return metrics
+
+
+if __name__ == "__main__":
+    main()
