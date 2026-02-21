@@ -12,21 +12,27 @@ from core.schema.feature_schema import (
     MODEL_FEATURES
 )
 
-from models.lstm_model import forecast_lstm
-from models.sarimax_model import SarimaxModel
-
 from app.monitoring.metrics import MODEL_VERSION
-
 
 logger = logging.getLogger("marketsentinel.loader")
 
+
+############################################################
+# MODEL CONTAINER
+############################################################
 
 @dataclass(frozen=True)
 class LoadedModel:
     model: object
     version: str
     schema_signature: str
+    dataset_hash: str
+    training_code_hash: str
 
+
+############################################################
+# SINGLETON LOADER (XGBOOST ONLY)
+############################################################
 
 class ModelLoader:
 
@@ -35,7 +41,7 @@ class ModelLoader:
 
     MIN_ARTIFACT_BYTES = 50_000
 
-    ###################################################
+    ########################################################
 
     def __new__(cls, *args, **kwargs):
 
@@ -46,7 +52,7 @@ class ModelLoader:
 
         return cls._instance
 
-    ###################################################
+    ########################################################
 
     def __init__(self):
 
@@ -54,15 +60,11 @@ class ModelLoader:
             return
 
         self._xgb_container: LoadedModel | None = None
-        self._sarimax_container: LoadedModel | None = None
-        self._lstm = None
-        self._scaler = None
-
         self._initialized = True
 
-    ###################################################
-    # HASH
-    ###################################################
+    ########################################################
+    # SHA256
+    ########################################################
 
     def _sha256(self, path):
 
@@ -74,9 +76,9 @@ class ModelLoader:
 
         return h.hexdigest()
 
-    ###################################################
-    # FIND LATEST TRAINING ARTIFACT
-    ###################################################
+    ########################################################
+    # FIND LATEST MODEL ARTIFACT
+    ########################################################
 
     def _find_latest_artifact(self, base_dir):
 
@@ -99,9 +101,9 @@ class ModelLoader:
 
         return latest, metadata_path, timestamp
 
-    ###################################################
+    ########################################################
     # VALIDATE METADATA
-    ###################################################
+    ########################################################
 
     def _validate_metadata(self, metadata_path):
 
@@ -111,11 +113,17 @@ class ModelLoader:
         if meta.get("schema_signature") != get_schema_signature():
             raise RuntimeError("Schema mismatch during inference.")
 
+        if "dataset_hash" not in meta:
+            raise RuntimeError("Metadata missing dataset_hash.")
+
+        if "training_code_hash" not in meta:
+            raise RuntimeError("Metadata missing training_code_hash.")
+
         return meta
 
-    ###################################################
-    # SAFE LOAD
-    ###################################################
+    ########################################################
+    # SAFE MODEL LOAD
+    ########################################################
 
     def _safe_load_model(self, model_path):
 
@@ -129,9 +137,9 @@ class ModelLoader:
 
         return model
 
-    ###################################################
-    # XGBOOST
-    ###################################################
+    ########################################################
+    # RELOAD XGB IF NEEDED
+    ########################################################
 
     def _reload_xgb_if_needed(self):
 
@@ -143,7 +151,10 @@ class ModelLoader:
         model_path, metadata_path, version = \
             self._find_latest_artifact(base_dir)
 
-        if self._xgb_container and self._xgb_container.version == version:
+        if (
+            self._xgb_container and
+            self._xgb_container.version == version
+        ):
             return self._xgb_container.model
 
         logger.info("Loading XGBoost version=%s", version)
@@ -154,7 +165,9 @@ class ModelLoader:
         self._xgb_container = LoadedModel(
             model=model,
             version=version,
-            schema_signature=meta["schema_signature"]
+            schema_signature=meta["schema_signature"],
+            dataset_hash=meta["dataset_hash"],
+            training_code_hash=meta["training_code_hash"]
         )
 
         MODEL_VERSION.labels(
@@ -164,9 +177,9 @@ class ModelLoader:
 
         return model
 
-    ###################################################
-    # FEATURE VALIDATION AT INFERENCE
-    ###################################################
+    ########################################################
+    # FEATURE VALIDATION
+    ########################################################
 
     def validate_features(self, df):
 
@@ -179,47 +192,25 @@ class ModelLoader:
 
         return df.loc[:, MODEL_FEATURES]
 
-    ###################################################
-    # PUBLIC ACCESSOR
-    ###################################################
+    ########################################################
+    # PUBLIC ACCESSORS
+    ########################################################
 
     @property
     def xgb(self):
         return self._reload_xgb_if_needed()
 
-    ###################################################
-    # LSTM
-    ###################################################
+    @property
+    def xgb_version(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.version
 
-    def _load_lstm_if_needed(self):
+    @property
+    def dataset_hash(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.dataset_hash
 
-        if self._lstm is not None:
-            return
-
-        base_dir = os.getenv(
-            "LSTM_REGISTRY_DIR",
-            os.path.abspath("artifacts/lstm")
-        )
-
-        from tensorflow.keras.models import load_model
-
-        model_path = os.path.join(base_dir, "model.keras")
-        scaler_path = os.path.join(base_dir, "scalers.pkl")
-
-        self._lstm = load_model(model_path)
-        self._scaler = joblib.load(scaler_path)
-
-        MODEL_VERSION.labels(
-            model="lstm",
-            version="production"
-        ).set(1)
-
-    def lstm_forecast(self, recent_prices):
-
-        self._load_lstm_if_needed()
-
-        return forecast_lstm(
-            self._lstm,
-            self._scaler,
-            recent_prices
-        )
+    @property
+    def training_code_hash(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.training_code_hash
