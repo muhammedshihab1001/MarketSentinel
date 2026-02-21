@@ -96,10 +96,12 @@ class WalkForwardValidator:
                 window_id += 1
                 continue
 
-            # Ensure schema integrity
+            # Strict schema check
             missing = set(MODEL_FEATURES) - set(train_df.columns)
             if missing:
-                raise RuntimeError(f"Missing model features in training set: {missing}")
+                raise RuntimeError(
+                    f"Missing model features in training set: {missing}"
+                )
 
             model = self.model_trainer(train_df)
 
@@ -158,27 +160,47 @@ class WalkForwardValidator:
                 for t, w in zip(shorts["ticker"], short_weights):
                     positions[t] = -float(w)
 
-                # --- Robust return computation ---
+                # --------------------------------------------------
+                # Robust return computation (dual-mode support)
+                # --------------------------------------------------
 
-                merged = pd.merge(
-                    signal_slice[["ticker", "close"]],
-                    next_slice[["ticker", "close"]],
-                    on="ticker",
-                    suffixes=("_today", "_next")
-                )
+                if "close" in signal_slice.columns and "close" in next_slice.columns:
 
-                merged = merged[
-                    (merged["close_today"] > 0) &
-                    (merged["close_next"] > 0)
-                ]
+                    merged = pd.merge(
+                        signal_slice[["ticker", "close"]],
+                        next_slice[["ticker", "close"]],
+                        on="ticker",
+                        suffixes=("_today", "_next")
+                    )
 
-                if merged.empty:
+                    merged = merged[
+                        (merged["close_today"] > 0) &
+                        (merged["close_next"] > 0)
+                    ]
+
+                    if merged.empty:
+                        continue
+
+                    merged["ret"] = (
+                        np.log(merged["close_next"]) -
+                        np.log(merged["close_today"])
+                    )
+
+                elif "return" in next_slice.columns:
+
+                    merged = pd.merge(
+                        signal_slice[["ticker"]],
+                        next_slice[["ticker", "return"]],
+                        on="ticker"
+                    )
+
+                    if merged.empty:
+                        continue
+
+                    merged["ret"] = merged["return"]
+
+                else:
                     continue
-
-                merged["ret"] = (
-                    np.log(merged["close_next"]) -
-                    np.log(merged["close_today"])
-                )
 
                 daily_ret = 0.0
 
