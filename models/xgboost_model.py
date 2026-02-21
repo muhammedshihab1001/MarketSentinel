@@ -1,14 +1,12 @@
 import xgboost as xgb
 import numpy as np
 import logging
-from sklearn.model_selection import train_test_split
 
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
 MIN_PROB_STD = 1e-5
-VALIDATION_SPLIT = 0.15
-EARLY_STOPPING_ROUNDS = 40
+NUM_BOOST_ROUNDS = 600  # fixed, deterministic
 
 
 ###################################################
@@ -34,7 +32,7 @@ def compute_class_weight(y):
 
 
 ###################################################
-# SAFE PRODUCTION MODEL (CPU LOCKED)
+# SAFE PRODUCTION MODEL (CPU LOCKED, NO RANDOM SPLIT)
 ###################################################
 
 class SafeXGBClassifier:
@@ -55,49 +53,38 @@ class SafeXGBClassifier:
         # Enforce deterministic dtype
         X = X.astype(np.float32)
 
-        X_train, X_val, y_train, y_val = train_test_split(
-            X,
-            y,
-            test_size=VALIDATION_SPLIT,
-            random_state=SEED,
-            stratify=y
-        )
-
+        # Store feature order explicitly
         self.feature_names = list(X.columns)
 
-        dtrain = xgb.DMatrix(X_train, label=y_train)
-        dval = xgb.DMatrix(X_val, label=y_val)
+        dtrain = xgb.DMatrix(X, label=y)
 
         params = {
             "max_depth": 3,
             "eta": 0.03,
-            "subsample": 0.65,
-            "colsample_bytree": 0.6,
+            "subsample": 1.0,          # deterministic
+            "colsample_bytree": 1.0,   # deterministic
             "min_child_weight": 6,
             "gamma": 0.25,
             "reg_alpha": 1.2,
             "reg_lambda": 3.5,
             "objective": "binary:logistic",
             "eval_metric": "logloss",
-            "tree_method": "hist",      # XGBoost 2.x compliant
-            "device": "cpu",            # Explicit CPU lock
+            "tree_method": "hist",
+            "device": "cpu",
             "scale_pos_weight": self.pos_weight,
             "seed": SEED,
             "verbosity": 0,
         }
 
-        evals = [(dtrain, "train"), (dval, "validation")]
-
         self.model = xgb.train(
             params,
             dtrain,
-            num_boost_round=800,
-            evals=evals,
-            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+            num_boost_round=NUM_BOOST_ROUNDS,
             verbose_eval=False
         )
 
-        preds = self.model.predict(xgb.DMatrix(X))
+        # Probability sanity check
+        preds = self.model.predict(dtrain)
 
         mean = float(np.mean(preds))
         std = float(np.std(preds))
@@ -116,9 +103,13 @@ class SafeXGBClassifier:
         return self
 
     def predict_proba(self, X):
-        X = X.astype(np.float32)
+
+        # Enforce feature order consistency
+        X = X[self.feature_names].astype(np.float32)
+
         dmatrix = xgb.DMatrix(X)
         probs = self.model.predict(dmatrix)
+
         return np.column_stack([1 - probs, probs])
 
     def export_feature_importance(self):
