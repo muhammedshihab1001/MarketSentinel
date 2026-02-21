@@ -22,7 +22,6 @@ class RegimeConfig:
 
     EPSILON: float = 1e-8
     MAX_DAILY_RETURN: float = 0.60
-
     HYSTERESIS_BUFFER: float = 0.005
 
 
@@ -34,12 +33,7 @@ class MarketRegimeDetector:
         self.config = config or RegimeConfig()
 
     ########################################################
-
-    def _assert_monotonic(self, df):
-
-        if not df["date"].is_monotonic_increasing:
-            raise RuntimeError("Non-monotonic timestamps detected.")
-
+    # SAFETY
     ########################################################
 
     def _neutral_regime(self, df: pd.DataFrame):
@@ -48,7 +42,7 @@ class MarketRegimeDetector:
 
         df = df.copy()
         df["regime"] = "SIDEWAYS"
-        df["market_regime"] = df["regime"]
+        df["market_regime"] = "SIDEWAYS"
 
         return df
 
@@ -62,7 +56,6 @@ class MarketRegimeDetector:
         regimes = np.asarray(regimes, dtype=object)
 
         confirmed = regimes.copy()
-
         current = regimes[0]
         streak = 0
 
@@ -84,38 +77,35 @@ class MarketRegimeDetector:
         return confirmed
 
     ########################################################
-    # SINGLE ASSET
+    # SINGLE ASSET (STRICTLY CAUSAL)
     ########################################################
 
     def _detect_single_asset(self, df: pd.DataFrame):
 
         cfg = self.config
 
+        df = df.sort_values("date").copy()
+
+        if "close" not in df.columns:
+            return self._neutral_regime(df)
+
         try:
 
-            df = df.sort_values("date").copy()
-            self._assert_monotonic(df)
+            close = pd.to_numeric(df["close"], errors="coerce")
 
-            close = pd.to_numeric(df["close"], errors="raise")
-
-            ################################################
-            # CORRECT RETURN COMPUTATION
-            ################################################
+            if close.isna().any():
+                return self._neutral_regime(df)
 
             returns = close.pct_change()
 
             if returns.abs().max() > cfg.MAX_DAILY_RETURN:
                 logger.warning("Extreme return detected — fallback.")
-                df["regime"] = "SIDEWAYS"
-                return df
+                return self._neutral_regime(df)
 
-            ################################################
-            # TREND
-            ################################################
-
+            # STRICTLY CAUSAL TREND
             ma_long = (
-                close.rolling(cfg.trend_window,
-                              min_periods=cfg.trend_window)
+                close
+                .rolling(cfg.trend_window, min_periods=cfg.trend_window)
                 .mean()
             )
 
@@ -124,10 +114,7 @@ class MarketRegimeDetector:
                 (ma_long + cfg.EPSILON)
             )
 
-            ################################################
-            # VOLATILITY (SMOOTHED)
-            ################################################
-
+            # STRICTLY CAUSAL VOLATILITY
             raw_vol = (
                 returns
                 .rolling(cfg.volatility_window,
@@ -136,10 +123,6 @@ class MarketRegimeDetector:
             )
 
             volatility = raw_vol.ewm(span=10, adjust=False).mean()
-
-            ################################################
-            # REGIME CLASSIFICATION
-            ################################################
 
             regime = np.full(len(df), "SIDEWAYS", dtype=object)
 
@@ -167,33 +150,25 @@ class MarketRegimeDetector:
             regime[bull] = "BULL"
             regime[bear] = "BEAR"
 
-            ################################################
-            # PERSISTENCE CONTROL
-            ################################################
-
             regime = self._apply_persistence(regime)
 
-            df["regime"] = pd.Categorical(
-                regime,
-                categories=self.VALID_REGIMES
-            )
-
-            df["regime"] = df["regime"].fillna("SIDEWAYS")
+            df["regime"] = regime
+            df["market_regime"] = regime
 
             return df
 
         except Exception as e:
-
             logger.warning("Regime degraded → %s", str(e))
-
-            df["regime"] = "SIDEWAYS"
-            return df
+            return self._neutral_regime(df)
 
     ########################################################
-    # MULTI ASSET
+    # MULTI ASSET (SAFE)
     ########################################################
 
     def detect(self, df: pd.DataFrame):
+
+        if df.empty:
+            return df
 
         grouped = []
 
@@ -209,10 +184,5 @@ class MarketRegimeDetector:
             .sort_values(["date", "ticker"])
             .reset_index(drop=True)
         )
-
-        counts = result.groupby("date")["ticker"].nunique()
-
-        if counts.min() < 2:
-            return self._neutral_regime(result)
 
         return result
