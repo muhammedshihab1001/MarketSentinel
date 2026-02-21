@@ -8,33 +8,27 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "30.2"  # bumped – strict production lock
+SCHEMA_VERSION = "30.3"  # bumped – inference compatibility fix
 
 ############################################################
 # CORE FEATURES
 ############################################################
 
 CORE_FEATURES: Tuple[str, ...] = (
-
     "return",
     "return_lag1",
     "return_lag5",
     "return_lag10",
-
     "volatility",
     "volatility_5",
     "volatility_20",
-
     "momentum_20",
-
     "rsi",
     "macd",
     "macd_signal",
-
     "ema_10",
     "ema_50",
     "ema_ratio",
-
     "regime_feature",
 )
 
@@ -43,13 +37,11 @@ CORE_FEATURES: Tuple[str, ...] = (
 ############################################################
 
 CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = (
-
     "momentum_20_z",
     "return_lag5_z",
     "rsi_z",
     "volatility_z",
     "ema_ratio_z",
-
     "momentum_20_rank",
     "return_lag5_rank",
     "rsi_rank",
@@ -66,7 +58,7 @@ MODEL_FEATURES: List[str] = list(
 )
 
 DTYPE = np.float32
-MIN_ROWS = 200
+MIN_ROWS_TRAINING = 200
 MIN_VARIANCE = 1e-8
 
 FORBIDDEN_REGEX = re.compile(
@@ -87,14 +79,20 @@ def _check_forbidden_columns(df: pd.DataFrame):
 
 def validate_feature_schema(
     df: pd.DataFrame,
-    strict: bool = False
+    mode: str = "training"  # training | inference | strict_contract
 ) -> pd.DataFrame:
 
     if df is None or df.empty:
         raise RuntimeError("Empty feature dataset.")
 
-    if len(df) < MIN_ROWS:
-        raise RuntimeError("Dataset below minimum rows.")
+    if mode not in {"training", "inference", "strict_contract"}:
+        raise RuntimeError(f"Unknown validation mode: {mode}")
+
+    # -------------------------------------------------------
+    # Row requirement (TRAINING ONLY)
+    # -------------------------------------------------------
+    if mode == "training" and len(df) < MIN_ROWS_TRAINING:
+        raise RuntimeError("Dataset below minimum rows for training.")
 
     _check_forbidden_columns(df)
 
@@ -102,16 +100,15 @@ def validate_feature_schema(
     if missing_core:
         raise RuntimeError(f"Missing core features: {missing_core}")
 
-    ########################################################
-    # STRICT MODE → ENFORCE FULL CONTRACT
-    ########################################################
-
-    if strict:
+    # -------------------------------------------------------
+    # STRICT CONTRACT MODE (final training enforcement)
+    # -------------------------------------------------------
+    if mode == "strict_contract":
 
         missing_all = set(MODEL_FEATURES) - set(df.columns)
         if missing_all:
             raise RuntimeError(
-                f"Strict mode: missing required features {missing_all}"
+                f"Strict contract: missing required features {missing_all}"
             )
 
         feature_df = df.loc[:, MODEL_FEATURES].copy()
@@ -124,10 +121,9 @@ def validate_feature_schema(
     feature_df = feature_df.astype(DTYPE)
     feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    ########################################################
+    # -------------------------------------------------------
     # CORE VALIDATION
-    ########################################################
-
+    # -------------------------------------------------------
     for col in CORE_FEATURES:
 
         series = feature_df[col]
@@ -136,17 +132,16 @@ def validate_feature_schema(
         if finite_vals.empty:
             raise RuntimeError(f"Core feature fully invalid: {col}")
 
-        if strict and finite_vals.nunique() <= 1:
+        if mode != "inference" and finite_vals.nunique() <= 1:
             raise RuntimeError(f"Constant CORE feature detected: {col}")
 
         if finite_vals.var(ddof=0) < MIN_VARIANCE:
             logger.warning(f"Low variance core feature: {col}")
 
-    ########################################################
-    # CROSS FEATURE BEHAVIOR
-    ########################################################
-
-    if not strict:
+    # -------------------------------------------------------
+    # CROSS FEATURE BEHAVIOR (non-strict modes)
+    # -------------------------------------------------------
+    if mode != "strict_contract":
 
         drop_cols = []
 
@@ -167,10 +162,9 @@ def validate_feature_schema(
         if drop_cols:
             feature_df.drop(columns=drop_cols, inplace=True)
 
-    ########################################################
+    # -------------------------------------------------------
     # FINAL SANITY CHECK
-    ########################################################
-
+    # -------------------------------------------------------
     if feature_df.isnull().any().any():
         raise RuntimeError("NaN detected after schema validation.")
 
