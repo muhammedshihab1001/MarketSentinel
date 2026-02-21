@@ -60,6 +60,74 @@ class DriftDetector:
         self._model_loader = ModelLoader()
 
     ########################################################
+    # CREATE BASELINE
+    ########################################################
+
+    def create_baseline(
+        self,
+        dataset: pd.DataFrame,
+        dataset_hash: str,
+        training_code_hash: str,
+        allow_overwrite: bool = False
+    ):
+
+        if dataset is None or dataset.empty:
+            raise RuntimeError("Cannot build baseline from empty dataset.")
+
+        path = self._safe_baseline_path()
+
+        if os.path.exists(path) and not allow_overwrite:
+            raise RuntimeError("Baseline already exists.")
+
+        numeric = self._safe_feature_block(dataset)
+
+        if len(numeric) < self.MIN_SAMPLE_BASELINE:
+            raise RuntimeError("Insufficient rows for baseline creation.")
+
+        features = {}
+
+        for col in MODEL_FEATURES:
+
+            series = numeric[col].dropna()
+
+            if len(series) < self.MIN_SAMPLE_BASELINE:
+                continue
+
+            mean = float(series.mean())
+            std = float(series.std())
+            variance = float(series.var())
+
+            counts, bin_edges = np.histogram(series, bins=20)
+
+            features[col] = {
+                "mean": mean,
+                "std": std,
+                "variance": variance,
+                "bin_edges": bin_edges.tolist(),
+                "expected_counts": counts.tolist()
+            }
+
+        if not features:
+            raise RuntimeError("No valid features for baseline.")
+
+        payload = {
+            "meta": {
+                "baseline_version": self.BASELINE_VERSION,
+                "created_at": datetime.utcnow().isoformat(),
+                "schema_signature": get_schema_signature(),
+                "dataset_hash": dataset_hash,
+                "training_code_hash": training_code_hash
+            },
+            "features": features
+        }
+
+        payload["integrity_hash"] = self._baseline_hash(payload)
+
+        self._atomic_write(payload, path)
+
+        logger.info("Drift baseline created successfully.")
+
+    ########################################################
     # SAFE PATH
     ########################################################
 
@@ -203,7 +271,6 @@ class DriftDetector:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Baseline schema mismatch.")
 
-        # STRICT FEATURE MATCH
         if set(baseline["features"].keys()) != set(MODEL_FEATURES):
             raise RuntimeError("Baseline feature contract mismatch.")
 
