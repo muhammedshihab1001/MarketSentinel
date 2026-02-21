@@ -11,6 +11,7 @@ from prometheus_client import generate_latest
 
 from app.api.routes import predict
 from app.api.routes import performance
+from app.api.routes import equity  # 🔥 NEW
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
 
@@ -39,7 +40,7 @@ STARTUP_TIMEOUT_SEC = int(
     os.getenv("STARTUP_TIMEOUT_SEC", "120")
 )
 
-APP_VERSION = os.getenv("APP_VERSION", "3.1.0")
+APP_VERSION = os.getenv("APP_VERSION", "3.2.0")  # 🔥 bumped
 
 
 # =====================================================
@@ -105,8 +106,7 @@ async def lifespan(app: FastAPI):
         # -------------------------------------------------
 
         loader = ModelLoader()
-
-        model = loader.xgb  # Force strict load
+        _ = loader.xgb
 
         readiness.models_loaded = True
         readiness.schema_signature = loader._xgb_container.schema_signature
@@ -147,7 +147,6 @@ async def lifespan(app: FastAPI):
         gc.collect()
 
     except Exception:
-
         logger.exception("CRITICAL STARTUP FAILURE")
         raise
 
@@ -170,7 +169,8 @@ app.add_exception_handler(Exception, global_exception_handler)
 # =====================================================
 
 app.include_router(predict.router, prefix="/v1")
-app.include_router(performance.router,prefix="/v1")
+app.include_router(performance.router, prefix="/v1")
+app.include_router(equity.router, prefix="/v1")  # 🔥 NEW
 
 
 # =====================================================
@@ -185,6 +185,7 @@ async def root():
         "boot_id": readiness.boot_id,
         "model_version": readiness.model_version,
         "artifact_hash": readiness.artifact_hash,
+        "version": APP_VERSION,
         "docs": "/docs",
         "metrics": "/metrics"
     }
@@ -200,6 +201,22 @@ def metrics():
         generate_latest(),
         media_type="text/plain"
     )
+
+
+# =====================================================
+# HEALTH (NEW)
+# =====================================================
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "model_loaded": readiness.models_loaded,
+        "redis_connected": readiness.redis_connected,
+        "boot_id": readiness.boot_id,
+        "version": APP_VERSION,
+        "uptime_seconds": int(time.time()) - readiness.start_time
+    }
 
 
 # =====================================================
