@@ -83,6 +83,8 @@ class InferencePipeline:
     CACHE_TTL = int(os.getenv("INFERENCE_CACHE_TTL_SECONDS", "600"))
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
 
+    ############################################################
+
     def __init__(self):
 
         self.market_data = MarketDataService()
@@ -172,7 +174,7 @@ class InferencePipeline:
         return weights
 
     ############################################################
-    # MAIN ENTRY
+    # LIVE INFERENCE (PRODUCTION)
     ############################################################
 
     def run_batch(self, tickers: list[str]):
@@ -221,14 +223,70 @@ class InferencePipeline:
             latest_date = df["date"].max()
             latest_df = df[df["date"] == latest_date].copy()
 
-            ########################################################
-            # MODEL INFERENCE
-            ########################################################
+            return self._run_model_and_construct(latest_df, use_cache=True)
 
-            feature_df = validate_feature_schema(
-                latest_df.loc[:, MODEL_FEATURES],
-                mode="inference"
-            ).astype(DTYPE)
+        except Exception as e:
+            self.breaker.record_failure()
+            PIPELINE_FAILURES.labels(stage="inference").inc()
+            logger.exception("Batch inference failure: %s", str(e))
+            raise
+
+        finally:
+            INFERENCE_IN_PROGRESS.dec()
+
+    ############################################################
+    # HISTORICAL INFERENCE (BACKTEST ONLY)
+    ############################################################
+
+    def run_historical_batch(
+        self,
+        price_history: dict[str, pd.DataFrame],
+        evaluation_date: pd.Timestamp
+    ):
+
+        datasets = []
+
+        for ticker, price_df in price_history.items():
+
+            df = price_df[price_df["date"] <= evaluation_date].copy()
+
+            if df.empty:
+                continue
+
+            dataset = self.feature_store.get_features(
+                df,
+                sentiment_df=None,
+                ticker=ticker,
+                training=False
+            )
+
+            if dataset is not None and not dataset.empty:
+                datasets.append(dataset)
+
+        if not datasets:
+            raise RuntimeError("No datasets built for historical batch.")
+
+        df = pd.concat(datasets, ignore_index=True)
+
+        latest_df = df[df["date"] == evaluation_date].copy()
+
+        if latest_df.empty:
+            raise RuntimeError("No data for evaluation date.")
+
+        return self._run_model_and_construct(latest_df, use_cache=False)
+
+    ############################################################
+    # SHARED MODEL EXECUTION
+    ############################################################
+
+    def _run_model_and_construct(self, latest_df, use_cache: bool):
+
+        feature_df = validate_feature_schema(
+            latest_df.loc[:, MODEL_FEATURES],
+            mode="inference"
+        ).astype(DTYPE)
+
+        if use_cache:
 
             dataset_hash = self._dataset_hash(latest_df)
 
@@ -245,70 +303,41 @@ class InferencePipeline:
 
             CACHE_MISSES.inc()
 
-            t0 = time.time()
-            probs = self.models.xgb.predict_proba(feature_df)[:, 1]
-            latency = time.time() - t0
+        t0 = time.time()
+        probs = self.models.xgb.predict_proba(feature_df)[:, 1]
+        latency = time.time() - t0
 
-            MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-            MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
+        MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
+        MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
 
-            probs = np.clip(probs, 1e-6, 1 - 1e-6)
+        probs = np.clip(probs, 1e-6, 1 - 1e-6)
 
-            if np.std(probs) < self.MIN_PROB_STD:
-                raise RuntimeError("Probability collapse detected.")
+        if np.std(probs) < self.MIN_PROB_STD:
+            raise RuntimeError("Probability collapse detected.")
 
-            latest_df["score"] = probs
-            latest_df["rank_pct"] = latest_df["score"].rank(pct=True)
+        latest_df["score"] = probs
+        latest_df["rank_pct"] = latest_df["score"].rank(pct=True)
 
-            def signal_from_rank(x):
-                if x >= 0.7:
-                    return "LONG"
-                elif x <= 0.3:
-                    return "SHORT"
-                return "NEUTRAL"
+        latest_df["signal"] = latest_df["rank_pct"].apply(
+            lambda x: "LONG" if x >= 0.7 else ("SHORT" if x <= 0.3 else "NEUTRAL")
+        )
 
-            latest_df["signal"] = latest_df["rank_pct"].apply(signal_from_rank)
+        weights = self._construct_portfolio(latest_df)
 
-            ########################################################
-            # PORTFOLIO
-            ########################################################
+        portfolio_rows = []
 
-            weights = self._construct_portfolio(latest_df)
+        for _, row in latest_df.iterrows():
 
-            ########################################################
-            # TERMINAL OUTPUT
-            ########################################################
+            portfolio_rows.append({
+                "date": row["date"],
+                "ticker": row["ticker"],
+                "score": float(row["score"]),
+                "signal": row["signal"],
+                "weight": float(weights.get(row["ticker"], 0.0))
+            })
 
-            portfolio_rows = []
-
-            for _, row in latest_df.iterrows():
-
-                ticker = row["ticker"]
-                weight = float(weights.get(ticker, 0.0))
-
-                portfolio_rows.append({
-                    "ticker": ticker,
-                    "score": float(row["score"]),
-                    "rank_pct": float(row["rank_pct"]),
-                    "signal": row["signal"],
-                    "weight": weight,
-                    "volatility": float(row["volatility"]),
-                    "momentum_20": float(row["momentum_20"]),
-                    "rsi": float(row["rsi"]),
-                    "regime": float(row["regime_feature"])
-                })
-
+        if use_cache:
             self.cache.set(cache_key, portfolio_rows, ttl=self.CACHE_TTL)
             self.breaker.record_success()
 
-            return portfolio_rows
-
-        except Exception as e:
-
-            self.breaker.record_failure()
-            PIPELINE_FAILURES.labels(stage="inference").inc()
-            logger.exception("Batch inference failure: %s", str(e))
-            raise
-
-        finally:
-            INFERENCE_IN_PROGRESS.dec()
+        return portfolio_rows
