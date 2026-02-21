@@ -106,13 +106,6 @@ class FeatureEngineer:
     @classmethod
     def add_volatility(cls, df):
 
-        if "return" not in df.columns:
-            df["return"] = (
-                df.groupby("ticker")["close"]
-                .pct_change()
-                .clip(*cls.RETURN_CLAMP)
-            )
-
         grp = df.groupby("ticker")["return"]
 
         df["volatility_5"] = (
@@ -182,10 +175,9 @@ class FeatureEngineer:
                 window=14
             )
 
-            if len(rsi) != len(group):
-                raise RuntimeError("RSI misalignment detected.")
-
             df.loc[group.index, "rsi"] = rsi.values.astype("float32")
+
+        df["rsi"] = df["rsi"].fillna(50.0)
 
         return df
 
@@ -203,11 +195,12 @@ class FeatureEngineer:
                 group[["date", "close"]]
             )
 
-            if len(macd) != len(group):
-                raise RuntimeError("MACD misalignment detected.")
-
             df.loc[group.index, "macd"] = macd.astype("float32")
             df.loc[group.index, "macd_signal"] = signal.astype("float32")
+
+        df[["macd", "macd_signal"]] = df[
+            ["macd", "macd_signal"]
+        ].fillna(0.0)
 
         return df
 
@@ -231,7 +224,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # CROSS-SECTIONAL FEATURES (NEW)
+    # CROSS-SECTIONAL FEATURES
     ########################################################
 
     @classmethod
@@ -247,20 +240,46 @@ class FeatureEngineer:
 
         for col in cross_cols:
 
-            if col not in df.columns:
-                raise RuntimeError(f"Missing base feature: {col}")
-
             grouped = df.groupby("date")[col]
 
-            df[f"{col}_z"] = (
-                grouped.transform(
-                    lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9)
-                )
-            ).clip(-5, 5)
+            z = grouped.transform(
+                lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9)
+            )
 
-            df[f"{col}_rank"] = grouped.transform(
+            rank = grouped.transform(
                 lambda x: x.rank(pct=True)
             )
+
+            df[f"{col}_z"] = z.fillna(0.0).clip(-5, 5)
+            df[f"{col}_rank"] = rank.fillna(0.5)
+
+        return df
+
+    ########################################################
+    # FINAL SANITIZATION
+    ########################################################
+
+    @classmethod
+    def _final_sanitize(cls, df):
+
+        df = df.replace([np.inf, -np.inf], np.nan)
+
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+
+        for col in numeric_cols:
+            if df[col].isnull().any():
+
+                if col.endswith("_rank"):
+                    df[col] = df[col].fillna(0.5)
+                elif col.endswith("_z"):
+                    df[col] = df[col].fillna(0.0)
+                elif "volatility" in col:
+                    df[col] = df[col].fillna(cls.VOL_FLOOR)
+                else:
+                    df[col] = df[col].fillna(0.0)
+
+        if not np.isfinite(df[numeric_cols].to_numpy()).all():
+            raise RuntimeError("Non-finite values remain after sanitization.")
 
         return df
 
@@ -282,15 +301,12 @@ class FeatureEngineer:
         df = cls.add_returns(df)
         df = cls.add_volatility(df)
         df = cls.add_regime_feature(df)
-
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
         df = cls.add_ema(df)
-
         df = cls.add_cross_sectional_features(df)
 
-        float_cols = df.select_dtypes(include=["float64"]).columns
-        df[float_cols] = df[float_cols].astype("float32")
+        df = cls._final_sanitize(df)
 
         logger.info("Feature pipeline built | rows=%s", len(df))
 
