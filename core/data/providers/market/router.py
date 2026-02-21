@@ -20,19 +20,6 @@ logger = logging.getLogger(__name__)
 
 
 class MarketProviderRouter:
-    """
-    Institutional Multi-Vendor Router.
-
-    Priority:
-        1️⃣ Yahoo (PRIMARY — most stable)
-        2️⃣ TwelveData (fallback)
-        3️⃣ AlphaVantage (last resort)
-
-    Design Goals:
-        ✔ Prefer statistical stability
-        ✔ Never silently accept garbage
-        ✔ Prefer degraded data over crash
-    """
 
     REQUIRED_COLUMNS = {
         "date",
@@ -43,7 +30,7 @@ class MarketProviderRouter:
         "volume"
     }
 
-    MIN_ACCEPTABLE_ROWS = 50
+    DEFAULT_MIN_ROWS = 50
     MAX_DAILY_MOVE = 0.90
     PROVIDER_TIMEOUT_WARN = 8.0
 
@@ -60,12 +47,11 @@ class MarketProviderRouter:
     def __init__(self):
 
         self.providers = []
-
         self._register_providers()
 
         if not self.providers:
             raise RuntimeError(
-                "No market providers available. Check API keys."
+                "No market providers available."
             )
 
         logger.info(
@@ -88,48 +74,23 @@ class MarketProviderRouter:
                 return
 
             if builder is None:
-                logger.warning(
-                    "Provider unavailable → %s (module missing)",
-                    name
-                )
                 return
 
             try:
-
                 provider = builder()
-
                 self.providers.append((name, provider))
-
                 logger.info("Provider registered → %s", name)
 
             except Exception as e:
-
                 logger.warning(
                     "Provider disabled → %s | reason=%s",
                     name,
                     str(e)
                 )
 
-        ####################################################
-        # 🔥 NEW PRIORITY ORDER (CRITICAL FIX)
-        ####################################################
-
-        # PRIMARY — MOST STABLE
         register("yahoo", YahooProvider)
-
-        # fallback
-        register(
-            "twelvedata",
-            TwelveDataProvider,
-            "TWELVEDATA_API_KEY"
-        )
-
-        # last resort
-        register(
-            "alphavantage",
-            AlphaVantageProvider,
-            "ALPHAVANTAGE_API_KEY"
-        )
+        register("twelvedata", TwelveDataProvider, "TWELVEDATA_API_KEY")
+        register("alphavantage", AlphaVantageProvider, "ALPHAVANTAGE_API_KEY")
 
     ############################################################
 
@@ -140,11 +101,11 @@ class MarketProviderRouter:
             raise ValueError(f"Unsupported interval: {interval}")
 
     ############################################################
-    # INSTITUTIONAL SANITIZER
+    # 🔥 SANITIZER WITH CONFIGURABLE MIN_ROWS
     ############################################################
 
     @classmethod
-    def _sanitize_dataframe(cls, df: pd.DataFrame):
+    def _sanitize_dataframe(cls, df: pd.DataFrame, min_rows):
 
         if df is None or df.empty:
             raise RuntimeError("Provider returned empty dataframe.")
@@ -166,9 +127,6 @@ class MarketProviderRouter:
 
         df = df.dropna(subset=["date"])
 
-        if df.empty:
-            raise RuntimeError("All datetime values invalid.")
-
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
         for col in numeric_cols:
@@ -176,13 +134,7 @@ class MarketProviderRouter:
 
         df = df.dropna(subset=numeric_cols)
 
-        if df.empty:
-            raise RuntimeError("All numeric rows invalid.")
-
         df = df[df["high"] >= df["low"]]
-
-        if df.empty:
-            raise RuntimeError("Price invariant violation.")
 
         jumps = df["close"].pct_change().abs()
 
@@ -196,18 +148,21 @@ class MarketProviderRouter:
             .reset_index(drop=True)
         )
 
-        if len(df) < cls.MIN_ACCEPTABLE_ROWS:
+        if len(df) < min_rows:
             raise RuntimeError(
-                f"Too few rows from provider ({len(df)})"
+                f"Too few rows from provider ({len(df)} < {min_rows})"
             )
 
         return df
 
     ############################################################
 
-    def fetch(self, ticker, start, end, interval):
+    def fetch(self, ticker, start, end, interval, min_rows=None):
 
         self._validate_interval(interval)
+
+        if min_rows is None:
+            min_rows = self.DEFAULT_MIN_ROWS
 
         last_error = None
 
@@ -221,7 +176,8 @@ class MarketProviderRouter:
                     ticker,
                     start,
                     end,
-                    interval
+                    interval,
+                    min_rows=min_rows
                 )
 
                 latency = time.time() - start_time
@@ -233,7 +189,7 @@ class MarketProviderRouter:
                         latency
                     )
 
-                df = self._sanitize_dataframe(df)
+                df = self._sanitize_dataframe(df, min_rows)
 
                 logger.info(
                     "Market data served → provider=%s ticker=%s rows=%s",
