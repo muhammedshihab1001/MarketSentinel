@@ -10,7 +10,8 @@ from app.inference.pipeline import InferencePipeline
 router = APIRouter()
 logger = logging.getLogger("marketsentinel.performance")
 
-MIN_HISTORY_ROWS = 60  # strict minimum for evaluation
+MIN_HISTORY_ROWS = 60
+BENCHMARK_TICKER = "SPY"
 
 
 @router.get("/performance")
@@ -28,7 +29,7 @@ def compute_performance(days: int = 120):
         start_date = end_date - pd.Timedelta(days=days + 365)
 
         ############################################################
-        # 1️⃣ FETCH HISTORY ONCE (CRITICAL FIX)
+        # 1️⃣ FETCH STRATEGY HISTORY
         ############################################################
 
         price_history = {}
@@ -45,14 +46,10 @@ def compute_performance(days: int = 120):
                     min_history=MIN_HISTORY_ROWS
                 )
 
-                if df is None or df.empty:
-                    continue
-
-                if len(df) < MIN_HISTORY_ROWS:
+                if df is None or len(df) < MIN_HISTORY_ROWS:
                     continue
 
                 df = df.sort_values("date").reset_index(drop=True)
-
                 df["forward_return"] = (
                     df["close"].shift(-1) / df["close"] - 1
                 )
@@ -67,7 +64,24 @@ def compute_performance(days: int = 120):
             raise RuntimeError("No valid price data available.")
 
         ############################################################
-        # 2️⃣ BUILD EVALUATION DATES
+        # 2️⃣ FETCH BENCHMARK ONCE
+        ############################################################
+
+        benchmark_df = market_data.get_price_data(
+            ticker=BENCHMARK_TICKER,
+            start_date=start_date.strftime("%Y-%m-%d"),
+            end_date=end_date.strftime("%Y-%m-%d"),
+            interval="1d",
+            min_history=MIN_HISTORY_ROWS
+        )
+
+        benchmark_df = benchmark_df.sort_values("date")
+        benchmark_df["forward_return"] = (
+            benchmark_df["close"].shift(-1) / benchmark_df["close"] - 1
+        )
+
+        ############################################################
+        # 3️⃣ BUILD EVALUATION DATES
         ############################################################
 
         combined_dates = sorted(
@@ -79,7 +93,7 @@ def compute_performance(days: int = 120):
         eval_dates = combined_dates[-days:]
 
         ############################################################
-        # 3️⃣ WALK-FORWARD SIGNAL GENERATION
+        # 4️⃣ WALK-FORWARD SIGNAL GENERATION
         ############################################################
 
         portfolio_records = []
@@ -93,8 +107,7 @@ def compute_performance(days: int = 120):
                     evaluation_date=eval_date
                 )
 
-                for row in results:
-                    portfolio_records.append(row)
+                portfolio_records.extend(results)
 
             except Exception as e:
                 logger.warning(
@@ -108,35 +121,79 @@ def compute_performance(days: int = 120):
         portfolio_df = pd.DataFrame(portfolio_records)
 
         ############################################################
-        # 4️⃣ BUILD FORWARD RETURN FRAME
+        # 5️⃣ BUILD FORWARD RETURN FRAME
         ############################################################
 
         forward_frames = []
 
         for ticker, df in price_history.items():
-
             tmp = df[["date", "forward_return"]].copy()
             tmp["ticker"] = ticker
-
             forward_frames.append(tmp)
 
         forward_df = pd.concat(forward_frames, ignore_index=True)
         forward_df.dropna(inplace=True)
 
         ############################################################
-        # 5️⃣ EVALUATE
+        # 6️⃣ STRATEGY EVALUATION
         ############################################################
 
         report = engine.evaluate(portfolio_df, forward_df)
 
+        ############################################################
+        # 7️⃣ BENCHMARK METRICS
+        ############################################################
+
+        benchmark_returns = (
+            benchmark_df
+            .set_index("date")["forward_return"]
+            .loc[report.daily_returns.index]
+            .dropna()
+        )
+
+        benchmark_equity = (1 + benchmark_returns).cumprod()
+        benchmark_cumulative = benchmark_equity.iloc[-1] - 1
+
+        ############################################################
+        # 8️⃣ ALPHA + INFORMATION RATIO
+        ############################################################
+
+        aligned_strategy = report.daily_returns.loc[benchmark_returns.index]
+
+        excess_returns = aligned_strategy - benchmark_returns
+
+        info_ratio = 0.0
+        if excess_returns.std() != 0:
+            info_ratio = (
+                excess_returns.mean() / excess_returns.std()
+            ) * (252 ** 0.5)
+
+        alpha = report.annual_return - (
+            (1 + benchmark_cumulative) ** (252 / len(benchmark_returns)) - 1
+        )
+
+        ############################################################
+        # 9️⃣ RESPONSE
+        ############################################################
+
         return {
-            "cumulative_return": report.cumulative_return,
-            "sharpe_ratio": report.sharpe_ratio,
-            "max_drawdown": report.max_drawdown,
-            "hit_rate": report.hit_rate,
-            "annual_volatility": report.annual_volatility,
-            "annual_return": report.annual_return,
-            "turnover": report.turnover
+            "strategy": {
+                "cumulative_return": report.cumulative_return,
+                "annual_return": report.annual_return,
+                "annual_volatility": report.annual_volatility,
+                "sharpe_ratio": report.sharpe_ratio,
+                "max_drawdown": report.max_drawdown,
+                "hit_rate": report.hit_rate,
+                "turnover": report.turnover,
+            },
+            "benchmark": {
+                "ticker": BENCHMARK_TICKER,
+                "cumulative_return": float(benchmark_cumulative),
+            },
+            "relative": {
+                "alpha": float(alpha),
+                "information_ratio": float(info_ratio),
+            }
         }
 
     except Exception as e:
