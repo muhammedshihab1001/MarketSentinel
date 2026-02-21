@@ -116,7 +116,7 @@ class FeatureEngineer:
 
         df["momentum_20"] = (
             df.groupby("ticker")["close"]
-            .transform(lambda x: x.pct_change(20))
+            .pct_change(20)
             .clip(-1, 1)
         )
 
@@ -157,7 +157,9 @@ class FeatureEngineer:
 
         rolling_vol = (
             df.groupby("ticker")["volatility_20"]
-            .transform(lambda x: x.rolling(40, min_periods=20).mean())
+            .rolling(40, min_periods=20)
+            .mean()
+            .reset_index(level=0, drop=True)
         )
 
         median_vol = rolling_vol.median()
@@ -169,41 +171,46 @@ class FeatureEngineer:
         )
 
     ########################################################
-    # TECHNICALS
+    # TECHNICALS (PANDAS 3.0 SAFE)
     ########################################################
 
     @classmethod
     def add_rsi(cls, df):
 
-        def _compute(group):
-            rsi = TechnicalIndicators.rsi(group[["date", "close"]], window=14)
-            group["rsi"] = rsi.values.astype("float32")
-            return group
+        df["rsi"] = np.nan
 
-        return df.groupby("ticker", group_keys=False).apply(_compute)
+        for ticker, group in df.groupby("ticker"):
+            rsi = TechnicalIndicators.rsi(group[["date", "close"]], window=14)
+            df.loc[group.index, "rsi"] = rsi.values.astype("float32")
+
+        return df
 
     @classmethod
     def add_macd(cls, df):
 
-        def _block(x):
-            macd, signal = TechnicalIndicators.macd(x[["date", "close"]])
-            x["macd"] = macd.astype("float32")
-            x["macd_signal"] = signal.astype("float32")
-            return x
+        df["macd"] = np.nan
+        df["macd_signal"] = np.nan
 
-        return df.groupby("ticker", group_keys=False).apply(_block)
+        for ticker, group in df.groupby("ticker"):
+            macd, signal = TechnicalIndicators.macd(group[["date", "close"]])
+            df.loc[group.index, "macd"] = macd.astype("float32")
+            df.loc[group.index, "macd_signal"] = signal.astype("float32")
+
+        return df
 
     @classmethod
     def add_ema(cls, df):
 
         df["ema_10"] = (
             df.groupby("ticker")["close"]
-            .transform(lambda x: x.ewm(span=10, adjust=False).mean())
+            .ewm(span=10, adjust=False)
+            .mean()
         )
 
         df["ema_50"] = (
             df.groupby("ticker")["close"]
-            .transform(lambda x: x.ewm(span=50, adjust=False).mean())
+            .ewm(span=50, adjust=False)
+            .mean()
         )
 
         df["ema_ratio"] = (
@@ -211,7 +218,7 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # MAIN PIPELINE (CORE FEATURES ONLY)
+    # MAIN PIPELINE
     ########################################################
 
     @classmethod
@@ -236,7 +243,6 @@ class FeatureEngineer:
         df = cls.add_macd(df)
         cls.add_ema(df)
 
-        # Only drop rows missing CORE features
         core_cols = [
             "return", "return_lag1", "return_lag5", "return_lag10",
             "volatility", "volatility_5", "volatility_20",
