@@ -11,6 +11,7 @@ router = APIRouter()
 logger = logging.getLogger("marketsentinel.equity")
 
 MIN_HISTORY_ROWS = 60
+MIN_ASSETS_PER_DAY = 4
 BENCHMARK_TICKER = "SPY"
 
 
@@ -60,7 +61,28 @@ def equity_curve(days: int = 120):
             raise RuntimeError("No valid price data available.")
 
         ############################################################
-        # 2️⃣ EVALUATION DATES
+        # 2️⃣ PRECOMPUTE FEATURES ONCE (CRITICAL FIX)
+        ############################################################
+
+        full_feature_cache = {}
+
+        for ticker, df in price_history.items():
+
+            features = pipeline.feature_store.get_features(
+                df,
+                sentiment_df=None,
+                ticker=ticker,
+                training=False
+            )
+
+            if features is not None and not features.empty:
+                full_feature_cache[ticker] = features
+
+        if not full_feature_cache:
+            raise RuntimeError("No feature datasets built.")
+
+        ############################################################
+        # 3️⃣ EVALUATION DATES
         ############################################################
 
         combined_dates = sorted(
@@ -70,7 +92,7 @@ def equity_curve(days: int = 120):
         eval_dates = combined_dates[-days:]
 
         ############################################################
-        # 3️⃣ HISTORICAL SIGNAL GENERATION
+        # 4️⃣ HISTORICAL SIGNAL GENERATION (FIXED)
         ############################################################
 
         portfolio_records = []
@@ -79,9 +101,9 @@ def equity_curve(days: int = 120):
 
             try:
 
-                results = pipeline.run_historical_batch(
-                    price_history=price_history,
-                    evaluation_date=pd.to_datetime(eval_date).normalize()
+                results = pipeline.run_historical_with_features(
+                    full_feature_cache=full_feature_cache,
+                    evaluation_date=eval_date
                 )
 
                 portfolio_records.extend(results)
@@ -97,7 +119,7 @@ def equity_curve(days: int = 120):
         portfolio_df = pd.DataFrame(portfolio_records)
 
         ############################################################
-        # 4️⃣ FORWARD RETURNS
+        # 5️⃣ FORWARD RETURNS
         ############################################################
 
         forward_frames = []
@@ -111,14 +133,14 @@ def equity_curve(days: int = 120):
         forward_df.dropna(inplace=True)
 
         ############################################################
-        # 5️⃣ STRATEGY PERFORMANCE
+        # 6️⃣ STRATEGY PERFORMANCE
         ############################################################
 
         report = engine.evaluate(portfolio_df, forward_df)
         strategy_equity = report.equity_curve
 
         ############################################################
-        # 6️⃣ BENCHMARK
+        # 7️⃣ BENCHMARK
         ############################################################
 
         benchmark_df = market_data.get_price_data(
@@ -152,7 +174,7 @@ def equity_curve(days: int = 120):
         benchmark_equity = (1 + benchmark_returns).cumprod()
 
         ############################################################
-        # 7️⃣ ALIGN STRATEGY
+        # 8️⃣ ALIGN STRATEGY
         ############################################################
 
         aligned_strategy = strategy_equity.loc[
