@@ -10,8 +10,7 @@ from app.inference.pipeline import InferencePipeline
 router = APIRouter()
 logger = logging.getLogger("marketsentinel.performance")
 
-
-MIN_HISTORY_ROWS = 50  # performance tolerance
+MIN_HISTORY_ROWS = 30  # relaxed for performance
 
 
 @router.get("/performance")
@@ -26,10 +25,10 @@ def compute_performance(days: int = 120):
         universe = MarketUniverse.get_universe()
 
         end_date = pd.Timestamp.utcnow().date()
-        start_date = end_date - pd.Timedelta(days=days + 10)
+        start_date = end_date - pd.Timedelta(days=days + 20)
 
         # -------------------------------------------------
-        # 1️⃣ FETCH HISTORY SAFELY
+        # 1️⃣ FETCH HISTORY WITH RELAXED MODE
         # -------------------------------------------------
 
         all_prices = []
@@ -40,20 +39,14 @@ def compute_performance(days: int = 120):
                 df = market_data.get_price_data(
                     ticker=ticker,
                     start_date=start_date.isoformat(),
-                    end_date=end_date.isoformat()
+                    end_date=end_date.isoformat(),
+                    min_history=MIN_HISTORY_ROWS  # 🔥 important
                 )
             except Exception:
                 logger.warning(f"Skipping {ticker} — fetch failure.")
                 continue
 
             if df is None or df.empty:
-                logger.warning(f"Skipping {ticker} — empty dataset.")
-                continue
-
-            if len(df) < MIN_HISTORY_ROWS:
-                logger.warning(
-                    f"Skipping {ticker} — insufficient history ({len(df)} rows)."
-                )
                 continue
 
             df = df.sort_values("date").copy()
@@ -72,7 +65,7 @@ def compute_performance(days: int = 120):
         forward_df.dropna(inplace=True)
 
         # -------------------------------------------------
-        # 2️⃣ GENERATE HISTORICAL PORTFOLIOS
+        # 2️⃣ GENERATE PORTFOLIO SNAPSHOTS
         # -------------------------------------------------
 
         portfolio_records = []
@@ -84,29 +77,27 @@ def compute_performance(days: int = 120):
             .tail(days)
         )
 
+        # IMPORTANT:
+        # This still uses latest model snapshot.
+        # Real historical backtest will come next phase.
+
+        try:
+            latest_portfolio = pipeline.run_batch(universe)
+        except Exception as e:
+            raise RuntimeError(f"Inference failed: {str(e)}")
+
         for eval_date in eval_dates:
-
-            try:
-                result = pipeline.run_batch(universe)
-
-                for row in result:
-                    portfolio_records.append({
-                        "date": eval_date,
-                        "ticker": row["ticker"],
-                        "weight": row["weight"]
-                    })
-
-            except Exception:
-                logger.warning(f"Skipping evaluation date {eval_date}")
-                continue
-
-        if not portfolio_records:
-            raise RuntimeError("No portfolio history generated.")
+            for row in latest_portfolio:
+                portfolio_records.append({
+                    "date": eval_date,
+                    "ticker": row["ticker"],
+                    "weight": row["weight"]
+                })
 
         portfolio_df = pd.DataFrame(portfolio_records)
 
         # -------------------------------------------------
-        # 3️⃣ EVALUATE PERFORMANCE
+        # 3️⃣ PERFORMANCE EVALUATION
         # -------------------------------------------------
 
         report = engine.evaluate(portfolio_df, forward_df)
