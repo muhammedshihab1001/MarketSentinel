@@ -14,6 +14,7 @@ from core.schema.feature_schema import (
     DTYPE
 )
 
+from core.artifacts.metadata_manager import MetadataManager
 from app.monitoring.metrics import MODEL_VERSION
 
 logger = logging.getLogger("marketsentinel.loader")
@@ -74,6 +75,9 @@ class ModelLoader:
 
     def _find_latest_artifact(self, base_dir):
 
+        if not os.path.exists(base_dir):
+            raise RuntimeError(f"Registry directory missing: {base_dir}")
+
         model_files = glob(os.path.join(base_dir, "model_*.pkl"))
 
         if not model_files:
@@ -82,6 +86,7 @@ class ModelLoader:
         latest = max(model_files, key=os.path.getmtime)
 
         filename = os.path.basename(latest)
+
         if not filename.startswith("model_") or not filename.endswith(".pkl"):
             raise RuntimeError("Unexpected artifact naming format.")
 
@@ -98,30 +103,6 @@ class ModelLoader:
         return latest, metadata_path, version
 
     ########################################################
-    # METADATA VALIDATION
-    ########################################################
-
-    def _validate_metadata(self, metadata_path):
-
-        with open(metadata_path, encoding="utf-8") as f:
-            meta = json.load(f)
-
-        if meta.get("schema_signature") != get_schema_signature():
-            raise RuntimeError("Schema mismatch during inference.")
-
-        required_fields = [
-            "dataset_hash",
-            "training_code_hash",
-            "schema_signature"
-        ]
-
-        for field in required_fields:
-            if field not in meta:
-                raise RuntimeError(f"Metadata missing required field: {field}")
-
-        return meta
-
-    ########################################################
     # SAFE LOAD
     ########################################################
 
@@ -135,7 +116,6 @@ class ModelLoader:
         if not hasattr(model, "predict_proba"):
             raise RuntimeError("Invalid model artifact loaded.")
 
-        # Validate feature alignment if available
         if hasattr(model, "feature_names"):
             trained_features = list(model.feature_names)
             if trained_features != MODEL_FEATURES:
@@ -167,7 +147,12 @@ class ModelLoader:
 
         logger.info("Loading XGBoost version=%s", version)
 
-        meta = self._validate_metadata(metadata_path)
+        # STRICT METADATA VALIDATION
+        meta = MetadataManager.load_metadata(metadata_path)
+
+        if meta["schema_signature"] != get_schema_signature():
+            raise RuntimeError("Schema mismatch during inference.")
+
         artifact_hash = self._sha256(model_path)
         model = self._safe_load_model(model_path)
 
