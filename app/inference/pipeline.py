@@ -135,7 +135,7 @@ class InferencePipeline:
 
         feature_block = validate_feature_schema(
             ordered.loc[:, MODEL_FEATURES],
-            mode="strict_contract"  # 🔒 FIXED
+            mode="inference"   # ✅ CORRECT
         )
 
         payload = (
@@ -241,7 +241,7 @@ class InferencePipeline:
 
             feature_df = validate_feature_schema(
                 latest_df.loc[:, MODEL_FEATURES],
-                mode="strict_contract"   # 🔒 FIXED
+                mode="inference"   # ✅ CORRECT
             )
 
             feature_df = feature_df.astype(DTYPE)
