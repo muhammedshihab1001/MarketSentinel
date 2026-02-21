@@ -235,55 +235,46 @@ class InferencePipeline:
             INFERENCE_IN_PROGRESS.dec()
 
     ############################################################
-    # HISTORICAL INFERENCE (OPTIMIZED)
+    # HISTORICAL INFERENCE (CORRECT VERSION)
     ############################################################
 
-    def run_historical_batch(
+    def run_historical_with_features(
         self,
-        price_history: dict[str, pd.DataFrame],
+        full_feature_cache: dict[str, pd.DataFrame],
         evaluation_date: pd.Timestamp
     ):
 
-        if not price_history:
-            raise RuntimeError("Empty price history provided.")
-
-        full_feature_cache = {}
-
-        # STEP 1: Precompute full features once per ticker
-        for ticker, price_df in price_history.items():
-
-            if price_df is None or price_df.empty:
-                continue
-
-            full_dataset = self.feature_store.get_features(
-                price_df,
-                sentiment_df=None,
-                ticker=ticker,
-                training=False
-            )
-
-            if full_dataset is not None and not full_dataset.empty:
-                full_feature_cache[ticker] = full_dataset
-
         if not full_feature_cache:
-            raise RuntimeError("No feature datasets built.")
+            raise RuntimeError("Empty feature cache.")
 
-        # STEP 2: Slice per evaluation date
+        eval_date = pd.to_datetime(evaluation_date).normalize()
+
         sliced = []
 
         for ticker, feature_df in full_feature_cache.items():
 
-            df = feature_df[feature_df["date"] == evaluation_date]
+            if feature_df is None or feature_df.empty:
+                continue
 
-            if df is not None and not df.empty:
+            feature_df = feature_df.copy()
+            feature_df["date"] = pd.to_datetime(
+                feature_df["date"]
+            ).dt.normalize()
+
+            df = feature_df[feature_df["date"] == eval_date]
+
+            if not df.empty:
                 sliced.append(df)
 
         if not sliced:
             raise RuntimeError("No data for evaluation date.")
 
-        df = pd.concat(sliced, ignore_index=True)
+        latest_df = pd.concat(sliced, ignore_index=True)
 
-        return self._run_model_and_construct(df, use_cache=False)
+        return self._run_model_and_construct(
+            latest_df,
+            use_cache=False
+        )
 
     ############################################################
     # SHARED MODEL EXECUTION
