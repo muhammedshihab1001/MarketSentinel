@@ -53,24 +53,6 @@ def compute_dataset_hash(df: pd.DataFrame) -> str:
 ############################################################
 
 def sanitize_metrics(metrics: dict) -> dict:
-    """
-    Strict boundary between research metrics and production metadata.
-
-    Accepts:
-        - int
-        - float
-        - numpy scalar
-
-    Rejects:
-        - list
-        - tuple
-        - dict
-        - ndarray
-        - any non-numeric object
-
-    Returns:
-        Dict[str, float]
-    """
 
     if not isinstance(metrics, dict) or not metrics:
         raise RuntimeError("Walk-forward metrics must be a non-empty dict.")
@@ -80,7 +62,6 @@ def sanitize_metrics(metrics: dict) -> dict:
 
     for k, v in metrics.items():
 
-        # Reject obvious complex types early
         if isinstance(v, (list, tuple, dict, np.ndarray)):
             dropped.append(k)
             continue
@@ -199,7 +180,7 @@ def trainer(train_df):
 
     X = validate_feature_schema(
         train_df.loc[:, MODEL_FEATURES],
-        strict=False
+        mode="training"   # ✅ updated
     )
 
     y = train_df["target"]
@@ -222,7 +203,7 @@ def final_trainer(train_df):
 
     X = validate_feature_schema(
         df,
-        strict=True
+        mode="strict_contract"   # ✅ updated
     )
 
     y = train_df["target"]
@@ -234,7 +215,7 @@ def final_trainer(train_df):
 
 
 ############################################################
-# ARTIFACT EXPORT (INSTITUTIONAL SAFE)
+# ARTIFACT EXPORT
 ############################################################
 
 def export_artifacts(model, metrics, dataset_hash,
@@ -288,23 +269,12 @@ def main(start_date=None, end_date=None):
 
     raw_df = load_training_data(start_date, end_date)
 
-    ########################################################
-    # WALK-FORWARD (RESEARCH LAYER)
-    ########################################################
-
     validator = WalkForwardValidator(trainer)
     research_metrics = validator.run(raw_df)
 
-    ########################################################
-    # 🔒 PRODUCTION METRIC SANITIZATION
-    ########################################################
-
     production_metrics = sanitize_metrics(research_metrics)
 
-    ########################################################
-
     final_df = build_final_target(raw_df)
-
     dataset_hash = compute_dataset_hash(final_df)
 
     final_model = final_trainer(final_df)
