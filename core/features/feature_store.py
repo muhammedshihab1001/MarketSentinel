@@ -22,7 +22,7 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v17"  # bumped version
+    CACHE_VERSION = "v18"  # bumped
     MAX_CACHE_FILES_PER_TICKER = 6
     MIN_FILE_BYTES = 5_000
 
@@ -36,7 +36,7 @@ class FeatureStore:
         self.env_hash = self._environment_fingerprint()[:12]
 
     ########################################################
-    # LIGHT NUMERIC SANITY (NO VARIANCE CHECK)
+    # BASIC SANITY
     ########################################################
 
     def _validate_basic_integrity(self, df: pd.DataFrame):
@@ -91,12 +91,16 @@ class FeatureStore:
         sentiment_df: Optional[pd.DataFrame]
     ) -> str:
 
-        h = hashlib.sha256()
-
         price_core = price_df[["ticker", "date", "close"]].copy()
+        price_core = price_core.sort_values(
+            ["ticker", "date"]
+        ).reset_index(drop=True)
+
+        h = hashlib.sha256()
         h.update(self._stable_hash_df(price_core).encode())
 
         if sentiment_df is not None and not sentiment_df.empty:
+
             sent_core = sentiment_df.copy()
 
             if "avg_sentiment" in sent_core.columns:
@@ -148,6 +152,10 @@ class FeatureStore:
         if price_df.duplicated(subset=["ticker", "date"]).any():
             raise RuntimeError("Duplicate rows detected in price data.")
 
+        price_df = price_df.sort_values(
+            ["ticker", "date"]
+        ).reset_index(drop=True)
+
         dataset_hash = self._dataset_hash(price_df, sentiment_df)
 
         ticker_safe = re.sub(r"[^A-Za-z0-9_]", "_", ticker)
@@ -162,6 +170,7 @@ class FeatureStore:
             f"{self.env_hash}.parquet"
         )
 
+        # LOAD CACHE
         if os.path.exists(path) and os.path.getsize(path) >= self.MIN_FILE_BYTES:
             try:
                 df = pd.read_parquet(path)
@@ -182,6 +191,15 @@ class FeatureStore:
         features = features.sort_values(
             ["date", "ticker"]
         ).reset_index(drop=True)
+
+        # Prevent leakage during inference
+        if not training:
+            leakage_cols = [
+                c for c in features.columns
+                if "forward" in c.lower()
+            ]
+            if leakage_cols:
+                features = features.drop(columns=leakage_cols)
 
         self._validate_basic_integrity(features)
 
