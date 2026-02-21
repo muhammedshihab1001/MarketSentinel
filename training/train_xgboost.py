@@ -1,14 +1,10 @@
 import os
 import time
-import json
 import joblib
 import logging
 import random
 import numpy as np
 import pandas as pd
-import hashlib
-import inspect
-from datetime import datetime
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
@@ -16,12 +12,11 @@ from core.features.feature_store import FeatureStore
 from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
-    get_schema_signature,
-    SCHEMA_VERSION
 )
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
 from core.monitoring.drift_detector import DriftDetector
+from core.artifacts.metadata_manager import MetadataManager
 
 from training.backtesting.walk_forward import WalkForwardValidator, FORWARD_DAYS
 from models.xgboost_model import build_xgboost_pipeline
@@ -33,8 +28,6 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
-METADATA_VERSION = "1.0"
-MODEL_NAME = "xgboost"
 
 
 ############################################################
@@ -48,46 +41,11 @@ def enforce_determinism():
 
 
 ############################################################
-# HASH UTILITIES
+# DATASET HASH
 ############################################################
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
-    feature_block = validate_feature_schema(
-        df.loc[:, MODEL_FEATURES],
-        strict=True
-    )
-
-    ordered = pd.concat(
-        [
-            df[["date", "ticker"]].reset_index(drop=True),
-            feature_block.reset_index(drop=True),
-            df["target"].reset_index(drop=True),
-        ],
-        axis=1
-    )
-
-    ordered = ordered.sort_values(["ticker", "date"]).reset_index(drop=True)
-
-    payload = ordered.to_csv(index=False).encode()
-    return hashlib.sha256(payload).hexdigest()
-
-
-def compute_training_code_hash() -> str:
-    import models.xgboost_model as xgb_module
-    source = inspect.getsource(xgb_module)
-    return hashlib.sha256(source.encode()).hexdigest()
-
-
-def compute_universe_hash(universe: list[str]) -> str:
-    payload = ",".join(sorted(universe)).encode()
-    return hashlib.sha256(payload).hexdigest()
-
-
-def compute_metadata_integrity_hash(meta: dict) -> str:
-    meta_copy = dict(meta)
-    meta_copy.pop("metadata_integrity_hash", None)
-    canonical = json.dumps(meta_copy, sort_keys=True).encode()
-    return hashlib.sha256(canonical).hexdigest()
+    return MetadataManager.fingerprint_dataset(df)
 
 
 ############################################################
@@ -208,11 +166,11 @@ def final_trainer(train_df):
 
 
 ############################################################
-# ARTIFACT EXPORT (INSTITUTIONAL METADATA)
+# ARTIFACT EXPORT (INSTITUTIONAL SAFE)
 ############################################################
 
-def export_artifacts(model, metrics, dataset_hash, training_code_hash,
-                     start_date, end_date, universe, final_df):
+def export_artifacts(model, metrics, dataset_hash,
+                     start_date, end_date, final_df):
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     timestamp = int(time.time())
@@ -223,44 +181,27 @@ def export_artifacts(model, metrics, dataset_hash, training_code_hash,
     joblib.dump(model, tmp_path)
     os.replace(tmp_path, model_path)
 
-    universe_hash = compute_universe_hash(universe)
+    ########################################################
+    # 🔒 OFFICIAL METADATA CREATION
+    ########################################################
 
-    metadata = {
-        "metadata_type": "model_training",
-        "metadata_version": METADATA_VERSION,
-        "model_name": MODEL_NAME,
-        "created_at": datetime.utcnow().isoformat(),
-        "timestamp": timestamp,
-        "training_window": {
-            "start": str(start_date),
-            "end": str(end_date)
-        },
-        "dataset_rows": int(len(final_df)),
-        "features": MODEL_FEATURES,
-        "feature_count": len(MODEL_FEATURES),
-        "schema_signature": get_schema_signature(),
-        "schema_version": SCHEMA_VERSION,
-        "environment": {
-            "python_version": os.sys.version
-        },
-        "training_universe": universe,
-        "universe_hash": universe_hash,
-        "dataset_hash": dataset_hash,
-        "training_code_hash": training_code_hash,
-        "metrics": metrics,
-        "artifact_path": model_path
-    }
-
-    metadata["metadata_integrity_hash"] = \
-        compute_metadata_integrity_hash(metadata)
+    metadata = MetadataManager.create_metadata(
+        model_name="xgboost",
+        metrics=metrics,
+        features=MODEL_FEATURES,
+        training_start=str(start_date),
+        training_end=str(end_date),
+        dataset_hash=dataset_hash,
+        dataset_rows=len(final_df),
+        metadata_type="training_manifest_v1"
+    )
 
     metadata_path = os.path.join(
         MODEL_DIR,
         f"metadata_{timestamp}.json"
     )
 
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+    MetadataManager.save_metadata(metadata, metadata_path)
 
     logger.info("Artifacts exported with institutional metadata.")
 
@@ -289,20 +230,15 @@ def main(start_date=None, end_date=None):
     final_df = build_final_target(raw_df)
 
     dataset_hash = compute_dataset_hash(final_df)
-    training_code_hash = compute_training_code_hash()
 
     final_model = final_trainer(final_df)
-
-    universe = MarketUniverse.get_universe()
 
     export_artifacts(
         final_model,
         metrics,
         dataset_hash,
-        training_code_hash,
         start_date,
         end_date,
-        universe,
         final_df
     )
 
@@ -310,7 +246,7 @@ def main(start_date=None, end_date=None):
     drift.create_baseline(
         dataset=final_df,
         dataset_hash=dataset_hash,
-        training_code_hash=training_code_hash,
+        training_code_hash=MetadataManager.fingerprint_training_code(),
         allow_overwrite=True
     )
 
