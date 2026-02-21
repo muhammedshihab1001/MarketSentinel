@@ -11,6 +11,7 @@ router = APIRouter()
 logger = logging.getLogger("marketsentinel.performance")
 
 MIN_HISTORY_ROWS = 60
+MIN_ASSETS_PER_DAY = 4
 BENCHMARK_TICKER = "SPY"
 
 
@@ -29,7 +30,7 @@ def compute_performance(days: int = 120):
         start_date = end_date - pd.Timedelta(days=days + 365)
 
         ############################################################
-        # 1️⃣ FETCH STRATEGY HISTORY
+        # 1️⃣ FETCH PRICE HISTORY
         ############################################################
 
         price_history = {}
@@ -50,6 +51,7 @@ def compute_performance(days: int = 120):
                     continue
 
                 df = df.sort_values("date").reset_index(drop=True)
+
                 df["forward_return"] = (
                     df["close"].shift(-1) / df["close"] - 1
                 )
@@ -58,13 +60,12 @@ def compute_performance(days: int = 120):
 
             except Exception as e:
                 logger.warning(f"Skipping {ticker} — {str(e)}")
-                continue
 
         if not price_history:
             raise RuntimeError("No valid price data available.")
 
         ############################################################
-        # 2️⃣ PRECOMPUTE FULL FEATURES ONCE
+        # 2️⃣ PRECOMPUTE FEATURES ONCE
         ############################################################
 
         full_feature_cache = {}
@@ -85,7 +86,7 @@ def compute_performance(days: int = 120):
             raise RuntimeError("No feature datasets built.")
 
         ############################################################
-        # 3️⃣ FETCH BENCHMARK ONCE
+        # 3️⃣ FETCH BENCHMARK
         ############################################################
 
         benchmark_df = market_data.get_price_data(
@@ -102,19 +103,17 @@ def compute_performance(days: int = 120):
         )
 
         ############################################################
-        # 4️⃣ BUILD EVALUATION DATES
+        # 4️⃣ EVALUATION DATES
         ############################################################
 
         combined_dates = sorted(
-            set(
-                pd.concat(price_history.values())["date"].unique()
-            )
+            set(pd.concat(price_history.values())["date"].unique())
         )
 
         eval_dates = combined_dates[-days:]
 
         ############################################################
-        # 5️⃣ GENERATE SIGNALS USING SLICING ONLY
+        # 5️⃣ GENERATE SIGNALS (SLICE ONLY)
         ############################################################
 
         portfolio_records = []
@@ -128,7 +127,7 @@ def compute_performance(days: int = 120):
                 if not df.empty:
                     sliced.append(df)
 
-            if not sliced:
+            if len(sliced) < MIN_ASSETS_PER_DAY:
                 continue
 
             latest_df = pd.concat(sliced, ignore_index=True)
@@ -139,11 +138,11 @@ def compute_performance(days: int = 120):
                     use_cache=False
                 )
                 portfolio_records.extend(results)
+
             except Exception as e:
                 logger.warning(
-                    f"Skipping eval_date {eval_date} — {str(e)}"
+                    f"Historical skip {eval_date} — {str(e)}"
                 )
-                continue
 
         if not portfolio_records:
             raise RuntimeError("No portfolio history generated.")
@@ -151,7 +150,7 @@ def compute_performance(days: int = 120):
         portfolio_df = pd.DataFrame(portfolio_records)
 
         ############################################################
-        # 6️⃣ BUILD FORWARD RETURN FRAME
+        # 6️⃣ FORWARD RETURNS
         ############################################################
 
         forward_frames = []
@@ -165,38 +164,45 @@ def compute_performance(days: int = 120):
         forward_df.dropna(inplace=True)
 
         ############################################################
-        # 7️⃣ STRATEGY EVALUATION
+        # 7️⃣ STRATEGY PERFORMANCE
         ############################################################
 
         report = engine.evaluate(portfolio_df, forward_df)
 
         ############################################################
-        # 8️⃣ BENCHMARK METRICS
+        # 8️⃣ BENCHMARK ALIGNMENT
         ############################################################
 
         benchmark_returns = (
             benchmark_df
             .set_index("date")["forward_return"]
-            .loc[report.daily_returns.index]
+            .reindex(report.daily_returns.index)
             .dropna()
         )
+
+        if benchmark_returns.empty:
+            raise RuntimeError("Benchmark alignment failed.")
 
         benchmark_equity = (1 + benchmark_returns).cumprod()
         benchmark_cumulative = benchmark_equity.iloc[-1] - 1
 
         aligned_strategy = report.daily_returns.loc[benchmark_returns.index]
-
         excess_returns = aligned_strategy - benchmark_returns
 
         info_ratio = 0.0
-        if excess_returns.std() != 0:
+        if excess_returns.std() > 0:
             info_ratio = (
-                excess_returns.mean() / excess_returns.std()
+                excess_returns.mean() /
+                excess_returns.std()
             ) * (252 ** 0.5)
 
-        alpha = report.annual_return - (
-            (1 + benchmark_cumulative) ** (252 / len(benchmark_returns)) - 1
+        years = len(benchmark_returns) / 252
+        benchmark_annual = (
+            (1 + benchmark_cumulative) ** (1 / years) - 1
+            if years > 0 else 0.0
         )
+
+        alpha = report.annual_return - benchmark_annual
 
         ############################################################
         # 9️⃣ RESPONSE
