@@ -12,7 +12,7 @@ class YahooProvider(MarketDataProvider):
 
     PROVIDER_NAME = "yahoo"
 
-    MIN_ROWS = 120
+    DEFAULT_MIN_ROWS = 120
     MAX_ROWS = 20_000
 
     ALLOWED_INTERVALS = {
@@ -55,10 +55,10 @@ class YahooProvider(MarketDataProvider):
             raise RuntimeError("Yahoo returned empty dataset.")
 
     ########################################################
-    # 🔥 INSTITUTIONAL NORMALIZER
+    # 🔥 NORMALIZER WITH CONFIGURABLE MIN_HISTORY
     ########################################################
 
-    def _normalize(self, df, ticker, start_date, end_date):
+    def _normalize(self, df, ticker, start_date, end_date, min_rows):
 
         self._validate_fetch_output(df)
 
@@ -110,8 +110,6 @@ class YahooProvider(MarketDataProvider):
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-        # Drop rows with missing price — SAFE
         df.dropna(subset=["open", "high", "low", "close"], inplace=True)
 
         if df.empty:
@@ -135,14 +133,10 @@ class YahooProvider(MarketDataProvider):
             .reset_index(drop=True)
         )
 
-        if len(df) < self.MIN_ROWS:
-            raise RuntimeError("Yahoo returned insufficient history.")
-
         ####################################################
-        # 🔥 SOFT PRICE REPAIR (CRITICAL)
+        # 🔥 PRICE REPAIR
         ####################################################
 
-        # Remove non-positive prices safely
         df = df[
             (df["open"] > 0) &
             (df["high"] > 0) &
@@ -153,7 +147,6 @@ class YahooProvider(MarketDataProvider):
         if df.empty:
             raise RuntimeError("All rows invalid after price filter.")
 
-        # Repair high / low anomalies instead of crashing
         df["high"] = df[["high", "open", "close"]].max(axis=1)
         df["low"] = df[["low", "open", "close"]].min(axis=1)
 
@@ -161,15 +154,17 @@ class YahooProvider(MarketDataProvider):
         # VOLUME REPAIR
         ####################################################
 
-        df["volume"] = df["volume"].clip(lower=0)
-        df["volume"] = df["volume"].fillna(0)
+        df["volume"] = df["volume"].clip(lower=0).fillna(0)
 
         ####################################################
-        # FINAL SAFETY
+        # 🔥 CONFIGURABLE MIN HISTORY
         ####################################################
 
-        if len(df) < self.MIN_ROWS:
-            raise RuntimeError("Dataset collapsed after repair.")
+        if len(df) < min_rows:
+            raise RuntimeError(
+                f"Insufficient history for {ticker} "
+                f"({len(df)} < {min_rows})"
+            )
 
         df["ticker"] = ticker
 
@@ -183,10 +178,13 @@ class YahooProvider(MarketDataProvider):
 
     ########################################################
 
-    def fetch(self, ticker, start_date, end_date, interval):
+    def fetch(self, ticker, start_date, end_date, interval, min_rows=None):
 
         if interval not in self.ALLOWED_INTERVALS:
             raise ValueError(f"Unsupported interval: {interval}")
+
+        if min_rows is None:
+            min_rows = self.DEFAULT_MIN_ROWS
 
         df = self.fetcher.fetch(
             ticker,
@@ -199,7 +197,8 @@ class YahooProvider(MarketDataProvider):
             df,
             ticker,
             start_date,
-            end_date
+            end_date,
+            min_rows=min_rows
         )
 
         return self.validate_contract(df)
