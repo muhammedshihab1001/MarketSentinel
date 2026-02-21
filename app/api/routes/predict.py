@@ -59,6 +59,8 @@ MAX_BATCH_SIZE = int(
     os.getenv("MAX_BATCH_SIZE", "50")
 )
 
+MIN_BATCH_SIZE = 4  # must match portfolio construction requirement
+
 inference_semaphore = asyncio.Semaphore(
     MAX_CONCURRENT_INFERENCES
 )
@@ -71,7 +73,7 @@ TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 # ------------------------------------------------
 
 class PortfolioRequest(BaseModel):
-    tickers: list[str] = Field(..., min_length=5, max_length=200)
+    tickers: list[str] = Field(..., min_length=1, max_length=200)
 
     @field_validator("tickers")
     @classmethod
@@ -87,7 +89,14 @@ class PortfolioRequest(BaseModel):
 
             cleaned.append(t)
 
-        return sorted(set(cleaned))
+        unique = sorted(set(cleaned))
+
+        if len(unique) < MIN_BATCH_SIZE:
+            raise ValueError(
+                f"At least {MIN_BATCH_SIZE} tickers required."
+            )
+
+        return unique
 
 
 # ------------------------------------------------
@@ -104,8 +113,12 @@ def validate_portfolio_output(result):
         if not isinstance(row, dict):
             raise RuntimeError("Invalid portfolio row structure.")
 
-        for k, v in row.items():
+        required = {"date", "ticker", "score", "signal", "weight"}
 
+        if not required.issubset(row.keys()):
+            raise RuntimeError("Portfolio row missing fields.")
+
+        for k, v in row.items():
             if isinstance(v, float):
                 if not math.isfinite(v):
                     raise RuntimeError(
@@ -135,6 +148,9 @@ async def build_portfolio(req: PortfolioRequest):
 
     try:
 
+        # Ensure model is loaded before inference
+        get_loader()
+
         async with inference_semaphore:
 
             result = await asyncio.wait_for(
@@ -149,15 +165,13 @@ async def build_portfolio(req: PortfolioRequest):
 
         loader = get_loader()
 
-        container = loader._xgb_container
-
         return {
             "meta": {
-                "model_version": container.version,
-                "schema_signature": container.schema_signature,
-                "dataset_hash": container.dataset_hash,
-                "training_code_hash": container.training_code_hash,
-                "artifact_hash": container.artifact_hash,
+                "model_version": loader.xgb_version,
+                "schema_signature": loader._xgb_container.schema_signature,
+                "dataset_hash": loader.dataset_hash,
+                "training_code_hash": loader.training_code_hash,
+                "artifact_hash": loader.artifact_hash,
                 "timestamp": int(time.time())
             },
             "portfolio": result
@@ -171,6 +185,16 @@ async def build_portfolio(req: PortfolioRequest):
         raise HTTPException(
             status_code=504,
             detail="Portfolio inference timeout"
+        )
+
+    except RuntimeError as e:
+
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        logger.warning(f"Portfolio runtime failure: {str(e)}")
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
         )
 
     except Exception:
@@ -211,16 +235,15 @@ async def readiness():
 
     try:
         loader = get_loader()
-        container = loader._xgb_container or loader.xgb
 
         return {
             "status": "ready",
-            "model_version": container.version,
-            "schema_signature": container.schema_signature
+            "model_version": loader.xgb_version,
+            "schema_signature": loader._xgb_container.schema_signature
         }
 
     except Exception:
         raise HTTPException(
             status_code=503,
             detail="Model not ready"
-        ) 
+        )
