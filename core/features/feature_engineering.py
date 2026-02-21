@@ -123,7 +123,7 @@ class FeatureEngineer:
             df[col] = df[col].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
 
     ########################################################
-    # REGIME
+    # REGIME (FIXED — STRICTLY CAUSAL)
     ########################################################
 
     @classmethod
@@ -136,13 +136,18 @@ class FeatureEngineer:
             .reset_index(level=0, drop=True)
         )
 
-        median_vol = rolling_vol.median()
+        df["rolling_vol_40"] = rolling_vol
+
+        # Cross-sectional median PER DATE (NOT GLOBAL)
+        date_median = df.groupby("date")["rolling_vol_40"].transform("median")
 
         df["regime_feature"] = np.where(
-            rolling_vol > median_vol,
+            df["rolling_vol_40"] > date_median,
             1.0,
             0.0
         )
+
+        df.drop(columns=["rolling_vol_40"], inplace=True)
 
     ########################################################
     # TECHNICALS
@@ -247,7 +252,6 @@ class FeatureEngineer:
 
         df = df.dropna(subset=core_cols)
 
-        # Strict causality guard
         forbidden = [
             c for c in df.columns
             if any(k in c.lower() for k in ["future", "forward", "lead"])
