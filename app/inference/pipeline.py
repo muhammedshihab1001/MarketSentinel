@@ -174,7 +174,7 @@ class InferencePipeline:
         return weights
 
     ############################################################
-    # LIVE INFERENCE (PRODUCTION)
+    # LIVE INFERENCE
     ############################################################
 
     def run_batch(self, tickers: list[str]):
@@ -235,7 +235,7 @@ class InferencePipeline:
             INFERENCE_IN_PROGRESS.dec()
 
     ############################################################
-    # HISTORICAL INFERENCE (BACKTEST ONLY)
+    # HISTORICAL INFERENCE (OPTIMIZED)
     ############################################################
 
     def run_historical_batch(
@@ -244,36 +244,46 @@ class InferencePipeline:
         evaluation_date: pd.Timestamp
     ):
 
-        datasets = []
+        if not price_history:
+            raise RuntimeError("Empty price history provided.")
 
+        full_feature_cache = {}
+
+        # STEP 1: Precompute full features once per ticker
         for ticker, price_df in price_history.items():
 
-            df = price_df[price_df["date"] <= evaluation_date].copy()
-
-            if df.empty:
+            if price_df is None or price_df.empty:
                 continue
 
-            dataset = self.feature_store.get_features(
-                df,
+            full_dataset = self.feature_store.get_features(
+                price_df,
                 sentiment_df=None,
                 ticker=ticker,
                 training=False
             )
 
-            if dataset is not None and not dataset.empty:
-                datasets.append(dataset)
+            if full_dataset is not None and not full_dataset.empty:
+                full_feature_cache[ticker] = full_dataset
 
-        if not datasets:
-            raise RuntimeError("No datasets built for historical batch.")
+        if not full_feature_cache:
+            raise RuntimeError("No feature datasets built.")
 
-        df = pd.concat(datasets, ignore_index=True)
+        # STEP 2: Slice per evaluation date
+        sliced = []
 
-        latest_df = df[df["date"] == evaluation_date].copy()
+        for ticker, feature_df in full_feature_cache.items():
 
-        if latest_df.empty:
+            df = feature_df[feature_df["date"] == evaluation_date]
+
+            if df is not None and not df.empty:
+                sliced.append(df)
+
+        if not sliced:
             raise RuntimeError("No data for evaluation date.")
 
-        return self._run_model_and_construct(latest_df, use_cache=False)
+        df = pd.concat(sliced, ignore_index=True)
+
+        return self._run_model_and_construct(df, use_cache=False)
 
     ############################################################
     # SHARED MODEL EXECUTION
@@ -327,7 +337,6 @@ class InferencePipeline:
         portfolio_rows = []
 
         for _, row in latest_df.iterrows():
-
             portfolio_rows.append({
                 "date": row["date"],
                 "ticker": row["ticker"],
