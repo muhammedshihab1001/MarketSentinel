@@ -6,6 +6,8 @@ import logging
 import random
 import numpy as np
 import pandas as pd
+import hashlib
+import inspect
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
@@ -17,6 +19,7 @@ from core.schema.feature_schema import (
 )
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
+from core.monitoring.drift_detector import DriftDetector
 
 from training.backtesting.walk_forward import WalkForwardValidator
 from models.xgboost_model import build_xgboost_pipeline
@@ -39,6 +42,26 @@ def enforce_determinism():
     os.environ["PYTHONHASHSEED"] = str(SEED)
     random.seed(SEED)
     np.random.seed(SEED)
+
+
+############################################################
+# HASH UTILITIES
+############################################################
+
+def compute_dataset_hash(df: pd.DataFrame) -> str:
+    payload = (
+        df.sort_values(["ticker", "date"])
+        .reset_index(drop=True)
+        .to_csv(index=False)
+        .encode()
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def compute_training_code_hash() -> str:
+    import models.xgboost_model as xgb_module
+    source = inspect.getsource(xgb_module)
+    return hashlib.sha256(source.encode()).hexdigest()
 
 
 ############################################################
@@ -145,15 +168,8 @@ def load_training_data(start_date, end_date):
     df = build_cross_sectional_features(df)
     df = build_cross_sectional_target(df)
 
-    # 🔥 Ensure feature alignment
     feature_df = validate_feature_schema(df.loc[:, MODEL_FEATURES])
     df = df.loc[feature_df.index]
-
-    logger.info(
-        "Target distribution | class_0=%s class_1=%s",
-        (df["target"] == 0).sum(),
-        (df["target"] == 1).sum()
-    )
 
     if df["target"].nunique() < 2:
         raise RuntimeError("Training labels collapsed.")
@@ -180,7 +196,7 @@ def trainer(train_df):
 # ARTIFACT EXPORT
 ############################################################
 
-def export_artifacts(model, metrics):
+def export_artifacts(model, metrics, dataset_hash, training_code_hash):
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -189,7 +205,6 @@ def export_artifacts(model, metrics):
     model_path = os.path.join(MODEL_DIR, f"model_{timestamp}.pkl")
     joblib.dump(model, model_path)
 
-    # Feature importance
     importance = model.export_feature_importance()
 
     importance_path = os.path.join(
@@ -200,11 +215,12 @@ def export_artifacts(model, metrics):
     with open(importance_path, "w") as f:
         json.dump(importance, f, indent=2)
 
-    # Metadata
     metadata = {
         "schema_signature": get_schema_signature(),
         "seed": SEED,
         "timestamp": timestamp,
+        "dataset_hash": dataset_hash,
+        "training_code_hash": training_code_hash,
         "metrics": metrics,
         "model_path": model_path
     }
@@ -242,14 +258,29 @@ def main(start_date=None, end_date=None):
 
     df = load_training_data(start_date, end_date)
 
+    dataset_hash = compute_dataset_hash(df)
+    training_code_hash = compute_training_code_hash()
+
     validator = WalkForwardValidator(trainer)
     metrics = validator.run(df)
 
-    logger.info("Walk-forward metrics: %s", metrics)
-
     final_model = trainer(df)
 
-    export_artifacts(final_model, metrics)
+    export_artifacts(
+        final_model,
+        metrics,
+        dataset_hash,
+        training_code_hash
+    )
+
+    # Create Drift Baseline
+    drift = DriftDetector()
+    drift.create_baseline(
+        dataset=df,
+        dataset_hash=dataset_hash,
+        training_code_hash=training_code_hash,
+        allow_overwrite=True
+    )
 
     logger.info(
         "Training completed in %.2f minutes",
