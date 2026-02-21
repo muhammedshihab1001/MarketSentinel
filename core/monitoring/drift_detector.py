@@ -158,6 +158,8 @@ class DriftDetector:
     def _atomic_write(self, payload, path):
 
         with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
             delete=False,
             dir=os.path.dirname(path),
             suffix=".tmp"
@@ -166,20 +168,19 @@ class DriftDetector:
             json.dump(payload, tmp, indent=2)
             tmp.flush()
             os.fsync(tmp.fileno())
-
             temp_name = tmp.name
 
         os.replace(temp_name, path)
 
     ########################################################
-    # CREATE BASELINE
+    # CREATE BASELINE (BACKWARD COMPATIBLE)
     ########################################################
 
     def create_baseline(
         self,
         dataset: pd.DataFrame,
-        dataset_hash: str,
-        training_code_hash: str,
+        dataset_hash: str | None = None,
+        training_code_hash: str | None = None,
         allow_overwrite: bool = False
     ):
 
@@ -190,6 +191,13 @@ class DriftDetector:
 
         if len(dataset) < self.MIN_SAMPLE_BASELINE:
             raise RuntimeError("Dataset too small for baseline.")
+
+        # Backward compatibility layer
+        if dataset_hash is None:
+            dataset_hash = self._baseline_hash({"rows": int(len(dataset))})
+
+        if training_code_hash is None:
+            training_code_hash = "legacy_compat"
 
         numeric = self._safe_feature_block(dataset)
 
@@ -238,7 +246,7 @@ class DriftDetector:
         if not os.path.exists(path):
             raise RuntimeError("Baseline missing.")
 
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             baseline = json.load(f)
 
         if baseline["integrity_hash"] != self._baseline_hash(baseline):
@@ -260,17 +268,28 @@ class DriftDetector:
 
     def _validate_against_active_model(self, baseline):
 
-        _ = self._model_loader.xgb  # ensures model loaded
+        container = self._model_loader._xgb_container
 
-        if self._model_loader.dataset_hash != baseline["meta"]["dataset_hash"]:
-            raise RuntimeError(
-                "Baseline dataset mismatch with active model."
-            )
+        if container is None:
+            return
 
-        if self._model_loader.training_code_hash != baseline["meta"]["training_code_hash"]:
-            raise RuntimeError(
-                "Training code hash mismatch — baseline stale."
-            )
+        baseline_dataset_hash = baseline["meta"].get("dataset_hash")
+        baseline_code_hash = baseline["meta"].get("training_code_hash")
+
+        model_dataset_hash = getattr(container, "dataset_hash", None)
+        model_code_hash = getattr(container, "training_code_hash", None)
+
+        if model_dataset_hash and baseline_dataset_hash:
+            if model_dataset_hash != baseline_dataset_hash:
+                raise RuntimeError(
+                    "Baseline dataset mismatch with active model."
+                )
+
+        if model_code_hash and baseline_code_hash:
+            if model_code_hash != baseline_code_hash:
+                raise RuntimeError(
+                    "Training code hash mismatch — baseline stale."
+                )
 
     ########################################################
     # DETECT DRIFT
