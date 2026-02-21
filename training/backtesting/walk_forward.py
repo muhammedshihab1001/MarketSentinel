@@ -46,7 +46,6 @@ class WalkForwardValidator:
         logger.info("Walk-forward validation started.")
 
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
         df = self.regime_detector.detect(df)
 
         unique_dates = pd.to_datetime(
@@ -98,7 +97,6 @@ class WalkForwardValidator:
             model = self.model_trainer(train_df)
 
             window_returns = []
-
             test_dates_sorted = sorted(test_df["date"].unique())
 
             for i in range(len(test_dates_sorted) - 1):
@@ -113,7 +111,6 @@ class WalkForwardValidator:
                     continue
 
                 X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
-
                 probs = model.predict_proba(X)[:, 1]
 
                 signal_slice = signal_slice.copy()
@@ -147,17 +144,36 @@ class WalkForwardValidator:
                 for t, w in zip(shorts["ticker"], short_weights):
                     positions[t] = -float(w)
 
-                merged = pd.merge(
-                    signal_slice[["ticker", "close"]],
-                    next_slice[["ticker", "close"]],
-                    on="ticker",
-                    suffixes=("_today", "_next")
-                )
+                # -----------------------------------------
+                # Robust return computation
+                # -----------------------------------------
 
-                merged["ret"] = (
-                    np.log(merged["close_next"]) -
-                    np.log(merged["close_today"])
-                )
+                if "close" in signal_slice.columns and "close" in next_slice.columns:
+
+                    merged = pd.merge(
+                        signal_slice[["ticker", "close"]],
+                        next_slice[["ticker", "close"]],
+                        on="ticker",
+                        suffixes=("_today", "_next")
+                    )
+
+                    merged["ret"] = (
+                        np.log(merged["close_next"]) -
+                        np.log(merged["close_today"])
+                    )
+
+                elif "return" in next_slice.columns:
+
+                    merged = pd.merge(
+                        signal_slice[["ticker"]],
+                        next_slice[["ticker", "return"]],
+                        on="ticker"
+                    )
+
+                    merged["ret"] = merged["return"]
+
+                else:
+                    continue
 
                 daily_ret = 0.0
 
@@ -202,7 +218,6 @@ class WalkForwardValidator:
     def aggregate_results(self, results, equity_curve):
 
         df = pd.DataFrame(results)
-
         curve = np.array(equity_curve, dtype=float)
 
         if len(curve) == 0:
