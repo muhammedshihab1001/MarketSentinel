@@ -2,9 +2,10 @@ import logging
 import time
 import gc
 import hashlib
+import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Response, Request
+from fastapi import FastAPI, Response, Request, HTTPException
 from fastapi.responses import JSONResponse
 from prometheus_client import generate_latest
 
@@ -34,7 +35,11 @@ BOOT_ID = hashlib.sha256(
     str(time.time()).encode()
 ).hexdigest()[:12]
 
-STARTUP_TIMEOUT_SEC = 120
+STARTUP_TIMEOUT_SEC = int(
+    os.getenv("STARTUP_TIMEOUT_SEC", "120")
+)
+
+APP_VERSION = os.getenv("APP_VERSION", "3.1.0")
 
 
 # =====================================================
@@ -48,6 +53,8 @@ class ReadinessState:
         self.redis_connected = False
         self.schema_signature = None
         self.model_version = None
+        self.artifact_hash = None
+        self.dataset_hash = None
         self.boot_id = BOOT_ID
         self.start_time = int(time.time())
 
@@ -64,6 +71,10 @@ readiness = ReadinessState()
 # =====================================================
 
 async def global_exception_handler(request: Request, exc: Exception):
+
+    # Preserve FastAPI HTTPExceptions
+    if isinstance(exc, HTTPException):
+        raise exc
 
     logger.exception("Unhandled API error")
 
@@ -96,11 +107,16 @@ async def lifespan(app: FastAPI):
         loader = ModelLoader()
 
         # Force model load
-        _ = loader.xgb
+        model = loader.xgb
 
         readiness.models_loaded = True
         readiness.schema_signature = get_schema_signature()
         readiness.model_version = loader.xgb_version
+        readiness.artifact_hash = loader.artifact_hash
+        readiness.dataset_hash = loader.dataset_hash
+
+        if not readiness.schema_signature:
+            raise RuntimeError("Schema signature missing at startup.")
 
         # -------------------------------------------------
         # REDIS CHECK
@@ -150,7 +166,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="MarketSentinel Portfolio API",
-    version="3.0.0",
+    version=APP_VERSION,
     lifespan=lifespan
 )
 
@@ -175,6 +191,7 @@ async def root():
         "status": "running",
         "boot_id": readiness.boot_id,
         "model_version": readiness.model_version,
+        "artifact_hash": readiness.artifact_hash,
         "docs": "/docs",
         "metrics": "/metrics"
     }
@@ -186,7 +203,10 @@ async def root():
 
 @app.get("/metrics")
 def metrics():
-    return Response(generate_latest(), media_type="text/plain")
+    return Response(
+        generate_latest(),
+        media_type="text/plain"
+    )
 
 
 # =====================================================
@@ -203,6 +223,8 @@ def readiness_probe():
         "status": "ready",
         "boot_id": readiness.boot_id,
         "model_version": readiness.model_version,
+        "artifact_hash": readiness.artifact_hash,
+        "dataset_hash": readiness.dataset_hash,
         "schema_signature": readiness.schema_signature,
         "redis_connected": readiness.redis_connected,
         "mode": "degraded" if not readiness.redis_connected else "normal",
