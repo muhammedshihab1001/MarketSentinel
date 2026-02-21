@@ -100,7 +100,8 @@ class InferencePipeline:
         self.drift_detector = DriftDetector()
         self.breaker = CircuitBreaker()
 
-        self.schema_sig = get_schema_signature()
+        # Force deterministic model load
+        _ = self.models.xgb
 
         self._validate_models_loaded()
 
@@ -110,23 +111,27 @@ class InferencePipeline:
 
     def _validate_models_loaded(self):
 
-        model = self.models.xgb
+        container = self.models._xgb_container
+
+        if container is None:
+            raise RuntimeError("Model container missing.")
+
+        model = container.model
 
         if not hasattr(model, "predict_proba"):
             raise RuntimeError("Loaded model is not a classifier.")
 
-        if not hasattr(self.models, "metadata"):
-            raise RuntimeError("Model metadata missing.")
+        runtime_schema = get_schema_signature()
 
-        metadata_schema = self.models.metadata.get("schema_signature")
-
-        if metadata_schema != self.schema_sig:
+        if container.schema_signature != runtime_schema:
             raise RuntimeError(
                 "Schema signature mismatch between training and inference."
             )
 
         logger.info("Model + schema signature verified.")
 
+    ############################################################
+    # DATASET HASH FOR CACHE KEY
     ############################################################
 
     def _dataset_hash(self, df: pd.DataFrame) -> str:
@@ -261,7 +266,7 @@ class InferencePipeline:
             cache_key = self.cache.build_key({
                 "model_version": self.models.xgb_version,
                 "dataset_hash": dataset_hash,
-                "schema": self.schema_sig
+                "schema": get_schema_signature()
             })
 
             cached = self.cache.get(cache_key)
