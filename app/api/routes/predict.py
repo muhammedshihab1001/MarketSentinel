@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from fastapi.concurrency import run_in_threadpool
-import datetime
 import time
 import asyncio
 import os
@@ -11,7 +10,6 @@ import logging
 from app.inference.pipeline import InferencePipeline
 from app.inference.model_loader import ModelLoader
 from core.schema.feature_schema import get_schema_signature
-from core.signals.signal_engine import StrategyEngine
 
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
@@ -27,7 +25,6 @@ logger = logging.getLogger("marketsentinel.api")
 # ------------------------------------------------
 
 _pipeline = None
-_strategy_engine = None
 _model_loader = None
 
 
@@ -38,13 +35,6 @@ def get_pipeline():
     return _pipeline
 
 
-def get_strategy_engine():
-    global _strategy_engine
-    if _strategy_engine is None:
-        _strategy_engine = StrategyEngine()
-    return _strategy_engine
-
-
 def get_loader():
     global _model_loader
     if _model_loader is None:
@@ -53,7 +43,7 @@ def get_loader():
 
 
 # ------------------------------------------------
-# CONCURRENCY GATE
+# CONCURRENCY CONTROL
 # ------------------------------------------------
 
 MAX_CONCURRENT_INFERENCES = int(
@@ -61,44 +51,30 @@ MAX_CONCURRENT_INFERENCES = int(
 )
 
 REQUEST_TIMEOUT = int(
-    os.getenv("INFERENCE_TIMEOUT_SEC", "25")
+    os.getenv("INFERENCE_TIMEOUT_SEC", "30")
+)
+
+MAX_BATCH_SIZE = int(
+    os.getenv("MAX_BATCH_SIZE", "50")
 )
 
 inference_semaphore = asyncio.Semaphore(
     MAX_CONCURRENT_INFERENCES
 )
 
-MAX_BATCH_SIZE = int(
-    os.getenv("MAX_BATCH_SIZE", "10")
-)
-
-TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,10}$")
+TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 
 
-# ----------------------------------------
-# REQUEST SCHEMAS
-# ----------------------------------------
+# ------------------------------------------------
+# REQUEST SCHEMA
+# ------------------------------------------------
 
-class PredictionRequest(BaseModel):
-    ticker: str = Field(default="AAPL")
-
-    @field_validator("ticker")
-    @classmethod
-    def validate_ticker(cls, v: str):
-        v = v.upper().strip()
-
-        if not TICKER_REGEX.match(v):
-            raise ValueError("Invalid ticker format")
-
-        return v
-
-
-class BatchPredictionRequest(BaseModel):
-    tickers: list[str] = Field(..., min_length=1, max_length=50)
+class PortfolioRequest(BaseModel):
+    tickers: list[str] = Field(..., min_length=5, max_length=200)
 
     @field_validator("tickers")
     @classmethod
-    def normalize(cls, tickers):
+    def validate_and_normalize(cls, tickers):
 
         cleaned = []
 
@@ -110,20 +86,27 @@ class BatchPredictionRequest(BaseModel):
 
             cleaned.append(t)
 
+        # remove duplicates
         return list(set(cleaned))
 
 
-# ----------------------------------------
-# SINGLE INFERENCE
-# ----------------------------------------
+# ------------------------------------------------
+# PORTFOLIO ENDPOINT
+# ------------------------------------------------
 
-@router.post("/predict")
-async def predict(req: PredictionRequest):
+@router.post("/portfolio")
+async def build_portfolio(req: PortfolioRequest):
 
-    endpoint = "/predict"
+    endpoint = "/portfolio"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
 
     start_time = time.time()
+
+    if len(req.tickers) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Batch size exceeds limit ({MAX_BATCH_SIZE})"
+        )
 
     try:
 
@@ -131,42 +114,43 @@ async def predict(req: PredictionRequest):
 
             result = await asyncio.wait_for(
                 run_in_threadpool(
-                    get_pipeline().run,
-                    req.ticker
+                    get_pipeline().run_batch,
+                    req.tickers
                 ),
                 timeout=REQUEST_TIMEOUT
             )
 
-        # Attach model metadata
         loader = get_loader()
 
         return {
             "meta": {
-                "model_version": loader.xgb_version if hasattr(loader, "xgb_version") else "latest",
+                "model_version": getattr(loader, "_xgb_container", None).version
+                if getattr(loader, "_xgb_container", None)
+                else "latest",
                 "schema_signature": get_schema_signature(),
                 "timestamp": int(time.time())
             },
-            "data": result
+            "portfolio": result
         }
 
     except asyncio.TimeoutError:
 
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.error("Inference timeout")
+        logger.error("Portfolio inference timeout")
 
         raise HTTPException(
             status_code=504,
-            detail="Inference timeout"
+            detail="Portfolio inference timeout"
         )
 
     except Exception:
 
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.exception("Inference failure")
+        logger.exception("Portfolio inference failure")
 
         raise HTTPException(
             status_code=500,
-            detail="Inference failed"
+            detail="Portfolio inference failed"
         )
 
     finally:
@@ -176,123 +160,9 @@ async def predict(req: PredictionRequest):
         )
 
 
-# ----------------------------------------
-# BATCH INFERENCE
-# ----------------------------------------
-
-@router.post("/predict/batch")
-async def predict_batch(req: BatchPredictionRequest):
-
-    endpoint = "/predict/batch"
-    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
-
-    start_time = time.time()
-
-    if len(req.tickers) > MAX_BATCH_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Batch size exceeds limit ({MAX_BATCH_SIZE})"
-        )
-
-    results = []
-
-    try:
-
-        for ticker in req.tickers:
-
-            async with inference_semaphore:
-
-                try:
-
-                    result = await asyncio.wait_for(
-                        run_in_threadpool(
-                            get_pipeline().run,
-                            ticker
-                        ),
-                        timeout=REQUEST_TIMEOUT
-                    )
-
-                    results.append(result)
-
-                except Exception:
-                    logger.exception(f"Batch inference failed for {ticker}")
-                    results.append({
-                        "ticker": ticker,
-                        "error": "inference_failed"
-                    })
-
-        return {
-            "count": len(results),
-            "results": results
-        }
-
-    finally:
-
-        API_LATENCY.labels(endpoint=endpoint).observe(
-            time.time() - start_time
-        )
-
-
-# ----------------------------------------
-# STRATEGY ENDPOINT
-# ----------------------------------------
-
-@router.post("/strategy/top")
-async def top_opportunities(req: BatchPredictionRequest):
-
-    endpoint = "/strategy/top"
-    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
-
-    start_time = time.time()
-
-    if len(req.tickers) > MAX_BATCH_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Batch size exceeds limit ({MAX_BATCH_SIZE})"
-        )
-
-    predictions = []
-
-    try:
-
-        for ticker in req.tickers:
-
-            async with inference_semaphore:
-
-                try:
-
-                    result = await asyncio.wait_for(
-                        run_in_threadpool(
-                            get_pipeline().run,
-                            ticker
-                        ),
-                        timeout=REQUEST_TIMEOUT
-                    )
-
-                    predictions.append(result)
-
-                except Exception:
-                    logger.exception(f"Strategy inference failed for {ticker}")
-
-        strategy_engine = get_strategy_engine()
-
-        return {
-            "top_buys": strategy_engine.top_opportunities(predictions),
-            "sell_alerts": strategy_engine.sell_alerts(predictions),
-            "signal_distribution": strategy_engine.signal_distribution(predictions),
-            "analyzed": len(predictions)
-        }
-
-    finally:
-
-        API_LATENCY.labels(endpoint=endpoint).observe(
-            time.time() - start_time
-        )
-
-
-# ----------------------------------------
-# HEALTH ENDPOINT
-# ----------------------------------------
+# ------------------------------------------------
+# HEALTH
+# ------------------------------------------------
 
 @router.get("/health")
 async def health():
@@ -302,9 +172,9 @@ async def health():
     }
 
 
-# ----------------------------------------
-# READINESS ENDPOINT
-# ----------------------------------------
+# ------------------------------------------------
+# READINESS
+# ------------------------------------------------
 
 @router.get("/ready")
 async def readiness():
