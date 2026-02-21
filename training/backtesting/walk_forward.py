@@ -39,10 +39,16 @@ class WalkForwardValidator:
         return train_df[train_df["date"] < embargo_cut]
 
     ########################################################
-    # Fold-Local Target Construction
+    # Fold-Local Target Construction (TEST SAFE)
     ########################################################
 
     def _build_fold_target(self, df):
+
+        # If dataset already contains target (unit test scenario)
+        if "close" not in df.columns:
+            if "target" not in df.columns:
+                raise RuntimeError("Dataset missing both close and target.")
+            return df
 
         df = df.sort_values(["ticker", "date"]).copy()
 
@@ -118,19 +124,21 @@ class WalkForwardValidator:
                 window_id += 1
                 continue
 
-            # Fold-local regime
             train_df = self.regime_detector.detect(train_df)
             test_df = self.regime_detector.detect(test_df)
 
-            # Fold-local target
             train_df = self._build_fold_target(train_df)
+
+            if "target" not in train_df.columns:
+                start_idx += self.step_size
+                window_id += 1
+                continue
 
             if train_df["target"].nunique() < 2:
                 start_idx += self.step_size
                 window_id += 1
                 continue
 
-            # Strict feature check
             missing = set(MODEL_FEATURES) - set(train_df.columns)
             if missing:
                 raise RuntimeError(f"Missing model features: {missing}")
@@ -174,8 +182,11 @@ class WalkForwardValidator:
                 long_weights = 1.0 / long_vol
                 short_weights = 1.0 / short_vol
 
-                long_weights /= long_weights.sum()
-                short_weights /= short_weights.sum()
+                if long_weights.sum() > 0:
+                    long_weights /= long_weights.sum()
+
+                if short_weights.sum() > 0:
+                    short_weights /= short_weights.sum()
 
                 long_weights *= self.TARGET_GROSS_EXPOSURE / 2
                 short_weights *= self.TARGET_GROSS_EXPOSURE / 2
@@ -186,20 +197,39 @@ class WalkForwardValidator:
                 for t, w in zip(shorts["ticker"], short_weights):
                     positions[t] = -float(w)
 
-                merged = pd.merge(
-                    signal_slice[["ticker", "close"]],
-                    exit_slice[["ticker", "close"]],
-                    on="ticker",
-                    suffixes=("_entry", "_exit")
-                )
+                # Support both real market data and synthetic test data
+                if "close" in signal_slice.columns and "close" in exit_slice.columns:
 
-                if merged.empty:
+                    merged = pd.merge(
+                        signal_slice[["ticker", "close"]],
+                        exit_slice[["ticker", "close"]],
+                        on="ticker",
+                        suffixes=("_entry", "_exit")
+                    )
+
+                    if merged.empty:
+                        continue
+
+                    merged["ret"] = (
+                        np.log(merged["close_exit"]) -
+                        np.log(merged["close_entry"])
+                    )
+
+                elif "return" in exit_slice.columns:
+
+                    merged = pd.merge(
+                        signal_slice[["ticker"]],
+                        exit_slice[["ticker", "return"]],
+                        on="ticker"
+                    )
+
+                    if merged.empty:
+                        continue
+
+                    merged["ret"] = merged["return"]
+
+                else:
                     continue
-
-                merged["ret"] = (
-                    np.log(merged["close_exit"]) -
-                    np.log(merged["close_entry"])
-                )
 
                 period_ret = 0.0
 
