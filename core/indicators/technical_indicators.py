@@ -27,7 +27,6 @@ class TechnicalIndicators:
     def _validate_window(window: int):
         if not isinstance(window, int):
             raise RuntimeError("Window must be int.")
-
         if window < 2:
             raise RuntimeError("Window must be >= 2.")
 
@@ -54,24 +53,18 @@ class TechnicalIndicators:
         ####################################################
 
         if "date" in df.columns:
-
             df["date"] = pd.to_datetime(
                 df["date"],
                 utc=True,
                 errors="raise"
             )
-
             df = df.sort_values("date")
 
             if not df["date"].is_monotonic_increasing:
-                raise RuntimeError(
-                    "Non-monotonic timestamps detected."
-                )
+                raise RuntimeError("Non-monotonic timestamps detected.")
 
             if df["date"].duplicated().any():
-                raise RuntimeError(
-                    "Duplicate timestamps detected."
-                )
+                raise RuntimeError("Duplicate timestamps detected.")
 
         ####################################################
         # PRICE SAFETY
@@ -82,16 +75,11 @@ class TechnicalIndicators:
             errors="coerce"
         )
 
-        close.replace(
-            [np.inf, -np.inf],
-            np.nan,
-            inplace=True
-        )
+        close.replace([np.inf, -np.inf], np.nan, inplace=True)
 
         if close.isna().any():
             raise RuntimeError(
-                "Missing close prices detected — refusing indicator calc. "
-                "Provider integrity compromised."
+                "Missing close prices detected — refusing indicator calc."
             )
 
         if (close <= 0).any():
@@ -102,7 +90,6 @@ class TechnicalIndicators:
         ####################################################
 
         returns = close.pct_change().abs()
-
         if returns.dropna().max() > TechnicalIndicators.MAX_DAILY_RETURN:
             raise RuntimeError(
                 "Unrealistic price jump detected — likely bad data."
@@ -130,7 +117,7 @@ class TechnicalIndicators:
         return ma.astype("float32")
 
     ####################################################
-    # RSI — WILDER SMOOTHING
+    # RSI — WILDER SMOOTHING (FIXED)
     ####################################################
 
     @classmethod
@@ -147,22 +134,37 @@ class TechnicalIndicators:
         loss = -delta.clip(upper=0)
 
         avg_gain = gain.ewm(
-            alpha=1/window,
+            alpha=1 / window,
             adjust=False,
             min_periods=window
         ).mean()
 
         avg_loss = loss.ewm(
-            alpha=1/window,
+            alpha=1 / window,
             adjust=False,
             min_periods=window
         ).mean()
 
-        rs = avg_gain / (avg_loss + 1e-12)
+        rsi = pd.Series(index=close.index, dtype="float32")
 
-        rsi = 100 - (100 / (1 + rs))
+        # Normal case
+        mask_normal = (avg_gain > 0) & (avg_loss > 0)
+        rs = avg_gain[mask_normal] / avg_loss[mask_normal]
+        rsi.loc[mask_normal] = 100 - (100 / (1 + rs))
 
-        rsi.fillna(50, inplace=True)
+        # Gain only
+        mask_gain_only = (avg_gain > 0) & (avg_loss == 0)
+        rsi.loc[mask_gain_only] = 100.0
+
+        # Loss only
+        mask_loss_only = (avg_gain == 0) & (avg_loss > 0)
+        rsi.loc[mask_loss_only] = 0.0
+
+        # Flat market
+        mask_flat = (avg_gain == 0) & (avg_loss == 0)
+        rsi.loc[mask_flat] = 50.0
+
+        rsi.fillna(50.0, inplace=True)
 
         return rsi.clip(0, 100).astype("float32")
 
@@ -215,19 +217,8 @@ class TechnicalIndicators:
         macd_line = ema12 - ema26
         signal = macd_line.ewm(span=9, adjust=False).mean()
 
-        macd_line = macd_line.replace(
-            [np.inf, -np.inf],
-            np.nan
-        ).fillna(0)
-
-        signal = signal.replace(
-            [np.inf, -np.inf],
-            np.nan
-        ).fillna(0)
-
-        ####################################################
-        # EXPLOSION GUARD
-        ####################################################
+        macd_line = macd_line.replace([np.inf, -np.inf], np.nan).fillna(0)
+        signal = signal.replace([np.inf, -np.inf], np.nan).fillna(0)
 
         macd_line = macd_line.clip(-500, 500)
         signal = signal.clip(-500, 500)
