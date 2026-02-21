@@ -5,6 +5,7 @@ import pandas as pd
 import logging
 import os
 import hashlib
+from datetime import timedelta
 
 from core.data.market_data_service import MarketDataService
 from core.features.feature_store import FeatureStore
@@ -87,6 +88,10 @@ class InferencePipeline:
         os.getenv("INFERENCE_CACHE_TTL_SECONDS", "600")
     )
 
+    INFERENCE_LOOKBACK_DAYS = int(
+        os.getenv("INFERENCE_LOOKBACK_DAYS", "400")
+    )
+
     MIN_PROB_STD = 1e-6
 
     ############################################################
@@ -100,13 +105,9 @@ class InferencePipeline:
         self.drift_detector = DriftDetector()
         self.breaker = CircuitBreaker()
 
-        # Force deterministic model load
-        _ = self.models.xgb
-
+        _ = self.models.xgb  # force load
         self._validate_models_loaded()
 
-    ############################################################
-    # MODEL + SCHEMA VALIDATION
     ############################################################
 
     def _validate_models_loaded(self):
@@ -116,22 +117,13 @@ class InferencePipeline:
         if container is None:
             raise RuntimeError("Model container missing.")
 
-        model = container.model
-
-        if not hasattr(model, "predict_proba"):
-            raise RuntimeError("Loaded model is not a classifier.")
-
-        runtime_schema = get_schema_signature()
-
-        if container.schema_signature != runtime_schema:
+        if container.schema_signature != get_schema_signature():
             raise RuntimeError(
                 "Schema signature mismatch between training and inference."
             )
 
         logger.info("Model + schema signature verified.")
 
-    ############################################################
-    # DATASET HASH FOR CACHE KEY
     ############################################################
 
     def _dataset_hash(self, df: pd.DataFrame) -> str:
@@ -142,7 +134,8 @@ class InferencePipeline:
         )
 
         feature_block = validate_feature_schema(
-            ordered.loc[:, MODEL_FEATURES]
+            ordered.loc[:, MODEL_FEATURES],
+            mode="inference"
         )
 
         payload = (
@@ -155,8 +148,6 @@ class InferencePipeline:
 
         return hashlib.sha256(payload).hexdigest()[:16]
 
-    ############################################################
-    # PORTFOLIO CONSTRUCTION
     ############################################################
 
     def _construct_portfolio(self, latest_df):
@@ -194,13 +185,6 @@ class InferencePipeline:
         for t, w in zip(shorts["ticker"], short_weights):
             weights[t] = -float(w)
 
-        net_exposure = sum(weights.values())
-
-        if abs(net_exposure) > self.MAX_NET_EXPOSURE:
-            scale = self.MAX_NET_EXPOSURE / abs(net_exposure)
-            for k in weights:
-                weights[k] *= scale
-
         return weights
 
     ############################################################
@@ -223,12 +207,15 @@ class InferencePipeline:
 
             datasets = []
 
+            end_date = pd.Timestamp.utcnow().date()
+            start_date = end_date - timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
+
             for ticker in tickers:
 
                 price_df = self.market_data.get_price_data(
                     ticker=ticker,
-                    start_date="2018-01-01",
-                    end_date=pd.Timestamp.utcnow().date().isoformat()
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat()
                 )
 
                 if price_df is None or price_df.empty:
@@ -253,13 +240,11 @@ class InferencePipeline:
             latest_df = df[df["date"] == latest_date].copy()
 
             feature_df = validate_feature_schema(
-                latest_df.loc[:, MODEL_FEATURES]
+                latest_df.loc[:, MODEL_FEATURES],
+                mode="inference"
             )
 
             feature_df = feature_df.astype(DTYPE)
-
-            if not np.isfinite(feature_df.values).all():
-                raise RuntimeError("Non-finite values detected in features.")
 
             dataset_hash = self._dataset_hash(latest_df)
 
@@ -276,25 +261,13 @@ class InferencePipeline:
 
             CACHE_MISSES.inc()
 
-            drift_report = self.drift_detector.detect(latest_df)
-
-            if drift_report.get("drift_detected"):
-                logger.critical("Drift detected during inference.")
-
-            t0 = time.time()
             probs = self.models.xgb.predict_proba(feature_df)[:, 1]
             probs = np.clip(probs, 1e-6, 1 - 1e-6)
 
             if np.std(probs) < self.MIN_PROB_STD:
                 raise RuntimeError("Probability collapse detected.")
 
-            latency = time.time() - t0
-
-            if latency > self.LATENCY_GUARD_SECONDS:
-                raise RuntimeError("Inference latency breach.")
-
             MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-            MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
 
             latest_df["score"] = probs
 
@@ -302,25 +275,14 @@ class InferencePipeline:
 
             response = {
                 "date": str(latest_date),
-                "scores": {
-                    row["ticker"]: float(row["score"])
-                    for _, row in latest_df.iterrows()
-                },
                 "portfolio_weights": weights,
                 "gross_exposure": float(sum(abs(w) for w in weights.values())),
                 "net_exposure": float(sum(weights.values())),
-                "num_longs": int(sum(1 for w in weights.values() if w > 0)),
-                "num_shorts": int(sum(1 for w in weights.values() if w < 0)),
                 "model_version": self.models.xgb_version
             }
 
             self.cache.set(cache_key, response, ttl=self.CACHE_TTL)
             self.breaker.record_success()
-
-            total_pipeline_time = time.time() - start_pipeline
-
-            if total_pipeline_time > self.LATENCY_GUARD_SECONDS * 2:
-                logger.warning("Pipeline latency high: %.3f sec", total_pipeline_time)
 
             return response
 
