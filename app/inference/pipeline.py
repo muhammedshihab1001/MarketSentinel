@@ -33,12 +33,7 @@ from app.monitoring.metrics import (
 logger = logging.getLogger("marketsentinel.pipeline")
 
 
-############################################################
-# CIRCUIT BREAKER
-############################################################
-
 class CircuitBreaker:
-
     def __init__(self, threshold=3, cooldown=120):
         self.threshold = threshold
         self.cooldown = cooldown
@@ -69,21 +64,16 @@ class CircuitBreaker:
             self.failures = 0
 
 
-############################################################
-# INFERENCE PIPELINE
-############################################################
-
 class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
     TOP_K = 3
     BOTTOM_K = 3
     MIN_PROB_STD = 1e-6
+    WEIGHT_TOLERANCE = 1e-6
 
     CACHE_TTL = int(os.getenv("INFERENCE_CACHE_TTL_SECONDS", "600"))
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
-
-    ############################################################
 
     def __init__(self):
 
@@ -115,41 +105,36 @@ class InferencePipeline:
 
     ############################################################
 
-    def _dataset_hash(self, df: pd.DataFrame) -> str:
+    def _validate_features_exist(self, df: pd.DataFrame):
 
-        ordered = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+        missing = set(MODEL_FEATURES) - set(df.columns)
 
-        feature_block = validate_feature_schema(
-            ordered.loc[:, MODEL_FEATURES],
-            mode="inference"
-        )
-
-        payload = (
-            feature_block
-            .astype(float)
-            .round(8)
-            .to_csv(index=False)
-            .encode()
-        )
-
-        return hashlib.sha256(payload).hexdigest()[:16]
+        if missing:
+            raise RuntimeError(
+                f"Missing required model features: {missing}"
+            )
 
     ############################################################
 
     def _construct_portfolio(self, latest_df):
+
+        if "volatility" not in latest_df.columns:
+            raise RuntimeError("Volatility feature missing for weighting.")
 
         n_assets = len(latest_df)
 
         if n_assets < 4:
             raise RuntimeError("Insufficient assets for portfolio construction.")
 
+        latest_df = latest_df.sort_values(
+            ["score", "ticker"]
+        )
+
         k_long = min(self.TOP_K, n_assets // 2)
         k_short = min(self.BOTTOM_K, n_assets // 2)
 
-        ranked = latest_df.sort_values("score")
-
-        longs = ranked.tail(k_long)
-        shorts = ranked.head(k_short)
+        longs = latest_df.tail(k_long)
+        shorts = latest_df.head(k_short)
 
         long_vol = longs["volatility"].replace(0, 1e-6)
         short_vol = shorts["volatility"].replace(0, 1e-6)
@@ -171,138 +156,26 @@ class InferencePipeline:
         for t, w in zip(shorts["ticker"], short_weights):
             weights[t] = -float(w)
 
+        gross = sum(abs(v) for v in weights.values())
+
+        if abs(gross - self.TARGET_GROSS_EXPOSURE) > self.WEIGHT_TOLERANCE:
+            raise RuntimeError(
+                f"Gross exposure mismatch: {gross}"
+            )
+
         return weights
 
     ############################################################
-    # LIVE INFERENCE
-    ############################################################
-
-    def run_batch(self, tickers: list[str]):
-
-        MarketUniverse.validate_subset(tickers)
-
-        if not self.breaker.allow():
-            PIPELINE_FAILURES.labels(stage="circuit_open").inc()
-            raise RuntimeError("Inference circuit breaker open.")
-
-        INFERENCE_IN_PROGRESS.inc()
-
-        try:
-
-            datasets = []
-
-            end_date = pd.Timestamp.utcnow().date()
-            start_date = end_date - timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
-
-            for ticker in tickers:
-
-                price_df = self.market_data.get_price_data(
-                    ticker=ticker,
-                    start_date=start_date.isoformat(),
-                    end_date=end_date.isoformat()
-                )
-
-                if price_df is None or price_df.empty:
-                    continue
-
-                dataset = self.feature_store.get_features(
-                    price_df,
-                    sentiment_df=None,
-                    ticker=ticker,
-                    training=False
-                )
-
-                if dataset is not None and not dataset.empty:
-                    datasets.append(dataset)
-
-            if not datasets:
-                raise RuntimeError("No valid datasets built.")
-
-            df = pd.concat(datasets, ignore_index=True)
-
-            latest_date = df["date"].max()
-            latest_df = df[df["date"] == latest_date].copy()
-
-            return self._run_model_and_construct(latest_df, use_cache=True)
-
-        except Exception as e:
-            self.breaker.record_failure()
-            PIPELINE_FAILURES.labels(stage="inference").inc()
-            logger.exception("Batch inference failure: %s", str(e))
-            raise
-
-        finally:
-            INFERENCE_IN_PROGRESS.dec()
-
-    ############################################################
-    # HISTORICAL INFERENCE (CORRECT VERSION)
-    ############################################################
-
-    def run_historical_with_features(
-        self,
-        full_feature_cache: dict[str, pd.DataFrame],
-        evaluation_date: pd.Timestamp
-    ):
-
-        if not full_feature_cache:
-            raise RuntimeError("Empty feature cache.")
-
-        eval_date = pd.to_datetime(evaluation_date).normalize()
-
-        sliced = []
-
-        for ticker, feature_df in full_feature_cache.items():
-
-            if feature_df is None or feature_df.empty:
-                continue
-
-            feature_df = feature_df.copy()
-            feature_df["date"] = pd.to_datetime(
-                feature_df["date"]
-            ).dt.normalize()
-
-            df = feature_df[feature_df["date"] == eval_date]
-
-            if not df.empty:
-                sliced.append(df)
-
-        if not sliced:
-            raise RuntimeError("No data for evaluation date.")
-
-        latest_df = pd.concat(sliced, ignore_index=True)
-
-        return self._run_model_and_construct(
-            latest_df,
-            use_cache=False
-        )
-
-    ############################################################
-    # SHARED MODEL EXECUTION
-    ############################################################
 
     def _run_model_and_construct(self, latest_df, use_cache: bool):
+
+        # 🔒 Hard feature existence check
+        self._validate_features_exist(latest_df)
 
         feature_df = validate_feature_schema(
             latest_df.loc[:, MODEL_FEATURES],
             mode="inference"
         ).astype(DTYPE)
-
-        if use_cache:
-
-            dataset_hash = self._dataset_hash(latest_df)
-
-            cache_key = self.cache.build_key({
-                "model_version": self.models.xgb_version,
-                "dataset_hash": dataset_hash,
-                "schema": get_schema_signature()
-            })
-
-            cached = self.cache.get(cache_key)
-            if cached:
-                CACHE_HITS.inc()
-                return cached
-
-            CACHE_MISSES.inc()
 
         t0 = time.time()
         probs = self.models.xgb.predict_proba(feature_df)[:, 1]
@@ -316,6 +189,7 @@ class InferencePipeline:
         if np.std(probs) < self.MIN_PROB_STD:
             raise RuntimeError("Probability collapse detected.")
 
+        latest_df = latest_df.copy()
         latest_df["score"] = probs
         latest_df["rank_pct"] = latest_df["score"].rank(pct=True)
 
@@ -335,9 +209,5 @@ class InferencePipeline:
                 "signal": row["signal"],
                 "weight": float(weights.get(row["ticker"], 0.0))
             })
-
-        if use_cache:
-            self.cache.set(cache_key, portfolio_rows, ttl=self.CACHE_TTL)
-            self.breaker.record_success()
 
         return portfolio_rows
