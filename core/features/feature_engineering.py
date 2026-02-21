@@ -171,7 +171,7 @@ class FeatureEngineer:
         )
 
     ########################################################
-    # TECHNICALS (PANDAS 3.0 SAFE)
+    # TECHNICALS
     ########################################################
 
     @classmethod
@@ -201,17 +201,20 @@ class FeatureEngineer:
     @classmethod
     def add_ema(cls, df):
 
-        df["ema_10"] = (
+        ema10 = (
             df.groupby("ticker")["close"]
-            .ewm(span=10, adjust=False)
-            .mean()
+            .apply(lambda x: x.ewm(span=10, adjust=False).mean())
+            .reset_index(level=0, drop=True)
         )
 
-        df["ema_50"] = (
+        ema50 = (
             df.groupby("ticker")["close"]
-            .ewm(span=50, adjust=False)
-            .mean()
+            .apply(lambda x: x.ewm(span=50, adjust=False).mean())
+            .reset_index(level=0, drop=True)
         )
+
+        df["ema_10"] = ema10
+        df["ema_50"] = ema50
 
         df["ema_ratio"] = (
             df["ema_10"] / df["ema_50"]
