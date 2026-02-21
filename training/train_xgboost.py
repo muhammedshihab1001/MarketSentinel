@@ -44,13 +44,15 @@ def enforce_determinism():
 
 
 ############################################################
-# HASH UTILITIES (STRICT + ORDERED)
+# HASH UTILITIES
 ############################################################
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
 
+    # 🔒 Strict schema enforcement for final dataset
     feature_block = validate_feature_schema(
-        df.loc[:, MODEL_FEATURES]
+        df.loc[:, MODEL_FEATURES],
+        strict=True
     )
 
     ordered = pd.concat(
@@ -125,7 +127,7 @@ def load_training_data(start_date, end_date):
 
 
 ############################################################
-# FINAL TARGET (STRICT CAUSAL)
+# FINAL TARGET
 ############################################################
 
 def build_final_target(df: pd.DataFrame):
@@ -163,7 +165,32 @@ def build_final_target(df: pd.DataFrame):
 
 def trainer(train_df):
 
-    X = validate_feature_schema(train_df.loc[:, MODEL_FEATURES])
+    # ⚠ Non-strict during walk-forward folds
+    X = validate_feature_schema(
+        train_df.loc[:, MODEL_FEATURES],
+        strict=False
+    )
+
+    y = train_df["target"]
+
+    pipeline = build_xgboost_pipeline(y)
+    pipeline.fit(X, y)
+
+    return pipeline
+
+
+############################################################
+# FINAL TRAINER (STRICT)
+############################################################
+
+def final_trainer(train_df):
+
+    # 🔒 Strict schema enforcement for production model
+    X = validate_feature_schema(
+        train_df.loc[:, MODEL_FEATURES],
+        strict=True
+    )
+
     y = train_df["target"]
 
     pipeline = build_xgboost_pipeline(y)
@@ -236,15 +263,17 @@ def main(start_date=None, end_date=None):
 
     raw_df = load_training_data(start_date, end_date)
 
+    # Walk-forward validation
     validator = WalkForwardValidator(trainer)
     metrics = validator.run(raw_df)
 
+    # Final production dataset
     final_df = build_final_target(raw_df)
 
     dataset_hash = compute_dataset_hash(final_df)
     training_code_hash = compute_training_code_hash()
 
-    final_model = trainer(final_df)
+    final_model = final_trainer(final_df)
 
     export_artifacts(
         final_model,
