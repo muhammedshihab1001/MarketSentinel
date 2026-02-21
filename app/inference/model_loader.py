@@ -21,7 +21,7 @@ logger = logging.getLogger("marketsentinel.loader")
 
 
 ############################################################
-# MODEL CONTAINER
+# MODEL CONTAINER (IMMUTABLE)
 ############################################################
 
 @dataclass(frozen=True)
@@ -121,9 +121,10 @@ class ModelLoader:
         if not hasattr(model, "predict_proba"):
             raise RuntimeError("Invalid model artifact loaded.")
 
-        # STRICT FEATURE CONTRACT
+        # STRICT FEATURE CONTRACT CHECK
         if hasattr(model, "feature_names"):
             trained_features = list(model.feature_names)
+
             if trained_features != MODEL_FEATURES:
                 raise RuntimeError(
                     "Model feature contract mismatch at inference."
@@ -132,7 +133,7 @@ class ModelLoader:
         return model
 
     ########################################################
-    # RELOAD IF NEEDED (THREAD SAFE)
+    # RELOAD IF NEEDED (ATOMIC SWAP)
     ########################################################
 
     def _reload_xgb_if_needed(self):
@@ -147,6 +148,7 @@ class ModelLoader:
             model_path, metadata_path, version = \
                 self._find_latest_artifact(base_dir)
 
+            # If already loaded and same version → return fast
             if (
                 self._xgb_container and
                 self._xgb_container.version == version
@@ -155,36 +157,52 @@ class ModelLoader:
 
             logger.info("Loading XGBoost version=%s", version)
 
-            # STRICT METADATA VALIDATION
             meta = MetadataManager.load_metadata(metadata_path)
 
-            if meta["metadata_type"] != "training_manifest_v1":
+            ####################################################
+            # STRICT METADATA VALIDATION
+            ####################################################
+
+            if meta.get("metadata_type") != "training_manifest_v1":
                 raise RuntimeError("Unsupported metadata type.")
 
-            if meta["schema_signature"] != get_schema_signature():
+            if meta.get("schema_signature") != get_schema_signature():
                 raise RuntimeError("Schema mismatch during inference.")
 
-            if meta["schema_version"] != SCHEMA_VERSION:
+            if meta.get("schema_version") != SCHEMA_VERSION:
                 raise RuntimeError("Schema version drift detected.")
 
-            if meta["features"] != MODEL_FEATURES:
-                raise RuntimeError(
-                    "Metadata feature contract mismatch."
-                )
+            if meta.get("features") != MODEL_FEATURES:
+                raise RuntimeError("Metadata feature contract mismatch.")
 
-            artifact_hash = self._sha256(model_path)
+            ####################################################
+            # ARTIFACT INTEGRITY CHECK
+            ####################################################
+
+            artifact_hash_actual = self._sha256(model_path)
+
+            if meta.get("artifact_hash"):
+                if meta["artifact_hash"] != artifact_hash_actual:
+                    raise RuntimeError("Artifact tampering detected.")
+
+            ####################################################
+            # SAFE LOAD
+            ####################################################
+
             model = self._safe_load_model(model_path)
 
-            container = LoadedModel(
+            # Create new container first (atomic swap pattern)
+            new_container = LoadedModel(
                 model=model,
                 version=version,
                 schema_signature=meta["schema_signature"],
                 dataset_hash=meta["dataset_hash"],
                 training_code_hash=meta["training_code_hash"],
-                artifact_hash=artifact_hash
+                artifact_hash=artifact_hash_actual
             )
 
-            self._xgb_container = container
+            # Atomic replace
+            self._xgb_container = new_container
 
             MODEL_VERSION.labels(
                 model="xgboost",
@@ -193,7 +211,7 @@ class ModelLoader:
 
             logger.info("Model loaded successfully | version=%s", version)
 
-            return container.model
+            return new_container.model
 
     ########################################################
     # STRICT FEATURE VALIDATION
