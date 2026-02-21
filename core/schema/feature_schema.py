@@ -8,7 +8,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "30.1"  # bumped
+SCHEMA_VERSION = "30.2"  # bumped – strict production lock
 
 ############################################################
 # CORE FEATURES
@@ -58,7 +58,7 @@ CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = (
 )
 
 ############################################################
-# MODEL FEATURE CONTRACT
+# MODEL FEATURE CONTRACT (IMMUTABLE)
 ############################################################
 
 MODEL_FEATURES: List[str] = list(
@@ -102,12 +102,30 @@ def validate_feature_schema(
     if missing_core:
         raise RuntimeError(f"Missing core features: {missing_core}")
 
-    feature_df = df.loc[:, [c for c in MODEL_FEATURES if c in df.columns]]
-    feature_df = feature_df.astype(DTYPE, copy=True)
+    ########################################################
+    # STRICT MODE → ENFORCE FULL CONTRACT
+    ########################################################
+
+    if strict:
+
+        missing_all = set(MODEL_FEATURES) - set(df.columns)
+        if missing_all:
+            raise RuntimeError(
+                f"Strict mode: missing required features {missing_all}"
+            )
+
+        feature_df = df.loc[:, MODEL_FEATURES].copy()
+
+    else:
+        feature_df = df.loc[
+            :, [c for c in MODEL_FEATURES if c in df.columns]
+        ].copy()
+
+    feature_df = feature_df.astype(DTYPE)
     feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
     ########################################################
-    # CORE FEATURE VALIDATION
+    # CORE VALIDATION
     ########################################################
 
     for col in CORE_FEATURES:
@@ -118,7 +136,6 @@ def validate_feature_schema(
         if finite_vals.empty:
             raise RuntimeError(f"Core feature fully invalid: {col}")
 
-        # 🔒 Strict only for final training
         if strict and finite_vals.nunique() <= 1:
             raise RuntimeError(f"Constant CORE feature detected: {col}")
 
@@ -126,25 +143,39 @@ def validate_feature_schema(
             logger.warning(f"Low variance core feature: {col}")
 
     ########################################################
-    # AUTO-DROP CONSTANT CROSS FEATURES
+    # CROSS FEATURE BEHAVIOR
     ########################################################
 
-    drop_cols = []
+    if not strict:
 
-    for col in CROSS_SECTIONAL_FEATURES:
+        drop_cols = []
 
-        if col not in feature_df.columns:
-            continue
+        for col in CROSS_SECTIONAL_FEATURES:
 
-        series = feature_df[col]
-        finite_vals = series[np.isfinite(series)]
+            if col not in feature_df.columns:
+                continue
 
-        if finite_vals.empty or finite_vals.nunique() <= 1:
-            logger.warning(f"Dropping constant cross feature: {col}")
-            drop_cols.append(col)
+            series = feature_df[col]
+            finite_vals = series[np.isfinite(series)]
 
-    if drop_cols:
-        feature_df.drop(columns=drop_cols, inplace=True)
+            if finite_vals.empty or finite_vals.nunique() <= 1:
+                logger.warning(
+                    f"Dropping constant cross feature: {col}"
+                )
+                drop_cols.append(col)
+
+        if drop_cols:
+            feature_df.drop(columns=drop_cols, inplace=True)
+
+    ########################################################
+    # FINAL SANITY CHECK
+    ########################################################
+
+    if feature_df.isnull().any().any():
+        raise RuntimeError("NaN detected after schema validation.")
+
+    if not np.isfinite(feature_df.values).all():
+        raise RuntimeError("Non-finite values detected.")
 
     return feature_df.astype(DTYPE, copy=False)
 
