@@ -21,9 +21,8 @@ from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
 from core.monitoring.drift_detector import DriftDetector
 
-from training.backtesting.walk_forward import WalkForwardValidator
+from training.backtesting.walk_forward import WalkForwardValidator, FORWARD_DAYS
 from models.xgboost_model import build_xgboost_pipeline
-
 
 logger = logging.getLogger("marketsentinel.train_xgb")
 
@@ -32,7 +31,6 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
-FORWARD_DAYS = 5
 
 
 ############################################################
@@ -66,72 +64,7 @@ def compute_training_code_hash() -> str:
 
 
 ############################################################
-# CROSS-SECTIONAL FEATURES
-############################################################
-
-def build_cross_sectional_features(df: pd.DataFrame):
-
-    cross_cols = [
-        "momentum_20",
-        "return_lag5",
-        "rsi",
-        "volatility",
-        "ema_ratio"
-    ]
-
-    for col in cross_cols:
-
-        if col not in df.columns:
-            raise RuntimeError(f"Missing base feature: {col}")
-
-        df[f"{col}_z"] = (
-            df.groupby("date")[col]
-            .transform(lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9))
-        ).clip(-5, 5)
-
-        df[f"{col}_rank"] = (
-            df.groupby("date")[col]
-            .transform(lambda x: x.rank(pct=True))
-        )
-
-    return df
-
-
-############################################################
-# STRICTLY CAUSAL TARGET
-############################################################
-
-def build_cross_sectional_target(df: pd.DataFrame):
-
-    if "close" not in df.columns:
-        raise RuntimeError("Target construction requires 'close' column.")
-
-    df = df.sort_values(["ticker", "date"]).copy()
-
-    df["forward_log_return"] = (
-        df.groupby("ticker")["close"]
-        .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
-    )
-
-    df = df.dropna(subset=["forward_log_return"])
-
-    df["alpha_rank_pct"] = (
-        df.groupby("date")["forward_log_return"]
-        .rank(pct=True)
-    )
-
-    df["target"] = np.nan
-    df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
-    df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
-
-    df = df.dropna(subset=["target"])
-    df["target"] = df["target"].astype(int)
-
-    return df
-
-
-############################################################
-# LOAD TRAINING DATA (LEAK-SAFE + METADATA SAFE)
+# LOAD RAW TRAINING DATA (NO TARGET, NO CROSS-SECTIONAL)
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -175,36 +108,42 @@ def load_training_data(start_date, end_date):
     if df["date"].nunique() < MIN_UNIQUE_DATES:
         raise RuntimeError("Insufficient unique dates.")
 
-    df = build_cross_sectional_features(df)
-    df = build_cross_sectional_target(df)
+    df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
-    if "target" not in df.columns:
-        raise RuntimeError("Target column missing.")
+    return df
 
-    metadata = df[["date", "ticker"]].copy()
-    y = df["target"].copy()
 
-    feature_df = df.loc[:, MODEL_FEATURES].copy()
-    validated_features = validate_feature_schema(feature_df)
+############################################################
+# FINAL TARGET (ONLY FOR FINAL MODEL)
+############################################################
 
-    metadata = metadata.loc[validated_features.index]
-    y = y.loc[validated_features.index]
+def build_final_target(df: pd.DataFrame):
 
-    final_df = pd.concat(
-        [
-            metadata.reset_index(drop=True),
-            validated_features.reset_index(drop=True),
-            y.reset_index(drop=True),
-        ],
-        axis=1
+    df = df.sort_values(["ticker", "date"]).copy()
+
+    df["forward_log_return"] = (
+        df.groupby("ticker")["close"]
+        .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
     )
 
-    final_df = final_df.sort_values(["date", "ticker"]).reset_index(drop=True)
+    df = df.dropna(subset=["forward_log_return"])
 
-    if final_df["target"].nunique() < 2:
+    df["alpha_rank_pct"] = (
+        df.groupby("date")["forward_log_return"]
+        .rank(pct=True)
+    )
+
+    df["target"] = np.nan
+    df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
+    df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
+
+    df = df.dropna(subset=["target"])
+    df["target"] = df["target"].astype(int)
+
+    if df["target"].nunique() < 2:
         raise RuntimeError("Training labels collapsed.")
 
-    return final_df
+    return df
 
 
 ############################################################
@@ -223,7 +162,7 @@ def trainer(train_df):
 
 
 ############################################################
-# ARTIFACT EXPORT (WINDOWS SAFE)
+# ARTIFACT EXPORT
 ############################################################
 
 def export_artifacts(model, metrics, dataset_hash, training_code_hash):
@@ -284,15 +223,19 @@ def main(start_date=None, end_date=None):
 
     logger.info("Training window | %s -> %s", start_date, end_date)
 
-    df = load_training_data(start_date, end_date)
+    raw_df = load_training_data(start_date, end_date)
 
-    dataset_hash = compute_dataset_hash(df)
+    # Walk-forward validation (fold-local target)
+    validator = WalkForwardValidator(trainer)
+    metrics = validator.run(raw_df)
+
+    # Build final target for production training
+    final_df = build_final_target(raw_df)
+
+    dataset_hash = compute_dataset_hash(final_df)
     training_code_hash = compute_training_code_hash()
 
-    validator = WalkForwardValidator(trainer)
-    metrics = validator.run(df)
-
-    final_model = trainer(df)
+    final_model = trainer(final_df)
 
     export_artifacts(
         final_model,
@@ -301,9 +244,10 @@ def main(start_date=None, end_date=None):
         training_code_hash
     )
 
+    # Baseline ONLY from final training dataset
     drift = DriftDetector()
     drift.create_baseline(
-        dataset=df,
+        dataset=final_df,
         dataset_hash=dataset_hash,
         training_code_hash=training_code_hash,
         allow_overwrite=True
