@@ -152,8 +152,18 @@ def trainer(train_df):
 
 def final_trainer(train_df):
 
+    df = train_df.copy()
+
+    # Ensure all MODEL_FEATURES exist
+    for col in MODEL_FEATURES:
+        if col not in df.columns:
+            df[col] = 0.0  # neutral default
+
+    # Ensure column order
+    df = df.loc[:, MODEL_FEATURES]
+
     X = validate_feature_schema(
-        train_df.loc[:, MODEL_FEATURES],
+        df,
         strict=True
     )
 
