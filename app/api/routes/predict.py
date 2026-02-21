@@ -21,7 +21,7 @@ router = APIRouter()
 logger = logging.getLogger("marketsentinel.api")
 
 # ------------------------------------------------
-# LAZY SINGLETONS
+# SINGLETONS
 # ------------------------------------------------
 
 _pipeline = None
@@ -39,6 +39,7 @@ def get_loader():
     global _model_loader
     if _model_loader is None:
         _model_loader = ModelLoader()
+        _model_loader.warmup()   # enforce load at first access
     return _model_loader
 
 
@@ -86,8 +87,8 @@ class PortfolioRequest(BaseModel):
 
             cleaned.append(t)
 
-        # remove duplicates
-        return list(set(cleaned))
+        # Remove duplicates deterministically
+        return sorted(set(cleaned))
 
 
 # ------------------------------------------------
@@ -120,14 +121,18 @@ async def build_portfolio(req: PortfolioRequest):
                 timeout=REQUEST_TIMEOUT
             )
 
+        if not isinstance(result, list):
+            raise RuntimeError("Invalid portfolio output format.")
+
         loader = get_loader()
 
         return {
             "meta": {
-                "model_version": getattr(loader, "_xgb_container", None).version
-                if getattr(loader, "_xgb_container", None)
-                else "latest",
+                "model_version": loader.xgb_version,
                 "schema_signature": get_schema_signature(),
+                "dataset_hash": loader.dataset_hash,
+                "training_code_hash": loader.training_code_hash,
+                "artifact_hash": loader.artifact_hash,
                 "timestamp": int(time.time())
             },
             "portfolio": result
@@ -180,11 +185,17 @@ async def health():
 async def readiness():
 
     try:
-        _ = get_loader().xgb
+        loader = get_loader()
+        _ = loader.xgb  # force load
+
         return {
             "status": "ready",
+            "model_version": loader.xgb_version,
             "schema_signature": get_schema_signature()
         }
 
     except Exception:
-        raise HTTPException(status_code=503, detail="Model not ready")
+        raise HTTPException(
+            status_code=503,
+            detail="Model not ready"
+        )
