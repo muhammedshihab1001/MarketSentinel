@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import hashlib
 import inspect
-import tempfile
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
@@ -51,13 +50,11 @@ def enforce_determinism():
 ############################################################
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
-
     hash_df = (
         df.sort_values(["ticker", "date"])
         .reset_index(drop=True)
         .loc[:, MODEL_FEATURES + ["target"]]
     )
-
     payload = hash_df.to_csv(index=False).encode()
     return hashlib.sha256(payload).hexdigest()
 
@@ -101,7 +98,7 @@ def build_cross_sectional_features(df: pd.DataFrame):
 
 
 ############################################################
-# CROSS-SECTIONAL TARGET (STRICTLY CAUSAL)
+# STRICTLY CAUSAL TARGET
 ############################################################
 
 def build_cross_sectional_target(df: pd.DataFrame):
@@ -134,7 +131,7 @@ def build_cross_sectional_target(df: pd.DataFrame):
 
 
 ############################################################
-# LOAD DATA
+# LOAD TRAINING DATA (LEAK-SAFE + METADATA SAFE)
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -181,16 +178,33 @@ def load_training_data(start_date, end_date):
     df = build_cross_sectional_features(df)
     df = build_cross_sectional_target(df)
 
-    validated = validate_feature_schema(df)
+    if "target" not in df.columns:
+        raise RuntimeError("Target column missing.")
 
-    df = df.loc[validated.index].copy()
+    metadata = df[["date", "ticker"]].copy()
+    y = df["target"].copy()
 
-    df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+    feature_df = df.loc[:, MODEL_FEATURES].copy()
+    validated_features = validate_feature_schema(feature_df)
 
-    if df["target"].nunique() < 2:
+    metadata = metadata.loc[validated_features.index]
+    y = y.loc[validated_features.index]
+
+    final_df = pd.concat(
+        [
+            metadata.reset_index(drop=True),
+            validated_features.reset_index(drop=True),
+            y.reset_index(drop=True),
+        ],
+        axis=1
+    )
+
+    final_df = final_df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+    if final_df["target"].nunique() < 2:
         raise RuntimeError("Training labels collapsed.")
 
-    return df
+    return final_df
 
 
 ############################################################
@@ -209,7 +223,7 @@ def trainer(train_df):
 
 
 ############################################################
-# ARTIFACT EXPORT (ATOMIC)
+# ARTIFACT EXPORT (WINDOWS SAFE)
 ############################################################
 
 def export_artifacts(model, metrics, dataset_hash, training_code_hash):
@@ -218,10 +232,10 @@ def export_artifacts(model, metrics, dataset_hash, training_code_hash):
     timestamp = int(time.time())
 
     model_path = os.path.join(MODEL_DIR, f"model_{timestamp}.pkl")
+    tmp_path = os.path.join(MODEL_DIR, f"tmp_model_{timestamp}.pkl")
 
-    with tempfile.NamedTemporaryFile(delete=False, dir=MODEL_DIR) as tmp:
-        joblib.dump(model, tmp.name)
-        os.replace(tmp.name, model_path)
+    joblib.dump(model, tmp_path)
+    os.replace(tmp_path, model_path)
 
     importance = model.export_feature_importance()
 
@@ -268,11 +282,7 @@ def main(start_date=None, end_date=None):
     if not start_date:
         start_date, end_date = MarketTime.window_for("xgboost")
 
-    logger.info(
-        "Training window | %s -> %s",
-        start_date,
-        end_date
-    )
+    logger.info("Training window | %s -> %s", start_date, end_date)
 
     df = load_training_data(start_date, end_date)
 
