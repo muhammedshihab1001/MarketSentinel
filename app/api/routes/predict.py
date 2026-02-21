@@ -6,10 +6,10 @@ import asyncio
 import os
 import re
 import logging
+import math
 
 from app.inference.pipeline import InferencePipeline
 from app.inference.model_loader import ModelLoader
-from core.schema.feature_schema import get_schema_signature
 
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
@@ -39,7 +39,7 @@ def get_loader():
     global _model_loader
     if _model_loader is None:
         _model_loader = ModelLoader()
-        _model_loader.warmup()   # enforce load at first access
+        _model_loader.warmup()
     return _model_loader
 
 
@@ -87,8 +87,32 @@ class PortfolioRequest(BaseModel):
 
             cleaned.append(t)
 
-        # Remove duplicates deterministically
         return sorted(set(cleaned))
+
+
+# ------------------------------------------------
+# STRICT PORTFOLIO VALIDATION
+# ------------------------------------------------
+
+def validate_portfolio_output(result):
+
+    if not isinstance(result, list):
+        raise RuntimeError("Invalid portfolio output format.")
+
+    for row in result:
+
+        if not isinstance(row, dict):
+            raise RuntimeError("Invalid portfolio row structure.")
+
+        for k, v in row.items():
+
+            if isinstance(v, float):
+                if not math.isfinite(v):
+                    raise RuntimeError(
+                        f"Non-finite value in portfolio output: {k}"
+                    )
+
+    return result
 
 
 # ------------------------------------------------
@@ -121,18 +145,19 @@ async def build_portfolio(req: PortfolioRequest):
                 timeout=REQUEST_TIMEOUT
             )
 
-        if not isinstance(result, list):
-            raise RuntimeError("Invalid portfolio output format.")
+        result = validate_portfolio_output(result)
 
         loader = get_loader()
 
+        container = loader._xgb_container
+
         return {
             "meta": {
-                "model_version": loader.xgb_version,
-                "schema_signature": get_schema_signature(),
-                "dataset_hash": loader.dataset_hash,
-                "training_code_hash": loader.training_code_hash,
-                "artifact_hash": loader.artifact_hash,
+                "model_version": container.version,
+                "schema_signature": container.schema_signature,
+                "dataset_hash": container.dataset_hash,
+                "training_code_hash": container.training_code_hash,
+                "artifact_hash": container.artifact_hash,
                 "timestamp": int(time.time())
             },
             "portfolio": result
@@ -186,16 +211,16 @@ async def readiness():
 
     try:
         loader = get_loader()
-        _ = loader.xgb  # force load
+        container = loader._xgb_container or loader.xgb
 
         return {
             "status": "ready",
-            "model_version": loader.xgb_version,
-            "schema_signature": get_schema_signature()
+            "model_version": container.version,
+            "schema_signature": container.schema_signature
         }
 
     except Exception:
         raise HTTPException(
             status_code=503,
             detail="Model not ready"
-        )
+        ) 
