@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 
 
 class BacktestEngine:
@@ -49,7 +50,6 @@ class BacktestEngine:
     def _gap_ok(self, prev_price, price):
 
         gap = abs(price / prev_price - 1)
-
         return gap <= self.MAX_GAP
 
     ############################################################
@@ -98,12 +98,7 @@ class BacktestEngine:
             price = prices[i]
 
             if not self._gap_ok(prev_price, price):
-                # Skip trading on extreme gap
                 prev_signal = "HOLD"
-
-            ####################################################
-            # EXECUTE PREVIOUS SIGNAL (t → t+1)
-            ####################################################
 
             if position > 0:
                 hold_bars += 1
@@ -120,7 +115,6 @@ class BacktestEngine:
             ):
 
                 execution_price = price * (1 + slippage)
-
                 deploy_cash = cash * position_size
 
                 shares = (
@@ -157,10 +151,6 @@ class BacktestEngine:
                 trade_count += 1
                 cooldown = self.REENTRY_COOLDOWN
 
-            ####################################################
-            # MARK TO MARKET
-            ####################################################
-
             portfolio_value = cash + position * price
 
             if portfolio_value <= self.MIN_CAPITAL:
@@ -175,12 +165,7 @@ class BacktestEngine:
                 portfolio_values.append(portfolio_value)
                 break
 
-            ####################################################
-            # RETURN CIRCUIT BREAKER
-            ####################################################
-
             if portfolio_values:
-
                 step_return = (
                     portfolio_value / portfolio_values[-1] - 1
                 )
@@ -199,13 +184,12 @@ class BacktestEngine:
             prev_price = price
 
         ####################################################
-        # FORCE LIQUIDATION SAFELY
+        # FORCE LIQUIDATION
         ####################################################
 
         if position > 0 and portfolio_values:
 
-            final_price = prices[min(len(prices) - 1, len(portfolio_values))]
-
+            final_price = prices[-1]
             liquidation_price = final_price * (1 - slippage)
 
             cash += position * liquidation_price * (1 - transaction_cost)
@@ -214,8 +198,6 @@ class BacktestEngine:
             portfolio_values[-1] = cash
 
             trade_count += 1
-
-        ####################################################
 
         if not portfolio_values:
             return self._empty_result(initial_cash)
@@ -231,16 +213,12 @@ class BacktestEngine:
         returns = returns[np.isfinite(returns)]
 
         if len(returns) > 1:
-
             std = np.std(returns)
-
             sharpe = (
                 np.mean(returns) / std * np.sqrt(252)
                 if std > 0 else 0.0
             )
-
             sharpe = float(np.clip(sharpe, -self.MAX_SHARPE, self.MAX_SHARPE))
-
         else:
             sharpe = 0.0
 
@@ -285,3 +263,59 @@ class BacktestEngine:
             "turnover": 0.0,
             "equity_curve": [initial_cash]
         }
+
+
+############################################################
+# WRAPPER FUNCTIONS (FOR TEST COMPATIBILITY)
+############################################################
+
+def backtest_strategy(df: pd.DataFrame):
+
+    if "close" not in df.columns or "signal" not in df.columns:
+        raise RuntimeError("DataFrame must contain 'close' and 'signal' columns.")
+
+    engine = BacktestEngine()
+
+    result = engine.run(
+        prices=df["close"].values,
+        signals=df["signal"].values
+    )
+
+    return {
+        "total_return": result["strategy_return"],
+        "buy_hold_return": result["buy_hold_return"],
+        "trade_count": result["trade_count"]
+    }
+
+
+def signal_hit_rate(df: pd.DataFrame):
+
+    if "close" not in df.columns or "signal" not in df.columns:
+        raise RuntimeError("DataFrame must contain 'close' and 'signal' columns.")
+
+    prices = df["close"].values
+    signals = df["signal"].values
+
+    if len(prices) < 2:
+        return {"hit_rate": 0.0}
+
+    correct = 0
+    total = 0
+
+    for i in range(len(prices) - 1):
+
+        ret = prices[i + 1] - prices[i]
+
+        if signals[i] == "BUY":
+            total += 1
+            if ret > 0:
+                correct += 1
+
+        elif signals[i] == "SELL":
+            total += 1
+            if ret < 0:
+                correct += 1
+
+    hit_rate = correct / total if total > 0 else 0.0
+
+    return {"hit_rate": float(hit_rate)}
