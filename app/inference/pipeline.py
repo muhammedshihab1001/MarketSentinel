@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import logging
 import os
+import hashlib
 
 from core.data.market_data_service import MarketDataService
 from core.features.feature_store import FeatureStore
@@ -81,6 +82,10 @@ class InferencePipeline:
         os.getenv("HARD_LATENCY_LIMIT_SECONDS", "5.0")
     )
 
+    CACHE_TTL = int(
+        os.getenv("INFERENCE_CACHE_TTL_SECONDS", "600")
+    )
+
     def __init__(self):
 
         self.market_data = MarketDataService()
@@ -100,6 +105,20 @@ class InferencePipeline:
         model = self.models.xgb
         if not hasattr(model, "predict_proba"):
             raise RuntimeError("Loaded model is not a classifier.")
+
+    ############################################################
+
+    def _dataset_hash(self, df: pd.DataFrame) -> str:
+        payload = (
+            df.sort_values(["ticker", "date"])
+            .reset_index(drop=True)
+            .loc[:, MODEL_FEATURES]
+            .astype(float)
+            .round(8)
+            .to_csv(index=False)
+            .encode()
+        )
+        return hashlib.sha256(payload).hexdigest()[:16]
 
     ############################################################
 
@@ -190,6 +209,9 @@ class InferencePipeline:
                     end_date=pd.Timestamp.utcnow().date().isoformat()
                 )
 
+                if price_df is None or price_df.empty:
+                    continue
+
                 dataset = self.feature_store.get_features(
                     price_df,
                     sentiment_df=None,
@@ -197,7 +219,11 @@ class InferencePipeline:
                     training=False
                 )
 
-                datasets.append(dataset)
+                if dataset is not None and not dataset.empty:
+                    datasets.append(dataset)
+
+            if not datasets:
+                raise RuntimeError("No valid datasets built.")
 
             df = pd.concat(datasets, ignore_index=True)
 
@@ -209,6 +235,39 @@ class InferencePipeline:
             feature_df = validate_feature_schema(
                 latest_df.loc[:, MODEL_FEATURES]
             )
+
+            # -------------------------
+            # CACHE CHECK
+            # -------------------------
+
+            dataset_hash = self._dataset_hash(latest_df)
+
+            cache_key = self.cache.build_key({
+                "model_version": self.models.xgb_version,
+                "dataset_hash": dataset_hash,
+                "schema": self.schema_sig
+            })
+
+            cached = self.cache.get(cache_key)
+
+            if cached:
+                CACHE_HITS.inc()
+                return cached
+
+            CACHE_MISSES.inc()
+
+            # -------------------------
+            # DRIFT DETECTION
+            # -------------------------
+
+            drift_report = self.drift_detector.detect(df)
+
+            if drift_report.get("drift_detected"):
+                logger.critical("Drift detected during portfolio inference.")
+
+            # -------------------------
+            # MODEL INFERENCE
+            # -------------------------
 
             t0 = time.time()
 
@@ -232,14 +291,18 @@ class InferencePipeline:
                 "gross_exposure": float(sum(abs(w) for w in weights.values())),
                 "net_exposure": float(sum(weights.values())),
                 "num_longs": int(sum(1 for w in weights.values() if w > 0)),
-                "num_shorts": int(sum(1 for w in weights.values() if w < 0))
+                "num_shorts": int(sum(1 for w in weights.values() if w < 0)),
+                "model_version": self.models.xgb_version
             }
+
+            self.cache.set(cache_key, response, ttl=self.CACHE_TTL)
 
             self.breaker.record_success()
 
             return response
 
         except Exception as e:
+
             self.breaker.record_failure()
             PIPELINE_FAILURES.labels(stage="inference").inc()
             logger.exception("Batch inference failure: %s", str(e))
