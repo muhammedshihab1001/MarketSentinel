@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import hashlib
 import inspect
+import tempfile
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
@@ -31,6 +32,7 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 
 SEED = 42
 MIN_TRAINING_ROWS = 1200
+MIN_UNIQUE_DATES = 250
 FORWARD_DAYS = 5
 
 
@@ -49,12 +51,14 @@ def enforce_determinism():
 ############################################################
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
-    payload = (
+
+    hash_df = (
         df.sort_values(["ticker", "date"])
         .reset_index(drop=True)
-        .to_csv(index=False)
-        .encode()
+        .loc[:, MODEL_FEATURES + ["target"]]
     )
+
+    payload = hash_df.to_csv(index=False).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -80,6 +84,9 @@ def build_cross_sectional_features(df: pd.DataFrame):
 
     for col in cross_cols:
 
+        if col not in df.columns:
+            raise RuntimeError(f"Missing base feature: {col}")
+
         df[f"{col}_z"] = (
             df.groupby("date")[col]
             .transform(lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9))
@@ -94,10 +101,13 @@ def build_cross_sectional_features(df: pd.DataFrame):
 
 
 ############################################################
-# CROSS-SECTIONAL TARGET
+# CROSS-SECTIONAL TARGET (STRICTLY CAUSAL)
 ############################################################
 
 def build_cross_sectional_target(df: pd.DataFrame):
+
+    if "close" not in df.columns:
+        raise RuntimeError("Target construction requires 'close' column.")
 
     df = df.sort_values(["ticker", "date"]).copy()
 
@@ -165,16 +175,22 @@ def load_training_data(start_date, end_date):
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError("Dataset too small.")
 
+    if df["date"].nunique() < MIN_UNIQUE_DATES:
+        raise RuntimeError("Insufficient unique dates.")
+
     df = build_cross_sectional_features(df)
     df = build_cross_sectional_target(df)
 
-    feature_df = validate_feature_schema(df.loc[:, MODEL_FEATURES])
-    df = df.loc[feature_df.index]
+    validated = validate_feature_schema(df)
+
+    df = df.loc[validated.index].copy()
+
+    df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
     if df["target"].nunique() < 2:
         raise RuntimeError("Training labels collapsed.")
 
-    return df.reset_index(drop=True)
+    return df
 
 
 ############################################################
@@ -193,17 +209,19 @@ def trainer(train_df):
 
 
 ############################################################
-# ARTIFACT EXPORT
+# ARTIFACT EXPORT (ATOMIC)
 ############################################################
 
 def export_artifacts(model, metrics, dataset_hash, training_code_hash):
 
     os.makedirs(MODEL_DIR, exist_ok=True)
-
     timestamp = int(time.time())
 
     model_path = os.path.join(MODEL_DIR, f"model_{timestamp}.pkl")
-    joblib.dump(model, model_path)
+
+    with tempfile.NamedTemporaryFile(delete=False, dir=MODEL_DIR) as tmp:
+        joblib.dump(model, tmp.name)
+        os.replace(tmp.name, model_path)
 
     importance = model.export_feature_importance()
 
@@ -273,7 +291,6 @@ def main(start_date=None, end_date=None):
         training_code_hash
     )
 
-    # Create Drift Baseline
     drift = DriftDetector()
     drift.create_baseline(
         dataset=df,
