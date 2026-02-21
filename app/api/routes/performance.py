@@ -11,6 +11,9 @@ router = APIRouter()
 logger = logging.getLogger("marketsentinel.performance")
 
 
+MIN_HISTORY_ROWS = 50  # performance tolerance
+
+
 @router.get("/performance")
 def compute_performance(days: int = 120):
 
@@ -23,29 +26,39 @@ def compute_performance(days: int = 120):
         universe = MarketUniverse.get_universe()
 
         end_date = pd.Timestamp.utcnow().date()
-        start_date = end_date - pd.Timedelta(days=days + 30)
+        start_date = end_date - pd.Timedelta(days=days + 10)
 
         # -------------------------------------------------
-        # 1️⃣ FETCH FULL HISTORY ONCE
+        # 1️⃣ FETCH HISTORY SAFELY
         # -------------------------------------------------
 
         all_prices = []
 
         for ticker in universe:
 
-            df = market_data.get_price_data(
-                ticker=ticker,
-                start_date=start_date.isoformat(),
-                end_date=end_date.isoformat()
-            )
+            try:
+                df = market_data.get_price_data(
+                    ticker=ticker,
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat()
+                )
+            except Exception:
+                logger.warning(f"Skipping {ticker} — fetch failure.")
+                continue
 
             if df is None or df.empty:
+                logger.warning(f"Skipping {ticker} — empty dataset.")
+                continue
+
+            if len(df) < MIN_HISTORY_ROWS:
+                logger.warning(
+                    f"Skipping {ticker} — insufficient history ({len(df)} rows)."
+                )
                 continue
 
             df = df.sort_values("date").copy()
             df["ticker"] = ticker
 
-            # forward return = next day return
             df["forward_return"] = (
                 df["close"].shift(-1) / df["close"] - 1
             )
@@ -53,7 +66,7 @@ def compute_performance(days: int = 120):
             all_prices.append(df[["date", "ticker", "forward_return"]])
 
         if not all_prices:
-            raise RuntimeError("No price data available.")
+            raise RuntimeError("No valid price data available.")
 
         forward_df = pd.concat(all_prices, ignore_index=True)
         forward_df.dropna(inplace=True)
@@ -84,6 +97,7 @@ def compute_performance(days: int = 120):
                     })
 
             except Exception:
+                logger.warning(f"Skipping evaluation date {eval_date}")
                 continue
 
         if not portfolio_records:
