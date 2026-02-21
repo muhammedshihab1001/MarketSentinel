@@ -130,30 +130,31 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # REGIME
+    # REGIME (TIME-SERIES STABLE VERSION)
     ########################################################
 
     @classmethod
     def add_regime_feature(cls, df):
 
-        rolling_vol = (
+        rolling_mean = (
             df.groupby("ticker")["volatility_20"]
-            .rolling(40, min_periods=20)
-            .mean()
-            .reset_index(level=0, drop=True)
+            .transform(lambda x: x.rolling(60, min_periods=20).mean())
         )
 
-        df["rolling_vol_40"] = rolling_vol
+        rolling_std = (
+            df.groupby("ticker")["volatility_20"]
+            .transform(lambda x: x.rolling(60, min_periods=20).std(ddof=0))
+        )
 
-        date_median = df.groupby("date")["rolling_vol_40"].transform("median")
+        zscore = (df["volatility_20"] - rolling_mean) / (rolling_std + 1e-9)
 
         df["regime_feature"] = np.where(
-            df["rolling_vol_40"] > date_median,
+            zscore > 0.5,
             1.0,
             0.0
         )
 
-        df.drop(columns=["rolling_vol_40"], inplace=True)
+        df["regime_feature"] = df["regime_feature"].fillna(0.0)
 
         return df
 
