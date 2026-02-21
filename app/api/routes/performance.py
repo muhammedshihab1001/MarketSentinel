@@ -1,11 +1,9 @@
-import time
 import logging
 import pandas as pd
 from fastapi import APIRouter, HTTPException
 
 from core.analytics.performance_engine import PerformanceEngine
 from core.data.market_data_service import MarketDataService
-from core.features.feature_store import FeatureStore
 from core.market.universe import MarketUniverse
 from app.inference.pipeline import InferencePipeline
 
@@ -21,57 +19,81 @@ def compute_performance(days: int = 120):
         engine = PerformanceEngine()
         pipeline = InferencePipeline()
         market_data = MarketDataService()
-        feature_store = FeatureStore()
 
         universe = MarketUniverse.get_universe()
 
         end_date = pd.Timestamp.utcnow().date()
-        start_date = end_date - pd.Timedelta(days=days + 5)
+        start_date = end_date - pd.Timedelta(days=days + 30)
+
+        # -------------------------------------------------
+        # 1️⃣ FETCH FULL HISTORY ONCE
+        # -------------------------------------------------
+
+        all_prices = []
+
+        for ticker in universe:
+
+            df = market_data.get_price_data(
+                ticker=ticker,
+                start_date=start_date.isoformat(),
+                end_date=end_date.isoformat()
+            )
+
+            if df is None or df.empty:
+                continue
+
+            df = df.sort_values("date").copy()
+            df["ticker"] = ticker
+
+            # forward return = next day return
+            df["forward_return"] = (
+                df["close"].shift(-1) / df["close"] - 1
+            )
+
+            all_prices.append(df[["date", "ticker", "forward_return"]])
+
+        if not all_prices:
+            raise RuntimeError("No price data available.")
+
+        forward_df = pd.concat(all_prices, ignore_index=True)
+        forward_df.dropna(inplace=True)
+
+        # -------------------------------------------------
+        # 2️⃣ GENERATE HISTORICAL PORTFOLIOS
+        # -------------------------------------------------
 
         portfolio_records = []
-        forward_records = []
 
-        for offset in range(days):
+        eval_dates = (
+            forward_df["date"]
+            .drop_duplicates()
+            .sort_values()
+            .tail(days)
+        )
 
-            eval_date = end_date - pd.Timedelta(days=offset)
+        for eval_date in eval_dates:
 
-            tickers = universe
+            try:
+                result = pipeline.run_batch(universe)
 
-            result = pipeline.run_batch(tickers)
-
-            for row in result:
-                portfolio_records.append({
-                    "date": eval_date,
-                    "ticker": row["ticker"],
-                    "weight": row["weight"]
-                })
-
-                # forward return proxy (next day close-to-close)
-                price_df = market_data.get_price_data(
-                    ticker=row["ticker"],
-                    start_date=(eval_date - pd.Timedelta(days=2)).isoformat(),
-                    end_date=(eval_date + pd.Timedelta(days=2)).isoformat()
-                )
-
-                if price_df is None or len(price_df) < 2:
-                    continue
-
-                price_df = price_df.sort_values("date")
-
-                if len(price_df) >= 2:
-                    r = (
-                        price_df.iloc[-1]["close"]
-                        / price_df.iloc[-2]["close"]
-                    ) - 1
-
-                    forward_records.append({
+                for row in result:
+                    portfolio_records.append({
                         "date": eval_date,
                         "ticker": row["ticker"],
-                        "forward_return": r
+                        "weight": row["weight"]
                     })
 
+            except Exception:
+                continue
+
+        if not portfolio_records:
+            raise RuntimeError("No portfolio history generated.")
+
         portfolio_df = pd.DataFrame(portfolio_records)
-        forward_df = pd.DataFrame(forward_records)
+
+        # -------------------------------------------------
+        # 3️⃣ EVALUATE PERFORMANCE
+        # -------------------------------------------------
 
         report = engine.evaluate(portfolio_df, forward_df)
 
