@@ -11,7 +11,6 @@ import numpy as np
 from core.schema.feature_schema import get_schema_signature
 from app.inference.model_loader import ModelLoader
 
-
 logger = logging.getLogger("marketsentinel.cache")
 
 
@@ -27,7 +26,7 @@ class RedisCache:
     MIN_TTL = 30
 
     MAX_PAYLOAD_BYTES = 256_000
-    CACHE_NAMESPACE_VERSION = "v4"
+    CACHE_NAMESPACE_VERSION = "v5"
 
     ###################################################
 
@@ -49,7 +48,7 @@ class RedisCache:
 
         try:
 
-            host = os.getenv("REDIS_HOST", "redis")
+            host = os.getenv("REDIS_HOST", "localhost")
             port = int(os.getenv("REDIS_PORT", "6379"))
 
             if RedisCache._pool is None:
@@ -61,7 +60,7 @@ class RedisCache:
                     socket_connect_timeout=2,
                     socket_keepalive=True,
                     health_check_interval=30,
-                    max_connections=32,
+                    max_connections=16,
                     retry_on_timeout=True,
                     decode_responses=False
                 )
@@ -160,53 +159,42 @@ class RedisCache:
         )
 
     ###################################################
-    # PORTFOLIO PAYLOAD VALIDATION
+    # PORTFOLIO LIST VALIDATION
     ###################################################
 
     def _validate_payload(self, value):
 
-        if not isinstance(value, dict):
-            raise RuntimeError("Cache payload must be dict.")
+        if not isinstance(value, list):
+            raise RuntimeError("Cache payload must be list.")
 
-        required = {
-            "date",
-            "portfolio_weights",
-            "gross_exposure",
-            "net_exposure",
-            "num_longs",
-            "num_shorts",
-            "model_version"
-        }
+        for row in value:
 
-        if not required.issubset(value.keys()):
-            raise RuntimeError("Cache payload missing required fields.")
+            if not isinstance(row, dict):
+                raise RuntimeError("Invalid portfolio row.")
 
-        weights = value["portfolio_weights"]
+            required = {
+                "date",
+                "ticker",
+                "score",
+                "signal",
+                "weight"
+            }
 
-        if not isinstance(weights, dict):
-            raise RuntimeError("Invalid portfolio_weights format.")
+            if not required.issubset(row.keys()):
+                raise RuntimeError("Portfolio row missing fields.")
 
-        for k, v in weights.items():
-            if not isinstance(k, str):
-                raise RuntimeError("Invalid ticker key in weights.")
+            if not isinstance(row["ticker"], str):
+                raise RuntimeError("Invalid ticker type.")
 
-            if not isinstance(v, (int, float)):
-                raise RuntimeError("Invalid weight type.")
+            if not isinstance(row["signal"], str):
+                raise RuntimeError("Invalid signal type.")
 
-            if not np.isfinite(v):
-                raise RuntimeError("Non-finite weight detected.")
-
-        gross = value["gross_exposure"]
-        net = value["net_exposure"]
-
-        if not np.isfinite(gross) or not np.isfinite(net):
-            raise RuntimeError("Invalid exposure values.")
-
-        if gross < 0 or gross > 2.0:
-            raise RuntimeError("Gross exposure out of bounds.")
-
-        if abs(net) > 1.0:
-            raise RuntimeError("Net exposure out of bounds.")
+            for field in ["score", "weight"]:
+                val = row[field]
+                if not isinstance(val, (int, float)):
+                    raise RuntimeError("Invalid numeric field.")
+                if not np.isfinite(val):
+                    raise RuntimeError("Non-finite numeric value.")
 
     ###################################################
     # GET
@@ -226,26 +214,18 @@ class RedisCache:
             if not data:
                 return None
 
-            try:
+            decompressed = zlib.decompress(data)
 
-                decompressed = zlib.decompress(data)
-
-                if len(decompressed) > self.MAX_PAYLOAD_BYTES:
-                    logger.warning("Oversized cache entry removed.")
-                    self.client.delete(key)
-                    return None
-
-                obj = json.loads(decompressed)
-
-                self._validate_payload(obj)
-
-                return obj
-
-            except Exception:
-
-                logger.warning("Corrupted cache entry removed.")
+            if len(decompressed) > self.MAX_PAYLOAD_BYTES:
+                logger.warning("Oversized cache entry removed.")
                 self.client.delete(key)
                 return None
+
+            obj = json.loads(decompressed)
+
+            self._validate_payload(obj)
+
+            return obj
 
         except Exception:
 
@@ -264,7 +244,7 @@ class RedisCache:
     # SET
     ###################################################
 
-    def set(self, key: str, value: dict, ttl=None):
+    def set(self, key: str, value, ttl=None):
 
         self._maybe_reconnect()
 
@@ -291,9 +271,6 @@ class RedisCache:
                 raise RuntimeError("Payload exceeds safe cache size.")
 
             payload = zlib.compress(serialized)
-
-            test = json.loads(zlib.decompress(payload))
-            self._validate_payload(test)
 
             self.client.set(
                 key,
