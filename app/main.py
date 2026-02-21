@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from prometheus_client import generate_latest
 
 from app.api.routes import predict
+from app.api.routes import performance
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
 
@@ -169,6 +170,7 @@ app.add_exception_handler(Exception, global_exception_handler)
 # =====================================================
 
 app.include_router(predict.router, prefix="/v1")
+app.include_router(performance.router,prefix="/v1")
 
 
 # =====================================================
