@@ -46,6 +46,8 @@ class WalkForwardValidator:
         logger.info("Walk-forward validation started.")
 
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+        df["date"] = pd.to_datetime(df["date"], utc=True)
+
         df = self.regime_detector.detect(df)
 
         unique_dates = pd.to_datetime(
@@ -94,6 +96,11 @@ class WalkForwardValidator:
                 window_id += 1
                 continue
 
+            # Ensure schema integrity
+            missing = set(MODEL_FEATURES) - set(train_df.columns)
+            if missing:
+                raise RuntimeError(f"Missing model features in training set: {missing}")
+
             model = self.model_trainer(train_df)
 
             window_returns = []
@@ -110,7 +117,14 @@ class WalkForwardValidator:
                 if signal_slice.empty or next_slice.empty:
                     continue
 
+                if not set(MODEL_FEATURES).issubset(signal_slice.columns):
+                    continue
+
                 X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
+
+                if X.isnull().any().any():
+                    continue
+
                 probs = model.predict_proba(X)[:, 1]
 
                 signal_slice = signal_slice.copy()
@@ -144,36 +158,27 @@ class WalkForwardValidator:
                 for t, w in zip(shorts["ticker"], short_weights):
                     positions[t] = -float(w)
 
-                # -----------------------------------------
-                # Robust return computation
-                # -----------------------------------------
+                # --- Robust return computation ---
 
-                if "close" in signal_slice.columns and "close" in next_slice.columns:
+                merged = pd.merge(
+                    signal_slice[["ticker", "close"]],
+                    next_slice[["ticker", "close"]],
+                    on="ticker",
+                    suffixes=("_today", "_next")
+                )
 
-                    merged = pd.merge(
-                        signal_slice[["ticker", "close"]],
-                        next_slice[["ticker", "close"]],
-                        on="ticker",
-                        suffixes=("_today", "_next")
-                    )
+                merged = merged[
+                    (merged["close_today"] > 0) &
+                    (merged["close_next"] > 0)
+                ]
 
-                    merged["ret"] = (
-                        np.log(merged["close_next"]) -
-                        np.log(merged["close_today"])
-                    )
-
-                elif "return" in next_slice.columns:
-
-                    merged = pd.merge(
-                        signal_slice[["ticker"]],
-                        next_slice[["ticker", "return"]],
-                        on="ticker"
-                    )
-
-                    merged["ret"] = merged["return"]
-
-                else:
+                if merged.empty:
                     continue
+
+                merged["ret"] = (
+                    np.log(merged["close_next"]) -
+                    np.log(merged["close_today"])
+                )
 
                 daily_ret = 0.0
 
@@ -194,13 +199,16 @@ class WalkForwardValidator:
                 capital *= (1 + r)
                 equity_curve.append(capital)
 
+            vol = np.std(window_returns)
+            sharpe = (
+                np.mean(window_returns) /
+                (vol + 1e-9) *
+                np.sqrt(252)
+            )
+
             results.append({
                 "strategy_return": float(window_returns.sum()),
-                "sharpe_ratio": float(
-                    np.mean(window_returns) /
-                    (np.std(window_returns) + 1e-9) *
-                    np.sqrt(252)
-                )
+                "sharpe_ratio": float(sharpe)
             })
 
             start_idx += self.step_size
