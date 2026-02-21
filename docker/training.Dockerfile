@@ -1,4 +1,8 @@
 ############################################################
+# MarketSentinel — Training Container (Institutional)
+############################################################
+
+############################################################
 # STAGE 1 — BUILDER
 ############################################################
 
@@ -12,7 +16,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 ############################################################
-# BUILD DEPENDENCIES
+# Build Dependencies (Isolated)
 ############################################################
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -23,17 +27,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements ./requirements
+############################################################
+# Copy Only Required Requirements
+############################################################
+
+COPY requirements/base.txt requirements/base.txt
+COPY requirements/training.txt requirements/training.txt
 
 RUN pip install --upgrade pip setuptools wheel
 
 ############################################################
-# INSTALL PYTHON PACKAGES
+# Install Python Packages
 ############################################################
 
-RUN pip install \
-    --prefer-binary \
-    -r requirements/training.txt
+RUN pip install --prefer-binary -r requirements/base.txt && \
+    pip install --prefer-binary -r requirements/training.txt
+
 
 
 ############################################################
@@ -45,7 +54,7 @@ FROM python:3.10-slim
 WORKDIR /app
 
 ############################################################
-# RUNTIME ENV (VERY IMPORTANT)
+# Runtime Environment (Deterministic)
 ############################################################
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -55,62 +64,66 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
     TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
     OMP_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    APP_ENV=training
 
 ############################################################
-# RUNTIME LIBS
+# Runtime Dependencies Only
 ############################################################
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     tini \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 ############################################################
-# NON ROOT USER (SECURITY)
+# Non-Root User
 ############################################################
 
-RUN useradd -m appuser
+RUN useradd -m -u 10001 appuser
 
 ############################################################
-# COPY PACKAGES FROM BUILDER
+# Copy Installed Python Packages
 ############################################################
 
 COPY --from=builder /usr/local /usr/local
 
 ############################################################
-# COPY PROJECT
+# Copy Project Code (Training Only What’s Needed)
 ############################################################
 
 COPY core ./core
 COPY models ./models
 COPY training ./training
-COPY requirements ./requirements
+COPY config ./config
 
 ############################################################
-# HUGGINGFACE CACHE DIRECTORY
+# HuggingFace Cache Directory
 ############################################################
 
-RUN mkdir -p /app/artifacts/huggingface \
-    && chown -R appuser:appuser /app
+RUN mkdir -p /app/artifacts/huggingface && \
+    chown -R appuser:appuser /app
 
 ENV HF_HOME=/app/artifacts/huggingface
 
 ############################################################
-# SWITCH USER
+# Switch User
 ############################################################
 
 USER appuser
 
 ############################################################
-# TINI (ZOMBIE PROCESS FIX)
+# Tini (Zombie Process Protection)
 ############################################################
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
 ############################################################
-# TRAIN PIPELINE
+# Default Command (Training Pipeline)
 ############################################################
 
-CMD ["python", "-m", "training.pipelines.train_pipeline"]
+CMD ["python", "-m", "training.train_xgboost"]
