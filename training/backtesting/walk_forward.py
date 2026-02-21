@@ -25,9 +25,9 @@ class WalkForwardValidator:
         embargo_days=14
     ):
         self.model_trainer = model_trainer
-        self.window_size = window_size
-        self.step_size = step_size
-        self.embargo_days = embargo_days
+        self.window_size = int(window_size)
+        self.step_size = int(step_size)
+        self.embargo_days = int(embargo_days)
         self.regime_detector = MarketRegimeDetector()
 
     ########################################################
@@ -40,14 +40,21 @@ class WalkForwardValidator:
 
     def run(self, df: pd.DataFrame):
 
+        if df.empty:
+            raise RuntimeError("WalkForward received empty dataset.")
+
         logger.info("Walk-forward validation started.")
 
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
         df = self.regime_detector.detect(df)
 
         unique_dates = pd.to_datetime(
             df["date"].drop_duplicates()
         ).sort_values()
+
+        if len(unique_dates) <= self.window_size:
+            raise RuntimeError("Insufficient history for walk-forward.")
 
         results = []
         equity_curve = []
@@ -73,10 +80,20 @@ class WalkForwardValidator:
 
             train_df = self._apply_embargo(train_df, test_dates.iloc[0])
 
+            if train_df.empty:
+                start_idx += self.step_size
+                window_id += 1
+                continue
+
             test_df = df[
                 (df["date"] >= test_dates.iloc[0]) &
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
+
+            if test_df.empty:
+                start_idx += self.step_size
+                window_id += 1
+                continue
 
             model = self.model_trainer(train_df)
 
@@ -96,6 +113,7 @@ class WalkForwardValidator:
                     continue
 
                 X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
+
                 probs = model.predict_proba(X)[:, 1]
 
                 signal_slice = signal_slice.copy()
@@ -108,15 +126,17 @@ class WalkForwardValidator:
 
                 positions = {}
 
-                # --- Volatility scaling ---
                 long_vol = longs["volatility"].replace(0, 1e-6)
                 short_vol = shorts["volatility"].replace(0, 1e-6)
 
                 long_weights = 1.0 / long_vol
                 short_weights = 1.0 / short_vol
 
-                long_weights /= long_weights.sum()
-                short_weights /= short_weights.sum()
+                if long_weights.sum() > 0:
+                    long_weights /= long_weights.sum()
+
+                if short_weights.sum() > 0:
+                    short_weights /= short_weights.sum()
 
                 long_weights *= self.TARGET_GROSS_EXPOSURE / 2
                 short_weights *= self.TARGET_GROSS_EXPOSURE / 2
@@ -152,7 +172,7 @@ class WalkForwardValidator:
                 window_id += 1
                 continue
 
-            window_returns = np.array(window_returns)
+            window_returns = np.array(window_returns, dtype=float)
 
             for r in window_returns:
                 capital *= (1 + r)
@@ -182,7 +202,11 @@ class WalkForwardValidator:
     def aggregate_results(self, results, equity_curve):
 
         df = pd.DataFrame(results)
+
         curve = np.array(equity_curve, dtype=float)
+
+        if len(curve) == 0:
+            raise RuntimeError("Empty equity curve.")
 
         peak = np.maximum.accumulate(curve)
         drawdowns = (curve - peak) / peak
@@ -196,7 +220,7 @@ class WalkForwardValidator:
             "profit_factor": float(gains / losses),
             "max_drawdown": float(drawdowns.min()),
             "return_volatility": float(df["strategy_return"].std()),
-            "final_equity": float(curve[-1]) if len(curve) else 0.0,
+            "final_equity": float(curve[-1]),
             "equity_curve": curve.tolist(),
             "num_windows": int(len(df))
         }
