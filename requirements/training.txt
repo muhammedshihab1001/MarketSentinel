@@ -6,52 +6,26 @@
 
 scikit-learn==1.5.1
 xgboost==2.1.1
-
-########################################
-# TENSORFLOW (CPU SAFE)
-########################################
-
-tensorflow-cpu==2.15.0
-keras==2.15.0
-
-protobuf==4.25.3
-typing_extensions==4.12.2
-
-########################################
-# PROPHET
-########################################
-
-holidays==0.48
-
-########################################
-# TORCH / NLP (CPU)
-########################################
-
---extra-index-url https://download.pytorch.org/whl/cpu
-
-torch==2.2.2
-transformers==4.38.2
-tokenizers==0.15.2
-safetensors==0.4.2
+joblib==1.4.2
+numpy==1.26.4
+pandas==2.2.2
 
 ########################################
 # DATA SOURCES
 ########################################
 
 feedparser==6.0.11
-yfinance==0.2.43
+yfinance
 
-########################################
-# TRAINING VISUALIZATION
-########################################
-
-matplotlib==3.9.2
-seaborn==0.13.2
-
-# REMOVE plotly unless dashboards are required
-# plotly pulls heavy JS dependencies
 ########################################
 # DATA ENGINEERING
 ########################################
 
 pyarrow==15.0.2
+
+########################################
+# VISUALIZATION (OPTIONAL — SAFE)
+########################################
+
+matplotlib==3.9.2
+seaborn==0.13.2
