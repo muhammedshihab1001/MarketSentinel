@@ -150,7 +150,7 @@ class MetadataManager:
 
         if metadata_type == "training_manifest_v1":
 
-            if frozen != MODEL_FEATURES:
+            if frozen != tuple(MODEL_FEATURES):
                 raise RuntimeError(
                     "Tabular feature mismatch — schema drift."
                 )
