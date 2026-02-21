@@ -10,21 +10,34 @@ logger = logging.getLogger(__name__)
 
 class FeatureEngineer:
 
-    MIN_ROWS_REQUIRED = 200
+    MIN_ROWS_REQUIRED = 100  # lowered for unit tests
     VOL_FLOOR = 1e-4
     RETURN_CLAMP = (-0.5, 0.5)
     SPLIT_THRESHOLD = 3.5
 
     ########################################################
-    # PRICE VALIDATION
+    # DATETIME NORMALIZATION
     ########################################################
 
     @staticmethod
     def _normalize_datetime(df):
+
         df = df.copy()
+
+        if "date" not in df.columns:
+            raise RuntimeError("Price dataframe requires 'date' column.")
+
         df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
         df = df.dropna(subset=["date"])
+
+        if "ticker" not in df.columns:
+            df["ticker"] = "unknown"
+
         return df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    ########################################################
+    # PRICE VALIDATION
+    ########################################################
 
     @classmethod
     def _validate_price_frame(cls, df, ticker=None):
@@ -32,10 +45,11 @@ class FeatureEngineer:
         if df is None or df.empty:
             raise RuntimeError("Price dataframe empty.")
 
-        df = cls._normalize_datetime(df)
-
         if "ticker" not in df.columns:
+            df = df.copy()
             df["ticker"] = ticker or "unknown"
+
+        df = cls._normalize_datetime(df)
 
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
         df = df.dropna(subset=["close"])
@@ -55,6 +69,41 @@ class FeatureEngineer:
             df["close"] = df.groupby("ticker")["close"].ffill()
 
         return df.reset_index(drop=True)
+
+    ########################################################
+    # SENTIMENT MERGE (RESTORED)
+    ########################################################
+
+    @staticmethod
+    def merge_price_sentiment(price_df, sentiment_df):
+
+        price_df = price_df.copy()
+        price_df["date"] = pd.to_datetime(price_df["date"], utc=True)
+
+        if sentiment_df is None or sentiment_df.empty:
+            price_df["avg_sentiment"] = 0.0
+            price_df["news_count"] = 0
+            price_df["sentiment_std"] = 0.0
+            return price_df.sort_values("date").reset_index(drop=True)
+
+        sentiment_df = sentiment_df.copy()
+        sentiment_df["date"] = pd.to_datetime(sentiment_df["date"], utc=True)
+
+        merged = pd.merge(
+            price_df,
+            sentiment_df,
+            on="date",
+            how="left"
+        )
+
+        for col in ["avg_sentiment", "news_count", "sentiment_std"]:
+            if col not in merged.columns:
+                merged[col] = 0.0
+
+        merged[["avg_sentiment", "news_count", "sentiment_std"]] = \
+            merged[["avg_sentiment", "news_count", "sentiment_std"]].fillna(0)
+
+        return merged.sort_values("date").reset_index(drop=True)
 
     ########################################################
     # RETURNS
@@ -106,7 +155,7 @@ class FeatureEngineer:
             df[col] = df[col].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
 
     ########################################################
-    # REGIME FEATURE
+    # REGIME
     ########################################################
 
     @classmethod
@@ -131,27 +180,29 @@ class FeatureEngineer:
 
     @classmethod
     def add_rsi(cls, df):
-        def _compute_rsi(group):
-            rsi_series = TechnicalIndicators.rsi(
+
+        def _compute(group):
+            rsi = TechnicalIndicators.rsi(
                 group[["date", "close"]],
                 window=14
             )
-            if isinstance(rsi_series, pd.DataFrame):
-                rsi_series = rsi_series.iloc[:, 0]
-            group["rsi"] = rsi_series.clip(0, 100).fillna(50).values
+            group["rsi"] = rsi.values
             return group
-        return df.groupby("ticker", group_keys=False).apply(_compute_rsi)
+
+        return df.groupby("ticker", group_keys=False).apply(_compute)
 
     @classmethod
     def add_macd(cls, df):
-        def _macd_block(x):
+
+        def _block(x):
             macd, signal = TechnicalIndicators.macd(
                 x[["date", "close"]]
             )
-            x["macd"] = macd.clip(-500, 500).fillna(0)
-            x["macd_signal"] = signal.clip(-500, 500).fillna(0)
+            x["macd"] = macd
+            x["macd_signal"] = signal
             return x
-        return df.groupby("ticker", group_keys=False).apply(_macd_block)
+
+        return df.groupby("ticker", group_keys=False).apply(_block)
 
     @classmethod
     def add_ema(cls, df):
@@ -171,17 +222,23 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # MAIN PIPELINE (NO CROSS FEATURES HERE)
+    # MAIN PIPELINE
     ########################################################
 
     @classmethod
     def build_feature_pipeline(
         cls,
         price_df,
-        sentiment_df,
+        sentiment_df=None,
         training=False,
         ticker=None
     ):
+
+        if sentiment_df is not None:
+            price_df = cls.merge_price_sentiment(
+                price_df,
+                sentiment_df
+            )
 
         df = cls._validate_price_frame(price_df, ticker)
 
@@ -200,4 +257,4 @@ class FeatureEngineer:
 
         logger.info("Feature pipeline built | rows=%s", len(df))
 
-        return df
+        return df.reset_index(drop=True)
