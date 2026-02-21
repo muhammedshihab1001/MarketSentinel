@@ -41,20 +41,26 @@ class LoadedModel:
 class ModelLoader:
 
     _instance = None
-    _lock = threading.Lock()
+    _instance_lock = threading.Lock()
 
     MIN_ARTIFACT_BYTES = 50_000
 
+    ########################################################
+
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            with cls._lock:
+            with cls._instance_lock:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
         return cls._instance
 
+    ########################################################
+
     def __init__(self):
         if hasattr(self, "_initialized"):
             return
+
+        self._reload_lock = threading.Lock()
         self._xgb_container: LoadedModel | None = None
         self._initialized = True
 
@@ -103,7 +109,28 @@ class ModelLoader:
         return latest, metadata_path, version
 
     ########################################################
-    # SAFE LOAD
+    # METADATA STRUCTURE VALIDATION
+    ########################################################
+
+    def _validate_metadata_structure(self, meta: dict):
+
+        required = {
+            "schema_signature",
+            "dataset_hash",
+            "training_code_hash",
+            "timestamp",
+            "metrics"
+        }
+
+        missing = required - set(meta.keys())
+
+        if missing:
+            raise RuntimeError(
+                f"Metadata missing required fields: {missing}"
+            )
+
+    ########################################################
+    # SAFE LOAD MODEL
     ########################################################
 
     def _safe_load_model(self, model_path):
@@ -116,6 +143,7 @@ class ModelLoader:
         if not hasattr(model, "predict_proba"):
             raise RuntimeError("Invalid model artifact loaded.")
 
+        # STRICT FEATURE CONTRACT
         if hasattr(model, "feature_names"):
             trained_features = list(model.feature_names)
             if trained_features != MODEL_FEATURES:
@@ -126,53 +154,59 @@ class ModelLoader:
         return model
 
     ########################################################
-    # RELOAD IF NEEDED
+    # RELOAD IF NEEDED (THREAD SAFE)
     ########################################################
 
     def _reload_xgb_if_needed(self):
 
-        base_dir = os.getenv(
-            "XGB_REGISTRY_DIR",
-            os.path.abspath("artifacts/xgboost")
-        )
+        with self._reload_lock:
 
-        model_path, metadata_path, version = \
-            self._find_latest_artifact(base_dir)
+            base_dir = os.getenv(
+                "XGB_REGISTRY_DIR",
+                os.path.abspath("artifacts/xgboost")
+            )
 
-        if (
-            self._xgb_container and
-            self._xgb_container.version == version
-        ):
-            return self._xgb_container.model
+            model_path, metadata_path, version = \
+                self._find_latest_artifact(base_dir)
 
-        logger.info("Loading XGBoost version=%s", version)
+            if (
+                self._xgb_container and
+                self._xgb_container.version == version
+            ):
+                return self._xgb_container.model
 
-        # STRICT METADATA VALIDATION
-        meta = MetadataManager.load_metadata(metadata_path)
+            logger.info("Loading XGBoost version=%s", version)
 
-        if meta["schema_signature"] != get_schema_signature():
-            raise RuntimeError("Schema mismatch during inference.")
+            meta = MetadataManager.load_metadata(metadata_path)
 
-        artifact_hash = self._sha256(model_path)
-        model = self._safe_load_model(model_path)
+            self._validate_metadata_structure(meta)
 
-        container = LoadedModel(
-            model=model,
-            version=version,
-            schema_signature=meta["schema_signature"],
-            dataset_hash=meta["dataset_hash"],
-            training_code_hash=meta["training_code_hash"],
-            artifact_hash=artifact_hash
-        )
+            if meta["schema_signature"] != get_schema_signature():
+                raise RuntimeError("Schema mismatch during inference.")
 
-        self._xgb_container = container
+            artifact_hash = self._sha256(model_path)
 
-        MODEL_VERSION.labels(
-            model="xgboost",
-            version=version
-        ).set(1)
+            model = self._safe_load_model(model_path)
 
-        return container.model
+            container = LoadedModel(
+                model=model,
+                version=version,
+                schema_signature=meta["schema_signature"],
+                dataset_hash=meta["dataset_hash"],
+                training_code_hash=meta["training_code_hash"],
+                artifact_hash=artifact_hash
+            )
+
+            self._xgb_container = container
+
+            MODEL_VERSION.labels(
+                model="xgboost",
+                version=version
+            ).set(1)
+
+            logger.info("Model loaded successfully | version=%s", version)
+
+            return container.model
 
     ########################################################
     # STRICT FEATURE VALIDATION
