@@ -12,7 +12,6 @@ from prometheus_client import generate_latest
 from app.api.routes import predict
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
-from core.schema.feature_schema import get_schema_signature
 
 
 # =====================================================
@@ -55,6 +54,7 @@ class ReadinessState:
         self.model_version = None
         self.artifact_hash = None
         self.dataset_hash = None
+        self.training_code_hash = None
         self.boot_id = BOOT_ID
         self.start_time = int(time.time())
 
@@ -72,7 +72,6 @@ readiness = ReadinessState()
 
 async def global_exception_handler(request: Request, exc: Exception):
 
-    # Preserve FastAPI HTTPExceptions
     if isinstance(exc, HTTPException):
         raise exc
 
@@ -106,14 +105,14 @@ async def lifespan(app: FastAPI):
 
         loader = ModelLoader()
 
-        # Force model load
-        model = loader.xgb
+        model = loader.xgb  # Force strict load
 
         readiness.models_loaded = True
-        readiness.schema_signature = get_schema_signature()
+        readiness.schema_signature = loader._xgb_container.schema_signature
         readiness.model_version = loader.xgb_version
         readiness.artifact_hash = loader.artifact_hash
         readiness.dataset_hash = loader.dataset_hash
+        readiness.training_code_hash = loader.training_code_hash
 
         if not readiness.schema_signature:
             raise RuntimeError("Schema signature missing at startup.")
@@ -130,10 +129,6 @@ async def lifespan(app: FastAPI):
         else:
             logger.warning("Redis unavailable — degraded mode.")
 
-        # -------------------------------------------------
-        # GC CLEANUP
-        # -------------------------------------------------
-
         gc.collect()
 
         boot_time = round(time.time() - start_time, 2)
@@ -146,10 +141,6 @@ async def lifespan(app: FastAPI):
         logger.info("Model version: %s", readiness.model_version)
 
         yield
-
-        # -------------------------------------------------
-        # SHUTDOWN
-        # -------------------------------------------------
 
         logger.info("Shutting down MarketSentinel...")
         gc.collect()
@@ -226,6 +217,7 @@ def readiness_probe():
         "artifact_hash": readiness.artifact_hash,
         "dataset_hash": readiness.dataset_hash,
         "schema_signature": readiness.schema_signature,
+        "training_code_hash": readiness.training_code_hash,
         "redis_connected": readiness.redis_connected,
         "mode": "degraded" if not readiness.redis_connected else "normal",
         "uptime_seconds": int(time.time()) - readiness.start_time
