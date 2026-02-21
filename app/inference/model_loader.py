@@ -28,6 +28,7 @@ class LoadedModel:
     schema_signature: str
     dataset_hash: str
     training_code_hash: str
+    artifact_hash: str
 
 
 ############################################################
@@ -107,17 +108,21 @@ class ModelLoader:
 
     def _validate_metadata(self, metadata_path):
 
-        with open(metadata_path) as f:
+        with open(metadata_path, encoding="utf-8") as f:
             meta = json.load(f)
 
         if meta.get("schema_signature") != get_schema_signature():
             raise RuntimeError("Schema mismatch during inference.")
 
-        if "dataset_hash" not in meta:
-            raise RuntimeError("Metadata missing dataset_hash.")
+        required_fields = [
+            "dataset_hash",
+            "training_code_hash",
+            "schema_signature"
+        ]
 
-        if "training_code_hash" not in meta:
-            raise RuntimeError("Metadata missing training_code_hash.")
+        for field in required_fields:
+            if field not in meta:
+                raise RuntimeError(f"Metadata missing required field: {field}")
 
         return meta
 
@@ -160,22 +165,29 @@ class ModelLoader:
         logger.info("Loading XGBoost version=%s", version)
 
         meta = self._validate_metadata(metadata_path)
+
+        artifact_hash = self._sha256(model_path)
+
         model = self._safe_load_model(model_path)
 
-        self._xgb_container = LoadedModel(
+        container = LoadedModel(
             model=model,
             version=version,
             schema_signature=meta["schema_signature"],
             dataset_hash=meta["dataset_hash"],
-            training_code_hash=meta["training_code_hash"]
+            training_code_hash=meta["training_code_hash"],
+            artifact_hash=artifact_hash
         )
+
+        # Atomic assignment (important for thread safety)
+        self._xgb_container = container
 
         MODEL_VERSION.labels(
             model="xgboost",
             version=version
         ).set(1)
 
-        return model
+        return container.model
 
     ########################################################
     # FEATURE VALIDATION
@@ -214,3 +226,16 @@ class ModelLoader:
     def training_code_hash(self):
         self._reload_xgb_if_needed()
         return self._xgb_container.training_code_hash
+
+    @property
+    def artifact_hash(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.artifact_hash
+
+    ########################################################
+    # WARMUP (used in app.main)
+    ########################################################
+
+    def warmup(self):
+        logger.info("Model warmup triggered.")
+        _ = self.xgb
