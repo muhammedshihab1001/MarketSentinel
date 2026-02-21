@@ -11,6 +11,7 @@ router = APIRouter()
 logger = logging.getLogger("marketsentinel.equity")
 
 MIN_HISTORY_ROWS = 60
+MIN_ASSETS_PER_DAY = 4
 BENCHMARK_TICKER = "SPY"
 
 
@@ -59,13 +60,12 @@ def equity_curve(days: int = 120):
 
             except Exception as e:
                 logger.warning(f"Skipping {ticker} — {str(e)}")
-                continue
 
         if not price_history:
             raise RuntimeError("No valid price data available.")
 
         ############################################################
-        # 2️⃣ PRECOMPUTE FULL FEATURES ONCE
+        # 2️⃣ PRECOMPUTE FEATURES ONCE
         ############################################################
 
         full_feature_cache = {}
@@ -103,19 +103,17 @@ def equity_curve(days: int = 120):
         )
 
         ############################################################
-        # 4️⃣ BUILD EVALUATION DATES
+        # 4️⃣ EVALUATION DATES
         ############################################################
 
         combined_dates = sorted(
-            set(
-                pd.concat(price_history.values())["date"].unique()
-            )
+            set(pd.concat(price_history.values())["date"].unique())
         )
 
         eval_dates = combined_dates[-days:]
 
         ############################################################
-        # 5️⃣ GENERATE STRATEGY SIGNALS (SLICING ONLY)
+        # 5️⃣ GENERATE STRATEGY SIGNALS (SLICE ONLY)
         ############################################################
 
         portfolio_records = []
@@ -129,7 +127,7 @@ def equity_curve(days: int = 120):
                 if not df.empty:
                     sliced.append(df)
 
-            if not sliced:
+            if len(sliced) < MIN_ASSETS_PER_DAY:
                 continue
 
             latest_df = pd.concat(sliced, ignore_index=True)
@@ -140,8 +138,11 @@ def equity_curve(days: int = 120):
                     use_cache=False
                 )
                 portfolio_records.extend(results)
-            except Exception:
-                continue
+
+            except Exception as e:
+                logger.warning(
+                    f"Historical skip {eval_date} — {str(e)}"
+                )
 
         if not portfolio_records:
             raise RuntimeError("No portfolio history generated.")
@@ -171,26 +172,32 @@ def equity_curve(days: int = 120):
         strategy_equity = report.equity_curve
 
         ############################################################
-        # 8️⃣ BENCHMARK EQUITY
+        # 8️⃣ BENCHMARK ALIGNMENT (SAFE)
         ############################################################
 
         benchmark_returns = (
             benchmark_df
             .set_index("date")["forward_return"]
-            .loc[strategy_equity.index]
+            .reindex(strategy_equity.index)
             .dropna()
         )
+
+        if benchmark_returns.empty:
+            raise RuntimeError("Benchmark alignment failed.")
 
         benchmark_equity = (1 + benchmark_returns).cumprod()
 
         ############################################################
-        # 9️⃣ ALIGN
+        # 9️⃣ ALIGN STRATEGY
         ############################################################
 
         aligned_strategy = strategy_equity.loc[benchmark_equity.index]
 
         return {
-            "dates": [d.strftime("%Y-%m-%d") for d in benchmark_equity.index],
+            "dates": [
+                d.strftime("%Y-%m-%d")
+                for d in benchmark_equity.index
+            ],
             "strategy_equity": aligned_strategy.tolist(),
             "benchmark_equity": benchmark_equity.tolist()
         }
