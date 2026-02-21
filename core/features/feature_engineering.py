@@ -252,7 +252,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # MAIN PIPELINE
+    # MAIN PIPELINE (FIXED)
     ########################################################
 
     @classmethod
@@ -279,9 +279,19 @@ class FeatureEngineer:
 
         df = cls.add_cross_sectional_features(df)
 
-        df = df.dropna()
+        ########################################################
+        # CRITICAL FIX: DO NOT GLOBAL DROPNA
+        ########################################################
 
-        float_cols = df.select_dtypes("float64").columns
+        missing_model_cols = set(MODEL_FEATURES) - set(df.columns)
+        if missing_model_cols:
+            raise RuntimeError(
+                f"Missing required model features: {missing_model_cols}"
+            )
+
+        df = df.dropna(subset=MODEL_FEATURES)
+
+        float_cols = df.select_dtypes(include=["float64"]).columns
         df[float_cols] = df[float_cols].astype("float32")
 
         logger.info("Feature pipeline built | rows=%s", len(df))
