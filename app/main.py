@@ -1,8 +1,6 @@
 import logging
 import time
 import gc
-import asyncio
-import os
 import hashlib
 from contextlib import asynccontextmanager
 
@@ -10,7 +8,7 @@ from fastapi import FastAPI, Response, Request
 from fastapi.responses import JSONResponse
 from prometheus_client import generate_latest
 
-from app.api.routes import health, predict
+from app.api.routes import predict
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
 from core.schema.feature_schema import get_schema_signature
@@ -37,7 +35,6 @@ BOOT_ID = hashlib.sha256(
 ).hexdigest()[:12]
 
 STARTUP_TIMEOUT_SEC = 120
-MAX_CONCURRENT_INFERENCE = 4
 
 
 # =====================================================
@@ -60,8 +57,6 @@ class ReadinessState:
 
 
 readiness = ReadinessState()
-
-inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCE)
 
 
 # =====================================================
@@ -99,15 +94,13 @@ async def lifespan(app: FastAPI):
         # -------------------------------------------------
 
         loader = ModelLoader()
-        loader.warmup()
+
+        # Force model load
+        _ = loader.xgb
 
         readiness.models_loaded = True
         readiness.schema_signature = get_schema_signature()
-
-        try:
-            readiness.model_version = loader.xgb_version
-        except Exception:
-            readiness.model_version = "latest"
+        readiness.model_version = loader.xgb_version
 
         # -------------------------------------------------
         # REDIS CHECK
@@ -156,8 +149,8 @@ async def lifespan(app: FastAPI):
 # =====================================================
 
 app = FastAPI(
-    title="MarketSentinel API",
-    version="2.0.0",
+    title="MarketSentinel Portfolio API",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -168,7 +161,6 @@ app.add_exception_handler(Exception, global_exception_handler)
 # ROUTES
 # =====================================================
 
-app.include_router(health.router, prefix="/health")
 app.include_router(predict.router, prefix="/v1")
 
 
@@ -179,9 +171,10 @@ app.include_router(predict.router, prefix="/v1")
 @app.get("/")
 async def root():
     return {
-        "service": "MarketSentinel API",
+        "service": "MarketSentinel Portfolio Engine",
         "status": "running",
         "boot_id": readiness.boot_id,
+        "model_version": readiness.model_version,
         "docs": "/docs",
         "metrics": "/metrics"
     }
