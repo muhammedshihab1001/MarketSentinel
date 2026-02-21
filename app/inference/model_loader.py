@@ -2,7 +2,6 @@ import os
 import joblib
 import logging
 import threading
-import json
 import hashlib
 import numpy as np
 from dataclasses import dataclass
@@ -11,6 +10,7 @@ from glob import glob
 from core.schema.feature_schema import (
     get_schema_signature,
     MODEL_FEATURES,
+    SCHEMA_VERSION,
     DTYPE
 )
 
@@ -90,7 +90,6 @@ class ModelLoader:
             raise RuntimeError("No trained model artifacts found.")
 
         latest = max(model_files, key=os.path.getmtime)
-
         filename = os.path.basename(latest)
 
         if not filename.startswith("model_") or not filename.endswith(".pkl"):
@@ -107,27 +106,6 @@ class ModelLoader:
             raise RuntimeError("Metadata file missing for latest model.")
 
         return latest, metadata_path, version
-
-    ########################################################
-    # METADATA STRUCTURE VALIDATION
-    ########################################################
-
-    def _validate_metadata_structure(self, meta: dict):
-
-        required = {
-            "schema_signature",
-            "dataset_hash",
-            "training_code_hash",
-            "timestamp",
-            "metrics"
-        }
-
-        missing = required - set(meta.keys())
-
-        if missing:
-            raise RuntimeError(
-                f"Metadata missing required fields: {missing}"
-            )
 
     ########################################################
     # SAFE LOAD MODEL
@@ -177,15 +155,24 @@ class ModelLoader:
 
             logger.info("Loading XGBoost version=%s", version)
 
+            # STRICT METADATA VALIDATION
             meta = MetadataManager.load_metadata(metadata_path)
 
-            self._validate_metadata_structure(meta)
+            if meta["metadata_type"] != "training_manifest_v1":
+                raise RuntimeError("Unsupported metadata type.")
 
             if meta["schema_signature"] != get_schema_signature():
                 raise RuntimeError("Schema mismatch during inference.")
 
-            artifact_hash = self._sha256(model_path)
+            if meta["schema_version"] != SCHEMA_VERSION:
+                raise RuntimeError("Schema version drift detected.")
 
+            if meta["features"] != MODEL_FEATURES:
+                raise RuntimeError(
+                    "Metadata feature contract mismatch."
+                )
+
+            artifact_hash = self._sha256(model_path)
             model = self._safe_load_model(model_path)
 
             container = LoadedModel(
