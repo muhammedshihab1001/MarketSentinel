@@ -76,25 +76,12 @@ class CircuitBreaker:
 class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
-    MAX_NET_EXPOSURE = 0.2
     TOP_K = 3
     BOTTOM_K = 3
-
-    LATENCY_GUARD_SECONDS = float(
-        os.getenv("HARD_LATENCY_LIMIT_SECONDS", "5.0")
-    )
-
-    CACHE_TTL = int(
-        os.getenv("INFERENCE_CACHE_TTL_SECONDS", "600")
-    )
-
-    INFERENCE_LOOKBACK_DAYS = int(
-        os.getenv("INFERENCE_LOOKBACK_DAYS", "400")
-    )
-
     MIN_PROB_STD = 1e-6
 
-    ############################################################
+    CACHE_TTL = int(os.getenv("INFERENCE_CACHE_TTL_SECONDS", "600"))
+    INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
 
     def __init__(self):
 
@@ -128,14 +115,11 @@ class InferencePipeline:
 
     def _dataset_hash(self, df: pd.DataFrame) -> str:
 
-        ordered = (
-            df.sort_values(["ticker", "date"])
-            .reset_index(drop=True)
-        )
+        ordered = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
         feature_block = validate_feature_schema(
             ordered.loc[:, MODEL_FEATURES],
-            mode="inference"   # ✅ CORRECT
+            mode="inference"
         )
 
         payload = (
@@ -168,8 +152,8 @@ class InferencePipeline:
         long_vol = longs["volatility"].replace(0, 1e-6)
         short_vol = shorts["volatility"].replace(0, 1e-6)
 
-        long_weights = 1.0 / long_vol
-        short_weights = 1.0 / short_vol
+        long_weights = (1.0 / long_vol)
+        short_weights = (1.0 / short_vol)
 
         long_weights /= long_weights.sum()
         short_weights /= short_weights.sum()
@@ -192,8 +176,6 @@ class InferencePipeline:
     ############################################################
 
     def run_batch(self, tickers: list[str]):
-
-        start_pipeline = time.time()
 
         MarketUniverse.validate_subset(tickers)
 
@@ -241,10 +223,8 @@ class InferencePipeline:
 
             feature_df = validate_feature_schema(
                 latest_df.loc[:, MODEL_FEATURES],
-                mode="inference"   # ✅ CORRECT
-            )
-
-            feature_df = feature_df.astype(DTYPE)
+                mode="inference"
+            ).astype(DTYPE)
 
             dataset_hash = self._dataset_hash(latest_df)
 
@@ -270,22 +250,33 @@ class InferencePipeline:
 
             probs = np.clip(probs, 1e-6, 1 - 1e-6)
 
+            if np.std(probs) < self.MIN_PROB_STD:
+                raise RuntimeError("Probability collapse detected.")
+
             latest_df["score"] = probs
 
             weights = self._construct_portfolio(latest_df)
 
-            response = {
-                "date": str(latest_date),
-                "portfolio_weights": weights,
-                "gross_exposure": float(sum(abs(w) for w in weights.values())),
-                "net_exposure": float(sum(weights.values())),
-                "model_version": self.models.xgb_version
-            }
+            portfolio_rows = []
 
-            self.cache.set(cache_key, response, ttl=self.CACHE_TTL)
+            for ticker, weight in weights.items():
+
+                score = float(
+                    latest_df.loc[
+                        latest_df["ticker"] == ticker, "score"
+                    ].values[0]
+                )
+
+                portfolio_rows.append({
+                    "ticker": ticker,
+                    "weight": float(weight),
+                    "score": score
+                })
+
+            self.cache.set(cache_key, portfolio_rows, ttl=self.CACHE_TTL)
             self.breaker.record_success()
 
-            return response
+            return portfolio_rows
 
         except Exception as e:
 
