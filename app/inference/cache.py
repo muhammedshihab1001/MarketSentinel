@@ -26,9 +26,8 @@ class RedisCache:
     MAX_TTL = 900
     MIN_TTL = 30
 
-    MAX_PAYLOAD_BYTES = 256_000   # 🔥 HARD LIMIT (256KB)
-
-    CACHE_NAMESPACE_VERSION = "v3"
+    MAX_PAYLOAD_BYTES = 256_000
+    CACHE_NAMESPACE_VERSION = "v4"
 
     ###################################################
 
@@ -60,7 +59,7 @@ class RedisCache:
                     port=port,
                     socket_timeout=2,
                     socket_connect_timeout=2,
-                    socket_keepalive=True,      # 🔥 critical
+                    socket_keepalive=True,
                     health_check_interval=30,
                     max_connections=32,
                     retry_on_timeout=True,
@@ -117,23 +116,16 @@ class RedisCache:
         self._connect()
 
     ###################################################
-    # SAFE MODEL FINGERPRINT
+    # MODEL FINGERPRINT
     ###################################################
 
     def _model_fingerprint(self):
 
         try:
             loader = ModelLoader()
-
-            # SAFE ACCESSOR
-            version = loader.xgb_version
-            if version:
-                return version
-
+            return loader.xgb_version
         except Exception:
-            pass
-
-        return "unknown"
+            return "unknown"
 
     ###################################################
     # CANONICAL JSON
@@ -155,21 +147,20 @@ class RedisCache:
     def build_key(self, payload: dict) -> str:
 
         raw = self._canonical_json(payload)
-
         fingerprint = hashlib.sha256(raw.encode()).hexdigest()
 
         model_fp = self._model_fingerprint()
 
         return (
             f"{self.CACHE_NAMESPACE_VERSION}:"
-            f"prediction:"
+            f"portfolio:"
             f"{model_fp}:"
             f"{self.schema_sig}:"
             f"{fingerprint}"
         )
 
     ###################################################
-    # PAYLOAD VALIDATION (HARDENED)
+    # PORTFOLIO PAYLOAD VALIDATION
     ###################################################
 
     def _validate_payload(self, value):
@@ -177,24 +168,45 @@ class RedisCache:
         if not isinstance(value, dict):
             raise RuntimeError("Cache payload must be dict.")
 
-        if not value:
-            raise RuntimeError("Refusing empty payload.")
-
-        required = {"ticker", "signal_today", "confidence"}
+        required = {
+            "date",
+            "portfolio_weights",
+            "gross_exposure",
+            "net_exposure",
+            "num_longs",
+            "num_shorts",
+            "model_version"
+        }
 
         if not required.issubset(value.keys()):
-            raise RuntimeError("Cache payload missing fields.")
+            raise RuntimeError("Cache payload missing required fields.")
 
-        confidence = value.get("confidence")
+        weights = value["portfolio_weights"]
 
-        if not isinstance(confidence, (int, float)):
-            raise RuntimeError("Invalid confidence type.")
+        if not isinstance(weights, dict):
+            raise RuntimeError("Invalid portfolio_weights format.")
 
-        if not np.isfinite(confidence):
-            raise RuntimeError("Non-finite confidence.")
+        for k, v in weights.items():
+            if not isinstance(k, str):
+                raise RuntimeError("Invalid ticker key in weights.")
 
-        if not (0 <= confidence <= 1.5):
-            raise RuntimeError("Confidence out of bounds.")
+            if not isinstance(v, (int, float)):
+                raise RuntimeError("Invalid weight type.")
+
+            if not np.isfinite(v):
+                raise RuntimeError("Non-finite weight detected.")
+
+        gross = value["gross_exposure"]
+        net = value["net_exposure"]
+
+        if not np.isfinite(gross) or not np.isfinite(net):
+            raise RuntimeError("Invalid exposure values.")
+
+        if gross < 0 or gross > 2.0:
+            raise RuntimeError("Gross exposure out of bounds.")
+
+        if abs(net) > 1.0:
+            raise RuntimeError("Net exposure out of bounds.")
 
     ###################################################
     # GET
@@ -280,11 +292,9 @@ class RedisCache:
 
             payload = zlib.compress(serialized)
 
-            # round-trip validation
             test = json.loads(zlib.decompress(payload))
             self._validate_payload(test)
 
-            # 🔥 Modern atomic set
             self.client.set(
                 key,
                 payload,
