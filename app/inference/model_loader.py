@@ -4,12 +4,14 @@ import logging
 import threading
 import json
 import hashlib
+import numpy as np
 from dataclasses import dataclass
 from glob import glob
 
 from core.schema.feature_schema import (
     get_schema_signature,
-    MODEL_FEATURES
+    MODEL_FEATURES,
+    DTYPE
 )
 
 from app.monitoring.metrics import MODEL_VERSION
@@ -32,7 +34,7 @@ class LoadedModel:
 
 
 ############################################################
-# SINGLETON LOADER (XGBOOST ONLY)
+# SINGLETON LOADER
 ############################################################
 
 class ModelLoader:
@@ -42,24 +44,16 @@ class ModelLoader:
 
     MIN_ARTIFACT_BYTES = 50_000
 
-    ########################################################
-
     def __new__(cls, *args, **kwargs):
-
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
-
         return cls._instance
 
-    ########################################################
-
     def __init__(self):
-
         if hasattr(self, "_initialized"):
             return
-
         self._xgb_container: LoadedModel | None = None
         self._initialized = True
 
@@ -68,17 +62,14 @@ class ModelLoader:
     ########################################################
 
     def _sha256(self, path):
-
         h = hashlib.sha256()
-
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
-
         return h.hexdigest()
 
     ########################################################
-    # FIND LATEST MODEL ARTIFACT
+    # FIND LATEST MODEL
     ########################################################
 
     def _find_latest_artifact(self, base_dir):
@@ -90,20 +81,24 @@ class ModelLoader:
 
         latest = max(model_files, key=os.path.getmtime)
 
-        timestamp = os.path.basename(latest).split("_")[1].split(".")[0]
+        filename = os.path.basename(latest)
+        if not filename.startswith("model_") or not filename.endswith(".pkl"):
+            raise RuntimeError("Unexpected artifact naming format.")
+
+        version = filename[len("model_"):-len(".pkl")]
 
         metadata_path = os.path.join(
             base_dir,
-            f"metadata_{timestamp}.json"
+            f"metadata_{version}.json"
         )
 
         if not os.path.exists(metadata_path):
             raise RuntimeError("Metadata file missing for latest model.")
 
-        return latest, metadata_path, timestamp
+        return latest, metadata_path, version
 
     ########################################################
-    # VALIDATE METADATA
+    # METADATA VALIDATION
     ########################################################
 
     def _validate_metadata(self, metadata_path):
@@ -127,7 +122,7 @@ class ModelLoader:
         return meta
 
     ########################################################
-    # SAFE MODEL LOAD
+    # SAFE LOAD
     ########################################################
 
     def _safe_load_model(self, model_path):
@@ -140,10 +135,18 @@ class ModelLoader:
         if not hasattr(model, "predict_proba"):
             raise RuntimeError("Invalid model artifact loaded.")
 
+        # Validate feature alignment if available
+        if hasattr(model, "feature_names"):
+            trained_features = list(model.feature_names)
+            if trained_features != MODEL_FEATURES:
+                raise RuntimeError(
+                    "Model feature contract mismatch at inference."
+                )
+
         return model
 
     ########################################################
-    # RELOAD XGB IF NEEDED
+    # RELOAD IF NEEDED
     ########################################################
 
     def _reload_xgb_if_needed(self):
@@ -165,9 +168,7 @@ class ModelLoader:
         logger.info("Loading XGBoost version=%s", version)
 
         meta = self._validate_metadata(metadata_path)
-
         artifact_hash = self._sha256(model_path)
-
         model = self._safe_load_model(model_path)
 
         container = LoadedModel(
@@ -179,7 +180,6 @@ class ModelLoader:
             artifact_hash=artifact_hash
         )
 
-        # Atomic assignment (important for thread safety)
         self._xgb_container = container
 
         MODEL_VERSION.labels(
@@ -190,7 +190,7 @@ class ModelLoader:
         return container.model
 
     ########################################################
-    # FEATURE VALIDATION
+    # STRICT FEATURE VALIDATION
     ########################################################
 
     def validate_features(self, df):
@@ -202,7 +202,15 @@ class ModelLoader:
                 f"Inference feature mismatch: missing {missing}"
             )
 
-        return df.loc[:, MODEL_FEATURES]
+        df = df.loc[:, MODEL_FEATURES]
+
+        if df.isnull().any().any():
+            raise RuntimeError("NaN detected in inference features.")
+
+        if not np.isfinite(df.values).all():
+            raise RuntimeError("Non-finite values detected in inference.")
+
+        return df.astype(DTYPE)
 
     ########################################################
     # PUBLIC ACCESSORS
@@ -233,7 +241,7 @@ class ModelLoader:
         return self._xgb_container.artifact_hash
 
     ########################################################
-    # WARMUP (used in app.main)
+    # WARMUP
     ########################################################
 
     def warmup(self):

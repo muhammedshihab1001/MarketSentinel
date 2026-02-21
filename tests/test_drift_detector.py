@@ -1,26 +1,27 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from core.monitoring.drift_detector import DriftDetector
+from core.schema.feature_schema import MODEL_FEATURES
 
 
 def test_drift_detector_runs():
 
+    n = 250  # must exceed MIN_SAMPLE_BASELINE
+
     df = pd.DataFrame({
-        "return": np.random.normal(0, 1, 100),
-        "volatility": np.random.normal(1, 0.1, 100),
-        "rsi": np.random.uniform(30, 70, 100),
-        "macd": np.random.normal(0, 1, 100),
-        "macd_signal": np.random.normal(0, 1, 100),
-        "avg_sentiment": np.random.normal(0, 1, 100),
-        "news_count": np.random.randint(1, 10, 100),
-        "sentiment_std": np.random.rand(100),
-        "return_lag1": np.random.normal(0, 1, 100),
-        "sentiment_lag1": np.random.normal(0, 1, 100),
+        col: np.random.normal(0, 1, n)
+        for col in MODEL_FEATURES
     })
 
     detector = DriftDetector()
-    detector.create_baseline(df)
+
+    detector.create_baseline(
+        dataset=df,
+        dataset_hash="testhash",
+        training_code_hash="codehash",
+        allow_overwrite=True
+    )
 
     result = detector.detect(df)
 
