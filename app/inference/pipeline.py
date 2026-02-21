@@ -221,6 +221,10 @@ class InferencePipeline:
             latest_date = df["date"].max()
             latest_df = df[df["date"] == latest_date].copy()
 
+            ########################################################
+            # MODEL INFERENCE
+            ########################################################
+
             feature_df = validate_feature_schema(
                 latest_df.loc[:, MODEL_FEATURES],
                 mode="inference"
@@ -254,23 +258,44 @@ class InferencePipeline:
                 raise RuntimeError("Probability collapse detected.")
 
             latest_df["score"] = probs
+            latest_df["rank_pct"] = latest_df["score"].rank(pct=True)
+
+            def signal_from_rank(x):
+                if x >= 0.7:
+                    return "LONG"
+                elif x <= 0.3:
+                    return "SHORT"
+                return "NEUTRAL"
+
+            latest_df["signal"] = latest_df["rank_pct"].apply(signal_from_rank)
+
+            ########################################################
+            # PORTFOLIO
+            ########################################################
 
             weights = self._construct_portfolio(latest_df)
 
+            ########################################################
+            # TERMINAL OUTPUT
+            ########################################################
+
             portfolio_rows = []
 
-            for ticker, weight in weights.items():
+            for _, row in latest_df.iterrows():
 
-                score = float(
-                    latest_df.loc[
-                        latest_df["ticker"] == ticker, "score"
-                    ].values[0]
-                )
+                ticker = row["ticker"]
+                weight = float(weights.get(ticker, 0.0))
 
                 portfolio_rows.append({
                     "ticker": ticker,
-                    "weight": float(weight),
-                    "score": score
+                    "score": float(row["score"]),
+                    "rank_pct": float(row["rank_pct"]),
+                    "signal": row["signal"],
+                    "weight": weight,
+                    "volatility": float(row["volatility"]),
+                    "momentum_20": float(row["momentum_20"]),
+                    "rsi": float(row["rsi"]),
+                    "regime": float(row["regime_feature"])
                 })
 
             self.cache.set(cache_key, portfolio_rows, ttl=self.CACHE_TTL)
