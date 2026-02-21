@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 class FeatureEngineer:
 
-    MIN_ROWS_REQUIRED = 100  # lowered for unit tests
+    MIN_ROWS_REQUIRED = 100
     VOL_FLOOR = 1e-4
     RETURN_CLAMP = (-0.5, 0.5)
     SPLIT_THRESHOLD = 3.5
@@ -71,7 +71,7 @@ class FeatureEngineer:
         return df.reset_index(drop=True)
 
     ########################################################
-    # SENTIMENT MERGE (RESTORED)
+    # SENTIMENT MERGE
     ########################################################
 
     @staticmethod
@@ -186,7 +186,7 @@ class FeatureEngineer:
                 group[["date", "close"]],
                 window=14
             )
-            group["rsi"] = rsi.values
+            group["rsi"] = rsi.values.astype("float32")
             return group
 
         return df.groupby("ticker", group_keys=False).apply(_compute)
@@ -198,8 +198,8 @@ class FeatureEngineer:
             macd, signal = TechnicalIndicators.macd(
                 x[["date", "close"]]
             )
-            x["macd"] = macd
-            x["macd_signal"] = signal
+            x["macd"] = macd.astype("float32")
+            x["macd_signal"] = signal.astype("float32")
             return x
 
         return df.groupby("ticker", group_keys=False).apply(_block)
@@ -222,6 +222,36 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
+    # CROSS-SECTIONAL FEATURES
+    ########################################################
+
+    @staticmethod
+    def add_cross_sectional_features(df):
+
+        base_cols = [
+            "momentum_20",
+            "return_lag5",
+            "rsi",
+            "volatility",
+            "ema_ratio"
+        ]
+
+        for col in base_cols:
+
+            mean = df.groupby("date")[col].transform("mean")
+            std = df.groupby("date")[col].transform("std").replace(0, 1e-6)
+
+            df[f"{col}_z"] = ((df[col] - mean) / std).astype("float32")
+
+            df[f"{col}_rank"] = (
+                df.groupby("date")[col]
+                .rank(pct=True)
+                .astype("float32")
+            )
+
+        return df
+
+    ########################################################
     # MAIN PIPELINE
     ########################################################
 
@@ -235,10 +265,7 @@ class FeatureEngineer:
     ):
 
         if sentiment_df is not None:
-            price_df = cls.merge_price_sentiment(
-                price_df,
-                sentiment_df
-            )
+            price_df = cls.merge_price_sentiment(price_df, sentiment_df)
 
         df = cls._validate_price_frame(price_df, ticker)
 
@@ -249,6 +276,8 @@ class FeatureEngineer:
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
         cls.add_ema(df)
+
+        df = cls.add_cross_sectional_features(df)
 
         df = df.dropna()
 
