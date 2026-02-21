@@ -89,6 +89,8 @@ class InferencePipeline:
 
     MIN_PROB_STD = 1e-6
 
+    ############################################################
+
     def __init__(self):
 
         self.market_data = MarketDataService()
@@ -103,54 +105,53 @@ class InferencePipeline:
         self._validate_models_loaded()
 
     ############################################################
+    # MODEL + SCHEMA VALIDATION
+    ############################################################
 
     def _validate_models_loaded(self):
+
         model = self.models.xgb
+
         if not hasattr(model, "predict_proba"):
             raise RuntimeError("Loaded model is not a classifier.")
+
+        if not hasattr(self.models, "metadata"):
+            raise RuntimeError("Model metadata missing.")
+
+        metadata_schema = self.models.metadata.get("schema_signature")
+
+        if metadata_schema != self.schema_sig:
+            raise RuntimeError(
+                "Schema signature mismatch between training and inference."
+            )
+
+        logger.info("Model + schema signature verified.")
 
     ############################################################
 
     def _dataset_hash(self, df: pd.DataFrame) -> str:
-        payload = (
+
+        ordered = (
             df.sort_values(["ticker", "date"])
             .reset_index(drop=True)
-            .loc[:, MODEL_FEATURES]
+        )
+
+        feature_block = validate_feature_schema(
+            ordered.loc[:, MODEL_FEATURES]
+        )
+
+        payload = (
+            feature_block
             .astype(float)
             .round(8)
             .to_csv(index=False)
             .encode()
         )
+
         return hashlib.sha256(payload).hexdigest()[:16]
 
     ############################################################
-
-    def _build_cross_sectional_features(self, df):
-
-        cross_cols = [
-            "momentum_20",
-            "return_lag5",
-            "rsi",
-            "volatility",
-            "ema_ratio"
-        ]
-
-        for col in cross_cols:
-
-            grouped = df.groupby("date")[col]
-
-            df[f"{col}_z"] = (
-                grouped.transform(
-                    lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9)
-                )
-            ).clip(-5, 5)
-
-            df[f"{col}_rank"] = grouped.transform(
-                lambda x: x.rank(pct=True)
-            )
-
-        return df
-
+    # PORTFOLIO CONSTRUCTION
     ############################################################
 
     def _construct_portfolio(self, latest_df):
@@ -242,7 +243,6 @@ class InferencePipeline:
                 raise RuntimeError("No valid datasets built.")
 
             df = pd.concat(datasets, ignore_index=True)
-            df = self._build_cross_sectional_features(df)
 
             latest_date = df["date"].max()
             latest_df = df[df["date"] == latest_date].copy()
@@ -251,13 +251,10 @@ class InferencePipeline:
                 latest_df.loc[:, MODEL_FEATURES]
             )
 
-            if feature_df.isnull().any().any():
-                raise RuntimeError("NaN detected in inference features.")
+            feature_df = feature_df.astype(DTYPE)
 
             if not np.isfinite(feature_df.values).all():
                 raise RuntimeError("Non-finite values detected in features.")
-
-            feature_df = feature_df.astype(DTYPE)
 
             dataset_hash = self._dataset_hash(latest_df)
 
@@ -277,7 +274,7 @@ class InferencePipeline:
             drift_report = self.drift_detector.detect(latest_df)
 
             if drift_report.get("drift_detected"):
-                logger.critical("Drift detected during portfolio inference.")
+                logger.critical("Drift detected during inference.")
 
             t0 = time.time()
             probs = self.models.xgb.predict_proba(feature_df)[:, 1]
