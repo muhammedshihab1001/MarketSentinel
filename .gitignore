@@ -43,17 +43,18 @@ terraform.tfstate*
 # ================== DATA GOVERNANCE ==================
 ########################################################
 
-data/
-datasets/
-notebooks/
+# Ignore all data by default
+data/*
 
-*.parquet
-*.feather
-*.hdf5
-*.sqlite
-*.db
-*.csv
-*.xlsx
+# Allow directory structure
+!data/.gitkeep
+!data/features/
+!data/features/.gitkeep
+
+# Prevent committing feature files
+data/features/*.parquet
+data/features/*.feather
+data/features/*.csv
 
 ########################################################
 # ================== MODEL BINARIES ===================
@@ -72,8 +73,17 @@ notebooks/
 # ================== ARTIFACT GOVERNANCE ==============
 ########################################################
 
-# NEVER commit artifacts (models, registry, drift, feature store)
-artifacts/
+# Ignore artifacts by default
+artifacts/*
+
+# Allow directory structure
+!artifacts/.gitkeep
+
+# Never commit model binaries inside artifacts
+artifacts/**/*.pkl
+artifacts/**/*.joblib
+artifacts/**/*.bin
+artifacts/**/*.model
 
 ########################################################
 # ================== XGBOOST CACHE ====================
