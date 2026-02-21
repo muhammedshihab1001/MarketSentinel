@@ -32,7 +32,9 @@ class FeatureEngineer:
         if "ticker" not in df.columns:
             df["ticker"] = "unknown"
 
-        return df.sort_values(["ticker", "date"]).reset_index(drop=True)
+        df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+        return df
 
     ########################################################
     # PRICE VALIDATION
@@ -70,41 +72,13 @@ class FeatureEngineer:
         return df.reset_index(drop=True)
 
     ########################################################
-    # SENTIMENT MERGE
-    ########################################################
-
-    @staticmethod
-    def merge_price_sentiment(price_df, sentiment_df):
-
-        price_df = price_df.copy()
-        price_df["date"] = pd.to_datetime(price_df["date"], utc=True)
-
-        if sentiment_df is None or sentiment_df.empty:
-            price_df["avg_sentiment"] = 0.0
-            price_df["news_count"] = 0
-            price_df["sentiment_std"] = 0.0
-            return price_df.sort_values("date").reset_index(drop=True)
-
-        sentiment_df = sentiment_df.copy()
-        sentiment_df["date"] = pd.to_datetime(sentiment_df["date"], utc=True)
-
-        merged = pd.merge(price_df, sentiment_df, on="date", how="left")
-
-        for col in ["avg_sentiment", "news_count", "sentiment_std"]:
-            if col not in merged.columns:
-                merged[col] = 0.0
-
-        merged[["avg_sentiment", "news_count", "sentiment_std"]] = \
-            merged[["avg_sentiment", "news_count", "sentiment_std"]].fillna(0)
-
-        return merged.sort_values("date").reset_index(drop=True)
-
-    ########################################################
     # RETURNS
     ########################################################
 
     @classmethod
     def add_returns(cls, df):
+
+        df = df.sort_values(["ticker", "date"])
 
         returns = df.groupby("ticker")["close"].pct_change()
         lo, hi = cls.RETURN_CLAMP
@@ -180,7 +154,17 @@ class FeatureEngineer:
         df["rsi"] = np.nan
 
         for ticker, group in df.groupby("ticker"):
-            rsi = TechnicalIndicators.rsi(group[["date", "close"]], window=14)
+
+            group = group.sort_values("date")
+
+            rsi = TechnicalIndicators.rsi(
+                group[["date", "close"]],
+                window=14
+            )
+
+            if len(rsi) != len(group):
+                raise RuntimeError("RSI misalignment detected.")
+
             df.loc[group.index, "rsi"] = rsi.values.astype("float32")
 
         return df
@@ -192,7 +176,16 @@ class FeatureEngineer:
         df["macd_signal"] = np.nan
 
         for ticker, group in df.groupby("ticker"):
-            macd, signal = TechnicalIndicators.macd(group[["date", "close"]])
+
+            group = group.sort_values("date")
+
+            macd, signal = TechnicalIndicators.macd(
+                group[["date", "close"]]
+            )
+
+            if len(macd) != len(group):
+                raise RuntimeError("MACD misalignment detected.")
+
             df.loc[group.index, "macd"] = macd.astype("float32")
             df.loc[group.index, "macd_signal"] = signal.astype("float32")
 
@@ -200,6 +193,8 @@ class FeatureEngineer:
 
     @classmethod
     def add_ema(cls, df):
+
+        df = df.sort_values(["ticker", "date"])
 
         ema10 = (
             df.groupby("ticker")["close"]
@@ -233,9 +228,6 @@ class FeatureEngineer:
         ticker=None
     ):
 
-        if sentiment_df is not None:
-            price_df = cls.merge_price_sentiment(price_df, sentiment_df)
-
         df = cls._validate_price_frame(price_df, ticker)
 
         cls.add_returns(df)
@@ -254,6 +246,16 @@ class FeatureEngineer:
         ]
 
         df = df.dropna(subset=core_cols)
+
+        # Strict causality guard
+        forbidden = [
+            c for c in df.columns
+            if any(k in c.lower() for k in ["future", "forward", "lead"])
+        ]
+        if forbidden:
+            raise RuntimeError(
+                f"Forward-looking feature detected: {forbidden}"
+            )
 
         float_cols = df.select_dtypes(include=["float64"]).columns
         df[float_cols] = df[float_cols].astype("float32")
