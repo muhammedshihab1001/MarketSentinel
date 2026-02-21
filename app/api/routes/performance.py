@@ -64,7 +64,28 @@ def compute_performance(days: int = 120):
             raise RuntimeError("No valid price data available.")
 
         ############################################################
-        # 2️⃣ FETCH BENCHMARK ONCE
+        # 2️⃣ PRECOMPUTE FULL FEATURES ONCE
+        ############################################################
+
+        full_feature_cache = {}
+
+        for ticker, df in price_history.items():
+
+            features = pipeline.feature_store.get_features(
+                df,
+                sentiment_df=None,
+                ticker=ticker,
+                training=False
+            )
+
+            if features is not None and not features.empty:
+                full_feature_cache[ticker] = features
+
+        if not full_feature_cache:
+            raise RuntimeError("No feature datasets built.")
+
+        ############################################################
+        # 3️⃣ FETCH BENCHMARK ONCE
         ############################################################
 
         benchmark_df = market_data.get_price_data(
@@ -81,7 +102,7 @@ def compute_performance(days: int = 120):
         )
 
         ############################################################
-        # 3️⃣ BUILD EVALUATION DATES
+        # 4️⃣ BUILD EVALUATION DATES
         ############################################################
 
         combined_dates = sorted(
@@ -93,22 +114,31 @@ def compute_performance(days: int = 120):
         eval_dates = combined_dates[-days:]
 
         ############################################################
-        # 4️⃣ WALK-FORWARD SIGNAL GENERATION
+        # 5️⃣ GENERATE SIGNALS USING SLICING ONLY
         ############################################################
 
         portfolio_records = []
 
         for eval_date in eval_dates:
 
+            sliced = []
+
+            for ticker, feature_df in full_feature_cache.items():
+                df = feature_df[feature_df["date"] == eval_date]
+                if not df.empty:
+                    sliced.append(df)
+
+            if not sliced:
+                continue
+
+            latest_df = pd.concat(sliced, ignore_index=True)
+
             try:
-
-                results = pipeline.run_historical_batch(
-                    price_history=price_history,
-                    evaluation_date=eval_date
+                results = pipeline._run_model_and_construct(
+                    latest_df,
+                    use_cache=False
                 )
-
                 portfolio_records.extend(results)
-
             except Exception as e:
                 logger.warning(
                     f"Skipping eval_date {eval_date} — {str(e)}"
@@ -121,7 +151,7 @@ def compute_performance(days: int = 120):
         portfolio_df = pd.DataFrame(portfolio_records)
 
         ############################################################
-        # 5️⃣ BUILD FORWARD RETURN FRAME
+        # 6️⃣ BUILD FORWARD RETURN FRAME
         ############################################################
 
         forward_frames = []
@@ -135,13 +165,13 @@ def compute_performance(days: int = 120):
         forward_df.dropna(inplace=True)
 
         ############################################################
-        # 6️⃣ STRATEGY EVALUATION
+        # 7️⃣ STRATEGY EVALUATION
         ############################################################
 
         report = engine.evaluate(portfolio_df, forward_df)
 
         ############################################################
-        # 7️⃣ BENCHMARK METRICS
+        # 8️⃣ BENCHMARK METRICS
         ############################################################
 
         benchmark_returns = (
@@ -153,10 +183,6 @@ def compute_performance(days: int = 120):
 
         benchmark_equity = (1 + benchmark_returns).cumprod()
         benchmark_cumulative = benchmark_equity.iloc[-1] - 1
-
-        ############################################################
-        # 8️⃣ ALPHA + INFORMATION RATIO
-        ############################################################
 
         aligned_strategy = report.daily_returns.loc[benchmark_returns.index]
 
