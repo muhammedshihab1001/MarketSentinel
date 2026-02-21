@@ -44,16 +44,27 @@ def enforce_determinism():
 
 
 ############################################################
-# HASH UTILITIES
+# HASH UTILITIES (STRICT + ORDERED)
 ############################################################
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
-    hash_df = (
-        df.sort_values(["ticker", "date"])
-        .reset_index(drop=True)
-        .loc[:, MODEL_FEATURES + ["target"]]
+
+    feature_block = validate_feature_schema(
+        df.loc[:, MODEL_FEATURES]
     )
-    payload = hash_df.to_csv(index=False).encode()
+
+    ordered = pd.concat(
+        [
+            df[["date", "ticker"]].reset_index(drop=True),
+            feature_block.reset_index(drop=True),
+            df["target"].reset_index(drop=True),
+        ],
+        axis=1
+    )
+
+    ordered = ordered.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    payload = ordered.to_csv(index=False).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -64,7 +75,7 @@ def compute_training_code_hash() -> str:
 
 
 ############################################################
-# LOAD RAW TRAINING DATA (NO TARGET, NO CROSS-SECTIONAL)
+# LOAD RAW TRAINING DATA
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -114,7 +125,7 @@ def load_training_data(start_date, end_date):
 
 
 ############################################################
-# FINAL TARGET (ONLY FOR FINAL MODEL)
+# FINAL TARGET (STRICT CAUSAL)
 ############################################################
 
 def build_final_target(df: pd.DataFrame):
@@ -152,7 +163,7 @@ def build_final_target(df: pd.DataFrame):
 
 def trainer(train_df):
 
-    X = train_df.loc[:, MODEL_FEATURES]
+    X = validate_feature_schema(train_df.loc[:, MODEL_FEATURES])
     y = train_df["target"]
 
     pipeline = build_xgboost_pipeline(y)
@@ -225,11 +236,9 @@ def main(start_date=None, end_date=None):
 
     raw_df = load_training_data(start_date, end_date)
 
-    # Walk-forward validation (fold-local target)
     validator = WalkForwardValidator(trainer)
     metrics = validator.run(raw_df)
 
-    # Build final target for production training
     final_df = build_final_target(raw_df)
 
     dataset_hash = compute_dataset_hash(final_df)
@@ -244,7 +253,6 @@ def main(start_date=None, end_date=None):
         training_code_hash
     )
 
-    # Baseline ONLY from final training dataset
     drift = DriftDetector()
     drift.create_baseline(
         dataset=final_df,
