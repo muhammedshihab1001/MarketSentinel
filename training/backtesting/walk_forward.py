@@ -7,14 +7,16 @@ from training.backtesting.regime import MarketRegimeDetector
 
 logger = logging.getLogger("marketsentinel.walkforward")
 
+FORWARD_DAYS = 5  # aligned with training
+
 
 class WalkForwardValidator:
 
     MIN_WINDOWS = 6
     MIN_TEST_DAYS = 20
 
-    TOP_K = 2
-    BOTTOM_K = 2
+    TOP_K = 3
+    BOTTOM_K = 3
     TARGET_GROSS_EXPOSURE = 1.0
 
     def __init__(
@@ -22,7 +24,7 @@ class WalkForwardValidator:
         model_trainer,
         window_size=252,
         step_size=63,
-        embargo_days=14
+        embargo_days=FORWARD_DAYS
     ):
         self.model_trainer = model_trainer
         self.window_size = int(window_size)
@@ -37,6 +39,35 @@ class WalkForwardValidator:
         return train_df[train_df["date"] < embargo_cut]
 
     ########################################################
+    # Fold-Local Target Construction
+    ########################################################
+
+    def _build_fold_target(self, df):
+
+        df = df.sort_values(["ticker", "date"]).copy()
+
+        df["forward_log_return"] = (
+            df.groupby("ticker")["close"]
+            .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
+        )
+
+        df = df.dropna(subset=["forward_log_return"])
+
+        df["alpha_rank_pct"] = (
+            df.groupby("date")["forward_log_return"]
+            .rank(pct=True)
+        )
+
+        df["target"] = np.nan
+        df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
+        df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
+
+        df = df.dropna(subset=["target"])
+        df["target"] = df["target"].astype(int)
+
+        return df
+
+    ########################################################
 
     def run(self, df: pd.DataFrame):
 
@@ -48,11 +79,7 @@ class WalkForwardValidator:
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"], utc=True)
 
-        df = self.regime_detector.detect(df)
-
-        unique_dates = pd.to_datetime(
-            df["date"].drop_duplicates()
-        ).sort_values()
+        unique_dates = df["date"].drop_duplicates().sort_values()
 
         if len(unique_dates) <= self.window_size:
             raise RuntimeError("Insufficient history for walk-forward.")
@@ -64,7 +91,7 @@ class WalkForwardValidator:
         start_idx = self.window_size
         window_id = 1
 
-        while start_idx < len(unique_dates) - 1:
+        while start_idx < len(unique_dates) - FORWARD_DAYS:
 
             logger.info("Running WF window #%s", window_id)
 
@@ -81,45 +108,47 @@ class WalkForwardValidator:
 
             train_df = self._apply_embargo(train_df, test_dates.iloc[0])
 
-            if train_df.empty:
-                start_idx += self.step_size
-                window_id += 1
-                continue
-
             test_df = df[
                 (df["date"] >= test_dates.iloc[0]) &
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
-            if test_df.empty:
+            if train_df.empty or test_df.empty:
                 start_idx += self.step_size
                 window_id += 1
                 continue
 
-            # Strict schema check
+            # Fold-local regime
+            train_df = self.regime_detector.detect(train_df)
+            test_df = self.regime_detector.detect(test_df)
+
+            # Fold-local target
+            train_df = self._build_fold_target(train_df)
+
+            if train_df["target"].nunique() < 2:
+                start_idx += self.step_size
+                window_id += 1
+                continue
+
+            # Strict feature check
             missing = set(MODEL_FEATURES) - set(train_df.columns)
             if missing:
-                raise RuntimeError(
-                    f"Missing model features in training set: {missing}"
-                )
+                raise RuntimeError(f"Missing model features: {missing}")
 
             model = self.model_trainer(train_df)
 
             window_returns = []
             test_dates_sorted = sorted(test_df["date"].unique())
 
-            for i in range(len(test_dates_sorted) - 1):
+            for i in range(len(test_dates_sorted) - FORWARD_DAYS):
 
                 signal_date = test_dates_sorted[i]
-                next_date = test_dates_sorted[i + 1]
+                exit_date = test_dates_sorted[i + FORWARD_DAYS]
 
                 signal_slice = test_df[test_df["date"] == signal_date]
-                next_slice = test_df[test_df["date"] == next_date]
+                exit_slice = test_df[test_df["date"] == exit_date]
 
-                if signal_slice.empty or next_slice.empty:
-                    continue
-
-                if not set(MODEL_FEATURES).issubset(signal_slice.columns):
+                if signal_slice.empty or exit_slice.empty:
                     continue
 
                 X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
@@ -145,11 +174,8 @@ class WalkForwardValidator:
                 long_weights = 1.0 / long_vol
                 short_weights = 1.0 / short_vol
 
-                if long_weights.sum() > 0:
-                    long_weights /= long_weights.sum()
-
-                if short_weights.sum() > 0:
-                    short_weights /= short_weights.sum()
+                long_weights /= long_weights.sum()
+                short_weights /= short_weights.sum()
 
                 long_weights *= self.TARGET_GROSS_EXPOSURE / 2
                 short_weights *= self.TARGET_GROSS_EXPOSURE / 2
@@ -160,73 +186,42 @@ class WalkForwardValidator:
                 for t, w in zip(shorts["ticker"], short_weights):
                     positions[t] = -float(w)
 
-                # --------------------------------------------------
-                # Robust return computation (dual-mode support)
-                # --------------------------------------------------
+                merged = pd.merge(
+                    signal_slice[["ticker", "close"]],
+                    exit_slice[["ticker", "close"]],
+                    on="ticker",
+                    suffixes=("_entry", "_exit")
+                )
 
-                if "close" in signal_slice.columns and "close" in next_slice.columns:
-
-                    merged = pd.merge(
-                        signal_slice[["ticker", "close"]],
-                        next_slice[["ticker", "close"]],
-                        on="ticker",
-                        suffixes=("_today", "_next")
-                    )
-
-                    merged = merged[
-                        (merged["close_today"] > 0) &
-                        (merged["close_next"] > 0)
-                    ]
-
-                    if merged.empty:
-                        continue
-
-                    merged["ret"] = (
-                        np.log(merged["close_next"]) -
-                        np.log(merged["close_today"])
-                    )
-
-                elif "return" in next_slice.columns:
-
-                    merged = pd.merge(
-                        signal_slice[["ticker"]],
-                        next_slice[["ticker", "return"]],
-                        on="ticker"
-                    )
-
-                    if merged.empty:
-                        continue
-
-                    merged["ret"] = merged["return"]
-
-                else:
+                if merged.empty:
                     continue
 
-                daily_ret = 0.0
+                merged["ret"] = (
+                    np.log(merged["close_exit"]) -
+                    np.log(merged["close_entry"])
+                )
+
+                period_ret = 0.0
 
                 for row in merged.itertuples():
                     if row.ticker in positions:
-                        daily_ret += positions[row.ticker] * row.ret
+                        period_ret += positions[row.ticker] * row.ret
 
-                window_returns.append(daily_ret)
+                window_returns.append(period_ret)
 
             if not window_returns:
                 start_idx += self.step_size
                 window_id += 1
                 continue
 
-            window_returns = np.array(window_returns, dtype=float)
+            window_returns = np.array(window_returns)
 
             for r in window_returns:
-                capital *= (1 + r)
+                capital *= np.exp(r)
                 equity_curve.append(capital)
 
             vol = np.std(window_returns)
-            sharpe = (
-                np.mean(window_returns) /
-                (vol + 1e-9) *
-                np.sqrt(252)
-            )
+            sharpe = (np.mean(window_returns) / (vol + 1e-9)) * np.sqrt(252 / FORWARD_DAYS)
 
             results.append({
                 "strategy_return": float(window_returns.sum()),
@@ -248,10 +243,7 @@ class WalkForwardValidator:
     def aggregate_results(self, results, equity_curve):
 
         df = pd.DataFrame(results)
-        curve = np.array(equity_curve, dtype=float)
-
-        if len(curve) == 0:
-            raise RuntimeError("Empty equity curve.")
+        curve = np.array(equity_curve)
 
         peak = np.maximum.accumulate(curve)
         drawdowns = (curve - peak) / peak
