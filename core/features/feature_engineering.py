@@ -52,6 +52,9 @@ class FeatureEngineer:
 
         df = cls._normalize_datetime(df)
 
+        if "close" not in df.columns:
+            raise RuntimeError("Price dataframe requires 'close' column.")
+
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
         df = df.dropna(subset=["close"])
 
@@ -94,12 +97,22 @@ class FeatureEngineer:
             .clip(-1, 1)
         )
 
+        return df
+
     ########################################################
-    # VOLATILITY
+    # VOLATILITY (ROBUST FIX)
     ########################################################
 
     @classmethod
     def add_volatility(cls, df):
+
+        # Ensure return exists (test safety)
+        if "return" not in df.columns:
+            df["return"] = (
+                df.groupby("ticker")["close"]
+                .pct_change()
+                .clip(*cls.RETURN_CLAMP)
+            )
 
         grp = df.groupby("ticker")["return"]
 
@@ -122,8 +135,10 @@ class FeatureEngineer:
         for col in ["volatility", "volatility_5", "volatility_20"]:
             df[col] = df[col].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
 
+        return df
+
     ########################################################
-    # REGIME (FIXED — STRICTLY CAUSAL)
+    # REGIME (STRICTLY CAUSAL)
     ########################################################
 
     @classmethod
@@ -138,7 +153,6 @@ class FeatureEngineer:
 
         df["rolling_vol_40"] = rolling_vol
 
-        # Cross-sectional median PER DATE (NOT GLOBAL)
         date_median = df.groupby("date")["rolling_vol_40"].transform("median")
 
         df["regime_feature"] = np.where(
@@ -148,6 +162,8 @@ class FeatureEngineer:
         )
 
         df.drop(columns=["rolling_vol_40"], inplace=True)
+
+        return df
 
     ########################################################
     # TECHNICALS
@@ -203,14 +219,12 @@ class FeatureEngineer:
 
         ema10 = (
             df.groupby("ticker")["close"]
-            .apply(lambda x: x.ewm(span=10, adjust=False).mean())
-            .reset_index(level=0, drop=True)
+            .transform(lambda x: x.ewm(span=10, adjust=False).mean())
         )
 
         ema50 = (
             df.groupby("ticker")["close"]
-            .apply(lambda x: x.ewm(span=50, adjust=False).mean())
-            .reset_index(level=0, drop=True)
+            .transform(lambda x: x.ewm(span=50, adjust=False).mean())
         )
 
         df["ema_10"] = ema10
@@ -219,6 +233,8 @@ class FeatureEngineer:
         df["ema_ratio"] = (
             df["ema_10"] / df["ema_50"]
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
+
+        return df
 
     ########################################################
     # MAIN PIPELINE
@@ -235,13 +251,13 @@ class FeatureEngineer:
 
         df = cls._validate_price_frame(price_df, ticker)
 
-        cls.add_returns(df)
-        cls.add_volatility(df)
-        cls.add_regime_feature(df)
+        df = cls.add_returns(df)
+        df = cls.add_volatility(df)
+        df = cls.add_regime_feature(df)
 
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
-        cls.add_ema(df)
+        df = cls.add_ema(df)
 
         core_cols = [
             "return", "return_lag1", "return_lag5", "return_lag10",
