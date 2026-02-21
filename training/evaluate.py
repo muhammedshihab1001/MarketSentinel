@@ -1,11 +1,17 @@
 import numpy as np
 from sklearn.metrics import (
     accuracy_score,
-    mean_squared_error,
     roc_auc_score,
-    mean_absolute_error,
     balanced_accuracy_score
 )
+
+###################################################
+# PRODUCTION THRESHOLDS
+###################################################
+
+XGB_MIN_ACCURACY = 0.50
+XGB_MIN_BALANCED_ACCURACY = 0.50
+XGB_MIN_ROC_AUC = 0.50
 
 
 def _flatten(arr):
@@ -16,13 +22,16 @@ def _flatten(arr):
 # XGBOOST / CLASSIFICATION
 ###################################################
 
-def evaluate_xgboost(y_true, y_pred, y_prob=None):
+def evaluate_xgboost(y_true, y_pred, y_prob=None, enforce_thresholds=False):
 
     y_true = _flatten(y_true)
     y_pred = _flatten(y_pred)
 
     if len(y_true) != len(y_pred):
         raise RuntimeError("Prediction length mismatch.")
+
+    if len(y_true) == 0:
+        raise RuntimeError("Empty evaluation arrays.")
 
     valid_labels = {0, 1}
 
@@ -32,12 +41,10 @@ def evaluate_xgboost(y_true, y_pred, y_prob=None):
     if not set(np.unique(y_pred)).issubset(valid_labels):
         raise RuntimeError("Invalid prediction labels detected.")
 
-    metrics = {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "balanced_accuracy": float(
-            balanced_accuracy_score(y_true, y_pred)
-        )
-    }
+    accuracy = float(accuracy_score(y_true, y_pred))
+    balanced_acc = float(balanced_accuracy_score(y_true, y_pred))
+
+    roc_auc = None
 
     if y_prob is not None:
 
@@ -46,84 +53,34 @@ def evaluate_xgboost(y_true, y_pred, y_prob=None):
         if len(y_prob) != len(y_true):
             raise RuntimeError("Probability length mismatch.")
 
+        if np.any(~np.isfinite(y_prob)):
+            raise RuntimeError("Non-finite probabilities detected.")
+
         if np.any(y_prob < 0) or np.any(y_prob > 1):
-            raise RuntimeError(
-                "Invalid probabilities detected in evaluation."
-            )
+            raise RuntimeError("Invalid probabilities detected.")
 
-        if np.std(y_prob) < 1e-5:
-            raise RuntimeError(
-                "Probability distribution collapsed."
-            )
+        if np.std(y_prob) < 1e-8:
+            raise RuntimeError("Probability distribution collapsed.")
 
-        try:
+        if len(np.unique(y_true)) < 2:
+            roc_auc = 0.5
+        else:
+            roc_auc = float(roc_auc_score(y_true, y_prob))
 
-            if len(np.unique(y_true)) < 2:
-                metrics["roc_auc"] = 0.5
-            else:
-                metrics["roc_auc"] = float(
-                    roc_auc_score(y_true, y_prob)
-                )
+    metrics = {
+        "accuracy": accuracy,
+        "balanced_accuracy": balanced_acc,
+        "roc_auc": roc_auc
+    }
 
-        except Exception:
-            metrics["roc_auc"] = 0.5
+    if enforce_thresholds:
+        if accuracy < XGB_MIN_ACCURACY:
+            raise RuntimeError("Accuracy below minimum threshold.")
 
-    else:
-        metrics["roc_auc"] = None
+        if balanced_acc < XGB_MIN_BALANCED_ACCURACY:
+            raise RuntimeError("Balanced accuracy below minimum threshold.")
+
+        if roc_auc is not None and roc_auc < XGB_MIN_ROC_AUC:
+            raise RuntimeError("ROC AUC below minimum threshold.")
 
     return metrics
-
-
-###################################################
-# LSTM / REGRESSION
-###################################################
-
-def evaluate_lstm(y_true, y_pred):
-
-    y_true = _flatten(y_true)
-    y_pred = _flatten(y_pred)
-
-    if len(y_true) != len(y_pred):
-        raise RuntimeError("Prediction length mismatch.")
-
-    if np.isnan(y_true).any():
-        raise RuntimeError("NaNs detected in targets.")
-
-    if np.isnan(y_pred).any():
-        raise RuntimeError("NaNs detected in predictions.")
-
-    rmse = np.sqrt(
-        mean_squared_error(y_true, y_pred)
-    )
-
-    return {
-        "rmse": float(rmse)
-    }
-
-
-###################################################
-# PROPHET / FORECASTING
-###################################################
-
-def evaluate_prophet(actual, predicted):
-
-    actual = _flatten(actual)
-    predicted = _flatten(predicted)
-
-    if len(actual) != len(predicted):
-        raise RuntimeError("Forecast length mismatch.")
-
-    if np.isnan(actual).any():
-        raise RuntimeError("NaNs detected in actual values.")
-
-    if np.isnan(predicted).any():
-        raise RuntimeError("NaNs detected in forecast.")
-
-    mae = mean_absolute_error(
-        actual,
-        predicted
-    )
-
-    return {
-        "mae": float(mae)
-    }
