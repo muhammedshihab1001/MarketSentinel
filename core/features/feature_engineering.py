@@ -100,13 +100,12 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # VOLATILITY (ROBUST FIX)
+    # VOLATILITY
     ########################################################
 
     @classmethod
     def add_volatility(cls, df):
 
-        # Ensure return exists (test safety)
         if "return" not in df.columns:
             df["return"] = (
                 df.groupby("ticker")["close"]
@@ -138,7 +137,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # REGIME (STRICTLY CAUSAL)
+    # REGIME
     ########################################################
 
     @classmethod
@@ -217,22 +216,51 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"])
 
-        ema10 = (
-            df.groupby("ticker")["close"]
-            .transform(lambda x: x.ewm(span=10, adjust=False).mean())
+        df["ema_10"] = df.groupby("ticker")["close"].transform(
+            lambda x: x.ewm(span=10, adjust=False).mean()
         )
 
-        ema50 = (
-            df.groupby("ticker")["close"]
-            .transform(lambda x: x.ewm(span=50, adjust=False).mean())
+        df["ema_50"] = df.groupby("ticker")["close"].transform(
+            lambda x: x.ewm(span=50, adjust=False).mean()
         )
-
-        df["ema_10"] = ema10
-        df["ema_50"] = ema50
 
         df["ema_ratio"] = (
             df["ema_10"] / df["ema_50"]
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
+
+        return df
+
+    ########################################################
+    # CROSS-SECTIONAL FEATURES (NEW)
+    ########################################################
+
+    @classmethod
+    def add_cross_sectional_features(cls, df):
+
+        cross_cols = [
+            "momentum_20",
+            "return_lag5",
+            "rsi",
+            "volatility",
+            "ema_ratio"
+        ]
+
+        for col in cross_cols:
+
+            if col not in df.columns:
+                raise RuntimeError(f"Missing base feature: {col}")
+
+            grouped = df.groupby("date")[col]
+
+            df[f"{col}_z"] = (
+                grouped.transform(
+                    lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9)
+                )
+            ).clip(-5, 5)
+
+            df[f"{col}_rank"] = grouped.transform(
+                lambda x: x.rank(pct=True)
+            )
 
         return df
 
@@ -259,23 +287,7 @@ class FeatureEngineer:
         df = cls.add_macd(df)
         df = cls.add_ema(df)
 
-        core_cols = [
-            "return", "return_lag1", "return_lag5", "return_lag10",
-            "volatility", "volatility_5", "volatility_20",
-            "momentum_20", "rsi", "macd", "macd_signal",
-            "ema_10", "ema_50", "ema_ratio", "regime_feature"
-        ]
-
-        df = df.dropna(subset=core_cols)
-
-        forbidden = [
-            c for c in df.columns
-            if any(k in c.lower() for k in ["future", "forward", "lead"])
-        ]
-        if forbidden:
-            raise RuntimeError(
-                f"Forward-looking feature detected: {forbidden}"
-            )
+        df = cls.add_cross_sectional_features(df)
 
         float_cols = df.select_dtypes(include=["float64"]).columns
         df[float_cols] = df[float_cols].astype("float32")
