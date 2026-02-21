@@ -8,10 +8,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "30.0"
+SCHEMA_VERSION = "30.1"  # bumped
 
 ############################################################
-# CORE FEATURES (TIME-SERIES STABLE ONLY)
+# CORE FEATURES
 ############################################################
 
 CORE_FEATURES: Tuple[str, ...] = (
@@ -39,7 +39,7 @@ CORE_FEATURES: Tuple[str, ...] = (
 )
 
 ############################################################
-# CROSS-SECTIONAL FEATURES (OPTIONAL – AUTO DROP)
+# CROSS-SECTIONAL FEATURES
 ############################################################
 
 CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = (
@@ -58,7 +58,7 @@ CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = (
 )
 
 ############################################################
-# MODEL FEATURE CONTRACT (ORDERED, PANDAS-SAFE)
+# MODEL FEATURE CONTRACT
 ############################################################
 
 MODEL_FEATURES: List[str] = list(
@@ -81,7 +81,14 @@ def _check_forbidden_columns(df: pd.DataFrame):
             raise RuntimeError(f"Lookahead column detected: {col}")
 
 
-def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
+############################################################
+# VALIDATION
+############################################################
+
+def validate_feature_schema(
+    df: pd.DataFrame,
+    strict: bool = False
+) -> pd.DataFrame:
 
     if df is None or df.empty:
         raise RuntimeError("Empty feature dataset.")
@@ -100,7 +107,7 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
     feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
     ########################################################
-    # Strict validation on CORE only
+    # CORE FEATURE VALIDATION
     ########################################################
 
     for col in CORE_FEATURES:
@@ -108,26 +115,31 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
         series = feature_df[col]
         finite_vals = series[np.isfinite(series)]
 
-        if finite_vals.nunique() <= 1:
+        if finite_vals.empty:
+            raise RuntimeError(f"Core feature fully invalid: {col}")
+
+        # 🔒 Strict only for final training
+        if strict and finite_vals.nunique() <= 1:
             raise RuntimeError(f"Constant CORE feature detected: {col}")
 
         if finite_vals.var(ddof=0) < MIN_VARIANCE:
             logger.warning(f"Low variance core feature: {col}")
 
     ########################################################
-    # Auto-drop constant CROSS features
+    # AUTO-DROP CONSTANT CROSS FEATURES
     ########################################################
 
     drop_cols = []
 
     for col in CROSS_SECTIONAL_FEATURES:
+
         if col not in feature_df.columns:
             continue
 
         series = feature_df[col]
         finite_vals = series[np.isfinite(series)]
 
-        if finite_vals.nunique() <= 1:
+        if finite_vals.empty or finite_vals.nunique() <= 1:
             logger.warning(f"Dropping constant cross feature: {col}")
             drop_cols.append(col)
 
@@ -136,6 +148,10 @@ def validate_feature_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     return feature_df.astype(DTYPE, copy=False)
 
+
+############################################################
+# SCHEMA SIGNATURE
+############################################################
 
 def get_schema_signature() -> str:
 
