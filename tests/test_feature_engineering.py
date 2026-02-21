@@ -1,12 +1,11 @@
 import pytest
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import CORE_FEATURES
-from tests.conftest import sample_data
 
 
-def test_training_pipeline_produces_all_core_features():
+def test_training_pipeline_produces_all_core_features(sample_data):
 
-    price, sentiment = sample_data()
+    price, sentiment = sample_data
 
     df = FeatureEngineer.build_feature_pipeline(
         price,
@@ -14,13 +13,12 @@ def test_training_pipeline_produces_all_core_features():
         training=True
     )
 
-    # Only CORE features required at feature layer
     assert set(CORE_FEATURES).issubset(set(df.columns))
 
 
-def test_inference_pipeline_no_training_artifacts():
+def test_inference_pipeline_no_training_artifacts(sample_data):
 
-    price, sentiment = sample_data()
+    price, sentiment = sample_data
 
     df = FeatureEngineer.build_feature_pipeline(
         price,
@@ -28,13 +26,12 @@ def test_inference_pipeline_no_training_artifacts():
         training=False
     )
 
-    # Still only CORE features at this stage
     assert set(CORE_FEATURES).issubset(set(df.columns))
 
 
-def test_pipeline_handles_missing_sentiment():
+def test_pipeline_handles_missing_sentiment(sample_data):
 
-    price, _ = sample_data()
+    price, _ = sample_data
 
     df = FeatureEngineer.build_feature_pipeline(
         price,
@@ -45,9 +42,9 @@ def test_pipeline_handles_missing_sentiment():
     assert set(CORE_FEATURES).issubset(set(df.columns))
 
 
-def test_core_feature_order_stable():
+def test_core_feature_order_stable(sample_data):
 
-    price, sentiment = sample_data()
+    price, sentiment = sample_data
 
     df = FeatureEngineer.build_feature_pipeline(
         price,
