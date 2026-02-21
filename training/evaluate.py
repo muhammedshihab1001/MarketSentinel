@@ -13,6 +13,9 @@ XGB_MIN_ACCURACY = 0.50
 XGB_MIN_BALANCED_ACCURACY = 0.50
 XGB_MIN_ROC_AUC = 0.50
 
+# ---- Test compatibility alias ----
+XGB_MIN_AUC = XGB_MIN_ROC_AUC
+
 
 def _flatten(arr):
     return np.asarray(arr).reshape(-1)
