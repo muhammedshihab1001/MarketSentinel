@@ -15,7 +15,7 @@ class FeatureEngineer:
     SPLIT_THRESHOLD = 3.5
 
     ########################################################
-    # DATETIME NORMALIZATION
+    # DATETIME NORMALIZATION (FIXED)
     ########################################################
 
     @staticmethod
@@ -26,7 +26,13 @@ class FeatureEngineer:
         if "date" not in df.columns:
             raise RuntimeError("Price dataframe requires 'date' column.")
 
-        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        # ✅ FIX: Convert to UTC then drop timezone (align with MarketDataService)
+        df["date"] = (
+            pd.to_datetime(df["date"], utc=True, errors="coerce")
+            .dt.tz_convert(None)
+            .dt.normalize()
+        )
+
         df = df.dropna(subset=["date"])
 
         if "ticker" not in df.columns:
@@ -130,7 +136,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # REGIME (TIME-SERIES STABLE VERSION)
+    # REGIME
     ########################################################
 
     @classmethod
@@ -148,12 +154,7 @@ class FeatureEngineer:
 
         zscore = (df["volatility_20"] - rolling_mean) / (rolling_std + 1e-9)
 
-        df["regime_feature"] = np.where(
-            zscore > 0.5,
-            1.0,
-            0.0
-        )
-
+        df["regime_feature"] = np.where(zscore > 0.5, 1.0, 0.0)
         df["regime_feature"] = df["regime_feature"].fillna(0.0)
 
         return df
@@ -168,14 +169,8 @@ class FeatureEngineer:
         df["rsi"] = np.nan
 
         for ticker, group in df.groupby("ticker"):
-
             group = group.sort_values("date")
-
-            rsi = TechnicalIndicators.rsi(
-                group[["date", "close"]],
-                window=14
-            )
-
+            rsi = TechnicalIndicators.rsi(group[["date", "close"]], window=14)
             df.loc[group.index, "rsi"] = rsi.values.astype("float32")
 
         df["rsi"] = df["rsi"].fillna(50.0)
@@ -189,13 +184,8 @@ class FeatureEngineer:
         df["macd_signal"] = np.nan
 
         for ticker, group in df.groupby("ticker"):
-
             group = group.sort_values("date")
-
-            macd, signal = TechnicalIndicators.macd(
-                group[["date", "close"]]
-            )
-
+            macd, signal = TechnicalIndicators.macd(group[["date", "close"]])
             df.loc[group.index, "macd"] = macd.astype("float32")
             df.loc[group.index, "macd_signal"] = signal.astype("float32")
 
@@ -225,7 +215,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # CROSS-SECTIONAL FEATURES
+    # CROSS-SECTIONAL
     ########################################################
 
     @classmethod
@@ -247,9 +237,7 @@ class FeatureEngineer:
                 lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9)
             )
 
-            rank = grouped.transform(
-                lambda x: x.rank(pct=True)
-            )
+            rank = grouped.transform(lambda x: x.rank(pct=True))
 
             df[f"{col}_z"] = z.fillna(0.0).clip(-5, 5)
             df[f"{col}_rank"] = rank.fillna(0.5)
@@ -269,7 +257,6 @@ class FeatureEngineer:
 
         for col in numeric_cols:
             if df[col].isnull().any():
-
                 if col.endswith("_rank"):
                     df[col] = df[col].fillna(0.5)
                 elif col.endswith("_z"):
