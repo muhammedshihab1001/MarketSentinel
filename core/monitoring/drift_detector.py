@@ -29,7 +29,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "13.0"
+    BASELINE_VERSION = "14.0"
 
     MIN_SAMPLE_BASELINE = 150
     MIN_SAMPLE_INFERENCE = 40
@@ -50,10 +50,8 @@ class DriftDetector:
     def __init__(self, z_threshold: float = 3.5):
 
         self.z_threshold = z_threshold
-
         os.makedirs("artifacts/drift", exist_ok=True)
 
-        # 🔥 DEFAULT = FALSE (critical change)
         self.hard_fail = os.getenv(
             "DRIFT_HARD_FAIL",
             "false"
@@ -76,7 +74,7 @@ class DriftDetector:
         return path
 
     ########################################################
-    # SAFE PSI
+    # PSI
     ########################################################
 
     def _psi(self, bin_edges, expected_counts, actual):
@@ -94,7 +92,6 @@ class DriftDetector:
             actual_counts.sum(), self.EPSILON
         )
 
-        # 🔥 bin floor prevents explosion
         expected_perc = np.clip(expected_perc, self.MIN_BIN_PCT, None)
         actual_perc = np.clip(actual_perc, self.MIN_BIN_PCT, None)
 
@@ -194,8 +191,6 @@ class DriftDetector:
         if len(dataset) < self.MIN_SAMPLE_BASELINE:
             raise RuntimeError("Dataset too small for baseline.")
 
-        logger.info("Creating drift baseline...")
-
         numeric = self._safe_feature_block(dataset)
 
         features = {}
@@ -204,10 +199,7 @@ class DriftDetector:
 
             series = numeric[col].dropna()
 
-            counts, edges = np.histogram(
-                series,
-                bins=25
-            )
+            counts, edges = np.histogram(series, bins=25)
 
             features[col] = {
                 "mean": float(series.mean()),
@@ -218,9 +210,7 @@ class DriftDetector:
             }
 
         payload = {
-
             "features": features,
-
             "meta": {
                 "created_at": datetime.utcnow().isoformat(),
                 "baseline_version": self.BASELINE_VERSION,
@@ -270,21 +260,16 @@ class DriftDetector:
 
     def _validate_against_active_model(self, baseline):
 
-        model = self._model_loader.xgb   # 🔥 PUBLIC ACCESS
+        _ = self._model_loader.xgb  # ensures model loaded
 
-        container = self._model_loader._xgb_container
-
-        if container.dataset_hash != baseline["meta"]["dataset_hash"]:
+        if self._model_loader.dataset_hash != baseline["meta"]["dataset_hash"]:
             raise RuntimeError(
                 "Baseline dataset mismatch with active model."
             )
 
-        metadata_hash = baseline["meta"]["training_code_hash"]
-
-        # ensures retrain invalidates baseline
-        if metadata_hash != container.dataset_hash:
-            logger.warning(
-                "Training code hash mismatch — baseline likely stale."
+        if self._model_loader.training_code_hash != baseline["meta"]["training_code_hash"]:
+            raise RuntimeError(
+                "Training code hash mismatch — baseline stale."
             )
 
     ########################################################
@@ -359,7 +344,6 @@ class DriftDetector:
 
             DRIFT_DETECTED.set(1 if drift_detected else 0)
 
-            # 🔥 SOFT FAIL
             if drift_detected:
                 logger.critical("FEATURE DRIFT DETECTED")
 
@@ -372,7 +356,6 @@ class DriftDetector:
         except Exception as exc:
 
             logger.exception("Drift enforcement triggered: %s", exc)
-
             DRIFT_DETECTED.set(1)
 
             if self.hard_fail:
