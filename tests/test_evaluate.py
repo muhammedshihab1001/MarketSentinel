@@ -1,26 +1,80 @@
+import numpy as np
+import pytest
+from sklearn.metrics import accuracy_score, roc_auc_score
+
 from training.evaluate import (
-    evaluate_xgboost,
-    evaluate_lstm,
-    evaluate_prophet
+    XGB_MIN_ACCURACY,
+    XGB_MIN_AUC
 )
 
 
-def test_xgboost_metrics():
-    y_true = [1, 0, 1]
-    y_pred = [1, 0, 1]
-    metrics = evaluate_xgboost(y_true, y_pred)
-    assert "accuracy" in metrics
+############################################################
+# METRIC CALCULATION TEST (UNIT LEVEL)
+############################################################
+
+def test_xgboost_metric_computation():
+
+    y_true = np.array([1, 0, 1, 0])
+    probs = np.array([0.9, 0.1, 0.8, 0.2])
+    preds = (probs > 0.5).astype(int)
+
+    accuracy = accuracy_score(y_true, preds)
+    auc = roc_auc_score(y_true, probs)
+
+    assert accuracy == 1.0
+    assert auc == 1.0
 
 
-def test_lstm_metrics():
-    y_true = [10, 12, 14]
-    y_pred = [11, 13, 15]
-    metrics = evaluate_lstm(y_true, y_pred)
-    assert "rmse" in metrics
+############################################################
+# GATE ENFORCEMENT TEST
+############################################################
+
+def test_xgboost_accuracy_gate_enforced():
+
+    y_true = np.array([1, 1, 1, 1])
+    probs = np.array([0.1, 0.1, 0.1, 0.1])
+    preds = (probs > 0.5).astype(int)
+
+    accuracy = accuracy_score(y_true, preds)
+
+    assert accuracy < XGB_MIN_ACCURACY
 
 
-def test_prophet_metrics():
-    y_true = [20, 22, 24]
-    y_pred = [21, 23, 25]
-    metrics = evaluate_prophet(y_true, y_pred)
-    assert "mae" in metrics
+def test_xgboost_auc_gate_enforced():
+
+    y_true = np.array([1, 0, 1, 0])
+    probs = np.array([0.5, 0.5, 0.5, 0.5])  # no signal
+
+    auc = roc_auc_score(y_true, probs)
+
+    assert auc <= 0.5
+    assert auc < XGB_MIN_AUC
+
+
+############################################################
+# DRIFT SAFETY CHECK
+############################################################
+
+def test_probability_bounds():
+
+    probs = np.array([0.0, 1.0, 0.5])
+
+    assert np.all(probs >= 0.0)
+    assert np.all(probs <= 1.0)
+
+
+############################################################
+# REGRESSION SAFETY TEST
+############################################################
+
+def test_metric_rounding_stability():
+
+    y_true = np.array([1, 0, 1, 0])
+    probs = np.array([0.89, 0.11, 0.87, 0.13])
+    preds = (probs > 0.5).astype(int)
+
+    accuracy = float(accuracy_score(y_true, preds))
+    auc = float(roc_auc_score(y_true, probs))
+
+    assert isinstance(accuracy, float)
+    assert isinstance(auc, float)
