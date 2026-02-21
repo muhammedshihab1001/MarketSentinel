@@ -79,6 +79,12 @@ class DriftDetector:
 
     def _psi(self, bin_edges, expected_counts, actual):
 
+        if len(bin_edges) < 2:
+            raise RuntimeError("Invalid baseline bin edges.")
+
+        if len(expected_counts) != len(bin_edges) - 1:
+            raise RuntimeError("Baseline histogram corrupted.")
+
         actual_counts = np.histogram(
             actual,
             bins=bin_edges
@@ -173,74 +179,6 @@ class DriftDetector:
         os.replace(temp_name, path)
 
     ########################################################
-    # CREATE BASELINE (BACKWARD COMPATIBLE + TEST SAFE)
-    ########################################################
-
-    def create_baseline(
-        self,
-        dataset: pd.DataFrame,
-        dataset_hash: str | None = None,
-        training_code_hash: str | None = None,
-        allow_overwrite: bool = False
-    ):
-
-        path = self._safe_baseline_path()
-
-        legacy_mode = dataset_hash is None and training_code_hash is None
-
-        # Allow overwrite automatically in legacy (test) mode
-        if os.path.exists(path) and not (allow_overwrite or legacy_mode):
-            raise RuntimeError("Baseline already exists.")
-
-        # Preserve production threshold, relax only for legacy mode
-        effective_min = 1 if legacy_mode else self.MIN_SAMPLE_BASELINE
-
-        if len(dataset) < effective_min:
-            raise RuntimeError("Dataset too small for baseline.")
-
-        if dataset_hash is None:
-            dataset_hash = self._baseline_hash({"rows": int(len(dataset))})
-
-        if training_code_hash is None:
-            training_code_hash = "legacy_compat"
-
-        numeric = self._safe_feature_block(dataset)
-
-        features = {}
-
-        for col in MODEL_FEATURES:
-
-            series = numeric[col].dropna()
-
-            counts, edges = np.histogram(series, bins=25)
-
-            features[col] = {
-                "mean": float(series.mean()),
-                "std": float(max(series.std(), self.EPSILON)),
-                "variance": float(max(series.var(), self.EPSILON)),
-                "bin_edges": edges.tolist(),
-                "expected_counts": counts.tolist()
-            }
-
-        payload = {
-            "features": features,
-            "meta": {
-                "created_at": datetime.utcnow().isoformat(),
-                "baseline_version": self.BASELINE_VERSION,
-                "schema_signature": get_schema_signature(),
-                "dataset_hash": dataset_hash,
-                "training_code_hash": training_code_hash,
-                "rows": int(len(numeric))
-            }
-        }
-
-        payload["integrity_hash"] = self._baseline_hash(payload)
-
-        self._atomic_write(payload, path)
-
-        logger.info("Drift baseline created successfully.")
-
-    ########################################################
     # LOAD VERIFIED BASELINE
     ########################################################
 
@@ -265,36 +203,11 @@ class DriftDetector:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Baseline schema mismatch.")
 
+        # STRICT FEATURE MATCH
+        if set(baseline["features"].keys()) != set(MODEL_FEATURES):
+            raise RuntimeError("Baseline feature contract mismatch.")
+
         return baseline
-
-    ########################################################
-    # VALIDATE AGAINST ACTIVE MODEL
-    ########################################################
-
-    def _validate_against_active_model(self, baseline):
-
-        container = self._model_loader._xgb_container
-
-        if container is None:
-            return
-
-        baseline_dataset_hash = baseline["meta"].get("dataset_hash")
-        baseline_code_hash = baseline["meta"].get("training_code_hash")
-
-        model_dataset_hash = getattr(container, "dataset_hash", None)
-        model_code_hash = getattr(container, "training_code_hash", None)
-
-        if model_dataset_hash and baseline_dataset_hash:
-            if model_dataset_hash != baseline_dataset_hash:
-                raise RuntimeError(
-                    "Baseline dataset mismatch with active model."
-                )
-
-        if model_code_hash and baseline_code_hash:
-            if model_code_hash != baseline_code_hash:
-                raise RuntimeError(
-                    "Training code hash mismatch — baseline stale."
-                )
 
     ########################################################
     # DETECT DRIFT
@@ -308,7 +221,6 @@ class DriftDetector:
                 raise RuntimeError("Empty dataset supplied.")
 
             baseline = self._load_verified_baseline()
-            self._validate_against_active_model(baseline)
 
             numeric = self._safe_feature_block(
                 dataset.tail(self.MAX_INFERENCE_ROWS)
@@ -331,7 +243,12 @@ class DriftDetector:
 
                 baseline_std = max(stats["std"], self.EPSILON)
                 baseline_var = max(stats["variance"], self.EPSILON)
-                current_var = max(current.var(), self.EPSILON)
+                current_var = current.var()
+
+                if np.isnan(current_var):
+                    current_var = self.EPSILON
+
+                current_var = max(current_var, self.EPSILON)
 
                 z_score = abs(current.mean() - stats["mean"]) / baseline_std
                 variance_ratio = current_var / baseline_var
