@@ -11,7 +11,7 @@ from sklearn.metrics import (
 
 XGB_MIN_ACCURACY = 0.50
 XGB_MIN_BALANCED_ACCURACY = 0.50
-XGB_MIN_ROC_AUC = 0.50
+XGB_MIN_ROC_AUC = 0.51
 
 # ---- Test compatibility alias ----
 XGB_MIN_AUC = XGB_MIN_ROC_AUC
