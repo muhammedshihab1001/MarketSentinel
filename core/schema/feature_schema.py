@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, List
 import pandas as pd
 import hashlib
 import numpy as np
@@ -57,7 +57,13 @@ CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = (
     "ema_ratio_rank",
 )
 
-MODEL_FEATURES: Tuple[str, ...] = CORE_FEATURES + CROSS_SECTIONAL_FEATURES
+############################################################
+# MODEL FEATURE CONTRACT (ORDERED, PANDAS-SAFE)
+############################################################
+
+MODEL_FEATURES: List[str] = list(
+    CORE_FEATURES + CROSS_SECTIONAL_FEATURES
+)
 
 DTYPE = np.float32
 MIN_ROWS = 200
