@@ -6,7 +6,7 @@ logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
 MIN_PROB_STD = 1e-5
-NUM_BOOST_ROUNDS = 600  # fixed, deterministic
+NUM_BOOST_ROUNDS = 600
 
 
 ###################################################
@@ -32,7 +32,7 @@ def compute_class_weight(y):
 
 
 ###################################################
-# SAFE PRODUCTION MODEL (CPU LOCKED, NO RANDOM SPLIT)
+# SAFE PRODUCTION MODEL
 ###################################################
 
 class SafeXGBClassifier:
@@ -42,6 +42,10 @@ class SafeXGBClassifier:
         self.model = None
         self.feature_names = None
 
+    ###################################################
+    # TRAIN
+    ###################################################
+
     def fit(self, X, y):
 
         logger.info(
@@ -50,10 +54,12 @@ class SafeXGBClassifier:
             X.shape[1]
         )
 
-        # Enforce deterministic dtype
+        if X.isnull().any().any():
+            raise RuntimeError("NaN detected in training features.")
+
         X = X.astype(np.float32)
 
-        # Store feature order explicitly
+        # 🔒 Lock feature order permanently
         self.feature_names = list(X.columns)
 
         dtrain = xgb.DMatrix(X, label=y)
@@ -61,8 +67,8 @@ class SafeXGBClassifier:
         params = {
             "max_depth": 3,
             "eta": 0.03,
-            "subsample": 1.0,          # deterministic
-            "colsample_bytree": 1.0,   # deterministic
+            "subsample": 1.0,
+            "colsample_bytree": 1.0,
             "min_child_weight": 6,
             "gamma": 0.25,
             "reg_alpha": 1.2,
@@ -83,7 +89,7 @@ class SafeXGBClassifier:
             verbose_eval=False
         )
 
-        # Probability sanity check
+        # 🔎 Probability sanity check
         preds = self.model.predict(dtrain)
 
         mean = float(np.mean(preds))
@@ -102,15 +108,42 @@ class SafeXGBClassifier:
 
         return self
 
+    ###################################################
+    # INFERENCE
+    ###################################################
+
     def predict_proba(self, X):
 
-        # Enforce feature order consistency
-        X = X[self.feature_names].astype(np.float32)
+        if self.model is None:
+            raise RuntimeError("Model not trained.")
+
+        # 🔒 Strict feature contract enforcement
+        missing = set(self.feature_names) - set(X.columns)
+        extra = set(X.columns) - set(self.feature_names)
+
+        if missing:
+            raise RuntimeError(f"Missing inference features: {missing}")
+
+        if extra:
+            logger.warning("Extra inference features ignored: %s", extra)
+
+        # Enforce training order exactly
+        X = X.loc[:, self.feature_names].astype(np.float32)
+
+        if X.isnull().any().any():
+            raise RuntimeError("NaN detected in inference features.")
 
         dmatrix = xgb.DMatrix(X)
         probs = self.model.predict(dmatrix)
 
+        if np.std(probs) < MIN_PROB_STD:
+            raise RuntimeError("Inference probability collapse detected.")
+
         return np.column_stack([1 - probs, probs])
+
+    ###################################################
+    # FEATURE IMPORTANCE
+    ###################################################
 
     def export_feature_importance(self):
 
@@ -138,6 +171,6 @@ def build_xgboost_pipeline(y):
     pos_weight = compute_class_weight(y)
     model = SafeXGBClassifier(pos_weight)
 
-    logger.info("XGBoost model built successfully (CPU mode).")
+    logger.info("XGBoost model built successfully (CPU deterministic mode).")
 
     return model
