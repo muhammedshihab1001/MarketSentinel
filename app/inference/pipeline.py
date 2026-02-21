@@ -12,7 +12,8 @@ from core.monitoring.drift_detector import DriftDetector
 from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
-    get_schema_signature
+    get_schema_signature,
+    DTYPE
 )
 from core.market.universe import MarketUniverse
 
@@ -68,7 +69,7 @@ class CircuitBreaker:
 
 
 ############################################################
-# PORTFOLIO INFERENCE PIPELINE
+# INFERENCE PIPELINE
 ############################################################
 
 class InferencePipeline:
@@ -85,6 +86,8 @@ class InferencePipeline:
     CACHE_TTL = int(
         os.getenv("INFERENCE_CACHE_TTL_SECONDS", "600")
     )
+
+    MIN_PROB_STD = 1e-6
 
     def __init__(self):
 
@@ -133,14 +136,17 @@ class InferencePipeline:
         ]
 
         for col in cross_cols:
+
+            grouped = df.groupby("date")[col]
+
             df[f"{col}_z"] = (
-                df.groupby("date")[col]
-                .transform(lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9))
+                grouped.transform(
+                    lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9)
+                )
             ).clip(-5, 5)
 
-            df[f"{col}_rank"] = (
-                df.groupby("date")[col]
-                .transform(lambda x: x.rank(pct=True))
+            df[f"{col}_rank"] = grouped.transform(
+                lambda x: x.rank(pct=True)
             )
 
         return df
@@ -149,10 +155,18 @@ class InferencePipeline:
 
     def _construct_portfolio(self, latest_df):
 
+        n_assets = len(latest_df)
+
+        if n_assets < 4:
+            raise RuntimeError("Insufficient assets for portfolio construction.")
+
+        k_long = min(self.TOP_K, n_assets // 2)
+        k_short = min(self.BOTTOM_K, n_assets // 2)
+
         ranked = latest_df.sort_values("score")
 
-        longs = ranked.tail(self.TOP_K)
-        shorts = ranked.head(self.BOTTOM_K)
+        longs = ranked.tail(k_long)
+        shorts = ranked.head(k_short)
 
         long_vol = longs["volatility"].replace(0, 1e-6)
         short_vol = shorts["volatility"].replace(0, 1e-6)
@@ -188,6 +202,8 @@ class InferencePipeline:
     ############################################################
 
     def run_batch(self, tickers: list[str]):
+
+        start_pipeline = time.time()
 
         MarketUniverse.validate_subset(tickers)
 
@@ -236,9 +252,13 @@ class InferencePipeline:
                 latest_df.loc[:, MODEL_FEATURES]
             )
 
-            # -------------------------
-            # CACHE CHECK
-            # -------------------------
+            if feature_df.isnull().any().any():
+                raise RuntimeError("NaN detected in inference features.")
+
+            if not np.isfinite(feature_df.values).all():
+                raise RuntimeError("Non-finite values detected in features.")
+
+            feature_df = feature_df.astype(DTYPE)
 
             dataset_hash = self._dataset_hash(latest_df)
 
@@ -256,22 +276,20 @@ class InferencePipeline:
 
             CACHE_MISSES.inc()
 
-            # -------------------------
-            # DRIFT DETECTION
-            # -------------------------
-
-            drift_report = self.drift_detector.detect(df)
+            # Drift on latest slice only
+            drift_report = self.drift_detector.detect(latest_df)
 
             if drift_report.get("drift_detected"):
                 logger.critical("Drift detected during portfolio inference.")
 
-            # -------------------------
-            # MODEL INFERENCE
-            # -------------------------
-
             t0 = time.time()
 
             probs = self.models.xgb.predict_proba(feature_df)[:, 1]
+
+            probs = np.clip(probs, 1e-6, 1 - 1e-6)
+
+            if np.std(probs) < self.MIN_PROB_STD:
+                raise RuntimeError("Probability collapse detected.")
 
             latency = time.time() - t0
 
@@ -298,6 +316,11 @@ class InferencePipeline:
             self.cache.set(cache_key, response, ttl=self.CACHE_TTL)
 
             self.breaker.record_success()
+
+            total_pipeline_time = time.time() - start_pipeline
+
+            if total_pipeline_time > self.LATENCY_GUARD_SECONDS * 2:
+                logger.warning("Pipeline latency high: %.3f sec", total_pipeline_time)
 
             return response
 
