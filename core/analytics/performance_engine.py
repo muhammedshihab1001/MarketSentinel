@@ -35,7 +35,25 @@ class PerformanceEngine:
 
         forward_returns:
             columns: date, ticker, forward_return
+            forward_return at date t = return from t -> t+1
         """
+
+        if portfolio_df.empty:
+            raise RuntimeError("Portfolio dataframe empty.")
+
+        if forward_returns.empty:
+            raise RuntimeError("Forward returns dataframe empty.")
+
+        # Ensure correct dtypes
+        portfolio_df = portfolio_df.copy()
+        forward_returns = forward_returns.copy()
+
+        portfolio_df["date"] = pd.to_datetime(portfolio_df["date"])
+        forward_returns["date"] = pd.to_datetime(forward_returns["date"])
+
+        ########################################################
+        # MERGE
+        ########################################################
 
         merged = portfolio_df.merge(
             forward_returns,
@@ -48,8 +66,16 @@ class PerformanceEngine:
                 "No overlapping data for performance evaluation."
             )
 
+        if merged["forward_return"].isnull().any():
+            raise RuntimeError("Null forward returns detected after merge.")
+
+        ########################################################
+        # DAILY RETURNS
+        ########################################################
+
         merged["weighted_return"] = (
-            merged["weight"] * merged["forward_return"]
+            merged["weight"].astype(float)
+            * merged["forward_return"].astype(float)
         )
 
         daily = (
@@ -62,7 +88,7 @@ class PerformanceEngine:
             raise RuntimeError("Insufficient daily returns for evaluation.")
 
         ########################################################
-        # EQUITY CURVE (Correct Institutional Method)
+        # EQUITY CURVE
         ########################################################
 
         equity = (1 + daily).cumprod()
@@ -127,15 +153,18 @@ class PerformanceEngine:
 
     def _turnover(self, portfolio_df):
 
-        pivot = portfolio_df.pivot(
-            index="date",
-            columns="ticker",
-            values="weight"
-        ).fillna(0)
+        pivot = (
+            portfolio_df
+            .pivot(index="date", columns="ticker", values="weight")
+            .fillna(0)
+            .sort_index()
+        )
 
         diff = pivot.diff().abs()
 
         # institutional turnover definition
         turnover = 0.5 * diff.sum(axis=1)
+
+        turnover = turnover.iloc[1:]  # drop first NaN day
 
         return float(turnover.mean())
