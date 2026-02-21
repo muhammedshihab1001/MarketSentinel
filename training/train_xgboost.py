@@ -49,6 +49,66 @@ def compute_dataset_hash(df: pd.DataFrame) -> str:
 
 
 ############################################################
+# METRIC SANITIZATION (🔒 PRODUCTION BOUNDARY)
+############################################################
+
+def sanitize_metrics(metrics: dict) -> dict:
+    """
+    Strict boundary between research metrics and production metadata.
+
+    Accepts:
+        - int
+        - float
+        - numpy scalar
+
+    Rejects:
+        - list
+        - tuple
+        - dict
+        - ndarray
+        - any non-numeric object
+
+    Returns:
+        Dict[str, float]
+    """
+
+    if not isinstance(metrics, dict) or not metrics:
+        raise RuntimeError("Walk-forward metrics must be a non-empty dict.")
+
+    sanitized = {}
+    dropped = []
+
+    for k, v in metrics.items():
+
+        # Reject obvious complex types early
+        if isinstance(v, (list, tuple, dict, np.ndarray)):
+            dropped.append(k)
+            continue
+
+        try:
+            val = float(v)
+        except Exception:
+            dropped.append(k)
+            continue
+
+        if not np.isfinite(val):
+            raise RuntimeError(f"Non-finite metric detected: {k}")
+
+        sanitized[k] = val
+
+    if not sanitized:
+        raise RuntimeError("All metrics were dropped during sanitization.")
+
+    if dropped:
+        logger.info(
+            "Dropped non-scalar research metrics from metadata: %s",
+            dropped
+        )
+
+    return sanitized
+
+
+############################################################
 # LOAD RAW TRAINING DATA
 ############################################################
 
@@ -154,12 +214,10 @@ def final_trainer(train_df):
 
     df = train_df.copy()
 
-    # Ensure all MODEL_FEATURES exist
     for col in MODEL_FEATURES:
         if col not in df.columns:
-            df[col] = 0.0  # neutral default
+            df[col] = 0.0
 
-    # Ensure column order
     df = df.loc[:, MODEL_FEATURES]
 
     X = validate_feature_schema(
@@ -190,10 +248,6 @@ def export_artifacts(model, metrics, dataset_hash,
 
     joblib.dump(model, tmp_path)
     os.replace(tmp_path, model_path)
-
-    ########################################################
-    # 🔒 OFFICIAL METADATA CREATION
-    ########################################################
 
     metadata = MetadataManager.create_metadata(
         model_name="xgboost",
@@ -234,8 +288,20 @@ def main(start_date=None, end_date=None):
 
     raw_df = load_training_data(start_date, end_date)
 
+    ########################################################
+    # WALK-FORWARD (RESEARCH LAYER)
+    ########################################################
+
     validator = WalkForwardValidator(trainer)
-    metrics = validator.run(raw_df)
+    research_metrics = validator.run(raw_df)
+
+    ########################################################
+    # 🔒 PRODUCTION METRIC SANITIZATION
+    ########################################################
+
+    production_metrics = sanitize_metrics(research_metrics)
+
+    ########################################################
 
     final_df = build_final_target(raw_df)
 
@@ -245,7 +311,7 @@ def main(start_date=None, end_date=None):
 
     export_artifacts(
         final_model,
-        metrics,
+        production_metrics,
         dataset_hash,
         start_date,
         end_date,
@@ -265,7 +331,7 @@ def main(start_date=None, end_date=None):
         (time.time() - t0) / 60
     )
 
-    return metrics
+    return research_metrics
 
 
 if __name__ == "__main__":
