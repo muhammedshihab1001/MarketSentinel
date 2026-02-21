@@ -242,7 +242,6 @@ class InferencePipeline:
                 raise RuntimeError("No valid datasets built.")
 
             df = pd.concat(datasets, ignore_index=True)
-
             df = self._build_cross_sectional_features(df)
 
             latest_date = df["date"].max()
@@ -269,23 +268,19 @@ class InferencePipeline:
             })
 
             cached = self.cache.get(cache_key)
-
             if cached:
                 CACHE_HITS.inc()
                 return cached
 
             CACHE_MISSES.inc()
 
-            # Drift on latest slice only
             drift_report = self.drift_detector.detect(latest_df)
 
             if drift_report.get("drift_detected"):
                 logger.critical("Drift detected during portfolio inference.")
 
             t0 = time.time()
-
             probs = self.models.xgb.predict_proba(feature_df)[:, 1]
-
             probs = np.clip(probs, 1e-6, 1 - 1e-6)
 
             if np.std(probs) < self.MIN_PROB_STD:
@@ -305,6 +300,10 @@ class InferencePipeline:
 
             response = {
                 "date": str(latest_date),
+                "scores": {
+                    row["ticker"]: float(row["score"])
+                    for _, row in latest_df.iterrows()
+                },
                 "portfolio_weights": weights,
                 "gross_exposure": float(sum(abs(w) for w in weights.values())),
                 "net_exposure": float(sum(weights.values())),
@@ -314,7 +313,6 @@ class InferencePipeline:
             }
 
             self.cache.set(cache_key, response, ttl=self.CACHE_TTL)
-
             self.breaker.record_success()
 
             total_pipeline_time = time.time() - start_pipeline
