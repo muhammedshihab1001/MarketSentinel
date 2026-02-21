@@ -22,9 +22,10 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v18"  # bumped
+    CACHE_VERSION = "v19"
     MAX_CACHE_FILES_PER_TICKER = 6
     MIN_FILE_BYTES = 5_000
+    MAX_TOTAL_CACHE_FILES = 2000
 
     def __init__(self):
         os.makedirs(self.FEATURE_DIR, exist_ok=True)
@@ -40,6 +41,12 @@ class FeatureStore:
     ########################################################
 
     def _validate_basic_integrity(self, df: pd.DataFrame):
+
+        if "date" not in df.columns or "ticker" not in df.columns:
+            raise RuntimeError("Feature dataset missing core columns.")
+
+        if df.duplicated(subset=["ticker", "date"]).any():
+            raise RuntimeError("Duplicate feature rows detected.")
 
         arr = df.select_dtypes("number").to_numpy(dtype=float)
 
@@ -126,15 +133,23 @@ class FeatureStore:
             if f.startswith(self.CACHE_VERSION + "_" + ticker)
         ]
 
-        if len(files) <= self.MAX_CACHE_FILES_PER_TICKER:
-            return
+        if len(files) > self.MAX_CACHE_FILES_PER_TICKER:
+            files.sort()
+            for f in files[:-self.MAX_CACHE_FILES_PER_TICKER]:
+                try:
+                    os.remove(os.path.join(self.FEATURE_DIR, f))
+                except Exception:
+                    pass
 
-        files.sort()
-        for f in files[:-self.MAX_CACHE_FILES_PER_TICKER]:
-            try:
-                os.remove(os.path.join(self.FEATURE_DIR, f))
-            except Exception:
-                pass
+        # Global cap protection
+        all_files = os.listdir(self.FEATURE_DIR)
+        if len(all_files) > self.MAX_TOTAL_CACHE_FILES:
+            all_files.sort()
+            for f in all_files[:200]:
+                try:
+                    os.remove(os.path.join(self.FEATURE_DIR, f))
+                except Exception:
+                    pass
 
     ########################################################
 
@@ -170,14 +185,22 @@ class FeatureStore:
             f"{self.env_hash}.parquet"
         )
 
+        ####################################################
         # LOAD CACHE
+        ####################################################
+
         if os.path.exists(path) and os.path.getsize(path) >= self.MIN_FILE_BYTES:
             try:
                 df = pd.read_parquet(path)
                 self._validate_basic_integrity(df)
                 return df
             except Exception:
+                logger.warning("Corrupted feature cache removed.")
                 os.remove(path)
+
+        ####################################################
+        # REBUILD
+        ####################################################
 
         logger.info("Feature cache miss — rebuilding.")
 
@@ -192,7 +215,7 @@ class FeatureStore:
             ["date", "ticker"]
         ).reset_index(drop=True)
 
-        # Prevent leakage during inference
+        # Leakage protection
         if not training:
             leakage_cols = [
                 c for c in features.columns
@@ -202,6 +225,10 @@ class FeatureStore:
                 features = features.drop(columns=leakage_cols)
 
         self._validate_basic_integrity(features)
+
+        ####################################################
+        # ATOMIC WRITE
+        ####################################################
 
         tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
 
