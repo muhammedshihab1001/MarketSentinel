@@ -43,23 +43,17 @@ terraform.tfstate*
 # ================== DATA GOVERNANCE ==================
 ########################################################
 
-data/raw/
-data/processed/
-data/cache/
-data/features/
-data/news_cache/
-data/sentiment_cache/
+data/
+datasets/
+notebooks/
 
-# Prevent accidental dataset leaks
 *.parquet
 *.feather
 *.hdf5
 *.sqlite
 *.db
-
-# Allow controlled CSV usage (tests/config only)
-!tests/**/*.csv
-!config/**/*.csv
+*.csv
+*.xlsx
 
 ########################################################
 # ================== MODEL BINARIES ===================
@@ -78,19 +72,8 @@ data/sentiment_cache/
 # ================== ARTIFACT GOVERNANCE ==============
 ########################################################
 
-# Block heavy artifacts
-artifacts/**/*.pkl
-artifacts/**/*.joblib
-artifacts/**/*.h5
-artifacts/**/*.pt
-artifacts/**/*.onnx
-
-# Allow metadata + lineage
-!artifacts/**/metadata_*.json
-!artifacts/**/manifest.json
-!artifacts/**/drift_baseline.json
-!artifacts/latest.json
-!artifacts/.keep
+# NEVER commit artifacts (models, registry, drift, feature store)
+artifacts/
 
 ########################################################
 # ================== XGBOOST CACHE ====================
@@ -106,7 +89,6 @@ xgboost_training_cache/
 
 .cache/
 .huggingface/
-artifacts/huggingface/
 
 ########################################################
 # ================== LOGS =============================
