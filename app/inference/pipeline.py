@@ -105,7 +105,7 @@ class InferencePipeline:
         self.drift_detector = DriftDetector()
         self.breaker = CircuitBreaker()
 
-        _ = self.models.xgb  # force load
+        _ = self.models.xgb
         self._validate_models_loaded()
 
     ############################################################
@@ -135,7 +135,7 @@ class InferencePipeline:
 
         feature_block = validate_feature_schema(
             ordered.loc[:, MODEL_FEATURES],
-            mode="inference"
+            mode="strict_contract"  # 🔒 FIXED
         )
 
         payload = (
@@ -241,7 +241,7 @@ class InferencePipeline:
 
             feature_df = validate_feature_schema(
                 latest_df.loc[:, MODEL_FEATURES],
-                mode="inference"
+                mode="strict_contract"   # 🔒 FIXED
             )
 
             feature_df = feature_df.astype(DTYPE)
@@ -261,13 +261,14 @@ class InferencePipeline:
 
             CACHE_MISSES.inc()
 
+            t0 = time.time()
             probs = self.models.xgb.predict_proba(feature_df)[:, 1]
-            probs = np.clip(probs, 1e-6, 1 - 1e-6)
-
-            if np.std(probs) < self.MIN_PROB_STD:
-                raise RuntimeError("Probability collapse detected.")
+            latency = time.time() - t0
 
             MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
+            MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
+
+            probs = np.clip(probs, 1e-6, 1 - 1e-6)
 
             latest_df["score"] = probs
 
