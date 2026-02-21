@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import logging
 
-from core.schema.feature_schema import MODEL_FEATURES
 from core.indicators.technical_indicators import TechnicalIndicators
 
 logger = logging.getLogger(__name__)
@@ -89,12 +88,7 @@ class FeatureEngineer:
         sentiment_df = sentiment_df.copy()
         sentiment_df["date"] = pd.to_datetime(sentiment_df["date"], utc=True)
 
-        merged = pd.merge(
-            price_df,
-            sentiment_df,
-            on="date",
-            how="left"
-        )
+        merged = pd.merge(price_df, sentiment_df, on="date", how="left")
 
         for col in ["avg_sentiment", "news_count", "sentiment_std"]:
             if col not in merged.columns:
@@ -182,10 +176,7 @@ class FeatureEngineer:
     def add_rsi(cls, df):
 
         def _compute(group):
-            rsi = TechnicalIndicators.rsi(
-                group[["date", "close"]],
-                window=14
-            )
+            rsi = TechnicalIndicators.rsi(group[["date", "close"]], window=14)
             group["rsi"] = rsi.values.astype("float32")
             return group
 
@@ -195,9 +186,7 @@ class FeatureEngineer:
     def add_macd(cls, df):
 
         def _block(x):
-            macd, signal = TechnicalIndicators.macd(
-                x[["date", "close"]]
-            )
+            macd, signal = TechnicalIndicators.macd(x[["date", "close"]])
             x["macd"] = macd.astype("float32")
             x["macd_signal"] = signal.astype("float32")
             return x
@@ -222,37 +211,7 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
     ########################################################
-    # CROSS-SECTIONAL FEATURES
-    ########################################################
-
-    @staticmethod
-    def add_cross_sectional_features(df):
-
-        base_cols = [
-            "momentum_20",
-            "return_lag5",
-            "rsi",
-            "volatility",
-            "ema_ratio"
-        ]
-
-        for col in base_cols:
-
-            mean = df.groupby("date")[col].transform("mean")
-            std = df.groupby("date")[col].transform("std").replace(0, 1e-6)
-
-            df[f"{col}_z"] = ((df[col] - mean) / std).astype("float32")
-
-            df[f"{col}_rank"] = (
-                df.groupby("date")[col]
-                .rank(pct=True)
-                .astype("float32")
-            )
-
-        return df
-
-    ########################################################
-    # MAIN PIPELINE (FIXED)
+    # MAIN PIPELINE (CORE FEATURES ONLY)
     ########################################################
 
     @classmethod
@@ -277,19 +236,15 @@ class FeatureEngineer:
         df = cls.add_macd(df)
         cls.add_ema(df)
 
-        df = cls.add_cross_sectional_features(df)
+        # Only drop rows missing CORE features
+        core_cols = [
+            "return", "return_lag1", "return_lag5", "return_lag10",
+            "volatility", "volatility_5", "volatility_20",
+            "momentum_20", "rsi", "macd", "macd_signal",
+            "ema_10", "ema_50", "ema_ratio", "regime_feature"
+        ]
 
-        ########################################################
-        # CRITICAL FIX: DO NOT GLOBAL DROPNA
-        ########################################################
-
-        missing_model_cols = set(MODEL_FEATURES) - set(df.columns)
-        if missing_model_cols:
-            raise RuntimeError(
-                f"Missing required model features: {missing_model_cols}"
-            )
-
-        df = df.dropna(subset=MODEL_FEATURES)
+        df = df.dropna(subset=core_cols)
 
         float_cols = df.select_dtypes(include=["float64"]).columns
         df[float_cols] = df[float_cols].astype("float32")
