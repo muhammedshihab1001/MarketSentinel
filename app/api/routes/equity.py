@@ -133,9 +133,9 @@ def equity_curve(days: int = 120):
             latest_df = pd.concat(sliced, ignore_index=True)
 
             try:
-                results = pipeline._run_model_and_construct(
-                    latest_df,
-                    use_cache=False
+                results = pipeline.run_historical_batch(
+                    price_history=price_history,
+                    evaluation_date=eval_date
                 )
                 portfolio_records.extend(results)
 
