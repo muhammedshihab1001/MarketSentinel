@@ -8,7 +8,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "32.0"  # institutional strict contract
+SCHEMA_VERSION = "32.1"  # bumped due to validation hardening
 
 
 ############################################################
@@ -96,18 +96,16 @@ def validate_feature_schema(
 
     _check_forbidden_columns(df)
 
-    # -------------------------------------------------------
-    # CORE PRESENCE CHECK
-    # -------------------------------------------------------
     missing_core = set(CORE_FEATURES) - set(df.columns)
     if missing_core:
         raise RuntimeError(f"Missing core features: {missing_core}")
 
     feature_df = df.copy()
 
-    # -------------------------------------------------------
-    # ENFORCE FULL CONTRACT FOR TRAINING & STRICT
-    # -------------------------------------------------------
+    ########################################################
+    # STRICT CONTRACT ENFORCEMENT
+    ########################################################
+
     if mode in {"training", "strict_contract"}:
 
         missing_all = set(MODEL_FEATURES) - set(feature_df.columns)
@@ -116,11 +114,9 @@ def validate_feature_schema(
                 f"Missing required features under strict contract: {missing_all}"
             )
 
+        # enforce deterministic ordering
         feature_df = feature_df.loc[:, MODEL_FEATURES]
 
-    # -------------------------------------------------------
-    # INFERENCE SAFETY
-    # -------------------------------------------------------
     elif mode == "inference":
 
         for col in MODEL_FEATURES:
@@ -129,12 +125,17 @@ def validate_feature_schema(
 
         feature_df = feature_df.loc[:, MODEL_FEATURES]
 
+    ########################################################
+    # TYPE + CLEANUP
+    ########################################################
+
     feature_df = feature_df.astype(DTYPE)
     feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    # -------------------------------------------------------
+    ########################################################
     # CORE VALIDATION
-    # -------------------------------------------------------
+    ########################################################
+
     for col in CORE_FEATURES:
 
         series = feature_df[col]
@@ -150,9 +151,24 @@ def validate_feature_schema(
         if finite_vals.var(ddof=0) < MIN_VARIANCE:
             logger.warning(f"Low variance core feature: {col}")
 
-    # -------------------------------------------------------
+    ########################################################
+    # CROSS-SECTIONAL VALIDATION (NEW HARDENING)
+    ########################################################
+
+    if mode in {"training", "strict_contract"}:
+        for col in CROSS_SECTIONAL_FEATURES:
+            series = feature_df[col]
+            finite_vals = series[np.isfinite(series)]
+
+            if finite_vals.nunique() <= 1:
+                raise RuntimeError(
+                    f"Constant cross-sectional feature detected: {col}"
+                )
+
+    ########################################################
     # FINAL SANITY
-    # -------------------------------------------------------
+    ########################################################
+
     if feature_df.isnull().any().any():
         raise RuntimeError("NaN detected after schema validation.")
 
