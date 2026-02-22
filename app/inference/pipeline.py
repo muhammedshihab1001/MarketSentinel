@@ -5,9 +5,11 @@ import pandas as pd
 import logging
 import os
 from datetime import timedelta
+from typing import List
 
 from core.data.market_data_service import MarketDataService
 from core.features.feature_store import FeatureStore
+from core.features.feature_engineering import FeatureEngineer
 from core.monitoring.drift_detector import DriftDetector
 from core.schema.feature_schema import (
     MODEL_FEATURES,
@@ -26,8 +28,6 @@ from app.monitoring.metrics import (
     MODEL_INFERENCE_COUNT,
     MODEL_INFERENCE_LATENCY,
     PIPELINE_FAILURES,
-    CACHE_HITS,
-    CACHE_MISSES,
     INFERENCE_IN_PROGRESS
 )
 
@@ -82,9 +82,7 @@ class InferencePipeline:
     MIN_PROB_STD = 1e-6
     WEIGHT_TOLERANCE = 1e-6
 
-    CACHE_TTL = int(os.getenv("INFERENCE_CACHE_TTL_SECONDS", "600"))
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
-
     MAX_DATA_STALENESS_DAYS = 5
     MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "200"))
 
@@ -117,63 +115,159 @@ class InferencePipeline:
         logger.info("Model + schema signature verified.")
 
     ############################################################
+    # PUBLIC ENTRYPOINTS
+    ############################################################
 
-    def _validate_features_exist(self, df: pd.DataFrame):
+    def run_single(self, ticker: str):
+        return self.run_batch([ticker])
 
-        if df.columns.duplicated().any():
-            raise RuntimeError("Duplicate feature columns detected.")
+    def run_batch(self, tickers: List[str]):
 
-        missing = set(MODEL_FEATURES) - set(df.columns)
+        if len(tickers) > self.MAX_BATCH_SIZE:
+            raise RuntimeError("Batch size exceeds MAX_BATCH_SIZE.")
 
-        if missing:
-            raise RuntimeError(
-                f"Missing required model features: {missing}"
+        if not self.breaker.allow():
+            raise RuntimeError("Inference blocked by circuit breaker.")
+
+        INFERENCE_IN_PROGRESS.inc()
+
+        try:
+            df = self._build_cross_sectional_frame(tickers)
+            latest_df = self._select_latest_snapshot(df)
+            result = self._run_model_and_construct(latest_df)
+
+            self.breaker.record_success()
+            return result
+
+        except Exception:
+            PIPELINE_FAILURES.inc()
+            self.breaker.record_failure()
+            logger.exception("Inference pipeline failure.")
+            raise
+
+        finally:
+            INFERENCE_IN_PROGRESS.dec()
+
+    ############################################################
+    # FEATURE ORCHESTRATION (MIRRORS TRAINING)
+    ############################################################
+
+    def _build_cross_sectional_frame(self, tickers: List[str]):
+
+        datasets = []
+
+        for ticker in tickers:
+
+            price_df = self.market_data.get_price_data(
+                ticker=ticker,
+                lookback_days=self.INFERENCE_LOOKBACK_DAYS
             )
+
+            dataset = self.feature_store.get_features(
+                price_df=price_df,
+                sentiment_df=None,
+                ticker=ticker,
+                training=False
+            )
+
+            datasets.append(dataset)
+
+        df = pd.concat(datasets, ignore_index=True)
+        df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+        # Mirror training pipeline
+        df = FeatureEngineer.add_cross_sectional_features(df)
+        df = FeatureEngineer.finalize(df)
+
+        return df
 
     ############################################################
 
-    def _validate_universe(self, df):
+    def _select_latest_snapshot(self, df: pd.DataFrame):
+
+        latest_date = df["date"].max()
+
+        if (pd.Timestamp.utcnow().normalize() - latest_date) > timedelta(days=self.MAX_DATA_STALENESS_DAYS):
+            raise RuntimeError("Inference data appears stale.")
+
+        latest_df = df[df["date"] == latest_date].copy()
+
+        if latest_df.empty:
+            raise RuntimeError("No latest snapshot available.")
+
+        return latest_df
+
+    ############################################################
+    # MODEL + PORTFOLIO
+    ############################################################
+
+    def _run_model_and_construct(self, latest_df):
 
         universe = set(MarketUniverse.get_universe())
-        unknown = set(df["ticker"]) - universe
+        unknown = set(latest_df["ticker"]) - universe
 
         if unknown:
             raise RuntimeError(f"Unknown tickers detected at inference: {unknown}")
 
-    ############################################################
+        feature_df = validate_feature_schema(
+            latest_df.loc[:, MODEL_FEATURES],
+            mode="inference"
+        ).astype(DTYPE)
 
-    def _validate_freshness(self, df):
+        t0 = time.time()
+        probs = self.models.xgb.predict_proba(feature_df)[:, 1]
+        latency = time.time() - t0
 
-        latest_date = pd.to_datetime(df["date"].max())
-        if (pd.Timestamp.utcnow().normalize() - latest_date) > timedelta(days=self.MAX_DATA_STALENESS_DAYS):
-            raise RuntimeError("Inference data appears stale.")
+        MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
+        MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
 
-    ############################################################
+        probs = np.clip(probs, 1e-6, 1 - 1e-6)
 
-    def _deterministic_sort(self, df):
-        return df.sort_values(
-            ["score", "ticker"],
-            ascending=[True, True]
+        if np.std(probs) < self.MIN_PROB_STD:
+            raise RuntimeError("Probability collapse detected.")
+
+        latest_df = latest_df.copy()
+        latest_df["score"] = probs
+
+        latest_df["rank_pct"] = latest_df["score"].rank(method="first", pct=True)
+
+        latest_df["signal"] = latest_df["rank_pct"].apply(
+            lambda x: "LONG" if x >= LONG_PERCENTILE
+            else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
         )
 
-    ############################################################
-    # PORTFOLIO CONSTRUCTION
+        drift_result = self.drift_detector.detect(feature_df)
+
+        if drift_result.get("drift_detected", False):
+
+            if self.drift_detector.hard_fail:
+                raise RuntimeError("Inference blocked due to feature drift.")
+            else:
+                logger.critical("Drift detected but non-blocking.")
+
+        weights = self._construct_portfolio(latest_df)
+
+        portfolio_rows = []
+
+        for _, row in latest_df.iterrows():
+            portfolio_rows.append({
+                "date": row["date"],
+                "ticker": row["ticker"],
+                "score": float(row["score"]),
+                "signal": row["signal"],
+                "weight": float(weights.get(row["ticker"], 0.0))
+            })
+
+        return portfolio_rows
+
     ############################################################
 
     def _construct_portfolio(self, latest_df):
 
-        if "volatility" not in latest_df.columns:
-            raise RuntimeError("Volatility feature missing for weighting.")
+        latest_df = latest_df.sort_values(["score", "ticker"])
 
-        n_assets = len(latest_df)
-
-        if n_assets < 4:
-            raise RuntimeError("Insufficient assets for portfolio construction.")
-
-        latest_df = self._deterministic_sort(latest_df)
-
-        k_long = min(self.TOP_K, n_assets // 2)
-        k_short = min(self.BOTTOM_K, n_assets // 2)
+        k_long = min(self.TOP_K, len(latest_df) // 2)
+        k_short = min(self.BOTTOM_K, len(latest_df) // 2)
 
         longs = latest_df.tail(k_long)
         shorts = latest_df.head(k_short)
@@ -204,96 +298,3 @@ class InferencePipeline:
             raise RuntimeError(f"Gross exposure mismatch: {gross}")
 
         return weights
-
-    ############################################################
-
-    def _run_model_and_construct(self, latest_df, use_cache: bool):
-
-        if use_cache:
-            logger.warning("use_cache=True but caching not implemented at pipeline level.")
-
-        if len(latest_df) > self.MAX_BATCH_SIZE:
-            raise RuntimeError("Batch size exceeds MAX_BATCH_SIZE.")
-
-        if not self.breaker.allow():
-            raise RuntimeError("Inference blocked by circuit breaker.")
-
-        INFERENCE_IN_PROGRESS.inc()
-
-        try:
-            self._validate_universe(latest_df)
-            self._validate_features_exist(latest_df)
-            self._validate_freshness(latest_df)
-
-            feature_df = validate_feature_schema(
-                latest_df.loc[:, MODEL_FEATURES],
-                mode="inference"
-            ).astype(DTYPE)
-
-            t0 = time.time()
-            probs = self.models.xgb.predict_proba(feature_df)[:, 1]
-            latency = time.time() - t0
-
-            MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-            MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
-
-            probs = np.clip(probs, 1e-6, 1 - 1e-6)
-
-            if np.std(probs) < self.MIN_PROB_STD:
-                raise RuntimeError("Probability collapse detected.")
-
-            latest_df = latest_df.copy()
-            latest_df["score"] = probs
-
-            # Deterministic ranking
-            latest_df["rank_pct"] = latest_df["score"].rank(
-                method="first",
-                pct=True
-            )
-
-            latest_df["signal"] = latest_df["rank_pct"].apply(
-                lambda x: "LONG" if x >= LONG_PERCENTILE
-                else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
-            )
-
-            # Drift check BEFORE portfolio construction
-            drift_result = self.drift_detector.detect(feature_df)
-
-            if drift_result.get("drift_detected", False):
-
-                if self.drift_detector.hard_fail:
-                    logger.critical(
-                        "Inference blocked due to detected drift | severity=%s",
-                        drift_result.get("severity_score")
-                    )
-                    raise RuntimeError("Inference blocked due to feature drift.")
-                else:
-                    logger.critical(
-                        "Drift detected (non-blocking mode) | severity=%s",
-                        drift_result.get("severity_score")
-                    )
-
-            weights = self._construct_portfolio(latest_df)
-
-            portfolio_rows = []
-
-            for _, row in latest_df.iterrows():
-                portfolio_rows.append({
-                    "date": row["date"],
-                    "ticker": row["ticker"],
-                    "score": float(row["score"]),
-                    "signal": row["signal"],
-                    "weight": float(weights.get(row["ticker"], 0.0))
-                })
-
-            self.breaker.record_success()
-            return portfolio_rows
-
-        except Exception:
-            PIPELINE_FAILURES.inc()
-            self.breaker.record_failure()
-            logger.exception("Inference pipeline failure.")
-            raise
-
-        finally:
-            INFERENCE_IN_PROGRESS.dec()
