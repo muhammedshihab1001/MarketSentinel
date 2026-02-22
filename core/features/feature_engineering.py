@@ -41,9 +41,6 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-        if not df["date"].is_monotonic_increasing:
-            df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
-
         return df
 
     ########################################################
@@ -75,7 +72,6 @@ class FeatureEngineer:
             raise RuntimeError("Invalid close prices.")
 
         returns = df.groupby("ticker")["close"].pct_change().abs()
-
         extreme = returns > cls.SPLIT_THRESHOLD
 
         if extreme.any():
@@ -100,7 +96,6 @@ class FeatureEngineer:
         returns = df.groupby("ticker")["close"].pct_change()
 
         lo, hi = cls.RETURN_CLAMP
-
         df["return"] = returns.clip(lo, hi)
 
         df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
@@ -141,11 +136,7 @@ class FeatureEngineer:
         df["volatility"] = df["volatility_5"]
 
         for col in ["volatility", "volatility_5", "volatility_20"]:
-            df[col] = (
-                df[col]
-                .fillna(cls.VOL_FLOOR)
-                .clip(lower=cls.VOL_FLOOR)
-            )
+            df[col] = df[col].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
 
         return df
 
@@ -166,9 +157,7 @@ class FeatureEngineer:
             .transform(lambda x: x.rolling(60, min_periods=20).std(ddof=0))
         )
 
-        zscore = (
-            df["volatility_20"] - rolling_mean
-        ) / (rolling_std + cls.EPSILON)
+        zscore = (df["volatility_20"] - rolling_mean) / (rolling_std + cls.EPSILON)
 
         df["regime_feature"] = np.where(zscore > 0.5, 1.0, 0.0)
         df["regime_feature"] = df["regime_feature"].fillna(0.0)
@@ -205,9 +194,7 @@ class FeatureEngineer:
             df.loc[group.index, "macd"] = macd.astype("float32")
             df.loc[group.index, "macd_signal"] = signal.astype("float32")
 
-        df[["macd", "macd_signal"]] = df[
-            ["macd", "macd_signal"]
-        ].fillna(0.0)
+        df[["macd", "macd_signal"]] = df[["macd", "macd_signal"]].fillna(0.0)
 
         return df
 
@@ -231,7 +218,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # CROSS-SECTIONAL FEATURES
+    # CROSS-SECTIONAL FEATURES (FIXED INDUSTRIAL VERSION)
     ########################################################
 
     @classmethod
@@ -256,9 +243,13 @@ class FeatureEngineer:
             cs_std = df.groupby("date")[col].transform("std")
 
             z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
-
             z = z.clip(-5, 5)
-            rank = df.groupby("date")[col].rank(pct=True)
+
+            # 🔥 FIX: prevent rank degeneracy
+            rank = (
+                df.groupby("date")[col]
+                .rank(method="first", pct=True)
+            )
 
             df[f"{col}_z"] = z.fillna(0.0)
             df[f"{col}_rank"] = rank.fillna(0.5)
@@ -277,9 +268,7 @@ class FeatureEngineer:
         numeric_cols = df.select_dtypes(include=[np.number]).columns
 
         for col in numeric_cols:
-
             if df[col].isnull().any():
-
                 if "volatility" in col:
                     df[col] = df[col].fillna(cls.VOL_FLOOR)
                 else:
@@ -315,7 +304,6 @@ class FeatureEngineer:
 
         df = cls._final_sanitize(df)
 
-        # 🔒 Ensure feature contract columns exist
         missing = set(MODEL_FEATURES) - set(df.columns)
         if missing:
             raise RuntimeError(f"Feature pipeline missing columns: {missing}")
