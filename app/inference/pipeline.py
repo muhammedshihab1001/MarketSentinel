@@ -257,15 +257,33 @@ class InferencePipeline:
                     "weight": float(weights.get(row["ticker"], 0.0))
                 })
 
-            try:
-                self.drift_detector.check_drift(feature_df)
-            except Exception as e:
-                logger.warning("Drift check failed (non-blocking): %s", str(e))
+            ########################################################
+            # 🔒 STRICT DRIFT ENFORCEMENT (FIXED)
+            ########################################################
+
+            drift_result = self.drift_detector.detect(feature_df)
+
+            if drift_result.get("drift_detected", False):
+
+                if self.drift_detector.hard_fail:
+                    logger.critical(
+                        "Inference blocked due to detected drift | severity=%s",
+                        drift_result.get("severity_score")
+                    )
+                    raise RuntimeError("Inference blocked due to feature drift.")
+
+                else:
+                    logger.critical(
+                        "Drift detected (non-blocking mode) | severity=%s",
+                        drift_result.get("severity_score")
+                    )
+
+            ########################################################
 
             self.breaker.record_success()
             return portfolio_rows
 
-        except Exception as e:
+        except Exception:
             PIPELINE_FAILURES.inc()
             self.breaker.record_failure()
             logger.exception("Inference pipeline failure.")
