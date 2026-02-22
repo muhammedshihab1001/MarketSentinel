@@ -17,12 +17,10 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "12.1"
+    METADATA_VERSION = "12.2"
     MIN_TRAINING_DAYS = 120
     MIN_METADATA_BYTES = 800
     MIN_FEATURE_COUNT = 10
-
-    #####################################################
 
     REQUIRED_METADATA_FIELDS = [
         "metadata_type",
@@ -109,25 +107,20 @@ class MetadataManager:
                 "Metadata integrity failure — possible tampering."
             )
 
-        #################################################
-        # SCHEMA COMPATIBILITY
-        #################################################
-
         if metadata["schema_signature"] != get_schema_signature():
             raise RuntimeError("Schema mismatch with runtime.")
 
         if metadata["schema_version"] != SCHEMA_VERSION:
             raise RuntimeError("Schema version drift detected.")
 
-        #################################################
-        # FEATURE CONTRACT STRICTNESS
-        #################################################
-
         if metadata["features"] != MODEL_FEATURES:
             raise RuntimeError("Metadata feature contract mismatch.")
 
         if metadata["feature_count"] != len(MODEL_FEATURES):
             raise RuntimeError("Feature count mismatch.")
+
+        if metadata["dataset_rows"] <= 0:
+            raise RuntimeError("Invalid dataset_rows in metadata.")
 
         return metadata
 
@@ -159,21 +152,15 @@ class MetadataManager:
 
         frozen = tuple(features)
 
-        if metadata_type == "training_manifest_v1":
+        if metadata_type != "training_manifest_v1":
+            raise RuntimeError(f"Unknown metadata_type: {metadata_type}")
 
-            if frozen != tuple(MODEL_FEATURES):
-                raise RuntimeError(
-                    "Tabular feature mismatch — schema drift."
-                )
+        if frozen != tuple(MODEL_FEATURES):
+            raise RuntimeError("Tabular feature mismatch — schema drift.")
 
-            if len(frozen) < MetadataManager.MIN_FEATURE_COUNT:
-                raise RuntimeError(
-                    "Feature contract below institutional minimum."
-                )
-
-        else:
+        if len(frozen) < MetadataManager.MIN_FEATURE_COUNT:
             raise RuntimeError(
-                f"Unknown metadata_type: {metadata_type}"
+                "Feature contract below institutional minimum."
             )
 
     #####################################################
@@ -187,21 +174,16 @@ class MetadataManager:
             raise RuntimeError("Metrics must be a non-empty dict.")
 
         for k, v in metrics.items():
-
             try:
                 val = float(v)
             except Exception:
-                raise RuntimeError(
-                    f"Metric must be numeric: {k}"
-                )
+                raise RuntimeError(f"Metric must be numeric: {k}")
 
             if not np.isfinite(val):
-                raise RuntimeError(
-                    f"Non-finite metric detected: {k}"
-                )
+                raise RuntimeError(f"Non-finite metric detected: {k}")
 
     #####################################################
-    # FLOAT-STABLE DATASET HASH
+    # DATASET HASH
     #####################################################
 
     @staticmethod
@@ -335,7 +317,7 @@ class MetadataManager:
                 "Training window below institutional minimum."
             )
 
-        #####################################################
+    #####################################################
     # CREATE METADATA
     #####################################################
 
@@ -350,8 +332,11 @@ class MetadataManager:
         dataset_rows,
         metadata_type,
         extra_fields=None,
-        feature_checksum=None,   # ← NEW (backward compatible)
+        feature_checksum=None,
     ):
+
+        if dataset_rows <= 0:
+            raise RuntimeError("dataset_rows must be positive.")
 
         MetadataManager._validate_feature_contract(
             features,
@@ -366,6 +351,9 @@ class MetadataManager:
         )
 
         universe_snapshot = MarketUniverse.snapshot()
+
+        if "universe_hash" not in universe_snapshot:
+            raise RuntimeError("Universe snapshot invalid.")
 
         metadata = {
 
@@ -401,18 +389,12 @@ class MetadataManager:
             "universe_hash": universe_snapshot["universe_hash"]
         }
 
-        #################################################
-        # OPTIONAL FEATURE CHECKSUM (NEW GOVERNANCE)
-        #################################################
-
         if feature_checksum is not None:
 
-            if not isinstance(feature_checksum, str) or len(feature_checksum) < 32:
-                raise RuntimeError("Invalid feature checksum.")
+            if not isinstance(feature_checksum, str) or len(feature_checksum) != 64:
+                raise RuntimeError("Invalid feature checksum format.")
 
             metadata["feature_checksum"] = feature_checksum
-
-        #################################################
 
         if extra_fields:
 
@@ -430,18 +412,13 @@ class MetadataManager:
         )
 
         return metadata
-        ########################################################
+
+    ########################################################
     # FEATURE CHECKSUM
     ########################################################
 
     @staticmethod
     def fingerprint_features(features: tuple) -> str:
-        """
-        Stable checksum of ordered model feature list.
-        Enforces strict feature contract binding.
-        """
-        import hashlib
-        import json
 
         canonical = json.dumps(
             list(features),
