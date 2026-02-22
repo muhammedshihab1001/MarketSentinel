@@ -44,7 +44,6 @@ class ModelLoader:
 
     _instance = None
     _instance_lock = threading.Lock()
-
     MIN_ARTIFACT_BYTES = 50_000
 
     ########################################################
@@ -134,7 +133,6 @@ class ModelLoader:
         # STRICT FEATURE CONTRACT CHECK
         if hasattr(model, "feature_names"):
             trained_features = list(model.feature_names)
-
             if trained_features != MODEL_FEATURES:
                 raise RuntimeError(
                     "Model feature contract mismatch at inference."
@@ -211,8 +209,13 @@ class ModelLoader:
 
             model = self._safe_load_model(model_path)
 
-            # Feature checksum verification (new)
-            feature_checksum = self._compute_feature_checksum(MODEL_FEATURES)
+            ####################################################
+            # FEATURE CHECKSUM (CRITICAL FIX)
+            ####################################################
+
+            feature_checksum = self._compute_feature_checksum(
+                MODEL_FEATURES
+            )
 
             new_container = LoadedModel(
                 model=model,
@@ -285,6 +288,15 @@ class ModelLoader:
     def artifact_hash(self):
         self._reload_xgb_if_needed()
         return self._xgb_container.artifact_hash
+
+    ########################################################
+    # 🔥 NEW: FEATURE CHECKSUM PROPERTY (FIX)
+    ########################################################
+
+    @property
+    def feature_checksum(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.feature_checksum
 
     ########################################################
     # WARMUP
