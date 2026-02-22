@@ -9,7 +9,7 @@ from datetime import datetime
 
 class MarketUniverse:
     """
-    Institutional Universe Controller (v6 hardened)
+    Institutional Universe Controller (v7 hardened)
 
     Guarantees:
     ✔ deterministic
@@ -21,15 +21,18 @@ class MarketUniverse:
     ✔ tamper detected
     ✔ hot-reload safe
     ✔ ticker validated
-    ✔ version monotonic
+    ✔ version monotonic (numeric-safe)
     ✔ metadata validated
     ✔ min_history_days enforced
+    ✔ cross-sectional statistical safety
     """
 
     UNIVERSE_FILE = "config/universe.json"
 
     MIN_FILE_BYTES = 20
-    MIN_UNIVERSE_SIZE = 5
+
+    # 🚨 Raised for cross-sectional stability
+    MIN_UNIVERSE_SIZE = 30
 
     TICKER_REGEX = re.compile(r"^[A-Z0-9.\-]{1,10}$")
 
@@ -37,6 +40,17 @@ class MarketUniverse:
     _LOCK = threading.RLock()
     _FILE_HASH = None
     _LAST_VERSION = None
+
+    ###################################################
+    # INTERNAL VERSION PARSER (NUMERIC SAFE)
+    ###################################################
+
+    @staticmethod
+    def _parse_version(version: str):
+        try:
+            return tuple(int(x) for x in version.split("."))
+        except Exception:
+            raise RuntimeError("Universe version must be numeric format like '6.0'")
 
     ###################################################
     # FILE HASH
@@ -117,19 +131,27 @@ class MarketUniverse:
         if not isinstance(tickers, list):
             raise RuntimeError("Universe tickers must be list.")
 
+        #################################################
+        # HARD MINIMUM FOR ML STABILITY
+        #################################################
+
         if len(tickers) < cls.MIN_UNIVERSE_SIZE:
             raise RuntimeError(
-                f"Universe too small (<{cls.MIN_UNIVERSE_SIZE})."
+                f"Universe too small for cross-sectional ML "
+                f"(minimum {cls.MIN_UNIVERSE_SIZE} required)."
             )
 
         #################################################
-        # VERSION MONOTONICITY
+        # VERSION MONOTONICITY (NUMERIC SAFE)
         #################################################
 
-        if cls._LAST_VERSION and version < cls._LAST_VERSION:
-            raise RuntimeError(
-                "Universe version downgrade detected."
-            )
+        parsed_version = cls._parse_version(version)
+
+        if cls._LAST_VERSION:
+            if parsed_version < cls._parse_version(cls._LAST_VERSION):
+                raise RuntimeError(
+                    "Universe version downgrade detected."
+                )
 
         #################################################
         # NORMALIZE + VALIDATE
