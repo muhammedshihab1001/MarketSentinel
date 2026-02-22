@@ -5,6 +5,7 @@ import logging
 import random
 import numpy as np
 import pandas as pd
+import argparse
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
@@ -53,7 +54,7 @@ def compute_dataset_hash(df: pd.DataFrame) -> str:
 
 
 ############################################################
-# GLOBAL CROSS-SECTIONAL FEATURES (INSTITUTIONAL FIX)
+# GLOBAL CROSS-SECTIONAL FEATURES
 ############################################################
 
 def add_cross_sectional_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -175,7 +176,7 @@ def load_training_data(start_date, end_date):
 
 
 ############################################################
-# TARGET (LEAKAGE SAFE)
+# TARGET
 ############################################################
 
 def build_final_target(df: pd.DataFrame):
@@ -302,12 +303,14 @@ def export_artifacts(model, metrics, dataset_hash,
 
     logger.info("Artifacts exported.")
 
+    return timestamp
+
 
 ############################################################
 # MAIN
 ############################################################
 
-def main(start_date=None, end_date=None):
+def main(start_date=None, end_date=None, create_baseline=False):
 
     t0 = time.time()
 
@@ -321,7 +324,6 @@ def main(start_date=None, end_date=None):
 
     raw_df = load_training_data(start_date, end_date)
 
-    # ✅ GLOBAL CROSS-SECTIONAL FEATURES ADDED HERE
     raw_df = add_cross_sectional_features(raw_df)
 
     validator = WalkForwardValidator(trainer)
@@ -335,7 +337,7 @@ def main(start_date=None, end_date=None):
 
     final_model = final_trainer(final_df)
 
-    export_artifacts(
+    version = export_artifacts(
         final_model,
         production_metrics,
         dataset_hash,
@@ -344,13 +346,15 @@ def main(start_date=None, end_date=None):
         final_df
     )
 
-    drift = DriftDetector()
-    drift.create_baseline(
-        dataset=final_df,
-        dataset_hash=dataset_hash,
-        training_code_hash=MetadataManager.fingerprint_training_code(),
-        allow_overwrite=True
-    )
+    if create_baseline:
+        drift = DriftDetector()
+        drift.create_baseline(
+            dataset=final_df,
+            dataset_hash=dataset_hash,
+            training_code_hash=MetadataManager.fingerprint_training_code(),
+            allow_overwrite=False
+        )
+        logger.info("Drift baseline created (explicit mode).")
 
     logger.info(
         "Training completed in %.2f minutes",
@@ -361,4 +365,9 @@ def main(start_date=None, end_date=None):
 
 
 if __name__ == "__main__":
-    main()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--create-baseline", action="store_true")
+    args = parser.parse_args()
+
+    main(create_baseline=args.create_baseline)
