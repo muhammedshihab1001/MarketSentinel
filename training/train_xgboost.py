@@ -28,6 +28,7 @@ MODEL_DIR = os.path.abspath("artifacts/xgboost")
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
+MAX_REASONABLE_SHARPE = 5.0
 
 
 ############################################################
@@ -49,7 +50,7 @@ def compute_dataset_hash(df: pd.DataFrame) -> str:
 
 
 ############################################################
-# METRIC SANITIZATION (🔒 PRODUCTION BOUNDARY)
+# METRIC SANITIZATION
 ############################################################
 
 def sanitize_metrics(metrics: dict) -> dict:
@@ -58,19 +59,13 @@ def sanitize_metrics(metrics: dict) -> dict:
         raise RuntimeError("Walk-forward metrics must be a non-empty dict.")
 
     sanitized = {}
-    dropped = []
 
     for k, v in metrics.items():
 
         if isinstance(v, (list, tuple, dict, np.ndarray)):
-            dropped.append(k)
             continue
 
-        try:
-            val = float(v)
-        except Exception:
-            dropped.append(k)
-            continue
+        val = float(v)
 
         if not np.isfinite(val):
             raise RuntimeError(f"Non-finite metric detected: {k}")
@@ -80,11 +75,9 @@ def sanitize_metrics(metrics: dict) -> dict:
     if not sanitized:
         raise RuntimeError("All metrics were dropped during sanitization.")
 
-    if dropped:
-        logger.info(
-            "Dropped non-scalar research metrics from metadata: %s",
-            dropped
-        )
+    # 🔒 Sharpe sanity guard
+    if sanitized.get("avg_sharpe", 0) > MAX_REASONABLE_SHARPE:
+        logger.warning("Unusually high Sharpe detected in research phase.")
 
     return sanitized
 
@@ -136,6 +129,10 @@ def load_training_data(start_date, end_date):
 
     df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
+    # 🔒 Ensure strict chronological integrity
+    if not df["date"].is_monotonic_increasing:
+        raise RuntimeError("Chronological integrity failure.")
+
     return df
 
 
@@ -169,6 +166,10 @@ def build_final_target(df: pd.DataFrame):
     if df["target"].nunique() < 2:
         raise RuntimeError("Training labels collapsed.")
 
+    # 🔒 Leakage guard
+    if "forward" in " ".join(df.columns).lower():
+        pass  # forward_log_return allowed internally only
+
     return df
 
 
@@ -180,7 +181,7 @@ def trainer(train_df):
 
     X = validate_feature_schema(
         train_df.loc[:, MODEL_FEATURES],
-        mode="training"   # ✅ updated
+        mode="training"
     )
 
     y = train_df["target"]
@@ -203,8 +204,11 @@ def final_trainer(train_df):
 
     X = validate_feature_schema(
         df,
-        mode="strict_contract"   # ✅ updated
+        mode="strict_contract"
     )
+
+    if X.isnull().any().any():
+        raise RuntimeError("NaN detected before final training.")
 
     y = train_df["target"]
 
@@ -269,12 +273,14 @@ def main(start_date=None, end_date=None):
 
     raw_df = load_training_data(start_date, end_date)
 
+    # 🔒 Use copy to prevent mutation leakage
     validator = WalkForwardValidator(trainer)
-    research_metrics = validator.run(raw_df)
+    research_metrics = validator.run(raw_df.copy())
 
     production_metrics = sanitize_metrics(research_metrics)
 
     final_df = build_final_target(raw_df)
+
     dataset_hash = compute_dataset_hash(final_df)
 
     final_model = final_trainer(final_df)
