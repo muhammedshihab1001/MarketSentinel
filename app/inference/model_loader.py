@@ -7,6 +7,7 @@ import numpy as np
 import json
 from dataclasses import dataclass
 from glob import glob
+from pathlib import Path
 
 from core.schema.feature_schema import (
     get_schema_signature,
@@ -43,6 +44,7 @@ class ModelLoader:
 
     _instance = None
     _instance_lock = threading.Lock()
+
     MIN_ARTIFACT_BYTES = 50_000
     POINTER_FILENAME = "production_pointer.json"
 
@@ -65,7 +67,6 @@ class ModelLoader:
         self._xgb_container: LoadedModel | None = None
         self._initialized = True
 
-        # Strict by default
         self._allow_latest_fallback = (
             os.getenv("ALLOW_LATEST_FALLBACK", "false").lower() == "true"
         )
@@ -74,7 +75,7 @@ class ModelLoader:
     # SHA256
     ########################################################
 
-    def _sha256(self, path):
+    def _sha256(self, path: str) -> str:
         h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -86,31 +87,59 @@ class ModelLoader:
     ########################################################
 
     def _compute_feature_checksum(self, feature_list):
-        canonical = json.dumps(feature_list, sort_keys=False)
-        return hashlib.sha256(canonical.encode()).hexdigest()
+        canonical = json.dumps(
+            list(feature_list),
+            sort_keys=False
+        ).encode()
+        return hashlib.sha256(canonical).hexdigest()
 
     ########################################################
-    # PRODUCTION POINTER LOGIC (STRICT)
+    # REGISTRY DIR VALIDATION
+    ########################################################
+
+    def _get_registry_dir(self):
+
+        base_dir = os.getenv(
+            "XGB_REGISTRY_DIR",
+            os.path.abspath("artifacts/xgboost")
+        )
+
+        base_dir = os.path.realpath(base_dir)
+
+        if not os.path.isdir(base_dir):
+            raise RuntimeError("Model registry directory missing.")
+
+        return base_dir
+
+    ########################################################
+    # PRODUCTION POINTER RESOLUTION
     ########################################################
 
     def _resolve_production_version(self, base_dir):
 
-        pointer_path = os.path.join(base_dir, self.POINTER_FILENAME)
+        pointer_path = os.path.join(
+            base_dir,
+            self.POINTER_FILENAME
+        )
 
         if not os.path.exists(pointer_path):
 
             if self._allow_latest_fallback:
                 logger.warning(
-                    "Production pointer missing — using latest artifact (fallback mode)."
+                    "Pointer missing — fallback enabled."
                 )
                 return None
 
             raise RuntimeError(
-                "production_pointer.json missing — production version undefined."
+                "production_pointer.json missing."
             )
 
         if os.path.islink(pointer_path):
-            raise RuntimeError("Symlinked production pointer detected.")
+            raise RuntimeError(
+                "Symlinked production pointer detected."
+            )
+
+        pointer_hash = self._sha256(pointer_path)
 
         with open(pointer_path, encoding="utf-8") as f:
             pointer = json.load(f)
@@ -118,46 +147,67 @@ class ModelLoader:
         version = pointer.get("model_version")
 
         if not version:
-            raise RuntimeError("Invalid production pointer format.")
+            raise RuntimeError(
+                "Invalid production pointer format."
+            )
 
-        model_path = os.path.join(base_dir, f"model_{version}.pkl")
-        metadata_path = os.path.join(base_dir, f"metadata_{version}.json")
+        model_path = os.path.join(
+            base_dir,
+            f"model_{version}.pkl"
+        )
+
+        metadata_path = os.path.join(
+            base_dir,
+            f"metadata_{version}.json"
+        )
 
         if not os.path.exists(model_path):
-            raise RuntimeError("Production pointer model file missing.")
+            raise RuntimeError(
+                "Production pointer model missing."
+            )
 
         if not os.path.exists(metadata_path):
-            raise RuntimeError("Production pointer metadata missing.")
+            raise RuntimeError(
+                "Production pointer metadata missing."
+            )
 
-        return model_path, metadata_path, version
+        return model_path, metadata_path, version, pointer_hash
 
     ########################################################
     # FIND ARTIFACT
     ########################################################
 
-    def _find_artifact(self, base_dir):
+    def _find_artifact(self):
+
+        base_dir = self._get_registry_dir()
 
         resolved = self._resolve_production_version(base_dir)
 
         if resolved:
             return resolved
 
-        # Only reachable if fallback explicitly enabled
-        model_files = glob(os.path.join(base_dir, "model_*.pkl"))
+        # Only allowed if fallback true
+        model_files = glob(
+            os.path.join(base_dir, "model_*.pkl")
+        )
 
         if not model_files:
-            raise RuntimeError("No trained model artifacts found.")
+            raise RuntimeError("No model artifacts found.")
 
         latest = max(model_files, key=os.path.getmtime)
-        filename = os.path.basename(latest)
+        version = Path(latest).stem.replace("model_", "")
 
-        version = filename[len("model_"):-len(".pkl")]
-        metadata_path = os.path.join(base_dir, f"metadata_{version}.json")
+        metadata_path = os.path.join(
+            base_dir,
+            f"metadata_{version}.json"
+        )
 
         if not os.path.exists(metadata_path):
-            raise RuntimeError("Metadata file missing for latest model.")
+            raise RuntimeError(
+                "Metadata missing for latest model."
+            )
 
-        return latest, metadata_path, version
+        return latest, metadata_path, version, None
 
     ########################################################
     # SAFE LOAD MODEL
@@ -166,37 +216,35 @@ class ModelLoader:
     def _safe_load_model(self, model_path):
 
         if os.path.getsize(model_path) < self.MIN_ARTIFACT_BYTES:
-            raise RuntimeError("Artifact too small — corrupted model.")
+            raise RuntimeError(
+                "Artifact too small — corrupted."
+            )
 
         model = joblib.load(model_path)
 
         if not hasattr(model, "predict_proba"):
-            raise RuntimeError("Invalid model artifact loaded.")
+            raise RuntimeError(
+                "Invalid model artifact."
+            )
 
         if hasattr(model, "feature_names"):
-            trained_features = list(model.feature_names)
-            if trained_features != MODEL_FEATURES:
+            if list(model.feature_names) != list(MODEL_FEATURES):
                 raise RuntimeError(
-                    "Model feature contract mismatch at inference."
+                    "Model feature contract mismatch."
                 )
 
         return model
 
     ########################################################
-    # RELOAD IF NEEDED (ATOMIC SWAP)
+    # RELOAD IF NEEDED
     ########################################################
 
     def _reload_xgb_if_needed(self):
 
         with self._reload_lock:
 
-            base_dir = os.getenv(
-                "XGB_REGISTRY_DIR",
-                os.path.abspath("artifacts/xgboost")
-            )
-
-            model_path, metadata_path, version = \
-                self._find_artifact(base_dir)
+            model_path, metadata_path, version, pointer_hash = \
+                self._find_artifact()
 
             if (
                 self._xgb_container and
@@ -204,49 +252,75 @@ class ModelLoader:
             ):
                 return self._xgb_container.model
 
-            logger.info("Loading XGBoost version=%s", version)
+            logger.info(
+                "Loading XGBoost version=%s",
+                version
+            )
 
-            meta = MetadataManager.load_metadata(metadata_path)
+            meta = MetadataManager.load_metadata(
+                metadata_path
+            )
 
             ####################################################
             # STRICT METADATA VALIDATION
             ####################################################
 
             if meta.get("metadata_type") != "training_manifest_v1":
-                raise RuntimeError("Unsupported metadata type.")
+                raise RuntimeError(
+                    "Unsupported metadata type."
+                )
 
-            if meta.get("schema_signature") != get_schema_signature():
-                raise RuntimeError("Schema mismatch during inference.")
+            if meta.get("schema_signature") != \
+                    get_schema_signature():
+                raise RuntimeError(
+                    "Schema signature mismatch."
+                )
 
             if meta.get("schema_version") != SCHEMA_VERSION:
-                raise RuntimeError("Schema version drift detected.")
+                raise RuntimeError(
+                    "Schema version drift detected."
+                )
 
-            if meta.get("features") != MODEL_FEATURES:
-                raise RuntimeError("Metadata feature contract mismatch.")
+            if list(meta.get("features")) != \
+                    list(MODEL_FEATURES):
+                raise RuntimeError(
+                    "Metadata feature mismatch."
+                )
 
             ####################################################
-            # ARTIFACT INTEGRITY CHECK
+            # ARTIFACT INTEGRITY
             ####################################################
 
-            artifact_hash_actual = self._sha256(model_path)
+            artifact_hash_actual = self._sha256(
+                model_path
+            )
 
-            if meta.get("artifact_hash"):
-                if meta["artifact_hash"] != artifact_hash_actual:
-                    raise RuntimeError("Artifact tampering detected.")
+            if not meta.get("artifact_hash"):
+                raise RuntimeError(
+                    "Artifact hash missing in metadata."
+                )
+
+            if meta["artifact_hash"] != artifact_hash_actual:
+                raise RuntimeError(
+                    "Artifact tampering detected."
+                )
 
             ####################################################
             # SAFE LOAD
             ####################################################
 
-            model = self._safe_load_model(model_path)
+            model = self._safe_load_model(
+                model_path
+            )
 
             ####################################################
             # FEATURE CHECKSUM
             ####################################################
 
-            feature_checksum = self._compute_feature_checksum(
-                MODEL_FEATURES
-            )
+            feature_checksum = \
+                self._compute_feature_checksum(
+                    MODEL_FEATURES
+                )
 
             new_container = LoadedModel(
                 model=model,
@@ -265,7 +339,10 @@ class ModelLoader:
                 version=version
             ).set(1)
 
-            logger.info("Model loaded successfully | version=%s", version)
+            logger.info(
+                "Model loaded successfully | version=%s",
+                version
+            )
 
             return new_container.model
 
