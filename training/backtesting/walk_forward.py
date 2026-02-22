@@ -159,15 +159,7 @@ class WalkForwardValidator:
                 if signal_slice["ticker"].nunique() != len(signal_slice):
                     raise RuntimeError("Duplicate tickers in signal slice.")
 
-                missing_close = (
-                    "close" not in signal_slice.columns or
-                    "close" not in exit_slice.columns
-                )
-                if missing_close:
-                    raise RuntimeError("Missing close price.")
-
                 X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
-
                 X = validate_feature_schema(X, mode="inference")
 
                 probs = model.predict_proba(X)[:, 1]
@@ -183,8 +175,18 @@ class WalkForwardValidator:
                 longs = ranked.tail(self.TOP_K)
                 shorts = ranked.head(self.BOTTOM_K)
 
-                long_vol = longs["volatility"].clip(lower=self.EPSILON)
-                short_vol = shorts["volatility"].clip(lower=self.EPSILON)
+                # 🔥 Explicit float casting (removes pandas future warning)
+                long_vol = (
+                    longs["volatility"]
+                    .astype("float64")
+                    .clip(lower=self.EPSILON)
+                )
+
+                short_vol = (
+                    shorts["volatility"]
+                    .astype("float64")
+                    .clip(lower=self.EPSILON)
+                )
 
                 long_weights = 1.0 / long_vol
                 short_weights = 1.0 / short_vol
