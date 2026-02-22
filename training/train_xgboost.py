@@ -12,6 +12,7 @@ import json
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
 from core.features.feature_store import FeatureStore
+from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
@@ -98,7 +99,7 @@ def sanitize_metrics(metrics: dict) -> dict:
 
 
 ############################################################
-# LOAD DATA
+# LOAD DATA (UPDATED)
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -132,6 +133,10 @@ def load_training_data(start_date, end_date):
     if not datasets:
         raise RuntimeError("All tickers failed.")
 
+    # --------------------------------------------------------
+    # CONCAT ALL TICKERS
+    # --------------------------------------------------------
+
     df = pd.concat(datasets, ignore_index=True)
 
     if len(df) < MIN_TRAINING_ROWS:
@@ -142,9 +147,17 @@ def load_training_data(start_date, end_date):
 
     df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
+    # --------------------------------------------------------
+    # ADD TRUE CROSS-SECTIONAL FEATURES (GLOBAL)
+    # --------------------------------------------------------
+
+    df = FeatureEngineer.add_cross_sectional_features(df)
+    df = FeatureEngineer.finalize(df)
+
     if df.columns.duplicated().any():
         raise RuntimeError("Duplicate columns detected.")
 
+    # Validate full contract now
     _ = validate_feature_schema(
         df.loc[:, MODEL_FEATURES],
         mode="training"
@@ -180,13 +193,8 @@ def build_final_target(df: pd.DataFrame):
     df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype(int)
 
-    # --------------------------------------------------------
-    # INDUSTRIAL SAFE PATCH
-    # Prevent strict_contract cross-sectional collapse
-    # --------------------------------------------------------
-
-    MIN_CS_WIDTH = 8  # safe for limited free market data
-
+    # Ensure minimum cross-sectional width
+    MIN_CS_WIDTH = 8
     counts = df.groupby("date")["ticker"].transform("count")
     df = df[counts >= MIN_CS_WIDTH]
 
