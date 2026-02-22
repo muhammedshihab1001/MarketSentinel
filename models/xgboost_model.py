@@ -1,12 +1,15 @@
 import xgboost as xgb
 import numpy as np
 import logging
+import hashlib
+import json
 
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
 MIN_PROB_STD = 1e-5
 NUM_BOOST_ROUNDS = 600
+EARLY_STOPPING_ROUNDS = 50
 
 
 ###################################################
@@ -41,6 +44,10 @@ class SafeXGBClassifier:
         self.pos_weight = pos_weight
         self.model = None
         self.feature_names = None
+        self.feature_checksum = None
+
+        # extra reproducibility guard
+        np.random.seed(SEED)
 
     ###################################################
     # TRAIN
@@ -61,6 +68,12 @@ class SafeXGBClassifier:
 
         # 🔒 Lock feature order permanently
         self.feature_names = list(X.columns)
+
+        # 🔐 Store deterministic feature checksum
+        checksum_str = json.dumps(self.feature_names, sort_keys=False)
+        self.feature_checksum = hashlib.sha256(
+            checksum_str.encode()
+        ).hexdigest()
 
         dtrain = xgb.DMatrix(X, label=y)
 
@@ -106,6 +119,9 @@ class SafeXGBClassifier:
         if std < MIN_PROB_STD:
             raise RuntimeError("Probability collapse detected.")
 
+        if np.any(preds < 0) or np.any(preds > 1):
+            raise RuntimeError("Invalid probability range detected.")
+
         return self
 
     ###################################################
@@ -117,7 +133,6 @@ class SafeXGBClassifier:
         if self.model is None:
             raise RuntimeError("Model not trained.")
 
-        # 🔒 Strict feature contract enforcement
         missing = set(self.feature_names) - set(X.columns)
         extra = set(X.columns) - set(self.feature_names)
 
@@ -127,17 +142,29 @@ class SafeXGBClassifier:
         if extra:
             logger.warning("Extra inference features ignored: %s", extra)
 
-        # Enforce training order exactly
+        # 🔒 Enforce training order exactly
         X = X.loc[:, self.feature_names].astype(np.float32)
 
         if X.isnull().any().any():
             raise RuntimeError("NaN detected in inference features.")
+
+        # 🔐 Verify feature checksum consistency
+        checksum_str = json.dumps(self.feature_names, sort_keys=False)
+        current_checksum = hashlib.sha256(
+            checksum_str.encode()
+        ).hexdigest()
+
+        if current_checksum != self.feature_checksum:
+            raise RuntimeError("Feature order integrity violated.")
 
         dmatrix = xgb.DMatrix(X)
         probs = self.model.predict(dmatrix)
 
         if np.std(probs) < MIN_PROB_STD:
             raise RuntimeError("Inference probability collapse detected.")
+
+        if np.any(probs < 0) or np.any(probs > 1):
+            raise RuntimeError("Invalid probability range detected.")
 
         return np.column_stack([1 - probs, probs])
 
@@ -173,4 +200,4 @@ def build_xgboost_pipeline(y):
 
     logger.info("XGBoost model built successfully (CPU deterministic mode).")
 
-    return model
+    return model 
