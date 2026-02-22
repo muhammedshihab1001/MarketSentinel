@@ -173,23 +173,25 @@ def build_final_target(df: pd.DataFrame):
 
 def trainer(train_df):
 
-    X_full = train_df.loc[:, MODEL_FEATURES].copy()
+    X = train_df.loc[:, MODEL_FEATURES].copy()
 
-    # 🔒 Fold-local constant feature detection
+    # 🔒 Detect fold-local constant features
     constant_cols = [
-        col for col in X_full.columns
-        if X_full[col].nunique(dropna=True) <= 1
+        col for col in X.columns
+        if X[col].nunique(dropna=True) <= 1
     ]
 
     if constant_cols:
         logger.warning(
-            "Dropping constant fold features: %s",
+            "Fold-local constant features neutralized (set to 0): %s",
             constant_cols
         )
 
-    X = X_full.drop(columns=constant_cols)
+        # 🔒 Neutralize instead of dropping
+        for col in constant_cols:
+            X[col] = 0.0
 
-    # 🔒 Schema still enforced
+    # 🔒 Now validate full schema (nothing missing)
     X = validate_feature_schema(
         X,
         mode="training"
