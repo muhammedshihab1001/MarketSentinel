@@ -7,6 +7,7 @@ import numpy as np
 import json
 from dataclasses import dataclass
 from glob import glob
+from datetime import datetime
 
 from core.schema.feature_schema import (
     get_schema_signature,
@@ -45,6 +46,7 @@ class ModelLoader:
     _instance = None
     _instance_lock = threading.Lock()
     MIN_ARTIFACT_BYTES = 50_000
+    POINTER_FILENAME = "production_pointer.json"
 
     ########################################################
 
@@ -85,14 +87,54 @@ class ModelLoader:
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     ########################################################
-    # FIND LATEST MODEL
+    # PRODUCTION POINTER LOGIC
     ########################################################
 
-    def _find_latest_artifact(self, base_dir):
+    def _resolve_production_version(self, base_dir):
 
-        if not os.path.exists(base_dir):
-            raise RuntimeError(f"Registry directory missing: {base_dir}")
+        pointer_path = os.path.join(base_dir, self.POINTER_FILENAME)
 
+        if not os.path.exists(pointer_path):
+            logger.warning(
+                "No production pointer found — falling back to latest model."
+            )
+            return None  # fallback to latest
+
+        if os.path.islink(pointer_path):
+            raise RuntimeError("Symlinked production pointer detected.")
+
+        with open(pointer_path, encoding="utf-8") as f:
+            pointer = json.load(f)
+
+        version = pointer.get("model_version")
+
+        if not version:
+            raise RuntimeError("Invalid production pointer format.")
+
+        model_path = os.path.join(base_dir, f"model_{version}.pkl")
+        metadata_path = os.path.join(base_dir, f"metadata_{version}.json")
+
+        if not os.path.exists(model_path):
+            raise RuntimeError("Production pointer model file missing.")
+
+        if not os.path.exists(metadata_path):
+            raise RuntimeError("Production pointer metadata missing.")
+
+        return model_path, metadata_path, version
+
+    ########################################################
+    # FIND ARTIFACT
+    ########################################################
+
+    def _find_artifact(self, base_dir):
+
+        # 1️⃣ Try production pointer first
+        resolved = self._resolve_production_version(base_dir)
+
+        if resolved:
+            return resolved
+
+        # 2️⃣ Fallback to latest (backward compatible)
         model_files = glob(os.path.join(base_dir, "model_*.pkl"))
 
         if not model_files:
@@ -105,11 +147,7 @@ class ModelLoader:
             raise RuntimeError("Unexpected artifact naming format.")
 
         version = filename[len("model_"):-len(".pkl")]
-
-        metadata_path = os.path.join(
-            base_dir,
-            f"metadata_{version}.json"
-        )
+        metadata_path = os.path.join(base_dir, f"metadata_{version}.json")
 
         if not os.path.exists(metadata_path):
             raise RuntimeError("Metadata file missing for latest model.")
@@ -130,7 +168,6 @@ class ModelLoader:
         if not hasattr(model, "predict_proba"):
             raise RuntimeError("Invalid model artifact loaded.")
 
-        # STRICT FEATURE CONTRACT CHECK
         if hasattr(model, "feature_names"):
             trained_features = list(model.feature_names)
             if trained_features != MODEL_FEATURES:
@@ -154,7 +191,7 @@ class ModelLoader:
             )
 
             model_path, metadata_path, version = \
-                self._find_latest_artifact(base_dir)
+                self._find_artifact(base_dir)
 
             if (
                 self._xgb_container and
@@ -210,7 +247,7 @@ class ModelLoader:
             model = self._safe_load_model(model_path)
 
             ####################################################
-            # FEATURE CHECKSUM (CRITICAL FIX)
+            # FEATURE CHECKSUM
             ####################################################
 
             feature_checksum = self._compute_feature_checksum(
@@ -237,29 +274,6 @@ class ModelLoader:
             logger.info("Model loaded successfully | version=%s", version)
 
             return new_container.model
-
-    ########################################################
-    # STRICT FEATURE VALIDATION
-    ########################################################
-
-    def validate_features(self, df):
-
-        missing = set(MODEL_FEATURES) - set(df.columns)
-
-        if missing:
-            raise RuntimeError(
-                f"Inference feature mismatch: missing {missing}"
-            )
-
-        df = df.loc[:, MODEL_FEATURES]
-
-        if df.isnull().any().any():
-            raise RuntimeError("NaN detected in inference features.")
-
-        if not np.isfinite(df.values).all():
-            raise RuntimeError("Non-finite values detected in inference.")
-
-        return df.astype(DTYPE)
 
     ########################################################
     # PUBLIC ACCESSORS
@@ -289,10 +303,6 @@ class ModelLoader:
         self._reload_xgb_if_needed()
         return self._xgb_container.artifact_hash
 
-    ########################################################
-    # 🔥 NEW: FEATURE CHECKSUM PROPERTY (FIX)
-    ########################################################
-
     @property
     def feature_checksum(self):
         self._reload_xgb_if_needed()
@@ -304,4 +314,4 @@ class ModelLoader:
 
     def warmup(self):
         logger.info("Model warmup triggered.")
-        _ = self.xgb
+        _ = self.xgb 
