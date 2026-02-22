@@ -156,7 +156,7 @@ class InferencePipeline:
 
         datasets = []
 
-        end_date = pd.Timestamp.utcnow().normalize()
+        end_date = pd.Timestamp.utcnow()
         start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
 
         for ticker in tickers:
@@ -198,15 +198,29 @@ class InferencePipeline:
         return df
 
     ############################################################
+    # FIXED TIMEZONE-SAFE VERSION
+    ############################################################
 
     def _select_latest_snapshot(self, df: pd.DataFrame):
 
         latest_date = df["date"].max()
 
-        if (pd.Timestamp.utcnow().normalize() - latest_date) > timedelta(days=self.MAX_DATA_STALENESS_DAYS):
+        if pd.isna(latest_date):
+            raise RuntimeError("No valid dates found in inference dataset.")
+
+        # Normalize both timestamps to tz-naive UTC
+        now_utc = pd.Timestamp.utcnow()
+
+        if latest_date.tzinfo is not None:
+            latest_date = latest_date.tz_convert("UTC").tz_localize(None)
+
+        if now_utc.tzinfo is not None:
+            now_utc = now_utc.tz_convert("UTC").tz_localize(None)
+
+        if (now_utc.normalize() - latest_date.normalize()) > timedelta(days=self.MAX_DATA_STALENESS_DAYS):
             raise RuntimeError("Inference data appears stale.")
 
-        return df[df["date"] == latest_date].copy()
+        return df[df["date"] == df["date"].max()].copy()
 
     ############################################################
 
