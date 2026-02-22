@@ -17,9 +17,10 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "12.0"
+    METADATA_VERSION = "12.1"
     MIN_TRAINING_DAYS = 120
     MIN_METADATA_BYTES = 800
+    MIN_FEATURE_COUNT = 10
 
     #####################################################
 
@@ -66,7 +67,7 @@ class MetadataManager:
 
         tmp = path + ".tmp"
 
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
@@ -87,7 +88,7 @@ class MetadataManager:
         if os.path.getsize(path) < MetadataManager.MIN_METADATA_BYTES:
             raise RuntimeError("Metadata file suspiciously small.")
 
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             metadata = json.load(f)
 
         missing = [
@@ -117,6 +118,16 @@ class MetadataManager:
 
         if metadata["schema_version"] != SCHEMA_VERSION:
             raise RuntimeError("Schema version drift detected.")
+
+        #################################################
+        # FEATURE CONTRACT STRICTNESS
+        #################################################
+
+        if metadata["features"] != MODEL_FEATURES:
+            raise RuntimeError("Metadata feature contract mismatch.")
+
+        if metadata["feature_count"] != len(MODEL_FEATURES):
+            raise RuntimeError("Feature count mismatch.")
 
         return metadata
 
@@ -153,6 +164,11 @@ class MetadataManager:
             if frozen != tuple(MODEL_FEATURES):
                 raise RuntimeError(
                     "Tabular feature mismatch — schema drift."
+                )
+
+            if len(frozen) < MetadataManager.MIN_FEATURE_COUNT:
+                raise RuntimeError(
+                    "Feature contract below institutional minimum."
                 )
 
         else:
