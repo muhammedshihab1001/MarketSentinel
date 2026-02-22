@@ -214,43 +214,6 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # CROSS-SECTIONAL (DEPRECATION SAFE)
-    ########################################################
-
-    @classmethod
-    def add_cross_sectional_features(cls, df):
-
-        cross_cols = [
-            "momentum_20",
-            "return_lag5",
-            "rsi",
-            "volatility",
-            "ema_ratio"
-        ]
-
-        df = df.sort_values(["date", "ticker"]).copy()
-
-        for col in cross_cols:
-
-            cs_mean = df.groupby("date")[col].transform("mean")
-            cs_std = df.groupby("date")[col].transform(lambda x: x.std(ddof=0))
-
-            degenerate_mask = (cs_std == 0) | (~np.isfinite(cs_std))
-
-            z = (df[col] - cs_mean) / cs_std.replace(0, np.nan)
-            z = z.clip(-5, 5)
-
-            rank = df.groupby("date")[col].rank(pct=True)
-
-            z[degenerate_mask] = 0.0
-            rank[degenerate_mask] = 0.5
-
-            df[f"{col}_z"] = z.fillna(0.0)
-            df[f"{col}_rank"] = rank.fillna(0.5)
-
-        return df
-
-    ########################################################
     # FINAL SANITIZATION
     ########################################################
 
@@ -263,11 +226,7 @@ class FeatureEngineer:
 
         for col in numeric_cols:
             if df[col].isnull().any():
-                if col.endswith("_rank"):
-                    df[col] = df[col].fillna(0.5)
-                elif col.endswith("_z"):
-                    df[col] = df[col].fillna(0.0)
-                elif "volatility" in col:
+                if "volatility" in col:
                     df[col] = df[col].fillna(cls.VOL_FLOOR)
                 else:
                     df[col] = df[col].fillna(0.0)
@@ -278,7 +237,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # MAIN PIPELINE
+    # MAIN PIPELINE (NO CROSS-SECTIONAL HERE)
     ########################################################
 
     @classmethod
@@ -298,7 +257,6 @@ class FeatureEngineer:
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
         df = cls.add_ema(df)
-        df = cls.add_cross_sectional_features(df)
 
         df = cls._final_sanitize(df)
 
