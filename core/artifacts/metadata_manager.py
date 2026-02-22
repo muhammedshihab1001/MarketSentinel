@@ -335,7 +335,7 @@ class MetadataManager:
                 "Training window below institutional minimum."
             )
 
-    #####################################################
+        #####################################################
     # CREATE METADATA
     #####################################################
 
@@ -349,7 +349,8 @@ class MetadataManager:
         dataset_hash,
         dataset_rows,
         metadata_type,
-        extra_fields=None
+        extra_fields=None,
+        feature_checksum=None,   # ← NEW (backward compatible)
     ):
 
         MetadataManager._validate_feature_contract(
@@ -399,6 +400,19 @@ class MetadataManager:
             "training_universe": universe_snapshot,
             "universe_hash": universe_snapshot["universe_hash"]
         }
+
+        #################################################
+        # OPTIONAL FEATURE CHECKSUM (NEW GOVERNANCE)
+        #################################################
+
+        if feature_checksum is not None:
+
+            if not isinstance(feature_checksum, str) or len(feature_checksum) < 32:
+                raise RuntimeError("Invalid feature checksum.")
+
+            metadata["feature_checksum"] = feature_checksum
+
+        #################################################
 
         if extra_fields:
 
