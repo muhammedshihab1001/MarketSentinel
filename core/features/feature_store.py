@@ -22,7 +22,7 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v19"
+    CACHE_VERSION = "v20"  # bumped due to cross-sectional refactor
     MAX_CACHE_FILES_PER_TICKER = 6
     MIN_FILE_BYTES = 5_000
     MAX_TOTAL_CACHE_FILES = 2000
@@ -106,18 +106,6 @@ class FeatureStore:
         h = hashlib.sha256()
         h.update(self._stable_hash_df(price_core).encode())
 
-        if sentiment_df is not None and not sentiment_df.empty:
-
-            sent_core = sentiment_df.copy()
-
-            if "avg_sentiment" in sent_core.columns:
-                sent_core = sent_core[["date", "avg_sentiment"]]
-                sent_core["date"] = pd.to_datetime(
-                    sent_core["date"], utc=True
-                )
-                sent_core = sent_core.sort_values("date").reset_index(drop=True)
-                h.update(sent_core.to_csv(index=False).encode())
-
         return h.hexdigest()[:20]
 
     ########################################################
@@ -141,16 +129,8 @@ class FeatureStore:
                 except Exception:
                     pass
 
-        # Global cap protection
-        all_files = os.listdir(self.FEATURE_DIR)
-        if len(all_files) > self.MAX_TOTAL_CACHE_FILES:
-            all_files.sort()
-            for f in all_files[:200]:
-                try:
-                    os.remove(os.path.join(self.FEATURE_DIR, f))
-                except Exception:
-                    pass
-
+    ########################################################
+    # MAIN ENTRY
     ########################################################
 
     def get_features(
@@ -199,32 +179,19 @@ class FeatureStore:
                 os.remove(path)
 
         ####################################################
-        # REBUILD
+        # REBUILD (CORE FEATURES ONLY)
         ####################################################
 
         logger.info("Feature cache miss — rebuilding.")
 
-        features = self.engineer.build_feature_pipeline(
-            price_df,
-            sentiment_df,
-            training=training,
-            ticker=ticker
-        )
+        df = self.engineer._validate_price_frame(price_df, ticker)
+        df = self.engineer.add_core_features(df)
 
-        features = features.sort_values(
+        df = df.sort_values(
             ["date", "ticker"]
         ).reset_index(drop=True)
 
-        # Leakage protection
-        if not training:
-            leakage_cols = [
-                c for c in features.columns
-                if "forward" in c.lower()
-            ]
-            if leakage_cols:
-                features = features.drop(columns=leakage_cols)
-
-        self._validate_basic_integrity(features)
+        self._validate_basic_integrity(df)
 
         ####################################################
         # ATOMIC WRITE
@@ -232,7 +199,7 @@ class FeatureStore:
 
         tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
 
-        features.to_parquet(
+        df.to_parquet(
             tmp_path,
             index=False,
             engine="pyarrow",
@@ -243,4 +210,4 @@ class FeatureStore:
 
         self._cleanup_old_cache(ticker)
 
-        return features
+        return df
