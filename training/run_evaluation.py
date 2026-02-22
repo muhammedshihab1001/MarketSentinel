@@ -22,6 +22,8 @@ from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
     get_schema_signature,
+    LONG_PERCENTILE,
+    SHORT_PERCENTILE,
 )
 from core.market.universe import MarketUniverse
 from core.time.market_time import MarketTime
@@ -60,8 +62,8 @@ def apply_cross_sectional_target(df):
     )
 
     df["target"] = np.nan
-    df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
-    df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
+    df.loc[df["alpha_rank_pct"] >= LONG_PERCENTILE, "target"] = 1
+    df.loc[df["alpha_rank_pct"] <= SHORT_PERCENTILE, "target"] = 0
 
     df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype("int8")
@@ -126,7 +128,6 @@ def build_dataset():
                 end_date=end_date
             )
 
-            # 🔥 Cross-sectional features now built inside FeatureEngineer
             dataset = store.get_features(
                 price_df,
                 sentiment_df=None,
@@ -145,7 +146,6 @@ def build_dataset():
 
     df = pd.concat(datasets, ignore_index=True)
 
-    # Target must match training
     df = apply_cross_sectional_target(df)
 
     feature_df = validate_feature_schema(df.loc[:, MODEL_FEATURES])
@@ -190,9 +190,9 @@ def main() -> int:
         if len(group) < 5:
             continue
 
-        # 🔒 Keep canonical 80/20 CI threshold
-        long_threshold = group["prob"].quantile(0.80)
-        short_threshold = group["prob"].quantile(0.20)
+        # 🔒 Canonical signal contract (now centralized in schema)
+        long_threshold = group["prob"].quantile(LONG_PERCENTILE)
+        short_threshold = group["prob"].quantile(SHORT_PERCENTILE)
 
         long_mask = (df_eval["date"] == date) & (df_eval["prob"] >= long_threshold)
         short_mask = (df_eval["date"] == date) & (df_eval["prob"] <= short_threshold)
