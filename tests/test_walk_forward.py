@@ -7,21 +7,20 @@ from core.schema.feature_schema import MODEL_FEATURES
 
 
 ############################################################
-# DUMMY TRAINER (Aligned With Current Architecture)
+# DUMMY TRAINER
 ############################################################
 
 def dummy_trainer(train_df):
 
     class DummyModel:
         def predict_proba(self, X):
-            # constant 60% up probability
             return np.tile([0.4, 0.6], (len(X), 1))
 
     return DummyModel()
 
 
 ############################################################
-# HELPER TO BUILD VALID DATASET (CROSS-SECTIONAL SAFE)
+# HELPER TO BUILD VALID DATASET (PRODUCTION-LIKE)
 ############################################################
 
 def build_valid_dataset(
@@ -29,17 +28,10 @@ def build_valid_dataset(
     n_tickers=20,
     seed=42
 ):
-    """
-    Build realistic cross-sectional dataset:
-    - Multiple tickers
-    - Enough rows for WF windows
-    - Deterministic seed
-    """
 
     np.random.seed(seed)
 
     dates = pd.date_range("2020-01-01", periods=rows)
-
     tickers = [f"T{i}" for i in range(n_tickers)]
 
     df = pd.DataFrame({
@@ -49,6 +41,16 @@ def build_valid_dataset(
 
     total_rows = len(df)
 
+    # --- REQUIRED PRICE COLUMNS ---
+    base_price = 100 + np.cumsum(np.random.randn(total_rows) * 0.5)
+    df["close"] = base_price.astype("float32")
+
+    # Volatility required for weighting
+    df["volatility"] = (
+        np.abs(np.random.randn(total_rows)) + 0.01
+    ).astype("float32")
+
+    # --- MODEL FEATURES ---
     for col in MODEL_FEATURES:
         df[col] = np.random.randn(total_rows).astype("float32")
 
