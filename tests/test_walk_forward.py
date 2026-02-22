@@ -21,22 +21,38 @@ def dummy_trainer(train_df):
 
 
 ############################################################
-# HELPER TO BUILD VALID DATASET
+# HELPER TO BUILD VALID DATASET (CROSS-SECTIONAL SAFE)
 ############################################################
 
-def build_valid_dataset(rows=500):
+def build_valid_dataset(
+    rows=2000,
+    n_tickers=20,
+    seed=42
+):
+    """
+    Build realistic cross-sectional dataset:
+    - Multiple tickers
+    - Enough rows for WF windows
+    - Deterministic seed
+    """
+
+    np.random.seed(seed)
 
     dates = pd.date_range("2020-01-01", periods=rows)
 
+    tickers = [f"T{i}" for i in range(n_tickers)]
+
     df = pd.DataFrame({
-        "date": np.tile(dates, 1),
-        "ticker": "TEST"
+        "date": np.repeat(dates, n_tickers),
+        "ticker": np.tile(tickers, rows)
     })
 
-    for col in MODEL_FEATURES:
-        df[col] = np.random.randn(rows).astype("float32")
+    total_rows = len(df)
 
-    df["target"] = np.random.randint(0, 2, size=rows)
+    for col in MODEL_FEATURES:
+        df[col] = np.random.randn(total_rows).astype("float32")
+
+    df["target"] = np.random.randint(0, 2, size=total_rows)
 
     return df
 
@@ -47,7 +63,7 @@ def build_valid_dataset(rows=500):
 
 def test_walk_forward_requires_enough_data():
 
-    df = build_valid_dataset(rows=100)
+    df = build_valid_dataset(rows=50, n_tickers=5)
 
     wf = WalkForwardValidator(
         model_trainer=dummy_trainer
@@ -63,7 +79,7 @@ def test_walk_forward_requires_enough_data():
 
 def test_walk_forward_runs_successfully():
 
-    df = build_valid_dataset(rows=600)
+    df = build_valid_dataset(rows=2000, n_tickers=20)
 
     wf = WalkForwardValidator(
         model_trainer=dummy_trainer
