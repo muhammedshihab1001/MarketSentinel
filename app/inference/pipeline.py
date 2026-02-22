@@ -13,7 +13,9 @@ from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
     get_schema_signature,
-    DTYPE
+    DTYPE,
+    LONG_PERCENTILE,
+    SHORT_PERCENTILE,
 )
 from core.market.universe import MarketUniverse
 
@@ -76,10 +78,6 @@ class InferencePipeline:
     TARGET_GROSS_EXPOSURE = 1.0
     TOP_K = 3
     BOTTOM_K = 3
-
-    # 🔒 Canonical thresholds (must match training target)
-    LONG_PERCENTILE = 0.70
-    SHORT_PERCENTILE = 0.30
 
     MIN_PROB_STD = 1e-6
     WEIGHT_TOLERANCE = 1e-6
@@ -243,10 +241,10 @@ class InferencePipeline:
             latest_df["score"] = probs
             latest_df["rank_pct"] = latest_df["score"].rank(pct=True)
 
-            # 🔒 Canonical signal logic (matches training)
+            # ✅ Canonical signal logic (from schema contract)
             latest_df["signal"] = latest_df["rank_pct"].apply(
-                lambda x: "LONG" if x >= self.LONG_PERCENTILE
-                else ("SHORT" if x <= self.SHORT_PERCENTILE else "NEUTRAL")
+                lambda x: "LONG" if x >= LONG_PERCENTILE
+                else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
             )
 
             weights = self._construct_portfolio(latest_df)
