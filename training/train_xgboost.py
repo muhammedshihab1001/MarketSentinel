@@ -75,7 +75,6 @@ def sanitize_metrics(metrics: dict) -> dict:
     if not sanitized:
         raise RuntimeError("All metrics were dropped during sanitization.")
 
-    # 🔒 Sharpe sanity guard
     if sanitized.get("avg_sharpe", 0) > MAX_REASONABLE_SHARPE:
         logger.warning("Unusually high Sharpe detected in research phase.")
 
@@ -129,7 +128,6 @@ def load_training_data(start_date, end_date):
 
     df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
-    # 🔒 Ensure strict chronological integrity
     if not df["date"].is_monotonic_increasing:
         raise RuntimeError("Chronological integrity failure.")
 
@@ -166,21 +164,34 @@ def build_final_target(df: pd.DataFrame):
     if df["target"].nunique() < 2:
         raise RuntimeError("Training labels collapsed.")
 
-    # 🔒 Leakage guard
-    if "forward" in " ".join(df.columns).lower():
-        pass  # forward_log_return allowed internally only
-
     return df
 
 
 ############################################################
-# TRAINER
+# TRAINER (FOLD-ROBUST)
 ############################################################
 
 def trainer(train_df):
 
+    X_full = train_df.loc[:, MODEL_FEATURES].copy()
+
+    # 🔒 Fold-local constant feature detection
+    constant_cols = [
+        col for col in X_full.columns
+        if X_full[col].nunique(dropna=True) <= 1
+    ]
+
+    if constant_cols:
+        logger.warning(
+            "Dropping constant fold features: %s",
+            constant_cols
+        )
+
+    X = X_full.drop(columns=constant_cols)
+
+    # 🔒 Schema still enforced
     X = validate_feature_schema(
-        train_df.loc[:, MODEL_FEATURES],
+        X,
         mode="training"
     )
 
@@ -191,6 +202,10 @@ def trainer(train_df):
 
     return pipeline
 
+
+############################################################
+# FINAL TRAINER (STRICT)
+############################################################
 
 def final_trainer(train_df):
 
