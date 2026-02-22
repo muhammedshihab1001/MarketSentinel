@@ -7,6 +7,8 @@ import os
 import re
 import logging
 import math
+import json
+from pathlib import Path
 
 from app.inference.pipeline import InferencePipeline
 from app.inference.model_loader import ModelLoader
@@ -20,9 +22,9 @@ from app.monitoring.metrics import (
 router = APIRouter()
 logger = logging.getLogger("marketsentinel.api")
 
-# ------------------------------------------------
+# =========================================================
 # SINGLETONS
-# ------------------------------------------------
+# =========================================================
 
 _pipeline = None
 _model_loader = None
@@ -43,23 +45,29 @@ def get_loader():
     return _model_loader
 
 
-# ------------------------------------------------
-# CONCURRENCY CONTROL
-# ------------------------------------------------
+# =========================================================
+# PRODUCTION LIMITS
+# =========================================================
 
 MAX_CONCURRENT_INFERENCES = int(
     os.getenv("MAX_CONCURRENT_INFERENCES", "4")
 )
 
 REQUEST_TIMEOUT = int(
-    os.getenv("INFERENCE_TIMEOUT_SEC", "30")
+    os.getenv("INFERENCE_TIMEOUT_SEC", "25")
 )
 
 MAX_BATCH_SIZE = int(
-    os.getenv("MAX_BATCH_SIZE", "50")
+    os.getenv("MAX_BATCH_SIZE", "25")  # 🔥 reduced from 50
 )
 
-MIN_BATCH_SIZE = 4  # must match portfolio construction requirement
+MIN_BATCH_SIZE = 4
+DEFAULT_USE_UNIVERSE = os.getenv(
+    "DEFAULT_USE_UNIVERSE",
+    "true"
+).lower() == "true"
+
+UNIVERSE_CONFIG_PATH = Path("config/universe.json")
 
 inference_semaphore = asyncio.Semaphore(
     MAX_CONCURRENT_INFERENCES
@@ -68,16 +76,37 @@ inference_semaphore = asyncio.Semaphore(
 TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 
 
-# ------------------------------------------------
+# =========================================================
+# DEFAULT UNIVERSE LOADER
+# =========================================================
+
+def load_default_universe():
+
+    if not UNIVERSE_CONFIG_PATH.exists():
+        raise RuntimeError("Universe config missing.")
+
+    with open(UNIVERSE_CONFIG_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, list):
+        raise RuntimeError("Universe config invalid format.")
+
+    return sorted(set(data))
+
+
+# =========================================================
 # REQUEST SCHEMA
-# ------------------------------------------------
+# =========================================================
 
 class PortfolioRequest(BaseModel):
-    tickers: list[str] = Field(..., min_length=1, max_length=200)
+    tickers: list[str] | None = Field(default=None)
 
     @field_validator("tickers")
     @classmethod
     def validate_and_normalize(cls, tickers):
+
+        if tickers is None:
+            return None
 
         cleaned = []
 
@@ -99,9 +128,9 @@ class PortfolioRequest(BaseModel):
         return unique
 
 
-# ------------------------------------------------
-# STRICT PORTFOLIO VALIDATION
-# ------------------------------------------------
+# =========================================================
+# OUTPUT VALIDATION
+# =========================================================
 
 def validate_portfolio_output(result):
 
@@ -128,42 +157,63 @@ def validate_portfolio_output(result):
     return result
 
 
-# ------------------------------------------------
+# =========================================================
 # PORTFOLIO ENDPOINT
-# ------------------------------------------------
+# =========================================================
 
 @router.post("/portfolio")
 async def build_portfolio(req: PortfolioRequest):
 
     endpoint = "/portfolio"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
-
     start_time = time.time()
-
-    if len(req.tickers) > MAX_BATCH_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Batch size exceeds limit ({MAX_BATCH_SIZE})"
-        )
 
     try:
 
-        # Ensure model is loaded before inference
-        get_loader()
+        # -------------------------------------------------
+        # Resolve tickers
+        # -------------------------------------------------
+
+        if req.tickers is None:
+
+            if not DEFAULT_USE_UNIVERSE:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Tickers required."
+                )
+
+            tickers = load_default_universe()
+
+        else:
+            tickers = req.tickers
+
+        if len(tickers) > MAX_BATCH_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Batch size exceeds limit ({MAX_BATCH_SIZE})"
+            )
+
+        # -------------------------------------------------
+        # Ensure model loaded
+        # -------------------------------------------------
+
+        loader = get_loader()
+
+        # -------------------------------------------------
+        # Concurrency Guard
+        # -------------------------------------------------
 
         async with inference_semaphore:
 
             result = await asyncio.wait_for(
                 run_in_threadpool(
                     get_pipeline().run_batch,
-                    req.tickers
+                    tickers
                 ),
                 timeout=REQUEST_TIMEOUT
             )
 
         result = validate_portfolio_output(result)
-
-        loader = get_loader()
 
         return {
             "meta": {
@@ -172,6 +222,7 @@ async def build_portfolio(req: PortfolioRequest):
                 "dataset_hash": loader.dataset_hash,
                 "training_code_hash": loader.training_code_hash,
                 "artifact_hash": loader.artifact_hash,
+                "inference_batch_size": len(tickers),
                 "timestamp": int(time.time())
             },
             "portfolio": result
@@ -214,9 +265,9 @@ async def build_portfolio(req: PortfolioRequest):
         )
 
 
-# ------------------------------------------------
+# =========================================================
 # HEALTH
-# ------------------------------------------------
+# =========================================================
 
 @router.get("/health")
 async def health():
@@ -226,9 +277,9 @@ async def health():
     }
 
 
-# ------------------------------------------------
+# =========================================================
 # READINESS
-# ------------------------------------------------
+# =========================================================
 
 @router.get("/ready")
 async def readiness():
