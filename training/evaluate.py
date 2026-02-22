@@ -9,13 +9,15 @@ from sklearn.metrics import (
 # GOVERNANCE THRESHOLDS
 # =========================================================
 
-# For financial alpha modeling:
-# 0.50 = random → NOT acceptable
+# Financial ML Governance Rules:
+# 0.50 = random guessing → unacceptable
 # Model must be strictly better than random.
 
 XGB_MIN_ACCURACY = 0.50
 XGB_MIN_BALANCED_ACCURACY = 0.50
-XGB_MIN_ROC_AUC = 0.50
+
+# Require measurable signal above random
+XGB_MIN_ROC_AUC = 0.55
 
 # Backward compatibility
 XGB_MIN_AUC = XGB_MIN_ROC_AUC
@@ -150,8 +152,8 @@ def evaluate_xgboost(
         if balanced_acc < XGB_MIN_BALANCED_ACCURACY:
             raise RuntimeError("Balanced accuracy below minimum threshold.")
 
-        # STRICT RULE: must be strictly better than random
+        # Must be strictly better than random
         if roc_auc is not None and roc_auc <= XGB_MIN_ROC_AUC:
-            raise RuntimeError("ROC AUC not better than random.")
+            raise RuntimeError("ROC AUC not sufficiently above random baseline.")
 
     return metrics

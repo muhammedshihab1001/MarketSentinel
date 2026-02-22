@@ -13,6 +13,10 @@ from training.evaluate import (
 ############################################################
 
 def test_xgboost_metric_computation():
+    """
+    Ensure metric calculations behave as expected
+    under perfect prediction.
+    """
 
     y_true = np.array([1, 0, 1, 0])
     probs = np.array([0.9, 0.1, 0.8, 0.2])
@@ -26,10 +30,14 @@ def test_xgboost_metric_computation():
 
 
 ############################################################
-# GATE ENFORCEMENT TEST
+# GATE ENFORCEMENT TESTS
 ############################################################
 
 def test_xgboost_accuracy_gate_enforced():
+    """
+    Ensure accuracy gate fails when predictions
+    are clearly wrong.
+    """
 
     y_true = np.array([1, 1, 1, 1])
     probs = np.array([0.1, 0.1, 0.1, 0.1])
@@ -41,13 +49,20 @@ def test_xgboost_accuracy_gate_enforced():
 
 
 def test_xgboost_auc_gate_enforced():
+    """
+    Ensure AUC gate fails when model has no signal.
+    AUC=0.5 represents random guessing.
+    """
 
     y_true = np.array([1, 0, 1, 0])
     probs = np.array([0.5, 0.5, 0.5, 0.5])  # no signal
 
     auc = roc_auc_score(y_true, probs)
 
-    assert auc <= 0.5
+    # Random model
+    assert auc == 0.5
+
+    # Must fail the CI gate
     assert auc < XGB_MIN_AUC
 
 
@@ -56,6 +71,9 @@ def test_xgboost_auc_gate_enforced():
 ############################################################
 
 def test_probability_bounds():
+    """
+    Ensure probabilities stay within valid bounds.
+    """
 
     probs = np.array([0.0, 1.0, 0.5])
 
@@ -68,6 +86,9 @@ def test_probability_bounds():
 ############################################################
 
 def test_metric_rounding_stability():
+    """
+    Ensure metric outputs remain float type and stable.
+    """
 
     y_true = np.array([1, 0, 1, 0])
     probs = np.array([0.89, 0.11, 0.87, 0.13])
