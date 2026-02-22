@@ -45,8 +45,9 @@ class SafeXGBClassifier:
         self.model = None
         self.feature_names = None
         self.feature_checksum = None
+        self.training_checksum = None
+        self.param_checksum = None
 
-        # extra reproducibility guard
         np.random.seed(SEED)
 
     ###################################################
@@ -54,6 +55,9 @@ class SafeXGBClassifier:
     ###################################################
 
     def fit(self, X, y):
+
+        if X is None or X.empty:
+            raise RuntimeError("Training feature matrix empty.")
 
         logger.info(
             "XGBoost training | rows=%s cols=%s",
@@ -65,15 +69,19 @@ class SafeXGBClassifier:
             raise RuntimeError("NaN detected in training features.")
 
         X = X.astype(np.float32)
+        y = np.asarray(y)
 
-        # 🔒 Lock feature order permanently
+        # 🔒 Lock feature order
         self.feature_names = list(X.columns)
 
-        # 🔐 Store deterministic feature checksum
         checksum_str = json.dumps(self.feature_names, sort_keys=False)
         self.feature_checksum = hashlib.sha256(
             checksum_str.encode()
         ).hexdigest()
+
+        # 🔒 Training data checksum
+        training_bytes = X.to_numpy().tobytes()
+        self.training_checksum = hashlib.sha256(training_bytes).hexdigest()
 
         dtrain = xgb.DMatrix(X, label=y)
 
@@ -92,17 +100,29 @@ class SafeXGBClassifier:
             "device": "cpu",
             "scale_pos_weight": self.pos_weight,
             "seed": SEED,
+            "nthread": 1,
             "verbosity": 0,
         }
 
+        # 🔐 Parameter fingerprint
+        self.param_checksum = hashlib.sha256(
+            json.dumps(params, sort_keys=True).encode()
+        ).hexdigest()
+
+        # 🔒 Simple validation split for early stopping
+        val_split = int(0.9 * len(X))
+        dtrain_part = xgb.DMatrix(X.iloc[:val_split], label=y[:val_split])
+        dval_part = xgb.DMatrix(X.iloc[val_split:], label=y[val_split:])
+
         self.model = xgb.train(
             params,
-            dtrain,
+            dtrain_part,
             num_boost_round=NUM_BOOST_ROUNDS,
+            evals=[(dval_part, "validation")],
+            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
             verbose_eval=False
         )
 
-        # 🔎 Probability sanity check
         preds = self.model.predict(dtrain)
 
         mean = float(np.mean(preds))
@@ -122,6 +142,11 @@ class SafeXGBClassifier:
         if np.any(preds < 0) or np.any(preds > 1):
             raise RuntimeError("Invalid probability range detected.")
 
+        # 🔒 Booster feature name integrity
+        booster_features = self.model.feature_names
+        if booster_features != self.feature_names:
+            raise RuntimeError("Booster feature order mismatch.")
+
         return self
 
     ###################################################
@@ -133,6 +158,9 @@ class SafeXGBClassifier:
         if self.model is None:
             raise RuntimeError("Model not trained.")
 
+        if X is None or X.empty:
+            raise RuntimeError("Inference feature matrix empty.")
+
         missing = set(self.feature_names) - set(X.columns)
         extra = set(X.columns) - set(self.feature_names)
 
@@ -142,13 +170,11 @@ class SafeXGBClassifier:
         if extra:
             logger.warning("Extra inference features ignored: %s", extra)
 
-        # 🔒 Enforce training order exactly
         X = X.loc[:, self.feature_names].astype(np.float32)
 
         if X.isnull().any().any():
             raise RuntimeError("NaN detected in inference features.")
 
-        # 🔐 Verify feature checksum consistency
         checksum_str = json.dumps(self.feature_names, sort_keys=False)
         current_checksum = hashlib.sha256(
             checksum_str.encode()
@@ -174,6 +200,9 @@ class SafeXGBClassifier:
 
     def export_feature_importance(self):
 
+        if self.model is None:
+            raise RuntimeError("Model not trained.")
+
         score = self.model.get_score(importance_type="gain")
 
         sorted_imp = sorted(
@@ -198,6 +227,6 @@ def build_xgboost_pipeline(y):
     pos_weight = compute_class_weight(y)
     model = SafeXGBClassifier(pos_weight)
 
-    logger.info("XGBoost model built successfully (CPU deterministic mode).")
+    logger.info("XGBoost model built (deterministic CPU mode, early stopping enabled).")
 
-    return model 
+    return model
