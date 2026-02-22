@@ -10,7 +10,8 @@ SEED = 42
 MIN_PROB_STD = 1e-5
 NUM_BOOST_ROUNDS = 600
 EARLY_STOPPING_ROUNDS = 50
-MIN_VALIDATION_ROWS = 300   # strengthened safety
+MIN_VALIDATION_ROWS = 300
+EPSILON = 1e-12
 
 
 ###################################################
@@ -42,12 +43,14 @@ def compute_class_weight(y):
 class SafeXGBClassifier:
 
     def __init__(self, pos_weight):
-        self.pos_weight = pos_weight
+        self.pos_weight = float(pos_weight)
         self.model = None
         self.feature_names = None
         self.feature_checksum = None
         self.training_checksum = None
         self.param_checksum = None
+        self.training_rows = None
+        self.training_cols = None
 
         np.random.seed(SEED)
 
@@ -60,17 +63,23 @@ class SafeXGBClassifier:
         if X is None or X.empty:
             raise RuntimeError("Training feature matrix empty.")
 
-        logger.info(
-            "XGBoost training | rows=%s cols=%s",
-            X.shape[0],
-            X.shape[1]
-        )
+        if len(X) != len(y):
+            raise RuntimeError("Feature/label length mismatch.")
 
         if X.isnull().any().any():
             raise RuntimeError("NaN detected in training features.")
 
         X = X.copy().astype(np.float32)
         y = np.asarray(y)
+
+        self.training_rows = X.shape[0]
+        self.training_cols = X.shape[1]
+
+        logger.info(
+            "XGBoost training | rows=%s cols=%s",
+            self.training_rows,
+            self.training_cols
+        )
 
         ###################################################
         # LOCK FEATURE CONTRACT
@@ -89,7 +98,7 @@ class SafeXGBClassifier:
         ).hexdigest()
 
         ###################################################
-        # SAFE TIME SPLIT
+        # SAFE TIME SPLIT (STRICTLY LAST 10%)
         ###################################################
 
         n = len(X)
@@ -105,11 +114,18 @@ class SafeXGBClassifier:
 
         split_idx = int(n * 0.9)
 
+        if split_idx <= 0 or split_idx >= n:
+            raise RuntimeError("Invalid validation split.")
+
         X_train_part = X.iloc[:split_idx]
         y_train_part = y[:split_idx]
 
         X_val_part = X.iloc[split_idx:]
         y_val_part = y[split_idx:]
+
+        if len(X_val_part) < MIN_VALIDATION_ROWS and use_early_stopping:
+            logger.warning("Validation set too small — disabling early stopping.")
+            use_early_stopping = False
 
         dtrain_part = xgb.DMatrix(
             X_train_part,
@@ -118,7 +134,7 @@ class SafeXGBClassifier:
         )
 
         ###################################################
-        # PARAMETERS
+        # PARAMETERS (FROZEN CONTRACT)
         ###################################################
 
         params = {
@@ -165,16 +181,8 @@ class SafeXGBClassifier:
                 verbose_eval=False
             )
 
-            # 🛡 Safe early stopping validation
             if not hasattr(self.model, "best_iteration"):
                 logger.warning("Early stopping not triggered safely.")
-            else:
-                if self.model.best_iteration is None:
-                    logger.warning("best_iteration undefined.")
-                elif self.model.best_iteration < 1:
-                    logger.warning(
-                        "Early stopping best_iteration < 1 — fallback to full model."
-                    )
 
         else:
             self.model = xgb.train(
@@ -185,7 +193,7 @@ class SafeXGBClassifier:
             )
 
         ###################################################
-        # PROBABILITY SANITY CHECK
+        # TRAIN PROBABILITY SANITY CHECK
         ###################################################
 
         dtrain_full = xgb.DMatrix(
@@ -194,6 +202,9 @@ class SafeXGBClassifier:
         )
 
         preds = self.model.predict(dtrain_full)
+
+        if not np.all(np.isfinite(preds)):
+            raise RuntimeError("Non-finite predictions detected.")
 
         mean = float(np.mean(preds))
         std = float(np.std(preds))
@@ -209,11 +220,11 @@ class SafeXGBClassifier:
         if std < MIN_PROB_STD:
             raise RuntimeError("Probability collapse detected.")
 
-        if np.any(preds < 0) or np.any(preds > 1):
+        if np.any(preds < -EPSILON) or np.any(preds > 1 + EPSILON):
             raise RuntimeError("Invalid probability range detected.")
 
         ###################################################
-        # FEATURE INTEGRITY CHECK
+        # FEATURE ORDER INTEGRITY
         ###################################################
 
         booster_features = self.model.feature_names
@@ -233,6 +244,9 @@ class SafeXGBClassifier:
 
         if X is None or X.empty:
             raise RuntimeError("Inference feature matrix empty.")
+
+        if len(X.columns) != self.training_cols:
+            raise RuntimeError("Inference feature dimension mismatch.")
 
         missing = set(self.feature_names) - set(X.columns)
         extra = set(X.columns) - set(self.feature_names)
@@ -263,9 +277,7 @@ class SafeXGBClassifier:
         ).hexdigest()
 
         if current_checksum != self.feature_checksum:
-            raise RuntimeError(
-                "Feature order integrity violated."
-            )
+            raise RuntimeError("Feature order integrity violated.")
 
         dmatrix = xgb.DMatrix(
             X,
@@ -274,15 +286,14 @@ class SafeXGBClassifier:
 
         probs = self.model.predict(dmatrix)
 
-        if np.std(probs) < MIN_PROB_STD:
-            raise RuntimeError(
-                "Inference probability collapse detected."
-            )
+        if not np.all(np.isfinite(probs)):
+            raise RuntimeError("Non-finite inference probabilities.")
 
-        if np.any(probs < 0) or np.any(probs > 1):
-            raise RuntimeError(
-                "Invalid probability range detected."
-            )
+        if np.std(probs) < MIN_PROB_STD:
+            raise RuntimeError("Inference probability collapse detected.")
+
+        if np.any(probs < -EPSILON) or np.any(probs > 1 + EPSILON):
+            raise RuntimeError("Invalid probability range detected.")
 
         return np.column_stack([1 - probs, probs])
 
