@@ -346,15 +346,30 @@ def main(start_date=None, end_date=None, create_baseline=False):
         final_df
     )
 
+    ########################################################
+    # GOVERNED BASELINE CREATION
+    ########################################################
+
     if create_baseline:
+
+        feature_checksum = MetadataManager.fingerprint_features(
+            tuple(MODEL_FEATURES)
+        )
+
         drift = DriftDetector()
         drift.create_baseline(
             dataset=final_df,
             dataset_hash=dataset_hash,
             training_code_hash=MetadataManager.fingerprint_training_code(),
+            feature_checksum=feature_checksum,
+            model_version=str(version),
             allow_overwrite=False
         )
-        logger.info("Drift baseline created (explicit mode).")
+
+        logger.info(
+            "Drift baseline created for model_version=%s",
+            version
+        )
 
     logger.info(
         "Training completed in %.2f minutes",
