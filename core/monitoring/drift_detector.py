@@ -29,7 +29,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "14.0"
+    BASELINE_VERSION = "14.1"
 
     MIN_SAMPLE_BASELINE = 150
     MIN_SAMPLE_INFERENCE = 40
@@ -99,6 +99,9 @@ class DriftDetector:
 
             counts, bin_edges = np.histogram(series, bins=20)
 
+            if len(bin_edges) < 2:
+                raise RuntimeError("Invalid histogram construction.")
+
             features[col] = {
                 "mean": mean,
                 "std": std,
@@ -107,8 +110,8 @@ class DriftDetector:
                 "expected_counts": counts.tolist()
             }
 
-        if not features:
-            raise RuntimeError("No valid features for baseline.")
+        if set(features.keys()) != set(MODEL_FEATURES):
+            raise RuntimeError("Incomplete feature baseline.")
 
         payload = {
             "meta": {
@@ -226,27 +229,6 @@ class DriftDetector:
         return block
 
     ########################################################
-    # ATOMIC WRITE
-    ########################################################
-
-    def _atomic_write(self, payload, path):
-
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            delete=False,
-            dir=os.path.dirname(path),
-            suffix=".tmp"
-        ) as tmp:
-
-            json.dump(payload, tmp, indent=2)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            temp_name = tmp.name
-
-        os.replace(temp_name, path)
-
-    ########################################################
     # LOAD VERIFIED BASELINE
     ########################################################
 
@@ -271,6 +253,14 @@ class DriftDetector:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Baseline schema mismatch.")
 
+        # 🔐 Cross-check model metadata
+        loader = self._model_loader
+        if meta["dataset_hash"] != loader.dataset_hash:
+            logger.warning("Dataset hash drift detected.")
+
+        if meta["training_code_hash"] != loader.training_code_hash:
+            logger.warning("Training code drift detected.")
+
         if set(baseline["features"].keys()) != set(MODEL_FEATURES):
             raise RuntimeError("Baseline feature contract mismatch.")
 
@@ -294,6 +284,7 @@ class DriftDetector:
             )
 
             drift_detected = False
+            severity_score = 0
             report = {}
 
             total_features = len(baseline["features"])
@@ -310,12 +301,7 @@ class DriftDetector:
 
                 baseline_std = max(stats["std"], self.EPSILON)
                 baseline_var = max(stats["variance"], self.EPSILON)
-                current_var = current.var()
-
-                if np.isnan(current_var):
-                    current_var = self.EPSILON
-
-                current_var = max(current_var, self.EPSILON)
+                current_var = max(current.var(), self.EPSILON)
 
                 z_score = abs(current.mean() - stats["mean"]) / baseline_std
                 variance_ratio = current_var / baseline_var
@@ -335,6 +321,7 @@ class DriftDetector:
 
                 if drift:
                     drift_detected = True
+                    severity_score += 1
 
                 report[col] = {
                     "z_score": float(z_score),
@@ -353,10 +340,14 @@ class DriftDetector:
             DRIFT_DETECTED.set(1 if drift_detected else 0)
 
             if drift_detected:
-                logger.critical("FEATURE DRIFT DETECTED")
+                logger.critical(
+                    "FEATURE DRIFT DETECTED | severity=%s",
+                    severity_score
+                )
 
             return {
                 "drift_detected": drift_detected,
+                "severity_score": severity_score,
                 "coverage": coverage,
                 "details": report
             }
