@@ -230,14 +230,41 @@ def main():
     dates = df["date"]
 
     probs = model.predict_proba(X)[:, 1]
-    preds = (probs > 0.5).astype(int)
+
+    # =====================================================
+    # TRUE CROSS-SECTIONAL DAILY EXECUTION RULE
+    # =====================================================
+
+    df_eval = df.copy()
+    df_eval["prob"] = probs
+
+    preds = np.full(len(df_eval), -1, dtype=int)
+
+    for date, group in df_eval.groupby("date"):
+
+        if len(group) < 5:
+            continue
+
+        long_threshold = group["prob"].quantile(0.70)
+        short_threshold = group["prob"].quantile(0.30)
+
+        long_mask = (df_eval["date"] == date) & (df_eval["prob"] >= long_threshold)
+        short_mask = (df_eval["date"] == date) & (df_eval["prob"] <= short_threshold)
+
+        preds[long_mask] = 1
+        preds[short_mask] = 0
+
+    active_mask = preds != -1
+
+    if np.sum(active_mask) < 500:
+        raise RuntimeError("Too few active trading signals.")
 
     metrics = evaluate_xgboost(
-        y_true=y,
-        y_pred=preds,
-        y_prob=probs,
-        forward_returns=forward_returns,
-        dates=dates,
+        y_true=y[active_mask],
+        y_pred=preds[active_mask],
+        y_prob=probs[active_mask],
+        forward_returns=forward_returns[active_mask],
+        dates=dates[active_mask],
         enforce_thresholds=False
     )
 
@@ -258,7 +285,3 @@ def main():
 
     print("CI evaluation passed.")
     return metrics
-
-
-if __name__ == "__main__":
-    main()
