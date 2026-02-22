@@ -1,7 +1,8 @@
 {
-  "version": "6.0-prod",
+  "version": "6.0",
   "created_utc": "2026-02-22T00:00:00Z",
-  "description": "Production inference universe (liquid core 30).",
+  "description": "universe diversified US large-cap equities (30 tickers)",
+  "min_history_days": 400,
   "tickers": [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL",
     "META", "TSLA", "JPM", "BAC", "GS",
