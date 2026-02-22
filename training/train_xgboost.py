@@ -27,6 +27,7 @@ from models.xgboost_model import build_xgboost_pipeline
 logger = logging.getLogger("marketsentinel.train_xgb")
 
 MODEL_DIR = os.path.abspath("artifacts/xgboost")
+PRODUCTION_POINTER = "production_pointer.json"
 
 SEED = 42
 MIN_TRAINING_ROWS = 1200
@@ -106,17 +107,9 @@ def load_training_data(start_date, end_date):
     store = FeatureStore()
     universe = MarketUniverse.get_universe()
 
-    logger.info(
-        "Universe version: %s | size=%s",
-        MarketUniverse.get_version(),
-        len(universe)
-    )
-
     datasets = []
 
     for ticker in universe:
-
-        logger.info("Building features for %s", ticker)
 
         price_df = market_data.get_price_data(
             ticker=ticker,
@@ -128,7 +121,7 @@ def load_training_data(start_date, end_date):
             price_df,
             sentiment_df=None,
             ticker=ticker,
-            training=True   # ✅ FIXED
+            training=True
         )
 
         if dataset is None or dataset.empty:
@@ -152,7 +145,6 @@ def load_training_data(start_date, end_date):
     if df.columns.duplicated().any():
         raise RuntimeError("Duplicate columns detected.")
 
-    # ✅ Early schema validation
     _ = validate_feature_schema(
         df.loc[:, MODEL_FEATURES],
         mode="training"
@@ -230,6 +222,31 @@ def final_trainer(train_df):
 
 
 ############################################################
+# UPDATE PRODUCTION POINTER
+############################################################
+
+def update_production_pointer(version: str):
+
+    pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
+
+    payload = {
+        "model_version": str(version),
+        "updated_at": int(time.time())
+    }
+
+    tmp_path = pointer_path + ".tmp"
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp_path, pointer_path)
+
+    logger.info("Production pointer updated to version=%s", version)
+
+
+############################################################
 # EXPORT
 ############################################################
 
@@ -267,6 +284,8 @@ def export_artifacts(model, metrics, dataset_hash,
 
     MetadataManager.save_metadata(metadata, metadata_path)
 
+    update_production_pointer(timestamp)
+
     logger.info("Artifacts exported.")
 
     return timestamp
@@ -285,8 +304,6 @@ def main(start_date=None, end_date=None, create_baseline=False):
 
     if not start_date:
         start_date, end_date = MarketTime.window_for("xgboost")
-
-    logger.info("Training window | %s -> %s", start_date, end_date)
 
     raw_df = load_training_data(start_date, end_date)
 
@@ -315,7 +332,7 @@ def main(start_date=None, end_date=None, create_baseline=False):
         drift = DriftDetector()
 
         drift.create_baseline(
-            dataset=final_df.loc[:, MODEL_FEATURES],  # ✅ FIXED
+            dataset=final_df.loc[:, MODEL_FEATURES],
             dataset_hash=dataset_hash,
             training_code_hash=MetadataManager.fingerprint_training_code(),
             feature_checksum=compute_feature_checksum(),
