@@ -11,11 +11,12 @@ MIN_PROB_STD = 1e-5
 NUM_BOOST_ROUNDS = 600
 EARLY_STOPPING_ROUNDS = 50
 MIN_VALIDATION_ROWS = 300
+MIN_MINORITY_SAMPLES = 50
 EPSILON = 1e-12
 
 
 ###################################################
-# CLASS WEIGHT
+# CLASS WEIGHT (INDUSTRIAL STABLE VERSION)
 ###################################################
 
 def compute_class_weight(y):
@@ -24,14 +25,31 @@ def compute_class_weight(y):
 
     pos = float(np.sum(y == 1))
     neg = float(np.sum(y == 0))
+    total = pos + neg
 
     if pos == 0 or neg == 0:
         raise RuntimeError("Label collapse detected.")
 
-    weight = neg / pos
-    weight = float(np.clip(weight, 0.9, 5.0))
+    if min(pos, neg) < MIN_MINORITY_SAMPLES:
+        logger.warning(
+            "Very small minority class detected (pos=%.0f neg=%.0f).",
+            pos, neg
+        )
 
-    logger.info("Computed class weight = %.3f", weight)
+    imbalance_ratio = max(pos, neg) / min(pos, neg)
+
+    logger.info(
+        "Class distribution | pos=%.0f neg=%.0f ratio=%.3f",
+        pos, neg, imbalance_ratio
+    )
+
+    # Standard scale_pos_weight formula
+    weight = neg / pos
+
+    # Soft clamp — avoid extreme instability
+    weight = float(np.clip(weight, 0.5, 10.0))
+
+    logger.info("Computed scale_pos_weight = %.3f", weight)
 
     return weight
 
@@ -98,19 +116,12 @@ class SafeXGBClassifier:
         ).hexdigest()
 
         ###################################################
-        # SAFE TIME SPLIT (STRICTLY LAST 10%)
+        # SAFE TIME SPLIT
         ###################################################
 
         n = len(X)
 
-        if n < MIN_VALIDATION_ROWS * 2:
-            logger.warning(
-                "Dataset small (%s rows) — early stopping disabled.",
-                n
-            )
-            use_early_stopping = False
-        else:
-            use_early_stopping = True
+        use_early_stopping = n >= MIN_VALIDATION_ROWS * 2
 
         split_idx = int(n * 0.9)
 
@@ -123,9 +134,9 @@ class SafeXGBClassifier:
         X_val_part = X.iloc[split_idx:]
         y_val_part = y[split_idx:]
 
-        if len(X_val_part) < MIN_VALIDATION_ROWS and use_early_stopping:
-            logger.warning("Validation set too small — disabling early stopping.")
+        if len(X_val_part) < MIN_VALIDATION_ROWS:
             use_early_stopping = False
+            logger.warning("Validation set too small — disabling early stopping.")
 
         dtrain_part = xgb.DMatrix(
             X_train_part,
@@ -134,7 +145,7 @@ class SafeXGBClassifier:
         )
 
         ###################################################
-        # PARAMETERS (FROZEN CONTRACT)
+        # PARAMETERS
         ###################################################
 
         params = {
@@ -181,9 +192,6 @@ class SafeXGBClassifier:
                 verbose_eval=False
             )
 
-            if not hasattr(self.model, "best_iteration"):
-                logger.warning("Early stopping not triggered safely.")
-
         else:
             self.model = xgb.train(
                 params,
@@ -223,12 +231,7 @@ class SafeXGBClassifier:
         if np.any(preds < -EPSILON) or np.any(preds > 1 + EPSILON):
             raise RuntimeError("Invalid probability range detected.")
 
-        ###################################################
-        # FEATURE ORDER INTEGRITY
-        ###################################################
-
-        booster_features = self.model.feature_names
-        if booster_features != self.feature_names:
+        if self.model.feature_names != self.feature_names:
             raise RuntimeError("Booster feature order mismatch.")
 
         return self
@@ -249,35 +252,13 @@ class SafeXGBClassifier:
             raise RuntimeError("Inference feature dimension mismatch.")
 
         missing = set(self.feature_names) - set(X.columns)
-        extra = set(X.columns) - set(self.feature_names)
-
         if missing:
-            raise RuntimeError(
-                f"Missing inference features: {missing}"
-            )
-
-        if extra:
-            logger.warning(
-                "Extra inference features ignored: %s",
-                extra
-            )
+            raise RuntimeError(f"Missing inference features: {missing}")
 
         X = X.loc[:, self.feature_names].astype(np.float32)
 
         if X.isnull().any().any():
             raise RuntimeError("NaN detected in inference features.")
-
-        checksum_str = json.dumps(
-            self.feature_names,
-            sort_keys=False
-        )
-
-        current_checksum = hashlib.sha256(
-            checksum_str.encode()
-        ).hexdigest()
-
-        if current_checksum != self.feature_checksum:
-            raise RuntimeError("Feature order integrity violated.")
 
         dmatrix = xgb.DMatrix(
             X,
@@ -306,9 +287,7 @@ class SafeXGBClassifier:
         if self.model is None:
             raise RuntimeError("Model not trained.")
 
-        score = self.model.get_score(
-            importance_type="gain"
-        )
+        score = self.model.get_score(importance_type="gain")
 
         sorted_imp = sorted(
             score.items(),
