@@ -29,7 +29,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "15.0"
+    BASELINE_VERSION = "16.0"  # 🔥 bumped due to governance binding
 
     MIN_SAMPLE_BASELINE = 150
     MIN_SAMPLE_INFERENCE = 40
@@ -93,7 +93,6 @@ class DriftDetector:
             if len(series) < self.MIN_SAMPLE_BASELINE:
                 raise RuntimeError(f"Baseline insufficient data for {col}")
 
-            # 🔒 Deterministic float stabilization
             series = (
                 series
                 .astype(np.float64)
@@ -129,7 +128,8 @@ class DriftDetector:
                 "schema_signature": get_schema_signature(),
                 "dataset_hash": dataset_hash,
                 "training_code_hash": training_code_hash,
-                "model_feature_checksum": self._model_loader.feature_checksum
+                "model_feature_checksum": self._model_loader.feature_checksum,
+                "model_version": self._model_loader.xgb_version  # 🔥 NEW
             },
             "features": features
         }
@@ -138,7 +138,10 @@ class DriftDetector:
 
         self._atomic_write(payload, path)
 
-        logger.info("Drift baseline created successfully.")
+        logger.info(
+            "Drift baseline created for model_version=%s",
+            self._model_loader.xgb_version
+        )
 
     ########################################################
     # SAFE PATH
@@ -182,9 +185,6 @@ class DriftDetector:
     def _psi(self, bin_edges, expected_counts, actual):
 
         actual = np.asarray(actual, dtype=np.float64)
-
-        if len(bin_edges) < 2:
-            raise RuntimeError("Invalid baseline bin edges.")
 
         actual_counts = np.histogram(actual, bins=bin_edges)[0]
 
@@ -240,7 +240,6 @@ class DriftDetector:
         block = dataset.loc[:, MODEL_FEATURES].copy()
 
         for col in MODEL_FEATURES:
-
             block[col] = pd.to_numeric(
                 block[col],
                 errors="coerce"
@@ -282,6 +281,13 @@ class DriftDetector:
             raise RuntimeError("Baseline schema mismatch.")
 
         loader = self._model_loader
+
+        # 🔥 NEW: enforce baseline ↔ production version binding
+        if meta.get("model_version") != loader.xgb_version:
+            raise RuntimeError(
+                f"Baseline tied to model_version={meta.get('model_version')} "
+                f"but current production version={loader.xgb_version}"
+            )
 
         if meta.get("model_feature_checksum") != loader.feature_checksum:
             raise RuntimeError("Model feature checksum mismatch.")
