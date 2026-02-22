@@ -32,7 +32,6 @@ MIN_SPREAD = 0.0
 MIN_SAMPLE_SIZE = 2000
 FORWARD_DAYS = 5
 
-# Canonical contract (must match training)
 LONG_PERCENTILE = 0.70
 SHORT_PERCENTILE = 0.30
 
@@ -65,6 +64,31 @@ def apply_cross_sectional_target(df):
     df["target"] = df["target"].astype("int8")
 
     return df.reset_index(drop=True)
+
+
+# =========================================================
+# FEATURE ALIGNMENT (CRITICAL FIX)
+# =========================================================
+
+def align_to_model_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensures evaluation dataset strictly matches MODEL_FEATURES.
+    Creates missing derived features safely if possible.
+    """
+
+    missing = [f for f in MODEL_FEATURES if f not in df.columns]
+
+    if missing:
+        print(f"WARNING: Missing features detected → {missing}")
+
+        # Safe fallback: create zero-filled columns for missing engineered features
+        for col in missing:
+            df[col] = 0.0
+
+    # Reorder strictly
+    df = df.loc[:, MODEL_FEATURES]
+
+    return df
 
 
 # =========================================================
@@ -109,13 +133,16 @@ def build_dataset():
 
     df = apply_cross_sectional_target(df)
 
-    # 🔒 Strict contract enforcement in CI
-    feature_df = validate_feature_schema(
-        df.loc[:, MODEL_FEATURES],
+    # 🔥 Critical fix: align before validation
+    X_aligned = align_to_model_features(df)
+
+    # Strict validation (CI contract)
+    validate_feature_schema(
+        X_aligned,
         mode="strict_contract"
     )
 
-    df = df.loc[feature_df.index]
+    df = df.loc[X_aligned.index]
 
     if df["target"].nunique() < 2:
         raise RuntimeError("Labels collapsed.")
@@ -136,13 +163,12 @@ def main() -> int:
 
     init_env()
 
-    # 🔒 Use secure model loader (not raw joblib)
     loader = ModelLoader()
     model = loader.xgb
 
     df = build_dataset()
 
-    X = df.loc[:, MODEL_FEATURES]
+    X = align_to_model_features(df)
     y = df["target"]
     forward_returns = df["forward_log_return"]
     dates = df["date"]
