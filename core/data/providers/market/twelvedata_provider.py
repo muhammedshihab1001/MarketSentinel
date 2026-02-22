@@ -8,43 +8,24 @@ import threading
 
 from core.data.providers.market.base import MarketDataProvider
 
-
 logger = logging.getLogger(__name__)
 
 
 class TwelveDataProvider(MarketDataProvider):
-    """
-    TIER-1 Institutional TwelveData Provider
-
-    Features:
-        ✔ Hard rate limiting (8/min)
-        ✔ Adaptive throttling
-        ✔ Retry hardened
-        ✔ Vendor error parsing
-        ✔ Poison candle guard
-        ✔ Schema drift protection
-        ✔ Never-over-reject logic
-    """
 
     BASE_URL = "https://api.twelvedata.com/time_series"
 
     MAX_RETRIES = 3
     RETRY_SLEEP = 1.5
 
-    MIN_ROWS = 120
+    DEFAULT_MIN_ROWS = 120
     MAX_DAILY_MOVE = 0.90
-
-    ###################################################
-    # 🔥 HARD RATE LIMITER
-    ###################################################
 
     CALL_LOCK = threading.Lock()
     CALL_TIMESTAMPS = []
 
     MAX_CALLS_PER_MIN = 8
     WINDOW_SECONDS = 60
-
-    ###################################################
 
     INTERVAL_MAP = {
         "1d": "1day",
@@ -70,7 +51,7 @@ class TwelveDataProvider(MarketDataProvider):
         logger.info("TwelveData provider ready (rate-aware).")
 
     ########################################################
-    # 🔥 RATE LIMIT ENFORCER
+    # RATE LIMIT ENFORCER
     ########################################################
 
     @classmethod
@@ -111,35 +92,19 @@ class TwelveDataProvider(MarketDataProvider):
 
                 self._respect_rate_limit()
 
-                start = time.time()
-
                 r = self.session.get(
                     self.BASE_URL,
                     params=params,
                     timeout=(5, 15)
                 )
 
-                latency = time.time() - start
-
-                if latency > 6:
-                    logger.warning(
-                        "Slow TwelveData response (%.2fs)",
-                        latency
-                    )
-
                 r.raise_for_status()
 
                 data = r.json()
 
-                ################################################
-                # Vendor error inside JSON
-                ################################################
-
                 if "code" in data:
-
                     msg = data.get("message", "Vendor error")
 
-                    # Rate limit from vendor
                     if "frequency" in msg.lower():
                         logger.warning("Vendor rate limit hit — backing off.")
                         time.sleep(8)
@@ -164,7 +129,7 @@ class TwelveDataProvider(MarketDataProvider):
 
     ########################################################
 
-    def _normalize(self, values, ticker):
+    def _normalize(self, values, ticker, min_rows):
 
         df = pd.DataFrame(values)
 
@@ -194,22 +159,12 @@ class TwelveDataProvider(MarketDataProvider):
         if df.empty:
             raise RuntimeError("All rows invalid after normalization.")
 
-        ####################################################
-        # Soft invariant
-        ####################################################
-
         df = df[df["high"] >= df["low"]]
-
-        ####################################################
-        # Poison candle guard
-        ####################################################
 
         jumps = df["close"].pct_change().abs()
 
         if (jumps > self.MAX_DAILY_MOVE).any():
             raise RuntimeError("Extreme price jump detected.")
-
-        ####################################################
 
         df = (
             df
@@ -218,7 +173,7 @@ class TwelveDataProvider(MarketDataProvider):
             .reset_index(drop=True)
         )
 
-        if len(df) < self.MIN_ROWS:
+        if len(df) < min_rows:
             raise RuntimeError(
                 f"TwelveData insufficient history ({len(df)} rows)."
             )
@@ -228,10 +183,22 @@ class TwelveDataProvider(MarketDataProvider):
         return df
 
     ########################################################
+    # PUBLIC FETCH (HARDENED)
+    ########################################################
 
-    def fetch(self, ticker, start_date, end_date, interval):
+    def fetch(
+        self,
+        ticker,
+        start_date,
+        end_date,
+        interval,
+        **kwargs
+    ):
 
         interval = self.INTERVAL_MAP.get(interval, interval)
+
+        # 🔒 Safe extraction
+        min_rows = kwargs.get("min_rows", self.DEFAULT_MIN_ROWS)
 
         params = {
             "symbol": ticker,
@@ -248,7 +215,11 @@ class TwelveDataProvider(MarketDataProvider):
         if "values" not in data:
             raise RuntimeError("TwelveData schema changed.")
 
-        df = self._normalize(data["values"], ticker)
+        df = self._normalize(
+            data["values"],
+            ticker,
+            min_rows
+        )
 
         logger.info(
             "TwelveData served | ticker=%s rows=%s",
