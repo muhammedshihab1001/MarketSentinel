@@ -85,7 +85,7 @@ class FeatureEngineer:
         return df.reset_index(drop=True)
 
     ########################################################
-    # CORE FEATURES (PER TICKER)
+    # CORE FEATURES
     ########################################################
 
     @classmethod
@@ -181,7 +181,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # TRUE CROSS-SECTIONAL (GLOBAL)
+    # CROSS SECTIONAL
     ########################################################
 
     @classmethod
@@ -213,7 +213,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # FINAL SANITIZE
+    # FINALIZE
     ########################################################
 
     @classmethod
@@ -234,3 +234,25 @@ class FeatureEngineer:
             raise RuntimeError(f"Missing features: {missing}")
 
         return df.reset_index(drop=True)
+
+    ########################################################
+    # COMPATIBILITY PIPELINE
+    ########################################################
+
+    @classmethod
+    def build_feature_pipeline(
+        cls,
+        price_df: pd.DataFrame,
+        sentiment_df=None,
+        training: bool = True
+    ) -> pd.DataFrame:
+
+        df = cls._validate_price_frame(price_df)
+        df = cls.add_core_features(df)
+
+        if training and df["ticker"].nunique() > 1:
+            df = cls.add_cross_sectional_features(df)
+
+        df = cls.finalize(df)
+
+        return df
