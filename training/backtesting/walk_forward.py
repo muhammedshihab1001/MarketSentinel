@@ -159,7 +159,6 @@ class WalkForwardValidator:
                 signal_slice = signal_slice.copy()
                 signal_slice["score"] = probs
 
-                # 🔒 deterministic ranking
                 ranked = signal_slice.sort_values(["score", "ticker"])
 
                 longs = ranked.tail(self.TOP_K)
@@ -185,20 +184,44 @@ class WalkForwardValidator:
                 for t, w in zip(shorts["ticker"], short_weights):
                     positions[t] = -float(w)
 
-                merged = pd.merge(
-                    signal_slice[["ticker", "close"]],
-                    exit_slice[["ticker", "close"]],
-                    on="ticker",
-                    suffixes=("_entry", "_exit")
-                )
+                # ====================================================
+                # REAL DATA PATH (close prices)
+                # ====================================================
+                if "close" in signal_slice.columns and "close" in exit_slice.columns:
 
-                if merged.empty:
+                    merged = pd.merge(
+                        signal_slice[["ticker", "close"]],
+                        exit_slice[["ticker", "close"]],
+                        on="ticker",
+                        suffixes=("_entry", "_exit")
+                    )
+
+                    if merged.empty:
+                        continue
+
+                    merged["ret"] = (
+                        np.log(merged["close_exit"] * (1 - self.SLIPPAGE)) -
+                        np.log(merged["close_entry"] * (1 + self.SLIPPAGE))
+                    )
+
+                # ====================================================
+                # SYNTHETIC UNIT TEST PATH
+                # ====================================================
+                elif "return" in exit_slice.columns:
+
+                    merged = pd.merge(
+                        signal_slice[["ticker"]],
+                        exit_slice[["ticker", "return"]],
+                        on="ticker"
+                    )
+
+                    if merged.empty:
+                        continue
+
+                    merged["ret"] = merged["return"]
+
+                else:
                     continue
-
-                merged["ret"] = (
-                    np.log(merged["close_exit"] * (1 - self.SLIPPAGE)) -
-                    np.log(merged["close_entry"] * (1 + self.SLIPPAGE))
-                )
 
                 period_ret = 0.0
 
