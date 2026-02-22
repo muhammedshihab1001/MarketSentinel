@@ -30,7 +30,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "17.2"   # 🔥 bumped (restored PSI method)
+    BASELINE_VERSION = "17.3"   # Stable restored version
     DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
 
     MIN_SAMPLE_BASELINE = 150
@@ -53,6 +53,7 @@ class DriftDetector:
     def __init__(self, z_threshold: float = 3.5, baseline_dir: str = "artifacts/drift"):
 
         self.z_threshold = z_threshold
+
         self.baseline_dir = os.path.realpath(baseline_dir)
         os.makedirs(self.baseline_dir, exist_ok=True)
 
@@ -69,7 +70,35 @@ class DriftDetector:
         self._model_loader = ModelLoader()
 
     ########################################################
-    # PSI (RESTORED — CRITICAL FIX)
+    # SAFE FEATURE BLOCK (RESTORED)
+    ########################################################
+
+    def _safe_feature_block(self, dataset: pd.DataFrame):
+
+        missing = set(MODEL_FEATURES) - set(dataset.columns)
+
+        if missing:
+            raise RuntimeError(
+                f"Missing features for drift detection: {missing}"
+            )
+
+        block = dataset.loc[:, MODEL_FEATURES].copy()
+
+        for col in MODEL_FEATURES:
+            block[col] = pd.to_numeric(
+                block[col],
+                errors="coerce"
+            ).astype(DTYPE)
+
+            block[col] = block[col].replace(
+                [np.inf, -np.inf],
+                np.nan
+            )
+
+        return block
+
+    ########################################################
+    # PSI (RESTORED)
     ########################################################
 
     def _psi(self, bin_edges, expected_counts, actual):
@@ -92,6 +121,75 @@ class DriftDetector:
         return float(psi)
 
     ########################################################
+    # HASH
+    ########################################################
+
+    @staticmethod
+    def _baseline_hash(payload: dict) -> str:
+
+        clone = dict(payload)
+        clone.pop("integrity_hash", None)
+
+        canonical = json.dumps(
+            clone,
+            sort_keys=True
+        ).encode()
+
+        return hashlib.sha256(canonical).hexdigest()
+
+    ########################################################
+    # ATOMIC WRITE (RESTORED)
+    ########################################################
+
+    def _atomic_write(self, payload: dict):
+
+        tmp_fd, tmp_path = tempfile.mkstemp()
+
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp_path, self.BASELINE_PATH)
+
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    ########################################################
+    # LOAD BASELINE
+    ########################################################
+
+    def _load_verified_baseline(self):
+
+        if not os.path.exists(self.BASELINE_PATH):
+            raise RuntimeError("Baseline missing.")
+
+        with open(self.BASELINE_PATH, encoding="utf-8") as f:
+            baseline = json.load(f)
+
+        if baseline["integrity_hash"] != self._baseline_hash(baseline):
+            raise RuntimeError("Baseline integrity failure.")
+
+        meta = baseline["meta"]
+
+        if meta["baseline_version"] != self.BASELINE_VERSION:
+            raise RuntimeError("Baseline version mismatch.")
+
+        if meta["schema_signature"] != get_schema_signature():
+            raise RuntimeError("Baseline schema mismatch.")
+
+        if meta.get("feature_checksum"):
+            current_checksum = MetadataManager.fingerprint_features(
+                tuple(MODEL_FEATURES)
+            )
+            if meta["feature_checksum"] != current_checksum:
+                raise RuntimeError("Baseline feature checksum mismatch.")
+
+        return baseline
+
+    ########################################################
     # BASELINE CREATION
     ########################################################
 
@@ -107,7 +205,7 @@ class DriftDetector:
 
         if os.path.exists(self.BASELINE_PATH) and not allow_overwrite:
             raise RuntimeError(
-                "Baseline already exists. Use allow_overwrite=True to replace."
+                "Baseline already exists. Use allow_overwrite=True."
             )
 
         if dataset is None or dataset.empty:
@@ -149,9 +247,6 @@ class DriftDetector:
                 "expected_counts": expected_counts.tolist()
             }
 
-        if not baseline_features:
-            raise RuntimeError("Baseline generation failed — no valid features.")
-
         payload = {
             "meta": {
                 "baseline_version": self.BASELINE_VERSION,
@@ -182,27 +277,21 @@ class DriftDetector:
 
         try:
 
-            if dataset.empty:
-                raise RuntimeError("Empty dataset supplied.")
-
             baseline = self._load_verified_baseline()
-
             numeric = self._safe_feature_block(
                 dataset.tail(self.MAX_INFERENCE_ROWS)
             )
 
             drift_count = 0
             report = {}
-
             total_features = len(baseline["features"])
             active_features = 0
-            sample_size = len(numeric)
 
             for col, stats in baseline["features"].items():
 
                 current = numeric[col].dropna()
 
-                if len(current) < min(self.MIN_SAMPLE_INFERENCE, sample_size):
+                if len(current) < self.MIN_SAMPLE_INFERENCE:
                     continue
 
                 active_features += 1
@@ -239,12 +328,6 @@ class DriftDetector:
 
             coverage = active_features / max(total_features, 1)
 
-            if sample_size >= self.MIN_SAMPLE_INFERENCE:
-                if coverage < self.MIN_ACTIVE_FEATURE_RATIO:
-                    raise RuntimeError(
-                        "Feature coverage collapsed — inference unsafe."
-                    )
-
             severity_ratio = drift_count / max(total_features, 1)
             severity_score = min(
                 int(severity_ratio * 10),
@@ -252,20 +335,12 @@ class DriftDetector:
             )
 
             drift_detected = drift_count > 0
-
             DRIFT_DETECTED.set(1 if drift_detected else 0)
-
-            if drift_detected:
-                logger.critical(
-                    "FEATURE DRIFT DETECTED | severity=%s | coverage=%.2f",
-                    severity_score,
-                    coverage
-                )
 
             return {
                 "drift_detected": drift_detected,
-                "severity_score": int(severity_score),
-                "coverage": float(coverage),
+                "severity_score": severity_score,
+                "coverage": coverage,
                 "details": report
             }
 
