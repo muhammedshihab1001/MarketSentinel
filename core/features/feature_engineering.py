@@ -199,16 +199,18 @@ class FeatureEngineer:
 
         for col in base_cols:
 
-            cs_mean = df.groupby("date")[col].transform("mean")
-            cs_std = df.groupby("date")[col].transform("std")
-
-            z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
-            z = z.clip(-5, 5)
-
-            rank = df.groupby("date")[col].rank(method="first", pct=True)
-
-            df[f"{col}_z"] = z.fillna(0.0)
-            df[f"{col}_rank"] = rank.fillna(0.5)
+            if df["ticker"].nunique() > 1:
+                cs_mean = df.groupby("date")[col].transform("mean")
+                cs_std = df.groupby("date")[col].transform("std")
+                z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
+                z = z.clip(-5, 5)
+                rank = df.groupby("date")[col].rank(method="first", pct=True)
+                df[f"{col}_z"] = z.fillna(0.0)
+                df[f"{col}_rank"] = rank.fillna(0.5)
+            else:
+                # Single ticker neutralization
+                df[f"{col}_z"] = 0.0
+                df[f"{col}_rank"] = 0.5
 
         return df
 
@@ -249,10 +251,7 @@ class FeatureEngineer:
 
         df = cls._validate_price_frame(price_df)
         df = cls.add_core_features(df)
-
-        if training and df["ticker"].nunique() > 1:
-            df = cls.add_cross_sectional_features(df)
-
+        df = cls.add_cross_sectional_features(df)
         df = cls.finalize(df)
 
         return df
