@@ -149,6 +149,39 @@ class InferencePipeline:
             INFERENCE_IN_PROGRESS.dec()
 
     ############################################################
+    # RESTORED: HISTORICAL SUPPORT (REQUIRED FOR PERFORMANCE)
+    ############################################################
+
+    def run_historical_with_features(
+        self,
+        full_feature_cache: Dict[str, pd.DataFrame],
+        evaluation_date: pd.Timestamp
+    ):
+
+        combined = []
+
+        for ticker, df in full_feature_cache.items():
+
+            snapshot = df[df["date"] <= evaluation_date]
+
+            if snapshot.empty:
+                continue
+
+            latest_row = snapshot.sort_values("date").iloc[-1:]
+
+            combined.append(latest_row)
+
+        if not combined:
+            raise RuntimeError("No valid features for evaluation date.")
+
+        latest_df = pd.concat(combined, ignore_index=True)
+
+        latest_df = FeatureEngineer.add_cross_sectional_features(latest_df)
+        latest_df = FeatureEngineer.finalize(latest_df)
+
+        return self._score_and_construct(latest_df)
+
+    ############################################################
     # FEATURE ORCHESTRATION
     ############################################################
 
@@ -198,7 +231,7 @@ class InferencePipeline:
         return df
 
     ############################################################
-    # FIXED TIMEZONE-SAFE VERSION
+    # TIMEZONE SAFE SNAPSHOT
     ############################################################
 
     def _select_latest_snapshot(self, df: pd.DataFrame):
@@ -208,7 +241,6 @@ class InferencePipeline:
         if pd.isna(latest_date):
             raise RuntimeError("No valid dates found in inference dataset.")
 
-        # Normalize both timestamps to tz-naive UTC
         now_utc = pd.Timestamp.utcnow()
 
         if latest_date.tzinfo is not None:
