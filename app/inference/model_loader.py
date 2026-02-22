@@ -5,7 +5,6 @@ import threading
 import hashlib
 import json
 from dataclasses import dataclass
-from pathlib import Path
 
 from core.schema.feature_schema import (
     get_schema_signature,
@@ -46,6 +45,7 @@ class ModelLoader:
 
     MIN_ARTIFACT_BYTES = 50_000
     POINTER_FILENAME = "production_pointer.json"
+    DRIFT_BASELINE_PATH = os.path.realpath("artifacts/drift/baseline.json")
 
     ########################################################
 
@@ -152,14 +152,6 @@ class ModelLoader:
         return model_path, metadata_path, version, pointer_hash
 
     ########################################################
-    # FIND ARTIFACT
-    ########################################################
-
-    def _find_artifact(self):
-        base_dir = self._get_registry_dir()
-        return self._resolve_production_version(base_dir)
-
-    ########################################################
     # SAFE LOAD MODEL
     ########################################################
 
@@ -180,6 +172,38 @@ class ModelLoader:
         return model
 
     ########################################################
+    # BASELINE LINEAGE VALIDATION
+    ########################################################
+
+    def _validate_baseline_lineage(self, meta: dict):
+
+        if not os.path.exists(self.DRIFT_BASELINE_PATH):
+            return  # No baseline yet — allowed
+
+        try:
+            with open(self.DRIFT_BASELINE_PATH, encoding="utf-8") as f:
+                baseline = json.load(f)
+
+            baseline_meta = baseline.get("meta", {})
+
+            if baseline_meta.get("dataset_hash") and \
+                    baseline_meta["dataset_hash"] != meta["dataset_hash"]:
+                raise RuntimeError(
+                    "Dataset hash mismatch between baseline and model."
+                )
+
+            if baseline_meta.get("training_code_hash") and \
+                    baseline_meta["training_code_hash"] != meta["training_code_hash"]:
+                raise RuntimeError(
+                    "Training code hash mismatch between baseline and model."
+                )
+
+        except Exception as e:
+            raise RuntimeError(
+                f"Baseline lineage validation failed: {e}"
+            )
+
+    ########################################################
     # RELOAD IF NEEDED
     ########################################################
 
@@ -187,8 +211,9 @@ class ModelLoader:
 
         with self._reload_lock:
 
+            base_dir = self._get_registry_dir()
             model_path, metadata_path, version, pointer_hash = \
-                self._find_artifact()
+                self._resolve_production_version(base_dir)
 
             if (
                 self._xgb_container and
@@ -239,6 +264,9 @@ class ModelLoader:
             if meta.get("feature_checksum") and \
                     meta["feature_checksum"] != feature_checksum_actual:
                 raise RuntimeError("Feature checksum mismatch.")
+
+            # 🔒 NEW: Baseline lineage enforcement
+            self._validate_baseline_lineage(meta)
 
             new_container = LoadedModel(
                 model=model,
