@@ -12,21 +12,13 @@ logger = logging.getLogger(__name__)
 
 
 class AlphaVantageProvider(MarketDataProvider):
-    """
-    Institutional fallback provider.
-
-    Designed for:
-        ✔ Maximum reliability
-        ✔ Zero schema surprises
-        ✔ Safe training fallback
-    """
 
     BASE_URL = "https://www.alphavantage.co/query"
 
     MAX_RETRIES = 3
-    RETRY_SLEEP = 12   # AlphaVantage is slow — respect it.
+    RETRY_SLEEP = 12
 
-    MIN_ROWS = 120
+    DEFAULT_MIN_ROWS = 120
 
     ##################################################
     # HARD RATE LIMIT (5/min)
@@ -34,8 +26,7 @@ class AlphaVantageProvider(MarketDataProvider):
 
     CALL_LOCK = threading.Lock()
     LAST_CALL = 0
-
-    MIN_INTERVAL = 12.5  # seconds
+    MIN_INTERVAL = 12.5
 
     ##################################################
 
@@ -104,7 +95,6 @@ class AlphaVantageProvider(MarketDataProvider):
                     raise RuntimeError(data["Error Message"])
 
                 if "Note" in data:
-                    # Rate limit message
                     logger.warning("AlphaVantage rate note received.")
                     time.sleep(20)
                     raise RuntimeError("Rate limited")
@@ -127,7 +117,7 @@ class AlphaVantageProvider(MarketDataProvider):
 
     ##################################################
 
-    def _normalize(self, data, ticker, start_date):
+    def _normalize(self, data, ticker, start_date, min_rows):
 
         key = "Time Series (Daily)"
 
@@ -150,7 +140,8 @@ class AlphaVantageProvider(MarketDataProvider):
 
         df["date"] = pd.to_datetime(
             df["date"],
-            utc=True
+            utc=True,
+            errors="coerce"
         )
 
         df = df[df["date"] >= pd.Timestamp(start_date, tz="UTC")]
@@ -159,6 +150,8 @@ class AlphaVantageProvider(MarketDataProvider):
 
         for col in numeric:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
         df.dropna(
             subset=["open", "high", "low", "close"],
@@ -174,28 +167,42 @@ class AlphaVantageProvider(MarketDataProvider):
             .reset_index(drop=True)
         )
 
-        if len(df) < self.MIN_ROWS:
-            raise RuntimeError("AlphaVantage insufficient history.")
+        if len(df) < min_rows:
+            raise RuntimeError(
+                f"AlphaVantage insufficient history ({len(df)} rows)."
+            )
 
         df["ticker"] = ticker
 
         return df
 
     ##################################################
+    # PUBLIC FETCH (HARDENED)
+    ##################################################
 
-    def fetch(self, ticker, start_date, end_date, interval):
+    def fetch(
+        self,
+        ticker,
+        start_date,
+        end_date,
+        interval,
+        **kwargs
+    ):
 
         if interval not in ["1d", "D"]:
             raise RuntimeError(
                 "AlphaVantage supports daily only."
             )
 
+        min_rows = kwargs.get("min_rows", self.DEFAULT_MIN_ROWS)
+
         data = self._call_api(ticker)
 
         df = self._normalize(
-            data,
-            ticker,
-            start_date
+            data=data,
+            ticker=ticker,
+            start_date=start_date,
+            min_rows=min_rows
         )
 
         logger.info(
