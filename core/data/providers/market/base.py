@@ -30,10 +30,18 @@ class MarketDataProvider(ABC):
         ticker: str,
         start_date: str,
         end_date: str,
-        interval: str
+        interval: str,
+        **kwargs
     ) -> pd.DataFrame:
         """
         Must return dataframe with REQUIRED_COLUMNS.
+
+        **kwargs allows forward-compatible arguments such as:
+        - min_rows
+        - retries
+        - provider-specific tuning
+
+        Providers must ignore unknown kwargs safely.
         """
         raise NotImplementedError
 
@@ -57,7 +65,6 @@ class MarketDataProvider(ABC):
                 f"Provider contract violated. Missing={missing}"
             )
 
-        # cheap numeric coercion check
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
         for col in numeric_cols:
