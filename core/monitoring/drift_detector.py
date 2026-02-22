@@ -13,6 +13,7 @@ from core.schema.feature_schema import (
     DTYPE
 )
 
+from core.artifacts.metadata_manager import MetadataManager
 from app.inference.model_loader import ModelLoader
 
 logger = logging.getLogger("marketsentinel.drift")
@@ -29,11 +30,11 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "16.0"
+    BASELINE_VERSION = "17.1"   # 🔥 bumped due to contract fix
     DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
 
     MIN_SAMPLE_BASELINE = 150
-    MIN_SAMPLE_INFERENCE = 20   # 🔧 lowered for cross-sectional inference
+    MIN_SAMPLE_INFERENCE = 20
 
     VARIANCE_RATIO_UPPER = 3.5
     VARIANCE_RATIO_LOWER = 0.25
@@ -44,9 +45,8 @@ class DriftDetector:
     MAX_INFERENCE_ROWS = 600
 
     EPSILON = 1e-8
-    MIN_ACTIVE_FEATURE_RATIO = 0.40   # 🔧 relaxed from 0.60
-
-    MAX_SEVERITY_CAP = 10  # 🔧 severity cap
+    MIN_ACTIVE_FEATURE_RATIO = 0.40
+    MAX_SEVERITY_CAP = 10
 
     ########################################################
 
@@ -73,6 +73,111 @@ class DriftDetector:
             os.path.realpath(self.baseline_dir) ==
             self.DEFAULT_BASELINE_DIR
         )
+
+    ########################################################
+    # BASELINE CREATION
+    ########################################################
+
+    def create_baseline(
+        self,
+        dataset: pd.DataFrame,
+        model_version: str,
+        dataset_hash: str | None = None,
+        training_code_hash: str | None = None,
+        feature_checksum: str | None = None,
+        allow_overwrite: bool = False,
+    ):
+
+        if os.path.exists(self.BASELINE_PATH) and not allow_overwrite:
+            raise RuntimeError(
+                "Baseline already exists. Use allow_overwrite=True to replace."
+            )
+
+        if dataset is None or dataset.empty:
+            raise RuntimeError("Cannot create baseline from empty dataset.")
+
+        if len(dataset) < self.MIN_SAMPLE_BASELINE:
+            raise RuntimeError(
+                f"Insufficient rows for baseline creation. "
+                f"Minimum required: {self.MIN_SAMPLE_BASELINE}"
+            )
+
+        numeric = self._safe_feature_block(dataset)
+
+        baseline_features = {}
+
+        for col in MODEL_FEATURES:
+
+            series = numeric[col].dropna()
+
+            if len(series) < self.MIN_SAMPLE_BASELINE:
+                continue
+
+            mean = float(series.mean())
+            std = float(max(series.std(), self.EPSILON))
+            variance = float(max(series.var(), self.EPSILON))
+
+            quantiles = np.linspace(0, 1, 11)
+            bin_edges = np.unique(np.quantile(series, quantiles))
+
+            if len(bin_edges) < 2:
+                bin_edges = np.array([series.min(), series.max() + self.EPSILON])
+
+            expected_counts = np.histogram(series, bins=bin_edges)[0]
+
+            baseline_features[col] = {
+                "mean": mean,
+                "std": std,
+                "variance": variance,
+                "bin_edges": bin_edges.tolist(),
+                "expected_counts": expected_counts.tolist()
+            }
+
+        if not baseline_features:
+            raise RuntimeError("Baseline generation failed — no valid features.")
+
+        payload = {
+            "meta": {
+                "baseline_version": self.BASELINE_VERSION,
+                "created_at": datetime.utcnow().isoformat(),
+                "schema_signature": get_schema_signature(),
+                "model_version": model_version,
+                "dataset_hash": dataset_hash,
+                "training_code_hash": training_code_hash,
+                "feature_checksum": feature_checksum,
+                "feature_count": len(baseline_features)
+            },
+            "features": baseline_features
+        }
+
+        payload["integrity_hash"] = self._baseline_hash(payload)
+
+        self._atomic_write(payload)
+
+        logger.info(
+            "Drift baseline created successfully | features=%s",
+            len(baseline_features)
+        )
+
+    ########################################################
+    # ATOMIC WRITE
+    ########################################################
+
+    def _atomic_write(self, payload: dict):
+
+        tmp_fd, tmp_path = tempfile.mkstemp()
+
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp_path, self.BASELINE_PATH)
+
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     ########################################################
     # SAFE FEATURE BLOCK
@@ -120,29 +225,6 @@ class DriftDetector:
         return hashlib.sha256(canonical).hexdigest()
 
     ########################################################
-    # PSI
-    ########################################################
-
-    def _psi(self, bin_edges, expected_counts, actual):
-
-        actual = np.asarray(actual, dtype=np.float64)
-        actual_counts = np.histogram(actual, bins=bin_edges)[0]
-
-        expected_perc = expected_counts / max(expected_counts.sum(), self.EPSILON)
-        actual_perc = actual_counts / max(actual_counts.sum(), self.EPSILON)
-
-        expected_perc = np.clip(expected_perc, self.MIN_BIN_PCT, None)
-        actual_perc = np.clip(actual_perc, self.MIN_BIN_PCT, None)
-
-        psi = np.sum(
-            (actual_perc - expected_perc) *
-            np.log((actual_perc + self.EPSILON) /
-                   (expected_perc + self.EPSILON))
-        )
-
-        return float(psi)
-
-    ########################################################
     # LOAD BASELINE
     ########################################################
 
@@ -164,6 +246,13 @@ class DriftDetector:
 
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Baseline schema mismatch.")
+
+        if "feature_checksum" in meta and meta["feature_checksum"]:
+            current_checksum = MetadataManager.fingerprint_features(
+                tuple(MODEL_FEATURES)
+            )
+            if meta["feature_checksum"] != current_checksum:
+                raise RuntimeError("Baseline feature checksum mismatch.")
 
         return baseline
 
