@@ -35,12 +35,14 @@ class WalkForwardValidator:
         model_trainer,
         window_size=252,
         step_size=63,
-        embargo_days=FORWARD_DAYS
+        embargo_days=FORWARD_DAYS,
+        debug=False
     ):
         self.model_trainer = model_trainer
         self.window_size = int(window_size)
         self.step_size = int(step_size)
         self.embargo_days = int(embargo_days)
+        self.debug = debug
         self.regime_detector = MarketRegimeDetector()
 
     ########################################################
@@ -119,7 +121,8 @@ class WalkForwardValidator:
             ].copy()
 
             if len(train_df) < self.MIN_TRAIN_ROWS:
-                logger.warning(f"Fold {window_id} skipped: insufficient train rows.")
+                if self.debug:
+                    logger.warning(f"Fold {window_id} skipped: insufficient train rows.")
                 start_idx += self.step_size
                 window_id += 1
                 continue
@@ -130,7 +133,8 @@ class WalkForwardValidator:
             train_df = self._build_fold_target(train_df)
 
             if train_df["target"].nunique() < 2:
-                logger.warning(f"Fold {window_id} skipped: label collapse.")
+                if self.debug:
+                    logger.warning(f"Fold {window_id} skipped: label collapse.")
                 start_idx += self.step_size
                 window_id += 1
                 continue
@@ -146,6 +150,8 @@ class WalkForwardValidator:
             window_returns = []
             test_dates_sorted = sorted(test_df["date"].unique())
 
+            collapse_logged = False
+
             for i in range(len(test_dates_sorted) - FORWARD_DAYS):
 
                 signal_date = test_dates_sorted[i]
@@ -157,7 +163,7 @@ class WalkForwardValidator:
                 if len(signal_slice) < self.MIN_CROSS_SECTION:
                     continue
 
-                X = signal_slice.loc[:, MODEL_FEATURES].copy()
+                X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
 
                 try:
                     X = validate_feature_schema(X, mode="inference")
@@ -170,9 +176,11 @@ class WalkForwardValidator:
                     continue
 
                 if np.std(probs) < self.MIN_PROB_STD:
-                    logger.warning(
-                        f"Fold {window_id} probability collapse on {signal_date}"
-                    )
+                    if not collapse_logged and self.debug:
+                        logger.warning(
+                            f"Fold {window_id} probability collapse."
+                        )
+                        collapse_logged = True
                     continue
 
                 signal_slice = signal_slice.copy()
@@ -185,8 +193,8 @@ class WalkForwardValidator:
 
                 positions = {}
 
-                long_vol = longs["volatility"].replace(0, 1e-6)
-                short_vol = shorts["volatility"].replace(0, 1e-6)
+                long_vol = longs["volatility"].clip(lower=1e-6)
+                short_vol = shorts["volatility"].clip(lower=1e-6)
 
                 long_weights = 1.0 / long_vol
                 short_weights = 1.0 / short_vol
@@ -233,22 +241,19 @@ class WalkForwardValidator:
                 window_id += 1
                 continue
 
-            window_returns = np.array(window_returns)
+            window_returns = np.array(window_returns, dtype=np.float64)
 
             for r in window_returns:
                 capital *= np.exp(r)
-                capital = max(capital, 1.0)  # safety floor
+                capital = max(capital, 1.0)
                 equity_curve.append(capital)
 
             vol = np.std(window_returns)
 
-            if vol < 1e-9:
-                sharpe = 0.0
-            else:
-                sharpe = (
-                    (np.mean(window_returns) / vol)
-                    * np.sqrt(252 / FORWARD_DAYS)
-                )
+            sharpe = 0.0 if vol < 1e-9 else (
+                (np.mean(window_returns) / vol)
+                * np.sqrt(252 / FORWARD_DAYS)
+            )
 
             sharpe = float(np.clip(sharpe, -self.MAX_SHARPE, self.MAX_SHARPE))
 
@@ -274,7 +279,7 @@ class WalkForwardValidator:
         if not equity_curve:
             raise RuntimeError("Equity curve empty.")
 
-        curve = np.array(equity_curve)
+        curve = np.array(equity_curve, dtype=np.float64)
 
         peak = np.maximum.accumulate(curve)
         drawdowns = (curve - peak) / peak
