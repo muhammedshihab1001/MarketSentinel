@@ -1,8 +1,3 @@
-"""
-Institutional evaluation metrics for XGBoost alpha model.
-Used in both training validation and CI evaluation.
-"""
-
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
@@ -10,6 +5,16 @@ from sklearn.metrics import (
     balanced_accuracy_score,
     roc_auc_score,
 )
+
+# =========================================================
+# GOVERNANCE THRESHOLDS (Backward Compatibility for Tests)
+# =========================================================
+
+XGB_MIN_ACCURACY = 0.50
+XGB_MIN_BALANCED_ACCURACY = 0.50
+XGB_MIN_ROC_AUC = 0.50
+
+XGB_MIN_AUC = XGB_MIN_ROC_AUC
 
 
 # =========================================================
