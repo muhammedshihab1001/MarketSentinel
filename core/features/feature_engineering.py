@@ -80,16 +80,16 @@ class FeatureEngineer:
             df["close"] = df.groupby("ticker")["close"].ffill()
 
         if df["close"].isnull().any():
-            raise RuntimeError("Unrecoverable missing close prices after split repair.")
+            raise RuntimeError("Unrecoverable missing close prices.")
 
         return df.reset_index(drop=True)
 
     ########################################################
-    # RETURNS
+    # CORE FEATURES (PER TICKER)
     ########################################################
 
     @classmethod
-    def add_returns(cls, df):
+    def add_core_features(cls, df):
 
         df = df.sort_values(["ticker", "date"])
 
@@ -107,15 +107,6 @@ class FeatureEngineer:
             .pct_change(20)
             .clip(-1, 1)
         )
-
-        return df
-
-    ########################################################
-    # VOLATILITY
-    ########################################################
-
-    @classmethod
-    def add_volatility(cls, df):
 
         grp = df.groupby("ticker")["return"]
 
@@ -138,41 +129,8 @@ class FeatureEngineer:
         for col in ["volatility", "volatility_5", "volatility_20"]:
             df[col] = df[col].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
 
-        return df
-
-    ########################################################
-    # REGIME
-    ########################################################
-
-    @classmethod
-    def add_regime_feature(cls, df):
-
-        rolling_mean = (
-            df.groupby("ticker")["volatility_20"]
-            .transform(lambda x: x.rolling(60, min_periods=20).mean())
-        )
-
-        rolling_std = (
-            df.groupby("ticker")["volatility_20"]
-            .transform(lambda x: x.rolling(60, min_periods=20).std(ddof=0))
-        )
-
-        zscore = (df["volatility_20"] - rolling_mean) / (rolling_std + cls.EPSILON)
-
-        df["regime_feature"] = np.where(zscore > 0.5, 1.0, 0.0)
-        df["regime_feature"] = df["regime_feature"].fillna(0.0)
-
-        return df
-
-    ########################################################
-    # TECHNICALS
-    ########################################################
-
-    @classmethod
-    def add_rsi(cls, df):
-
+        # RSI
         df["rsi"] = np.nan
-
         for ticker, group in df.groupby("ticker"):
             group = group.sort_values("date")
             rsi = TechnicalIndicators.rsi(group[["date", "close"]], window=14)
@@ -180,11 +138,7 @@ class FeatureEngineer:
 
         df["rsi"] = df["rsi"].fillna(50.0).clip(0, 100)
 
-        return df
-
-    @classmethod
-    def add_macd(cls, df):
-
+        # MACD
         df["macd"] = np.nan
         df["macd_signal"] = np.nan
 
@@ -196,13 +150,7 @@ class FeatureEngineer:
 
         df[["macd", "macd_signal"]] = df[["macd", "macd_signal"]].fillna(0.0)
 
-        return df
-
-    @classmethod
-    def add_ema(cls, df):
-
-        df = df.sort_values(["ticker", "date"])
-
+        # EMA
         df["ema_10"] = df.groupby("ticker")["close"].transform(
             lambda x: x.ewm(span=10, adjust=False).mean()
         )
@@ -215,10 +163,25 @@ class FeatureEngineer:
             df["ema_10"] / (df["ema_50"] + cls.EPSILON)
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
+        # Regime
+        rolling_mean = (
+            df.groupby("ticker")["volatility_20"]
+            .transform(lambda x: x.rolling(60, min_periods=20).mean())
+        )
+
+        rolling_std = (
+            df.groupby("ticker")["volatility_20"]
+            .transform(lambda x: x.rolling(60, min_periods=20).std(ddof=0))
+        )
+
+        zscore = (df["volatility_20"] - rolling_mean) / (rolling_std + cls.EPSILON)
+        df["regime_feature"] = np.where(zscore > 0.5, 1.0, 0.0)
+        df["regime_feature"] = df["regime_feature"].fillna(0.0)
+
         return df
 
     ########################################################
-    # CROSS-SECTIONAL FEATURES (FIXED INDUSTRIAL VERSION)
+    # TRUE CROSS-SECTIONAL (GLOBAL)
     ########################################################
 
     @classmethod
@@ -236,20 +199,13 @@ class FeatureEngineer:
 
         for col in base_cols:
 
-            if col not in df.columns:
-                raise RuntimeError(f"Missing base feature: {col}")
-
             cs_mean = df.groupby("date")[col].transform("mean")
             cs_std = df.groupby("date")[col].transform("std")
 
             z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
             z = z.clip(-5, 5)
 
-            # 🔥 FIX: prevent rank degeneracy
-            rank = (
-                df.groupby("date")[col]
-                .rank(method="first", pct=True)
-            )
+            rank = df.groupby("date")[col].rank(method="first", pct=True)
 
             df[f"{col}_z"] = z.fillna(0.0)
             df[f"{col}_rank"] = rank.fillna(0.5)
@@ -257,57 +213,24 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # FINAL SANITIZATION
+    # FINAL SANITIZE
     ########################################################
 
     @classmethod
-    def _final_sanitize(cls, df):
+    def finalize(cls, df):
 
         df = df.replace([np.inf, -np.inf], np.nan)
 
         numeric_cols = df.select_dtypes(include=[np.number]).columns
 
         for col in numeric_cols:
-            if df[col].isnull().any():
-                if "volatility" in col:
-                    df[col] = df[col].fillna(cls.VOL_FLOOR)
-                else:
-                    df[col] = df[col].fillna(0.0)
+            df[col] = df[col].fillna(0.0)
 
         if not np.isfinite(df[numeric_cols].to_numpy()).all():
-            raise RuntimeError("Non-finite values remain after sanitization.")
-
-        return df
-
-    ########################################################
-    # MAIN PIPELINE
-    ########################################################
-
-    @classmethod
-    def build_feature_pipeline(
-        cls,
-        price_df,
-        sentiment_df=None,
-        training=False,
-        ticker=None
-    ):
-
-        df = cls._validate_price_frame(price_df, ticker)
-
-        df = cls.add_returns(df)
-        df = cls.add_volatility(df)
-        df = cls.add_regime_feature(df)
-        df = cls.add_rsi(df)
-        df = cls.add_macd(df)
-        df = cls.add_ema(df)
-        df = cls.add_cross_sectional_features(df)
-
-        df = cls._final_sanitize(df)
+            raise RuntimeError("Non-finite values remain.")
 
         missing = set(MODEL_FEATURES) - set(df.columns)
         if missing:
-            raise RuntimeError(f"Feature pipeline missing columns: {missing}")
-
-        logger.info("Feature pipeline built | rows=%s", len(df))
+            raise RuntimeError(f"Missing features: {missing}")
 
         return df.reset_index(drop=True)
