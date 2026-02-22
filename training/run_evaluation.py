@@ -40,7 +40,163 @@ FORWARD_DAYS = 5
 
 
 # =========================================================
-# ENTRY POINT
+# CROSS-SECTIONAL FEATURE REBUILD (MUST MATCH TRAINING)
+# =========================================================
+
+def add_cross_sectional_features(df: pd.DataFrame) -> pd.DataFrame:
+
+    df = df.sort_values(["date", "ticker"]).copy()
+
+    base_cols = [
+        "momentum_20",
+        "return_lag5",
+        "rsi",
+        "volatility",
+        "ema_ratio"
+    ]
+
+    for col in base_cols:
+
+        if col not in df.columns:
+            raise RuntimeError(f"Missing base feature: {col}")
+
+        cs_mean = df.groupby("date")[col].transform("mean")
+        cs_std = df.groupby("date")[col].transform("std")
+
+        z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
+        z = z.clip(-5, 5)
+
+        rank = df.groupby("date")[col].rank(pct=True)
+
+        df[f"{col}_z"] = z.fillna(0.0)
+        df[f"{col}_rank"] = rank.fillna(0.5)
+
+    return df
+
+
+# =========================================================
+# TARGET REBUILD (MUST MATCH TRAINING)
+# =========================================================
+
+def apply_cross_sectional_target(df):
+
+    df = df.sort_values(["ticker", "date"]).copy()
+
+    df["forward_log_return"] = (
+        df.groupby("ticker")["close"]
+        .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
+    )
+
+    df = df.dropna(subset=["forward_log_return"])
+
+    df["alpha_rank_pct"] = (
+        df.groupby("date")["forward_log_return"]
+        .rank(pct=True)
+    )
+
+    df["target"] = np.nan
+    df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
+    df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
+
+    df = df.dropna(subset=["target"])
+    df["target"] = df["target"].astype("int8")
+
+    return df.reset_index(drop=True)
+
+
+# =========================================================
+# LOAD MODEL
+# =========================================================
+
+def load_latest_model():
+
+    base_dir = os.path.join("artifacts", "xgboost")
+    model_files = glob.glob(os.path.join(base_dir, "model_*.pkl"))
+
+    if not model_files:
+        raise RuntimeError("No trained model artifacts found.")
+
+    latest = max(model_files, key=os.path.getmtime)
+    timestamp = os.path.basename(latest).split("_")[1].split(".")[0]
+
+    metadata_path = os.path.join(base_dir, f"metadata_{timestamp}.json")
+
+    if not os.path.exists(metadata_path):
+        raise RuntimeError("Metadata file missing.")
+
+    with open(metadata_path, encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    if metadata.get("schema_signature") != get_schema_signature():
+        raise RuntimeError("Schema signature mismatch.")
+
+    model = joblib.load(latest)
+
+    if not hasattr(model, "predict_proba"):
+        raise RuntimeError("Artifact not classifier.")
+
+    print(f"Loaded model version: {timestamp}")
+    return model
+
+
+# =========================================================
+# DATASET BUILD
+# =========================================================
+
+def build_dataset():
+
+    market_data = MarketDataService()
+    store = FeatureStore()
+    universe = MarketUniverse.get_universe()
+
+    start_date, end_date = MarketTime.window_for("xgboost")
+
+    datasets = []
+
+    for ticker in universe:
+        try:
+            price_df = market_data.get_price_data(
+                ticker=ticker,
+                start_date=start_date,
+                end_date=end_date
+            )
+
+            dataset = store.get_features(
+                price_df,
+                sentiment_df=None,
+                ticker=ticker,
+                training=False
+            )
+
+            if dataset is not None and not dataset.empty:
+                datasets.append(dataset)
+
+        except Exception:
+            continue
+
+    if not datasets:
+        raise RuntimeError("No evaluation datasets built.")
+
+    df = pd.concat(datasets, ignore_index=True)
+
+    # 🔥 CRITICAL: must match training
+    df = add_cross_sectional_features(df)
+    df = apply_cross_sectional_target(df)
+
+    feature_df = validate_feature_schema(df.loc[:, MODEL_FEATURES])
+    df = df.loc[feature_df.index]
+
+    if df["target"].nunique() < 2:
+        raise RuntimeError("Labels collapsed.")
+
+    if len(df) < MIN_SAMPLE_SIZE:
+        raise RuntimeError("Dataset too small.")
+
+    return df.reset_index(drop=True)
+
+
+# =========================================================
+# MAIN ENTRY (CI SAFE)
 # =========================================================
 
 def main() -> int:
@@ -95,15 +251,15 @@ def main() -> int:
 
     print("Evaluation metrics:", metrics)
 
-    if metrics["roc_auc"] is not None and metrics["roc_auc"] < MIN_ROC_AUC:
+    if metrics["roc_auc"] < MIN_ROC_AUC:
         print("FAIL: ROC AUC below gate.")
         return 1
 
-    if metrics["sharpe"] is not None and metrics["sharpe"] < MIN_SHARPE:
+    if metrics["sharpe"] < MIN_SHARPE:
         print("FAIL: Sharpe below gate.")
         return 1
 
-    if metrics["long_short_spread"] is not None and metrics["long_short_spread"] < MIN_SPREAD:
+    if metrics["long_short_spread"] < MIN_SPREAD:
         print("FAIL: Negative spread.")
         return 1
 
@@ -111,121 +267,5 @@ def main() -> int:
     return 0
 
 
-# =========================================================
-# SUPPORT FUNCTIONS
-# =========================================================
-
-def load_latest_model():
-
-    base_dir = os.path.join("artifacts", "xgboost")
-    model_files = glob.glob(os.path.join(base_dir, "model_*.pkl"))
-
-    if not model_files:
-        raise RuntimeError("No trained model artifacts found.")
-
-    latest = max(model_files, key=os.path.getmtime)
-    timestamp = os.path.basename(latest).split("_")[1].split(".")[0]
-
-    metadata_path = os.path.join(base_dir, f"metadata_{timestamp}.json")
-
-    if not os.path.exists(metadata_path):
-        raise RuntimeError("Metadata file missing.")
-
-    with open(metadata_path, encoding="utf-8") as f:
-        metadata = json.load(f)
-
-    if metadata.get("schema_signature") != get_schema_signature():
-        raise RuntimeError("Schema signature mismatch.")
-
-    model = joblib.load(latest)
-
-    if not hasattr(model, "predict_proba"):
-        raise RuntimeError("Artifact not classifier.")
-
-    print(f"Loaded model version: {timestamp}")
-    return model
-
-
-def build_dataset():
-
-    market_data = MarketDataService()
-    store = FeatureStore()
-    universe = MarketUniverse.get_universe()
-
-    start_date, end_date = MarketTime.window_for("xgboost")
-
-    datasets = []
-
-    for ticker in universe:
-        try:
-            price_df = market_data.get_price_data(
-                ticker=ticker,
-                start_date=start_date,
-                end_date=end_date
-            )
-
-            dataset = store.get_features(
-                price_df,
-                sentiment_df=None,
-                ticker=ticker,
-                training=False
-            )
-
-            if dataset is not None and not dataset.empty:
-                datasets.append(dataset)
-
-        except Exception:
-            continue
-
-    if not datasets:
-        raise RuntimeError("No evaluation datasets built.")
-
-    df = pd.concat(datasets, ignore_index=True)
-
-    df = apply_cross_sectional_target(df)
-
-    feature_df = validate_feature_schema(df.loc[:, MODEL_FEATURES])
-    df = df.loc[feature_df.index]
-
-    if df["target"].nunique() < 2:
-        raise RuntimeError("Labels collapsed.")
-
-    if len(df) < MIN_SAMPLE_SIZE:
-        raise RuntimeError("Dataset too small.")
-
-    return df.reset_index(drop=True)
-
-
-def apply_cross_sectional_target(df):
-
-    df = df.sort_values(["ticker", "date"]).copy()
-
-    df["forward_log_return"] = (
-        df.groupby("ticker")["close"]
-        .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
-    )
-
-    df = df.dropna(subset=["forward_log_return"])
-
-    df["alpha_rank_pct"] = (
-        df.groupby("date")["forward_log_return"]
-        .rank(pct=True)
-    )
-
-    df["target"] = np.nan
-    df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
-    df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
-
-    df = df.dropna(subset=["target"])
-    df["target"] = df["target"].astype("int8")
-
-    return df.reset_index(drop=True)
-
-
-# =========================================================
-# FORCE EXECUTION (CI SAFE)
-# =========================================================
-
 if __name__ == "__main__":
-    exit_code = main()
-    sys.exit(exit_code)
+    sys.exit(main())
