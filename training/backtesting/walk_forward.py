@@ -14,6 +14,9 @@ class WalkForwardValidator:
 
     MIN_WINDOWS = 6
     MIN_TEST_DAYS = 20
+    MIN_TRAIN_ROWS = 1500
+    MIN_CROSS_SECTION = 10
+    MIN_PROB_STD = 1e-6
 
     TOP_K = 3
     BOTTOM_K = 3
@@ -43,15 +46,8 @@ class WalkForwardValidator:
         return train_df[train_df["date"] < embargo_cut]
 
     ########################################################
-    # Fold-Local Target
-    ########################################################
 
     def _build_fold_target(self, df):
-
-        if "close" not in df.columns:
-            if "target" not in df.columns:
-                raise RuntimeError("Dataset missing both close and target.")
-            return df
 
         df = df.sort_values(["ticker", "date"]).copy()
 
@@ -118,7 +114,8 @@ class WalkForwardValidator:
                 (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
-            if train_df.empty or test_df.empty:
+            if len(train_df) < self.MIN_TRAIN_ROWS:
+                logger.warning(f"Fold {window_id} skipped: insufficient train rows.")
                 start_idx += self.step_size
                 window_id += 1
                 continue
@@ -129,11 +126,18 @@ class WalkForwardValidator:
             train_df = self._build_fold_target(train_df)
 
             if train_df["target"].nunique() < 2:
+                logger.warning(f"Fold {window_id} skipped: label collapse.")
                 start_idx += self.step_size
                 window_id += 1
                 continue
 
-            model = self.model_trainer(train_df)
+            try:
+                model = self.model_trainer(train_df)
+            except Exception as e:
+                logger.warning(f"Fold {window_id} training failed: {e}")
+                start_idx += self.step_size
+                window_id += 1
+                continue
 
             window_returns = []
             test_dates_sorted = sorted(test_df["date"].unique())
@@ -146,7 +150,7 @@ class WalkForwardValidator:
                 signal_slice = test_df[test_df["date"] == signal_date]
                 exit_slice = test_df[test_df["date"] == exit_date]
 
-                if signal_slice.empty or exit_slice.empty:
+                if len(signal_slice) < self.MIN_CROSS_SECTION:
                     continue
 
                 X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
@@ -154,7 +158,14 @@ class WalkForwardValidator:
                 if X.isnull().any().any():
                     continue
 
-                probs = model.predict_proba(X)[:, 1]
+                try:
+                    probs = model.predict_proba(X)[:, 1]
+                except Exception:
+                    continue
+
+                if np.std(probs) < self.MIN_PROB_STD:
+                    logger.warning(f"Fold {window_id} probability collapse on {signal_date}")
+                    continue
 
                 signal_slice = signal_slice.copy()
                 signal_slice["score"] = probs
@@ -184,44 +195,20 @@ class WalkForwardValidator:
                 for t, w in zip(shorts["ticker"], short_weights):
                     positions[t] = -float(w)
 
-                # ====================================================
-                # REAL DATA PATH (close prices)
-                # ====================================================
-                if "close" in signal_slice.columns and "close" in exit_slice.columns:
+                merged = pd.merge(
+                    signal_slice[["ticker", "close"]],
+                    exit_slice[["ticker", "close"]],
+                    on="ticker",
+                    suffixes=("_entry", "_exit")
+                )
 
-                    merged = pd.merge(
-                        signal_slice[["ticker", "close"]],
-                        exit_slice[["ticker", "close"]],
-                        on="ticker",
-                        suffixes=("_entry", "_exit")
-                    )
-
-                    if merged.empty:
-                        continue
-
-                    merged["ret"] = (
-                        np.log(merged["close_exit"] * (1 - self.SLIPPAGE)) -
-                        np.log(merged["close_entry"] * (1 + self.SLIPPAGE))
-                    )
-
-                # ====================================================
-                # SYNTHETIC UNIT TEST PATH
-                # ====================================================
-                elif "return" in exit_slice.columns:
-
-                    merged = pd.merge(
-                        signal_slice[["ticker"]],
-                        exit_slice[["ticker", "return"]],
-                        on="ticker"
-                    )
-
-                    if merged.empty:
-                        continue
-
-                    merged["ret"] = merged["return"]
-
-                else:
+                if merged.empty:
                     continue
+
+                merged["ret"] = (
+                    np.log(merged["close_exit"] * (1 - self.SLIPPAGE)) -
+                    np.log(merged["close_entry"] * (1 + self.SLIPPAGE))
+                )
 
                 period_ret = 0.0
 
@@ -238,7 +225,7 @@ class WalkForwardValidator:
                 window_id += 1
                 continue
 
-            window_returns = np.array(window_returns, dtype=float)
+            window_returns = np.array(window_returns)
 
             for r in window_returns:
                 capital *= np.exp(r)
