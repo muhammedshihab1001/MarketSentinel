@@ -22,7 +22,7 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v20"  # bumped due to cross-sectional refactor
+    CACHE_VERSION = "v21"  # bumped due to sanitization fix
     MAX_CACHE_FILES_PER_TICKER = 6
     MIN_FILE_BYTES = 5_000
     MAX_TOTAL_CACHE_FILES = 2000
@@ -186,6 +186,21 @@ class FeatureStore:
 
         df = self.engineer._validate_price_frame(price_df, ticker)
         df = self.engineer.add_core_features(df)
+
+        # 🔥 INDUSTRIAL SANITIZATION
+        df = df.replace([np.inf, -np.inf], np.nan)
+
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+
+        for col in numeric_cols:
+            if df[col].isnull().any():
+                if "volatility" in col:
+                    df[col] = df[col].fillna(1e-4)
+                else:
+                    df[col] = df[col].fillna(0.0)
+
+        if not np.isfinite(df[numeric_cols].to_numpy()).all():
+            raise RuntimeError("Non-finite values remain after sanitization.")
 
         df = df.sort_values(
             ["date", "ticker"]
