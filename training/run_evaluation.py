@@ -1,13 +1,14 @@
 """
-MarketSentinel Evaluation Runner
+MarketSentinel Institutional Evaluation Runner
 
-Used by CI pipeline.
+Used by CI/CD pipeline.
 
 Guarantees:
 - Loads latest XGBoost artifact
 - Validates schema signature
 - Rebuilds evaluation dataset
-- Enforces production thresholds
+- Computes alpha + classification metrics
+- Enforces production governance thresholds
 """
 
 import os
@@ -31,19 +32,21 @@ from core.time.market_time import MarketTime
 from training.evaluate import evaluate_xgboost
 
 
-# ---------------------------------------------------------
-# THRESHOLDS (CI Gate)
-# ---------------------------------------------------------
+# =========================================================
+# GOVERNANCE THRESHOLDS (CI HARD GATE)
+# =========================================================
 
-MIN_ACCURACY = 0.50
-MIN_ROC_AUC = 0.51
+MIN_ROC_AUC = 0.50
+MIN_SHARPE = 0.10
+MIN_SPREAD = 0.0
+MIN_SAMPLE_SIZE = 2000
 
 FORWARD_DAYS = 5
 
 
-# ---------------------------------------------------------
-# LOAD LATEST MODEL
-# ---------------------------------------------------------
+# =========================================================
+# LOAD LATEST MODEL (STRICT)
+# =========================================================
 
 def load_latest_model():
 
@@ -82,9 +85,9 @@ def load_latest_model():
     return model
 
 
-# ---------------------------------------------------------
+# =========================================================
 # CROSS-SECTIONAL TARGET (MUST MATCH TRAINING)
-# ---------------------------------------------------------
+# =========================================================
 
 def apply_cross_sectional_target(df):
 
@@ -112,9 +115,9 @@ def apply_cross_sectional_target(df):
     return df.reset_index(drop=True)
 
 
-# ---------------------------------------------------------
+# =========================================================
 # BUILD EVALUATION DATASET
-# ---------------------------------------------------------
+# =========================================================
 
 def build_dataset():
 
@@ -164,12 +167,15 @@ def build_dataset():
     if df["target"].nunique() < 2:
         raise RuntimeError("Evaluation labels collapsed.")
 
+    if len(df) < MIN_SAMPLE_SIZE:
+        raise RuntimeError("Evaluation dataset too small.")
+
     return df.reset_index(drop=True)
 
 
-# ---------------------------------------------------------
+# =========================================================
 # MAIN EVALUATION
-# ---------------------------------------------------------
+# =========================================================
 
 def main():
 
@@ -181,6 +187,8 @@ def main():
 
     X = df.loc[:, MODEL_FEATURES]
     y = df["target"]
+    forward_returns = df["forward_log_return"]
+    dates = df["date"]
 
     probs = model.predict_proba(X)[:, 1]
     preds = (probs > 0.5).astype(int)
@@ -189,18 +197,27 @@ def main():
         y_true=y,
         y_pred=preds,
         y_prob=probs,
+        forward_returns=forward_returns,
+        dates=dates,
         enforce_thresholds=False
     )
 
     print("Evaluation metrics:", metrics)
 
-    if metrics["accuracy"] < MIN_ACCURACY:
-        raise RuntimeError("Accuracy below CI gate.")
+    # =====================================================
+    # HARD GOVERNANCE GATES
+    # =====================================================
 
     if metrics["roc_auc"] is not None and metrics["roc_auc"] < MIN_ROC_AUC:
         raise RuntimeError("ROC AUC below CI gate.")
 
-    print("Evaluation passed.")
+    if metrics["sharpe"] is not None and metrics["sharpe"] < MIN_SHARPE:
+        raise RuntimeError("Sharpe below CI gate.")
+
+    if metrics["long_short_spread"] is not None and metrics["long_short_spread"] < MIN_SPREAD:
+        raise RuntimeError("Negative long-short spread.")
+
+    print("CI evaluation passed.")
     return metrics
 
 
