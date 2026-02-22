@@ -1,3 +1,5 @@
+# core/features/feature_engineering.py
+
 import pandas as pd
 import numpy as np
 import logging
@@ -143,12 +145,12 @@ class FeatureEngineer:
 
         for ticker, group in df.groupby("ticker"):
             macd, signal = TechnicalIndicators.macd(group[["date", "close"]])
-            df.loc[group.index, "macd"] = macd
-            df.loc[group.index, "macd_signal"] = signal
+            df.loc[group.index, "macd"] = macd.astype("float32")
+            df.loc[group.index, "macd_signal"] = signal.astype("float32")
 
         df[["macd", "macd_signal"]] = df[["macd", "macd_signal"]].fillna(0.0)
 
-        # EMA ratio
+        # EMA
         df["ema_10"] = df.groupby("ticker")["close"].transform(
             lambda x: x.ewm(span=10, adjust=False).mean()
         )
@@ -164,7 +166,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # CROSS SECTIONAL (ALWAYS CREATED)
+    # CROSS SECTIONAL
     ########################################################
 
     @classmethod
@@ -180,12 +182,18 @@ class FeatureEngineer:
             "ema_ratio",
         ]
 
+        single_ticker = df["ticker"].nunique() <= 1
+
         for col in base_cols:
+
+            if single_ticker:
+                df[f"{col}_z"] = 0.0
+                df[f"{col}_rank"] = 0.5
+                continue
 
             cs_mean = df.groupby("date")[col].transform("mean")
             cs_std = df.groupby("date")[col].transform("std")
 
-            # If single ticker → std becomes NaN → handled below
             z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
             rank = df.groupby("date")[col].rank(method="first", pct=True)
 
@@ -195,7 +203,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # FINALIZE
+    # FINALIZE (STRICT CONTRACT ENFORCEMENT)
     ########################################################
 
     @classmethod
@@ -215,10 +223,13 @@ class FeatureEngineer:
         if missing:
             raise RuntimeError(f"Missing features: {missing}")
 
-        # Enforce feature order stability
-        df = df.reindex(columns=list(df.columns))
+        # 🔒 Enforce strict model feature contract ordering
+        feature_block = df.loc[:, MODEL_FEATURES].copy()
 
-        return df.reset_index(drop=True)
+        return pd.concat(
+            [df[["date", "ticker", "close"]], feature_block],
+            axis=1
+        ).reset_index(drop=True)
 
     ########################################################
     # PIPELINE
@@ -234,10 +245,7 @@ class FeatureEngineer:
 
         df = cls._validate_price_frame(price_df)
         df = cls.add_core_features(df)
-
-        # ALWAYS add cross-sectional
         df = cls.add_cross_sectional_features(df)
-
         df = cls.finalize(df)
 
         return df
