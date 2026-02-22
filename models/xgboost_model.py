@@ -10,7 +10,7 @@ SEED = 42
 MIN_PROB_STD = 1e-5
 NUM_BOOST_ROUNDS = 600
 EARLY_STOPPING_ROUNDS = 50
-MIN_VALIDATION_ROWS = 200
+MIN_VALIDATION_ROWS = 300   # strengthened safety
 
 
 ###################################################
@@ -69,12 +69,13 @@ class SafeXGBClassifier:
         if X.isnull().any().any():
             raise RuntimeError("NaN detected in training features.")
 
-        # 🔒 Ensure deterministic ordering
-        X = X.copy()
-        X = X.astype(np.float32)
+        X = X.copy().astype(np.float32)
         y = np.asarray(y)
 
-        # 🔒 Lock feature order
+        ###################################################
+        # LOCK FEATURE CONTRACT
+        ###################################################
+
         self.feature_names = list(X.columns)
 
         checksum_str = json.dumps(self.feature_names, sort_keys=False)
@@ -82,19 +83,22 @@ class SafeXGBClassifier:
             checksum_str.encode()
         ).hexdigest()
 
-        # 🔒 Training data checksum
         training_bytes = X.to_numpy().tobytes()
-        self.training_checksum = hashlib.sha256(training_bytes).hexdigest()
+        self.training_checksum = hashlib.sha256(
+            training_bytes
+        ).hexdigest()
 
         ###################################################
-        # TIME-SAFE EARLY STOPPING SPLIT
+        # SAFE TIME SPLIT
         ###################################################
 
         n = len(X)
 
         if n < MIN_VALIDATION_ROWS * 2:
-            # Too small → disable early stopping safely
-            logger.warning("Dataset small — early stopping disabled.")
+            logger.warning(
+                "Dataset small (%s rows) — early stopping disabled.",
+                n
+            )
             use_early_stopping = False
         else:
             use_early_stopping = True
@@ -110,12 +114,6 @@ class SafeXGBClassifier:
         dtrain_part = xgb.DMatrix(
             X_train_part,
             label=y_train_part,
-            feature_names=self.feature_names
-        )
-
-        dval_part = xgb.DMatrix(
-            X_val_part,
-            label=y_val_part,
             feature_names=self.feature_names
         )
 
@@ -151,6 +149,13 @@ class SafeXGBClassifier:
         ###################################################
 
         if use_early_stopping:
+
+            dval_part = xgb.DMatrix(
+                X_val_part,
+                label=y_val_part,
+                feature_names=self.feature_names
+            )
+
             self.model = xgb.train(
                 params,
                 dtrain_part,
@@ -159,6 +164,18 @@ class SafeXGBClassifier:
                 early_stopping_rounds=EARLY_STOPPING_ROUNDS,
                 verbose_eval=False
             )
+
+            # 🛡 Safe early stopping validation
+            if not hasattr(self.model, "best_iteration"):
+                logger.warning("Early stopping not triggered safely.")
+            else:
+                if self.model.best_iteration is None:
+                    logger.warning("best_iteration undefined.")
+                elif self.model.best_iteration < 1:
+                    logger.warning(
+                        "Early stopping best_iteration < 1 — fallback to full model."
+                    )
+
         else:
             self.model = xgb.train(
                 params,
@@ -203,10 +220,6 @@ class SafeXGBClassifier:
         if booster_features != self.feature_names:
             raise RuntimeError("Booster feature order mismatch.")
 
-        if hasattr(self.model, "best_iteration"):
-            if self.model.best_iteration <= 0:
-                raise RuntimeError("Invalid early stopping state.")
-
         return self
 
     ###################################################
@@ -225,23 +238,34 @@ class SafeXGBClassifier:
         extra = set(X.columns) - set(self.feature_names)
 
         if missing:
-            raise RuntimeError(f"Missing inference features: {missing}")
+            raise RuntimeError(
+                f"Missing inference features: {missing}"
+            )
 
         if extra:
-            logger.warning("Extra inference features ignored: %s", extra)
+            logger.warning(
+                "Extra inference features ignored: %s",
+                extra
+            )
 
         X = X.loc[:, self.feature_names].astype(np.float32)
 
         if X.isnull().any().any():
             raise RuntimeError("NaN detected in inference features.")
 
-        checksum_str = json.dumps(self.feature_names, sort_keys=False)
+        checksum_str = json.dumps(
+            self.feature_names,
+            sort_keys=False
+        )
+
         current_checksum = hashlib.sha256(
             checksum_str.encode()
         ).hexdigest()
 
         if current_checksum != self.feature_checksum:
-            raise RuntimeError("Feature order integrity violated.")
+            raise RuntimeError(
+                "Feature order integrity violated."
+            )
 
         dmatrix = xgb.DMatrix(
             X,
@@ -251,10 +275,14 @@ class SafeXGBClassifier:
         probs = self.model.predict(dmatrix)
 
         if np.std(probs) < MIN_PROB_STD:
-            raise RuntimeError("Inference probability collapse detected.")
+            raise RuntimeError(
+                "Inference probability collapse detected."
+            )
 
         if np.any(probs < 0) or np.any(probs > 1):
-            raise RuntimeError("Invalid probability range detected.")
+            raise RuntimeError(
+                "Invalid probability range detected."
+            )
 
         return np.column_stack([1 - probs, probs])
 
@@ -267,7 +295,9 @@ class SafeXGBClassifier:
         if self.model is None:
             raise RuntimeError("Model not trained.")
 
-        score = self.model.get_score(importance_type="gain")
+        score = self.model.get_score(
+            importance_type="gain"
+        )
 
         sorted_imp = sorted(
             score.items(),
@@ -289,10 +319,11 @@ class SafeXGBClassifier:
 def build_xgboost_pipeline(y):
 
     pos_weight = compute_class_weight(y)
+
     model = SafeXGBClassifier(pos_weight)
 
     logger.info(
-        "XGBoost model built (deterministic CPU mode, leakage-safe early stopping)."
+        "XGBoost model built (deterministic CPU mode, fold-safe early stopping)."
     )
 
     return model
