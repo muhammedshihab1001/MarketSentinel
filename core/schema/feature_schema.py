@@ -8,7 +8,19 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "32.3"  # bumped: neutralized cross-sectional constants allowed in strict mode
+# ============================================================
+# SCHEMA VERSION
+# ============================================================
+
+SCHEMA_VERSION = "33.0"  # bumped: canonical signal percentile contract introduced
+
+
+############################################################
+# SIGNAL CONTRACT (CANONICAL)
+############################################################
+
+LONG_PERCENTILE = 0.70
+SHORT_PERCENTILE = 0.30
 
 
 ############################################################
@@ -151,7 +163,7 @@ def validate_feature_schema(
             logger.warning(f"Low variance core feature: {col}")
 
     ########################################################
-    # CROSS-SECTIONAL VALIDATION (UPDATED)
+    # CROSS-SECTIONAL VALIDATION
     ########################################################
 
     if mode == "training":
@@ -172,7 +184,7 @@ def validate_feature_schema(
 
             if finite_vals.nunique() <= 1:
 
-                # ✅ Allow fully neutralized column (all zeros)
+                # Allow fully neutralized column (all zeros)
                 if (finite_vals == 0).all():
                     logger.warning(
                         "Neutralized constant cross-sectional feature allowed in strict contract: %s",
@@ -206,6 +218,10 @@ def get_schema_signature() -> str:
     contract = {
         "core": list(CORE_FEATURES),
         "cross": list(CROSS_SECTIONAL_FEATURES),
+        "signal": {
+            "long_percentile": LONG_PERCENTILE,
+            "short_percentile": SHORT_PERCENTILE,
+        },
         "version": SCHEMA_VERSION,
     }
 
