@@ -5,6 +5,7 @@ import pandas as pd
 import logging
 import os
 import hashlib
+import json
 from datetime import timedelta
 
 from core.data.market_data_service import MarketDataService
@@ -115,6 +116,18 @@ class InferencePipeline:
             )
 
     ############################################################
+    # DETERMINISTIC SORT GUARD
+    ############################################################
+
+    def _deterministic_sort(self, df):
+
+        # enforce deterministic ranking (score, ticker)
+        return df.sort_values(
+            ["score", "ticker"],
+            ascending=[True, True]
+        )
+
+    ############################################################
 
     def _construct_portfolio(self, latest_df):
 
@@ -126,9 +139,7 @@ class InferencePipeline:
         if n_assets < 4:
             raise RuntimeError("Insufficient assets for portfolio construction.")
 
-        latest_df = latest_df.sort_values(
-            ["score", "ticker"]
-        )
+        latest_df = self._deterministic_sort(latest_df)
 
         k_long = min(self.TOP_K, n_assets // 2)
         k_short = min(self.BOTTOM_K, n_assets // 2)
@@ -169,7 +180,6 @@ class InferencePipeline:
 
     def _run_model_and_construct(self, latest_df, use_cache: bool):
 
-        # 🔒 Hard feature existence check
         self._validate_features_exist(latest_df)
 
         feature_df = validate_feature_schema(
@@ -189,12 +199,20 @@ class InferencePipeline:
         if np.std(probs) < self.MIN_PROB_STD:
             raise RuntimeError("Probability collapse detected.")
 
+        logger.info(
+            "Inference prob stats | mean=%.4f std=%.4f",
+            float(np.mean(probs)),
+            float(np.std(probs))
+        )
+
         latest_df = latest_df.copy()
         latest_df["score"] = probs
         latest_df["rank_pct"] = latest_df["score"].rank(pct=True)
 
         latest_df["signal"] = latest_df["rank_pct"].apply(
-            lambda x: "LONG" if x >= 0.7 else ("SHORT" if x <= 0.3 else "NEUTRAL")
+            lambda x: "LONG" if x >= 0.7 else (
+                "SHORT" if x <= 0.3 else "NEUTRAL"
+            )
         )
 
         weights = self._construct_portfolio(latest_df)
@@ -209,5 +227,11 @@ class InferencePipeline:
                 "signal": row["signal"],
                 "weight": float(weights.get(row["ticker"], 0.0))
             })
+
+        # 🔐 Drift trigger (non-blocking)
+        try:
+            self.drift_detector.check_drift(feature_df)
+        except Exception as e:
+            logger.warning("Drift check failed (non-blocking): %s", str(e))
 
         return portfolio_rows
