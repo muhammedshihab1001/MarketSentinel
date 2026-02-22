@@ -5,7 +5,6 @@ import threading
 import hashlib
 import json
 from dataclasses import dataclass
-from glob import glob
 from pathlib import Path
 
 from core.schema.feature_schema import (
@@ -67,10 +66,6 @@ class ModelLoader:
         self._xgb_container: LoadedModel | None = None
         self._initialized = True
 
-        self._allow_latest_fallback = (
-            os.getenv("ALLOW_LATEST_FALLBACK", "false").lower() == "true"
-        )
-
     ########################################################
     # SHA256
     ########################################################
@@ -112,7 +107,7 @@ class ModelLoader:
         return base_dir
 
     ########################################################
-    # PRODUCTION POINTER RESOLUTION
+    # PRODUCTION POINTER RESOLUTION (MANDATORY)
     ########################################################
 
     def _resolve_production_version(self, base_dir):
@@ -123,11 +118,6 @@ class ModelLoader:
         )
 
         if not os.path.exists(pointer_path):
-
-            if self._allow_latest_fallback:
-                logger.warning("Pointer missing — fallback enabled.")
-                return None
-
             raise RuntimeError("production_pointer.json missing.")
 
         if os.path.islink(pointer_path):
@@ -162,37 +152,14 @@ class ModelLoader:
         return model_path, metadata_path, version, pointer_hash
 
     ########################################################
-    # FIND ARTIFACT
+    # FIND ARTIFACT (STRICT POINTER MODE)
     ########################################################
 
     def _find_artifact(self):
 
         base_dir = self._get_registry_dir()
 
-        resolved = self._resolve_production_version(base_dir)
-
-        if resolved:
-            return resolved
-
-        model_files = glob(
-            os.path.join(base_dir, "model_*.pkl")
-        )
-
-        if not model_files:
-            raise RuntimeError("No model artifacts found.")
-
-        latest = max(model_files, key=os.path.getmtime)
-        version = Path(latest).stem.replace("model_", "")
-
-        metadata_path = os.path.join(
-            base_dir,
-            f"metadata_{version}.json"
-        )
-
-        if not os.path.exists(metadata_path):
-            raise RuntimeError("Metadata missing for latest model.")
-
-        return latest, metadata_path, version, None
+        return self._resolve_production_version(base_dir)
 
     ########################################################
     # SAFE LOAD MODEL
