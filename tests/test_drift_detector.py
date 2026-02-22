@@ -3,6 +3,7 @@ import pandas as pd
 
 from core.monitoring.drift_detector import DriftDetector
 from core.schema.feature_schema import MODEL_FEATURES
+from core.artifacts.metadata_manager import MetadataManager
 
 
 def test_drift_detector_runs():
@@ -20,6 +21,10 @@ def test_drift_detector_runs():
         dataset=df,
         dataset_hash="testhash",
         training_code_hash="codehash",
+        feature_checksum=MetadataManager.fingerprint_features(
+            tuple(MODEL_FEATURES)
+        ),
+        model_version="test_version",
         allow_overwrite=True
     )
 
