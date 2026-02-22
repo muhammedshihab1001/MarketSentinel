@@ -99,7 +99,7 @@ def sanitize_metrics(metrics: dict) -> dict:
 
 
 ############################################################
-# LOAD DATA (UPDATED)
+# LOAD DATA
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -133,10 +133,6 @@ def load_training_data(start_date, end_date):
     if not datasets:
         raise RuntimeError("All tickers failed.")
 
-    # --------------------------------------------------------
-    # CONCAT ALL TICKERS
-    # --------------------------------------------------------
-
     df = pd.concat(datasets, ignore_index=True)
 
     if len(df) < MIN_TRAINING_ROWS:
@@ -147,17 +143,12 @@ def load_training_data(start_date, end_date):
 
     df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
-    # --------------------------------------------------------
-    # ADD TRUE CROSS-SECTIONAL FEATURES (GLOBAL)
-    # --------------------------------------------------------
-
     df = FeatureEngineer.add_cross_sectional_features(df)
     df = FeatureEngineer.finalize(df)
 
     if df.columns.duplicated().any():
         raise RuntimeError("Duplicate columns detected.")
 
-    # Validate full contract now
     _ = validate_feature_schema(
         df.loc[:, MODEL_FEATURES],
         mode="training"
@@ -193,7 +184,6 @@ def build_final_target(df: pd.DataFrame):
     df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype(int)
 
-    # Ensure minimum cross-sectional width
     MIN_CS_WIDTH = 8
     counts = df.groupby("date")["ticker"].transform("count")
     df = df[counts >= MIN_CS_WIDTH]
@@ -213,7 +203,7 @@ def build_final_target(df: pd.DataFrame):
 
 
 ############################################################
-# TRAINER
+# TRAINERS
 ############################################################
 
 def trainer(train_df):
@@ -230,10 +220,6 @@ def trainer(train_df):
 
     return pipeline
 
-
-############################################################
-# FINAL TRAINER
-############################################################
 
 def final_trainer(train_df):
 
@@ -276,7 +262,7 @@ def update_production_pointer(version: str):
 
 
 ############################################################
-# EXPORT
+# EXPORT (FIXED WITH artifact_hash)
 ############################################################
 
 def export_artifacts(model, metrics, dataset_hash,
@@ -292,18 +278,31 @@ def export_artifacts(model, metrics, dataset_hash,
     joblib.dump(model, tmp_path)
     os.replace(tmp_path, model_path)
 
+    # Compute artifact hash
+    def sha256(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    artifact_hash = sha256(model_path)
+
     feature_checksum = compute_feature_checksum()
 
     metadata = MetadataManager.create_metadata(
         model_name="xgboost",
         metrics=metrics,
         features=tuple(MODEL_FEATURES),
-        feature_checksum=feature_checksum,
         training_start=str(start_date),
         training_end=str(end_date),
         dataset_hash=dataset_hash,
         dataset_rows=len(final_df),
-        metadata_type="training_manifest_v1"
+        metadata_type="training_manifest_v1",
+        feature_checksum=feature_checksum,
+        extra_fields={
+            "artifact_hash": artifact_hash
+        }
     )
 
     metadata_path = os.path.join(
@@ -315,7 +314,7 @@ def export_artifacts(model, metrics, dataset_hash,
 
     update_production_pointer(timestamp)
 
-    logger.info("Artifacts exported.")
+    logger.info("Artifacts exported with artifact_hash.")
 
     return timestamp
 
