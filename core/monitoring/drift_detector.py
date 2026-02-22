@@ -30,7 +30,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "17.1"   # 🔥 bumped due to contract fix
+    BASELINE_VERSION = "17.2"   # 🔥 bumped (restored PSI method)
     DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
 
     MIN_SAMPLE_BASELINE = 150
@@ -53,7 +53,6 @@ class DriftDetector:
     def __init__(self, z_threshold: float = 3.5, baseline_dir: str = "artifacts/drift"):
 
         self.z_threshold = z_threshold
-
         self.baseline_dir = os.path.realpath(baseline_dir)
         os.makedirs(self.baseline_dir, exist_ok=True)
 
@@ -69,10 +68,28 @@ class DriftDetector:
 
         self._model_loader = ModelLoader()
 
-        self._enforce_model_contract = (
-            os.path.realpath(self.baseline_dir) ==
-            self.DEFAULT_BASELINE_DIR
+    ########################################################
+    # PSI (RESTORED — CRITICAL FIX)
+    ########################################################
+
+    def _psi(self, bin_edges, expected_counts, actual):
+
+        actual = np.asarray(actual, dtype=np.float64)
+        actual_counts = np.histogram(actual, bins=bin_edges)[0]
+
+        expected_perc = expected_counts / max(expected_counts.sum(), self.EPSILON)
+        actual_perc = actual_counts / max(actual_counts.sum(), self.EPSILON)
+
+        expected_perc = np.clip(expected_perc, self.MIN_BIN_PCT, None)
+        actual_perc = np.clip(actual_perc, self.MIN_BIN_PCT, None)
+
+        psi = np.sum(
+            (actual_perc - expected_perc) *
+            np.log((actual_perc + self.EPSILON) /
+                   (expected_perc + self.EPSILON))
         )
+
+        return float(psi)
 
     ########################################################
     # BASELINE CREATION
@@ -103,7 +120,6 @@ class DriftDetector:
             )
 
         numeric = self._safe_feature_block(dataset)
-
         baseline_features = {}
 
         for col in MODEL_FEATURES:
@@ -151,110 +167,12 @@ class DriftDetector:
         }
 
         payload["integrity_hash"] = self._baseline_hash(payload)
-
         self._atomic_write(payload)
 
         logger.info(
             "Drift baseline created successfully | features=%s",
             len(baseline_features)
         )
-
-    ########################################################
-    # ATOMIC WRITE
-    ########################################################
-
-    def _atomic_write(self, payload: dict):
-
-        tmp_fd, tmp_path = tempfile.mkstemp()
-
-        try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-
-            os.replace(tmp_path, self.BASELINE_PATH)
-
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-    ########################################################
-    # SAFE FEATURE BLOCK
-    ########################################################
-
-    def _safe_feature_block(self, dataset: pd.DataFrame):
-
-        missing = set(MODEL_FEATURES) - set(dataset.columns)
-
-        if missing:
-            raise RuntimeError(
-                f"Missing features for drift detection: {missing}"
-            )
-
-        block = dataset.loc[:, MODEL_FEATURES].copy()
-
-        for col in MODEL_FEATURES:
-            block[col] = pd.to_numeric(
-                block[col],
-                errors="coerce"
-            ).astype(DTYPE)
-
-            block[col] = block[col].replace(
-                [np.inf, -np.inf],
-                np.nan
-            )
-
-        return block
-
-    ########################################################
-    # HASH
-    ########################################################
-
-    @staticmethod
-    def _baseline_hash(payload: dict) -> str:
-
-        clone = dict(payload)
-        clone.pop("integrity_hash", None)
-
-        canonical = json.dumps(
-            clone,
-            sort_keys=True
-        ).encode()
-
-        return hashlib.sha256(canonical).hexdigest()
-
-    ########################################################
-    # LOAD BASELINE
-    ########################################################
-
-    def _load_verified_baseline(self):
-
-        if not os.path.exists(self.BASELINE_PATH):
-            raise RuntimeError("Baseline missing.")
-
-        with open(self.BASELINE_PATH, encoding="utf-8") as f:
-            baseline = json.load(f)
-
-        if baseline["integrity_hash"] != self._baseline_hash(baseline):
-            raise RuntimeError("Baseline integrity failure.")
-
-        meta = baseline["meta"]
-
-        if meta["baseline_version"] != self.BASELINE_VERSION:
-            raise RuntimeError("Baseline version mismatch.")
-
-        if meta["schema_signature"] != get_schema_signature():
-            raise RuntimeError("Baseline schema mismatch.")
-
-        if "feature_checksum" in meta and meta["feature_checksum"]:
-            current_checksum = MetadataManager.fingerprint_features(
-                tuple(MODEL_FEATURES)
-            )
-            if meta["feature_checksum"] != current_checksum:
-                raise RuntimeError("Baseline feature checksum mismatch.")
-
-        return baseline
 
     ########################################################
     # DETECT
@@ -278,14 +196,12 @@ class DriftDetector:
 
             total_features = len(baseline["features"])
             active_features = 0
-
             sample_size = len(numeric)
 
             for col, stats in baseline["features"].items():
 
                 current = numeric[col].dropna()
 
-                # 🔧 Adaptive minimum sample logic
                 if len(current) < min(self.MIN_SAMPLE_INFERENCE, sample_size):
                     continue
 
@@ -317,20 +233,18 @@ class DriftDetector:
                 report[col] = {
                     "z_score": float(z_score),
                     "variance_ratio": float(variance_ratio),
-                    "psi": psi,
+                    "psi": float(psi),
                     "drift": drift
                 }
 
             coverage = active_features / max(total_features, 1)
 
-            # 🔧 Only fail if truly catastrophic
             if sample_size >= self.MIN_SAMPLE_INFERENCE:
                 if coverage < self.MIN_ACTIVE_FEATURE_RATIO:
                     raise RuntimeError(
                         "Feature coverage collapsed — inference unsafe."
                     )
 
-            # 🔧 Normalize severity
             severity_ratio = drift_count / max(total_features, 1)
             severity_score = min(
                 int(severity_ratio * 10),
