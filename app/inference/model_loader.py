@@ -152,13 +152,11 @@ class ModelLoader:
         return model_path, metadata_path, version, pointer_hash
 
     ########################################################
-    # FIND ARTIFACT (STRICT POINTER MODE)
+    # FIND ARTIFACT
     ########################################################
 
     def _find_artifact(self):
-
         base_dir = self._get_registry_dir()
-
         return self._resolve_production_version(base_dir)
 
     ########################################################
@@ -203,10 +201,6 @@ class ModelLoader:
 
             meta = MetadataManager.load_metadata(metadata_path)
 
-            ####################################################
-            # STRICT METADATA VALIDATION
-            ####################################################
-
             required_keys = {
                 "metadata_type",
                 "schema_signature",
@@ -232,24 +226,12 @@ class ModelLoader:
             if list(meta.get("features")) != list(MODEL_FEATURES):
                 raise RuntimeError("Metadata feature mismatch.")
 
-            ####################################################
-            # ARTIFACT INTEGRITY
-            ####################################################
-
             artifact_hash_actual = self._sha256(model_path)
 
             if meta["artifact_hash"] != artifact_hash_actual:
                 raise RuntimeError("Artifact tampering detected.")
 
-            ####################################################
-            # SAFE LOAD
-            ####################################################
-
             model = self._safe_load_model(model_path)
-
-            ####################################################
-            # FEATURE CHECKSUM VALIDATION
-            ####################################################
 
             feature_checksum_actual = \
                 self._compute_feature_checksum(MODEL_FEATURES)
@@ -292,6 +274,11 @@ class ModelLoader:
     def xgb_version(self):
         self._reload_xgb_if_needed()
         return self._xgb_container.version
+
+    @property
+    def schema_signature(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.schema_signature
 
     @property
     def dataset_hash(self):
