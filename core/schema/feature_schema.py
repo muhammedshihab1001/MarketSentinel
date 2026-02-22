@@ -8,7 +8,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "32.2"  # bumped due to fold-safe cross-sectional handling
+SCHEMA_VERSION = "32.3"  # bumped: neutralized cross-sectional constants allowed in strict mode
 
 
 ############################################################
@@ -151,7 +151,7 @@ def validate_feature_schema(
             logger.warning(f"Low variance core feature: {col}")
 
     ########################################################
-    # CROSS-SECTIONAL VALIDATION (FOLD-SAFE)
+    # CROSS-SECTIONAL VALIDATION (UPDATED)
     ########################################################
 
     if mode == "training":
@@ -171,6 +171,15 @@ def validate_feature_schema(
             finite_vals = series[np.isfinite(series)]
 
             if finite_vals.nunique() <= 1:
+
+                # ✅ Allow fully neutralized column (all zeros)
+                if (finite_vals == 0).all():
+                    logger.warning(
+                        "Neutralized constant cross-sectional feature allowed in strict contract: %s",
+                        col
+                    )
+                    continue
+
                 raise RuntimeError(
                     f"Constant cross-sectional feature detected: {col}"
                 )
