@@ -3,15 +3,11 @@ MarketSentinel Institutional Evaluation Runner
 
 Used by CI/CD pipeline.
 
-Guarantees:
-- Loads latest XGBoost artifact
-- Validates schema signature
-- Rebuilds evaluation dataset
-- Reconstructs cross-sectional features
-- Computes alpha + classification metrics
-- Enforces production governance thresholds
+Hard-fails on governance breach.
+Explicit exit codes for CI.
 """
 
+import sys
 import os
 import glob
 import json
@@ -29,43 +25,108 @@ from core.schema.feature_schema import (
 )
 from core.market.universe import MarketUniverse
 from core.time.market_time import MarketTime
-
 from training.evaluate import evaluate_xgboost
 
 
 # =========================================================
-# GOVERNANCE THRESHOLDS (CI HARD GATE)
+# GOVERNANCE THRESHOLDS
 # =========================================================
 
 MIN_ROC_AUC = 0.50
 MIN_SHARPE = 0.10
 MIN_SPREAD = 0.0
 MIN_SAMPLE_SIZE = 2000
-
 FORWARD_DAYS = 5
 
 
 # =========================================================
-# LOAD LATEST MODEL (STRICT)
+# ENTRY POINT
+# =========================================================
+
+def main() -> int:
+
+    print("Starting CI evaluation...")
+
+    init_env()
+
+    model = load_latest_model()
+    df = build_dataset()
+
+    X = df.loc[:, MODEL_FEATURES]
+    y = df["target"]
+    forward_returns = df["forward_log_return"]
+    dates = df["date"]
+
+    probs = model.predict_proba(X)[:, 1]
+
+    df_eval = df.copy()
+    df_eval["prob"] = probs
+
+    preds = np.full(len(df_eval), -1, dtype=int)
+
+    for date, group in df_eval.groupby("date"):
+
+        if len(group) < 5:
+            continue
+
+        long_threshold = group["prob"].quantile(0.70)
+        short_threshold = group["prob"].quantile(0.30)
+
+        long_mask = (df_eval["date"] == date) & (df_eval["prob"] >= long_threshold)
+        short_mask = (df_eval["date"] == date) & (df_eval["prob"] <= short_threshold)
+
+        preds[long_mask] = 1
+        preds[short_mask] = 0
+
+    active_mask = preds != -1
+
+    if np.sum(active_mask) < 500:
+        print("FAIL: Too few active signals.")
+        return 1
+
+    metrics = evaluate_xgboost(
+        y_true=y[active_mask],
+        y_pred=preds[active_mask],
+        y_prob=probs[active_mask],
+        forward_returns=forward_returns[active_mask],
+        dates=dates[active_mask],
+        enforce_thresholds=False
+    )
+
+    print("Evaluation metrics:", metrics)
+
+    if metrics["roc_auc"] is not None and metrics["roc_auc"] < MIN_ROC_AUC:
+        print("FAIL: ROC AUC below gate.")
+        return 1
+
+    if metrics["sharpe"] is not None and metrics["sharpe"] < MIN_SHARPE:
+        print("FAIL: Sharpe below gate.")
+        return 1
+
+    if metrics["long_short_spread"] is not None and metrics["long_short_spread"] < MIN_SPREAD:
+        print("FAIL: Negative spread.")
+        return 1
+
+    print("CI evaluation passed.")
+    return 0
+
+
+# =========================================================
+# SUPPORT FUNCTIONS
 # =========================================================
 
 def load_latest_model():
 
     base_dir = os.path.join("artifacts", "xgboost")
-
     model_files = glob.glob(os.path.join(base_dir, "model_*.pkl"))
 
     if not model_files:
         raise RuntimeError("No trained model artifacts found.")
 
     latest = max(model_files, key=os.path.getmtime)
-
     timestamp = os.path.basename(latest).split("_")[1].split(".")[0]
 
-    metadata_path = os.path.join(
-        base_dir,
-        f"metadata_{timestamp}.json"
-    )
+    metadata_path = os.path.join(base_dir, f"metadata_{timestamp}.json")
 
     if not os.path.exists(metadata_path):
         raise RuntimeError("Metadata file missing.")
@@ -74,56 +135,66 @@ def load_latest_model():
         metadata = json.load(f)
 
     if metadata.get("schema_signature") != get_schema_signature():
-        raise RuntimeError("Schema signature mismatch during evaluation.")
+        raise RuntimeError("Schema signature mismatch.")
 
     model = joblib.load(latest)
 
     if not hasattr(model, "predict_proba"):
-        raise RuntimeError("Loaded artifact is not a classifier.")
+        raise RuntimeError("Artifact not classifier.")
 
     print(f"Loaded model version: {timestamp}")
-
     return model
 
 
-# =========================================================
-# CROSS-SECTIONAL FEATURES (MUST MATCH TRAINING)
-# =========================================================
+def build_dataset():
 
-def add_cross_sectional_features(df: pd.DataFrame) -> pd.DataFrame:
+    market_data = MarketDataService()
+    store = FeatureStore()
+    universe = MarketUniverse.get_universe()
 
-    df = df.sort_values(["date", "ticker"]).copy()
+    start_date, end_date = MarketTime.window_for("xgboost")
 
-    base_cols = [
-        "momentum_20",
-        "return_lag5",
-        "rsi",
-        "volatility",
-        "ema_ratio"
-    ]
+    datasets = []
 
-    for col in base_cols:
+    for ticker in universe:
+        try:
+            price_df = market_data.get_price_data(
+                ticker=ticker,
+                start_date=start_date,
+                end_date=end_date
+            )
 
-        if col not in df.columns:
-            raise RuntimeError(f"Missing base feature: {col}")
+            dataset = store.get_features(
+                price_df,
+                sentiment_df=None,
+                ticker=ticker,
+                training=False
+            )
 
-        cs_mean = df.groupby("date")[col].transform("mean")
-        cs_std = df.groupby("date")[col].transform("std")
+            if dataset is not None and not dataset.empty:
+                datasets.append(dataset)
 
-        z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
-        z = z.clip(-5, 5)
+        except Exception:
+            continue
 
-        rank = df.groupby("date")[col].rank(pct=True)
+    if not datasets:
+        raise RuntimeError("No evaluation datasets built.")
 
-        df[f"{col}_z"] = z.fillna(0.0)
-        df[f"{col}_rank"] = rank.fillna(0.5)
+    df = pd.concat(datasets, ignore_index=True)
 
-    return df
+    df = apply_cross_sectional_target(df)
 
+    feature_df = validate_feature_schema(df.loc[:, MODEL_FEATURES])
+    df = df.loc[feature_df.index]
 
-# =========================================================
-# CROSS-SECTIONAL TARGET (MUST MATCH TRAINING)
-# =========================================================
+    if df["target"].nunique() < 2:
+        raise RuntimeError("Labels collapsed.")
+
+    if len(df) < MIN_SAMPLE_SIZE:
+        raise RuntimeError("Dataset too small.")
+
+    return df.reset_index(drop=True)
+
 
 def apply_cross_sectional_target(df):
 
@@ -152,136 +223,9 @@ def apply_cross_sectional_target(df):
 
 
 # =========================================================
-# BUILD EVALUATION DATASET
+# FORCE EXECUTION (CI SAFE)
 # =========================================================
 
-def build_dataset():
-
-    market_data = MarketDataService()
-    store = FeatureStore()
-    universe = MarketUniverse.get_universe()
-
-    start_date, end_date = MarketTime.window_for("xgboost")
-
-    datasets = []
-
-    for ticker in universe:
-
-        try:
-            price_df = market_data.get_price_data(
-                ticker=ticker,
-                start_date=start_date,
-                end_date=end_date
-            )
-
-            dataset = store.get_features(
-                price_df,
-                sentiment_df=None,
-                ticker=ticker,
-                training=False
-            )
-
-            if dataset is not None and not dataset.empty:
-                datasets.append(dataset)
-
-        except Exception:
-            continue
-
-    if not datasets:
-        raise RuntimeError("No evaluation datasets built.")
-
-    df = pd.concat(datasets, ignore_index=True)
-
-    # 🔥 MUST MATCH TRAINING
-    df = add_cross_sectional_features(df)
-
-    df = apply_cross_sectional_target(df)
-
-    feature_df = validate_feature_schema(
-        df.loc[:, MODEL_FEATURES]
-    )
-
-    df = df.loc[feature_df.index]
-
-    if df["target"].nunique() < 2:
-        raise RuntimeError("Evaluation labels collapsed.")
-
-    if len(df) < MIN_SAMPLE_SIZE:
-        raise RuntimeError("Evaluation dataset too small.")
-
-    return df.reset_index(drop=True)
-
-
-# =========================================================
-# MAIN EVALUATION
-# =========================================================
-
-def main():
-
-    init_env()
-
-    model = load_latest_model()
-
-    df = build_dataset()
-
-    X = df.loc[:, MODEL_FEATURES]
-    y = df["target"]
-    forward_returns = df["forward_log_return"]
-    dates = df["date"]
-
-    probs = model.predict_proba(X)[:, 1]
-
-    # =====================================================
-    # TRUE CROSS-SECTIONAL DAILY EXECUTION RULE
-    # =====================================================
-
-    df_eval = df.copy()
-    df_eval["prob"] = probs
-
-    preds = np.full(len(df_eval), -1, dtype=int)
-
-    for date, group in df_eval.groupby("date"):
-
-        if len(group) < 5:
-            continue
-
-        long_threshold = group["prob"].quantile(0.70)
-        short_threshold = group["prob"].quantile(0.30)
-
-        long_mask = (df_eval["date"] == date) & (df_eval["prob"] >= long_threshold)
-        short_mask = (df_eval["date"] == date) & (df_eval["prob"] <= short_threshold)
-
-        preds[long_mask] = 1
-        preds[short_mask] = 0
-
-    active_mask = preds != -1
-
-    if np.sum(active_mask) < 500:
-        raise RuntimeError("Too few active trading signals.")
-
-    metrics = evaluate_xgboost(
-        y_true=y[active_mask],
-        y_pred=preds[active_mask],
-        y_prob=probs[active_mask],
-        forward_returns=forward_returns[active_mask],
-        dates=dates[active_mask],
-        enforce_thresholds=False
-    )
-
-    print("Evaluation metrics:", metrics)
-
-    # =====================================================
-    # HARD GOVERNANCE GATES
-    # =====================================================
-
-    if metrics["roc_auc"] is not None and metrics["roc_auc"] < MIN_ROC_AUC:
-        raise RuntimeError("ROC AUC below CI gate.")
-
-    if metrics["sharpe"] is not None and metrics["sharpe"] < MIN_SHARPE:
-        raise RuntimeError("Sharpe below CI gate.")
-
-    if metrics["long_short_spread"] is not None and metrics["long_short_spread"] < MIN_SPREAD:
-        raise RuntimeError("Negative long-short spread.")
-
-    print("CI evaluation passed.")
-    return metrics
+if __name__ == "__main__":
+    exit_code = main()
+    sys.exit(exit_code)
