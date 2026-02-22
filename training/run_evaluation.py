@@ -40,41 +40,6 @@ FORWARD_DAYS = 5
 
 
 # =========================================================
-# CROSS-SECTIONAL FEATURE REBUILD (MUST MATCH TRAINING)
-# =========================================================
-
-def add_cross_sectional_features(df: pd.DataFrame) -> pd.DataFrame:
-
-    df = df.sort_values(["date", "ticker"]).copy()
-
-    base_cols = [
-        "momentum_20",
-        "return_lag5",
-        "rsi",
-        "volatility",
-        "ema_ratio"
-    ]
-
-    for col in base_cols:
-
-        if col not in df.columns:
-            raise RuntimeError(f"Missing base feature: {col}")
-
-        cs_mean = df.groupby("date")[col].transform("mean")
-        cs_std = df.groupby("date")[col].transform("std")
-
-        z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
-        z = z.clip(-5, 5)
-
-        rank = df.groupby("date")[col].rank(pct=True)
-
-        df[f"{col}_z"] = z.fillna(0.0)
-        df[f"{col}_rank"] = rank.fillna(0.5)
-
-    return df
-
-
-# =========================================================
 # TARGET REBUILD (MUST MATCH TRAINING)
 # =========================================================
 
@@ -161,6 +126,7 @@ def build_dataset():
                 end_date=end_date
             )
 
+            # 🔥 Cross-sectional features now built inside FeatureEngineer
             dataset = store.get_features(
                 price_df,
                 sentiment_df=None,
@@ -179,8 +145,7 @@ def build_dataset():
 
     df = pd.concat(datasets, ignore_index=True)
 
-    # 🔥 CRITICAL: must match training
-    df = add_cross_sectional_features(df)
+    # Target must match training
     df = apply_cross_sectional_target(df)
 
     feature_df = validate_feature_schema(df.loc[:, MODEL_FEATURES])
@@ -225,6 +190,7 @@ def main() -> int:
         if len(group) < 5:
             continue
 
+        # 🔒 Keep canonical 80/20 CI threshold
         long_threshold = group["prob"].quantile(0.80)
         short_threshold = group["prob"].quantile(0.20)
 
