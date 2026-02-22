@@ -30,6 +30,8 @@ class WalkForwardValidator:
     SLIPPAGE = 0.0005
     MAX_SHARPE = 5.0
 
+    EPSILON = 1e-9
+
     def __init__(
         self,
         model_trainer,
@@ -88,6 +90,9 @@ class WalkForwardValidator:
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"], utc=True)
 
+        if df.duplicated(subset=["date", "ticker"]).any():
+            raise RuntimeError("Duplicate date/ticker rows detected.")
+
         unique_dates = df["date"].drop_duplicates().sort_values()
 
         if len(unique_dates) <= self.window_size:
@@ -121,8 +126,6 @@ class WalkForwardValidator:
             ].copy()
 
             if len(train_df) < self.MIN_TRAIN_ROWS:
-                if self.debug:
-                    logger.warning(f"Fold {window_id} skipped: insufficient train rows.")
                 start_idx += self.step_size
                 window_id += 1
                 continue
@@ -133,24 +136,14 @@ class WalkForwardValidator:
             train_df = self._build_fold_target(train_df)
 
             if train_df["target"].nunique() < 2:
-                if self.debug:
-                    logger.warning(f"Fold {window_id} skipped: label collapse.")
                 start_idx += self.step_size
                 window_id += 1
                 continue
 
-            try:
-                model = self.model_trainer(train_df)
-            except Exception as e:
-                logger.warning(f"Fold {window_id} training failed: {e}")
-                start_idx += self.step_size
-                window_id += 1
-                continue
+            model = self.model_trainer(train_df)
 
             window_returns = []
             test_dates_sorted = sorted(test_df["date"].unique())
-
-            collapse_logged = False
 
             for i in range(len(test_dates_sorted) - FORWARD_DAYS):
 
@@ -163,24 +156,23 @@ class WalkForwardValidator:
                 if len(signal_slice) < self.MIN_CROSS_SECTION:
                     continue
 
+                if signal_slice["ticker"].nunique() != len(signal_slice):
+                    raise RuntimeError("Duplicate tickers in signal slice.")
+
+                missing_close = (
+                    "close" not in signal_slice.columns or
+                    "close" not in exit_slice.columns
+                )
+                if missing_close:
+                    raise RuntimeError("Missing close price.")
+
                 X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
 
-                try:
-                    X = validate_feature_schema(X, mode="inference")
-                except Exception:
-                    continue
+                X = validate_feature_schema(X, mode="inference")
 
-                try:
-                    probs = model.predict_proba(X)[:, 1]
-                except Exception:
-                    continue
+                probs = model.predict_proba(X)[:, 1]
 
                 if np.std(probs) < self.MIN_PROB_STD:
-                    if not collapse_logged and self.debug:
-                        logger.warning(
-                            f"Fold {window_id} probability collapse."
-                        )
-                        collapse_logged = True
                     continue
 
                 signal_slice = signal_slice.copy()
@@ -191,10 +183,8 @@ class WalkForwardValidator:
                 longs = ranked.tail(self.TOP_K)
                 shorts = ranked.head(self.BOTTOM_K)
 
-                positions = {}
-
-                long_vol = longs["volatility"].clip(lower=1e-6)
-                short_vol = shorts["volatility"].clip(lower=1e-6)
+                long_vol = longs["volatility"].clip(lower=self.EPSILON)
+                short_vol = shorts["volatility"].clip(lower=self.EPSILON)
 
                 long_weights = 1.0 / long_vol
                 short_weights = 1.0 / short_vol
@@ -205,11 +195,17 @@ class WalkForwardValidator:
                 long_weights *= self.TARGET_GROSS_EXPOSURE / 2
                 short_weights *= self.TARGET_GROSS_EXPOSURE / 2
 
+                positions = {}
+
                 for t, w in zip(longs["ticker"], long_weights):
                     positions[t] = float(w)
 
                 for t, w in zip(shorts["ticker"], short_weights):
                     positions[t] = -float(w)
+
+                gross = sum(abs(v) for v in positions.values())
+                if abs(gross - self.TARGET_GROSS_EXPOSURE) > 1e-6:
+                    raise RuntimeError("Gross exposure mismatch.")
 
                 merged = pd.merge(
                     signal_slice[["ticker", "close"]],
@@ -250,7 +246,7 @@ class WalkForwardValidator:
 
             vol = np.std(window_returns)
 
-            sharpe = 0.0 if vol < 1e-9 else (
+            sharpe = 0.0 if vol < self.EPSILON else (
                 (np.mean(window_returns) / vol)
                 * np.sqrt(252 / FORWARD_DAYS)
             )
@@ -275,6 +271,9 @@ class WalkForwardValidator:
     def aggregate_results(self, results, equity_curve):
 
         df = pd.DataFrame(results)
+
+        if df.empty:
+            raise RuntimeError("No WF results.")
 
         if not equity_curve:
             raise RuntimeError("Equity curve empty.")
