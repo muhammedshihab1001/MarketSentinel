@@ -6,6 +6,8 @@ import random
 import numpy as np
 import pandas as pd
 import argparse
+import hashlib
+import json
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
@@ -45,6 +47,18 @@ def enforce_determinism():
 
 
 ############################################################
+# FEATURE CHECKSUM (LOCAL GOVERNED)
+############################################################
+
+def compute_feature_checksum():
+    canonical = json.dumps(
+        list(MODEL_FEATURES),
+        sort_keys=False
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+############################################################
 # DATASET HASH
 ############################################################
 
@@ -54,7 +68,7 @@ def compute_dataset_hash(df: pd.DataFrame) -> str:
 
 
 ############################################################
-# GLOBAL CROSS-SECTIONAL FEATURES
+# CROSS-SECTIONAL FEATURES
 ############################################################
 
 def add_cross_sectional_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -97,6 +111,7 @@ def sanitize_metrics(metrics: dict) -> dict:
     sanitized = {}
 
     for k, v in metrics.items():
+
         if isinstance(v, (list, tuple, dict, np.ndarray)):
             continue
 
@@ -258,7 +273,6 @@ def final_trainer(train_df):
             df[col] = 0.0
 
     X = validate_feature_schema(df, mode="strict_contract")
-
     y = train_df["target"]
 
     pipeline = build_xgboost_pipeline(y)
@@ -275,6 +289,7 @@ def export_artifacts(model, metrics, dataset_hash,
                      start_date, end_date, final_df):
 
     os.makedirs(MODEL_DIR, exist_ok=True)
+
     timestamp = int(time.time())
 
     model_path = os.path.join(MODEL_DIR, f"model_{timestamp}.pkl")
@@ -283,10 +298,13 @@ def export_artifacts(model, metrics, dataset_hash,
     joblib.dump(model, tmp_path)
     os.replace(tmp_path, model_path)
 
+    feature_checksum = compute_feature_checksum()
+
     metadata = MetadataManager.create_metadata(
         model_name="xgboost",
         metrics=metrics,
         features=tuple(MODEL_FEATURES),
+        feature_checksum=feature_checksum,
         training_start=str(start_date),
         training_end=str(end_date),
         dataset_hash=dataset_hash,
@@ -346,22 +364,14 @@ def main(start_date=None, end_date=None, create_baseline=False):
         final_df
     )
 
-    ########################################################
-    # GOVERNED BASELINE CREATION
-    ########################################################
-
     if create_baseline:
-
-        feature_checksum = MetadataManager.fingerprint_features(
-            tuple(MODEL_FEATURES)
-        )
 
         drift = DriftDetector()
         drift.create_baseline(
             dataset=final_df,
             dataset_hash=dataset_hash,
             training_code_hash=MetadataManager.fingerprint_training_code(),
-            feature_checksum=feature_checksum,
+            feature_checksum=compute_feature_checksum(),
             model_version=str(version),
             allow_overwrite=False
         )
