@@ -18,6 +18,8 @@ class BacktestEngine:
     MAX_GAP = 0.35
     MAX_TURNOVER = 8.0
 
+    EPSILON = 1e-12
+
     ############################################################
 
     def _validate_inputs(self, prices, signals, position_size):
@@ -48,7 +50,6 @@ class BacktestEngine:
     ############################################################
 
     def _gap_ok(self, prev_price, price):
-
         gap = abs(price / prev_price - 1)
         return gap <= self.MAX_GAP
 
@@ -66,7 +67,7 @@ class BacktestEngine:
 
         self._validate_inputs(prices, signals, position_size)
 
-        prices = np.asarray(prices, dtype=float)
+        prices = np.asarray(prices, dtype=np.float64)
         signals = list(signals)
 
         if len(prices) < 2:
@@ -87,7 +88,7 @@ class BacktestEngine:
         peak_equity = initial_cash
 
         prev_price = prices[0]
-        prev_signal = "HOLD"
+        prev_signal = signals[0]  # 🔒 align signal timing strictly
 
         ####################################################
         # MAIN LOOP
@@ -95,7 +96,7 @@ class BacktestEngine:
 
         for i in range(1, len(prices)):
 
-            price = prices[i]
+            price = float(prices[i])
 
             if not self._gap_ok(prev_price, price):
                 prev_signal = "HOLD"
@@ -106,7 +107,10 @@ class BacktestEngine:
             if cooldown > 0:
                 cooldown -= 1
 
+            ################################################
             # BUY
+            ################################################
+
             if (
                 prev_signal == "BUY"
                 and cash > self.MIN_CAPITAL
@@ -115,20 +119,26 @@ class BacktestEngine:
             ):
 
                 execution_price = price * (1 + slippage)
+
                 deploy_cash = cash * position_size
+                deploy_cash = min(deploy_cash, cash)
 
                 shares = (
                     deploy_cash * (1 - transaction_cost)
                 ) / execution_price
 
-                position = shares
+                position = float(shares)
                 cash -= deploy_cash
+                cash = max(cash, 0.0)
 
                 capital_rotated += deploy_cash
                 trade_count += 1
                 hold_bars = 0
 
+            ################################################
             # SELL
+            ################################################
+
             elif (
                 prev_signal == "SELL"
                 and position > 0
@@ -146,10 +156,14 @@ class BacktestEngine:
                 capital_rotated += proceeds
 
                 cash += proceeds
-                position = 0
+                position = 0.0
 
                 trade_count += 1
                 cooldown = self.REENTRY_COOLDOWN
+
+            ################################################
+            # PORTFOLIO VALUE
+            ################################################
 
             portfolio_value = cash + position * price
 
@@ -178,7 +192,7 @@ class BacktestEngine:
             if position > 0:
                 time_in_market += 1
 
-            portfolio_values.append(portfolio_value)
+            portfolio_values.append(float(portfolio_value))
 
             prev_signal = signals[i]
             prev_price = price
@@ -192,24 +206,37 @@ class BacktestEngine:
             final_price = prices[-1]
             liquidation_price = final_price * (1 - slippage)
 
-            cash += position * liquidation_price * (1 - transaction_cost)
+            proceeds = (
+                position
+                * liquidation_price
+                * (1 - transaction_cost)
+            )
 
-            position = 0
-            portfolio_values[-1] = cash
+            cash += proceeds
+            position = 0.0
+
+            portfolio_values[-1] = float(cash)
 
             trade_count += 1
 
         if not portfolio_values:
             return self._empty_result(initial_cash)
 
-        portfolio_values = np.array(portfolio_values, dtype=float)
+        portfolio_values = np.array(portfolio_values, dtype=np.float64)
         portfolio_values = np.maximum(portfolio_values, self.MIN_CAPITAL)
+
+        ####################################################
+        # PERFORMANCE METRICS
+        ####################################################
 
         strategy_return = portfolio_values[-1] / initial_cash - 1
         buy_hold_return = prices[-1] / prices[0] - 1
         alpha = strategy_return - buy_hold_return
 
-        returns = np.diff(portfolio_values) / portfolio_values[:-1]
+        returns = np.diff(portfolio_values) / (
+            portfolio_values[:-1] + self.EPSILON
+        )
+
         returns = returns[np.isfinite(returns)]
 
         if len(returns) > 1:
@@ -263,59 +290,3 @@ class BacktestEngine:
             "turnover": 0.0,
             "equity_curve": [initial_cash]
         }
-
-
-############################################################
-# WRAPPER FUNCTIONS (FOR TEST COMPATIBILITY)
-############################################################
-
-def backtest_strategy(df: pd.DataFrame):
-
-    if "close" not in df.columns or "signal" not in df.columns:
-        raise RuntimeError("DataFrame must contain 'close' and 'signal' columns.")
-
-    engine = BacktestEngine()
-
-    result = engine.run(
-        prices=df["close"].values,
-        signals=df["signal"].values
-    )
-
-    return {
-        "total_return": result["strategy_return"],
-        "buy_hold_return": result["buy_hold_return"],
-        "trade_count": result["trade_count"]
-    }
-
-
-def signal_hit_rate(df: pd.DataFrame):
-
-    if "close" not in df.columns or "signal" not in df.columns:
-        raise RuntimeError("DataFrame must contain 'close' and 'signal' columns.")
-
-    prices = df["close"].values
-    signals = df["signal"].values
-
-    if len(prices) < 2:
-        return {"hit_rate": 0.0}
-
-    correct = 0
-    total = 0
-
-    for i in range(len(prices) - 1):
-
-        ret = prices[i + 1] - prices[i]
-
-        if signals[i] == "BUY":
-            total += 1
-            if ret > 0:
-                correct += 1
-
-        elif signals[i] == "SELL":
-            total += 1
-            if ret < 0:
-                correct += 1
-
-    hit_rate = correct / total if total > 0 else 0.0
-
-    return {"hit_rate": float(hit_rate)}
