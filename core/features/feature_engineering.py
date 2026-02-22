@@ -1,5 +1,3 @@
-# core/features/feature_engineering.py
-
 import pandas as pd
 import numpy as np
 import logging
@@ -163,6 +161,27 @@ class FeatureEngineer:
             df["ema_10"] / (df["ema_50"] + cls.EPSILON)
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
+        ########################################################
+        # REGIME FEATURE (RESTORED)
+        ########################################################
+
+        rolling_mean = (
+            df.groupby("ticker")["volatility_20"]
+            .transform(lambda x: x.rolling(60, min_periods=20).mean())
+        )
+
+        rolling_std = (
+            df.groupby("ticker")["volatility_20"]
+            .transform(lambda x: x.rolling(60, min_periods=20).std(ddof=0))
+        )
+
+        zscore = (df["volatility_20"] - rolling_mean) / (
+            rolling_std + cls.EPSILON
+        )
+
+        df["regime_feature"] = np.where(zscore > 0.5, 1.0, 0.0)
+        df["regime_feature"] = df["regime_feature"].fillna(0.0)
+
         return df
 
     ########################################################
@@ -203,7 +222,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # FINALIZE (STRICT CONTRACT ENFORCEMENT)
+    # FINALIZE
     ########################################################
 
     @classmethod
@@ -223,13 +242,7 @@ class FeatureEngineer:
         if missing:
             raise RuntimeError(f"Missing features: {missing}")
 
-        # 🔒 Enforce strict model feature contract ordering
-        feature_block = df.loc[:, MODEL_FEATURES].copy()
-
-        return pd.concat(
-            [df[["date", "ticker", "close"]], feature_block],
-            axis=1
-        ).reset_index(drop=True)
+        return df.reset_index(drop=True)
 
     ########################################################
     # PIPELINE
