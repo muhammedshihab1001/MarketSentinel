@@ -12,6 +12,8 @@ class StockPriceFetcher:
     MAX_RETRIES = 3
     RETRY_SLEEP = 2
     MIN_ROWS = 100
+    MAX_DAILY_RETURN = 0.60
+    MAX_VOLUME_SPIKE = 50
 
     ########################################################
     # BULLETPROOF DATE EXTRACTION
@@ -19,11 +21,9 @@ class StockPriceFetcher:
 
     def _extract_date_column(self, df):
 
-        # CASE 1 — DatetimeIndex
         if isinstance(df.index, pd.DatetimeIndex):
             df = df.reset_index()
 
-        # Normalize column names early
         df.columns = [str(c).lower().strip() for c in df.columns]
 
         possible = ["date", "datetime", "timestamp", "index"]
@@ -51,7 +51,6 @@ class StockPriceFetcher:
 
     def _flatten_columns(self, df):
 
-        # Handles MultiIndex from Yahoo
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] for c in df.columns]
 
@@ -83,6 +82,31 @@ class StockPriceFetcher:
 
         if (df["volume"] < 0).any():
             raise RuntimeError("Negative volume detected.")
+
+        ####################################################
+        # OHLC CONSISTENCY CHECK
+        ####################################################
+
+        if not ((df["low"] <= df["close"]) & (df["close"] <= df["high"])).all():
+            raise RuntimeError("OHLC inconsistency detected.")
+
+        ####################################################
+        # EXTREME RETURN GUARD
+        ####################################################
+
+        returns = df["close"].pct_change().abs()
+
+        if returns.max() > self.MAX_DAILY_RETURN:
+            raise RuntimeError("Extreme price jump detected.")
+
+        ####################################################
+        # VOLUME SPIKE GUARD
+        ####################################################
+
+        vol_ratio = df["volume"] / (df["volume"].rolling(20).mean() + 1e-6)
+
+        if vol_ratio.max() > self.MAX_VOLUME_SPIKE:
+            logger.warning("Unusual volume spike detected.")
 
         return df
 
@@ -138,25 +162,26 @@ class StockPriceFetcher:
         )
 
         ####################################################
-        # 🔥 FIX 1 — FLATTEN FIRST
+        # FLATTEN
         ####################################################
 
         df = self._flatten_columns(df)
 
         ####################################################
-        # 🔥 FIX 2 — DATE EXTRACTION
+        # DATE EXTRACTION
         ####################################################
 
         df = self._extract_date_column(df)
 
         ####################################################
-        # 🔥 FIX 3 — UTC SAFE
+        # UTC NORMALIZATION
         ####################################################
 
         df["date"] = self._ensure_utc(df["date"])
-
         df.dropna(subset=["date"], inplace=True)
 
+        ####################################################
+        # ADJUSTED CLOSE HANDLING
         ####################################################
 
         if "adj_close" in df.columns:
@@ -171,11 +196,21 @@ class StockPriceFetcher:
                 f"Yahoo schema drift detected. Missing={missing}"
             )
 
+        ####################################################
+        # VALIDATION
+        ####################################################
+
         df = self._validate_prices(df)
+
+        ####################################################
+        # DUPLICATE DATE HARD STOP
+        ####################################################
+
+        if df["date"].duplicated().any():
+            raise RuntimeError("Duplicate timestamps detected.")
 
         df = (
             df
-            .drop_duplicates("date")
             .sort_values("date")
             .reset_index(drop=True)
         )
@@ -189,10 +224,23 @@ class StockPriceFetcher:
         if df["date"].max() > now_utc:
             raise RuntimeError("Future candle detected.")
 
+        ####################################################
+        # MINIMUM HISTORY CHECK
+        ####################################################
+
         if len(df) < self.MIN_ROWS:
             raise RuntimeError(
                 f"Insufficient history for {ticker}"
             )
+
+        ####################################################
+        # GAP LOGGING (non-fatal)
+        ####################################################
+
+        date_diff = df["date"].diff().dt.days
+
+        if date_diff.max() > 10:
+            logger.warning("Large calendar gap detected for %s", ticker)
 
         df["ticker"] = ticker
 
