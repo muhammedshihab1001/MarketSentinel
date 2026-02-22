@@ -28,7 +28,8 @@ except Exception:
 
 class DriftDetector:
 
-    BASELINE_PATH = "artifacts/drift/baseline.json"
+    BASELINE_FILENAME = "baseline.json"
+
     BASELINE_VERSION = "16.0"
 
     MIN_SAMPLE_BASELINE = 150
@@ -47,10 +48,17 @@ class DriftDetector:
 
     ########################################################
 
-    def __init__(self, z_threshold: float = 3.5):
+    def __init__(self, z_threshold: float = 3.5, baseline_dir: str = "artifacts/drift"):
 
         self.z_threshold = z_threshold
-        os.makedirs("artifacts/drift", exist_ok=True)
+
+        self.baseline_dir = os.path.realpath(baseline_dir)
+        os.makedirs(self.baseline_dir, exist_ok=True)
+
+        self.BASELINE_PATH = os.path.join(
+            self.baseline_dir,
+            self.BASELINE_FILENAME
+        )
 
         self.hard_fail = os.getenv(
             "DRIFT_HARD_FAIL",
@@ -110,12 +118,9 @@ class DriftDetector:
             if not np.isfinite([mean, std, variance]).all():
                 raise RuntimeError(f"Non-finite baseline stats for {col}")
 
-            if std <= 0:
-                raise RuntimeError(f"Zero-variance baseline feature: {col}")
-
             counts, bin_edges = np.histogram(series, bins=20)
 
-            if len(bin_edges) < 2 or counts.sum() == 0:
+            if len(bin_edges) < 2:
                 raise RuntimeError("Invalid histogram construction.")
 
             features[col] = {
@@ -149,21 +154,16 @@ class DriftDetector:
         )
 
     ########################################################
-    # SAFE PATH
-    ########################################################
 
     def _safe_baseline_path(self):
 
-        base = os.path.realpath("artifacts/drift")
         path = os.path.realpath(self.BASELINE_PATH)
 
-        if not path.startswith(base):
+        if not path.startswith(self.baseline_dir):
             raise RuntimeError("Baseline path traversal detected.")
 
         return path
 
-    ########################################################
-    # ATOMIC WRITE
     ########################################################
 
     def _atomic_write(self, payload, path):
@@ -172,7 +172,7 @@ class DriftDetector:
             mode="w",
             encoding="utf-8",
             delete=False,
-            dir=os.path.dirname(path),
+            dir=self.baseline_dir,
             suffix=".tmp"
         ) as tmp:
 
@@ -182,134 +182,6 @@ class DriftDetector:
             temp_name = tmp.name
 
         os.replace(temp_name, path)
-
-    ########################################################
-    # PSI
-    ########################################################
-
-    def _psi(self, bin_edges, expected_counts, actual):
-
-        actual = np.asarray(actual, dtype=np.float64)
-
-        if len(actual) == 0:
-            return 0.0
-
-        actual_counts = np.histogram(actual, bins=bin_edges)[0]
-
-        expected_perc = expected_counts / max(
-            expected_counts.sum(), self.EPSILON
-        )
-
-        actual_perc = actual_counts / max(
-            actual_counts.sum(), self.EPSILON
-        )
-
-        expected_perc = np.clip(expected_perc, self.MIN_BIN_PCT, None)
-        actual_perc = np.clip(actual_perc, self.MIN_BIN_PCT, None)
-
-        psi = np.sum(
-            (actual_perc - expected_perc) *
-            np.log((actual_perc + self.EPSILON) /
-                   (expected_perc + self.EPSILON))
-        )
-
-        return float(psi)
-
-    ########################################################
-    # HASH
-    ########################################################
-
-    @staticmethod
-    def _baseline_hash(payload: dict) -> str:
-
-        clone = dict(payload)
-        clone.pop("integrity_hash", None)
-
-        canonical = json.dumps(
-            clone,
-            sort_keys=True,
-            separators=(",", ":")
-        ).encode()
-
-        return hashlib.sha256(canonical).hexdigest()
-
-    ########################################################
-    # SAFE FEATURE BLOCK
-    ########################################################
-
-    def _safe_feature_block(self, dataset: pd.DataFrame):
-
-        missing = set(MODEL_FEATURES) - set(dataset.columns)
-
-        if missing:
-            raise RuntimeError(
-                f"Missing features for drift detection: {missing}"
-            )
-
-        block = dataset.loc[:, MODEL_FEATURES].copy()
-
-        for col in MODEL_FEATURES:
-            block[col] = pd.to_numeric(
-                block[col],
-                errors="coerce"
-            ).astype(DTYPE)
-
-            block[col] = block[col].replace(
-                [np.inf, -np.inf],
-                np.nan
-            )
-
-        if block.isnull().all().all():
-            raise RuntimeError("All features invalid.")
-
-        return block
-
-    ########################################################
-    # LOAD VERIFIED BASELINE
-    ########################################################
-
-    def _load_verified_baseline(self):
-
-        path = self._safe_baseline_path()
-
-        if not os.path.exists(path):
-            raise RuntimeError("Baseline missing.")
-
-        with open(path, encoding="utf-8") as f:
-            baseline = json.load(f)
-
-        if baseline["integrity_hash"] != self._baseline_hash(baseline):
-            raise RuntimeError("Baseline integrity failure.")
-
-        meta = baseline["meta"]
-
-        if meta["baseline_version"] != self.BASELINE_VERSION:
-            raise RuntimeError("Baseline version mismatch.")
-
-        if meta["schema_signature"] != get_schema_signature():
-            raise RuntimeError("Baseline schema mismatch.")
-
-        if set(baseline["features"].keys()) != set(MODEL_FEATURES):
-            raise RuntimeError("Baseline feature contract mismatch.")
-
-        loader = self._model_loader
-
-        if meta.get("model_version") != loader.xgb_version:
-            raise RuntimeError(
-                f"Baseline tied to model_version={meta.get('model_version')} "
-                f"but current production version={loader.xgb_version}"
-            )
-
-        if meta.get("model_feature_checksum") != loader.feature_checksum:
-            raise RuntimeError("Model feature checksum mismatch.")
-
-        if meta["dataset_hash"] != loader.dataset_hash:
-            logger.warning("Dataset hash drift detected.")
-
-        if meta["training_code_hash"] != loader.training_code_hash:
-            logger.warning("Training code drift detected.")
-
-        return baseline
 
     ########################################################
     # DETECT DRIFT
