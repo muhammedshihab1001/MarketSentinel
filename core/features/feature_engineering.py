@@ -15,7 +15,7 @@ class FeatureEngineer:
     SPLIT_THRESHOLD = 3.5
 
     ########################################################
-    # DATETIME NORMALIZATION (FIXED)
+    # DATETIME NORMALIZATION
     ########################################################
 
     @staticmethod
@@ -26,7 +26,6 @@ class FeatureEngineer:
         if "date" not in df.columns:
             raise RuntimeError("Price dataframe requires 'date' column.")
 
-        # ✅ FIX: Convert to UTC then drop timezone (align with MarketDataService)
         df["date"] = (
             pd.to_datetime(df["date"], utc=True, errors="coerce")
             .dt.tz_convert(None)
@@ -215,7 +214,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # CROSS-SECTIONAL
+    # CROSS-SECTIONAL (DEPRECATION SAFE)
     ########################################################
 
     @classmethod
@@ -229,17 +228,24 @@ class FeatureEngineer:
             "ema_ratio"
         ]
 
+        df = df.sort_values(["date", "ticker"]).copy()
+
         for col in cross_cols:
 
-            grouped = df.groupby("date")[col]
+            cs_mean = df.groupby("date")[col].transform("mean")
+            cs_std = df.groupby("date")[col].transform(lambda x: x.std(ddof=0))
 
-            z = grouped.transform(
-                lambda x: (x - x.mean()) / (x.std(ddof=0) + 1e-9)
-            )
+            degenerate_mask = (cs_std == 0) | (~np.isfinite(cs_std))
 
-            rank = grouped.transform(lambda x: x.rank(pct=True))
+            z = (df[col] - cs_mean) / cs_std.replace(0, np.nan)
+            z = z.clip(-5, 5)
 
-            df[f"{col}_z"] = z.fillna(0.0).clip(-5, 5)
+            rank = df.groupby("date")[col].rank(pct=True)
+
+            z[degenerate_mask] = 0.0
+            rank[degenerate_mask] = 0.5
+
+            df[f"{col}_z"] = z.fillna(0.0)
             df[f"{col}_rank"] = rank.fillna(0.5)
 
         return df
