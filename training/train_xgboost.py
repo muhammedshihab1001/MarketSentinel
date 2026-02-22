@@ -214,18 +214,41 @@ def trainer(train_df):
 
 
 ############################################################
-# FINAL TRAINER (STRICT CONTRACT)
+# FINAL TRAINER (STRICT CONTRACT + CONSISTENT WITH CV)
 ############################################################
 
 def final_trainer(train_df):
 
     df = train_df.copy()
 
+    # Ensure all required model features exist
     for col in MODEL_FEATURES:
         if col not in df.columns:
             df[col] = 0.0
 
-    df = df.loc[:, MODEL_FEATURES]
+    df = df.loc[:, MODEL_FEATURES].copy()
+
+    ########################################################
+    # NEUTRALIZE CONSTANT FEATURES (CONSISTENT WITH CV)
+    ########################################################
+
+    constant_cols = [
+        col for col in df.columns
+        if df[col].nunique(dropna=True) <= 1
+    ]
+
+    if constant_cols:
+        logger.warning(
+            "Final-train constant features neutralized (set to 0): %s",
+            constant_cols
+        )
+
+        for col in constant_cols:
+            df[col] = 0.0
+
+    ########################################################
+    # STRICT SCHEMA VALIDATION
+    ########################################################
 
     X = validate_feature_schema(df, mode="strict_contract")
 
