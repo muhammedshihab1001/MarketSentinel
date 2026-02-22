@@ -180,6 +180,27 @@ def build_final_target(df: pd.DataFrame):
     df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype(int)
 
+    # --------------------------------------------------------
+    # INDUSTRIAL SAFE PATCH
+    # Prevent strict_contract cross-sectional collapse
+    # --------------------------------------------------------
+
+    MIN_CS_WIDTH = 8  # safe for limited free market data
+
+    counts = df.groupby("date")["ticker"].transform("count")
+    df = df[counts >= MIN_CS_WIDTH]
+
+    if df.empty:
+        raise RuntimeError(
+            "All dates dropped after cross-sectional width enforcement."
+        )
+
+    logger.info(
+        "Final training dataset | rows=%s | unique_dates=%s",
+        len(df),
+        df["date"].nunique()
+    )
+
     return df
 
 
