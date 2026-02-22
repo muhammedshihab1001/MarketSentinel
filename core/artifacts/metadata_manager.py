@@ -416,3 +416,22 @@ class MetadataManager:
         )
 
         return metadata
+        ########################################################
+    # FEATURE CHECKSUM
+    ########################################################
+
+    @staticmethod
+    def fingerprint_features(features: tuple) -> str:
+        """
+        Stable checksum of ordered model feature list.
+        Enforces strict feature contract binding.
+        """
+        import hashlib
+        import json
+
+        canonical = json.dumps(
+            list(features),
+            sort_keys=False
+        ).encode()
+
+        return hashlib.sha256(canonical).hexdigest()
