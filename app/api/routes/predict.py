@@ -9,6 +9,7 @@ import logging
 import math
 import json
 from pathlib import Path
+from typing import List, Optional, Dict, Any
 
 from app.inference.pipeline import InferencePipeline
 from app.inference.model_loader import ModelLoader
@@ -21,6 +22,7 @@ from app.monitoring.metrics import (
 
 router = APIRouter()
 logger = logging.getLogger("marketsentinel.api")
+
 
 # =========================================================
 # SINGLETONS
@@ -58,10 +60,11 @@ REQUEST_TIMEOUT = int(
 )
 
 MAX_BATCH_SIZE = int(
-    os.getenv("MAX_BATCH_SIZE", "30")  # 🔥 reduced from 50
+    os.getenv("MAX_BATCH_SIZE", "30")
 )
 
 MIN_BATCH_SIZE = 4
+
 DEFAULT_USE_UNIVERSE = os.getenv(
     "DEFAULT_USE_UNIVERSE",
     "true"
@@ -85,7 +88,7 @@ TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 # DEFAULT UNIVERSE LOADER
 # =========================================================
 
-def load_default_universe():
+def load_default_universe() -> List[str]:
 
     if not UNIVERSE_CONFIG_PATH.exists():
         raise RuntimeError("Universe config missing.")
@@ -104,7 +107,7 @@ def load_default_universe():
 # =========================================================
 
 class PortfolioRequest(BaseModel):
-    tickers: list[str] | None = Field(default=None)
+    tickers: Optional[List[str]] = Field(default=None)
 
     @field_validator("tickers")
     @classmethod
@@ -137,7 +140,7 @@ class PortfolioRequest(BaseModel):
 # OUTPUT VALIDATION
 # =========================================================
 
-def validate_portfolio_output(result):
+def validate_portfolio_output(result: Any):
 
     if not isinstance(result, list):
         raise RuntimeError("Invalid portfolio output format.")
@@ -153,20 +156,28 @@ def validate_portfolio_output(result):
             raise RuntimeError("Portfolio row missing fields.")
 
         for k, v in row.items():
-            if isinstance(v, float):
-                if not math.isfinite(v):
-                    raise RuntimeError(
-                        f"Non-finite value in portfolio output: {k}"
-                    )
+            if isinstance(v, float) and not math.isfinite(v):
+                raise RuntimeError(
+                    f"Non-finite value in portfolio output: {k}"
+                )
 
     return result
+
+
+# =========================================================
+# RESPONSE MODEL (STRICT)
+# =========================================================
+
+class PortfolioResponse(BaseModel):
+    meta: Dict[str, Any]
+    portfolio: List[Dict[str, Any]]
 
 
 # =========================================================
 # PORTFOLIO ENDPOINT
 # =========================================================
 
-@router.post("/portfolio")
+@router.post("/portfolio", response_model=PortfolioResponse)
 async def build_portfolio(req: PortfolioRequest):
 
     endpoint = "/portfolio"
@@ -204,6 +215,13 @@ async def build_portfolio(req: PortfolioRequest):
 
         loader = get_loader()
 
+        # Defensive: ensure model container integrity
+        if loader._xgb_container is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Model container unavailable"
+            )
+
         # -------------------------------------------------
         # Concurrency Guard
         # -------------------------------------------------
@@ -220,18 +238,24 @@ async def build_portfolio(req: PortfolioRequest):
 
         result = validate_portfolio_output(result)
 
-        return {
-            "meta": {
-                "model_version": loader.xgb_version,
-                "schema_signature": loader._xgb_container.schema_signature,
-                "dataset_hash": loader.dataset_hash,
-                "training_code_hash": loader.training_code_hash,
-                "artifact_hash": loader.artifact_hash,
-                "inference_batch_size": len(tickers),
-                "timestamp": int(time.time())
-            },
-            "portfolio": result
+        # -------------------------------------------------
+        # Structured metadata exposure
+        # -------------------------------------------------
+
+        meta = {
+            "model_version": loader.xgb_version,
+            "schema_signature": loader._xgb_container.schema_signature,
+            "dataset_hash": loader.dataset_hash,
+            "training_code_hash": loader.training_code_hash,
+            "artifact_hash": loader.artifact_hash,
+            "inference_batch_size": len(tickers),
+            "timestamp": int(time.time())
         }
+
+        return PortfolioResponse(
+            meta=meta,
+            portfolio=result
+        )
 
     except asyncio.TimeoutError:
 
@@ -242,6 +266,10 @@ async def build_portfolio(req: PortfolioRequest):
             status_code=504,
             detail="Portfolio inference timeout"
         )
+
+    except HTTPException:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        raise
 
     except RuntimeError as e:
 
@@ -291,6 +319,9 @@ async def readiness():
 
     try:
         loader = get_loader()
+
+        if loader._xgb_container is None:
+            raise RuntimeError("Model not loaded")
 
         return {
             "status": "ready",
