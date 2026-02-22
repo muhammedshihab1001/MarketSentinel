@@ -5,7 +5,7 @@ import pandas as pd
 import logging
 import os
 from datetime import timedelta
-from typing import List
+from typing import List, Dict
 
 from core.data.market_data_service import MarketDataService
 from core.features.feature_store import FeatureStore
@@ -134,7 +134,7 @@ class InferencePipeline:
         try:
             df = self._build_cross_sectional_frame(tickers)
             latest_df = self._select_latest_snapshot(df)
-            result = self._run_model_and_construct(latest_df)
+            result = self._score_and_construct(latest_df)
 
             self.breaker.record_success()
             return result
@@ -149,7 +149,40 @@ class InferencePipeline:
             INFERENCE_IN_PROGRESS.dec()
 
     ############################################################
-    # FEATURE ORCHESTRATION (MIRRORS TRAINING)
+    # HISTORICAL SUPPORT
+    ############################################################
+
+    def run_historical_with_features(
+        self,
+        full_feature_cache: Dict[str, pd.DataFrame],
+        evaluation_date: pd.Timestamp
+    ):
+
+        combined = []
+
+        for ticker, df in full_feature_cache.items():
+
+            snapshot = df[df["date"] <= evaluation_date]
+
+            if snapshot.empty:
+                continue
+
+            latest_row = snapshot.sort_values("date").iloc[-1:]
+
+            combined.append(latest_row)
+
+        if not combined:
+            raise RuntimeError("No valid features for evaluation date.")
+
+        latest_df = pd.concat(combined, ignore_index=True)
+
+        latest_df = FeatureEngineer.add_cross_sectional_features(latest_df)
+        latest_df = FeatureEngineer.finalize(latest_df)
+
+        return self._score_and_construct(latest_df)
+
+    ############################################################
+    # FEATURE ORCHESTRATION
     ############################################################
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
@@ -175,7 +208,6 @@ class InferencePipeline:
         df = pd.concat(datasets, ignore_index=True)
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
-        # Mirror training pipeline
         df = FeatureEngineer.add_cross_sectional_features(df)
         df = FeatureEngineer.finalize(df)
 
@@ -190,24 +222,17 @@ class InferencePipeline:
         if (pd.Timestamp.utcnow().normalize() - latest_date) > timedelta(days=self.MAX_DATA_STALENESS_DAYS):
             raise RuntimeError("Inference data appears stale.")
 
-        latest_df = df[df["date"] == latest_date].copy()
-
-        if latest_df.empty:
-            raise RuntimeError("No latest snapshot available.")
-
-        return latest_df
+        return df[df["date"] == latest_date].copy()
 
     ############################################################
-    # MODEL + PORTFOLIO
-    ############################################################
 
-    def _run_model_and_construct(self, latest_df):
+    def _score_and_construct(self, latest_df):
 
         universe = set(MarketUniverse.get_universe())
         unknown = set(latest_df["ticker"]) - universe
 
         if unknown:
-            raise RuntimeError(f"Unknown tickers detected at inference: {unknown}")
+            raise RuntimeError(f"Unknown tickers detected: {unknown}")
 
         feature_df = validate_feature_schema(
             latest_df.loc[:, MODEL_FEATURES],
@@ -238,27 +263,21 @@ class InferencePipeline:
 
         drift_result = self.drift_detector.detect(feature_df)
 
-        if drift_result.get("drift_detected", False):
-
-            if self.drift_detector.hard_fail:
-                raise RuntimeError("Inference blocked due to feature drift.")
-            else:
-                logger.critical("Drift detected but non-blocking.")
+        if drift_result.get("drift_detected", False) and self.drift_detector.hard_fail:
+            raise RuntimeError("Inference blocked due to feature drift.")
 
         weights = self._construct_portfolio(latest_df)
 
-        portfolio_rows = []
-
-        for _, row in latest_df.iterrows():
-            portfolio_rows.append({
+        return [
+            {
                 "date": row["date"],
                 "ticker": row["ticker"],
                 "score": float(row["score"]),
                 "signal": row["signal"],
                 "weight": float(weights.get(row["ticker"], 0.0))
-            })
-
-        return portfolio_rows
+            }
+            for _, row in latest_df.iterrows()
+        ]
 
     ############################################################
 
