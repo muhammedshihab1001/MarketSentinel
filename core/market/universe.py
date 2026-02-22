@@ -5,11 +5,12 @@ import os
 import threading
 import re
 from datetime import datetime
+from pathlib import Path
 
 
 class MarketUniverse:
     """
-    Institutional Universe Controller (v7 hardened)
+    Institutional Universe Controller (v8 dual-universe hardened)
 
     Guarantees:
     ✔ deterministic
@@ -25,13 +26,24 @@ class MarketUniverse:
     ✔ metadata validated
     ✔ min_history_days enforced
     ✔ cross-sectional statistical safety
+    ✔ research/production separation
     """
 
-    UNIVERSE_FILE = "config/universe.json"
+    ###################################################
+    # FILE SELECTION (ENV GOVERNED)
+    ###################################################
+
+    DEFAULT_RESEARCH_FILE = "config/universe_research.json"
+    DEFAULT_PRODUCTION_FILE = "config/universe_production.json"
+
+    UNIVERSE_FILE = os.getenv(
+        "UNIVERSE_PATH",
+        DEFAULT_RESEARCH_FILE
+    )
 
     MIN_FILE_BYTES = 20
 
-    # 🚨 Raised for cross-sectional stability
+    # 🚨 For ML stability (research only)
     MIN_UNIVERSE_SIZE = 30
 
     TICKER_REGEX = re.compile(r"^[A-Z0-9.\-]{1,10}$")
@@ -42,7 +54,7 @@ class MarketUniverse:
     _LAST_VERSION = None
 
     ###################################################
-    # INTERNAL VERSION PARSER (NUMERIC SAFE)
+    # INTERNAL VERSION PARSER
     ###################################################
 
     @staticmethod
@@ -50,7 +62,9 @@ class MarketUniverse:
         try:
             return tuple(int(x) for x in version.split("."))
         except Exception:
-            raise RuntimeError("Universe version must be numeric format like '6.0'")
+            raise RuntimeError(
+                "Universe version must be numeric format like '6.0'"
+            )
 
     ###################################################
     # FILE HASH
@@ -74,17 +88,18 @@ class MarketUniverse:
     @classmethod
     def _load_file(cls):
 
-        if not os.path.exists(cls.UNIVERSE_FILE):
+        path = Path(cls.UNIVERSE_FILE)
+
+        if not path.exists():
             raise RuntimeError(
                 f"Universe file missing: {cls.UNIVERSE_FILE}"
             )
 
-        if os.path.getsize(cls.UNIVERSE_FILE) < cls.MIN_FILE_BYTES:
+        if path.stat().st_size < cls.MIN_FILE_BYTES:
             raise RuntimeError("Universe file corrupted.")
 
         try:
-            with open(cls.UNIVERSE_FILE, "rb") as f:
-                payload = json.loads(f.read().decode())
+            payload = json.loads(path.read_text())
         except Exception as exc:
             raise RuntimeError(
                 "Universe config unreadable."
@@ -98,10 +113,10 @@ class MarketUniverse:
             "version",
             "created_utc",
             "description",
-            "min_history_days",
             "tickers"
         }
 
+        # min_history_days optional in production
         missing = required_fields - set(payload.keys())
         if missing:
             raise RuntimeError(
@@ -111,17 +126,15 @@ class MarketUniverse:
         version = payload["version"]
         created_utc = payload["created_utc"]
         description = payload["description"]
-        min_history_days = payload["min_history_days"]
         tickers = payload["tickers"]
+
+        min_history_days = payload.get("min_history_days", None)
 
         if not isinstance(version, str):
             raise RuntimeError("Universe version must be string.")
 
         if not isinstance(description, str):
             raise RuntimeError("Universe description must be string.")
-
-        if not isinstance(min_history_days, int) or min_history_days <= 0:
-            raise RuntimeError("min_history_days must be positive int.")
 
         try:
             datetime.fromisoformat(created_utc.replace("Z", "+00:00"))
@@ -132,17 +145,29 @@ class MarketUniverse:
             raise RuntimeError("Universe tickers must be list.")
 
         #################################################
-        # HARD MINIMUM FOR ML STABILITY
+        # ML SAFETY CHECK (ONLY FOR RESEARCH)
         #################################################
 
-        if len(tickers) < cls.MIN_UNIVERSE_SIZE:
-            raise RuntimeError(
-                f"Universe too small for cross-sectional ML "
-                f"(minimum {cls.MIN_UNIVERSE_SIZE} required)."
-            )
+        if cls.UNIVERSE_FILE == cls.DEFAULT_RESEARCH_FILE:
+
+            if min_history_days is None:
+                raise RuntimeError(
+                    "Research universe requires min_history_days."
+                )
+
+            if not isinstance(min_history_days, int) or min_history_days <= 0:
+                raise RuntimeError(
+                    "min_history_days must be positive int."
+                )
+
+            if len(tickers) < cls.MIN_UNIVERSE_SIZE:
+                raise RuntimeError(
+                    f"Universe too small for cross-sectional ML "
+                    f"(minimum {cls.MIN_UNIVERSE_SIZE} required)."
+                )
 
         #################################################
-        # VERSION MONOTONICITY (NUMERIC SAFE)
+        # VERSION MONOTONICITY
         #################################################
 
         parsed_version = cls._parse_version(version)
@@ -229,7 +254,7 @@ class MarketUniverse:
         return cls._get_cached()["tickers"]
 
     @classmethod
-    def get_min_history_days(cls) -> int:
+    def get_min_history_days(cls):
         return cls._get_cached()["min_history_days"]
 
     @classmethod
