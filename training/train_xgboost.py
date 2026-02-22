@@ -47,7 +47,7 @@ def enforce_determinism():
 
 
 ############################################################
-# FEATURE CHECKSUM (LOCAL GOVERNED)
+# FEATURE CHECKSUM
 ############################################################
 
 def compute_feature_checksum():
@@ -128,7 +128,7 @@ def load_training_data(start_date, end_date):
             price_df,
             sentiment_df=None,
             ticker=ticker,
-            training=False
+            training=True   # ✅ FIXED
         )
 
         if dataset is None or dataset.empty:
@@ -149,11 +149,14 @@ def load_training_data(start_date, end_date):
 
     df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
-    if not df["date"].is_monotonic_increasing:
-        raise RuntimeError("Chronological integrity failure.")
-
     if df.columns.duplicated().any():
         raise RuntimeError("Duplicate columns detected.")
+
+    # ✅ Early schema validation
+    _ = validate_feature_schema(
+        df.loc[:, MODEL_FEATURES],
+        mode="training"
+    )
 
     return df
 
@@ -194,19 +197,10 @@ def build_final_target(df: pd.DataFrame):
 
 def trainer(train_df):
 
-    X = train_df.loc[:, MODEL_FEATURES].copy()
-
-    constant_cols = [
-        col for col in X.columns
-        if X[col].nunique(dropna=True) <= 1
-    ]
-
-    if constant_cols:
-        logger.warning("Neutralized constant features: %s", constant_cols)
-        for col in constant_cols:
-            X[col] = 0.0
-
-    X = validate_feature_schema(X, mode="training")
+    X = validate_feature_schema(
+        train_df.loc[:, MODEL_FEATURES],
+        mode="training"
+    )
 
     y = train_df["target"]
 
@@ -222,25 +216,11 @@ def trainer(train_df):
 
 def final_trainer(train_df):
 
-    df = train_df.copy()
+    X = validate_feature_schema(
+        train_df.loc[:, MODEL_FEATURES],
+        mode="strict_contract"
+    )
 
-    for col in MODEL_FEATURES:
-        if col not in df.columns:
-            df[col] = 0.0
-
-    df = df.loc[:, MODEL_FEATURES].copy()
-
-    constant_cols = [
-        col for col in df.columns
-        if df[col].nunique(dropna=True) <= 1
-    ]
-
-    if constant_cols:
-        logger.warning("Final neutralized constants: %s", constant_cols)
-        for col in constant_cols:
-            df[col] = 0.0
-
-    X = validate_feature_schema(df, mode="strict_contract")
     y = train_df["target"]
 
     pipeline = build_xgboost_pipeline(y)
@@ -308,7 +288,6 @@ def main(start_date=None, end_date=None, create_baseline=False):
 
     logger.info("Training window | %s -> %s", start_date, end_date)
 
-    # 🔥 Cross-sectional now handled in FeatureEngineer (canonical)
     raw_df = load_training_data(start_date, end_date)
 
     validator = WalkForwardValidator(trainer)
@@ -334,8 +313,9 @@ def main(start_date=None, end_date=None, create_baseline=False):
     if create_baseline:
 
         drift = DriftDetector()
+
         drift.create_baseline(
-            dataset=final_df,
+            dataset=final_df.loc[:, MODEL_FEATURES],  # ✅ FIXED
             dataset_hash=dataset_hash,
             training_code_hash=MetadataManager.fingerprint_training_code(),
             feature_checksum=compute_feature_checksum(),
