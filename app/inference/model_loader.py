@@ -4,6 +4,7 @@ import logging
 import threading
 import hashlib
 import numpy as np
+import json
 from dataclasses import dataclass
 from glob import glob
 
@@ -32,6 +33,7 @@ class LoadedModel:
     dataset_hash: str
     training_code_hash: str
     artifact_hash: str
+    feature_checksum: str
 
 
 ############################################################
@@ -74,6 +76,14 @@ class ModelLoader:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
         return h.hexdigest()
+
+    ########################################################
+    # FEATURE CHECKSUM
+    ########################################################
+
+    def _compute_feature_checksum(self, feature_list):
+        canonical = json.dumps(feature_list, sort_keys=False)
+        return hashlib.sha256(canonical.encode()).hexdigest()
 
     ########################################################
     # FIND LATEST MODEL
@@ -148,7 +158,6 @@ class ModelLoader:
             model_path, metadata_path, version = \
                 self._find_latest_artifact(base_dir)
 
-            # If already loaded and same version → return fast
             if (
                 self._xgb_container and
                 self._xgb_container.version == version
@@ -162,6 +171,17 @@ class ModelLoader:
             ####################################################
             # STRICT METADATA VALIDATION
             ####################################################
+
+            required_fields = {
+                "schema_signature",
+                "schema_version",
+                "features",
+                "dataset_hash",
+                "training_code_hash"
+            }
+
+            if not required_fields.issubset(meta.keys()):
+                raise RuntimeError("Incomplete metadata manifest.")
 
             if meta.get("metadata_type") != "training_manifest_v1":
                 raise RuntimeError("Unsupported metadata type.")
@@ -191,17 +211,19 @@ class ModelLoader:
 
             model = self._safe_load_model(model_path)
 
-            # Create new container first (atomic swap pattern)
+            # Feature checksum verification (new)
+            feature_checksum = self._compute_feature_checksum(MODEL_FEATURES)
+
             new_container = LoadedModel(
                 model=model,
                 version=version,
                 schema_signature=meta["schema_signature"],
                 dataset_hash=meta["dataset_hash"],
                 training_code_hash=meta["training_code_hash"],
-                artifact_hash=artifact_hash_actual
+                artifact_hash=artifact_hash_actual,
+                feature_checksum=feature_checksum
             )
 
-            # Atomic replace
             self._xgb_container = new_container
 
             MODEL_VERSION.labels(
