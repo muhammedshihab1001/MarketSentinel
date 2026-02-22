@@ -207,14 +207,14 @@ class YahooProvider(MarketDataProvider):
         start_date,
         end_date,
         interval,
-        min_rows=None
+        **kwargs
     ):
 
         if interval not in self.ALLOWED_INTERVALS:
             raise ValueError(f"Unsupported interval: {interval}")
 
-        if min_rows is None:
-            min_rows = self.DEFAULT_MIN_ROWS
+        # 🔒 Safe extraction of min_rows from kwargs
+        min_rows = kwargs.get("min_rows", self.DEFAULT_MIN_ROWS)
 
         df = self.fetcher.fetch(
             ticker,
