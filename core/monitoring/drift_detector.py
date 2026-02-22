@@ -29,7 +29,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "14.2"
+    BASELINE_VERSION = "15.0"
 
     MIN_SAMPLE_BASELINE = 150
     MIN_SAMPLE_INFERENCE = 40
@@ -42,7 +42,7 @@ class DriftDetector:
 
     MAX_INFERENCE_ROWS = 600
 
-    EPSILON = 1e-6
+    EPSILON = 1e-8
     MIN_ACTIVE_FEATURE_RATIO = 0.60
 
     ########################################################
@@ -91,14 +91,23 @@ class DriftDetector:
             series = numeric[col].dropna()
 
             if len(series) < self.MIN_SAMPLE_BASELINE:
-                continue
+                raise RuntimeError(f"Baseline insufficient data for {col}")
 
-            # 🔒 deterministic rounding for histogram stability
-            series = series.astype(np.float64).round(8)
+            # 🔒 Deterministic float stabilization
+            series = (
+                series
+                .astype(np.float64)
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna()
+                .round(10)
+            )
 
             mean = float(series.mean())
             std = float(series.std())
             variance = float(series.var())
+
+            if not np.isfinite([mean, std, variance]).all():
+                raise RuntimeError(f"Non-finite baseline stats for {col}")
 
             counts, bin_edges = np.histogram(series, bins=20)
 
@@ -113,16 +122,14 @@ class DriftDetector:
                 "expected_counts": counts.tolist()
             }
 
-        if set(features.keys()) != set(MODEL_FEATURES):
-            raise RuntimeError("Incomplete feature baseline.")
-
         payload = {
             "meta": {
                 "baseline_version": self.BASELINE_VERSION,
                 "created_at": datetime.utcnow().isoformat(),
                 "schema_signature": get_schema_signature(),
                 "dataset_hash": dataset_hash,
-                "training_code_hash": training_code_hash
+                "training_code_hash": training_code_hash,
+                "model_feature_checksum": self._model_loader.feature_checksum
             },
             "features": features
         }
@@ -179,13 +186,7 @@ class DriftDetector:
         if len(bin_edges) < 2:
             raise RuntimeError("Invalid baseline bin edges.")
 
-        if len(expected_counts) != len(bin_edges) - 1:
-            raise RuntimeError("Baseline histogram corrupted.")
-
-        actual_counts = np.histogram(
-            actual,
-            bins=bin_edges
-        )[0]
+        actual_counts = np.histogram(actual, bins=bin_edges)[0]
 
         expected_perc = expected_counts / max(
             expected_counts.sum(), self.EPSILON
@@ -200,7 +201,8 @@ class DriftDetector:
 
         psi = np.sum(
             (actual_perc - expected_perc) *
-            np.log(actual_perc / expected_perc)
+            np.log((actual_perc + self.EPSILON) /
+                   (expected_perc + self.EPSILON))
         )
 
         return float(psi)
@@ -281,14 +283,14 @@ class DriftDetector:
 
         loader = self._model_loader
 
+        if meta.get("model_feature_checksum") != loader.feature_checksum:
+            raise RuntimeError("Model feature checksum mismatch.")
+
         if meta["dataset_hash"] != loader.dataset_hash:
             logger.warning("Dataset hash drift detected.")
 
         if meta["training_code_hash"] != loader.training_code_hash:
             logger.warning("Training code drift detected.")
-
-        if set(baseline["features"].keys()) != set(MODEL_FEATURES):
-            raise RuntimeError("Baseline feature contract mismatch.")
 
         return baseline
 
