@@ -132,8 +132,7 @@ class FeatureEngineer:
         # RSI
         df["rsi"] = np.nan
         for ticker, group in df.groupby("ticker"):
-            group = group.sort_values("date")
-            rsi = TechnicalIndicators.rsi(group[["date", "close"]], window=14)
+            rsi = TechnicalIndicators.rsi(group[["date", "close"]], 14)
             df.loc[group.index, "rsi"] = rsi.values.astype("float32")
 
         df["rsi"] = df["rsi"].fillna(50.0).clip(0, 100)
@@ -143,14 +142,13 @@ class FeatureEngineer:
         df["macd_signal"] = np.nan
 
         for ticker, group in df.groupby("ticker"):
-            group = group.sort_values("date")
             macd, signal = TechnicalIndicators.macd(group[["date", "close"]])
-            df.loc[group.index, "macd"] = macd.astype("float32")
-            df.loc[group.index, "macd_signal"] = signal.astype("float32")
+            df.loc[group.index, "macd"] = macd
+            df.loc[group.index, "macd_signal"] = signal
 
         df[["macd", "macd_signal"]] = df[["macd", "macd_signal"]].fillna(0.0)
 
-        # EMA
+        # EMA ratio
         df["ema_10"] = df.groupby("ticker")["close"].transform(
             lambda x: x.ewm(span=10, adjust=False).mean()
         )
@@ -163,25 +161,10 @@ class FeatureEngineer:
             df["ema_10"] / (df["ema_50"] + cls.EPSILON)
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
-        # Regime
-        rolling_mean = (
-            df.groupby("ticker")["volatility_20"]
-            .transform(lambda x: x.rolling(60, min_periods=20).mean())
-        )
-
-        rolling_std = (
-            df.groupby("ticker")["volatility_20"]
-            .transform(lambda x: x.rolling(60, min_periods=20).std(ddof=0))
-        )
-
-        zscore = (df["volatility_20"] - rolling_mean) / (rolling_std + cls.EPSILON)
-        df["regime_feature"] = np.where(zscore > 0.5, 1.0, 0.0)
-        df["regime_feature"] = df["regime_feature"].fillna(0.0)
-
         return df
 
     ########################################################
-    # CROSS SECTIONAL
+    # CROSS SECTIONAL (ALWAYS CREATED)
     ########################################################
 
     @classmethod
@@ -199,18 +182,15 @@ class FeatureEngineer:
 
         for col in base_cols:
 
-            if df["ticker"].nunique() > 1:
-                cs_mean = df.groupby("date")[col].transform("mean")
-                cs_std = df.groupby("date")[col].transform("std")
-                z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
-                z = z.clip(-5, 5)
-                rank = df.groupby("date")[col].rank(method="first", pct=True)
-                df[f"{col}_z"] = z.fillna(0.0)
-                df[f"{col}_rank"] = rank.fillna(0.5)
-            else:
-                # Single ticker neutralization
-                df[f"{col}_z"] = 0.0
-                df[f"{col}_rank"] = 0.5
+            cs_mean = df.groupby("date")[col].transform("mean")
+            cs_std = df.groupby("date")[col].transform("std")
+
+            # If single ticker → std becomes NaN → handled below
+            z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
+            rank = df.groupby("date")[col].rank(method="first", pct=True)
+
+            df[f"{col}_z"] = z.fillna(0.0).clip(-5, 5)
+            df[f"{col}_rank"] = rank.fillna(0.5)
 
         return df
 
@@ -235,23 +215,29 @@ class FeatureEngineer:
         if missing:
             raise RuntimeError(f"Missing features: {missing}")
 
+        # Enforce feature order stability
+        df = df.reindex(columns=list(df.columns))
+
         return df.reset_index(drop=True)
 
     ########################################################
-    # COMPATIBILITY PIPELINE
+    # PIPELINE
     ########################################################
 
     @classmethod
     def build_feature_pipeline(
         cls,
-        price_df: pd.DataFrame,
+        price_df,
         sentiment_df=None,
-        training: bool = True
-    ) -> pd.DataFrame:
+        training=True,
+    ):
 
         df = cls._validate_price_frame(price_df)
         df = cls.add_core_features(df)
+
+        # ALWAYS add cross-sectional
         df = cls.add_cross_sectional_features(df)
+
         df = cls.finalize(df)
 
         return df
