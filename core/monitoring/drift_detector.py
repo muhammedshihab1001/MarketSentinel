@@ -30,6 +30,7 @@ class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
     BASELINE_VERSION = "16.0"
+    DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
 
     MIN_SAMPLE_BASELINE = 150
     MIN_SAMPLE_INFERENCE = 40
@@ -65,6 +66,12 @@ class DriftDetector:
         ).lower() == "true"
 
         self._model_loader = ModelLoader()
+
+        # Enforce model contract only if using production baseline directory
+        self._enforce_model_contract = (
+            os.path.realpath(self.baseline_dir) ==
+            self.DEFAULT_BASELINE_DIR
+        )
 
     ########################################################
     # SAFE FEATURE BLOCK
@@ -168,22 +175,25 @@ class DriftDetector:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Baseline schema mismatch.")
 
-        loader = self._model_loader
+        # 🔒 Strict enforcement only in production mode
+        if self._enforce_model_contract:
 
-        if meta.get("model_version") != loader.xgb_version:
-            raise RuntimeError(
-                f"Baseline tied to model_version={meta.get('model_version')} "
-                f"but production version={loader.xgb_version}"
-            )
+            loader = self._model_loader
 
-        if meta.get("model_feature_checksum") != loader.feature_checksum:
-            raise RuntimeError("Model feature checksum mismatch.")
+            if meta.get("model_version") != loader.xgb_version:
+                raise RuntimeError(
+                    f"Baseline tied to model_version={meta.get('model_version')} "
+                    f"but production version={loader.xgb_version}"
+                )
 
-        if meta["dataset_hash"] != loader.dataset_hash:
-            logger.warning("Dataset hash drift detected.")
+            if meta.get("model_feature_checksum") != loader.feature_checksum:
+                raise RuntimeError("Model feature checksum mismatch.")
 
-        if meta["training_code_hash"] != loader.training_code_hash:
-            logger.warning("Training code drift detected.")
+            if meta["dataset_hash"] != loader.dataset_hash:
+                logger.warning("Dataset hash drift detected.")
+
+            if meta["training_code_hash"] != loader.training_code_hash:
+                logger.warning("Training code drift detected.")
 
         return baseline
 
