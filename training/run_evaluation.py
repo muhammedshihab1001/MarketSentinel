@@ -1,17 +1,11 @@
 """
 MarketSentinel Institutional Evaluation Runner
-
 Used by CI/CD pipeline.
-
 Hard-fails on governance breach.
 Explicit exit codes for CI.
 """
 
 import sys
-import os
-import glob
-import json
-import joblib
 import numpy as np
 import pandas as pd
 
@@ -21,12 +15,10 @@ from core.features.feature_store import FeatureStore
 from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
-    get_schema_signature,
-    LONG_PERCENTILE,
-    SHORT_PERCENTILE,
 )
 from core.market.universe import MarketUniverse
 from core.time.market_time import MarketTime
+from app.inference.model_loader import ModelLoader
 from training.evaluate import evaluate_xgboost
 
 
@@ -39,6 +31,10 @@ MIN_SHARPE = 0.10
 MIN_SPREAD = 0.0
 MIN_SAMPLE_SIZE = 2000
 FORWARD_DAYS = 5
+
+# Canonical contract (must match training)
+LONG_PERCENTILE = 0.70
+SHORT_PERCENTILE = 0.30
 
 
 # =========================================================
@@ -69,41 +65,6 @@ def apply_cross_sectional_target(df):
     df["target"] = df["target"].astype("int8")
 
     return df.reset_index(drop=True)
-
-
-# =========================================================
-# LOAD MODEL
-# =========================================================
-
-def load_latest_model():
-
-    base_dir = os.path.join("artifacts", "xgboost")
-    model_files = glob.glob(os.path.join(base_dir, "model_*.pkl"))
-
-    if not model_files:
-        raise RuntimeError("No trained model artifacts found.")
-
-    latest = max(model_files, key=os.path.getmtime)
-    timestamp = os.path.basename(latest).split("_")[1].split(".")[0]
-
-    metadata_path = os.path.join(base_dir, f"metadata_{timestamp}.json")
-
-    if not os.path.exists(metadata_path):
-        raise RuntimeError("Metadata file missing.")
-
-    with open(metadata_path, encoding="utf-8") as f:
-        metadata = json.load(f)
-
-    if metadata.get("schema_signature") != get_schema_signature():
-        raise RuntimeError("Schema signature mismatch.")
-
-    model = joblib.load(latest)
-
-    if not hasattr(model, "predict_proba"):
-        raise RuntimeError("Artifact not classifier.")
-
-    print(f"Loaded model version: {timestamp}")
-    return model
 
 
 # =========================================================
@@ -148,7 +109,12 @@ def build_dataset():
 
     df = apply_cross_sectional_target(df)
 
-    feature_df = validate_feature_schema(df.loc[:, MODEL_FEATURES])
+    # 🔒 Strict contract enforcement in CI
+    feature_df = validate_feature_schema(
+        df.loc[:, MODEL_FEATURES],
+        mode="strict_contract"
+    )
+
     df = df.loc[feature_df.index]
 
     if df["target"].nunique() < 2:
@@ -170,7 +136,10 @@ def main() -> int:
 
     init_env()
 
-    model = load_latest_model()
+    # 🔒 Use secure model loader (not raw joblib)
+    loader = ModelLoader()
+    model = loader.xgb
+
     df = build_dataset()
 
     X = df.loc[:, MODEL_FEATURES]
@@ -190,12 +159,18 @@ def main() -> int:
         if len(group) < 5:
             continue
 
-        # 🔒 Canonical signal contract (now centralized in schema)
         long_threshold = group["prob"].quantile(LONG_PERCENTILE)
         short_threshold = group["prob"].quantile(SHORT_PERCENTILE)
 
-        long_mask = (df_eval["date"] == date) & (df_eval["prob"] >= long_threshold)
-        short_mask = (df_eval["date"] == date) & (df_eval["prob"] <= short_threshold)
+        long_mask = (
+            (df_eval["date"] == date) &
+            (df_eval["prob"] >= long_threshold)
+        )
+
+        short_mask = (
+            (df_eval["date"] == date) &
+            (df_eval["prob"] <= short_threshold)
+        )
 
         preds[long_mask] = 1
         preds[short_mask] = 0
