@@ -3,6 +3,7 @@ import time
 import joblib
 import logging
 import random
+import hashlib
 import numpy as np
 import pandas as pd
 
@@ -32,21 +33,24 @@ MAX_REASONABLE_SHARPE = 5.0
 
 
 ############################################################
-# DETERMINISM
+# DETERMINISM (HARDENED)
 ############################################################
 
 def enforce_determinism():
     os.environ["PYTHONHASHSEED"] = str(SEED)
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
     random.seed(SEED)
     np.random.seed(SEED)
 
 
 ############################################################
-# DATASET HASH
+# DATASET HASH (STABLE ORDER)
 ############################################################
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
-    return MetadataManager.fingerprint_dataset(df)
+    df_sorted = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+    return MetadataManager.fingerprint_dataset(df_sorted)
 
 
 ############################################################
@@ -91,6 +95,10 @@ def load_training_data(start_date, end_date):
     store = FeatureStore()
     universe = MarketUniverse.get_universe()
 
+    logger.info("Universe version: %s | size=%s",
+                MarketUniverse.get_version(),
+                len(universe))
+
     datasets = []
 
     for ticker in universe:
@@ -131,11 +139,14 @@ def load_training_data(start_date, end_date):
     if not df["date"].is_monotonic_increasing:
         raise RuntimeError("Chronological integrity failure.")
 
+    if df.columns.duplicated().any():
+        raise RuntimeError("Duplicate feature columns detected.")
+
     return df
 
 
 ############################################################
-# FINAL TARGET
+# FINAL TARGET (LEAKAGE SAFE)
 ############################################################
 
 def build_final_target(df: pd.DataFrame):
@@ -164,6 +175,9 @@ def build_final_target(df: pd.DataFrame):
     if df["target"].nunique() < 2:
         raise RuntimeError("Training labels collapsed.")
 
+    if df["date"].max() <= df["date"].min():
+        raise RuntimeError("Date range invalid after target creation.")
+
     return df
 
 
@@ -175,7 +189,6 @@ def trainer(train_df):
 
     X = train_df.loc[:, MODEL_FEATURES].copy()
 
-    # 🔒 Detect fold-local constant features
     constant_cols = [
         col for col in X.columns
         if X[col].nunique(dropna=True) <= 1
@@ -187,15 +200,10 @@ def trainer(train_df):
             constant_cols
         )
 
-        # 🔒 Neutralize instead of dropping
         for col in constant_cols:
             X[col] = 0.0
 
-    # 🔒 Now validate full schema (nothing missing)
-    X = validate_feature_schema(
-        X,
-        mode="training"
-    )
+    X = validate_feature_schema(X, mode="training")
 
     y = train_df["target"]
 
@@ -206,7 +214,7 @@ def trainer(train_df):
 
 
 ############################################################
-# FINAL TRAINER (STRICT)
+# FINAL TRAINER (STRICT CONTRACT)
 ############################################################
 
 def final_trainer(train_df):
@@ -219,10 +227,7 @@ def final_trainer(train_df):
 
     df = df.loc[:, MODEL_FEATURES]
 
-    X = validate_feature_schema(
-        df,
-        mode="strict_contract"
-    )
+    X = validate_feature_schema(df, mode="strict_contract")
 
     if X.isnull().any().any():
         raise RuntimeError("NaN detected before final training.")
@@ -236,7 +241,7 @@ def final_trainer(train_df):
 
 
 ############################################################
-# ARTIFACT EXPORT
+# ARTIFACT EXPORT (ATOMIC SAFE)
 ############################################################
 
 def export_artifacts(model, metrics, dataset_hash,
@@ -254,7 +259,7 @@ def export_artifacts(model, metrics, dataset_hash,
     metadata = MetadataManager.create_metadata(
         model_name="xgboost",
         metrics=metrics,
-        features=MODEL_FEATURES,
+        features=tuple(MODEL_FEATURES),
         training_start=str(start_date),
         training_end=str(end_date),
         dataset_hash=dataset_hash,
@@ -290,7 +295,6 @@ def main(start_date=None, end_date=None):
 
     raw_df = load_training_data(start_date, end_date)
 
-    # 🔒 Use copy to prevent mutation leakage
     validator = WalkForwardValidator(trainer)
     research_metrics = validator.run(raw_df.copy())
 
