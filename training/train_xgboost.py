@@ -68,38 +68,6 @@ def compute_dataset_hash(df: pd.DataFrame) -> str:
 
 
 ############################################################
-# CROSS-SECTIONAL FEATURES
-############################################################
-
-def add_cross_sectional_features(df: pd.DataFrame) -> pd.DataFrame:
-
-    df = df.sort_values(["date", "ticker"]).copy()
-
-    base_cols = [
-        "momentum_20",
-        "return_lag5",
-        "rsi",
-        "volatility",
-        "ema_ratio"
-    ]
-
-    for col in base_cols:
-
-        cs_mean = df.groupby("date")[col].transform("mean")
-        cs_std = df.groupby("date")[col].transform("std")
-
-        z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
-        z = z.clip(-5, 5)
-
-        rank = df.groupby("date")[col].rank(pct=True)
-
-        df[f"{col}_z"] = z.fillna(0.0)
-        df[f"{col}_rank"] = rank.fillna(0.5)
-
-    return df
-
-
-############################################################
 # METRIC SANITIZATION
 ############################################################
 
@@ -340,9 +308,8 @@ def main(start_date=None, end_date=None, create_baseline=False):
 
     logger.info("Training window | %s -> %s", start_date, end_date)
 
+    # 🔥 Cross-sectional now handled in FeatureEngineer (canonical)
     raw_df = load_training_data(start_date, end_date)
-
-    raw_df = add_cross_sectional_features(raw_df)
 
     validator = WalkForwardValidator(trainer)
     research_metrics = validator.run(raw_df.copy())
