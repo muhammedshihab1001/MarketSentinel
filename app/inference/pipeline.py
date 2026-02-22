@@ -140,46 +140,13 @@ class InferencePipeline:
             return result
 
         except Exception:
-            PIPELINE_FAILURES.inc()
+            PIPELINE_FAILURES.labels(stage="run_batch").inc()
             self.breaker.record_failure()
             logger.exception("Inference pipeline failure.")
             raise
 
         finally:
             INFERENCE_IN_PROGRESS.dec()
-
-    ############################################################
-    # HISTORICAL SUPPORT
-    ############################################################
-
-    def run_historical_with_features(
-        self,
-        full_feature_cache: Dict[str, pd.DataFrame],
-        evaluation_date: pd.Timestamp
-    ):
-
-        combined = []
-
-        for ticker, df in full_feature_cache.items():
-
-            snapshot = df[df["date"] <= evaluation_date]
-
-            if snapshot.empty:
-                continue
-
-            latest_row = snapshot.sort_values("date").iloc[-1:]
-
-            combined.append(latest_row)
-
-        if not combined:
-            raise RuntimeError("No valid features for evaluation date.")
-
-        latest_df = pd.concat(combined, ignore_index=True)
-
-        latest_df = FeatureEngineer.add_cross_sectional_features(latest_df)
-        latest_df = FeatureEngineer.finalize(latest_df)
-
-        return self._score_and_construct(latest_df)
 
     ############################################################
     # FEATURE ORCHESTRATION
@@ -189,12 +156,22 @@ class InferencePipeline:
 
         datasets = []
 
+        end_date = pd.Timestamp.utcnow().normalize()
+        start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
+
         for ticker in tickers:
 
             price_df = self.market_data.get_price_data(
                 ticker=ticker,
-                lookback_days=self.INFERENCE_LOOKBACK_DAYS
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d"),
+                interval="1d",
+                min_history=60
             )
+
+            if price_df is None or price_df.empty:
+                logger.warning(f"No price data for {ticker}")
+                continue
 
             dataset = self.feature_store.get_features(
                 price_df=price_df,
@@ -203,7 +180,14 @@ class InferencePipeline:
                 training=False
             )
 
+            if dataset is None or dataset.empty:
+                logger.warning(f"No features generated for {ticker}")
+                continue
+
             datasets.append(dataset)
+
+        if not datasets:
+            raise RuntimeError("All tickers failed feature build.")
 
         df = pd.concat(datasets, ignore_index=True)
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
@@ -253,7 +237,6 @@ class InferencePipeline:
 
         latest_df = latest_df.copy()
         latest_df["score"] = probs
-
         latest_df["rank_pct"] = latest_df["score"].rank(method="first", pct=True)
 
         latest_df["signal"] = latest_df["rank_pct"].apply(
