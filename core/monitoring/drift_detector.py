@@ -29,7 +29,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "16.0"  # 🔥 bumped due to governance binding
+    BASELINE_VERSION = "16.0"
 
     MIN_SAMPLE_BASELINE = 150
     MIN_SAMPLE_INFERENCE = 40
@@ -60,7 +60,7 @@ class DriftDetector:
         self._model_loader = ModelLoader()
 
     ########################################################
-    # CREATE BASELINE
+    # CREATE BASELINE (DECOUPLED FROM MODEL LOADER)
     ########################################################
 
     def create_baseline(
@@ -68,6 +68,8 @@ class DriftDetector:
         dataset: pd.DataFrame,
         dataset_hash: str,
         training_code_hash: str,
+        feature_checksum: str,
+        model_version: str,
         allow_overwrite: bool = False
     ):
 
@@ -128,8 +130,8 @@ class DriftDetector:
                 "schema_signature": get_schema_signature(),
                 "dataset_hash": dataset_hash,
                 "training_code_hash": training_code_hash,
-                "model_feature_checksum": self._model_loader.feature_checksum,
-                "model_version": self._model_loader.xgb_version  # 🔥 NEW
+                "model_feature_checksum": feature_checksum,
+                "model_version": model_version
             },
             "features": features
         }
@@ -140,7 +142,7 @@ class DriftDetector:
 
         logger.info(
             "Drift baseline created for model_version=%s",
-            self._model_loader.xgb_version
+            model_version
         )
 
     ########################################################
@@ -282,7 +284,6 @@ class DriftDetector:
 
         loader = self._model_loader
 
-        # 🔥 NEW: enforce baseline ↔ production version binding
         if meta.get("model_version") != loader.xgb_version:
             raise RuntimeError(
                 f"Baseline tied to model_version={meta.get('model_version')} "
@@ -301,7 +302,7 @@ class DriftDetector:
         return baseline
 
     ########################################################
-    # DETECT DRIFT
+    # DETECT DRIFT (UNCHANGED)
     ########################################################
 
     def detect(self, dataset: pd.DataFrame):
