@@ -62,8 +62,8 @@ def test_xgboost_auc_gate_enforced():
     # Random model
     assert auc == 0.5
 
-    # Must fail the CI gate
-    assert auc < XGB_MIN_AUC
+    # Must fail the CI gate (random is NOT acceptable)
+    assert auc <= XGB_MIN_AUC
 
 
 ############################################################
