@@ -14,7 +14,10 @@ def dummy_trainer(train_df):
 
     class DummyModel:
         def predict_proba(self, X):
-            return np.tile([0.4, 0.6], (len(X), 1))
+            # produce cross-sectional variation
+            scores = X.iloc[:, 0].values
+            probs = 1 / (1 + np.exp(-scores))  # sigmoid
+            return np.column_stack([1 - probs, probs])
 
     return DummyModel()
 
