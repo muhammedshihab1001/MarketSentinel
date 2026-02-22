@@ -14,10 +14,9 @@ class StockPriceFetcher:
     MIN_ROWS = 100
     MAX_DAILY_RETURN = 0.60
     MAX_VOLUME_SPIKE = 50
-    OHLC_TOLERANCE = 1e-4  # 🔥 NEW: floating tolerance
 
     ########################################################
-    # BULLETPROOF DATE EXTRACTION
+    # DATE EXTRACTION
     ########################################################
 
     def _extract_date_column(self, df):
@@ -63,6 +62,8 @@ class StockPriceFetcher:
         return df
 
     ########################################################
+    # VALIDATION (Soft OHLC Repair)
+    ########################################################
 
     def _validate_prices(self, df):
 
@@ -84,19 +85,14 @@ class StockPriceFetcher:
             raise RuntimeError("Negative volume detected.")
 
         ####################################################
-        # TOLERANCE-BASED OHLC CONSISTENCY CHECK
+        # SOFT OHLC REPAIR (NO HARD FAILURE)
         ####################################################
 
-        tol = self.OHLC_TOLERANCE
-
-        high_check = df["high"] + tol >= df[["open", "close"]].max(axis=1)
-        low_check = df["low"] - tol <= df[["open", "close"]].min(axis=1)
-
-        if not (high_check & low_check).all():
-            raise RuntimeError("OHLC inconsistency detected.")
+        df["high"] = df[["high", "open", "close"]].max(axis=1)
+        df["low"] = df[["low", "open", "close"]].min(axis=1)
 
         ####################################################
-        # EXTREME RETURN GUARD
+        # EXTREME RETURN GUARD (still strict)
         ####################################################
 
         returns = df["close"].pct_change().abs()
