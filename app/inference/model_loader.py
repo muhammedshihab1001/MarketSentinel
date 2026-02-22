@@ -7,13 +7,11 @@ import numpy as np
 import json
 from dataclasses import dataclass
 from glob import glob
-from datetime import datetime
 
 from core.schema.feature_schema import (
     get_schema_signature,
     MODEL_FEATURES,
     SCHEMA_VERSION,
-    DTYPE
 )
 
 from core.artifacts.metadata_manager import MetadataManager
@@ -67,6 +65,11 @@ class ModelLoader:
         self._xgb_container: LoadedModel | None = None
         self._initialized = True
 
+        # Strict by default
+        self._allow_latest_fallback = (
+            os.getenv("ALLOW_LATEST_FALLBACK", "false").lower() == "true"
+        )
+
     ########################################################
     # SHA256
     ########################################################
@@ -87,7 +90,7 @@ class ModelLoader:
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     ########################################################
-    # PRODUCTION POINTER LOGIC
+    # PRODUCTION POINTER LOGIC (STRICT)
     ########################################################
 
     def _resolve_production_version(self, base_dir):
@@ -95,10 +98,16 @@ class ModelLoader:
         pointer_path = os.path.join(base_dir, self.POINTER_FILENAME)
 
         if not os.path.exists(pointer_path):
-            logger.warning(
-                "No production pointer found — falling back to latest model."
+
+            if self._allow_latest_fallback:
+                logger.warning(
+                    "Production pointer missing — using latest artifact (fallback mode)."
+                )
+                return None
+
+            raise RuntimeError(
+                "production_pointer.json missing — production version undefined."
             )
-            return None  # fallback to latest
 
         if os.path.islink(pointer_path):
             raise RuntimeError("Symlinked production pointer detected.")
@@ -128,13 +137,12 @@ class ModelLoader:
 
     def _find_artifact(self, base_dir):
 
-        # 1️⃣ Try production pointer first
         resolved = self._resolve_production_version(base_dir)
 
         if resolved:
             return resolved
 
-        # 2️⃣ Fallback to latest (backward compatible)
+        # Only reachable if fallback explicitly enabled
         model_files = glob(os.path.join(base_dir, "model_*.pkl"))
 
         if not model_files:
@@ -142,9 +150,6 @@ class ModelLoader:
 
         latest = max(model_files, key=os.path.getmtime)
         filename = os.path.basename(latest)
-
-        if not filename.startswith("model_") or not filename.endswith(".pkl"):
-            raise RuntimeError("Unexpected artifact naming format.")
 
         version = filename[len("model_"):-len(".pkl")]
         metadata_path = os.path.join(base_dir, f"metadata_{version}.json")
@@ -206,17 +211,6 @@ class ModelLoader:
             ####################################################
             # STRICT METADATA VALIDATION
             ####################################################
-
-            required_fields = {
-                "schema_signature",
-                "schema_version",
-                "features",
-                "dataset_hash",
-                "training_code_hash"
-            }
-
-            if not required_fields.issubset(meta.keys()):
-                raise RuntimeError("Incomplete metadata manifest.")
 
             if meta.get("metadata_type") != "training_manifest_v1":
                 raise RuntimeError("Unsupported metadata type.")
@@ -314,4 +308,4 @@ class ModelLoader:
 
     def warmup(self):
         logger.info("Model warmup triggered.")
-        _ = self.xgb 
+        _ = self.xgb
