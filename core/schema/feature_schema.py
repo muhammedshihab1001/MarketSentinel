@@ -8,7 +8,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "32.1"  # bumped due to validation hardening
+SCHEMA_VERSION = "32.2"  # bumped due to fold-safe cross-sectional handling
 
 
 ############################################################
@@ -114,7 +114,6 @@ def validate_feature_schema(
                 f"Missing required features under strict contract: {missing_all}"
             )
 
-        # enforce deterministic ordering
         feature_df = feature_df.loc[:, MODEL_FEATURES]
 
     elif mode == "inference":
@@ -152,10 +151,21 @@ def validate_feature_schema(
             logger.warning(f"Low variance core feature: {col}")
 
     ########################################################
-    # CROSS-SECTIONAL VALIDATION (NEW HARDENING)
+    # CROSS-SECTIONAL VALIDATION (FOLD-SAFE)
     ########################################################
 
-    if mode in {"training", "strict_contract"}:
+    if mode == "training":
+        for col in CROSS_SECTIONAL_FEATURES:
+            series = feature_df[col]
+            finite_vals = series[np.isfinite(series)]
+
+            if finite_vals.nunique() <= 1:
+                logger.warning(
+                    "Constant cross-sectional feature allowed in training fold: %s",
+                    col
+                )
+
+    if mode == "strict_contract":
         for col in CROSS_SECTIONAL_FEATURES:
             series = feature_df[col]
             finite_vals = series[np.isfinite(series)]
