@@ -1,0 +1,13 @@
+{
+  "version": "6.0-prod",
+  "created_utc": "2026-02-22T00:00:00Z",
+  "description": "Production inference universe (liquid core 30).",
+  "tickers": [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL",
+    "META", "TSLA", "JPM", "BAC", "GS",
+    "XOM", "CVX", "UNH", "JNJ", "LLY",
+    "HD", "COST", "WMT", "PG", "KO",
+    "PEP", "BA", "CAT", "RTX", "NFLX",
+    "AMD", "AVGO", "ORCL", "CRM", "SPGI"
+  ]
+}

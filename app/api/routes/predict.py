@@ -58,7 +58,7 @@ REQUEST_TIMEOUT = int(
 )
 
 MAX_BATCH_SIZE = int(
-    os.getenv("MAX_BATCH_SIZE", "25")  # 🔥 reduced from 50
+    os.getenv("MAX_BATCH_SIZE", "30")  # 🔥 reduced from 50
 )
 
 MIN_BATCH_SIZE = 4
@@ -67,7 +67,12 @@ DEFAULT_USE_UNIVERSE = os.getenv(
     "true"
 ).lower() == "true"
 
-UNIVERSE_CONFIG_PATH = Path("config/universe.json")
+UNIVERSE_CONFIG_PATH = Path(
+    os.getenv(
+        "PRODUCTION_UNIVERSE_PATH",
+        "config/universe_production.json"
+    )
+)
 
 inference_semaphore = asyncio.Semaphore(
     MAX_CONCURRENT_INFERENCES
