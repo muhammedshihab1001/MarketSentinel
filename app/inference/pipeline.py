@@ -4,8 +4,6 @@ import numpy as np
 import pandas as pd
 import logging
 import os
-import hashlib
-import json
 from datetime import timedelta
 
 from core.data.market_data_service import MarketDataService
@@ -35,7 +33,7 @@ logger = logging.getLogger("marketsentinel.pipeline")
 
 
 ############################################################
-# CIRCUIT BREAKER (THREAD SAFE)
+# CIRCUIT BREAKER
 ############################################################
 
 class CircuitBreaker:
@@ -78,6 +76,11 @@ class InferencePipeline:
     TARGET_GROSS_EXPOSURE = 1.0
     TOP_K = 3
     BOTTOM_K = 3
+
+    # 🔒 Canonical thresholds (must match training target)
+    LONG_PERCENTILE = 0.70
+    SHORT_PERCENTILE = 0.30
+
     MIN_PROB_STD = 1e-6
     WEIGHT_TOLERANCE = 1e-6
 
@@ -154,6 +157,8 @@ class InferencePipeline:
             ascending=[True, True]
         )
 
+    ############################################################
+    # PORTFOLIO CONSTRUCTION (TOP_K ONLY FOR WEIGHTING)
     ############################################################
 
     def _construct_portfolio(self, latest_df):
@@ -238,10 +243,10 @@ class InferencePipeline:
             latest_df["score"] = probs
             latest_df["rank_pct"] = latest_df["score"].rank(pct=True)
 
+            # 🔒 Canonical signal logic (matches training)
             latest_df["signal"] = latest_df["rank_pct"].apply(
-                lambda x: "LONG" if x >= 0.7 else (
-                    "SHORT" if x <= 0.3 else "NEUTRAL"
-                )
+                lambda x: "LONG" if x >= self.LONG_PERCENTILE
+                else ("SHORT" if x <= self.SHORT_PERCENTILE else "NEUTRAL")
             )
 
             weights = self._construct_portfolio(latest_df)
@@ -257,10 +262,6 @@ class InferencePipeline:
                     "weight": float(weights.get(row["ticker"], 0.0))
                 })
 
-            ########################################################
-            # 🔒 STRICT DRIFT ENFORCEMENT (FIXED)
-            ########################################################
-
             drift_result = self.drift_detector.detect(feature_df)
 
             if drift_result.get("drift_detected", False):
@@ -271,14 +272,11 @@ class InferencePipeline:
                         drift_result.get("severity_score")
                     )
                     raise RuntimeError("Inference blocked due to feature drift.")
-
                 else:
                     logger.critical(
                         "Drift detected (non-blocking mode) | severity=%s",
                         drift_result.get("severity_score")
                     )
-
-            ########################################################
 
             self.breaker.record_success()
             return portfolio_rows
