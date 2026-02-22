@@ -14,6 +14,7 @@ class StockPriceFetcher:
     MIN_ROWS = 100
     MAX_DAILY_RETURN = 0.60
     MAX_VOLUME_SPIKE = 50
+    OHLC_TOLERANCE = 1e-4  # 🔥 NEW: floating tolerance
 
     ########################################################
     # BULLETPROOF DATE EXTRACTION
@@ -71,7 +72,6 @@ class StockPriceFetcher:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
         df.dropna(subset=["open", "high", "low", "close"], inplace=True)
 
         if df.empty:
@@ -84,10 +84,15 @@ class StockPriceFetcher:
             raise RuntimeError("Negative volume detected.")
 
         ####################################################
-        # OHLC CONSISTENCY CHECK
+        # TOLERANCE-BASED OHLC CONSISTENCY CHECK
         ####################################################
 
-        if not ((df["low"] <= df["close"]) & (df["close"] <= df["high"])).all():
+        tol = self.OHLC_TOLERANCE
+
+        high_check = df["high"] + tol >= df[["open", "close"]].max(axis=1)
+        low_check = df["low"] - tol <= df[["open", "close"]].min(axis=1)
+
+        if not (high_check & low_check).all():
             raise RuntimeError("OHLC inconsistency detected.")
 
         ####################################################
@@ -161,34 +166,16 @@ class StockPriceFetcher:
             interval
         )
 
-        ####################################################
-        # FLATTEN
-        ####################################################
-
         df = self._flatten_columns(df)
-
-        ####################################################
-        # DATE EXTRACTION
-        ####################################################
-
         df = self._extract_date_column(df)
-
-        ####################################################
-        # UTC NORMALIZATION
-        ####################################################
 
         df["date"] = self._ensure_utc(df["date"])
         df.dropna(subset=["date"], inplace=True)
-
-        ####################################################
-        # ADJUSTED CLOSE HANDLING
-        ####################################################
 
         if "adj_close" in df.columns:
             df["close"] = df["adj_close"]
 
         required = {"open", "high", "low", "close", "volume"}
-
         missing = required - set(df.columns)
 
         if missing:
@@ -196,46 +183,22 @@ class StockPriceFetcher:
                 f"Yahoo schema drift detected. Missing={missing}"
             )
 
-        ####################################################
-        # VALIDATION
-        ####################################################
-
         df = self._validate_prices(df)
-
-        ####################################################
-        # DUPLICATE DATE HARD STOP
-        ####################################################
 
         if df["date"].duplicated().any():
             raise RuntimeError("Duplicate timestamps detected.")
 
-        df = (
-            df
-            .sort_values("date")
-            .reset_index(drop=True)
-        )
-
-        ####################################################
-        # FUTURE LEAKAGE GUARD
-        ####################################################
+        df = df.sort_values("date").reset_index(drop=True)
 
         now_utc = pd.Timestamp.now(tz="UTC")
 
         if df["date"].max() > now_utc:
             raise RuntimeError("Future candle detected.")
 
-        ####################################################
-        # MINIMUM HISTORY CHECK
-        ####################################################
-
         if len(df) < self.MIN_ROWS:
             raise RuntimeError(
                 f"Insufficient history for {ticker}"
             )
-
-        ####################################################
-        # GAP LOGGING (non-fatal)
-        ####################################################
 
         date_diff = df["date"].diff().dt.days
 
