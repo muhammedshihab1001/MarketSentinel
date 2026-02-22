@@ -2,7 +2,11 @@ import numpy as np
 import pandas as pd
 import logging
 
-from core.schema.feature_schema import MODEL_FEATURES, DTYPE
+from core.schema.feature_schema import (
+    MODEL_FEATURES,
+    DTYPE,
+    validate_feature_schema,
+)
 from training.backtesting.regime import MarketRegimeDetector
 
 logger = logging.getLogger("marketsentinel.walkforward")
@@ -153,9 +157,11 @@ class WalkForwardValidator:
                 if len(signal_slice) < self.MIN_CROSS_SECTION:
                     continue
 
-                X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
+                X = signal_slice.loc[:, MODEL_FEATURES].copy()
 
-                if X.isnull().any().any():
+                try:
+                    X = validate_feature_schema(X, mode="inference")
+                except Exception:
                     continue
 
                 try:
@@ -164,7 +170,9 @@ class WalkForwardValidator:
                     continue
 
                 if np.std(probs) < self.MIN_PROB_STD:
-                    logger.warning(f"Fold {window_id} probability collapse on {signal_date}")
+                    logger.warning(
+                        f"Fold {window_id} probability collapse on {signal_date}"
+                    )
                     continue
 
                 signal_slice = signal_slice.copy()
@@ -229,13 +237,18 @@ class WalkForwardValidator:
 
             for r in window_returns:
                 capital *= np.exp(r)
+                capital = max(capital, 1.0)  # safety floor
                 equity_curve.append(capital)
 
             vol = np.std(window_returns)
-            sharpe = (
-                (np.mean(window_returns) / (vol + 1e-9))
-                * np.sqrt(252 / FORWARD_DAYS)
-            )
+
+            if vol < 1e-9:
+                sharpe = 0.0
+            else:
+                sharpe = (
+                    (np.mean(window_returns) / vol)
+                    * np.sqrt(252 / FORWARD_DAYS)
+                )
 
             sharpe = float(np.clip(sharpe, -self.MAX_SHARPE, self.MAX_SHARPE))
 
@@ -257,13 +270,19 @@ class WalkForwardValidator:
     def aggregate_results(self, results, equity_curve):
 
         df = pd.DataFrame(results)
+
+        if not equity_curve:
+            raise RuntimeError("Equity curve empty.")
+
         curve = np.array(equity_curve)
 
         peak = np.maximum.accumulate(curve)
         drawdowns = (curve - peak) / peak
 
         gains = df[df["strategy_return"] > 0]["strategy_return"].sum()
-        losses = abs(df[df["strategy_return"] < 0]["strategy_return"].sum()) or 1e-6
+        losses = abs(
+            df[df["strategy_return"] < 0]["strategy_return"].sum()
+        ) or 1e-6
 
         return {
             "avg_strategy_return": float(df["strategy_return"].mean()),
