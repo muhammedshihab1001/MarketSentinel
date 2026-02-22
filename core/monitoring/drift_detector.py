@@ -29,7 +29,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_PATH = "artifacts/drift/baseline.json"
-    BASELINE_VERSION = "14.1"
+    BASELINE_VERSION = "14.2"
 
     MIN_SAMPLE_BASELINE = 150
     MIN_SAMPLE_INFERENCE = 40
@@ -93,6 +93,9 @@ class DriftDetector:
             if len(series) < self.MIN_SAMPLE_BASELINE:
                 continue
 
+            # 🔒 deterministic rounding for histogram stability
+            series = series.astype(np.float64).round(8)
+
             mean = float(series.mean())
             std = float(series.std())
             variance = float(series.var())
@@ -145,10 +148,33 @@ class DriftDetector:
         return path
 
     ########################################################
+    # ATOMIC WRITE
+    ########################################################
+
+    def _atomic_write(self, payload, path):
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+            dir=os.path.dirname(path),
+            suffix=".tmp"
+        ) as tmp:
+
+            json.dump(payload, tmp, indent=2, sort_keys=True)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            temp_name = tmp.name
+
+        os.replace(temp_name, path)
+
+    ########################################################
     # PSI
     ########################################################
 
     def _psi(self, bin_edges, expected_counts, actual):
+
+        actual = np.asarray(actual, dtype=np.float64)
 
         if len(bin_edges) < 2:
             raise RuntimeError("Invalid baseline bin edges.")
@@ -253,8 +279,8 @@ class DriftDetector:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Baseline schema mismatch.")
 
-        # 🔐 Cross-check model metadata
         loader = self._model_loader
+
         if meta["dataset_hash"] != loader.dataset_hash:
             logger.warning("Dataset hash drift detected.")
 
