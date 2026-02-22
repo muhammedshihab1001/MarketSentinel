@@ -60,7 +60,7 @@ class DriftDetector:
         self._model_loader = ModelLoader()
 
     ########################################################
-    # CREATE BASELINE (DECOUPLED FROM MODEL LOADER)
+    # CREATE BASELINE
     ########################################################
 
     def create_baseline(
@@ -110,9 +110,12 @@ class DriftDetector:
             if not np.isfinite([mean, std, variance]).all():
                 raise RuntimeError(f"Non-finite baseline stats for {col}")
 
+            if std <= 0:
+                raise RuntimeError(f"Zero-variance baseline feature: {col}")
+
             counts, bin_edges = np.histogram(series, bins=20)
 
-            if len(bin_edges) < 2:
+            if len(bin_edges) < 2 or counts.sum() == 0:
                 raise RuntimeError("Invalid histogram construction.")
 
             features[col] = {
@@ -188,6 +191,9 @@ class DriftDetector:
 
         actual = np.asarray(actual, dtype=np.float64)
 
+        if len(actual) == 0:
+            return 0.0
+
         actual_counts = np.histogram(actual, bins=bin_edges)[0]
 
         expected_perc = expected_counts / max(
@@ -221,7 +227,8 @@ class DriftDetector:
 
         canonical = json.dumps(
             clone,
-            sort_keys=True
+            sort_keys=True,
+            separators=(",", ":")
         ).encode()
 
         return hashlib.sha256(canonical).hexdigest()
@@ -252,7 +259,7 @@ class DriftDetector:
                 np.nan
             )
 
-        if not np.isfinite(block.to_numpy()).any():
+        if block.isnull().all().all():
             raise RuntimeError("All features invalid.")
 
         return block
@@ -282,6 +289,9 @@ class DriftDetector:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Baseline schema mismatch.")
 
+        if set(baseline["features"].keys()) != set(MODEL_FEATURES):
+            raise RuntimeError("Baseline feature contract mismatch.")
+
         loader = self._model_loader
 
         if meta.get("model_version") != loader.xgb_version:
@@ -302,7 +312,7 @@ class DriftDetector:
         return baseline
 
     ########################################################
-    # DETECT DRIFT (UNCHANGED)
+    # DETECT DRIFT
     ########################################################
 
     def detect(self, dataset: pd.DataFrame):
@@ -382,8 +392,8 @@ class DriftDetector:
 
             return {
                 "drift_detected": drift_detected,
-                "severity_score": severity_score,
-                "coverage": coverage,
+                "severity_score": int(severity_score),
+                "coverage": float(coverage),
                 "details": report
             }
 
