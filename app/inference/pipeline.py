@@ -86,6 +86,7 @@ class InferencePipeline:
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
 
     MAX_DATA_STALENESS_DAYS = 5
+    MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "200"))
 
     def __init__(self):
 
@@ -156,7 +157,7 @@ class InferencePipeline:
         )
 
     ############################################################
-    # PORTFOLIO CONSTRUCTION (TOP_K ONLY FOR WEIGHTING)
+    # PORTFOLIO CONSTRUCTION
     ############################################################
 
     def _construct_portfolio(self, latest_df):
@@ -200,15 +201,19 @@ class InferencePipeline:
         gross = sum(abs(v) for v in weights.values())
 
         if abs(gross - self.TARGET_GROSS_EXPOSURE) > self.WEIGHT_TOLERANCE:
-            raise RuntimeError(
-                f"Gross exposure mismatch: {gross}"
-            )
+            raise RuntimeError(f"Gross exposure mismatch: {gross}")
 
         return weights
 
     ############################################################
 
     def _run_model_and_construct(self, latest_df, use_cache: bool):
+
+        if use_cache:
+            logger.warning("use_cache=True but caching not implemented at pipeline level.")
+
+        if len(latest_df) > self.MAX_BATCH_SIZE:
+            raise RuntimeError("Batch size exceeds MAX_BATCH_SIZE.")
 
         if not self.breaker.allow():
             raise RuntimeError("Inference blocked by circuit breaker.")
@@ -239,27 +244,19 @@ class InferencePipeline:
 
             latest_df = latest_df.copy()
             latest_df["score"] = probs
-            latest_df["rank_pct"] = latest_df["score"].rank(pct=True)
 
-            # ✅ Canonical signal logic (from schema contract)
+            # Deterministic ranking
+            latest_df["rank_pct"] = latest_df["score"].rank(
+                method="first",
+                pct=True
+            )
+
             latest_df["signal"] = latest_df["rank_pct"].apply(
                 lambda x: "LONG" if x >= LONG_PERCENTILE
                 else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
             )
 
-            weights = self._construct_portfolio(latest_df)
-
-            portfolio_rows = []
-
-            for _, row in latest_df.iterrows():
-                portfolio_rows.append({
-                    "date": row["date"],
-                    "ticker": row["ticker"],
-                    "score": float(row["score"]),
-                    "signal": row["signal"],
-                    "weight": float(weights.get(row["ticker"], 0.0))
-                })
-
+            # Drift check BEFORE portfolio construction
             drift_result = self.drift_detector.detect(feature_df)
 
             if drift_result.get("drift_detected", False):
@@ -275,6 +272,19 @@ class InferencePipeline:
                         "Drift detected (non-blocking mode) | severity=%s",
                         drift_result.get("severity_score")
                     )
+
+            weights = self._construct_portfolio(latest_df)
+
+            portfolio_rows = []
+
+            for _, row in latest_df.iterrows():
+                portfolio_rows.append({
+                    "date": row["date"],
+                    "ticker": row["ticker"],
+                    "score": float(row["score"]),
+                    "signal": row["signal"],
+                    "weight": float(weights.get(row["ticker"], 0.0))
+                })
 
             self.breaker.record_success()
             return portfolio_rows
