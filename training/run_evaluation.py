@@ -225,8 +225,8 @@ def main() -> int:
         if len(group) < 5:
             continue
 
-        long_threshold = group["prob"].quantile(0.70)
-        short_threshold = group["prob"].quantile(0.30)
+        long_threshold = group["prob"].quantile(0.80)
+        short_threshold = group["prob"].quantile(0.20)
 
         long_mask = (df_eval["date"] == date) & (df_eval["prob"] >= long_threshold)
         short_mask = (df_eval["date"] == date) & (df_eval["prob"] <= short_threshold)
