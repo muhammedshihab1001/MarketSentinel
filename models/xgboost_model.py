@@ -10,6 +10,7 @@ SEED = 42
 MIN_PROB_STD = 1e-5
 NUM_BOOST_ROUNDS = 600
 EARLY_STOPPING_ROUNDS = 50
+MIN_VALIDATION_ROWS = 200
 
 
 ###################################################
@@ -68,6 +69,8 @@ class SafeXGBClassifier:
         if X.isnull().any().any():
             raise RuntimeError("NaN detected in training features.")
 
+        # 🔒 Ensure deterministic ordering
+        X = X.copy()
         X = X.astype(np.float32)
         y = np.asarray(y)
 
@@ -83,7 +86,42 @@ class SafeXGBClassifier:
         training_bytes = X.to_numpy().tobytes()
         self.training_checksum = hashlib.sha256(training_bytes).hexdigest()
 
-        dtrain = xgb.DMatrix(X, label=y)
+        ###################################################
+        # TIME-SAFE EARLY STOPPING SPLIT
+        ###################################################
+
+        n = len(X)
+
+        if n < MIN_VALIDATION_ROWS * 2:
+            # Too small → disable early stopping safely
+            logger.warning("Dataset small — early stopping disabled.")
+            use_early_stopping = False
+        else:
+            use_early_stopping = True
+
+        split_idx = int(n * 0.9)
+
+        X_train_part = X.iloc[:split_idx]
+        y_train_part = y[:split_idx]
+
+        X_val_part = X.iloc[split_idx:]
+        y_val_part = y[split_idx:]
+
+        dtrain_part = xgb.DMatrix(
+            X_train_part,
+            label=y_train_part,
+            feature_names=self.feature_names
+        )
+
+        dval_part = xgb.DMatrix(
+            X_val_part,
+            label=y_val_part,
+            feature_names=self.feature_names
+        )
+
+        ###################################################
+        # PARAMETERS
+        ###################################################
 
         params = {
             "max_depth": 3,
@@ -104,26 +142,41 @@ class SafeXGBClassifier:
             "verbosity": 0,
         }
 
-        # 🔐 Parameter fingerprint
         self.param_checksum = hashlib.sha256(
             json.dumps(params, sort_keys=True).encode()
         ).hexdigest()
 
-        # 🔒 Simple validation split for early stopping
-        val_split = int(0.9 * len(X))
-        dtrain_part = xgb.DMatrix(X.iloc[:val_split], label=y[:val_split])
-        dval_part = xgb.DMatrix(X.iloc[val_split:], label=y[val_split:])
+        ###################################################
+        # TRAIN
+        ###################################################
 
-        self.model = xgb.train(
-            params,
-            dtrain_part,
-            num_boost_round=NUM_BOOST_ROUNDS,
-            evals=[(dval_part, "validation")],
-            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-            verbose_eval=False
+        if use_early_stopping:
+            self.model = xgb.train(
+                params,
+                dtrain_part,
+                num_boost_round=NUM_BOOST_ROUNDS,
+                evals=[(dval_part, "validation")],
+                early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+                verbose_eval=False
+            )
+        else:
+            self.model = xgb.train(
+                params,
+                dtrain_part,
+                num_boost_round=NUM_BOOST_ROUNDS,
+                verbose_eval=False
+            )
+
+        ###################################################
+        # PROBABILITY SANITY CHECK
+        ###################################################
+
+        dtrain_full = xgb.DMatrix(
+            X,
+            feature_names=self.feature_names
         )
 
-        preds = self.model.predict(dtrain)
+        preds = self.model.predict(dtrain_full)
 
         mean = float(np.mean(preds))
         std = float(np.std(preds))
@@ -142,10 +195,17 @@ class SafeXGBClassifier:
         if np.any(preds < 0) or np.any(preds > 1):
             raise RuntimeError("Invalid probability range detected.")
 
-        # 🔒 Booster feature name integrity
+        ###################################################
+        # FEATURE INTEGRITY CHECK
+        ###################################################
+
         booster_features = self.model.feature_names
         if booster_features != self.feature_names:
             raise RuntimeError("Booster feature order mismatch.")
+
+        if hasattr(self.model, "best_iteration"):
+            if self.model.best_iteration <= 0:
+                raise RuntimeError("Invalid early stopping state.")
 
         return self
 
@@ -183,7 +243,11 @@ class SafeXGBClassifier:
         if current_checksum != self.feature_checksum:
             raise RuntimeError("Feature order integrity violated.")
 
-        dmatrix = xgb.DMatrix(X)
+        dmatrix = xgb.DMatrix(
+            X,
+            feature_names=self.feature_names
+        )
+
         probs = self.model.predict(dmatrix)
 
         if np.std(probs) < MIN_PROB_STD:
@@ -227,6 +291,8 @@ def build_xgboost_pipeline(y):
     pos_weight = compute_class_weight(y)
     model = SafeXGBClassifier(pos_weight)
 
-    logger.info("XGBoost model built (deterministic CPU mode, early stopping enabled).")
+    logger.info(
+        "XGBoost model built (deterministic CPU mode, leakage-safe early stopping)."
+    )
 
     return model
