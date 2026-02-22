@@ -34,6 +34,10 @@ from app.monitoring.metrics import (
 logger = logging.getLogger("marketsentinel.pipeline")
 
 
+############################################################
+# CIRCUIT BREAKER (THREAD SAFE)
+############################################################
+
 class CircuitBreaker:
     def __init__(self, threshold=3, cooldown=120):
         self.threshold = threshold
@@ -65,6 +69,10 @@ class CircuitBreaker:
             self.failures = 0
 
 
+############################################################
+# INFERENCE PIPELINE
+############################################################
+
 class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
@@ -75,6 +83,8 @@ class InferencePipeline:
 
     CACHE_TTL = int(os.getenv("INFERENCE_CACHE_TTL_SECONDS", "600"))
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
+
+    MAX_DATA_STALENESS_DAYS = 5
 
     def __init__(self):
 
@@ -108,6 +118,9 @@ class InferencePipeline:
 
     def _validate_features_exist(self, df: pd.DataFrame):
 
+        if df.columns.duplicated().any():
+            raise RuntimeError("Duplicate feature columns detected.")
+
         missing = set(MODEL_FEATURES) - set(df.columns)
 
         if missing:
@@ -116,12 +129,26 @@ class InferencePipeline:
             )
 
     ############################################################
-    # DETERMINISTIC SORT GUARD
+
+    def _validate_universe(self, df):
+
+        universe = set(MarketUniverse.get_universe())
+        unknown = set(df["ticker"]) - universe
+
+        if unknown:
+            raise RuntimeError(f"Unknown tickers detected at inference: {unknown}")
+
+    ############################################################
+
+    def _validate_freshness(self, df):
+
+        latest_date = pd.to_datetime(df["date"].max())
+        if (pd.Timestamp.utcnow().normalize() - latest_date) > timedelta(days=self.MAX_DATA_STALENESS_DAYS):
+            raise RuntimeError("Inference data appears stale.")
+
     ############################################################
 
     def _deterministic_sort(self, df):
-
-        # enforce deterministic ranking (score, ticker)
         return df.sort_values(
             ["score", "ticker"],
             ascending=[True, True]
@@ -180,58 +207,69 @@ class InferencePipeline:
 
     def _run_model_and_construct(self, latest_df, use_cache: bool):
 
-        self._validate_features_exist(latest_df)
+        if not self.breaker.allow():
+            raise RuntimeError("Inference blocked by circuit breaker.")
 
-        feature_df = validate_feature_schema(
-            latest_df.loc[:, MODEL_FEATURES],
-            mode="inference"
-        ).astype(DTYPE)
+        INFERENCE_IN_PROGRESS.inc()
 
-        t0 = time.time()
-        probs = self.models.xgb.predict_proba(feature_df)[:, 1]
-        latency = time.time() - t0
-
-        MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-        MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
-
-        probs = np.clip(probs, 1e-6, 1 - 1e-6)
-
-        if np.std(probs) < self.MIN_PROB_STD:
-            raise RuntimeError("Probability collapse detected.")
-
-        logger.info(
-            "Inference prob stats | mean=%.4f std=%.4f",
-            float(np.mean(probs)),
-            float(np.std(probs))
-        )
-
-        latest_df = latest_df.copy()
-        latest_df["score"] = probs
-        latest_df["rank_pct"] = latest_df["score"].rank(pct=True)
-
-        latest_df["signal"] = latest_df["rank_pct"].apply(
-            lambda x: "LONG" if x >= 0.7 else (
-                "SHORT" if x <= 0.3 else "NEUTRAL"
-            )
-        )
-
-        weights = self._construct_portfolio(latest_df)
-
-        portfolio_rows = []
-
-        for _, row in latest_df.iterrows():
-            portfolio_rows.append({
-                "date": row["date"],
-                "ticker": row["ticker"],
-                "score": float(row["score"]),
-                "signal": row["signal"],
-                "weight": float(weights.get(row["ticker"], 0.0))
-            })
-
-        # 🔐 Drift trigger (non-blocking)
         try:
-            self.drift_detector.check_drift(feature_df)
-        except Exception as e:
-            logger.warning("Drift check failed (non-blocking): %s", str(e))
+            self._validate_universe(latest_df)
+            self._validate_features_exist(latest_df)
+            self._validate_freshness(latest_df)
 
-        return portfolio_rows
+            feature_df = validate_feature_schema(
+                latest_df.loc[:, MODEL_FEATURES],
+                mode="inference"
+            ).astype(DTYPE)
+
+            t0 = time.time()
+            probs = self.models.xgb.predict_proba(feature_df)[:, 1]
+            latency = time.time() - t0
+
+            MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
+            MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
+
+            probs = np.clip(probs, 1e-6, 1 - 1e-6)
+
+            if np.std(probs) < self.MIN_PROB_STD:
+                raise RuntimeError("Probability collapse detected.")
+
+            latest_df = latest_df.copy()
+            latest_df["score"] = probs
+            latest_df["rank_pct"] = latest_df["score"].rank(pct=True)
+
+            latest_df["signal"] = latest_df["rank_pct"].apply(
+                lambda x: "LONG" if x >= 0.7 else (
+                    "SHORT" if x <= 0.3 else "NEUTRAL"
+                )
+            )
+
+            weights = self._construct_portfolio(latest_df)
+
+            portfolio_rows = []
+
+            for _, row in latest_df.iterrows():
+                portfolio_rows.append({
+                    "date": row["date"],
+                    "ticker": row["ticker"],
+                    "score": float(row["score"]),
+                    "signal": row["signal"],
+                    "weight": float(weights.get(row["ticker"], 0.0))
+                })
+
+            try:
+                self.drift_detector.check_drift(feature_df)
+            except Exception as e:
+                logger.warning("Drift check failed (non-blocking): %s", str(e))
+
+            self.breaker.record_success()
+            return portfolio_rows
+
+        except Exception as e:
+            PIPELINE_FAILURES.inc()
+            self.breaker.record_failure()
+            logger.exception("Inference pipeline failure.")
+            raise
+
+        finally:
+            INFERENCE_IN_PROGRESS.dec()
