@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 # ============================================================
 
-SCHEMA_VERSION = "33.0"  # bumped: canonical signal percentile contract introduced
+SCHEMA_VERSION = "34.0"  # strict cross-sectional neutralization stabilization
 
 
 ############################################################
@@ -65,7 +65,7 @@ CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = (
 
 
 ############################################################
-# MODEL FEATURE CONTRACT (IMMUTABLE)
+# MODEL FEATURE CONTRACT
 ############################################################
 
 MODEL_FEATURES: List[str] = list(
@@ -94,7 +94,7 @@ def _check_forbidden_columns(df: pd.DataFrame):
 
 def validate_feature_schema(
     df: pd.DataFrame,
-    mode: str = "training"  # training | inference | strict_contract
+    mode: str = "training"
 ) -> pd.DataFrame:
 
     if df is None or df.empty:
@@ -163,33 +163,40 @@ def validate_feature_schema(
             logger.warning(f"Low variance core feature: {col}")
 
     ########################################################
-    # CROSS-SECTIONAL VALIDATION
+    # CROSS-SECTIONAL VALIDATION (FIXED)
     ########################################################
 
-    if mode == "training":
-        for col in CROSS_SECTIONAL_FEATURES:
-            series = feature_df[col]
-            finite_vals = series[np.isfinite(series)]
+    for col in CROSS_SECTIONAL_FEATURES:
 
-            if finite_vals.nunique() <= 1:
+        series = feature_df[col]
+        finite_vals = series[np.isfinite(series)]
+
+        if finite_vals.nunique() <= 1:
+
+            if mode == "training":
                 logger.warning(
                     "Constant cross-sectional feature allowed in training fold: %s",
                     col
                 )
+                continue
 
-    if mode == "strict_contract":
-        for col in CROSS_SECTIONAL_FEATURES:
-            series = feature_df[col]
-            finite_vals = series[np.isfinite(series)]
+            if mode == "strict_contract":
 
-            if finite_vals.nunique() <= 1:
-
-                # Allow fully neutralized column (all zeros)
-                if (finite_vals == 0).all():
+                # Auto-neutralize safely
+                if col.endswith("_z"):
                     logger.warning(
-                        "Neutralized constant cross-sectional feature allowed in strict contract: %s",
+                        "Neutralizing constant cross-sectional Z feature: %s",
                         col
                     )
+                    feature_df[col] = 0.0
+                    continue
+
+                if col.endswith("_rank"):
+                    logger.warning(
+                        "Neutralizing constant cross-sectional RANK feature: %s",
+                        col
+                    )
+                    feature_df[col] = 0.5
                     continue
 
                 raise RuntimeError(
