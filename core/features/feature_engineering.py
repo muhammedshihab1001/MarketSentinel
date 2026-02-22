@@ -214,6 +214,38 @@ class FeatureEngineer:
         return df
 
     ########################################################
+    # CROSS-SECTIONAL FEATURES (NEW — CANONICAL)
+    ########################################################
+
+    @classmethod
+    def add_cross_sectional_features(cls, df):
+
+        df = df.sort_values(["date", "ticker"]).copy()
+
+        base_cols = [
+            "momentum_20",
+            "return_lag5",
+            "rsi",
+            "volatility",
+            "ema_ratio",
+        ]
+
+        for col in base_cols:
+
+            cs_mean = df.groupby("date")[col].transform("mean")
+            cs_std = df.groupby("date")[col].transform("std")
+
+            z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
+            z = z.clip(-5, 5)
+
+            rank = df.groupby("date")[col].rank(pct=True)
+
+            df[f"{col}_z"] = z.fillna(0.0)
+            df[f"{col}_rank"] = rank.fillna(0.5)
+
+        return df
+
+    ########################################################
     # FINAL SANITIZATION
     ########################################################
 
@@ -237,7 +269,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # MAIN PIPELINE (NO CROSS-SECTIONAL HERE)
+    # MAIN PIPELINE (UPDATED — CROSS-SECTIONAL INCLUDED)
     ########################################################
 
     @classmethod
@@ -257,6 +289,9 @@ class FeatureEngineer:
         df = cls.add_rsi(df)
         df = cls.add_macd(df)
         df = cls.add_ema(df)
+
+        # 🔥 CANONICAL CROSS-SECTIONAL
+        df = cls.add_cross_sectional_features(df)
 
         df = cls._final_sanitize(df)
 
