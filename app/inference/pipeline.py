@@ -34,10 +34,6 @@ from app.monitoring.metrics import (
 logger = logging.getLogger("marketsentinel.pipeline")
 
 
-# ============================================================
-# CIRCUIT BREAKER
-# ============================================================
-
 class CircuitBreaker:
     def __init__(self, threshold=3, cooldown=120):
         self.threshold = threshold
@@ -69,10 +65,6 @@ class CircuitBreaker:
             self.failures = 0
 
 
-# ============================================================
-# INFERENCE PIPELINE
-# ============================================================
-
 class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
@@ -88,7 +80,6 @@ class InferencePipeline:
     SNAPSHOT_CACHE_TTL = int(os.getenv("SNAPSHOT_CACHE_TTL", "15"))
 
     def __init__(self):
-
         self.market_data = MarketDataService()
         self.feature_store = FeatureStore()
         self.models = ModelLoader()
@@ -103,46 +94,26 @@ class InferencePipeline:
         _ = self.models.xgb
         self._validate_models_loaded()
 
-    # ============================================================
-    # VALIDATION
-    # ============================================================
-
     def _validate_models_loaded(self):
         container = self.models._xgb_container
-
         if container is None:
             raise RuntimeError("Model container missing.")
-
         if container.schema_signature != get_schema_signature():
             raise RuntimeError(
                 "Schema signature mismatch between training and inference."
             )
-
         logger.info("Model + schema signature verified.")
 
-    # ============================================================
-    # SNAPSHOT SELECTION
-    # ============================================================
-
     def _select_latest_snapshot(self, df: pd.DataFrame) -> pd.DataFrame:
-
         if df is None or df.empty:
             raise RuntimeError("Feature dataframe empty before snapshot selection.")
-
         if "date" not in df.columns:
             raise RuntimeError("Missing 'date' column in feature dataframe.")
-
         latest_date = df["date"].max()
         latest_df = df[df["date"] == latest_date].copy()
-
         if latest_df.empty:
             raise RuntimeError("No rows found for latest snapshot date.")
-
         return latest_df.reset_index(drop=True)
-
-    # ============================================================
-    # SNAPSHOT ENTRYPOINT
-    # ============================================================
 
     def run_snapshot(self, tickers: List[str]):
 
@@ -165,7 +136,6 @@ class InferencePipeline:
         start_time = time.time()
 
         try:
-
             df = self._build_cross_sectional_frame(tickers)
             latest_df = self._select_latest_snapshot(df)
 
@@ -179,7 +149,6 @@ class InferencePipeline:
                 mode="inference"
             ).astype(DTYPE)
 
-            # ---------------- DRIFT DETECTION ----------------
             try:
                 drift_result = self.drift_detector.detect(feature_df)
             except Exception as e:
@@ -193,8 +162,6 @@ class InferencePipeline:
 
             if drift_result.get("drift_state") == "hard":
                 raise RuntimeError("Hard drift detected.")
-
-            # ---------------- MODEL INFERENCE ----------------
 
             probs = self.models.xgb.predict_proba(feature_df)[:, 1]
             probs = np.clip(probs, 1e-6, 1 - 1e-6)
@@ -211,7 +178,12 @@ class InferencePipeline:
                 else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
             )
 
-            weights = self._construct_portfolio(latest_df)
+            # 🔥 SAFE SINGLE-TICKER HANDLING
+            if len(latest_df) >= 2:
+                weights = self._construct_portfolio(latest_df)
+            else:
+                ticker = latest_df.iloc[0]["ticker"]
+                weights = {ticker: 0.0}
 
             prob_stats = {
                 "mean": float(np.mean(probs)),
@@ -248,9 +220,7 @@ class InferencePipeline:
                 "signals": snapshot_rows
             }
 
-            # ✅ CORRECT PROMETHEUS LABELS
             MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-
             MODEL_INFERENCE_LATENCY.labels(
                 model="xgboost"
             ).observe(time.time() - start_time)
