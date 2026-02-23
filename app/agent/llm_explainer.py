@@ -1,23 +1,38 @@
-import os
 import logging
 import asyncio
 from typing import Dict, Any
 
 from openai import AsyncOpenAI
 
+from core.config.env_loader import (
+    get_env,
+    get_bool,
+    get_int,
+)
+
 logger = logging.getLogger("marketsentinel.llm")
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "12"))
-LLM_ENABLED = os.getenv("LLM_ENABLED", "false").lower() == "true"
-
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 class LLMExplainer:
 
     def __init__(self):
-        self.enabled = LLM_ENABLED
+
+        # 🔐 Use centralized env loader
+        self.enabled = get_bool("LLM_ENABLED", False)
+        self.model_name = get_env("OPENAI_MODEL", "gpt-4o-mini")
+        self.timeout = get_int("OPENAI_TIMEOUT", 12)
+
+        api_key = get_env("OPENAI_API_KEY")
+
+        if self.enabled and not api_key:
+            logger.warning("LLM enabled but OPENAI_API_KEY missing.")
+            self.enabled = False
+
+        self.client = AsyncOpenAI(api_key=api_key) if self.enabled else None
+
+    ########################################################
+    # PUBLIC API
+    ########################################################
 
     async def explain(
         self,
@@ -32,26 +47,41 @@ class LLMExplainer:
                 "message": "LLM explanation disabled"
             }
 
-        prompt = self._build_prompt(signal_row, agent_output, probability_stats)
+        prompt = self._build_prompt(
+            signal_row,
+            agent_output,
+            probability_stats
+        )
 
         try:
 
             response = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=OPENAI_MODEL,
+                self.client.chat.completions.create(
+                    model=self.model_name,
                     messages=[
-                        {"role": "system", "content": "You are a financial risk explanation engine. Do NOT change signals. Only explain."},
-                        {"role": "user", "content": prompt}
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a financial explanation engine. "
+                                "You MUST NOT change trading signals. "
+                                "You only explain the provided signal."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
                     ],
                     temperature=0.2,
                 ),
-                timeout=OPENAI_TIMEOUT
+                timeout=self.timeout
             )
 
             content = response.choices[0].message.content
 
             return {
                 "llm_enabled": True,
+                "model": self.model_name,
                 "narrative": content
             }
 
@@ -62,6 +92,10 @@ class LLMExplainer:
                 "llm_enabled": True,
                 "error": "llm_unavailable"
             }
+
+    ########################################################
+    # PROMPT BUILDER
+    ########################################################
 
     def _build_prompt(self, row, agent, stats):
 
@@ -83,7 +117,7 @@ Market Context:
 Probability Mean: {stats.get("mean")}
 Probability Std: {stats.get("std")}
 
-Explain this signal in clear institutional language.
+Explain this signal in professional institutional language.
 Do not invent new numbers.
-Do not change the signal.
+Do not modify the signal.
 """
