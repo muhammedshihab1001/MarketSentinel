@@ -22,10 +22,13 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v21"  # bumped due to sanitization fix
+    CACHE_VERSION = "v22"  # bumped for stable dataset hashing
     MAX_CACHE_FILES_PER_TICKER = 6
     MIN_FILE_BYTES = 5_000
     MAX_TOTAL_CACHE_FILES = 2000
+
+    # 🔥 in-memory cache (per process)
+    _memory_cache = {}
 
     def __init__(self):
         os.makedirs(self.FEATURE_DIR, exist_ok=True)
@@ -91,6 +94,8 @@ class FeatureStore:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     ########################################################
+    # STABLE DATASET HASH
+    ########################################################
 
     def _dataset_hash(
         self,
@@ -99,9 +104,14 @@ class FeatureStore:
     ) -> str:
 
         price_core = price_df[["ticker", "date", "close"]].copy()
+        price_core["date"] = pd.to_datetime(price_core["date"], utc=True)
         price_core = price_core.sort_values(
             ["ticker", "date"]
         ).reset_index(drop=True)
+
+        # 🔥 Use only last 300 rows for inference stability
+        if len(price_core) > 300:
+            price_core = price_core.tail(300)
 
         h = hashlib.sha256()
         h.update(self._stable_hash_df(price_core).encode())
@@ -155,6 +165,12 @@ class FeatureStore:
 
         ticker_safe = re.sub(r"[^A-Za-z0-9_]", "_", ticker)
 
+        cache_key = f"{ticker_safe}_{dataset_hash}_{self.schema_hash}"
+
+        # 🔥 In-memory fast path
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
         path = os.path.join(
             self.FEATURE_DIR,
             f"{self.CACHE_VERSION}_"
@@ -173,13 +189,15 @@ class FeatureStore:
             try:
                 df = pd.read_parquet(path)
                 self._validate_basic_integrity(df)
+
+                self._memory_cache[cache_key] = df
                 return df
             except Exception:
                 logger.warning("Corrupted feature cache removed.")
                 os.remove(path)
 
         ####################################################
-        # REBUILD (CORE FEATURES ONLY)
+        # REBUILD
         ####################################################
 
         logger.info("Feature cache miss — rebuilding.")
@@ -187,7 +205,6 @@ class FeatureStore:
         df = self.engineer._validate_price_frame(price_df, ticker)
         df = self.engineer.add_core_features(df)
 
-        # 🔥 INDUSTRIAL SANITIZATION
         df = df.replace([np.inf, -np.inf], np.nan)
 
         numeric_cols = df.select_dtypes(include=[np.number]).columns
@@ -224,5 +241,7 @@ class FeatureStore:
         os.replace(tmp_path, path)
 
         self._cleanup_old_cache(ticker)
+
+        self._memory_cache[cache_key] = df
 
         return df
