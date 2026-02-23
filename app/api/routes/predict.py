@@ -165,12 +165,17 @@ def validate_portfolio_output(result: Any):
 
 
 # =========================================================
-# RESPONSE MODEL
+# RESPONSE MODELS
 # =========================================================
 
 class PortfolioResponse(BaseModel):
     meta: Dict[str, Any]
     portfolio: List[Dict[str, Any]]
+
+
+class SnapshotResponse(BaseModel):
+    meta: Dict[str, Any]
+    snapshot: Dict[str, Any]
 
 
 # =========================================================
@@ -235,13 +240,9 @@ async def build_portfolio(req: PortfolioRequest):
             "timestamp": int(time.time())
         }
 
-        return PortfolioResponse(
-            meta=meta,
-            portfolio=result
-        )
+        return PortfolioResponse(meta=meta, portfolio=result)
 
     except asyncio.TimeoutError:
-
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         raise HTTPException(
             status_code=504,
@@ -253,7 +254,6 @@ async def build_portfolio(req: PortfolioRequest):
         raise
 
     except RuntimeError as e:
-
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         raise HTTPException(
             status_code=400,
@@ -261,7 +261,6 @@ async def build_portfolio(req: PortfolioRequest):
         )
 
     except Exception:
-
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         raise HTTPException(
             status_code=500,
@@ -269,7 +268,66 @@ async def build_portfolio(req: PortfolioRequest):
         )
 
     finally:
+        API_LATENCY.labels(endpoint=endpoint).observe(
+            time.time() - start_time
+        )
 
+
+# =========================================================
+# 🔥 LIVE SNAPSHOT (ML SHOWCASE ENDPOINT)
+# =========================================================
+
+@router.get("/live-snapshot", response_model=SnapshotResponse)
+async def live_snapshot():
+
+    endpoint = "/live-snapshot"
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
+    start_time = time.time()
+
+    try:
+
+        tickers = load_default_universe()
+
+        loader = get_loader()
+
+        async with inference_semaphore:
+
+            snapshot = await asyncio.wait_for(
+                run_in_threadpool(
+                    get_pipeline().run_snapshot,
+                    tickers
+                ),
+                timeout=REQUEST_TIMEOUT
+            )
+
+        meta = {
+            "model_version": loader.xgb_version,
+            "schema_signature": loader._xgb_container.schema_signature,
+            "dataset_hash": loader.dataset_hash,
+            "training_code_hash": loader.training_code_hash,
+            "artifact_hash": loader.artifact_hash,
+            "universe_size": len(tickers),
+            "timestamp": int(time.time())
+        }
+
+        return SnapshotResponse(meta=meta, snapshot=snapshot)
+
+    except asyncio.TimeoutError:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        raise HTTPException(
+            status_code=504,
+            detail="Snapshot inference timeout"
+        )
+
+    except Exception:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        logger.exception("Live snapshot failure")
+        raise HTTPException(
+            status_code=500,
+            detail="Live snapshot failed"
+        )
+
+    finally:
         API_LATENCY.labels(endpoint=endpoint).observe(
             time.time() - start_time
         )
