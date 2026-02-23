@@ -10,8 +10,7 @@ from typing import List
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from app.inference.pipeline import InferencePipeline
-from app.inference.model_loader import ModelLoader
+from app.inference.pipeline import InferencePipeline, get_shared_model_loader
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
@@ -28,11 +27,10 @@ router = APIRouter()
 logger = logging.getLogger("marketsentinel.api")
 
 # =========================================================
-# SAFE SINGLETONS (Reload-safe)
+# SAFE SINGLETON PIPELINE
 # =========================================================
 
 _pipeline: InferencePipeline | None = None
-_model_loader: ModelLoader | None = None
 
 
 def get_pipeline() -> InferencePipeline:
@@ -41,15 +39,6 @@ def get_pipeline() -> InferencePipeline:
         logger.info("Initializing InferencePipeline (singleton)")
         _pipeline = InferencePipeline()
     return _pipeline
-
-
-def get_loader() -> ModelLoader:
-    global _model_loader
-    if _model_loader is None:
-        logger.info("Initializing ModelLoader (singleton)")
-        _model_loader = ModelLoader()
-        _model_loader.warmup()
-    return _model_loader
 
 
 # =========================================================
@@ -123,8 +112,8 @@ async def live_snapshot():
 
     try:
         tickers = load_default_universe()
-        loader = get_loader()
         pipeline = get_pipeline()
+        loader = get_shared_model_loader()
 
         async with inference_semaphore:
             snapshot = await asyncio.wait_for(
@@ -148,7 +137,10 @@ async def live_snapshot():
             for s in signals
         ]
 
-        avg_strength = round(sum(strength_scores) / len(strength_scores), 2) if strength_scores else 0.0
+        avg_strength = (
+            round(sum(strength_scores) / len(strength_scores), 2)
+            if strength_scores else 0.0
+        )
 
         meta = {
             "model_version": loader.xgb_version,
@@ -199,8 +191,8 @@ async def signal_explanation(ticker: str):
         raise HTTPException(status_code=400, detail="Invalid ticker format.")
 
     try:
-        loader = get_loader()
         pipeline = get_pipeline()
+        loader = get_shared_model_loader()
 
         async with inference_semaphore:
             snapshot = await asyncio.wait_for(
