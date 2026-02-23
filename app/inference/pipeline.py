@@ -132,6 +132,7 @@ class InferencePipeline:
         with self._snapshot_lock:
             self._snapshot_cache[key] = (value, time.time())
 
+
     ############################################################
     # PUBLIC ENTRYPOINT
     ############################################################
@@ -167,6 +168,24 @@ class InferencePipeline:
                 mode="inference"
             ).astype(DTYPE)
 
+            ############################################################
+            # 🔥 DRIFT DETECTION INTEGRATION
+            ############################################################
+
+            drift_result = self.drift_detector.detect(feature_df)
+
+            drift_detected = drift_result.get("drift_detected", False)
+            drift_state = drift_result.get("drift_state", "none")
+            drift_severity = drift_result.get("severity_score", 0)
+            drift_confidence = drift_result.get("drift_confidence", 0.0)
+
+            if drift_state == "hard":
+                raise RuntimeError(
+                    f"HARD drift detected. Severity={drift_severity}"
+                )
+
+            ############################################################
+
             probs = self.models.xgb.predict_proba(feature_df)[:, 1]
             probs = np.clip(probs, 1e-6, 1 - 1e-6)
 
@@ -194,7 +213,6 @@ class InferencePipeline:
             snapshot_rows = []
             strength_scores = []
             risk_levels = []
-
             long_scores = []
             short_scores = []
 
@@ -207,7 +225,6 @@ class InferencePipeline:
                     probability_stats=prob_stats
                 )
 
-                # Defensive guarantees
                 strength = int(agent_output.get("strength_score", 0))
                 risk = agent_output.get("risk_level", "moderate")
 
@@ -231,8 +248,6 @@ class InferencePipeline:
                     "agent": agent_output
                 })
 
-            # ---- Snapshot Meta Aggregation ----
-
             avg_strength = float(np.mean(strength_scores)) if strength_scores else 0.0
             max_strength = int(np.max(strength_scores)) if strength_scores else 0
             min_strength = int(np.min(strength_scores)) if strength_scores else 0
@@ -254,6 +269,12 @@ class InferencePipeline:
                 "min_strength_score": min_strength,
                 "high_conviction_count": high_conviction_count,
                 "elevated_risk_count": elevated_risk_count,
+                "drift": {
+                    "detected": drift_detected,
+                    "state": drift_state,
+                    "severity": drift_severity,
+                    "confidence": drift_confidence
+                },
                 "signals": snapshot_rows
             }
 
