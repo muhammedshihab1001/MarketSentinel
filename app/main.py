@@ -18,7 +18,7 @@ from app.api.routes import (
     universe,
     health,
     predict,
-    performance,
+    performance,   # 🔥 preserved
     equity,
     agent
 )
@@ -50,8 +50,7 @@ BOOT_ID = hashlib.sha256(
 ).hexdigest()[:12]
 
 STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 120)
-
-APP_VERSION = get_env("APP_VERSION", "3.2.0")
+APP_VERSION = get_env("APP_VERSION", "3.2.1")  # 🔥 minor bump
 
 
 # =====================================================
@@ -151,6 +150,7 @@ async def lifespan(app: FastAPI):
         logger.info("System ready in %.2fs", boot_time)
         logger.info("Schema signature: %s", readiness.schema_signature)
         logger.info("Model version: %s", readiness.model_version)
+        logger.info("Artifact hash: %s", readiness.artifact_hash)
 
         yield
 
@@ -176,7 +176,7 @@ app.add_exception_handler(Exception, global_exception_handler)
 
 
 # =====================================================
-# ROUTES (ALL PRESERVED)
+# ROUTES (ALL PRESERVED + PERFORMANCE FIXED)
 # =====================================================
 
 app.include_router(predict.router)
@@ -185,6 +185,7 @@ app.include_router(universe.router)
 app.include_router(model_info.router)
 app.include_router(drift.router)
 app.include_router(portfolio.router)
+app.include_router(performance.router)  # 🔥 FIXED (was missing)
 app.include_router(equity.router)
 app.include_router(agent.router)
 
