@@ -22,12 +22,11 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v22"  # bumped for stable dataset hashing
+    CACHE_VERSION = "v22"
     MAX_CACHE_FILES_PER_TICKER = 6
     MIN_FILE_BYTES = 5_000
     MAX_TOTAL_CACHE_FILES = 2000
 
-    # 🔥 in-memory cache (per process)
     _memory_cache = {}
 
     def __init__(self):
@@ -109,7 +108,6 @@ class FeatureStore:
             ["ticker", "date"]
         ).reset_index(drop=True)
 
-        # 🔥 Use only last 300 rows for inference stability
         if len(price_core) > 300:
             price_core = price_core.tail(300)
 
@@ -165,20 +163,22 @@ class FeatureStore:
 
         ticker_safe = re.sub(r"[^A-Za-z0-9_]", "_", ticker)
 
-        cache_key = f"{ticker_safe}_{dataset_hash}_{self.schema_hash}"
-
-        # 🔥 In-memory fast path
-        if cache_key in self._memory_cache:
-            return self._memory_cache[cache_key]
-
-        path = os.path.join(
-            self.FEATURE_DIR,
+        # 🔥 FIXED: memory cache now matches disk versioning
+        cache_key = (
             f"{self.CACHE_VERSION}_"
             f"{ticker_safe}_"
             f"{dataset_hash}_"
             f"{self.schema_hash}_"
             f"{self.engineer_hash}_"
-            f"{self.env_hash}.parquet"
+            f"{self.env_hash}"
+        )
+
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        path = os.path.join(
+            self.FEATURE_DIR,
+            f"{cache_key}.parquet"
         )
 
         ####################################################
