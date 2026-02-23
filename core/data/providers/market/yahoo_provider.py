@@ -45,29 +45,12 @@ class YahooProvider(MarketDataProvider):
         return dt
 
     ########################################################
-    # FETCH OUTPUT VALIDATION
-    ########################################################
-
-    @staticmethod
-    def _validate_fetch_output(df):
-
-        if df is None:
-            raise RuntimeError("Yahoo fetcher returned None.")
-
-        if not isinstance(df, pd.DataFrame):
-            raise RuntimeError("Yahoo fetcher returned non-DataFrame.")
-
-        if df.empty:
-            raise RuntimeError("Yahoo returned empty dataset.")
-
-    ########################################################
-    # SAFE COLUMN FLATTENER  🔥 FIX
+    # SAFE COLUMN FLATTENER
     ########################################################
 
     @staticmethod
     def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
 
-        # Handle MultiIndex columns safely
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [
                 "_".join(
@@ -81,28 +64,72 @@ class YahooProvider(MarketDataProvider):
         return df
 
     ########################################################
+    # STRICT COLUMN EXTRACTION
+    ########################################################
+
+    @staticmethod
+    def _extract_ohlcv(df: pd.DataFrame, ticker: str):
+
+        # Identify candidate columns
+        col_map = {}
+
+        for col in df.columns:
+
+            if col.startswith("open"):
+                col_map["open"] = col
+
+            elif col.startswith("high"):
+                col_map["high"] = col
+
+            elif col.startswith("low"):
+                col_map["low"] = col
+
+            elif col.startswith("close"):
+                col_map["close"] = col
+
+            elif col.startswith("adj close"):
+                col_map["close"] = col
+
+            elif col.startswith("volume"):
+                col_map["volume"] = col
+
+        required = {"open", "high", "low", "close", "volume"}
+
+        if not required.issubset(col_map.keys()):
+            missing = required - set(col_map.keys())
+            raise RuntimeError(f"Yahoo schema violation: {missing}")
+
+        clean = pd.DataFrame({
+            "open": df[col_map["open"]],
+            "high": df[col_map["high"]],
+            "low": df[col_map["low"]],
+            "close": df[col_map["close"]],
+            "volume": df[col_map["volume"]],
+        })
+
+        return clean
+
+    ########################################################
     # CORE NORMALIZER
     ########################################################
 
-    def _normalize(
-        self,
-        df,
-        ticker,
-        min_rows
-    ):
+    def _normalize(self, df, ticker, min_rows):
 
-        self._validate_fetch_output(df)
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            raise RuntimeError("Yahoo fetch returned invalid dataframe.")
 
         df = df.copy()
 
+        # Flatten columns FIRST
+        df = self._flatten_columns(df)
+
         ####################################################
-        # HANDLE INDEX → date column
+        # HANDLE DATE
         ####################################################
 
         if "date" not in df.columns:
 
             if isinstance(df.index, pd.DatetimeIndex):
-
                 idx = df.index
 
                 if idx.tz is None:
@@ -117,28 +144,12 @@ class YahooProvider(MarketDataProvider):
                 raise RuntimeError("Yahoo index is not datetime.")
 
         ####################################################
-        # COLUMN STANDARDIZATION  🔥 FIXED
+        # EXTRACT STRICT OHLCV
         ####################################################
 
-        df = self._flatten_columns(df)
+        clean = self._extract_ohlcv(df, ticker)
 
-        # If we have close_* (e.g., close_aapl), normalize safely
-        close_cols = [c for c in df.columns if c.startswith("close")]
-
-        if "close" not in df.columns and len(close_cols) == 1:
-            df["close"] = df[close_cols[0]]
-
-        if "adj close" in df.columns:
-            df["close"] = df["adj close"]
-
-        required = {
-            "date", "open", "high",
-            "low", "close", "volume"
-        }
-
-        missing = required - set(df.columns)
-        if missing:
-            raise RuntimeError(f"Yahoo schema violation: {missing}")
+        clean["date"] = df["date"]
 
         ####################################################
         # NUMERIC HARDENING
@@ -147,27 +158,26 @@ class YahooProvider(MarketDataProvider):
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
         for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            clean[col] = pd.to_numeric(clean[col], errors="coerce")
 
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        clean.replace([np.inf, -np.inf], np.nan, inplace=True)
+        clean.dropna(subset=["open", "high", "low", "close"], inplace=True)
 
-        df.dropna(subset=["open", "high", "low", "close"], inplace=True)
-
-        if df.empty:
+        if clean.empty:
             raise RuntimeError("Normalization produced empty dataset.")
 
         ####################################################
         # DATE NORMALIZATION
         ####################################################
 
-        df["date"] = self._normalize_datetime(df["date"])
+        clean["date"] = self._normalize_datetime(clean["date"])
 
         ####################################################
-        # SORT + DEDUPE + ROW CAP
+        # SORT + DEDUPE
         ####################################################
 
-        df = (
-            df
+        clean = (
+            clean
             .drop_duplicates("date")
             .sort_values("date")
             .tail(self.MAX_ROWS)
@@ -175,53 +185,37 @@ class YahooProvider(MarketDataProvider):
         )
 
         ####################################################
-        # PRICE SAFETY FILTER
+        # PRICE INVARIANT REPAIR
         ####################################################
 
-        df = df[
-            (df["open"] > 0) &
-            (df["high"] > 0) &
-            (df["low"] > 0) &
-            (df["close"] > 0)
-        ]
-
-        if df.empty:
-            raise RuntimeError("All rows invalid after price filter.")
-
-        # Repair high/low invariants
-        df["high"] = df[["high", "open", "close"]].max(axis=1)
-        df["low"] = df[["low", "open", "close"]].min(axis=1)
+        clean["high"] = clean[["high", "open", "close"]].max(axis=1)
+        clean["low"] = clean[["low", "open", "close"]].min(axis=1)
 
         ####################################################
         # VOLUME SAFETY
         ####################################################
 
-        df["volume"] = df["volume"].clip(lower=0)
-        df["volume"] = df["volume"].fillna(0)
+        clean["volume"] = clean["volume"].clip(lower=0).fillna(0)
 
         ####################################################
-        # CONFIGURABLE MIN HISTORY
+        # MIN HISTORY
         ####################################################
 
-        if len(df) < min_rows:
+        if len(clean) < min_rows:
             raise RuntimeError(
                 f"Insufficient history for {ticker} "
-                f"({len(df)} < {min_rows})"
+                f"({len(clean)} < {min_rows})"
             )
 
-        ####################################################
-        # FINALIZE
-        ####################################################
-
-        df["ticker"] = ticker
+        clean["ticker"] = ticker
 
         logger.info(
             "Yahoo normalized | ticker=%s rows=%s",
             ticker,
-            len(df)
+            len(clean)
         )
 
-        return df
+        return clean
 
     ########################################################
     # PUBLIC FETCH
@@ -241,17 +235,17 @@ class YahooProvider(MarketDataProvider):
 
         min_rows = kwargs.get("min_rows", self.DEFAULT_MIN_ROWS)
 
-        df = self.fetcher.fetch(
+        raw_df = self.fetcher.fetch(
             ticker,
             start_date,
             end_date,
             interval
         )
 
-        df = self._normalize(
-            df=df,
+        normalized = self._normalize(
+            df=raw_df,
             ticker=ticker,
             min_rows=min_rows
         )
 
-        return self.validate_contract(df)
+        return self.validate_contract(normalized)
