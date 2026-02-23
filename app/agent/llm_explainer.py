@@ -4,7 +4,9 @@ import time
 import threading
 import hashlib
 import json
+import os
 from typing import Dict, Any
+from datetime import datetime
 
 from openai import AsyncOpenAI
 
@@ -35,6 +37,9 @@ class LLMExplainer:
         # 📦 Cache
         self.cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
         self.cache_ttl_seconds = get_int("LLM_CACHE_TTL_SEC", 120)
+
+        # 📜 Audit logging
+        self.audit_enabled = get_bool("LLM_AUDIT_ENABLED", True)
 
         self._request_times = []
         self._rate_lock = threading.Lock()
@@ -125,6 +130,43 @@ class LLMExplainer:
             self._cache[key] = (value, time.time())
 
     ########################################################
+    # AUDIT LOGGING
+    ########################################################
+
+    def _audit_log(
+        self,
+        ticker: str,
+        signal: str,
+        result: Dict[str, Any],
+        cached: bool,
+    ):
+
+        if not self.audit_enabled:
+            return
+
+        try:
+
+            response_hash = hashlib.sha256(
+                json.dumps(result, sort_keys=True).encode()
+            ).hexdigest()
+
+            audit_record = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "ticker": ticker,
+                "signal": signal,
+                "model": self.model_name,
+                "cached": cached,
+                "status": "success" if "error" not in result else "error",
+                "response_hash": response_hash,
+                "env_fingerprint": os.getenv("ENV_FINGERPRINT"),
+            }
+
+            logger.info("LLM_AUDIT | %s", json.dumps(audit_record))
+
+        except Exception:
+            logger.warning("Failed to write LLM audit log.")
+
+    ########################################################
     # PUBLIC API
     ########################################################
 
@@ -141,6 +183,9 @@ class LLMExplainer:
                 "message": "LLM explanation disabled"
             }
 
+        ticker = signal_row.get("ticker")
+        signal = signal_row.get("signal")
+
         cache_key = self._cache_key(
             signal_row,
             agent_output,
@@ -149,17 +194,19 @@ class LLMExplainer:
 
         cached = self._get_cached(cache_key)
         if cached:
+            self._audit_log(ticker, signal, cached, cached=True)
             return {
                 **cached,
                 "cached": True
             }
 
         if not self._check_rate_limit():
-            logger.warning("LLM rate limit exceeded.")
-            return {
+            result = {
                 "llm_enabled": True,
                 "error": "rate_limit_exceeded"
             }
+            self._audit_log(ticker, signal, result, cached=False)
+            return result
 
         prompt = self._build_prompt(
             signal_row,
@@ -176,16 +223,8 @@ class LLMExplainer:
                         {
                             "role": "system",
                             "content": (
-                                "You are a financial explanation engine.\n"
-                                "You MUST return ONLY valid JSON.\n"
-                                "You MUST NOT modify signals.\n"
-                                "Return format:\n"
-                                "{\n"
-                                '  "summary": "...",\n'
-                                '  "rationale": "...",\n'
-                                '  "risk_commentary": "...",\n'
-                                '  "outlook": "..."\n'
-                                "}"
+                                "Return ONLY valid JSON with keys:\n"
+                                "summary, rationale, risk_commentary, outlook."
                             ),
                         },
                         {
@@ -199,7 +238,6 @@ class LLMExplainer:
             )
 
             raw_content = response.choices[0].message.content.strip()
-
             parsed = self._safe_parse_json(raw_content)
 
             result = {
@@ -211,14 +249,17 @@ class LLMExplainer:
 
             self._set_cache(cache_key, result)
 
+            self._audit_log(ticker, signal, result, cached=False)
+
             return result
 
-        except Exception as e:
-            logger.warning("LLM explanation failed: %s", e)
-            return {
+        except Exception:
+            result = {
                 "llm_enabled": True,
                 "error": "llm_unavailable"
             }
+            self._audit_log(ticker, signal, result, cached=False)
+            return result
 
     ########################################################
     # SAFE JSON PARSER
@@ -237,7 +278,7 @@ class LLMExplainer:
             }
 
             if not required.issubset(data.keys()):
-                raise ValueError("Missing required keys")
+                raise ValueError
 
             return data
 
@@ -271,5 +312,5 @@ Warnings: {agent.get("warnings")}
 Probability Mean: {stats.get("mean")}
 Probability Std: {stats.get("std")}
 
-Explain this signal clearly and professionally.
+Explain professionally.
 """
