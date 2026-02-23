@@ -62,7 +62,7 @@ def equity_curve(days: int = 120):
             raise RuntimeError("No valid price data available.")
 
         ############################################################
-        # 2️⃣ BUILD FEATURE DATASETS (CORE ONLY)
+        # 2️⃣ BUILD FEATURE DATASETS
         ############################################################
 
         datasets = []
@@ -85,13 +85,12 @@ def equity_curve(days: int = 120):
             raise RuntimeError("No feature datasets built.")
 
         ############################################################
-        # 3️⃣ CONCAT + CROSS-SECTIONAL ALIGNMENT (CRITICAL FIX)
+        # 3️⃣ CROSS-SECTIONAL ALIGNMENT
         ############################################################
 
         full_df = pd.concat(datasets, ignore_index=True)
         full_df = full_df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
-        # 🔥 Ensure cross-sectional features match live inference
         full_df = FeatureEngineer.add_cross_sectional_features(full_df)
         full_df = FeatureEngineer.finalize(full_df)
 
@@ -116,24 +115,17 @@ def equity_curve(days: int = 120):
                 continue
 
             if snapshot["ticker"].nunique() < MIN_ASSETS_PER_DAY:
-                logger.warning(
-                    f"Skipping {eval_date} — insufficient cross-sectional width."
-                )
                 continue
 
             try:
-
                 results = pipeline.run_historical_with_features(
                     df=snapshot,
                     evaluation_date=eval_date
                 )
-
                 portfolio_records.extend(results)
 
             except Exception as e:
-                logger.warning(
-                    f"Historical skip {eval_date} — {str(e)}"
-                )
+                logger.warning(f"Historical skip {eval_date} — {str(e)}")
 
         if not portfolio_records:
             raise RuntimeError("No portfolio history generated.")
@@ -155,14 +147,7 @@ def equity_curve(days: int = 120):
         forward_df.dropna(inplace=True)
 
         ############################################################
-        # 7️⃣ STRATEGY PERFORMANCE
-        ############################################################
-
-        report = engine.evaluate(portfolio_df, forward_df)
-        strategy_equity = report.equity_curve
-
-        ############################################################
-        # 8️⃣ BENCHMARK
+        # 7️⃣ BENCHMARK RETURNS
         ############################################################
 
         benchmark_df = market_data.get_price_data(
@@ -186,30 +171,66 @@ def equity_curve(days: int = 120):
         benchmark_returns = (
             benchmark_df
             .set_index("date")["forward_return"]
-            .reindex(strategy_equity.index)
+        )
+
+        ############################################################
+        # 8️⃣ STRATEGY PERFORMANCE (NOW FULL REPORT)
+        ############################################################
+
+        report = engine.evaluate(
+            portfolio_df,
+            forward_df,
+            benchmark_returns=benchmark_returns
+        )
+
+        aligned_benchmark = (
+            benchmark_returns
+            .reindex(report.equity_curve.index)
             .dropna()
         )
 
-        if benchmark_returns.empty:
-            raise RuntimeError("Benchmark alignment failed.")
+        benchmark_equity = (1 + aligned_benchmark).cumprod()
 
-        benchmark_equity = (1 + benchmark_returns).cumprod()
-
-        ############################################################
-        # 9️⃣ ALIGN STRATEGY
-        ############################################################
-
-        aligned_strategy = strategy_equity.loc[
+        aligned_strategy = report.equity_curve.loc[
             benchmark_equity.index
         ]
 
+        ############################################################
+        # 9️⃣ STRUCTURED OUTPUT
+        ############################################################
+
         return {
-            "dates": [
-                d.strftime("%Y-%m-%d")
-                for d in benchmark_equity.index
-            ],
-            "strategy_equity": aligned_strategy.tolist(),
-            "benchmark_equity": benchmark_equity.tolist()
+            "summary": {
+                "cumulative_return": report.cumulative_return,
+                "annual_return": report.annual_return,
+                "annual_volatility": report.annual_volatility,
+                "sharpe_ratio": report.sharpe_ratio,
+                "sortino_ratio": report.sortino_ratio,
+                "calmar_ratio": report.calmar_ratio,
+                "max_drawdown": report.max_drawdown,
+                "max_drawdown_duration": report.max_drawdown_duration,
+                "hit_rate": report.hit_rate,
+                "turnover": report.turnover,
+                "beta": report.beta,
+                "information_ratio": report.information_ratio,
+            },
+            "series": {
+                "dates": [
+                    d.strftime("%Y-%m-%d")
+                    for d in benchmark_equity.index
+                ],
+                "strategy_equity": aligned_strategy.tolist(),
+                "benchmark_equity": benchmark_equity.tolist(),
+                "drawdown": report.drawdown_series.loc[
+                    benchmark_equity.index
+                ].tolist(),
+                "rolling_sharpe": report.rolling_sharpe.loc[
+                    benchmark_equity.index
+                ].fillna(0).tolist(),
+                "rolling_volatility": report.rolling_volatility.loc[
+                    benchmark_equity.index
+                ].fillna(0).tolist()
+            }
         }
 
     except Exception as e:
