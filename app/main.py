@@ -2,7 +2,6 @@ import logging
 import time
 import gc
 import hashlib
-import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Response, Request, HTTPException
@@ -18,17 +17,17 @@ from app.api.routes import (
     universe,
     health,
     predict,
-    performance,   # 🔥 preserved
+    performance,
     equity,
     agent
 )
 
-from app.inference.model_loader import ModelLoader
+from app.inference.model_loader import ModelLoader, set_shared_model_loader
 from app.inference.cache import RedisCache
 
 
 # =====================================================
-# ENV INITIALIZATION (🔐 PRODUCTION SAFE)
+# ENV INITIALIZATION
 # =====================================================
 
 init_env()
@@ -50,11 +49,11 @@ BOOT_ID = hashlib.sha256(
 ).hexdigest()[:12]
 
 STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 120)
-APP_VERSION = get_env("APP_VERSION", "3.2.1")  # 🔥 minor bump
+APP_VERSION = get_env("APP_VERSION", "3.3.0")
 
 
 # =====================================================
-# GLOBAL STATE
+# GLOBAL READINESS STATE
 # =====================================================
 
 class ReadinessState:
@@ -112,11 +111,15 @@ async def lifespan(app: FastAPI):
         logger.info("===================================")
 
         # -------------------------------------------------
-        # MODEL LOADING
+        # MODEL LOADING (SHARED SINGLETON)
         # -------------------------------------------------
 
         loader = ModelLoader()
-        _ = loader.xgb  # trigger load
+        _ = loader.xgb  # force load
+        loader.warmup()
+
+        # register shared loader
+        set_shared_model_loader(loader)
 
         readiness.models_loaded = True
         readiness.schema_signature = loader.schema_signature
@@ -176,7 +179,7 @@ app.add_exception_handler(Exception, global_exception_handler)
 
 
 # =====================================================
-# ROUTES (ALL PRESERVED + PERFORMANCE FIXED)
+# ROUTES
 # =====================================================
 
 app.include_router(predict.router)
@@ -185,7 +188,7 @@ app.include_router(universe.router)
 app.include_router(model_info.router)
 app.include_router(drift.router)
 app.include_router(portfolio.router)
-app.include_router(performance.router)  # 🔥 FIXED (was missing)
+app.include_router(performance.router)
 app.include_router(equity.router)
 app.include_router(agent.router)
 
