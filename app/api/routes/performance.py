@@ -20,30 +20,37 @@ def compute_performance(days: int = 120):
 
     try:
 
+        ############################################################
+        # 🔁 Reuse heavy components once per request
+        ############################################################
+
         engine = PerformanceEngine()
         pipeline = InferencePipeline()
         market_data = MarketDataService()
 
-        universe = MarketUniverse.get_universe()
+        universe = list(set(MarketUniverse.get_universe()))
 
         end_date = pd.Timestamp.utcnow().normalize()
         start_date = end_date - pd.Timedelta(days=days + 365)
 
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
+
         ############################################################
-        # 1️⃣ FETCH PRICE HISTORY
+        # 1️⃣ FETCH PRICE HISTORY (PARALLELIZED)
         ############################################################
 
-        price_history = {}
+        price_history = market_data.get_price_data_batch(
+            tickers=universe,
+            start_date=start_str,
+            end_date=end_str,
+            interval="1d",
+            min_history=MIN_HISTORY_ROWS
+        )
 
-        for ticker in universe:
+        cleaned_history = {}
 
-            df = market_data.get_price_data(
-                ticker=ticker,
-                start_date=start_date.strftime("%Y-%m-%d"),
-                end_date=end_date.strftime("%Y-%m-%d"),
-                interval="1d",
-                min_history=MIN_HISTORY_ROWS
-            )
+        for ticker, df in price_history.items():
 
             if df is None or len(df) < MIN_HISTORY_ROWS:
                 continue
@@ -55,18 +62,18 @@ def compute_performance(days: int = 120):
                 df["close"].shift(-1) / df["close"] - 1
             )
 
-            price_history[ticker] = df
+            cleaned_history[ticker] = df
 
-        if not price_history:
+        if not cleaned_history:
             raise RuntimeError("No valid price data available.")
 
         ############################################################
-        # 2️⃣ PRECOMPUTE FEATURES ONCE (CRITICAL FIX)
+        # 2️⃣ PRECOMPUTE FEATURES ONCE
         ############################################################
 
         full_feature_cache = {}
 
-        for ticker, df in price_history.items():
+        for ticker, df in cleaned_history.items():
 
             features = pipeline.feature_store.get_features(
                 df,
@@ -85,14 +92,17 @@ def compute_performance(days: int = 120):
         # 3️⃣ EVALUATION DATES
         ############################################################
 
-        combined_dates = sorted(
-            set(pd.concat(price_history.values())["date"].unique())
-        )
+        all_dates = pd.concat(
+            [df[["date"]] for df in cleaned_history.values()],
+            ignore_index=True
+        )["date"].unique()
+
+        combined_dates = sorted(all_dates)
 
         eval_dates = combined_dates[-days:]
 
         ############################################################
-        # 4️⃣ HISTORICAL SIGNAL GENERATION (FIXED)
+        # 4️⃣ HISTORICAL SIGNAL GENERATION
         ############################################################
 
         portfolio_records = []
@@ -124,7 +134,7 @@ def compute_performance(days: int = 120):
 
         forward_frames = []
 
-        for ticker, df in price_history.items():
+        for ticker, df in cleaned_history.items():
             tmp = df[["date", "forward_return"]].copy()
             tmp["ticker"] = ticker
             forward_frames.append(tmp)
@@ -139,16 +149,21 @@ def compute_performance(days: int = 120):
         report = engine.evaluate(portfolio_df, forward_df)
 
         ############################################################
-        # 7️⃣ BENCHMARK
+        # 7️⃣ BENCHMARK (PARALLEL SAFE)
         ############################################################
 
-        benchmark_df = market_data.get_price_data(
-            ticker=BENCHMARK_TICKER,
-            start_date=start_date.strftime("%Y-%m-%d"),
-            end_date=end_date.strftime("%Y-%m-%d"),
+        benchmark_map = market_data.get_price_data_batch(
+            tickers=[BENCHMARK_TICKER],
+            start_date=start_str,
+            end_date=end_str,
             interval="1d",
             min_history=MIN_HISTORY_ROWS
         )
+
+        benchmark_df = benchmark_map.get(BENCHMARK_TICKER)
+
+        if benchmark_df is None or benchmark_df.empty:
+            raise RuntimeError("Benchmark fetch failed.")
 
         benchmark_df = benchmark_df.sort_values("date")
         benchmark_df["date"] = pd.to_datetime(
