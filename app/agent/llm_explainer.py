@@ -2,6 +2,8 @@ import logging
 import asyncio
 import time
 import threading
+import hashlib
+import json
 from typing import Dict, Any
 
 from openai import AsyncOpenAI
@@ -17,17 +19,28 @@ logger = logging.getLogger("marketsentinel.llm")
 
 class LLMExplainer:
 
+    ########################################################
+    # INIT
+    ########################################################
+
     def __init__(self):
 
         self.enabled = get_bool("LLM_ENABLED", False)
         self.model_name = get_env("OPENAI_MODEL", "gpt-4o-mini")
         self.timeout = get_int("OPENAI_TIMEOUT", 12)
 
-        # 🔐 Rate limiting config
+        # 🔐 Rate limiting
         self.rate_limit_per_minute = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
+
+        # 📦 Cache config
+        self.cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
+        self.cache_ttl_seconds = get_int("LLM_CACHE_TTL_SEC", 120)
 
         self._request_times = []
         self._rate_lock = threading.Lock()
+
+        self._cache = {}
+        self._cache_lock = threading.Lock()
 
         api_key = get_env("OPENAI_API_KEY")
 
@@ -38,7 +51,7 @@ class LLMExplainer:
         self.client = AsyncOpenAI(api_key=api_key) if self.enabled else None
 
     ########################################################
-    # RATE LIMIT CHECK
+    # RATE LIMIT
     ########################################################
 
     def _check_rate_limit(self):
@@ -50,7 +63,6 @@ class LLMExplainer:
 
         with self._rate_lock:
 
-            # Remove timestamps older than 60 seconds
             self._request_times = [
                 t for t in self._request_times
                 if now - t < 60
@@ -61,6 +73,56 @@ class LLMExplainer:
 
             self._request_times.append(now)
             return True
+
+    ########################################################
+    # CACHE HELPERS
+    ########################################################
+
+    def _cache_key(self, row, agent, stats):
+
+        payload = {
+            "ticker": row.get("ticker"),
+            "signal": row.get("signal"),
+            "score": row.get("score"),
+            "rank_pct": row.get("rank_pct"),
+            "confidence": agent.get("confidence"),
+            "trend": agent.get("trend"),
+            "volatility_regime": agent.get("volatility_regime"),
+            "momentum_state": agent.get("momentum_state"),
+            "prob_mean": stats.get("mean"),
+            "prob_std": stats.get("std"),
+        }
+
+        canonical = json.dumps(payload, sort_keys=True)
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def _get_cached(self, key):
+
+        if not self.cache_enabled:
+            return None
+
+        with self._cache_lock:
+
+            entry = self._cache.get(key)
+
+            if not entry:
+                return None
+
+            data, ts = entry
+
+            if time.time() - ts > self.cache_ttl_seconds:
+                del self._cache[key]
+                return None
+
+            return data
+
+    def _set_cache(self, key, value):
+
+        if not self.cache_enabled:
+            return
+
+        with self._cache_lock:
+            self._cache[key] = (value, time.time())
 
     ########################################################
     # PUBLIC API
@@ -77,6 +139,19 @@ class LLMExplainer:
             return {
                 "llm_enabled": False,
                 "message": "LLM explanation disabled"
+            }
+
+        cache_key = self._cache_key(
+            signal_row,
+            agent_output,
+            probability_stats
+        )
+
+        cached = self._get_cached(cache_key)
+        if cached:
+            return {
+                **cached,
+                "cached": True
             }
 
         if not self._check_rate_limit():
@@ -119,11 +194,16 @@ class LLMExplainer:
 
             content = response.choices[0].message.content
 
-            return {
+            result = {
                 "llm_enabled": True,
                 "model": self.model_name,
-                "narrative": content
+                "narrative": content,
+                "cached": False
             }
+
+            self._set_cache(cache_key, result)
+
+            return result
 
         except Exception as e:
             logger.warning("LLM explanation failed: %s", e)
