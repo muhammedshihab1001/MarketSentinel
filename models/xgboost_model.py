@@ -205,8 +205,9 @@ class SafeXGBClassifier:
         if not np.all(np.isfinite(preds)):
             raise RuntimeError("Non-finite predictions detected.")
 
+        # 🔥 KEEP collapse guard during training only
         if np.std(preds) < MIN_PROB_STD:
-            raise RuntimeError("Probability collapse detected.")
+            raise RuntimeError("Probability collapse detected during training.")
 
         if np.any(preds < -EPSILON) or np.any(preds > 1 + EPSILON):
             raise RuntimeError("Invalid probability range detected.")
@@ -252,8 +253,9 @@ class SafeXGBClassifier:
         if not np.all(np.isfinite(probs)):
             raise RuntimeError("Non-finite inference probabilities.")
 
+        # 🔥 REMOVED inference-time collapse exception
         if np.std(probs) < MIN_PROB_STD:
-            raise RuntimeError("Inference probability collapse detected.")
+            logger.warning("Inference probability collapse detected.")
 
         if np.any(probs < -EPSILON) or np.any(probs > 1 + EPSILON):
             raise RuntimeError("Invalid probability range detected.")
@@ -261,7 +263,7 @@ class SafeXGBClassifier:
         return np.column_stack([1 - probs, probs])
 
     ###################################################
-    # FEATURE IMPORTANCE (UPGRADED)
+    # FEATURE IMPORTANCE
     ###################################################
 
     def export_feature_importance(self):
@@ -274,7 +276,6 @@ class SafeXGBClassifier:
         if not raw_gain:
             raise RuntimeError("No feature importance available.")
 
-        # Ensure all features appear (even zero importance)
         importance = {
             name: float(raw_gain.get(name, 0.0))
             for name in self.feature_names
