@@ -3,13 +3,11 @@ import asyncio
 import os
 import re
 import logging
-import math
 import json
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
 from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline
@@ -30,23 +28,25 @@ router = APIRouter()
 logger = logging.getLogger("marketsentinel.api")
 
 # =========================================================
-# SINGLETONS
+# SAFE SINGLETONS (Reload-safe)
 # =========================================================
 
-_pipeline = None
-_model_loader = None
+_pipeline: InferencePipeline | None = None
+_model_loader: ModelLoader | None = None
 
 
-def get_pipeline():
+def get_pipeline() -> InferencePipeline:
     global _pipeline
     if _pipeline is None:
+        logger.info("Initializing InferencePipeline (singleton)")
         _pipeline = InferencePipeline()
     return _pipeline
 
 
-def get_loader():
+def get_loader() -> ModelLoader:
     global _model_loader
     if _model_loader is None:
+        logger.info("Initializing ModelLoader (singleton)")
         _model_loader = ModelLoader()
         _model_loader.warmup()
     return _model_loader
@@ -58,7 +58,6 @@ def get_loader():
 
 MAX_CONCURRENT_INFERENCES = int(os.getenv("MAX_CONCURRENT_INFERENCES", "4"))
 REQUEST_TIMEOUT = int(os.getenv("INFERENCE_TIMEOUT_SEC", "25"))
-MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "30"))
 MIN_BATCH_SIZE = 4
 
 PRIMARY_UNIVERSE_PATH = Path(
@@ -97,12 +96,11 @@ def load_default_universe() -> List[str]:
     else:
         raise RuntimeError("Universe config invalid format.")
 
-    cleaned = []
-
-    for t in tickers:
-        t = str(t).upper().strip()
-        if TICKER_REGEX.match(t):
-            cleaned.append(t)
+    cleaned = [
+        str(t).upper().strip()
+        for t in tickers
+        if TICKER_REGEX.match(str(t).upper().strip())
+    ]
 
     unique = sorted(set(cleaned))
 
@@ -113,7 +111,7 @@ def load_default_universe() -> List[str]:
 
 
 # =========================================================
-# SNAPSHOT (UNCHANGED)
+# LIVE SNAPSHOT
 # =========================================================
 
 @router.get("/live-snapshot")
@@ -124,13 +122,11 @@ async def live_snapshot():
     start_time = time.time()
 
     try:
-
         tickers = load_default_universe()
         loader = get_loader()
         pipeline = get_pipeline()
 
         async with inference_semaphore:
-
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(
                     pipeline.run_snapshot,
@@ -139,7 +135,10 @@ async def live_snapshot():
                 timeout=REQUEST_TIMEOUT
             )
 
-        signals = snapshot.get("signals", [])
+        if not isinstance(snapshot, dict) or "signals" not in snapshot:
+            raise RuntimeError("Invalid snapshot structure.")
+
+        signals = snapshot["signals"]
 
         long_count = sum(1 for s in signals if s.get("signal") == "LONG")
         short_count = sum(1 for s in signals if s.get("signal") == "SHORT")
@@ -150,18 +149,6 @@ async def live_snapshot():
         ]
 
         avg_strength = round(sum(strength_scores) / len(strength_scores), 2) if strength_scores else 0.0
-        max_strength = max(strength_scores) if strength_scores else 0.0
-        min_strength = min(strength_scores) if strength_scores else 0.0
-
-        high_conviction_count = sum(
-            1 for s in signals
-            if s.get("agent", {}).get("strength_score", 0.0) >= 75
-        )
-
-        elevated_risk_count = sum(
-            1 for s in signals
-            if s.get("agent", {}).get("risk_level") == "elevated"
-        )
 
         meta = {
             "model_version": loader.xgb_version,
@@ -173,10 +160,6 @@ async def live_snapshot():
             "long_signals": long_count,
             "short_signals": short_count,
             "avg_strength_score": avg_strength,
-            "max_strength_score": max_strength,
-            "min_strength_score": min_strength,
-            "high_conviction_count": high_conviction_count,
-            "elevated_risk_count": elevated_risk_count,
             "latency_ms": int((time.time() - start_time) * 1000),
             "timestamp": int(time.time())
         }
@@ -187,17 +170,17 @@ async def live_snapshot():
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         raise HTTPException(status_code=504, detail="Snapshot inference timeout")
 
-    except Exception:
+    except Exception as e:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         logger.exception("Live snapshot failure")
-        raise HTTPException(status_code=500, detail="Live snapshot failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
     finally:
         API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
 
 
 # =========================================================
-# 🔥 NEW: SIGNAL EXPLANATION ENDPOINT
+# SIGNAL EXPLANATION
 # =========================================================
 
 @router.get(
@@ -216,12 +199,10 @@ async def signal_explanation(ticker: str):
         raise HTTPException(status_code=400, detail="Invalid ticker format.")
 
     try:
-
         loader = get_loader()
         pipeline = get_pipeline()
 
         async with inference_semaphore:
-
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(
                     pipeline.run_snapshot,
@@ -230,12 +211,10 @@ async def signal_explanation(ticker: str):
                 timeout=REQUEST_TIMEOUT
             )
 
-        signals = snapshot.get("signals", [])
-
-        if not signals:
+        if not isinstance(snapshot, dict) or not snapshot.get("signals"):
             raise HTTPException(status_code=404, detail="No signal generated.")
 
-        row = signals[0]
+        row = snapshot["signals"][0]
         agent_data = row.get("agent", {})
 
         explanation = SignalExplanationResponse(
@@ -276,10 +255,10 @@ async def signal_explanation(ticker: str):
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         raise
 
-    except Exception:
+    except Exception as e:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         logger.exception("Signal explanation failure")
-        raise HTTPException(status_code=500, detail="Signal explanation failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
     finally:
         API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
