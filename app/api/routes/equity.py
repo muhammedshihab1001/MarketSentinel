@@ -102,7 +102,7 @@ def equity_curve(days: int = 120):
         eval_dates = combined_dates[-days:]
 
         ############################################################
-        # 5️⃣ HISTORICAL SIGNAL GENERATION
+        # 5️⃣ HISTORICAL SIGNAL GENERATION (FIXED)
         ############################################################
 
         portfolio_records = []
@@ -118,11 +118,27 @@ def equity_curve(days: int = 120):
                 continue
 
             try:
-                results = pipeline.run_historical_with_features(
-                    df=snapshot,
-                    evaluation_date=eval_date
-                )
-                portfolio_records.extend(results)
+                # 🔥 Direct inference instead of missing method
+                probs = pipeline.model.predict_proba(
+                    snapshot[pipeline.model_features]
+                )[:, 1]
+
+                snapshot["score"] = probs
+
+                # Long top 25%
+                threshold = snapshot["score"].quantile(0.75)
+
+                longs = snapshot[snapshot["score"] >= threshold]
+
+                if longs.empty:
+                    continue
+
+                for _, row in longs.iterrows():
+                    portfolio_records.append({
+                        "date": eval_date,
+                        "ticker": row["ticker"],
+                        "weight": 1.0 / len(longs)
+                    })
 
             except Exception as e:
                 logger.warning(f"Historical skip {eval_date} — {str(e)}")
@@ -174,7 +190,7 @@ def equity_curve(days: int = 120):
         )
 
         ############################################################
-        # 8️⃣ STRATEGY PERFORMANCE (NOW FULL REPORT)
+        # 8️⃣ STRATEGY PERFORMANCE
         ############################################################
 
         report = engine.evaluate(
@@ -200,20 +216,7 @@ def equity_curve(days: int = 120):
         ############################################################
 
         return {
-            "summary": {
-                "cumulative_return": report.cumulative_return,
-                "annual_return": report.annual_return,
-                "annual_volatility": report.annual_volatility,
-                "sharpe_ratio": report.sharpe_ratio,
-                "sortino_ratio": report.sortino_ratio,
-                "calmar_ratio": report.calmar_ratio,
-                "max_drawdown": report.max_drawdown,
-                "max_drawdown_duration": report.max_drawdown_duration,
-                "hit_rate": report.hit_rate,
-                "turnover": report.turnover,
-                "beta": report.beta,
-                "information_ratio": report.information_ratio,
-            },
+            "summary": report.to_dict(),
             "series": {
                 "dates": [
                     d.strftime("%Y-%m-%d")
@@ -224,12 +227,6 @@ def equity_curve(days: int = 120):
                 "drawdown": report.drawdown_series.loc[
                     benchmark_equity.index
                 ].tolist(),
-                "rolling_sharpe": report.rolling_sharpe.loc[
-                    benchmark_equity.index
-                ].fillna(0).tolist(),
-                "rolling_volatility": report.rolling_volatility.loc[
-                    benchmark_equity.index
-                ].fillna(0).tolist()
             }
         }
 
