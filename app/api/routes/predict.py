@@ -165,7 +165,7 @@ def validate_portfolio_output(result: Any):
 
 
 # =========================================================
-# RESPONSE MODEL (STRICT)
+# RESPONSE MODEL
 # =========================================================
 
 class PortfolioResponse(BaseModel):
@@ -186,10 +186,6 @@ async def build_portfolio(req: PortfolioRequest):
 
     try:
 
-        # -------------------------------------------------
-        # Resolve tickers
-        # -------------------------------------------------
-
         if req.tickers is None:
 
             if not DEFAULT_USE_UNIVERSE:
@@ -209,22 +205,13 @@ async def build_portfolio(req: PortfolioRequest):
                 detail=f"Batch size exceeds limit ({MAX_BATCH_SIZE})"
             )
 
-        # -------------------------------------------------
-        # Ensure model loaded
-        # -------------------------------------------------
-
         loader = get_loader()
 
-        # Defensive: ensure model container integrity
         if loader._xgb_container is None:
             raise HTTPException(
                 status_code=503,
                 detail="Model container unavailable"
             )
-
-        # -------------------------------------------------
-        # Concurrency Guard
-        # -------------------------------------------------
 
         async with inference_semaphore:
 
@@ -237,10 +224,6 @@ async def build_portfolio(req: PortfolioRequest):
             )
 
         result = validate_portfolio_output(result)
-
-        # -------------------------------------------------
-        # Structured metadata exposure
-        # -------------------------------------------------
 
         meta = {
             "model_version": loader.xgb_version,
@@ -260,8 +243,6 @@ async def build_portfolio(req: PortfolioRequest):
     except asyncio.TimeoutError:
 
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.error("Portfolio inference timeout")
-
         raise HTTPException(
             status_code=504,
             detail="Portfolio inference timeout"
@@ -274,8 +255,6 @@ async def build_portfolio(req: PortfolioRequest):
     except RuntimeError as e:
 
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.warning(f"Portfolio runtime failure: {str(e)}")
-
         raise HTTPException(
             status_code=400,
             detail=str(e)
@@ -284,8 +263,6 @@ async def build_portfolio(req: PortfolioRequest):
     except Exception:
 
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.exception("Portfolio inference failure")
-
         raise HTTPException(
             status_code=500,
             detail="Portfolio inference failed"
@@ -295,42 +272,4 @@ async def build_portfolio(req: PortfolioRequest):
 
         API_LATENCY.labels(endpoint=endpoint).observe(
             time.time() - start_time
-        )
-
-
-# =========================================================
-# HEALTH
-# =========================================================
-
-@router.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "timestamp": int(time.time())
-    }
-
-
-# =========================================================
-# READINESS
-# =========================================================
-
-@router.get("/ready")
-async def readiness():
-
-    try:
-        loader = get_loader()
-
-        if loader._xgb_container is None:
-            raise RuntimeError("Model not loaded")
-
-        return {
-            "status": "ready",
-            "model_version": loader.xgb_version,
-            "schema_signature": loader._xgb_container.schema_signature
-        }
-
-    except Exception:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not ready"
         )
