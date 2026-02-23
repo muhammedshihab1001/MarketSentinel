@@ -14,6 +14,7 @@ from app.api.routes import performance
 from app.api.routes import equity  # 🔥 NEW
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
+from app.api.routes import agent
 
 
 # =====================================================
@@ -175,7 +176,7 @@ app.include_router(model_info.router)
 app.include_router(drift.router)
 app.include_router(portfolio.router)
 app.include_router(equity.router)
-
+app.include_router(agent.router)
 
 # =====================================================
 # ROOT
