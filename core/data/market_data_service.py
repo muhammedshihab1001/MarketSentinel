@@ -5,10 +5,10 @@ import time
 import numpy as np
 import hashlib
 import re
-import tempfile
-import os
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import os
 
 from core.data.providers.market.router import MarketProviderRouter
 
@@ -35,11 +35,15 @@ class MarketDataService:
     MIN_FILE_BYTES = 5_000
     MAX_DAILY_MOVE = 0.85
 
-    MAX_WORKERS = 8   # 🔥 parallelism control
-    MEMORY_CACHE_TTL = 30  # seconds
+    MAX_WORKERS = int(os.getenv("MARKET_MAX_WORKERS", 6))
+    MEMORY_CACHE_TTL = 30
+
+    # 🔥 Fast mode (Yahoo-only unless failure)
+    FAST_PROVIDER_MODE = os.getenv("MARKET_FAST_MODE", "true").lower() == "true"
 
     _PROVIDER = None
     _memory_cache = {}
+    _cache_lock = Lock()
 
     ########################################################
 
@@ -89,7 +93,6 @@ class MarketDataService:
     def _dataset_hash(self, df: pd.DataFrame):
 
         df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
-
         payload = df.to_csv(index=False).encode()
 
         return hashlib.sha256(payload).hexdigest()[:16]
@@ -136,6 +139,8 @@ class MarketDataService:
         return df.reset_index(drop=True)
 
     ########################################################
+    # 🔥 SMART FETCH (FAST MODE SUPPORT)
+    ########################################################
 
     def _fetch_with_retry(
         self,
@@ -144,7 +149,7 @@ class MarketDataService:
         end,
         interval,
         min_history,
-        retries=4
+        retries=3
     ):
 
         last_error = None
@@ -153,13 +158,24 @@ class MarketDataService:
 
             try:
 
-                df = self._fetcher.fetch(
-                    ticker,
-                    start,
-                    end,
-                    interval,
-                    min_rows=min_history
-                )
+                # FAST MODE: Try Yahoo first only
+                if self.FAST_PROVIDER_MODE:
+                    df = self._fetcher.fetch(
+                        ticker,
+                        start,
+                        end,
+                        interval,
+                        min_rows=min_history,
+                        provider="yahoo"  # router must support this param
+                    )
+                else:
+                    df = self._fetcher.fetch(
+                        ticker,
+                        start,
+                        end,
+                        interval,
+                        min_rows=min_history
+                    )
 
                 validated = self._validate_dataset(
                     df,
@@ -175,7 +191,7 @@ class MarketDataService:
 
                 last_error = e
 
-                sleep = (2 ** attempt) + random.uniform(0, 1)
+                sleep = (2 ** attempt) + random.uniform(0, 0.5)
 
                 logger.warning(
                     "Fetch failed (%s) attempt %d/%d | %.2fs | %s",
@@ -193,21 +209,26 @@ class MarketDataService:
         ) from last_error
 
     ########################################################
-    # MEMORY CACHE LAYER
+    # THREAD SAFE MEMORY CACHE
     ########################################################
 
     def _cache_key(self, ticker, start, end, interval, min_history):
         return f"{ticker}_{start}_{end}_{interval}_{min_history}"
 
     def _get_from_memory_cache(self, key):
-        item = self._memory_cache.get(key)
-        if not item:
-            return None
-        df, ts = item
-        if time.time() - ts > self.MEMORY_CACHE_TTL:
-            del self._memory_cache[key]
-            return None
-        return df
+        with self._cache_lock:
+            item = self._memory_cache.get(key)
+            if not item:
+                return None
+            df, ts = item
+            if time.time() - ts > self.MEMORY_CACHE_TTL:
+                del self._memory_cache[key]
+                return None
+            return df.copy()
+
+    def _set_memory_cache(self, key, df):
+        with self._cache_lock:
+            self._memory_cache[key] = (df.copy(), time.time())
 
     ########################################################
     # PUBLIC API
@@ -238,7 +259,7 @@ class MarketDataService:
 
         cached = self._get_from_memory_cache(cache_key)
         if cached is not None:
-            return cached.copy()
+            return cached
 
         logger.info(
             "Fetching dataset for %s (min_history=%d)",
@@ -254,12 +275,12 @@ class MarketDataService:
             min_history
         )
 
-        self._memory_cache[cache_key] = (df.copy(), time.time())
+        self._set_memory_cache(cache_key, df)
 
-        return df.reset_index(drop=True)
+        return df
 
     ########################################################
-    # 🔥 NEW: BATCH FETCH (PARALLEL)
+    # 🔥 PARALLEL BATCH FETCH (SAFE + FAST)
     ########################################################
 
     def get_price_data_batch(
@@ -272,6 +293,8 @@ class MarketDataService:
     ):
 
         results = {}
+
+        tickers = list(set(tickers))  # prevent duplicates
 
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
 
@@ -295,4 +318,5 @@ class MarketDataService:
                     logger.error("Batch fetch failed: %s | %s", ticker, str(e))
                     raise
 
-        return results
+        # preserve input order
+        return {t: results[t] for t in tickers if t in results}
