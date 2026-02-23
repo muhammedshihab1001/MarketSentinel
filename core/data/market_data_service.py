@@ -38,7 +38,6 @@ class MarketDataService:
     MAX_WORKERS = int(os.getenv("MARKET_MAX_WORKERS", 6))
     MEMORY_CACHE_TTL = 30
 
-    # 🔥 Fast mode (Yahoo-only unless failure)
     FAST_PROVIDER_MODE = os.getenv("MARKET_FAST_MODE", "true").lower() == "true"
 
     _PROVIDER = None
@@ -56,10 +55,12 @@ class MarketDataService:
 
         self._fetcher = MarketDataService._PROVIDER
 
-        # 🔥 Auto-reduce workers if single-provider FAST mode
         if self.FAST_PROVIDER_MODE and len(self._fetcher.providers) == 1:
             self.MAX_WORKERS = min(self.MAX_WORKERS, 2)
-            logger.info("Single-provider FAST mode → worker cap set to %s", self.MAX_WORKERS)
+            logger.info(
+                "Single-provider FAST mode → worker cap set to %s",
+                self.MAX_WORKERS
+            )
 
         self.SCHEMA_HASH = hashlib.sha256(
             ",".join(sorted(self.REQUIRED_COLUMNS)).encode()
@@ -103,31 +104,51 @@ class MarketDataService:
         return hashlib.sha256(payload).hexdigest()[:16]
 
     ########################################################
+    # 🔥 HARDENED VALIDATION
+    ########################################################
 
     def _validate_dataset(self, df: pd.DataFrame, ticker: str, min_rows: int):
 
-        if df is None or df.empty:
-            raise RuntimeError("Market data empty.")
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            raise RuntimeError("Market data empty or invalid structure.")
 
         df = df.copy()
-        df["ticker"] = ticker
 
+        # enforce required columns existence
         missing = self.REQUIRED_COLUMNS - set(df.columns)
         if missing:
             raise RuntimeError(f"Schema violation. Missing={missing}")
 
-        df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_convert(None)
+        df["ticker"] = ticker
+
+        # normalize date safely
+        df["date"] = pd.to_datetime(
+            df["date"],
+            errors="coerce",
+            utc=True
+        ).dt.tz_convert(None)
+
+        if df["date"].isna().any():
+            raise RuntimeError("Invalid date values detected.")
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
+        # strict numeric enforcement
         for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="raise")
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        if not np.isfinite(df[numeric_cols].to_numpy()).all():
+        if df[numeric_cols].isna().any().any():
+            raise RuntimeError("NaN values detected in numeric columns.")
+
+        # 🔥 safer finite check
+        numeric_array = df[numeric_cols].values.astype(float)
+
+        if not np.isfinite(numeric_array).all():
             raise RuntimeError("Non-finite prices detected.")
 
         df = df.sort_values("date").reset_index(drop=True)
 
+        # daily jump guard
         pct = df["close"].pct_change().abs().fillna(0)
 
         if (pct > self.MAX_DAILY_MOVE).any():
@@ -144,7 +165,7 @@ class MarketDataService:
         return df.reset_index(drop=True)
 
     ########################################################
-    # 🔥 SMART FETCH (FAST MODE SUPPORT)
+    # RETRY FETCH
     ########################################################
 
     def _fetch_with_retry(
@@ -163,7 +184,6 @@ class MarketDataService:
 
             try:
 
-                # FAST MODE: Try Yahoo first only
                 if self.FAST_PROVIDER_MODE:
                     df = self._fetcher.fetch(
                         ticker,
@@ -171,7 +191,7 @@ class MarketDataService:
                         end,
                         interval,
                         min_rows=min_history,
-                        provider="yahoo"  # router must support this param
+                        provider="yahoo"
                     )
                 else:
                     df = self._fetcher.fetch(
@@ -214,7 +234,7 @@ class MarketDataService:
         ) from last_error
 
     ########################################################
-    # THREAD SAFE MEMORY CACHE
+    # MEMORY CACHE
     ########################################################
 
     def _cache_key(self, ticker, start, end, interval, min_history):
@@ -285,7 +305,7 @@ class MarketDataService:
         return df
 
     ########################################################
-    # 🔥 PARALLEL BATCH FETCH (SAFE + FAST)
+    # PARALLEL BATCH FETCH
     ########################################################
 
     def get_price_data_batch(
@@ -299,7 +319,7 @@ class MarketDataService:
 
         results = {}
 
-        tickers = list(set(tickers))  # prevent duplicates
+        tickers = list(dict.fromkeys(tickers))  # preserve order safely
 
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
 
@@ -320,8 +340,11 @@ class MarketDataService:
                 try:
                     results[ticker] = future.result()
                 except Exception as e:
-                    logger.error("Batch fetch failed: %s | %s", ticker, str(e))
+                    logger.error(
+                        "Batch fetch failed: %s | %s",
+                        ticker,
+                        str(e)
+                    )
                     raise
 
-        # preserve input order
         return {t: results[t] for t in tickers if t in results}
