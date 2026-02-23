@@ -18,10 +18,6 @@ from app.monitoring.metrics import MODEL_VERSION
 logger = logging.getLogger("marketsentinel.loader")
 
 
-############################################################
-# MODEL CONTAINER (IMMUTABLE)
-############################################################
-
 @dataclass(frozen=True)
 class LoadedModel:
     model: object
@@ -34,16 +30,14 @@ class LoadedModel:
     pointer_hash: str | None
 
 
-############################################################
-# SINGLETON LOADER
-############################################################
-
 class ModelLoader:
 
     _instance = None
     _instance_lock = threading.Lock()
 
     MIN_ARTIFACT_BYTES = 50_000
+    MIN_METADATA_BYTES = 500
+
     POINTER_FILENAME = "production_pointer.json"
     DRIFT_BASELINE_PATH = os.path.realpath("artifacts/drift/baseline.json")
 
@@ -67,7 +61,7 @@ class ModelLoader:
         self._initialized = True
 
     ########################################################
-    # SHA256
+    # HASH
     ########################################################
 
     def _sha256(self, path: str) -> str:
@@ -89,7 +83,7 @@ class ModelLoader:
         return hashlib.sha256(canonical).hexdigest()
 
     ########################################################
-    # REGISTRY DIR VALIDATION
+    # REGISTRY
     ########################################################
 
     def _get_registry_dir(self):
@@ -107,21 +101,21 @@ class ModelLoader:
         return base_dir
 
     ########################################################
-    # PRODUCTION POINTER RESOLUTION
+    # POINTER
     ########################################################
 
     def _resolve_production_version(self, base_dir):
 
-        pointer_path = os.path.join(
-            base_dir,
-            self.POINTER_FILENAME
-        )
+        pointer_path = os.path.join(base_dir, self.POINTER_FILENAME)
 
         if not os.path.exists(pointer_path):
             raise RuntimeError("production_pointer.json missing.")
 
         if os.path.islink(pointer_path):
             raise RuntimeError("Symlinked production pointer detected.")
+
+        if os.path.getsize(pointer_path) < 20:
+            raise RuntimeError("Production pointer corrupted.")
 
         pointer_hash = self._sha256(pointer_path)
 
@@ -133,21 +127,14 @@ class ModelLoader:
         if not version:
             raise RuntimeError("Invalid production pointer format.")
 
-        model_path = os.path.join(
-            base_dir,
-            f"model_{version}.pkl"
-        )
-
-        metadata_path = os.path.join(
-            base_dir,
-            f"metadata_{version}.json"
-        )
+        model_path = os.path.join(base_dir, f"model_{version}.pkl")
+        metadata_path = os.path.join(base_dir, f"metadata_{version}.json")
 
         if not os.path.exists(model_path):
-            raise RuntimeError("Production pointer model missing.")
+            raise RuntimeError("Production model missing.")
 
         if not os.path.exists(metadata_path):
-            raise RuntimeError("Production pointer metadata missing.")
+            raise RuntimeError("Production metadata missing.")
 
         return model_path, metadata_path, version, pointer_hash
 
@@ -172,7 +159,7 @@ class ModelLoader:
         return model
 
     ########################################################
-    # BASELINE LINEAGE VALIDATION
+    # BASELINE LINEAGE (SOFT FAIL)
     ########################################################
 
     def _validate_baseline_lineage(self, meta: dict):
@@ -188,23 +175,17 @@ class ModelLoader:
 
             if baseline_meta.get("dataset_hash") and \
                     baseline_meta["dataset_hash"] != meta["dataset_hash"]:
-                raise RuntimeError(
-                    "Dataset hash mismatch between baseline and model."
-                )
+                logger.warning("Baseline dataset hash mismatch.")
 
             if baseline_meta.get("training_code_hash") and \
                     baseline_meta["training_code_hash"] != meta["training_code_hash"]:
-                raise RuntimeError(
-                    "Training code hash mismatch between baseline and model."
-                )
+                logger.warning("Baseline training code hash mismatch.")
 
         except Exception as e:
-            raise RuntimeError(
-                f"Baseline lineage validation failed: {e}"
-            )
+            logger.warning("Baseline lineage validation soft-failed: %s", e)
 
     ########################################################
-    # RELOAD IF NEEDED
+    # RELOAD
     ########################################################
 
     def _reload_xgb_if_needed(self):
@@ -223,6 +204,9 @@ class ModelLoader:
                 return self._xgb_container.model
 
             logger.info("Loading XGBoost version=%s", version)
+
+            if os.path.getsize(metadata_path) < self.MIN_METADATA_BYTES:
+                raise RuntimeError("Metadata file corrupted.")
 
             meta = MetadataManager.load_metadata(metadata_path)
 
@@ -265,6 +249,7 @@ class ModelLoader:
                     meta["feature_checksum"] != feature_checksum_actual:
                 raise RuntimeError("Feature checksum mismatch.")
 
+            # Soft validation (no hard fail for free-data use case)
             self._validate_baseline_lineage(meta)
 
             new_container = LoadedModel(
@@ -278,6 +263,7 @@ class ModelLoader:
                 pointer_hash=pointer_hash
             )
 
+            # Atomic-style swap
             self._xgb_container = new_container
 
             MODEL_VERSION.labels(
@@ -328,7 +314,7 @@ class ModelLoader:
         return self._xgb_container.feature_checksum
 
     ########################################################
-    # 🔥 FEATURE IMPORTANCE SAFE ACCESSOR
+    # FEATURE IMPORTANCE
     ########################################################
 
     def get_feature_importance(self):
