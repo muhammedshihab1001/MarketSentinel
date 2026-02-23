@@ -42,6 +42,8 @@ def test_signal_agent_structure():
     assert "momentum_state" in result
     assert "warnings" in result
     assert "explanation" in result
+    assert "strength_score" in result
+    assert "risk_level" in result
 
 
 # -------------------------------------------------------
@@ -170,3 +172,61 @@ def test_bearish_trend():
     result = agent.analyze(row=row, probability_stats=make_prob_stats())
 
     assert result["trend"] == "bearish"
+
+
+# -------------------------------------------------------
+# STRENGTH SCORE TESTS
+# -------------------------------------------------------
+
+def test_strength_score_range():
+
+    agent = SignalAgent()
+    row = make_base_row()
+
+    result = agent.analyze(row=row, probability_stats=make_prob_stats())
+
+    assert 0.0 <= result["strength_score"] <= 100.0
+
+
+def test_strength_score_increases_with_probability():
+
+    agent = SignalAgent()
+
+    row_low = make_base_row()
+    row_low["score"] = 0.55
+
+    row_high = make_base_row()
+    row_high["score"] = 0.85
+
+    result_low = agent.analyze(row=row_low, probability_stats=make_prob_stats())
+    result_high = agent.analyze(row=row_high, probability_stats=make_prob_stats())
+
+    assert result_high["strength_score"] > result_low["strength_score"]
+
+
+# -------------------------------------------------------
+# RISK LEVEL CLASSIFICATION
+# -------------------------------------------------------
+
+def test_risk_level_low():
+
+    agent = SignalAgent()
+    row = make_base_row()
+    row["score"] = 0.90
+    row["rank_pct"] = 0.95
+
+    result = agent.analyze(row=row, probability_stats=make_prob_stats(std=0.15))
+
+    assert result["risk_level"] == "low"
+
+
+def test_risk_level_elevated():
+
+    agent = SignalAgent()
+    row = make_base_row()
+    row["score"] = 0.52
+    row["rank_pct"] = 0.51
+
+    result = agent.analyze(row=row, probability_stats=make_prob_stats(std=0.01))
+
+    assert result["risk_level"] in {"moderate", "elevated"}
