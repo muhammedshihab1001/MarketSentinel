@@ -180,7 +180,6 @@ class InferencePipeline:
             ).astype(DTYPE)
 
             # ---------------- DRIFT DETECTION ----------------
-
             try:
                 drift_result = self.drift_detector.detect(feature_df)
             except Exception as e:
@@ -224,7 +223,6 @@ class InferencePipeline:
             snapshot_rows = []
 
             for _, row in latest_df.iterrows():
-
                 agent_output = self.agent.analyze(
                     row=row.to_dict(),
                     probability_stats=prob_stats
@@ -250,11 +248,12 @@ class InferencePipeline:
                 "signals": snapshot_rows
             }
 
-            # 🔥 FIXED METRICS LABEL USAGE
-            MODEL_INFERENCE_COUNT.labels(stage="xgboost").inc()
-            MODEL_INFERENCE_LATENCY.labels(stage="xgboost").observe(
-                time.time() - start_time
-            )
+            # ✅ CORRECT PROMETHEUS LABELS
+            MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
+
+            MODEL_INFERENCE_LATENCY.labels(
+                model="xgboost"
+            ).observe(time.time() - start_time)
 
             with self._snapshot_lock:
                 self._snapshot_cache[cache_key] = (result, time.time())
@@ -270,53 +269,6 @@ class InferencePipeline:
 
         finally:
             INFERENCE_IN_PROGRESS.dec()
-
-    # ============================================================
-    # HISTORICAL RUN (FIXED SIGNATURE)
-    # ============================================================
-
-    def run_historical_with_features(
-        self,
-        full_feature_cache: Dict[str, pd.DataFrame],
-        evaluation_date: pd.Timestamp
-    ):
-
-        records = []
-
-        for ticker, df in full_feature_cache.items():
-
-            df_day = df[df["date"] == evaluation_date]
-
-            if df_day.empty:
-                continue
-
-            feature_df = validate_feature_schema(
-                df_day.loc[:, MODEL_FEATURES],
-                mode="inference"
-            ).astype(DTYPE)
-
-            probs = self.models.xgb.predict_proba(feature_df)[:, 1]
-
-            df_day = df_day.copy()
-            df_day["score"] = probs
-            df_day["rank_pct"] = df_day["score"].rank(method="first", pct=True)
-
-            df_day["signal"] = df_day["rank_pct"].apply(
-                lambda x: "LONG" if x >= LONG_PERCENTILE
-                else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
-            )
-
-            weights = self._construct_portfolio(df_day)
-
-            for _, row in df_day.iterrows():
-                records.append({
-                    "date": row["date"],
-                    "ticker": row["ticker"],
-                    "signal": row["signal"],
-                    "weight": float(weights.get(row["ticker"], 0.0)),
-                })
-
-        return records
 
     # ============================================================
     # FEATURE BUILD
@@ -370,7 +322,7 @@ class InferencePipeline:
         return df
 
     # ============================================================
-    # PORTFOLIO CONSTRUCTION
+    # PORTFOLIO
     # ============================================================
 
     def _construct_portfolio(self, latest_df):
