@@ -22,7 +22,10 @@ from app.api.routes import (
     agent
 )
 
-from app.inference.model_loader import ModelLoader, set_shared_model_loader
+from app.inference.model_loader import (
+    ModelLoader,
+    set_shared_model_loader
+)
 from app.inference.cache import RedisCache
 
 
@@ -95,7 +98,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # =====================================================
-# LIFESPAN
+# LIFESPAN MANAGEMENT
 # =====================================================
 
 @asynccontextmanager
@@ -104,21 +107,20 @@ async def lifespan(app: FastAPI):
     start_time = time.time()
 
     try:
-
         logger.info("===================================")
         logger.info(" MarketSentinel Boot Sequence Start ")
         logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("===================================")
 
         # -------------------------------------------------
-        # MODEL LOADING (SHARED SINGLETON)
+        # MODEL LOADING (SINGLETON REGISTRATION)
         # -------------------------------------------------
 
         loader = ModelLoader()
-        _ = loader.xgb  # force load
+        _ = loader.xgb  # Force model load
         loader.warmup()
 
-        # register shared loader
+        # Register shared singleton
         set_shared_model_loader(loader)
 
         readiness.models_loaded = True
@@ -179,7 +181,7 @@ app.add_exception_handler(Exception, global_exception_handler)
 
 
 # =====================================================
-# ROUTES
+# ROUTE REGISTRATION
 # =====================================================
 
 app.include_router(predict.router)
@@ -212,7 +214,7 @@ async def root():
 
 
 # =====================================================
-# PROMETHEUS
+# PROMETHEUS METRICS
 # =====================================================
 
 @app.get("/metrics")
@@ -224,7 +226,7 @@ def metrics():
 
 
 # =====================================================
-# READINESS
+# READINESS PROBE
 # =====================================================
 
 @app.get("/ready")
@@ -248,7 +250,7 @@ def readiness_probe():
 
 
 # =====================================================
-# LIVENESS
+# LIVENESS PROBE
 # =====================================================
 
 @app.get("/live")
