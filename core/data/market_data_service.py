@@ -8,6 +8,7 @@ import re
 import tempfile
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core.data.providers.market.router import MarketProviderRouter
 
@@ -28,13 +29,17 @@ class MarketDataService:
         "volume"
     }
 
-    DEFAULT_MIN_HISTORY_ROWS = 60   # 🔥 configurable
+    DEFAULT_MIN_HISTORY_ROWS = 60
     SAFE_LAG_DAYS = 2
     MAX_ROWS = 15000
     MIN_FILE_BYTES = 5_000
     MAX_DAILY_MOVE = 0.85
 
+    MAX_WORKERS = 8   # 🔥 parallelism control
+    MEMORY_CACHE_TTL = 30  # seconds
+
     _PROVIDER = None
+    _memory_cache = {}
 
     ########################################################
 
@@ -123,7 +128,6 @@ class MarketDataService:
         if len(df) > self.MAX_ROWS:
             df = df.tail(self.MAX_ROWS)
 
-        # 🔥 configurable tolerance
         if len(df) < min_rows:
             raise RuntimeError(
                 f"Insufficient history ({len(df)} < {min_rows})"
@@ -154,7 +158,7 @@ class MarketDataService:
                     start,
                     end,
                     interval,
-                    min_rows=min_history  # 🔥 propagate
+                    min_rows=min_history
                 )
 
                 validated = self._validate_dataset(
@@ -189,6 +193,25 @@ class MarketDataService:
         ) from last_error
 
     ########################################################
+    # MEMORY CACHE LAYER
+    ########################################################
+
+    def _cache_key(self, ticker, start, end, interval, min_history):
+        return f"{ticker}_{start}_{end}_{interval}_{min_history}"
+
+    def _get_from_memory_cache(self, key):
+        item = self._memory_cache.get(key)
+        if not item:
+            return None
+        df, ts = item
+        if time.time() - ts > self.MEMORY_CACHE_TTL:
+            del self._memory_cache[key]
+            return None
+        return df
+
+    ########################################################
+    # PUBLIC API
+    ########################################################
 
     def get_price_data(
         self,
@@ -196,15 +219,26 @@ class MarketDataService:
         start_date: str,
         end_date: str,
         interval: str = "1d",
-        min_history: int | None = None   # 🔥 NEW PARAM
+        min_history: int | None = None
     ):
 
         ticker = self._sanitize_ticker(ticker)
-
         end_date = self._cap_to_safe_date(end_date)
 
         if min_history is None:
             min_history = self.DEFAULT_MIN_HISTORY_ROWS
+
+        cache_key = self._cache_key(
+            ticker,
+            start_date,
+            end_date.strftime("%Y-%m-%d"),
+            interval,
+            min_history
+        )
+
+        cached = self._get_from_memory_cache(cache_key)
+        if cached is not None:
+            return cached.copy()
 
         logger.info(
             "Fetching dataset for %s (min_history=%d)",
@@ -220,4 +254,45 @@ class MarketDataService:
             min_history
         )
 
+        self._memory_cache[cache_key] = (df.copy(), time.time())
+
         return df.reset_index(drop=True)
+
+    ########################################################
+    # 🔥 NEW: BATCH FETCH (PARALLEL)
+    ########################################################
+
+    def get_price_data_batch(
+        self,
+        tickers: list[str],
+        start_date: str,
+        end_date: str,
+        interval: str = "1d",
+        min_history: int | None = None
+    ):
+
+        results = {}
+
+        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
+
+            futures = {
+                executor.submit(
+                    self.get_price_data,
+                    ticker,
+                    start_date,
+                    end_date,
+                    interval,
+                    min_history
+                ): ticker
+                for ticker in tickers
+            }
+
+            for future in as_completed(futures):
+                ticker = futures[future]
+                try:
+                    results[ticker] = future.result()
+                except Exception as e:
+                    logger.error("Batch fetch failed: %s | %s", ticker, str(e))
+                    raise
+
+        return results
