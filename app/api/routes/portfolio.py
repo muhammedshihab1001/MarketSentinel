@@ -15,19 +15,44 @@ def portfolio_summary():
         pipeline = InferencePipeline()
         universe = MarketUniverse.get_universe()
 
-        # Use canonical snapshot path
         snapshot = pipeline.run_snapshot(universe)
-        results = snapshot.get("signals", [])
+
+        if not isinstance(snapshot, dict) or "signals" not in snapshot:
+            raise RuntimeError("Invalid snapshot structure.")
+
+        results = snapshot["signals"]
 
         if not results:
             raise RuntimeError("No signals generated.")
 
-        long_count = sum(1 for r in results if r["signal"] == "LONG")
-        short_count = sum(1 for r in results if r["signal"] == "SHORT")
-        neutral_count = sum(1 for r in results if r["signal"] == "NEUTRAL")
+        # ===============================
+        # SIGNAL COUNTS
+        # ===============================
+
+        long_count = sum(1 for r in results if r.get("signal") == "LONG")
+        short_count = sum(1 for r in results if r.get("signal") == "SHORT")
+        neutral_count = sum(1 for r in results if r.get("signal") == "NEUTRAL")
+
+        # ===============================
+        # EXPOSURE
+        # ===============================
 
         gross_exposure = sum(abs(r.get("weight", 0.0)) for r in results)
         net_exposure = sum(r.get("weight", 0.0) for r in results)
+
+        # ===============================
+        # AGENT METRICS (FIXED)
+        # ===============================
+
+        high_conviction_count = sum(
+            1 for r in results
+            if r.get("agent", {}).get("strength_score", 0.0) >= 75
+        )
+
+        elevated_risk_count = sum(
+            1 for r in results
+            if r.get("agent", {}).get("risk_level") == "elevated"
+        )
 
         return {
             "snapshot_date": snapshot.get("snapshot_date"),
@@ -37,8 +62,8 @@ def portfolio_summary():
             "neutral_count": neutral_count,
             "gross_exposure": round(gross_exposure, 6),
             "net_exposure": round(net_exposure, 6),
-            "high_conviction_count": snapshot.get("high_conviction_count"),
-            "elevated_risk_count": snapshot.get("elevated_risk_count"),
+            "high_conviction_count": high_conviction_count,
+            "elevated_risk_count": elevated_risk_count,
         }
 
     except Exception as e:

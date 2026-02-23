@@ -23,6 +23,7 @@ logger = logging.getLogger("marketsentinel.performance")
 
 MIN_HISTORY_ROWS = 60
 BENCHMARK_TICKER = "SPY"
+MIN_PROB_STD = 1e-6
 
 
 @router.get("/performance")
@@ -33,6 +34,8 @@ def compute_performance(days: int = 120):
         engine = PerformanceEngine()
         pipeline = InferencePipeline()
         loader = ModelLoader()
+        loader.warmup()  # 🔥 ensure model ready
+
         market_data = MarketDataService()
 
         universe = list(set(MarketUniverse.get_universe()))
@@ -43,9 +46,9 @@ def compute_performance(days: int = 120):
         start_str = start_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
 
-        ############################################################
+        # =========================================================
         # 1️⃣ FETCH PRICE HISTORY
-        ############################################################
+        # =========================================================
 
         price_history = market_data.get_price_data_batch(
             tickers=universe,
@@ -58,20 +61,22 @@ def compute_performance(days: int = 120):
         cleaned_history = {}
 
         for ticker, df in price_history.items():
+
             if df is None or len(df) < MIN_HISTORY_ROWS:
                 continue
 
             df = df.sort_values("date").reset_index(drop=True)
             df["date"] = pd.to_datetime(df["date"]).dt.normalize()
             df["forward_return"] = df["close"].shift(-1) / df["close"] - 1
+
             cleaned_history[ticker] = df
 
         if not cleaned_history:
             raise RuntimeError("No valid price data available.")
 
-        ############################################################
-        # 2️⃣ BUILD FULL FEATURE DATASET (ALL TICKERS)
-        ############################################################
+        # =========================================================
+        # 2️⃣ BUILD FEATURES
+        # =========================================================
 
         feature_frames = []
 
@@ -98,9 +103,9 @@ def compute_performance(days: int = 120):
         full_df = FeatureEngineer.add_cross_sectional_features(full_df)
         full_df = FeatureEngineer.finalize(full_df)
 
-        ############################################################
-        # 3️⃣ HISTORICAL SNAPSHOT SIMULATION
-        ############################################################
+        # =========================================================
+        # 3️⃣ HISTORICAL SIMULATION
+        # =========================================================
 
         portfolio_records = []
 
@@ -115,7 +120,11 @@ def compute_performance(days: int = 120):
             if daily_slice.empty:
                 continue
 
+            if daily_slice["ticker"].nunique() < 2:
+                continue  # 🔥 avoid portfolio crash
+
             try:
+
                 feature_df = validate_feature_schema(
                     daily_slice.loc[:, MODEL_FEATURES],
                     mode="inference"
@@ -123,6 +132,11 @@ def compute_performance(days: int = 120):
 
                 probs = model.predict_proba(feature_df)[:, 1]
                 probs = np.clip(probs, 1e-6, 1 - 1e-6)
+
+                # 🔥 probability collapse fallback
+                if np.std(probs) < MIN_PROB_STD:
+                    logger.warning(f"Prob collapse at {eval_date} — neutralizing")
+                    probs = np.full_like(probs, 0.5)
 
                 daily_slice["score"] = probs
                 daily_slice["rank_pct"] = daily_slice["score"].rank(
@@ -152,9 +166,9 @@ def compute_performance(days: int = 120):
 
         portfolio_df = pd.DataFrame(portfolio_records)
 
-        ############################################################
+        # =========================================================
         # 4️⃣ FORWARD RETURNS
-        ############################################################
+        # =========================================================
 
         forward_frames = []
 
@@ -166,15 +180,15 @@ def compute_performance(days: int = 120):
         forward_df = pd.concat(forward_frames, ignore_index=True)
         forward_df.dropna(inplace=True)
 
-        ############################################################
+        # =========================================================
         # 5️⃣ STRATEGY PERFORMANCE
-        ############################################################
+        # =========================================================
 
         report = engine.evaluate(portfolio_df, forward_df)
 
-        ############################################################
+        # =========================================================
         # 6️⃣ BENCHMARK
-        ############################################################
+        # =========================================================
 
         benchmark_map = market_data.get_price_data_batch(
             tickers=[BENCHMARK_TICKER],
@@ -230,9 +244,9 @@ def compute_performance(days: int = 120):
 
         alpha = report.annual_return - benchmark_annual
 
-        ############################################################
-        # 7️⃣ RESPONSE
-        ############################################################
+        # =========================================================
+        # RESPONSE
+        # =========================================================
 
         return {
             "strategy": {
