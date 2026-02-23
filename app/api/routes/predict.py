@@ -1,6 +1,3 @@
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, field_validator
-from fastapi.concurrency import run_in_threadpool
 import time
 import asyncio
 import os
@@ -10,6 +7,10 @@ import math
 import json
 from pathlib import Path
 from typing import List, Optional, Dict, Any
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field, field_validator
+from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline
 from app.inference.model_loader import ModelLoader
@@ -51,35 +52,18 @@ def get_loader():
 # PRODUCTION LIMITS
 # =========================================================
 
-MAX_CONCURRENT_INFERENCES = int(
-    os.getenv("MAX_CONCURRENT_INFERENCES", "4")
-)
-
-REQUEST_TIMEOUT = int(
-    os.getenv("INFERENCE_TIMEOUT_SEC", "25")
-)
-
-MAX_BATCH_SIZE = int(
-    os.getenv("MAX_BATCH_SIZE", "30")
-)
-
+MAX_CONCURRENT_INFERENCES = int(os.getenv("MAX_CONCURRENT_INFERENCES", "4"))
+REQUEST_TIMEOUT = int(os.getenv("INFERENCE_TIMEOUT_SEC", "25"))
+MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "30"))
 MIN_BATCH_SIZE = 4
 
-DEFAULT_USE_UNIVERSE = os.getenv(
-    "DEFAULT_USE_UNIVERSE",
-    "true"
-).lower() == "true"
+DEFAULT_USE_UNIVERSE = os.getenv("DEFAULT_USE_UNIVERSE", "true").lower() == "true"
 
 UNIVERSE_CONFIG_PATH = Path(
-    os.getenv(
-        "PRODUCTION_UNIVERSE_PATH",
-        "config/universe_production.json"
-    )
+    os.getenv("PRODUCTION_UNIVERSE_PATH", "config/universe_production.json")
 )
 
-inference_semaphore = asyncio.Semaphore(
-    MAX_CONCURRENT_INFERENCES
-)
+inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
 
 TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 
@@ -129,39 +113,9 @@ class PortfolioRequest(BaseModel):
         unique = sorted(set(cleaned))
 
         if len(unique) < MIN_BATCH_SIZE:
-            raise ValueError(
-                f"At least {MIN_BATCH_SIZE} tickers required."
-            )
+            raise ValueError(f"At least {MIN_BATCH_SIZE} tickers required.")
 
         return unique
-
-
-# =========================================================
-# OUTPUT VALIDATION
-# =========================================================
-
-def validate_portfolio_output(result: Any):
-
-    if not isinstance(result, list):
-        raise RuntimeError("Invalid portfolio output format.")
-
-    for row in result:
-
-        if not isinstance(row, dict):
-            raise RuntimeError("Invalid portfolio row structure.")
-
-        required = {"date", "ticker", "score", "signal", "weight"}
-
-        if not required.issubset(row.keys()):
-            raise RuntimeError("Portfolio row missing fields.")
-
-        for k, v in row.items():
-            if isinstance(v, float) and not math.isfinite(v):
-                raise RuntimeError(
-                    f"Non-finite value in portfolio output: {k}"
-                )
-
-    return result
 
 
 # =========================================================
@@ -179,6 +133,32 @@ class SnapshotResponse(BaseModel):
 
 
 # =========================================================
+# OUTPUT VALIDATION
+# =========================================================
+
+def validate_portfolio_output(result: Any):
+
+    if not isinstance(result, list):
+        raise RuntimeError("Invalid portfolio output format.")
+
+    for row in result:
+
+        required = {"date", "ticker", "score", "signal", "weight"}
+
+        if not isinstance(row, dict):
+            raise RuntimeError("Invalid portfolio row structure.")
+
+        if not required.issubset(row.keys()):
+            raise RuntimeError("Portfolio row missing fields.")
+
+        for k, v in row.items():
+            if isinstance(v, float) and not math.isfinite(v):
+                raise RuntimeError(f"Non-finite value in portfolio output: {k}")
+
+    return result
+
+
+# =========================================================
 # PORTFOLIO ENDPOINT
 # =========================================================
 
@@ -191,18 +171,12 @@ async def build_portfolio(req: PortfolioRequest):
 
     try:
 
-        if req.tickers is None:
+        tickers = req.tickers or (
+            load_default_universe() if DEFAULT_USE_UNIVERSE else None
+        )
 
-            if not DEFAULT_USE_UNIVERSE:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Tickers required."
-                )
-
-            tickers = load_default_universe()
-
-        else:
-            tickers = req.tickers
+        if tickers is None:
+            raise HTTPException(status_code=400, detail="Tickers required.")
 
         if len(tickers) > MAX_BATCH_SIZE:
             raise HTTPException(
@@ -211,12 +185,6 @@ async def build_portfolio(req: PortfolioRequest):
             )
 
         loader = get_loader()
-
-        if loader._xgb_container is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Model container unavailable"
-            )
 
         async with inference_semaphore:
 
@@ -232,11 +200,12 @@ async def build_portfolio(req: PortfolioRequest):
 
         meta = {
             "model_version": loader.xgb_version,
-            "schema_signature": loader._xgb_container.schema_signature,
+            "schema_signature": loader.schema_signature,
             "dataset_hash": loader.dataset_hash,
             "training_code_hash": loader.training_code_hash,
             "artifact_hash": loader.artifact_hash,
-            "inference_batch_size": len(tickers),
+            "batch_size": len(tickers),
+            "latency_ms": int((time.time() - start_time) * 1000),
             "timestamp": int(time.time())
         }
 
@@ -244,37 +213,23 @@ async def build_portfolio(req: PortfolioRequest):
 
     except asyncio.TimeoutError:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        raise HTTPException(
-            status_code=504,
-            detail="Portfolio inference timeout"
-        )
+        raise HTTPException(status_code=504, detail="Portfolio inference timeout")
 
     except HTTPException:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         raise
 
-    except RuntimeError as e:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
-
     except Exception:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        raise HTTPException(
-            status_code=500,
-            detail="Portfolio inference failed"
-        )
+        logger.exception("Portfolio inference failure")
+        raise HTTPException(status_code=500, detail="Portfolio inference failed")
 
     finally:
-        API_LATENCY.labels(endpoint=endpoint).observe(
-            time.time() - start_time
-        )
+        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
 
 
 # =========================================================
-# 🔥 LIVE SNAPSHOT (ML SHOWCASE ENDPOINT)
+# LIVE SNAPSHOT (AI SYSTEM SHOWCASE)
 # =========================================================
 
 @router.get("/live-snapshot", response_model=SnapshotResponse)
@@ -287,26 +242,34 @@ async def live_snapshot():
     try:
 
         tickers = load_default_universe()
-
         loader = get_loader()
+        pipeline = get_pipeline()
 
         async with inference_semaphore:
 
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(
-                    get_pipeline().run_snapshot,
+                    pipeline.run_snapshot,
                     tickers
                 ),
                 timeout=REQUEST_TIMEOUT
             )
 
+        # 🔥 Add signal summary
+        signals = snapshot.get("signals", [])
+        long_count = sum(1 for s in signals if s.get("signal") == "LONG")
+        short_count = sum(1 for s in signals if s.get("signal") == "SHORT")
+
         meta = {
             "model_version": loader.xgb_version,
-            "schema_signature": loader._xgb_container.schema_signature,
+            "schema_signature": loader.schema_signature,
             "dataset_hash": loader.dataset_hash,
             "training_code_hash": loader.training_code_hash,
             "artifact_hash": loader.artifact_hash,
             "universe_size": len(tickers),
+            "long_signals": long_count,
+            "short_signals": short_count,
+            "latency_ms": int((time.time() - start_time) * 1000),
             "timestamp": int(time.time())
         }
 
@@ -314,20 +277,12 @@ async def live_snapshot():
 
     except asyncio.TimeoutError:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        raise HTTPException(
-            status_code=504,
-            detail="Snapshot inference timeout"
-        )
+        raise HTTPException(status_code=504, detail="Snapshot inference timeout")
 
     except Exception:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         logger.exception("Live snapshot failure")
-        raise HTTPException(
-            status_code=500,
-            detail="Live snapshot failed"
-        )
+        raise HTTPException(status_code=500, detail="Live snapshot failed")
 
     finally:
-        API_LATENCY.labels(endpoint=endpoint).observe(
-            time.time() - start_time
-        )
+        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
