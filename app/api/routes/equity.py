@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from core.analytics.performance_engine import PerformanceEngine
 from core.data.market_data_service import MarketDataService
 from core.market.universe import MarketUniverse
+from core.features.feature_engineering import FeatureEngineer
 from app.inference.pipeline import InferencePipeline
 
 router = APIRouter()
@@ -61,10 +62,10 @@ def equity_curve(days: int = 120):
             raise RuntimeError("No valid price data available.")
 
         ############################################################
-        # 2️⃣ PRECOMPUTE FEATURES ONCE (CRITICAL FIX)
+        # 2️⃣ BUILD FEATURE DATASETS (CORE ONLY)
         ############################################################
 
-        full_feature_cache = {}
+        datasets = []
 
         for ticker, df in price_history.items():
 
@@ -75,34 +76,55 @@ def equity_curve(days: int = 120):
                 training=False
             )
 
-            if features is not None and not features.empty:
-                full_feature_cache[ticker] = features
+            if features is None or features.empty:
+                continue
 
-        if not full_feature_cache:
+            datasets.append(features)
+
+        if not datasets:
             raise RuntimeError("No feature datasets built.")
 
         ############################################################
-        # 3️⃣ EVALUATION DATES
+        # 3️⃣ CONCAT + CROSS-SECTIONAL ALIGNMENT (CRITICAL FIX)
         ############################################################
 
-        combined_dates = sorted(
-            set(pd.concat(price_history.values())["date"].unique())
-        )
+        full_df = pd.concat(datasets, ignore_index=True)
+        full_df = full_df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
+        # 🔥 Ensure cross-sectional features match live inference
+        full_df = FeatureEngineer.add_cross_sectional_features(full_df)
+        full_df = FeatureEngineer.finalize(full_df)
+
+        ############################################################
+        # 4️⃣ EVALUATION DATES
+        ############################################################
+
+        combined_dates = sorted(full_df["date"].unique())
         eval_dates = combined_dates[-days:]
 
         ############################################################
-        # 4️⃣ HISTORICAL SIGNAL GENERATION (FIXED)
+        # 5️⃣ HISTORICAL SIGNAL GENERATION
         ############################################################
 
         portfolio_records = []
 
         for eval_date in eval_dates:
 
+            snapshot = full_df[full_df["date"] == eval_date].copy()
+
+            if snapshot.empty:
+                continue
+
+            if snapshot["ticker"].nunique() < MIN_ASSETS_PER_DAY:
+                logger.warning(
+                    f"Skipping {eval_date} — insufficient cross-sectional width."
+                )
+                continue
+
             try:
 
                 results = pipeline.run_historical_with_features(
-                    full_feature_cache=full_feature_cache,
+                    df=snapshot,
                     evaluation_date=eval_date
                 )
 
@@ -119,7 +141,7 @@ def equity_curve(days: int = 120):
         portfolio_df = pd.DataFrame(portfolio_records)
 
         ############################################################
-        # 5️⃣ FORWARD RETURNS
+        # 6️⃣ FORWARD RETURNS
         ############################################################
 
         forward_frames = []
@@ -133,14 +155,14 @@ def equity_curve(days: int = 120):
         forward_df.dropna(inplace=True)
 
         ############################################################
-        # 6️⃣ STRATEGY PERFORMANCE
+        # 7️⃣ STRATEGY PERFORMANCE
         ############################################################
 
         report = engine.evaluate(portfolio_df, forward_df)
         strategy_equity = report.equity_curve
 
         ############################################################
-        # 7️⃣ BENCHMARK
+        # 8️⃣ BENCHMARK
         ############################################################
 
         benchmark_df = market_data.get_price_data(
@@ -174,7 +196,7 @@ def equity_curve(days: int = 120):
         benchmark_equity = (1 + benchmark_returns).cumprod()
 
         ############################################################
-        # 8️⃣ ALIGN STRATEGY
+        # 9️⃣ ALIGN STRATEGY
         ############################################################
 
         aligned_strategy = strategy_equity.loc[
