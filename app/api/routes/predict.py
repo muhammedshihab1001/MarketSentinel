@@ -1,5 +1,3 @@
-# (FULL FILE STARTS HERE)
-
 import time
 import asyncio
 import os
@@ -11,7 +9,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel
 from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline
@@ -20,6 +18,12 @@ from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
     API_ERROR_COUNT
+)
+
+from app.api.schemas import (
+    SignalExplanationEnvelope,
+    SignalExplanationMeta,
+    SignalExplanationResponse,
 )
 
 router = APIRouter()
@@ -57,11 +61,6 @@ REQUEST_TIMEOUT = int(os.getenv("INFERENCE_TIMEOUT_SEC", "25"))
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "30"))
 MIN_BATCH_SIZE = 4
 
-DEFAULT_USE_UNIVERSE = os.getenv(
-    "DEFAULT_USE_UNIVERSE",
-    "true"
-).lower() == "true"
-
 PRIMARY_UNIVERSE_PATH = Path(
     os.getenv("PRODUCTION_UNIVERSE_PATH", "config/universe_production.json")
 )
@@ -83,10 +82,8 @@ def load_default_universe() -> List[str]:
 
     if PRIMARY_UNIVERSE_PATH.exists():
         universe_path = PRIMARY_UNIVERSE_PATH
-        logger.info("Using production universe file.")
     elif FALLBACK_UNIVERSE_PATH.exists():
         universe_path = FALLBACK_UNIVERSE_PATH
-        logger.warning("Production universe missing. Using fallback universe.json")
     else:
         raise RuntimeError("No universe configuration file found.")
 
@@ -116,24 +113,10 @@ def load_default_universe() -> List[str]:
 
 
 # =========================================================
-# RESPONSE MODELS
+# SNAPSHOT (UNCHANGED)
 # =========================================================
 
-class PortfolioResponse(BaseModel):
-    meta: Dict[str, Any]
-    portfolio: List[Dict[str, Any]]
-
-
-class SnapshotResponse(BaseModel):
-    meta: Dict[str, Any]
-    snapshot: Dict[str, Any]
-
-
-# =========================================================
-# LIVE SNAPSHOT (ENHANCED)
-# =========================================================
-
-@router.get("/live-snapshot", response_model=SnapshotResponse)
+@router.get("/live-snapshot")
 async def live_snapshot():
 
     endpoint = "/live-snapshot"
@@ -161,7 +144,6 @@ async def live_snapshot():
         long_count = sum(1 for s in signals if s.get("signal") == "LONG")
         short_count = sum(1 for s in signals if s.get("signal") == "SHORT")
 
-        # 🔥 NEW AGGREGATE METRICS
         strength_scores = [
             s.get("agent", {}).get("strength_score", 0.0)
             for s in signals
@@ -199,7 +181,7 @@ async def live_snapshot():
             "timestamp": int(time.time())
         }
 
-        return SnapshotResponse(meta=meta, snapshot=snapshot)
+        return {"meta": meta, "snapshot": snapshot}
 
     except asyncio.TimeoutError:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
@@ -209,6 +191,95 @@ async def live_snapshot():
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         logger.exception("Live snapshot failure")
         raise HTTPException(status_code=500, detail="Live snapshot failed")
+
+    finally:
+        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
+
+
+# =========================================================
+# 🔥 NEW: SIGNAL EXPLANATION ENDPOINT
+# =========================================================
+
+@router.get(
+    "/signal-explanation/{ticker}",
+    response_model=SignalExplanationEnvelope
+)
+async def signal_explanation(ticker: str):
+
+    endpoint = "/signal-explanation"
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
+    start_time = time.time()
+
+    ticker = ticker.upper().strip()
+
+    if not TICKER_REGEX.match(ticker):
+        raise HTTPException(status_code=400, detail="Invalid ticker format.")
+
+    try:
+
+        loader = get_loader()
+        pipeline = get_pipeline()
+
+        async with inference_semaphore:
+
+            snapshot = await asyncio.wait_for(
+                run_in_threadpool(
+                    pipeline.run_snapshot,
+                    [ticker]
+                ),
+                timeout=REQUEST_TIMEOUT
+            )
+
+        signals = snapshot.get("signals", [])
+
+        if not signals:
+            raise HTTPException(status_code=404, detail="No signal generated.")
+
+        row = signals[0]
+        agent_data = row.get("agent", {})
+
+        explanation = SignalExplanationResponse(
+            ticker=row["ticker"],
+            score=row["score"],
+            rank_pct=row["rank_pct"],
+            signal=row["signal"],
+            strength_score=agent_data.get("strength_score", 0.0),
+            risk_level=agent_data.get("risk_level", "unknown"),
+            confidence=agent_data.get("confidence", "unknown"),
+            volatility_regime=agent_data.get("volatility_regime", "unknown"),
+            trend=agent_data.get("trend", "unknown"),
+            momentum_state=agent_data.get("momentum_state", "unknown"),
+            warnings=agent_data.get("warnings", []),
+            explanation=agent_data.get("explanation", "")
+        )
+
+        meta = SignalExplanationMeta(
+            model_version=loader.xgb_version,
+            schema_signature=loader.schema_signature,
+            dataset_hash=loader.dataset_hash,
+            training_code_hash=loader.training_code_hash,
+            artifact_hash=loader.artifact_hash,
+            latency_ms=int((time.time() - start_time) * 1000),
+            timestamp=int(time.time())
+        )
+
+        return SignalExplanationEnvelope(
+            meta=meta,
+            explanation=explanation
+        )
+
+    except asyncio.TimeoutError:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        raise HTTPException(status_code=504, detail="Signal explanation timeout")
+
+    except HTTPException:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        raise
+
+    except Exception:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        logger.exception("Signal explanation failure")
+        raise HTTPException(status_code=500, detail="Signal explanation failed")
 
     finally:
         API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
