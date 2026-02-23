@@ -107,7 +107,7 @@ class ModelLoader:
         return base_dir
 
     ########################################################
-    # PRODUCTION POINTER RESOLUTION (MANDATORY)
+    # PRODUCTION POINTER RESOLUTION
     ########################################################
 
     def _resolve_production_version(self, base_dir):
@@ -178,7 +178,7 @@ class ModelLoader:
     def _validate_baseline_lineage(self, meta: dict):
 
         if not os.path.exists(self.DRIFT_BASELINE_PATH):
-            return  # No baseline yet — allowed
+            return
 
         try:
             with open(self.DRIFT_BASELINE_PATH, encoding="utf-8") as f:
@@ -265,7 +265,6 @@ class ModelLoader:
                     meta["feature_checksum"] != feature_checksum_actual:
                 raise RuntimeError("Feature checksum mismatch.")
 
-            # 🔒 NEW: Baseline lineage enforcement
             self._validate_baseline_lineage(meta)
 
             new_container = LoadedModel(
@@ -327,6 +326,24 @@ class ModelLoader:
     def feature_checksum(self):
         self._reload_xgb_if_needed()
         return self._xgb_container.feature_checksum
+
+    ########################################################
+    # 🔥 FEATURE IMPORTANCE SAFE ACCESSOR
+    ########################################################
+
+    def get_feature_importance(self):
+        model = self.xgb
+
+        if not hasattr(model, "export_feature_importance"):
+            raise RuntimeError("Model does not support feature importance export.")
+
+        importance = model.export_feature_importance()
+
+        return {
+            "model_version": self.xgb_version,
+            "feature_checksum": self.feature_checksum,
+            "importance": importance
+        }
 
     ########################################################
     # WARMUP
