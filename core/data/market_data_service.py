@@ -104,7 +104,7 @@ class MarketDataService:
         return hashlib.sha256(payload).hexdigest()[:16]
 
     ########################################################
-    # 🔥 HARDENED VALIDATION
+    # VALIDATION
     ########################################################
 
     def _validate_dataset(self, df: pd.DataFrame, ticker: str, min_rows: int):
@@ -114,14 +114,12 @@ class MarketDataService:
 
         df = df.copy()
 
-        # enforce required columns existence
         missing = self.REQUIRED_COLUMNS - set(df.columns)
         if missing:
             raise RuntimeError(f"Schema violation. Missing={missing}")
 
         df["ticker"] = ticker
 
-        # normalize date safely
         df["date"] = pd.to_datetime(
             df["date"],
             errors="coerce",
@@ -133,14 +131,12 @@ class MarketDataService:
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
-        # strict numeric enforcement
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         if df[numeric_cols].isna().any().any():
             raise RuntimeError("NaN values detected in numeric columns.")
 
-        # 🔥 safer finite check
         numeric_array = df[numeric_cols].values.astype(float)
 
         if not np.isfinite(numeric_array).all():
@@ -148,7 +144,6 @@ class MarketDataService:
 
         df = df.sort_values("date").reset_index(drop=True)
 
-        # daily jump guard
         pct = df["close"].pct_change().abs().fillna(0)
 
         if (pct > self.MAX_DAILY_MOVE).any():
@@ -305,7 +300,7 @@ class MarketDataService:
         return df
 
     ########################################################
-    # PARALLEL BATCH FETCH
+    # PARALLEL BATCH FETCH (STABILIZED)
     ########################################################
 
     def get_price_data_batch(
@@ -318,8 +313,9 @@ class MarketDataService:
     ):
 
         results = {}
+        failures = {}
 
-        tickers = list(dict.fromkeys(tickers))  # preserve order safely
+        tickers = list(dict.fromkeys(tickers))
 
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
 
@@ -337,14 +333,36 @@ class MarketDataService:
 
             for future in as_completed(futures):
                 ticker = futures[future]
+
                 try:
                     results[ticker] = future.result()
+
                 except Exception as e:
+                    failures[ticker] = str(e)
                     logger.error(
                         "Batch fetch failed: %s | %s",
                         ticker,
                         str(e)
                     )
-                    raise
+
+        total = len(tickers)
+        success = len(results)
+        failed = len(failures)
+
+        if success == 0:
+            logger.critical(
+                "Batch fetch total failure | tickers=%d | failed=%d",
+                total,
+                failed
+            )
+            raise RuntimeError("All tickers failed during batch fetch.")
+
+        if failed > 0:
+            logger.warning(
+                "Batch partial failure | total=%d | success=%d | failed=%d",
+                total,
+                success,
+                failed
+            )
 
         return {t: results[t] for t in tickers if t in results}
