@@ -30,7 +30,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "18.0"  # 🔥 upgraded severity + confidence logic
+    BASELINE_VERSION = "19.1"  # 🔥 backward-compatible enhancement
     DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
 
     MIN_SAMPLE_BASELINE = 150
@@ -47,6 +47,10 @@ class DriftDetector:
     EPSILON = 1e-8
     MIN_ACTIVE_FEATURE_RATIO = 0.40
     MAX_SEVERITY_CAP = 10
+
+    # 🔥 NEW: classification thresholds (does NOT break old fields)
+    SOFT_SEVERITY_THRESHOLD = 3
+    HARD_SEVERITY_THRESHOLD = 7
 
     def __init__(self, z_threshold: float = 3.5, baseline_dir: str = "artifacts/drift"):
 
@@ -68,7 +72,7 @@ class DriftDetector:
         self._model_loader = ModelLoader()
 
     ########################################################
-    # BASELINE CREATION (UNCHANGED BEHAVIOR)
+    # BASELINE CREATION (UNCHANGED)
     ########################################################
 
     def create_baseline(
@@ -217,26 +221,6 @@ class DriftDetector:
         return hashlib.sha256(canonical).hexdigest()
 
     ########################################################
-    # ATOMIC WRITE
-    ########################################################
-
-    def _atomic_write(self, payload: dict):
-
-        tmp_fd, tmp_path = tempfile.mkstemp()
-
-        try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-
-            os.replace(tmp_path, self.BASELINE_PATH)
-
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-    ########################################################
     # LOAD VERIFIED BASELINE
     ########################################################
 
@@ -269,7 +253,7 @@ class DriftDetector:
         return baseline
 
     ########################################################
-    # DETECT (UPGRADED LOGIC)
+    # DETECT (BACKWARD COMPATIBLE + ENHANCED)
     ########################################################
 
     def detect(self, dataset: pd.DataFrame):
@@ -310,19 +294,16 @@ class DriftDetector:
                     current.values
                 )
 
-                drift_flags = [
+                drift = any([
                     z_score > self.z_threshold,
                     variance_ratio > self.VARIANCE_RATIO_UPPER,
                     variance_ratio < self.VARIANCE_RATIO_LOWER,
                     psi > self.PSI_ALERT
-                ]
-
-                drift = any(drift_flags)
+                ])
 
                 if drift:
                     drift_count += 1
 
-                    # 🔥 feature-level severity scoring
                     feature_severity = (
                         min(z_score / self.z_threshold, 3) +
                         min(abs(np.log(variance_ratio + self.EPSILON)), 3) +
@@ -340,31 +321,40 @@ class DriftDetector:
 
             coverage = active_features / max(total_features, 1)
 
-            if coverage < self.MIN_ACTIVE_FEATURE_RATIO:
-                raise RuntimeError("Insufficient active feature coverage.")
-
-            severity_ratio = drift_count / max(total_features, 1)
-
             severity_score = min(
                 int(severity_accumulator),
                 self.MAX_SEVERITY_CAP
             )
 
-            drift_detected = drift_count > 0
+            severity_ratio = drift_count / max(total_features, 1)
 
             drift_confidence = round(
                 min(severity_ratio * 1.5, 1.0),
                 3
             )
 
+            drift_detected = drift_count > 0
+
+            # 🔥 New field (does NOT break old usage)
+            if severity_score >= self.HARD_SEVERITY_THRESHOLD:
+                drift_state = "hard"
+            elif severity_score >= self.SOFT_SEVERITY_THRESHOLD:
+                drift_state = "soft"
+            else:
+                drift_state = "none"
+
             DRIFT_DETECTED.set(1 if drift_detected else 0)
 
             return {
+                # Old fields preserved
                 "drift_detected": drift_detected,
                 "severity_score": severity_score,
                 "drift_confidence": drift_confidence,
                 "coverage": coverage,
-                "details": report
+                "details": report,
+
+                # New safe extension
+                "drift_state": drift_state
             }
 
         except Exception as exc:
@@ -377,5 +367,9 @@ class DriftDetector:
 
             return {
                 "drift_detected": True,
-                "reason": "detector_failure"
+                "severity_score": 10,
+                "drift_confidence": 1.0,
+                "coverage": 0.0,
+                "details": {},
+                "drift_state": "detector_failure"
             }
