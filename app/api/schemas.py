@@ -1,9 +1,14 @@
 from pydantic import BaseModel, Field, validator
-from datetime import date, timedelta
+from datetime import date
+from typing import List, Optional, Dict, Any
 
 
 MAX_FORECAST_DAYS = 90
 
+
+# =========================================================
+# EXISTING FORECAST REQUEST (UNCHANGED)
+# =========================================================
 
 class PredictionRequest(BaseModel):
     """
@@ -34,10 +39,6 @@ class PredictionRequest(BaseModel):
         le=MAX_FORECAST_DAYS,
         description="Number of days to forecast (max 90)"
     )
-
-    # --------------------------------------------------
-    # AUTO VALIDATION (VERY IMPORTANT)
-    # --------------------------------------------------
 
     @validator("ticker")
     def normalize_ticker(cls, v):
@@ -72,3 +73,49 @@ class PredictionRequest(BaseModel):
                 f"forecast_days cannot exceed {MAX_FORECAST_DAYS}"
             )
         return v
+
+
+# =========================================================
+# NEW SIGNAL EXPLANATION RESPONSE MODEL
+# =========================================================
+
+class SignalExplanationResponse(BaseModel):
+    """
+    Detailed explanation output for a single ticker signal.
+    """
+
+    ticker: str
+    score: float
+    rank_pct: float
+    signal: str
+    strength_score: float
+    risk_level: str
+    confidence: str
+    volatility_regime: str
+    trend: str
+    momentum_state: str
+    warnings: List[str]
+    explanation: str
+
+
+class SignalExplanationMeta(BaseModel):
+    """
+    Metadata block for explanation endpoint.
+    """
+
+    model_version: str
+    schema_signature: str
+    dataset_hash: str
+    training_code_hash: str
+    artifact_hash: str
+    latency_ms: int
+    timestamp: int
+
+
+class SignalExplanationEnvelope(BaseModel):
+    """
+    Full API response structure.
+    """
+
+    meta: SignalExplanationMeta
+    explanation: SignalExplanationResponse
