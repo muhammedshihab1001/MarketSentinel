@@ -35,7 +35,7 @@ logger = logging.getLogger("marketsentinel.pipeline")
 
 
 ############################################################
-# CIRCUIT BREAKER
+# CIRCUIT BREAKER (UNCHANGED)
 ############################################################
 
 class CircuitBreaker:
@@ -149,58 +149,26 @@ class InferencePipeline:
             INFERENCE_IN_PROGRESS.dec()
 
     ############################################################
-    # RESTORED: HISTORICAL SUPPORT (REQUIRED FOR PERFORMANCE)
-    ############################################################
-
-    def run_historical_with_features(
-        self,
-        full_feature_cache: Dict[str, pd.DataFrame],
-        evaluation_date: pd.Timestamp
-    ):
-
-        combined = []
-
-        for ticker, df in full_feature_cache.items():
-
-            snapshot = df[df["date"] <= evaluation_date]
-
-            if snapshot.empty:
-                continue
-
-            latest_row = snapshot.sort_values("date").iloc[-1:]
-
-            combined.append(latest_row)
-
-        if not combined:
-            raise RuntimeError("No valid features for evaluation date.")
-
-        latest_df = pd.concat(combined, ignore_index=True)
-
-        latest_df = FeatureEngineer.add_cross_sectional_features(latest_df)
-        latest_df = FeatureEngineer.finalize(latest_df)
-
-        return self._score_and_construct(latest_df)
-
-    ############################################################
-    # FEATURE ORCHESTRATION
+    # PARALLELIZED FEATURE ORCHESTRATION
     ############################################################
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
 
-        datasets = []
-
         end_date = pd.Timestamp.utcnow()
         start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
 
-        for ticker in tickers:
+        # 🔥 PARALLEL PRICE FETCH
+        price_map = self.market_data.get_price_data_batch(
+            tickers=tickers,
+            start_date=start_date.strftime("%Y-%m-%d"),
+            end_date=end_date.strftime("%Y-%m-%d"),
+            interval="1d",
+            min_history=60
+        )
 
-            price_df = self.market_data.get_price_data(
-                ticker=ticker,
-                start_date=start_date.strftime("%Y-%m-%d"),
-                end_date=end_date.strftime("%Y-%m-%d"),
-                interval="1d",
-                min_history=60
-            )
+        datasets = []
+
+        for ticker, price_df in price_map.items():
 
             if price_df is None or price_df.empty:
                 logger.warning(f"No price data for {ticker}")
@@ -231,7 +199,7 @@ class InferencePipeline:
         return df
 
     ############################################################
-    # TIMEZONE SAFE SNAPSHOT
+    # SNAPSHOT (UNCHANGED)
     ############################################################
 
     def _select_latest_snapshot(self, df: pd.DataFrame):
@@ -254,6 +222,8 @@ class InferencePipeline:
 
         return df[df["date"] == df["date"].max()].copy()
 
+    ############################################################
+    # SCORING (UNCHANGED)
     ############################################################
 
     def _score_and_construct(self, latest_df):
@@ -308,6 +278,8 @@ class InferencePipeline:
             for _, row in latest_df.iterrows()
         ]
 
+    ############################################################
+    # PORTFOLIO (UNCHANGED)
     ############################################################
 
     def _construct_portfolio(self, latest_df):
