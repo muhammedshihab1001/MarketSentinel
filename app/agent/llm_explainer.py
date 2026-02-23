@@ -32,7 +32,7 @@ class LLMExplainer:
         # 🔐 Rate limiting
         self.rate_limit_per_minute = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
 
-        # 📦 Cache config
+        # 📦 Cache
         self.cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
         self.cache_ttl_seconds = get_int("LLM_CACHE_TTL_SEC", 120)
 
@@ -75,7 +75,7 @@ class LLMExplainer:
             return True
 
     ########################################################
-    # CACHE HELPERS
+    # CACHE
     ########################################################
 
     def _cache_key(self, row, agent, stats):
@@ -156,7 +156,6 @@ class LLMExplainer:
 
         if not self._check_rate_limit():
             logger.warning("LLM rate limit exceeded.")
-
             return {
                 "llm_enabled": True,
                 "error": "rate_limit_exceeded"
@@ -177,9 +176,16 @@ class LLMExplainer:
                         {
                             "role": "system",
                             "content": (
-                                "You are a financial explanation engine. "
-                                "You MUST NOT change trading signals. "
-                                "You only explain the provided signal."
+                                "You are a financial explanation engine.\n"
+                                "You MUST return ONLY valid JSON.\n"
+                                "You MUST NOT modify signals.\n"
+                                "Return format:\n"
+                                "{\n"
+                                '  "summary": "...",\n'
+                                '  "rationale": "...",\n'
+                                '  "risk_commentary": "...",\n'
+                                '  "outlook": "..."\n'
+                                "}"
                             ),
                         },
                         {
@@ -192,12 +198,14 @@ class LLMExplainer:
                 timeout=self.timeout
             )
 
-            content = response.choices[0].message.content
+            raw_content = response.choices[0].message.content.strip()
+
+            parsed = self._safe_parse_json(raw_content)
 
             result = {
                 "llm_enabled": True,
                 "model": self.model_name,
-                "narrative": content,
+                "structured": parsed,
                 "cached": False
             }
 
@@ -207,10 +215,39 @@ class LLMExplainer:
 
         except Exception as e:
             logger.warning("LLM explanation failed: %s", e)
-
             return {
                 "llm_enabled": True,
                 "error": "llm_unavailable"
+            }
+
+    ########################################################
+    # SAFE JSON PARSER
+    ########################################################
+
+    def _safe_parse_json(self, content: str):
+
+        try:
+            data = json.loads(content)
+
+            required = {
+                "summary",
+                "rationale",
+                "risk_commentary",
+                "outlook"
+            }
+
+            if not required.issubset(data.keys()):
+                raise ValueError("Missing required keys")
+
+            return data
+
+        except Exception:
+            logger.warning("Malformed LLM JSON response.")
+            return {
+                "summary": "Explanation unavailable.",
+                "rationale": "Model response could not be parsed.",
+                "risk_commentary": "Unavailable.",
+                "outlook": "Unavailable."
             }
 
     ########################################################
@@ -220,24 +257,19 @@ class LLMExplainer:
     def _build_prompt(self, row, agent, stats):
 
         return f"""
-Signal Summary:
 Ticker: {row.get("ticker")}
 Signal: {row.get("signal")}
 Score: {row.get("score")}
 Rank Percentile: {row.get("rank_pct")}
 
-Agent Assessment:
 Confidence: {agent.get("confidence")}
 Trend: {agent.get("trend")}
 Volatility Regime: {agent.get("volatility_regime")}
 Momentum State: {agent.get("momentum_state")}
 Warnings: {agent.get("warnings")}
 
-Market Context:
 Probability Mean: {stats.get("mean")}
 Probability Std: {stats.get("std")}
 
-Explain this signal in professional institutional language.
-Do not invent new numbers.
-Do not modify the signal.
+Explain this signal clearly and professionally.
 """
