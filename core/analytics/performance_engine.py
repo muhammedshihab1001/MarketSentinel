@@ -1,17 +1,22 @@
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
 class PerformanceReport:
     cumulative_return: float
     sharpe_ratio: float
+    sortino_ratio: float
+    calmar_ratio: float
     max_drawdown: float
+    max_drawdown_duration: int
     hit_rate: float
     annual_volatility: float
     annual_return: float
     turnover: float
+    beta: Optional[float]
     daily_returns: pd.Series
     equity_curve: pd.Series
 
@@ -27,16 +32,9 @@ class PerformanceEngine:
     def evaluate(
         self,
         portfolio_df: pd.DataFrame,
-        forward_returns: pd.DataFrame
+        forward_returns: pd.DataFrame,
+        benchmark_returns: Optional[pd.Series] = None
     ) -> PerformanceReport:
-        """
-        portfolio_df:
-            columns: date, ticker, weight
-
-        forward_returns:
-            columns: date, ticker, forward_return
-            forward_return at date t = return from t -> t+1
-        """
 
         if portfolio_df.empty:
             raise RuntimeError("Portfolio dataframe empty.")
@@ -44,7 +42,6 @@ class PerformanceEngine:
         if forward_returns.empty:
             raise RuntimeError("Forward returns dataframe empty.")
 
-        # Ensure correct dtypes
         portfolio_df = portfolio_df.copy()
         forward_returns = forward_returns.copy()
 
@@ -95,21 +92,33 @@ class PerformanceEngine:
 
         cumulative_return = equity.iloc[-1] - 1
 
+        ########################################################
+        # METRICS
+        ########################################################
+
         sharpe = self._sharpe_ratio(daily)
+        sortino = self._sortino_ratio(daily)
         max_dd = self._max_drawdown(equity)
-        hit = self._hit_rate(daily)
+        max_dd_duration = self._max_drawdown_duration(equity)
         ann_vol = self._annual_volatility(daily)
         ann_ret = self._annual_return(daily)
+        calmar = self._calmar_ratio(ann_ret, max_dd)
+        hit = self._hit_rate(daily)
         turnover = self._turnover(portfolio_df)
+        beta = self._beta(daily, benchmark_returns)
 
         return PerformanceReport(
             cumulative_return=float(cumulative_return),
             sharpe_ratio=float(sharpe),
+            sortino_ratio=float(sortino),
+            calmar_ratio=float(calmar),
             max_drawdown=float(max_dd),
+            max_drawdown_duration=int(max_dd_duration),
             hit_rate=float(hit),
             annual_volatility=float(ann_vol),
             annual_return=float(ann_ret),
             turnover=float(turnover),
+            beta=beta,
             daily_returns=daily,
             equity_curve=equity
         )
@@ -123,10 +132,26 @@ class PerformanceEngine:
         mean = daily_returns.mean()
         std = daily_returns.std()
 
-        if std == 0:
+        if std == 0 or np.isnan(std):
             return 0.0
 
         return (mean / std) * np.sqrt(self.TRADING_DAYS)
+
+    def _sortino_ratio(self, daily_returns):
+
+        downside = daily_returns[daily_returns < 0]
+
+        if len(downside) == 0:
+            return 0.0
+
+        downside_std = downside.std()
+
+        if downside_std == 0 or np.isnan(downside_std):
+            return 0.0
+
+        mean = daily_returns.mean()
+
+        return (mean / downside_std) * np.sqrt(self.TRADING_DAYS)
 
     def _annual_volatility(self, daily_returns):
         return daily_returns.std() * np.sqrt(self.TRADING_DAYS)
@@ -148,6 +173,30 @@ class PerformanceEngine:
 
         return drawdown.min()
 
+    def _max_drawdown_duration(self, equity_curve):
+
+        rolling_max = equity_curve.cummax()
+        drawdown = equity_curve < rolling_max
+
+        duration = 0
+        max_duration = 0
+
+        for val in drawdown:
+            if val:
+                duration += 1
+                max_duration = max(max_duration, duration)
+            else:
+                duration = 0
+
+        return max_duration
+
+    def _calmar_ratio(self, annual_return, max_drawdown):
+
+        if max_drawdown == 0:
+            return 0.0
+
+        return annual_return / abs(max_drawdown)
+
     def _hit_rate(self, daily_returns):
         return float((daily_returns > 0).mean())
 
@@ -162,9 +211,27 @@ class PerformanceEngine:
 
         diff = pivot.diff().abs()
 
-        # institutional turnover definition
         turnover = 0.5 * diff.sum(axis=1)
 
-        turnover = turnover.iloc[1:]  # drop first NaN day
+        turnover = turnover.iloc[1:]
 
         return float(turnover.mean())
+
+    def _beta(self, strategy_returns, benchmark_returns):
+
+        if benchmark_returns is None:
+            return None
+
+        aligned = strategy_returns.align(benchmark_returns, join="inner")[0]
+        bench = benchmark_returns.align(strategy_returns, join="inner")[0]
+
+        if len(aligned) < 2:
+            return None
+
+        cov = np.cov(aligned, bench)[0][1]
+        var = np.var(bench)
+
+        if var == 0:
+            return None
+
+        return float(cov / var)
