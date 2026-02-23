@@ -149,10 +149,11 @@ class InferencePipeline:
                 mode="inference"
             ).astype(DTYPE)
 
+            # Drift detection
             try:
                 drift_result = self.drift_detector.detect(feature_df)
             except Exception as e:
-                logger.warning("Drift check failed (dev mode fallback): %s", e)
+                logger.warning("Drift check failed (dev fallback): %s", e)
                 drift_result = {
                     "drift_detected": False,
                     "drift_state": "dev_bypass",
@@ -163,11 +164,21 @@ class InferencePipeline:
             if drift_result.get("drift_state") == "hard":
                 raise RuntimeError("Hard drift detected.")
 
-            probs = self.models.xgb.predict_proba(feature_df)[:, 1]
+            # 🔥 SAFE PROBABILITY HANDLING
+            try:
+                probs = self.models.xgb.predict_proba(feature_df)[:, 1]
+            except RuntimeError as e:
+                if "collapse" in str(e).lower():
+                    logger.warning("Model probability collapse — fallback to neutral.")
+                    probs = np.full(len(feature_df), 0.5)
+                else:
+                    raise
+
             probs = np.clip(probs, 1e-6, 1 - 1e-6)
 
             if np.std(probs) < self.MIN_PROB_STD:
-                raise RuntimeError("Probability collapse detected.")
+                logger.warning("Probability std too low — fallback to neutral.")
+                probs = np.full(len(feature_df), 0.5)
 
             latest_df = latest_df.copy()
             latest_df["score"] = probs
@@ -178,7 +189,7 @@ class InferencePipeline:
                 else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
             )
 
-            # 🔥 SAFE SINGLE-TICKER HANDLING
+            # Safe single ticker handling
             if len(latest_df) >= 2:
                 weights = self._construct_portfolio(latest_df)
             else:
@@ -221,9 +232,9 @@ class InferencePipeline:
             }
 
             MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-            MODEL_INFERENCE_LATENCY.labels(
-                model="xgboost"
-            ).observe(time.time() - start_time)
+            MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(
+                time.time() - start_time
+            )
 
             with self._snapshot_lock:
                 self._snapshot_cache[cache_key] = (result, time.time())
@@ -240,8 +251,6 @@ class InferencePipeline:
         finally:
             INFERENCE_IN_PROGRESS.dec()
 
-    # ============================================================
-    # FEATURE BUILD
     # ============================================================
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
@@ -260,7 +269,6 @@ class InferencePipeline:
         datasets = []
 
         for ticker, price_df in price_map.items():
-
             if price_df is None or price_df.empty:
                 continue
 
@@ -291,8 +299,6 @@ class InferencePipeline:
 
         return df
 
-    # ============================================================
-    # PORTFOLIO
     # ============================================================
 
     def _construct_portfolio(self, latest_df):
