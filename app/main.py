@@ -207,21 +207,6 @@ def metrics():
     )
 
 
-# =====================================================
-# HEALTH (NEW)
-# =====================================================
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "model_loaded": readiness.models_loaded,
-        "redis_connected": readiness.redis_connected,
-        "boot_id": readiness.boot_id,
-        "version": APP_VERSION,
-        "uptime_seconds": int(time.time()) - readiness.start_time
-    }
-
 
 # =====================================================
 # READINESS
