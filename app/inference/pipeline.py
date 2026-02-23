@@ -31,6 +31,9 @@ from app.monitoring.metrics import (
     INFERENCE_IN_PROGRESS
 )
 
+# ✅ NEW IMPORT
+from core.agent.signal_agent import SignalAgent
+
 logger = logging.getLogger("marketsentinel.pipeline")
 
 
@@ -95,6 +98,9 @@ class InferencePipeline:
         self.drift_detector = DriftDetector()
         self.breaker = CircuitBreaker()
 
+        # ✅ NEW AGENT INITIALIZATION
+        self.agent = SignalAgent()
+
         _ = self.models.xgb
         self._validate_models_loaded()
 
@@ -151,27 +157,17 @@ class InferencePipeline:
             INFERENCE_IN_PROGRESS.dec()
 
     ############################################################
-    # 🔥 FULLY COMPATIBLE HISTORICAL BACKTEST
+    # HISTORICAL BACKTEST (UNCHANGED)
     ############################################################
 
     def run_historical_with_features(self, *args, **kwargs):
 
-        """
-        Compatible with:
-        - positional df
-        - df= keyword
-        - evaluation_date
-        - future kwargs
-        """
-
         df = None
         evaluation_date = None
 
-        # positional
         if len(args) >= 1:
             df = args[0]
 
-        # keyword override
         if "df" in kwargs:
             df = kwargs["df"]
 
@@ -228,7 +224,7 @@ class InferencePipeline:
         return results
 
     ############################################################
-    # PARALLELIZED FEATURE ORCHESTRATION
+    # FEATURE BUILD (UNCHANGED)
     ############################################################
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
@@ -236,7 +232,6 @@ class InferencePipeline:
         end_date = pd.Timestamp.utcnow()
         start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
 
-        # 🔥 PARALLEL PRICE FETCH
         price_map = self.market_data.get_price_data_batch(
             tickers=tickers,
             start_date=start_date.strftime("%Y-%m-%d"),
@@ -278,93 +273,10 @@ class InferencePipeline:
         return df
 
     ############################################################
-    # SNAPSHOT (UNCHANGED)
-    ############################################################
-
-    def _select_latest_snapshot(self, df: pd.DataFrame):
-
-        latest_date = df["date"].max()
-
-        if pd.isna(latest_date):
-            raise RuntimeError("No valid dates found in inference dataset.")
-
-        now_utc = pd.Timestamp.utcnow()
-
-        if latest_date.tzinfo is not None:
-            latest_date = latest_date.tz_convert("UTC").tz_localize(None)
-
-        if now_utc.tzinfo is not None:
-            now_utc = now_utc.tz_convert("UTC").tz_localize(None)
-
-        if (now_utc.normalize() - latest_date.normalize()) > timedelta(days=self.MAX_DATA_STALENESS_DAYS):
-            raise RuntimeError("Inference data appears stale.")
-
-        return df[df["date"] == df["date"].max()].copy()
-
-    ############################################################
-    # SCORING (UNCHANGED)
-    ############################################################
-
-    def _score_and_construct(self, latest_df):
-
-        universe = set(MarketUniverse.get_universe())
-        unknown = set(latest_df["ticker"]) - universe
-
-        if unknown:
-            raise RuntimeError(f"Unknown tickers detected: {unknown}")
-
-        feature_df = validate_feature_schema(
-            latest_df.loc[:, MODEL_FEATURES],
-            mode="inference"
-        ).astype(DTYPE)
-
-        t0 = time.time()
-        probs = self.models.xgb.predict_proba(feature_df)[:, 1]
-        latency = time.time() - t0
-
-        MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-        MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(latency)
-
-        probs = np.clip(probs, 1e-6, 1 - 1e-6)
-
-        if np.std(probs) < self.MIN_PROB_STD:
-            raise RuntimeError("Probability collapse detected.")
-
-        latest_df = latest_df.copy()
-        latest_df["score"] = probs
-        latest_df["rank_pct"] = latest_df["score"].rank(method="first", pct=True)
-
-        latest_df["signal"] = latest_df["rank_pct"].apply(
-            lambda x: "LONG" if x >= LONG_PERCENTILE
-            else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
-        )
-
-        drift_result = self.drift_detector.detect(feature_df)
-
-        if drift_result.get("drift_detected", False) and self.drift_detector.hard_fail:
-            raise RuntimeError("Inference blocked due to feature drift.")
-
-        weights = self._construct_portfolio(latest_df)
-
-        return [
-            {
-                "date": row["date"],
-                "ticker": row["ticker"],
-                "score": float(row["score"]),
-                "signal": row["signal"],
-                "weight": float(weights.get(row["ticker"], 0.0))
-            }
-            for _, row in latest_df.iterrows()
-        ]
-    ############################################################
-    # 🔥 INDUSTRIAL SNAPSHOT (NON-BREAKING ADDITION)
+    # SNAPSHOT (UPDATED WITH AGENT)
     ############################################################
 
     def run_snapshot(self, tickers: List[str]):
-        """
-        Extended inference snapshot for ML introspection.
-        Does NOT modify run_batch behavior.
-        """
 
         if len(tickers) > self.MAX_BATCH_SIZE:
             raise RuntimeError("Batch size exceeds MAX_BATCH_SIZE.")
@@ -396,10 +308,7 @@ class InferencePipeline:
 
             latest_df = latest_df.copy()
             latest_df["score"] = probs
-            latest_df["rank_pct"] = latest_df["score"].rank(
-                method="first",
-                pct=True
-            )
+            latest_df["rank_pct"] = latest_df["score"].rank(method="first", pct=True)
 
             latest_df["signal"] = latest_df["rank_pct"].apply(
                 lambda x: "LONG" if x >= LONG_PERCENTILE
@@ -408,7 +317,6 @@ class InferencePipeline:
 
             weights = self._construct_portfolio(latest_df)
 
-            # 🔥 Probability diagnostics
             prob_stats = {
                 "mean": float(np.mean(probs)),
                 "std": float(np.std(probs)),
@@ -416,7 +324,6 @@ class InferencePipeline:
                 "max": float(np.max(probs))
             }
 
-            # 🔥 Long-short spread
             long_scores = latest_df[latest_df["signal"] == "LONG"]["score"]
             short_scores = latest_df[latest_df["signal"] == "SHORT"]["score"]
 
@@ -427,6 +334,14 @@ class InferencePipeline:
             snapshot_rows = []
 
             for _, row in latest_df.iterrows():
+
+                row_dict = row.to_dict()
+
+                agent_output = self.agent.analyze(
+                    row=row_dict,
+                    probability_stats=prob_stats
+                )
+
                 snapshot_rows.append({
                     "date": row["date"],
                     "ticker": row["ticker"],
@@ -436,6 +351,7 @@ class InferencePipeline:
                     "weight": float(weights.get(row["ticker"], 0.0)),
                     "volatility": float(row.get("volatility", 0.0)),
                     "momentum_20_z": float(row.get("momentum_20_z", 0.0)),
+                    "agent": agent_output
                 })
 
             self.breaker.record_success()
@@ -455,6 +371,7 @@ class InferencePipeline:
 
         finally:
             INFERENCE_IN_PROGRESS.dec()
+
     ############################################################
     # PORTFOLIO (UNCHANGED)
     ############################################################
