@@ -17,15 +17,6 @@ class SignalAgent:
     MOMENTUM_STRONG = 1.0
     DISPERSION_WEAK = 0.02
 
-    # 🔥 Strength weighting constants
-    PROB_WEIGHT = 0.4
-    RANK_WEIGHT = 0.3
-    DISPERSION_WEIGHT = 0.2
-    REGIME_WEIGHT = 0.1
-
-    def __init__(self):
-        pass
-
     ########################################################
     # PUBLIC API
     ########################################################
@@ -61,14 +52,6 @@ class SignalAgent:
         else:
             confidence = "very_low"
 
-        if abs(rank_pct - 0.5) < 0.05:
-            warnings.append("Signal near decision boundary.")
-
-        prob_std = float(probability_stats.get("std", 0.0))
-
-        if prob_std < self.DISPERSION_WEAK:
-            warnings.append("Low cross-sectional dispersion detected.")
-
         ####################################################
         # 2️⃣ Volatility Context
         ####################################################
@@ -101,6 +84,7 @@ class SignalAgent:
 
         if signal == "LONG" and momentum_z < 0:
             warnings.append("Momentum contradicts LONG signal.")
+
         if signal == "SHORT" and momentum_z > 0:
             warnings.append("Momentum contradicts SHORT signal.")
 
@@ -116,32 +100,42 @@ class SignalAgent:
             trend = "neutral"
 
         ####################################################
-        # 6️⃣ Quantitative Strength Score (0–100)
+        # 6️⃣ Strength Score (0–100)
         ####################################################
 
-        # Probability strength (distance from 0.5 scaled 0–1)
-        prob_strength = min(abs(score - 0.5) * 2.0, 1.0)
+        strength = 0.0
 
-        # Rank strength (distance from median)
-        rank_strength = min(abs(rank_pct - 0.5) * 2.0, 1.0)
+        # Distance from neutral probability
+        strength += abs(score - 0.5) * 100
 
-        # Dispersion factor (normalize to reasonable range)
-        dispersion_factor = min(prob_std / 0.10, 1.0)
+        # Rank distance boost
+        strength += abs(rank_pct - 0.5) * 50
 
-        # Regime adjustment (penalize high volatility regime slightly)
-        regime_adjustment = 0.8 if regime_feature == 1.0 else 1.0
+        # Momentum alignment boost
+        if (
+            (signal == "LONG" and momentum_z > 0) or
+            (signal == "SHORT" and momentum_z < 0)
+        ):
+            strength += 10
 
-        raw_strength = (
-            self.PROB_WEIGHT * prob_strength +
-            self.RANK_WEIGHT * rank_strength +
-            self.DISPERSION_WEIGHT * dispersion_factor +
-            self.REGIME_WEIGHT * regime_adjustment
-        )
+        # Trend alignment boost
+        if (
+            (signal == "LONG" and trend == "bullish") or
+            (signal == "SHORT" and trend == "bearish")
+        ):
+            strength += 10
 
-        strength_score = round(max(min(raw_strength, 1.0), 0.0) * 100.0, 2)
+        # Volatility penalty
+        if volatility_regime == "high_volatility":
+            strength -= 10
+
+        # Warning penalty
+        strength -= len(warnings) * 5
+
+        strength_score = int(np.clip(strength, 0, 100))
 
         ####################################################
-        # 7️⃣ Risk Level Classification
+        # 7️⃣ Risk Level
         ####################################################
 
         if strength_score >= 75:
@@ -152,7 +146,7 @@ class SignalAgent:
             risk_level = "elevated"
 
         ####################################################
-        # Explanation Text (Deterministic)
+        # Explanation Text
         ####################################################
 
         explanation = (
@@ -160,8 +154,7 @@ class SignalAgent:
             f"(score={score:.3f}, rank={rank_pct:.2f}). "
             f"Trend: {trend}. "
             f"Volatility regime: {volatility_regime}. "
-            f"Momentum: {momentum_state}. "
-            f"Strength score: {strength_score:.2f}."
+            f"Momentum: {momentum_state}."
         )
 
         return {
