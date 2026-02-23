@@ -1,5 +1,7 @@
 import logging
 import asyncio
+import time
+import threading
 from typing import Dict, Any
 
 from openai import AsyncOpenAI
@@ -17,10 +19,15 @@ class LLMExplainer:
 
     def __init__(self):
 
-        # 🔐 Use centralized env loader
         self.enabled = get_bool("LLM_ENABLED", False)
         self.model_name = get_env("OPENAI_MODEL", "gpt-4o-mini")
         self.timeout = get_int("OPENAI_TIMEOUT", 12)
+
+        # 🔐 Rate limiting config
+        self.rate_limit_per_minute = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
+
+        self._request_times = []
+        self._rate_lock = threading.Lock()
 
         api_key = get_env("OPENAI_API_KEY")
 
@@ -29,6 +36,31 @@ class LLMExplainer:
             self.enabled = False
 
         self.client = AsyncOpenAI(api_key=api_key) if self.enabled else None
+
+    ########################################################
+    # RATE LIMIT CHECK
+    ########################################################
+
+    def _check_rate_limit(self):
+
+        if self.rate_limit_per_minute <= 0:
+            return True
+
+        now = time.time()
+
+        with self._rate_lock:
+
+            # Remove timestamps older than 60 seconds
+            self._request_times = [
+                t for t in self._request_times
+                if now - t < 60
+            ]
+
+            if len(self._request_times) >= self.rate_limit_per_minute:
+                return False
+
+            self._request_times.append(now)
+            return True
 
     ########################################################
     # PUBLIC API
@@ -45,6 +77,14 @@ class LLMExplainer:
             return {
                 "llm_enabled": False,
                 "message": "LLM explanation disabled"
+            }
+
+        if not self._check_rate_limit():
+            logger.warning("LLM rate limit exceeded.")
+
+            return {
+                "llm_enabled": True,
+                "error": "rate_limit_exceeded"
             }
 
         prompt = self._build_prompt(
