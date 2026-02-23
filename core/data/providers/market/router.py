@@ -35,10 +35,9 @@ class MarketProviderRouter:
     DEFAULT_MIN_ROWS = 50
     MAX_DAILY_MOVE = 0.90
     PROVIDER_TIMEOUT_WARN = 8.0
-
     PROVIDER_TIMEOUT_HARD = 15.0
     MAX_PROVIDER_WORKERS = 3
-    FAILURE_COOLDOWN = 30  # seconds
+    FAILURE_COOLDOWN = 30
 
     ALLOWED_INTERVALS = {
         "1d", "D",
@@ -103,12 +102,9 @@ class MarketProviderRouter:
 
     @classmethod
     def _validate_interval(cls, interval):
-
         if interval not in cls.ALLOWED_INTERVALS:
             raise ValueError(f"Unsupported interval: {interval}")
 
-    ############################################################
-    # SANITIZER
     ############################################################
 
     @classmethod
@@ -118,20 +114,12 @@ class MarketProviderRouter:
             raise RuntimeError("Provider returned empty dataframe.")
 
         missing = cls.REQUIRED_COLUMNS - set(df.columns)
-
         if missing:
-            raise RuntimeError(
-                f"Provider schema invalid. Missing={missing}"
-            )
+            raise RuntimeError(f"Provider schema invalid. Missing={missing}")
 
         df = df.copy()
 
-        df["date"] = pd.to_datetime(
-            df["date"],
-            utc=True,
-            errors="coerce"
-        )
-
+        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
         df = df.dropna(subset=["date"])
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
@@ -140,11 +128,9 @@ class MarketProviderRouter:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df = df.dropna(subset=numeric_cols)
-
         df = df[df["high"] >= df["low"]]
 
         jumps = df["close"].pct_change().abs()
-
         if (jumps > cls.MAX_DAILY_MOVE).any():
             raise RuntimeError("Extreme price jump detected.")
 
@@ -167,7 +153,6 @@ class MarketProviderRouter:
     ############################################################
 
     def _provider_allowed(self, name):
-
         with self._lock:
             last_fail = self._provider_failures.get(name)
             if not last_fail:
@@ -181,19 +166,62 @@ class MarketProviderRouter:
             self._provider_failures[name] = time.time()
 
     ############################################################
-    # PARALLEL FETCH
+    # 🔥 UPDATED FETCH (SUPPORTS PROVIDER OVERRIDE)
     ############################################################
 
-    def fetch(self, ticker, start, end, interval, min_rows=None):
+    def fetch(
+        self,
+        ticker,
+        start,
+        end,
+        interval,
+        min_rows=None,
+        provider: str | None = None
+    ):
 
         self._validate_interval(interval)
 
         if min_rows is None:
             min_rows = self.DEFAULT_MIN_ROWS
 
+        # 🔥 Provider override mode
+        if provider is not None:
+
+            provider = provider.lower()
+
+            match = [
+                (name, p)
+                for name, p in self.providers
+                if name == provider
+            ]
+
+            if not match:
+                raise RuntimeError(f"Requested provider not available: {provider}")
+
+            name, provider_obj = match[0]
+
+            if not self._provider_allowed(name):
+                raise RuntimeError(f"Provider {name} in cooldown.")
+
+            try:
+                return self._attempt_provider(
+                    name,
+                    provider_obj,
+                    ticker,
+                    start,
+                    end,
+                    interval,
+                    min_rows
+                )
+            except Exception as e:
+                self._record_failure(name)
+                raise
+
+        # 🔥 Default parallel racing mode
+
         eligible = [
-            (name, provider)
-            for name, provider in self.providers
+            (name, provider_obj)
+            for name, provider_obj in self.providers
             if self._provider_allowed(name)
         ]
 
@@ -204,13 +232,13 @@ class MarketProviderRouter:
 
         with ThreadPoolExecutor(max_workers=self.MAX_PROVIDER_WORKERS) as executor:
 
-            for name, provider in eligible:
+            for name, provider_obj in eligible:
 
                 futures[
                     executor.submit(
                         self._attempt_provider,
                         name,
-                        provider,
+                        provider_obj,
                         ticker,
                         start,
                         end,
@@ -235,9 +263,7 @@ class MarketProviderRouter:
                     )
                     self._record_failure(name)
 
-        raise RuntimeError(
-            f"All market providers failed for {ticker}"
-        )
+        raise RuntimeError(f"All market providers failed for {ticker}")
 
     ############################################################
 
