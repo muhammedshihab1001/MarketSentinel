@@ -16,7 +16,7 @@ EPSILON = 1e-12
 
 
 ###################################################
-# CLASS WEIGHT (INDUSTRIAL STABLE VERSION)
+# CLASS WEIGHT
 ###################################################
 
 def compute_class_weight(y):
@@ -25,7 +25,6 @@ def compute_class_weight(y):
 
     pos = float(np.sum(y == 1))
     neg = float(np.sum(y == 0))
-    total = pos + neg
 
     if pos == 0 or neg == 0:
         raise RuntimeError("Label collapse detected.")
@@ -36,20 +35,13 @@ def compute_class_weight(y):
             pos, neg
         )
 
-    imbalance_ratio = max(pos, neg) / min(pos, neg)
-
-    logger.info(
-        "Class distribution | pos=%.0f neg=%.0f ratio=%.3f",
-        pos, neg, imbalance_ratio
-    )
-
-    # Standard scale_pos_weight formula
     weight = neg / pos
-
-    # Soft clamp — avoid extreme instability
     weight = float(np.clip(weight, 0.5, 10.0))
 
-    logger.info("Computed scale_pos_weight = %.3f", weight)
+    logger.info(
+        "Class distribution | pos=%.0f neg=%.0f scale_pos_weight=%.3f",
+        pos, neg, weight
+    )
 
     return weight
 
@@ -69,6 +61,7 @@ class SafeXGBClassifier:
         self.param_checksum = None
         self.training_rows = None
         self.training_cols = None
+        self.importance_checksum = None
 
         np.random.seed(SEED)
 
@@ -120,9 +113,7 @@ class SafeXGBClassifier:
         ###################################################
 
         n = len(X)
-
         use_early_stopping = n >= MIN_VALIDATION_ROWS * 2
-
         split_idx = int(n * 0.9)
 
         if split_idx <= 0 or split_idx >= n:
@@ -201,7 +192,7 @@ class SafeXGBClassifier:
             )
 
         ###################################################
-        # TRAIN PROBABILITY SANITY CHECK
+        # TRAIN SANITY CHECK
         ###################################################
 
         dtrain_full = xgb.DMatrix(
@@ -214,18 +205,7 @@ class SafeXGBClassifier:
         if not np.all(np.isfinite(preds)):
             raise RuntimeError("Non-finite predictions detected.")
 
-        mean = float(np.mean(preds))
-        std = float(np.std(preds))
-
-        logger.info(
-            "Train prob stats | mean=%.4f std=%.4f min=%.4f max=%.4f",
-            mean,
-            std,
-            float(np.min(preds)),
-            float(np.max(preds))
-        )
-
-        if std < MIN_PROB_STD:
+        if np.std(preds) < MIN_PROB_STD:
             raise RuntimeError("Probability collapse detected.")
 
         if np.any(preds < -EPSILON) or np.any(preds > 1 + EPSILON):
@@ -233,6 +213,8 @@ class SafeXGBClassifier:
 
         if self.model.feature_names != self.feature_names:
             raise RuntimeError("Booster feature order mismatch.")
+
+        logger.info("XGBoost training completed successfully.")
 
         return self
 
@@ -279,7 +261,7 @@ class SafeXGBClassifier:
         return np.column_stack([1 - probs, probs])
 
     ###################################################
-    # FEATURE IMPORTANCE
+    # FEATURE IMPORTANCE (UPGRADED)
     ###################################################
 
     def export_feature_importance(self):
@@ -287,19 +269,43 @@ class SafeXGBClassifier:
         if self.model is None:
             raise RuntimeError("Model not trained.")
 
-        score = self.model.get_score(importance_type="gain")
+        raw_gain = self.model.get_score(importance_type="gain")
+
+        if not raw_gain:
+            raise RuntimeError("No feature importance available.")
+
+        # Ensure all features appear (even zero importance)
+        importance = {
+            name: float(raw_gain.get(name, 0.0))
+            for name in self.feature_names
+        }
+
+        total_gain = sum(importance.values())
+
+        normalized = {
+            k: (v / total_gain if total_gain > 0 else 0.0)
+            for k, v in importance.items()
+        }
 
         sorted_imp = sorted(
-            score.items(),
+            normalized.items(),
             key=lambda x: x[1],
             reverse=True
         )
 
-        logger.info("Top 5 features:")
+        checksum_str = json.dumps(sorted_imp, sort_keys=False)
+        self.importance_checksum = hashlib.sha256(
+            checksum_str.encode()
+        ).hexdigest()
+
+        logger.info("Top 5 normalized feature importances:")
         for name, val in sorted_imp[:5]:
             logger.info("  %s : %.4f", name, val)
 
-        return sorted_imp
+        return {
+            "feature_importance": sorted_imp,
+            "importance_checksum": self.importance_checksum
+        }
 
 
 ###################################################
@@ -313,7 +319,7 @@ def build_xgboost_pipeline(y):
     model = SafeXGBClassifier(pos_weight)
 
     logger.info(
-        "XGBoost model built (deterministic CPU mode, fold-safe early stopping)."
+        "XGBoost model built (deterministic CPU mode, early stopping safe)."
     )
 
     return model
