@@ -14,7 +14,6 @@ from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline
 from app.inference.model_loader import ModelLoader
-
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
@@ -23,7 +22,6 @@ from app.monitoring.metrics import (
 
 router = APIRouter()
 logger = logging.getLogger("marketsentinel.api")
-
 
 # =========================================================
 # SINGLETONS
@@ -57,11 +55,17 @@ REQUEST_TIMEOUT = int(os.getenv("INFERENCE_TIMEOUT_SEC", "25"))
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "30"))
 MIN_BATCH_SIZE = 4
 
-DEFAULT_USE_UNIVERSE = os.getenv("DEFAULT_USE_UNIVERSE", "true").lower() == "true"
+DEFAULT_USE_UNIVERSE = os.getenv(
+    "DEFAULT_USE_UNIVERSE",
+    "true"
+).lower() == "true"
 
-UNIVERSE_CONFIG_PATH = Path(
+# 🔥 Smart universe resolution
+PRIMARY_UNIVERSE_PATH = Path(
     os.getenv("PRODUCTION_UNIVERSE_PATH", "config/universe_production.json")
 )
+
+FALLBACK_UNIVERSE_PATH = Path("config/universe.json")
 
 inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
 
@@ -69,21 +73,40 @@ TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 
 
 # =========================================================
-# DEFAULT UNIVERSE LOADER
+# DEFAULT UNIVERSE LOADER (PRODUCTION SAFE)
 # =========================================================
 
 def load_default_universe() -> List[str]:
 
-    if not UNIVERSE_CONFIG_PATH.exists():
-        raise RuntimeError("Universe config missing.")
+    universe_path = None
 
-    with open(UNIVERSE_CONFIG_PATH, "r", encoding="utf-8") as f:
+    if PRIMARY_UNIVERSE_PATH.exists():
+        universe_path = PRIMARY_UNIVERSE_PATH
+        logger.info("Using production universe file.")
+    elif FALLBACK_UNIVERSE_PATH.exists():
+        universe_path = FALLBACK_UNIVERSE_PATH
+        logger.warning("Production universe missing. Using fallback universe.json")
+    else:
+        raise RuntimeError("No universe configuration file found.")
+
+    with open(universe_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     if not isinstance(data, list):
         raise RuntimeError("Universe config invalid format.")
 
-    return sorted(set(data))
+    cleaned = []
+    for t in data:
+        t = str(t).upper().strip()
+        if TICKER_REGEX.match(t):
+            cleaned.append(t)
+
+    unique = sorted(set(cleaned))
+
+    if len(unique) < MIN_BATCH_SIZE:
+        raise RuntimeError("Universe size below minimum batch size.")
+
+    return unique
 
 
 # =========================================================
@@ -229,7 +252,7 @@ async def build_portfolio(req: PortfolioRequest):
 
 
 # =========================================================
-# LIVE SNAPSHOT (AI SYSTEM SHOWCASE)
+# LIVE SNAPSHOT
 # =========================================================
 
 @router.get("/live-snapshot", response_model=SnapshotResponse)
@@ -255,7 +278,6 @@ async def live_snapshot():
                 timeout=REQUEST_TIMEOUT
             )
 
-        # 🔥 Add signal summary
         signals = snapshot.get("signals", [])
         long_count = sum(1 for s in signals if s.get("signal") == "LONG")
         short_count = sum(1 for s in signals if s.get("signal") == "SHORT")
