@@ -99,6 +99,8 @@ class InferencePipeline:
         self._validate_models_loaded()
 
     ############################################################
+    # VALIDATION
+    ############################################################
 
     def _validate_models_loaded(self):
 
@@ -147,6 +149,83 @@ class InferencePipeline:
 
         finally:
             INFERENCE_IN_PROGRESS.dec()
+
+    ############################################################
+    # 🔥 FULLY COMPATIBLE HISTORICAL BACKTEST
+    ############################################################
+
+    def run_historical_with_features(self, *args, **kwargs):
+
+        """
+        Compatible with:
+        - positional df
+        - df= keyword
+        - evaluation_date
+        - future kwargs
+        """
+
+        df = None
+        evaluation_date = None
+
+        # positional
+        if len(args) >= 1:
+            df = args[0]
+
+        # keyword override
+        if "df" in kwargs:
+            df = kwargs["df"]
+
+        if "evaluation_date" in kwargs:
+            evaluation_date = kwargs["evaluation_date"]
+
+        if df is None:
+            raise RuntimeError("Historical inference requires dataframe.")
+
+        if df.empty:
+            raise RuntimeError("Empty dataframe for historical inference.")
+
+        df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+        results = []
+
+        if evaluation_date is not None:
+            dates = [pd.Timestamp(evaluation_date)]
+        else:
+            dates = sorted(df["date"].unique())
+
+        for date in dates:
+
+            snapshot = df[df["date"] == date].copy()
+
+            if snapshot.empty:
+                continue
+
+            try:
+                feature_df = validate_feature_schema(
+                    snapshot.loc[:, MODEL_FEATURES],
+                    mode="inference"
+                ).astype(DTYPE)
+
+                probs = self.models.xgb.predict_proba(feature_df)[:, 1]
+                probs = np.clip(probs, 1e-6, 1 - 1e-6)
+
+                snapshot["score"] = probs
+
+                weights = self._construct_portfolio(snapshot)
+
+                for _, row in snapshot.iterrows():
+                    results.append({
+                        "date": row["date"],
+                        "ticker": row["ticker"],
+                        "score": float(row["score"]),
+                        "weight": float(weights.get(row["ticker"], 0.0))
+                    })
+
+            except Exception as e:
+                logger.warning(f"Historical skip {date} — {e}")
+                continue
+
+        return results
 
     ############################################################
     # PARALLELIZED FEATURE ORCHESTRATION

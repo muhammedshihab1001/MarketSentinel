@@ -1,8 +1,9 @@
 import logging
 from fastapi import APIRouter
 
-from core.monitoring.drift_detector import DriftDetector
-from app.inference.model_loader import ModelLoader
+from app.inference.pipeline import InferencePipeline
+from core.market.universe import MarketUniverse
+from core.schema.feature_schema import MODEL_FEATURES
 
 router = APIRouter()
 logger = logging.getLogger("marketsentinel.drift")
@@ -11,14 +12,29 @@ logger = logging.getLogger("marketsentinel.drift")
 @router.get("/drift-status")
 def drift_status():
 
-    loader = ModelLoader()
-    detector = DriftDetector()
+    pipeline = InferencePipeline()
 
-    # Lightweight call – no prediction
-    status = detector.get_status()
+    try:
+        tickers = MarketUniverse.get_universe()
 
-    return {
-        "drift_detected": status.get("drift_detected", False),
-        "severity_score": status.get("severity_score", 0.0),
-        "model_version": loader.xgb_version
-    }
+        df = pipeline._build_cross_sectional_frame(tickers)
+        latest_df = pipeline._select_latest_snapshot(df)
+
+        feature_df = latest_df.loc[:, MODEL_FEATURES]
+
+        drift_result = pipeline.drift_detector.detect(feature_df)
+
+        return {
+            "drift_detected": drift_result.get("drift_detected", False),
+            "severity_score": drift_result.get("severity_score", 0),
+            "model_version": pipeline.models.xgb_version
+        }
+
+    except Exception:
+        logger.exception("Drift status check failed")
+
+        return {
+            "drift_detected": True,
+            "severity_score": 10,
+            "reason": "status_failure"
+        }
