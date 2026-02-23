@@ -356,7 +356,105 @@ class InferencePipeline:
             }
             for _, row in latest_df.iterrows()
         ]
+    ############################################################
+    # 🔥 INDUSTRIAL SNAPSHOT (NON-BREAKING ADDITION)
+    ############################################################
 
+    def run_snapshot(self, tickers: List[str]):
+        """
+        Extended inference snapshot for ML introspection.
+        Does NOT modify run_batch behavior.
+        """
+
+        if len(tickers) > self.MAX_BATCH_SIZE:
+            raise RuntimeError("Batch size exceeds MAX_BATCH_SIZE.")
+
+        if not self.breaker.allow():
+            raise RuntimeError("Inference blocked by circuit breaker.")
+
+        INFERENCE_IN_PROGRESS.inc()
+
+        try:
+            df = self._build_cross_sectional_frame(tickers)
+            latest_df = self._select_latest_snapshot(df)
+
+            universe = set(MarketUniverse.get_universe())
+            unknown = set(latest_df["ticker"]) - universe
+            if unknown:
+                raise RuntimeError(f"Unknown tickers detected: {unknown}")
+
+            feature_df = validate_feature_schema(
+                latest_df.loc[:, MODEL_FEATURES],
+                mode="inference"
+            ).astype(DTYPE)
+
+            probs = self.models.xgb.predict_proba(feature_df)[:, 1]
+            probs = np.clip(probs, 1e-6, 1 - 1e-6)
+
+            if np.std(probs) < self.MIN_PROB_STD:
+                raise RuntimeError("Probability collapse detected.")
+
+            latest_df = latest_df.copy()
+            latest_df["score"] = probs
+            latest_df["rank_pct"] = latest_df["score"].rank(
+                method="first",
+                pct=True
+            )
+
+            latest_df["signal"] = latest_df["rank_pct"].apply(
+                lambda x: "LONG" if x >= LONG_PERCENTILE
+                else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
+            )
+
+            weights = self._construct_portfolio(latest_df)
+
+            # 🔥 Probability diagnostics
+            prob_stats = {
+                "mean": float(np.mean(probs)),
+                "std": float(np.std(probs)),
+                "min": float(np.min(probs)),
+                "max": float(np.max(probs))
+            }
+
+            # 🔥 Long-short spread
+            long_scores = latest_df[latest_df["signal"] == "LONG"]["score"]
+            short_scores = latest_df[latest_df["signal"] == "SHORT"]["score"]
+
+            spread = None
+            if not long_scores.empty and not short_scores.empty:
+                spread = float(long_scores.mean() - short_scores.mean())
+
+            snapshot_rows = []
+
+            for _, row in latest_df.iterrows():
+                snapshot_rows.append({
+                    "date": row["date"],
+                    "ticker": row["ticker"],
+                    "score": float(row["score"]),
+                    "rank_pct": float(row["rank_pct"]),
+                    "signal": row["signal"],
+                    "weight": float(weights.get(row["ticker"], 0.0)),
+                    "volatility": float(row.get("volatility", 0.0)),
+                    "momentum_20_z": float(row.get("momentum_20_z", 0.0)),
+                })
+
+            self.breaker.record_success()
+
+            return {
+                "snapshot_date": str(latest_df["date"].iloc[0]),
+                "universe_size": int(len(latest_df)),
+                "probability_stats": prob_stats,
+                "long_short_spread": spread,
+                "signals": snapshot_rows
+            }
+
+        except Exception:
+            self.breaker.record_failure()
+            logger.exception("Snapshot inference failure.")
+            raise
+
+        finally:
+            INFERENCE_IN_PROGRESS.dec()
     ############################################################
     # PORTFOLIO (UNCHANGED)
     ############################################################
