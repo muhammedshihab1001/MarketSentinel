@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response, Request, HTTPException
 from fastapi.responses import JSONResponse
 from prometheus_client import generate_latest
-from app.api.routes import drift,model_info,portfolio,universe
+from app.api.routes import drift,model_info,portfolio,universe,health
 from app.api.routes import predict
 from app.api.routes import performance
 from app.api.routes import equity  # 🔥 NEW
@@ -168,13 +168,13 @@ app.add_exception_handler(Exception, global_exception_handler)
 # ROUTES
 # =====================================================
 
-app.include_router(predict.router, prefix="/v1")
-app.include_router(performance.router, prefix="/v1")
-app.include_router(equity.router, prefix="/v1")  # 🔥 NEW
-app.include_router(model_info.router)
+app.include_router(predict.router)
+app.include_router(health.router)
 app.include_router(universe.router)
+app.include_router(model_info.router)
 app.include_router(drift.router)
 app.include_router(portfolio.router)
+app.include_router(equity.router)
 
 
 # =====================================================
