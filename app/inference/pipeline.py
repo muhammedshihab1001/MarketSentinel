@@ -23,6 +23,7 @@ from core.market.universe import MarketUniverse
 
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
+from core.agent.signal_agent import SignalAgent
 
 from app.monitoring.metrics import (
     MODEL_INFERENCE_COUNT,
@@ -31,15 +32,8 @@ from app.monitoring.metrics import (
     INFERENCE_IN_PROGRESS
 )
 
-# ✅ NEW IMPORT
-from core.agent.signal_agent import SignalAgent
-
 logger = logging.getLogger("marketsentinel.pipeline")
 
-
-############################################################
-# CIRCUIT BREAKER (UNCHANGED)
-############################################################
 
 class CircuitBreaker:
     def __init__(self, threshold=3, cooldown=120):
@@ -72,10 +66,6 @@ class CircuitBreaker:
             self.failures = 0
 
 
-############################################################
-# INFERENCE PIPELINE
-############################################################
-
 class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
@@ -86,8 +76,12 @@ class InferencePipeline:
     WEIGHT_TOLERANCE = 1e-6
 
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
+    CROSS_SECTIONAL_WINDOW_DAYS = int(os.getenv("CS_WINDOW_DAYS", "30"))
+
     MAX_DATA_STALENESS_DAYS = 5
     MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "200"))
+
+    SNAPSHOT_CACHE_TTL = int(os.getenv("SNAPSHOT_CACHE_TTL", "15"))
 
     def __init__(self):
 
@@ -97,9 +91,10 @@ class InferencePipeline:
         self.cache = RedisCache()
         self.drift_detector = DriftDetector()
         self.breaker = CircuitBreaker()
-
-        # ✅ NEW AGENT INITIALIZATION
         self.agent = SignalAgent()
+
+        self._snapshot_cache = {}
+        self._snapshot_lock = threading.Lock()
 
         _ = self.models.xgb
         self._validate_models_loaded()
@@ -121,6 +116,25 @@ class InferencePipeline:
             )
 
         logger.info("Model + schema signature verified.")
+
+    ############################################################
+    # SNAPSHOT CACHE
+    ############################################################
+
+    def _get_snapshot_cache(self, key):
+        with self._snapshot_lock:
+            item = self._snapshot_cache.get(key)
+            if not item:
+                return None
+            result, ts = item
+            if time.time() - ts > self.SNAPSHOT_CACHE_TTL:
+                del self._snapshot_cache[key]
+                return None
+            return result
+
+    def _set_snapshot_cache(self, key, value):
+        with self._snapshot_lock:
+            self._snapshot_cache[key] = (value, time.time())
 
     ############################################################
     # PUBLIC ENTRYPOINTS
@@ -157,74 +171,7 @@ class InferencePipeline:
             INFERENCE_IN_PROGRESS.dec()
 
     ############################################################
-    # HISTORICAL BACKTEST (UNCHANGED)
-    ############################################################
-
-    def run_historical_with_features(self, *args, **kwargs):
-
-        df = None
-        evaluation_date = None
-
-        if len(args) >= 1:
-            df = args[0]
-
-        if "df" in kwargs:
-            df = kwargs["df"]
-
-        if "evaluation_date" in kwargs:
-            evaluation_date = kwargs["evaluation_date"]
-
-        if df is None:
-            raise RuntimeError("Historical inference requires dataframe.")
-
-        if df.empty:
-            raise RuntimeError("Empty dataframe for historical inference.")
-
-        df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
-        results = []
-
-        if evaluation_date is not None:
-            dates = [pd.Timestamp(evaluation_date)]
-        else:
-            dates = sorted(df["date"].unique())
-
-        for date in dates:
-
-            snapshot = df[df["date"] == date].copy()
-
-            if snapshot.empty:
-                continue
-
-            try:
-                feature_df = validate_feature_schema(
-                    snapshot.loc[:, MODEL_FEATURES],
-                    mode="inference"
-                ).astype(DTYPE)
-
-                probs = self.models.xgb.predict_proba(feature_df)[:, 1]
-                probs = np.clip(probs, 1e-6, 1 - 1e-6)
-
-                snapshot["score"] = probs
-
-                weights = self._construct_portfolio(snapshot)
-
-                for _, row in snapshot.iterrows():
-                    results.append({
-                        "date": row["date"],
-                        "ticker": row["ticker"],
-                        "score": float(row["score"]),
-                        "weight": float(weights.get(row["ticker"], 0.0))
-                    })
-
-            except Exception as e:
-                logger.warning(f"Historical skip {date} — {e}")
-                continue
-
-        return results
-
-    ############################################################
-    # FEATURE BUILD (UNCHANGED)
+    # OPTIMIZED FEATURE BUILD
     ############################################################
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
@@ -245,7 +192,6 @@ class InferencePipeline:
         for ticker, price_df in price_map.items():
 
             if price_df is None or price_df.empty:
-                logger.warning(f"No price data for {ticker}")
                 continue
 
             dataset = self.feature_store.get_features(
@@ -256,7 +202,6 @@ class InferencePipeline:
             )
 
             if dataset is None or dataset.empty:
-                logger.warning(f"No features generated for {ticker}")
                 continue
 
             datasets.append(dataset)
@@ -267,16 +212,26 @@ class InferencePipeline:
         df = pd.concat(datasets, ignore_index=True)
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
+        # 🔥 Optimization: Reduce window for cross-sectional calc
+        latest_date = df["date"].max()
+        cutoff = latest_date - pd.Timedelta(days=self.CROSS_SECTIONAL_WINDOW_DAYS)
+        df = df[df["date"] >= cutoff].copy()
+
         df = FeatureEngineer.add_cross_sectional_features(df)
         df = FeatureEngineer.finalize(df)
 
         return df
 
     ############################################################
-    # SNAPSHOT (UPDATED WITH AGENT)
+    # SNAPSHOT WITH AGENT + CACHE
     ############################################################
 
     def run_snapshot(self, tickers: List[str]):
+
+        cache_key = tuple(sorted(tickers))
+        cached = self._get_snapshot_cache(cache_key)
+        if cached:
+            return cached
 
         if len(tickers) > self.MAX_BATCH_SIZE:
             raise RuntimeError("Batch size exceeds MAX_BATCH_SIZE.")
@@ -324,13 +279,6 @@ class InferencePipeline:
                 "max": float(np.max(probs))
             }
 
-            long_scores = latest_df[latest_df["signal"] == "LONG"]["score"]
-            short_scores = latest_df[latest_df["signal"] == "SHORT"]["score"]
-
-            spread = None
-            if not long_scores.empty and not short_scores.empty:
-                spread = float(long_scores.mean() - short_scores.mean())
-
             snapshot_rows = []
 
             for _, row in latest_df.iterrows():
@@ -354,15 +302,16 @@ class InferencePipeline:
                     "agent": agent_output
                 })
 
-            self.breaker.record_success()
-
-            return {
+            result = {
                 "snapshot_date": str(latest_df["date"].iloc[0]),
                 "universe_size": int(len(latest_df)),
                 "probability_stats": prob_stats,
-                "long_short_spread": spread,
                 "signals": snapshot_rows
             }
+
+            self._set_snapshot_cache(cache_key, result)
+            self.breaker.record_success()
+            return result
 
         except Exception:
             self.breaker.record_failure()
