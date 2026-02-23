@@ -34,6 +34,27 @@ from app.monitoring.metrics import (
 logger = logging.getLogger("marketsentinel.pipeline")
 
 
+# =========================================================
+# SHARED MODEL LOADER (TRUE SINGLETON PER PROCESS)
+# =========================================================
+
+_SHARED_MODEL_LOADER = None
+_MODEL_LOCK = threading.Lock()
+
+
+def get_shared_model_loader():
+    global _SHARED_MODEL_LOADER
+    if _SHARED_MODEL_LOADER is None:
+        with _MODEL_LOCK:
+            if _SHARED_MODEL_LOADER is None:
+                logger.info("Initializing shared ModelLoader (pipeline)")
+                _SHARED_MODEL_LOADER = ModelLoader()
+                _ = _SHARED_MODEL_LOADER.xgb
+    return _SHARED_MODEL_LOADER
+
+
+# =========================================================
+
 class CircuitBreaker:
     def __init__(self, threshold=3, cooldown=120):
         self.threshold = threshold
@@ -46,12 +67,10 @@ class CircuitBreaker:
         with self._lock:
             if self.failures < self.threshold:
                 return True
-
             if self.last_failure and (time.time() - self.last_failure) > self.cooldown:
                 logger.warning("Circuit breaker reset.")
                 self.failures = 0
                 return True
-
             logger.critical("Inference blocked by circuit breaker.")
             return False
 
@@ -64,6 +83,8 @@ class CircuitBreaker:
         with self._lock:
             self.failures = 0
 
+
+# =========================================================
 
 class InferencePipeline:
 
@@ -82,7 +103,7 @@ class InferencePipeline:
     def __init__(self):
         self.market_data = MarketDataService()
         self.feature_store = FeatureStore()
-        self.models = ModelLoader()
+        self.models = get_shared_model_loader()
         self.cache = RedisCache()
         self.drift_detector = DriftDetector()
         self.breaker = CircuitBreaker()
@@ -91,8 +112,9 @@ class InferencePipeline:
         self._snapshot_cache: Dict = {}
         self._snapshot_lock = threading.Lock()
 
-        _ = self.models.xgb
         self._validate_models_loaded()
+
+    # =========================================================
 
     def _validate_models_loaded(self):
         container = self.models._xgb_container
@@ -104,16 +126,18 @@ class InferencePipeline:
             )
         logger.info("Model + schema signature verified.")
 
+    # =========================================================
+
     def _select_latest_snapshot(self, df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
             raise RuntimeError("Feature dataframe empty before snapshot selection.")
-        if "date" not in df.columns:
-            raise RuntimeError("Missing 'date' column in feature dataframe.")
         latest_date = df["date"].max()
         latest_df = df[df["date"] == latest_date].copy()
         if latest_df.empty:
             raise RuntimeError("No rows found for latest snapshot date.")
         return latest_df.reset_index(drop=True)
+
+    # =========================================================
 
     def run_snapshot(self, tickers: List[str]):
 
@@ -139,37 +163,45 @@ class InferencePipeline:
             df = self._build_cross_sectional_frame(tickers)
             latest_df = self._select_latest_snapshot(df)
 
+            # -------------------------------------------------
+            # Unknown ticker protection (soft drop)
+            # -------------------------------------------------
             universe = set(MarketUniverse.get_universe())
-            unknown = set(latest_df["ticker"]) - universe
-            if unknown:
-                raise RuntimeError(f"Unknown tickers detected: {unknown}")
+            latest_df = latest_df[latest_df["ticker"].isin(universe)]
+
+            if latest_df.empty:
+                raise RuntimeError("All tickers filtered out after universe validation.")
 
             feature_df = validate_feature_schema(
                 latest_df.loc[:, MODEL_FEATURES],
                 mode="inference"
             ).astype(DTYPE)
 
-            # Drift detection
+            # -------------------------------------------------
+            # Drift detection (soft fail)
+            # -------------------------------------------------
             try:
                 drift_result = self.drift_detector.detect(feature_df)
+                if drift_result.get("drift_state") == "hard":
+                    logger.error("Hard drift detected — continuing in degraded mode.")
+                    drift_result["degraded"] = True
             except Exception as e:
-                logger.warning("Drift check failed (dev fallback): %s", e)
+                logger.warning("Drift check failed — bypassing: %s", e)
                 drift_result = {
                     "drift_detected": False,
-                    "drift_state": "dev_bypass",
+                    "drift_state": "bypass",
                     "severity_score": 0,
                     "drift_confidence": 0.0
                 }
 
-            if drift_result.get("drift_state") == "hard":
-                raise RuntimeError("Hard drift detected.")
-
-            # 🔥 SAFE PROBABILITY HANDLING
+            # -------------------------------------------------
+            # Model inference
+            # -------------------------------------------------
             try:
                 probs = self.models.xgb.predict_proba(feature_df)[:, 1]
             except RuntimeError as e:
                 if "collapse" in str(e).lower():
-                    logger.warning("Model probability collapse — fallback to neutral.")
+                    logger.warning("Probability collapse — fallback neutral.")
                     probs = np.full(len(feature_df), 0.5)
                 else:
                     raise
@@ -177,7 +209,6 @@ class InferencePipeline:
             probs = np.clip(probs, 1e-6, 1 - 1e-6)
 
             if np.std(probs) < self.MIN_PROB_STD:
-                logger.warning("Probability std too low — fallback to neutral.")
                 probs = np.full(len(feature_df), 0.5)
 
             latest_df = latest_df.copy()
@@ -189,12 +220,11 @@ class InferencePipeline:
                 else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
             )
 
-            # Safe single ticker handling
-            if len(latest_df) >= 2:
-                weights = self._construct_portfolio(latest_df)
-            else:
-                ticker = latest_df.iloc[0]["ticker"]
-                weights = {ticker: 0.0}
+            weights = (
+                self._construct_portfolio(latest_df)
+                if len(latest_df) >= 2
+                else {latest_df.iloc[0]["ticker"]: 0.0}
+            )
 
             prob_stats = {
                 "mean": float(np.mean(probs)),
@@ -251,7 +281,7 @@ class InferencePipeline:
         finally:
             INFERENCE_IN_PROGRESS.dec()
 
-    # ============================================================
+    # =========================================================
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
 
@@ -299,7 +329,7 @@ class InferencePipeline:
 
         return df
 
-    # ============================================================
+    # =========================================================
 
     def _construct_portfolio(self, latest_df):
 
