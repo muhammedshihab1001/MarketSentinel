@@ -22,10 +22,7 @@ from app.api.routes import (
     agent
 )
 
-from app.inference.model_loader import (
-    ModelLoader,
-    set_shared_model_loader
-)
+from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
 
 
@@ -52,7 +49,7 @@ BOOT_ID = hashlib.sha256(
 ).hexdigest()[:12]
 
 STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 120)
-APP_VERSION = get_env("APP_VERSION", "3.3.0")
+APP_VERSION = get_env("APP_VERSION", "3.3.1")
 
 
 # =====================================================
@@ -113,15 +110,12 @@ async def lifespan(app: FastAPI):
         logger.info("===================================")
 
         # -------------------------------------------------
-        # MODEL LOADING (SINGLETON REGISTRATION)
+        # MODEL LOADING (INTERNAL SINGLETON)
         # -------------------------------------------------
 
         loader = ModelLoader()
-        _ = loader.xgb  # Force model load
+        _ = loader.xgb   # force model load
         loader.warmup()
-
-        # Register shared singleton
-        set_shared_model_loader(loader)
 
         readiness.models_loaded = True
         readiness.schema_signature = loader.schema_signature
@@ -214,7 +208,7 @@ async def root():
 
 
 # =====================================================
-# PROMETHEUS METRICS
+# PROMETHEUS
 # =====================================================
 
 @app.get("/metrics")
@@ -226,7 +220,7 @@ def metrics():
 
 
 # =====================================================
-# READINESS PROBE
+# READINESS
 # =====================================================
 
 @app.get("/ready")
@@ -250,7 +244,7 @@ def readiness_probe():
 
 
 # =====================================================
-# LIVENESS PROBE
+# LIVENESS
 # =====================================================
 
 @app.get("/live")
