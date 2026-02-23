@@ -2,6 +2,8 @@ import os
 import logging
 import pandas as pd
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core.data.providers.market.yahoo_provider import YahooProvider
 
@@ -34,6 +36,10 @@ class MarketProviderRouter:
     MAX_DAILY_MOVE = 0.90
     PROVIDER_TIMEOUT_WARN = 8.0
 
+    PROVIDER_TIMEOUT_HARD = 15.0
+    MAX_PROVIDER_WORKERS = 3
+    FAILURE_COOLDOWN = 30  # seconds
+
     ALLOWED_INTERVALS = {
         "1d", "D",
         "1h", "60m",
@@ -47,12 +53,13 @@ class MarketProviderRouter:
     def __init__(self):
 
         self.providers = []
+        self._provider_failures = {}
+        self._lock = threading.Lock()
+
         self._register_providers()
 
         if not self.providers:
-            raise RuntimeError(
-                "No market providers available."
-            )
+            raise RuntimeError("No market providers available.")
 
         logger.info(
             "Market router ready | priority=%s",
@@ -101,7 +108,7 @@ class MarketProviderRouter:
             raise ValueError(f"Unsupported interval: {interval}")
 
     ############################################################
-    # 🔥 SANITIZER WITH CONFIGURABLE MIN_ROWS
+    # SANITIZER
     ############################################################
 
     @classmethod
@@ -156,6 +163,26 @@ class MarketProviderRouter:
         return df
 
     ############################################################
+    # FAILURE TRACKING
+    ############################################################
+
+    def _provider_allowed(self, name):
+
+        with self._lock:
+            last_fail = self._provider_failures.get(name)
+            if not last_fail:
+                return True
+            if time.time() - last_fail > self.FAILURE_COOLDOWN:
+                return True
+            return False
+
+    def _record_failure(self, name):
+        with self._lock:
+            self._provider_failures[name] = time.time()
+
+    ############################################################
+    # PARALLEL FETCH
+    ############################################################
 
     def fetch(self, ticker, start, end, interval, min_rows=None):
 
@@ -164,53 +191,93 @@ class MarketProviderRouter:
         if min_rows is None:
             min_rows = self.DEFAULT_MIN_ROWS
 
-        last_error = None
+        eligible = [
+            (name, provider)
+            for name, provider in self.providers
+            if self._provider_allowed(name)
+        ]
 
-        for name, provider in self.providers:
+        if not eligible:
+            raise RuntimeError("All providers in cooldown.")
 
-            start_time = time.time()
+        futures = {}
 
-            try:
+        with ThreadPoolExecutor(max_workers=self.MAX_PROVIDER_WORKERS) as executor:
 
-                df = provider.fetch(
-                    ticker,
-                    start,
-                    end,
-                    interval,
-                    min_rows=min_rows
-                )
+            for name, provider in eligible:
 
-                latency = time.time() - start_time
-
-                if latency > self.PROVIDER_TIMEOUT_WARN:
-                    logger.warning(
-                        "Slow provider detected → %s (%.2fs)",
+                futures[
+                    executor.submit(
+                        self._attempt_provider,
                         name,
-                        latency
+                        provider,
+                        ticker,
+                        start,
+                        end,
+                        interval,
+                        min_rows
                     )
+                ] = name
 
-                df = self._sanitize_dataframe(df, min_rows)
+            for future in as_completed(futures):
 
-                logger.info(
-                    "Market data served → provider=%s ticker=%s rows=%s",
-                    name,
-                    ticker,
-                    len(df)
-                )
+                name = futures[future]
 
-                return df.copy()
+                try:
+                    return future.result()
 
-            except Exception as e:
-
-                last_error = e
-
-                logger.warning(
-                    "Provider failed → %s | ticker=%s | error=%s",
-                    name,
-                    ticker,
-                    str(e)
-                )
+                except Exception as e:
+                    logger.warning(
+                        "Provider failed → %s | ticker=%s | error=%s",
+                        name,
+                        ticker,
+                        str(e)
+                    )
+                    self._record_failure(name)
 
         raise RuntimeError(
             f"All market providers failed for {ticker}"
-        ) from last_error
+        )
+
+    ############################################################
+
+    def _attempt_provider(
+        self,
+        name,
+        provider,
+        ticker,
+        start,
+        end,
+        interval,
+        min_rows
+    ):
+
+        start_time = time.time()
+
+        df = provider.fetch(
+            ticker,
+            start,
+            end,
+            interval,
+            min_rows=min_rows
+        )
+
+        latency = time.time() - start_time
+
+        if latency > self.PROVIDER_TIMEOUT_WARN:
+            logger.warning(
+                "Slow provider detected → %s (%.2fs)",
+                name,
+                latency
+            )
+
+        df = self._sanitize_dataframe(df, min_rows)
+
+        logger.info(
+            "Market data served → provider=%s ticker=%s rows=%s",
+            name,
+            ticker,
+            len(df)
+        )
+
+        return df.copy()
