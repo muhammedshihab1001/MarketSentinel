@@ -30,7 +30,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "17.3"
+    BASELINE_VERSION = "17.4"  # 🔥 bump due to restored baseline creation
     DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
 
     MIN_SAMPLE_BASELINE = 150
@@ -70,6 +70,89 @@ class DriftDetector:
         self._model_loader = ModelLoader()
 
     ########################################################
+    # BASELINE CREATION (RESTORED)
+    ########################################################
+
+    def create_baseline(
+        self,
+        dataset: pd.DataFrame,
+        model_version: str,
+        dataset_hash: str | None = None,
+        training_code_hash: str | None = None,
+        feature_checksum: str | None = None,
+        allow_overwrite: bool = False,
+    ):
+
+        if os.path.exists(self.BASELINE_PATH) and not allow_overwrite:
+            raise RuntimeError("Baseline already exists.")
+
+        if dataset is None or dataset.empty:
+            raise RuntimeError("Cannot create baseline from empty dataset.")
+
+        if len(dataset) < self.MIN_SAMPLE_BASELINE:
+            raise RuntimeError(
+                f"Insufficient rows for baseline creation "
+                f"({len(dataset)} < {self.MIN_SAMPLE_BASELINE})"
+            )
+
+        numeric = self._safe_feature_block(dataset)
+
+        baseline_features = {}
+
+        for col in MODEL_FEATURES:
+
+            series = numeric[col].dropna()
+
+            if len(series) < self.MIN_SAMPLE_BASELINE:
+                continue
+
+            mean = float(series.mean())
+            std = float(max(series.std(), self.EPSILON))
+            variance = float(max(series.var(), self.EPSILON))
+
+            quantiles = np.linspace(0, 1, 11)
+            bin_edges = np.unique(np.quantile(series, quantiles))
+
+            if len(bin_edges) < 2:
+                bin_edges = np.array([series.min(), series.max() + self.EPSILON])
+
+            expected_counts = np.histogram(series, bins=bin_edges)[0]
+
+            baseline_features[col] = {
+                "mean": mean,
+                "std": std,
+                "variance": variance,
+                "bin_edges": bin_edges.tolist(),
+                "expected_counts": expected_counts.tolist()
+            }
+
+        if not baseline_features:
+            raise RuntimeError("Baseline generation failed.")
+
+        payload = {
+            "meta": {
+                "baseline_version": self.BASELINE_VERSION,
+                "created_at": datetime.utcnow().isoformat(),
+                "schema_signature": get_schema_signature(),
+                "model_version": model_version,
+                "dataset_hash": dataset_hash,
+                "training_code_hash": training_code_hash,
+                "feature_checksum": feature_checksum,
+                "feature_count": len(baseline_features)
+            },
+            "features": baseline_features
+        }
+
+        payload["integrity_hash"] = self._baseline_hash(payload)
+
+        self._atomic_write(payload)
+
+        logger.info(
+            "Drift baseline created successfully | features=%s",
+            len(baseline_features)
+        )
+
+    ########################################################
     # SAFE FEATURE BLOCK
     ########################################################
 
@@ -78,9 +161,7 @@ class DriftDetector:
         missing = set(MODEL_FEATURES) - set(dataset.columns)
 
         if missing:
-            raise RuntimeError(
-                f"Missing features for drift detection: {missing}"
-            )
+            raise RuntimeError(f"Missing features: {missing}")
 
         block = dataset.loc[:, MODEL_FEATURES].copy()
 
@@ -185,45 +266,12 @@ class DriftDetector:
                 tuple(MODEL_FEATURES)
             )
             if meta["feature_checksum"] != current_checksum:
-                raise RuntimeError("Baseline feature checksum mismatch.")
+                raise RuntimeError("Feature checksum mismatch.")
 
         return baseline
 
     ########################################################
-    # STATUS (NEW — FIXES YOUR CRASH)
-    ########################################################
-
-    def get_status(self) -> dict:
-        """
-        Returns drift system status without performing detection.
-        Safe for health endpoints.
-        """
-
-        try:
-            baseline = self._load_verified_baseline()
-            meta = baseline.get("meta", {})
-
-            return {
-                "baseline_present": True,
-                "baseline_version": meta.get("baseline_version"),
-                "model_version": meta.get("model_version"),
-                "schema_signature": meta.get("schema_signature"),
-                "feature_count": meta.get("feature_count"),
-                "created_at": meta.get("created_at"),
-                "hard_fail_mode": self.hard_fail
-            }
-
-        except Exception as exc:
-            logger.warning("Drift status check failed: %s", exc)
-
-            return {
-                "baseline_present": False,
-                "reason": str(exc),
-                "hard_fail_mode": self.hard_fail
-            }
-
-    ########################################################
-    # DETECT
+    # DETECT (UNCHANGED)
     ########################################################
 
     def detect(self, dataset: pd.DataFrame):
