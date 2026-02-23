@@ -92,11 +92,25 @@ def load_default_universe() -> List[str]:
     with open(universe_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    if not isinstance(data, list):
+    # -----------------------------------------------------
+    # 🔥 SUPPORT BOTH FORMATS
+    # -----------------------------------------------------
+
+    if isinstance(data, list):
+        tickers = data
+
+    elif isinstance(data, dict) and "tickers" in data:
+        tickers = data["tickers"]
+
+    else:
         raise RuntimeError("Universe config invalid format.")
 
+    if not isinstance(tickers, list):
+        raise RuntimeError("Universe tickers must be a list.")
+
     cleaned = []
-    for t in data:
+
+    for t in tickers:
         t = str(t).upper().strip()
         if TICKER_REGEX.match(t):
             cleaned.append(t)
@@ -105,6 +119,8 @@ def load_default_universe() -> List[str]:
 
     if len(unique) < MIN_BATCH_SIZE:
         raise RuntimeError("Universe size below minimum batch size.")
+
+    logger.info(f"Universe loaded successfully ({len(unique)} tickers).")
 
     return unique
 
