@@ -1,3 +1,5 @@
+# (FULL FILE STARTS HERE)
+
 import time
 import asyncio
 import os
@@ -60,7 +62,6 @@ DEFAULT_USE_UNIVERSE = os.getenv(
     "true"
 ).lower() == "true"
 
-# 🔥 Smart universe resolution
 PRIMARY_UNIVERSE_PATH = Path(
     os.getenv("PRODUCTION_UNIVERSE_PATH", "config/universe_production.json")
 )
@@ -73,7 +74,7 @@ TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 
 
 # =========================================================
-# DEFAULT UNIVERSE LOADER (PRODUCTION SAFE)
+# DEFAULT UNIVERSE LOADER
 # =========================================================
 
 def load_default_universe() -> List[str]:
@@ -92,21 +93,12 @@ def load_default_universe() -> List[str]:
     with open(universe_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # -----------------------------------------------------
-    # 🔥 SUPPORT BOTH FORMATS
-    # -----------------------------------------------------
-
     if isinstance(data, list):
         tickers = data
-
     elif isinstance(data, dict) and "tickers" in data:
         tickers = data["tickers"]
-
     else:
         raise RuntimeError("Universe config invalid format.")
-
-    if not isinstance(tickers, list):
-        raise RuntimeError("Universe tickers must be a list.")
 
     cleaned = []
 
@@ -120,41 +112,7 @@ def load_default_universe() -> List[str]:
     if len(unique) < MIN_BATCH_SIZE:
         raise RuntimeError("Universe size below minimum batch size.")
 
-    logger.info(f"Universe loaded successfully ({len(unique)} tickers).")
-
     return unique
-
-
-# =========================================================
-# REQUEST SCHEMA
-# =========================================================
-
-class PortfolioRequest(BaseModel):
-    tickers: Optional[List[str]] = Field(default=None)
-
-    @field_validator("tickers")
-    @classmethod
-    def validate_and_normalize(cls, tickers):
-
-        if tickers is None:
-            return None
-
-        cleaned = []
-
-        for t in tickers:
-            t = t.upper().strip()
-
-            if not TICKER_REGEX.match(t):
-                raise ValueError(f"Invalid ticker: {t}")
-
-            cleaned.append(t)
-
-        unique = sorted(set(cleaned))
-
-        if len(unique) < MIN_BATCH_SIZE:
-            raise ValueError(f"At least {MIN_BATCH_SIZE} tickers required.")
-
-        return unique
 
 
 # =========================================================
@@ -172,103 +130,7 @@ class SnapshotResponse(BaseModel):
 
 
 # =========================================================
-# OUTPUT VALIDATION
-# =========================================================
-
-def validate_portfolio_output(result: Any):
-
-    if not isinstance(result, list):
-        raise RuntimeError("Invalid portfolio output format.")
-
-    for row in result:
-
-        required = {"date", "ticker", "score", "signal", "weight"}
-
-        if not isinstance(row, dict):
-            raise RuntimeError("Invalid portfolio row structure.")
-
-        if not required.issubset(row.keys()):
-            raise RuntimeError("Portfolio row missing fields.")
-
-        for k, v in row.items():
-            if isinstance(v, float) and not math.isfinite(v):
-                raise RuntimeError(f"Non-finite value in portfolio output: {k}")
-
-    return result
-
-
-# =========================================================
-# PORTFOLIO ENDPOINT
-# =========================================================
-
-@router.post("/portfolio", response_model=PortfolioResponse)
-async def build_portfolio(req: PortfolioRequest):
-
-    endpoint = "/portfolio"
-    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
-    start_time = time.time()
-
-    try:
-
-        tickers = req.tickers or (
-            load_default_universe() if DEFAULT_USE_UNIVERSE else None
-        )
-
-        if tickers is None:
-            raise HTTPException(status_code=400, detail="Tickers required.")
-
-        if len(tickers) > MAX_BATCH_SIZE:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Batch size exceeds limit ({MAX_BATCH_SIZE})"
-            )
-
-        loader = get_loader()
-
-        async with inference_semaphore:
-
-            result = await asyncio.wait_for(
-                run_in_threadpool(
-                    get_pipeline().run_batch,
-                    tickers
-                ),
-                timeout=REQUEST_TIMEOUT
-            )
-
-        result = validate_portfolio_output(result)
-
-        meta = {
-            "model_version": loader.xgb_version,
-            "schema_signature": loader.schema_signature,
-            "dataset_hash": loader.dataset_hash,
-            "training_code_hash": loader.training_code_hash,
-            "artifact_hash": loader.artifact_hash,
-            "batch_size": len(tickers),
-            "latency_ms": int((time.time() - start_time) * 1000),
-            "timestamp": int(time.time())
-        }
-
-        return PortfolioResponse(meta=meta, portfolio=result)
-
-    except asyncio.TimeoutError:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        raise HTTPException(status_code=504, detail="Portfolio inference timeout")
-
-    except HTTPException:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        raise
-
-    except Exception:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.exception("Portfolio inference failure")
-        raise HTTPException(status_code=500, detail="Portfolio inference failed")
-
-    finally:
-        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
-
-
-# =========================================================
-# LIVE SNAPSHOT
+# LIVE SNAPSHOT (ENHANCED)
 # =========================================================
 
 @router.get("/live-snapshot", response_model=SnapshotResponse)
@@ -295,8 +157,29 @@ async def live_snapshot():
             )
 
         signals = snapshot.get("signals", [])
+
         long_count = sum(1 for s in signals if s.get("signal") == "LONG")
         short_count = sum(1 for s in signals if s.get("signal") == "SHORT")
+
+        # 🔥 NEW AGGREGATE METRICS
+        strength_scores = [
+            s.get("agent", {}).get("strength_score", 0.0)
+            for s in signals
+        ]
+
+        avg_strength = round(sum(strength_scores) / len(strength_scores), 2) if strength_scores else 0.0
+        max_strength = max(strength_scores) if strength_scores else 0.0
+        min_strength = min(strength_scores) if strength_scores else 0.0
+
+        high_conviction_count = sum(
+            1 for s in signals
+            if s.get("agent", {}).get("strength_score", 0.0) >= 75
+        )
+
+        elevated_risk_count = sum(
+            1 for s in signals
+            if s.get("agent", {}).get("risk_level") == "elevated"
+        )
 
         meta = {
             "model_version": loader.xgb_version,
@@ -307,6 +190,11 @@ async def live_snapshot():
             "universe_size": len(tickers),
             "long_signals": long_count,
             "short_signals": short_count,
+            "avg_strength_score": avg_strength,
+            "max_strength_score": max_strength,
+            "min_strength_score": min_strength,
+            "high_conviction_count": high_conviction_count,
+            "elevated_risk_count": elevated_risk_count,
             "latency_ms": int((time.time() - start_time) * 1000),
             "timestamp": int(time.time())
         }
