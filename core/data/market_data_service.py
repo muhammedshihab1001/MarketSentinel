@@ -56,6 +56,11 @@ class MarketDataService:
 
         self._fetcher = MarketDataService._PROVIDER
 
+        # 🔥 Auto-reduce workers if single-provider FAST mode
+        if self.FAST_PROVIDER_MODE and len(self._fetcher.providers) == 1:
+            self.MAX_WORKERS = min(self.MAX_WORKERS, 2)
+            logger.info("Single-provider FAST mode → worker cap set to %s", self.MAX_WORKERS)
+
         self.SCHEMA_HASH = hashlib.sha256(
             ",".join(sorted(self.REQUIRED_COLUMNS)).encode()
         ).hexdigest()[:10]

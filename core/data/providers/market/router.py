@@ -35,7 +35,6 @@ class MarketProviderRouter:
     DEFAULT_MIN_ROWS = 50
     MAX_DAILY_MOVE = 0.90
     PROVIDER_TIMEOUT_WARN = 8.0
-    PROVIDER_TIMEOUT_HARD = 15.0
     MAX_PROVIDER_WORKERS = 3
     FAILURE_COOLDOWN = 30
 
@@ -60,9 +59,12 @@ class MarketProviderRouter:
         if not self.providers:
             raise RuntimeError("No market providers available.")
 
+        self._single_provider_mode = len(self.providers) == 1
+
         logger.info(
-            "Market router ready | priority=%s",
-            [p[0] for p in self.providers]
+            "Market router ready | priority=%s | single_provider=%s",
+            [p[0] for p in self.providers],
+            self._single_provider_mode
         )
 
     ############################################################
@@ -106,53 +108,14 @@ class MarketProviderRouter:
             raise ValueError(f"Unsupported interval: {interval}")
 
     ############################################################
-
-    @classmethod
-    def _sanitize_dataframe(cls, df: pd.DataFrame, min_rows):
-
-        if df is None or df.empty:
-            raise RuntimeError("Provider returned empty dataframe.")
-
-        missing = cls.REQUIRED_COLUMNS - set(df.columns)
-        if missing:
-            raise RuntimeError(f"Provider schema invalid. Missing={missing}")
-
-        df = df.copy()
-
-        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
-        df = df.dropna(subset=["date"])
-
-        numeric_cols = ["open", "high", "low", "close", "volume"]
-
-        for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df = df.dropna(subset=numeric_cols)
-        df = df[df["high"] >= df["low"]]
-
-        jumps = df["close"].pct_change().abs()
-        if (jumps > cls.MAX_DAILY_MOVE).any():
-            raise RuntimeError("Extreme price jump detected.")
-
-        df = (
-            df
-            .drop_duplicates("date")
-            .sort_values("date")
-            .reset_index(drop=True)
-        )
-
-        if len(df) < min_rows:
-            raise RuntimeError(
-                f"Too few rows from provider ({len(df)} < {min_rows})"
-            )
-
-        return df
-
-    ############################################################
     # FAILURE TRACKING
     ############################################################
 
     def _provider_allowed(self, name):
+
+        if self._single_provider_mode:
+            return True  # 🔥 disable cooldown logic if only one provider
+
         with self._lock:
             last_fail = self._provider_failures.get(name)
             if not last_fail:
@@ -162,11 +125,13 @@ class MarketProviderRouter:
             return False
 
     def _record_failure(self, name):
+
+        if self._single_provider_mode:
+            return  # 🔥 no cooldown in single-provider mode
+
         with self._lock:
             self._provider_failures[name] = time.time()
 
-    ############################################################
-    # 🔥 UPDATED FETCH (SUPPORTS PROVIDER OVERRIDE)
     ############################################################
 
     def fetch(
@@ -184,9 +149,7 @@ class MarketProviderRouter:
         if min_rows is None:
             min_rows = self.DEFAULT_MIN_ROWS
 
-        # 🔥 Provider override mode
         if provider is not None:
-
             provider = provider.lower()
 
             match = [
@@ -216,8 +179,6 @@ class MarketProviderRouter:
             except Exception as e:
                 self._record_failure(name)
                 raise
-
-        # 🔥 Default parallel racing mode
 
         eligible = [
             (name, provider_obj)
@@ -297,13 +258,11 @@ class MarketProviderRouter:
                 latency
             )
 
-        df = self._sanitize_dataframe(df, min_rows)
-
         logger.info(
             "Market data served → provider=%s ticker=%s rows=%s",
             name,
             ticker,
-            len(df)
+            len(df) if df is not None else 0
         )
 
         return df.copy()
