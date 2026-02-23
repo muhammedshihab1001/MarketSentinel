@@ -251,8 +251,8 @@ class InferencePipeline:
             }
 
             # 🔥 FIXED METRICS LABEL USAGE
-            MODEL_INFERENCE_COUNT.labels(stage="snapshot").inc()
-            MODEL_INFERENCE_LATENCY.labels(stage="snapshot").observe(
+            MODEL_INFERENCE_COUNT.labels(stage="xgboost").inc()
+            MODEL_INFERENCE_LATENCY.labels(stage="xgboost").observe(
                 time.time() - start_time
             )
 
