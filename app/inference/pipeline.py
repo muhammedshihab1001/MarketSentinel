@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import logging
 import os
-from datetime import timedelta
 from typing import List, Dict
 
 from core.data.market_data_service import MarketDataService
@@ -77,10 +76,7 @@ class InferencePipeline:
 
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
     CROSS_SECTIONAL_WINDOW_DAYS = int(os.getenv("CS_WINDOW_DAYS", "30"))
-
-    MAX_DATA_STALENESS_DAYS = 5
     MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "200"))
-
     SNAPSHOT_CACHE_TTL = int(os.getenv("SNAPSHOT_CACHE_TTL", "15"))
 
     def __init__(self):
@@ -137,93 +133,7 @@ class InferencePipeline:
             self._snapshot_cache[key] = (value, time.time())
 
     ############################################################
-    # PUBLIC ENTRYPOINTS
-    ############################################################
-
-    def run_single(self, ticker: str):
-        return self.run_batch([ticker])
-
-    def run_batch(self, tickers: List[str]):
-
-        if len(tickers) > self.MAX_BATCH_SIZE:
-            raise RuntimeError("Batch size exceeds MAX_BATCH_SIZE.")
-
-        if not self.breaker.allow():
-            raise RuntimeError("Inference blocked by circuit breaker.")
-
-        INFERENCE_IN_PROGRESS.inc()
-
-        try:
-            df = self._build_cross_sectional_frame(tickers)
-            latest_df = self._select_latest_snapshot(df)
-            result = self._score_and_construct(latest_df)
-
-            self.breaker.record_success()
-            return result
-
-        except Exception:
-            PIPELINE_FAILURES.labels(stage="run_batch").inc()
-            self.breaker.record_failure()
-            logger.exception("Inference pipeline failure.")
-            raise
-
-        finally:
-            INFERENCE_IN_PROGRESS.dec()
-
-    ############################################################
-    # OPTIMIZED FEATURE BUILD
-    ############################################################
-
-    def _build_cross_sectional_frame(self, tickers: List[str]):
-
-        end_date = pd.Timestamp.utcnow()
-        start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
-
-        price_map = self.market_data.get_price_data_batch(
-            tickers=tickers,
-            start_date=start_date.strftime("%Y-%m-%d"),
-            end_date=end_date.strftime("%Y-%m-%d"),
-            interval="1d",
-            min_history=60
-        )
-
-        datasets = []
-
-        for ticker, price_df in price_map.items():
-
-            if price_df is None or price_df.empty:
-                continue
-
-            dataset = self.feature_store.get_features(
-                price_df=price_df,
-                sentiment_df=None,
-                ticker=ticker,
-                training=False
-            )
-
-            if dataset is None or dataset.empty:
-                continue
-
-            datasets.append(dataset)
-
-        if not datasets:
-            raise RuntimeError("All tickers failed feature build.")
-
-        df = pd.concat(datasets, ignore_index=True)
-        df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
-        # 🔥 Optimization: Reduce window for cross-sectional calc
-        latest_date = df["date"].max()
-        cutoff = latest_date - pd.Timedelta(days=self.CROSS_SECTIONAL_WINDOW_DAYS)
-        df = df[df["date"] >= cutoff].copy()
-
-        df = FeatureEngineer.add_cross_sectional_features(df)
-        df = FeatureEngineer.finalize(df)
-
-        return df
-
-    ############################################################
-    # SNAPSHOT WITH AGENT + CACHE
+    # PUBLIC ENTRYPOINT
     ############################################################
 
     def run_snapshot(self, tickers: List[str]):
@@ -240,8 +150,10 @@ class InferencePipeline:
             raise RuntimeError("Inference blocked by circuit breaker.")
 
         INFERENCE_IN_PROGRESS.inc()
+        start_time = time.time()
 
         try:
+
             df = self._build_cross_sectional_frame(tickers)
             latest_df = self._select_latest_snapshot(df)
 
@@ -280,6 +192,11 @@ class InferencePipeline:
             }
 
             snapshot_rows = []
+            strength_scores = []
+            risk_levels = []
+
+            long_scores = []
+            short_scores = []
 
             for _, row in latest_df.iterrows():
 
@@ -289,6 +206,18 @@ class InferencePipeline:
                     row=row_dict,
                     probability_stats=prob_stats
                 )
+
+                # Defensive guarantees
+                strength = int(agent_output.get("strength_score", 0))
+                risk = agent_output.get("risk_level", "moderate")
+
+                strength_scores.append(strength)
+                risk_levels.append(risk)
+
+                if row["signal"] == "LONG":
+                    long_scores.append(row["score"])
+                elif row["signal"] == "SHORT":
+                    short_scores.append(row["score"])
 
                 snapshot_rows.append({
                     "date": row["date"],
@@ -302,18 +231,42 @@ class InferencePipeline:
                     "agent": agent_output
                 })
 
+            # ---- Snapshot Meta Aggregation ----
+
+            avg_strength = float(np.mean(strength_scores)) if strength_scores else 0.0
+            max_strength = int(np.max(strength_scores)) if strength_scores else 0
+            min_strength = int(np.min(strength_scores)) if strength_scores else 0
+
+            high_conviction_count = sum(1 for s in strength_scores if s >= 75)
+            elevated_risk_count = sum(1 for r in risk_levels if r == "elevated")
+
+            spread = None
+            if long_scores and short_scores:
+                spread = float(np.mean(long_scores) - np.mean(short_scores))
+
             result = {
                 "snapshot_date": str(latest_df["date"].iloc[0]),
                 "universe_size": int(len(latest_df)),
                 "probability_stats": prob_stats,
+                "long_short_spread": spread,
+                "avg_strength_score": round(avg_strength, 2),
+                "max_strength_score": max_strength,
+                "min_strength_score": min_strength,
+                "high_conviction_count": high_conviction_count,
+                "elevated_risk_count": elevated_risk_count,
                 "signals": snapshot_rows
             }
 
+            MODEL_INFERENCE_COUNT.inc()
+            MODEL_INFERENCE_LATENCY.observe(time.time() - start_time)
+
             self._set_snapshot_cache(cache_key, result)
             self.breaker.record_success()
+
             return result
 
         except Exception:
+            PIPELINE_FAILURES.labels(stage="snapshot").inc()
             self.breaker.record_failure()
             logger.exception("Snapshot inference failure.")
             raise
@@ -322,7 +275,57 @@ class InferencePipeline:
             INFERENCE_IN_PROGRESS.dec()
 
     ############################################################
-    # PORTFOLIO (UNCHANGED)
+    # FEATURE BUILD
+    ############################################################
+
+    def _build_cross_sectional_frame(self, tickers: List[str]):
+
+        end_date = pd.Timestamp.utcnow()
+        start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
+
+        price_map = self.market_data.get_price_data_batch(
+            tickers=tickers,
+            start_date=start_date.strftime("%Y-%m-%d"),
+            end_date=end_date.strftime("%Y-%m-%d"),
+            interval="1d",
+            min_history=60
+        )
+
+        datasets = []
+
+        for ticker, price_df in price_map.items():
+            if price_df is None or price_df.empty:
+                continue
+
+            dataset = self.feature_store.get_features(
+                price_df=price_df,
+                sentiment_df=None,
+                ticker=ticker,
+                training=False
+            )
+
+            if dataset is None or dataset.empty:
+                continue
+
+            datasets.append(dataset)
+
+        if not datasets:
+            raise RuntimeError("All tickers failed feature build.")
+
+        df = pd.concat(datasets, ignore_index=True)
+        df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+        latest_date = df["date"].max()
+        cutoff = latest_date - pd.Timedelta(days=self.CROSS_SECTIONAL_WINDOW_DAYS)
+        df = df[df["date"] >= cutoff].copy()
+
+        df = FeatureEngineer.add_cross_sectional_features(df)
+        df = FeatureEngineer.finalize(df)
+
+        return df
+
+    ############################################################
+    # PORTFOLIO
     ############################################################
 
     def _construct_portfolio(self, latest_df):
