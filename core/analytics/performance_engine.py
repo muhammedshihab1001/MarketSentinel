@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, Any
 
 
 @dataclass
@@ -17,13 +17,18 @@ class PerformanceReport:
     annual_return: float
     turnover: float
     beta: Optional[float]
+    information_ratio: Optional[float]
     daily_returns: pd.Series
     equity_curve: pd.Series
+    drawdown_series: pd.Series
+    rolling_sharpe: pd.Series
+    rolling_volatility: pd.Series
 
 
 class PerformanceEngine:
 
     TRADING_DAYS = 252
+    ROLLING_WINDOW = 63  # 3-month rolling window
 
     ########################################################
     # CORE ENTRY
@@ -89,8 +94,14 @@ class PerformanceEngine:
         ########################################################
 
         equity = (1 + daily).cumprod()
-
         cumulative_return = equity.iloc[-1] - 1
+
+        ########################################################
+        # DRAWDOWN SERIES
+        ########################################################
+
+        rolling_max = equity.cummax()
+        drawdown_series = (equity - rolling_max) / rolling_max
 
         ########################################################
         # METRICS
@@ -98,7 +109,7 @@ class PerformanceEngine:
 
         sharpe = self._sharpe_ratio(daily)
         sortino = self._sortino_ratio(daily)
-        max_dd = self._max_drawdown(equity)
+        max_dd = drawdown_series.min()
         max_dd_duration = self._max_drawdown_duration(equity)
         ann_vol = self._annual_volatility(daily)
         ann_ret = self._annual_return(daily)
@@ -106,6 +117,14 @@ class PerformanceEngine:
         hit = self._hit_rate(daily)
         turnover = self._turnover(portfolio_df)
         beta = self._beta(daily, benchmark_returns)
+        info_ratio = self._information_ratio(daily, benchmark_returns)
+
+        ########################################################
+        # ROLLING METRICS
+        ########################################################
+
+        rolling_sharpe = self._rolling_sharpe(daily)
+        rolling_volatility = self._rolling_volatility(daily)
 
         return PerformanceReport(
             cumulative_return=float(cumulative_return),
@@ -119,8 +138,12 @@ class PerformanceEngine:
             annual_return=float(ann_ret),
             turnover=float(turnover),
             beta=beta,
+            information_ratio=info_ratio,
             daily_returns=daily,
-            equity_curve=equity
+            equity_curve=equity,
+            drawdown_series=drawdown_series,
+            rolling_sharpe=rolling_sharpe,
+            rolling_volatility=rolling_volatility
         )
 
     ########################################################
@@ -129,13 +152,12 @@ class PerformanceEngine:
 
     def _sharpe_ratio(self, daily_returns):
 
-        mean = daily_returns.mean()
         std = daily_returns.std()
 
         if std == 0 or np.isnan(std):
             return 0.0
 
-        return (mean / std) * np.sqrt(self.TRADING_DAYS)
+        return (daily_returns.mean() / std) * np.sqrt(self.TRADING_DAYS)
 
     def _sortino_ratio(self, daily_returns):
 
@@ -149,9 +171,7 @@ class PerformanceEngine:
         if downside_std == 0 or np.isnan(downside_std):
             return 0.0
 
-        mean = daily_returns.mean()
-
-        return (mean / downside_std) * np.sqrt(self.TRADING_DAYS)
+        return (daily_returns.mean() / downside_std) * np.sqrt(self.TRADING_DAYS)
 
     def _annual_volatility(self, daily_returns):
         return daily_returns.std() * np.sqrt(self.TRADING_DAYS)
@@ -165,13 +185,6 @@ class PerformanceEngine:
             return 0.0
 
         return cumulative ** (1 / years) - 1
-
-    def _max_drawdown(self, equity_curve):
-
-        rolling_max = equity_curve.cummax()
-        drawdown = (equity_curve - rolling_max) / rolling_max
-
-        return drawdown.min()
 
     def _max_drawdown_duration(self, equity_curve):
 
@@ -210,9 +223,7 @@ class PerformanceEngine:
         )
 
         diff = pivot.diff().abs()
-
         turnover = 0.5 * diff.sum(axis=1)
-
         turnover = turnover.iloc[1:]
 
         return float(turnover.mean())
@@ -235,3 +246,41 @@ class PerformanceEngine:
             return None
 
         return float(cov / var)
+
+    def _information_ratio(self, strategy_returns, benchmark_returns):
+
+        if benchmark_returns is None:
+            return None
+
+        aligned_strategy, aligned_bench = strategy_returns.align(
+            benchmark_returns,
+            join="inner"
+        )
+
+        active = aligned_strategy - aligned_bench
+
+        if active.std() == 0:
+            return None
+
+        return float(
+            (active.mean() / active.std()) * np.sqrt(self.TRADING_DAYS)
+        )
+
+    ########################################################
+    # ROLLING METRICS
+    ########################################################
+
+    def _rolling_sharpe(self, daily_returns):
+
+        rolling = daily_returns.rolling(self.ROLLING_WINDOW)
+
+        return (
+            rolling.mean() /
+            rolling.std().replace(0, np.nan)
+        ) * np.sqrt(self.TRADING_DAYS)
+
+    def _rolling_volatility(self, daily_returns):
+
+        return daily_returns.rolling(
+            self.ROLLING_WINDOW
+        ).std() * np.sqrt(self.TRADING_DAYS)
