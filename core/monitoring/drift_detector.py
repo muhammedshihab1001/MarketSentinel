@@ -29,7 +29,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "20.0"   # 🔥 incremented safely
+    BASELINE_VERSION = "20.1"  # 🔥 safe bump
     DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
 
     MIN_SAMPLE_BASELINE = 150
@@ -44,13 +44,12 @@ class DriftDetector:
     MAX_INFERENCE_ROWS = 600
 
     EPSILON = 1e-8
-    MIN_ACTIVE_FEATURE_RATIO = 0.40
     MAX_SEVERITY_CAP = 10
 
     SOFT_SEVERITY_THRESHOLD = 3
     HARD_SEVERITY_THRESHOLD = 7
 
-    AUTO_REGENERATE = True   # 🔥 new safe control
+    AUTO_REGENERATE = True
 
     def __init__(self, z_threshold: float = 3.5, baseline_dir: str = "artifacts/drift"):
 
@@ -129,7 +128,28 @@ class DriftDetector:
         os.replace(tmp_path, self.BASELINE_PATH)
 
     ########################################################
-    # AUTO BASELINE REGEN
+    # SAFE MODEL VERSION RESOLUTION 🔥
+    ########################################################
+
+    def _resolve_model_version(self) -> str:
+        """
+        Safely extract model version from ModelLoader
+        without assuming attribute names.
+        """
+
+        if hasattr(self._model_loader, "xgb_version"):
+            return str(self._model_loader.xgb_version)
+
+        if hasattr(self._model_loader, "model_version"):
+            return str(self._model_loader.model_version)
+
+        if hasattr(self._model_loader, "version"):
+            return str(self._model_loader.version)
+
+        return "unknown"
+
+    ########################################################
+    # AUTO BASELINE REGEN (FIXED)
     ########################################################
 
     def _auto_regenerate_baseline(self, dataset: pd.DataFrame):
@@ -172,7 +192,7 @@ class DriftDetector:
                 "baseline_version": self.BASELINE_VERSION,
                 "created_at": datetime.utcnow().isoformat(),
                 "schema_signature": get_schema_signature(),
-                "model_version": str(self._model_loader.version),
+                "model_version": self._resolve_model_version(),  # 🔥 FIXED
                 "feature_checksum": MetadataManager.fingerprint_features(
                     tuple(MODEL_FEATURES)
                 ),
@@ -184,7 +204,7 @@ class DriftDetector:
         self._atomic_write(payload)
 
     ########################################################
-    # LOAD VERIFIED BASELINE (SAFE UPGRADE)
+    # LOAD VERIFIED BASELINE
     ########################################################
 
     def _load_verified_baseline(self, dataset: pd.DataFrame):
@@ -198,27 +218,23 @@ class DriftDetector:
         with open(self.BASELINE_PATH, encoding="utf-8") as f:
             baseline = json.load(f)
 
-        # integrity
         if baseline["integrity_hash"] != self._baseline_hash(baseline):
             raise RuntimeError("Baseline integrity failure.")
 
         meta = baseline["meta"]
 
-        # version mismatch
         if meta["baseline_version"] != self.BASELINE_VERSION:
             if self.AUTO_REGENERATE:
                 self._auto_regenerate_baseline(dataset)
                 return self._load_verified_baseline(dataset)
             raise RuntimeError("Baseline version mismatch.")
 
-        # schema mismatch
         if meta["schema_signature"] != get_schema_signature():
             if self.AUTO_REGENERATE:
                 self._auto_regenerate_baseline(dataset)
                 return self._load_verified_baseline(dataset)
             raise RuntimeError("Baseline schema mismatch.")
 
-        # checksum mismatch
         if meta.get("feature_checksum"):
             current_checksum = MetadataManager.fingerprint_features(
                 tuple(MODEL_FEATURES)
@@ -255,7 +271,7 @@ class DriftDetector:
         return float(psi)
 
     ########################################################
-    # DETECT (UNCHANGED OUTPUT CONTRACT)
+    # DETECT (CONTRACT PRESERVED)
     ########################################################
 
     def detect(self, dataset: pd.DataFrame):
