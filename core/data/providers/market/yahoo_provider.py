@@ -61,6 +61,26 @@ class YahooProvider(MarketDataProvider):
             raise RuntimeError("Yahoo returned empty dataset.")
 
     ########################################################
+    # SAFE COLUMN FLATTENER  🔥 FIX
+    ########################################################
+
+    @staticmethod
+    def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+
+        # Handle MultiIndex columns safely
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [
+                "_".join(
+                    [str(level).strip().lower() for level in col if level]
+                )
+                for col in df.columns
+            ]
+        else:
+            df.columns = [str(c).strip().lower() for c in df.columns]
+
+        return df
+
+    ########################################################
     # CORE NORMALIZER
     ########################################################
 
@@ -97,10 +117,16 @@ class YahooProvider(MarketDataProvider):
                 raise RuntimeError("Yahoo index is not datetime.")
 
         ####################################################
-        # COLUMN STANDARDIZATION
+        # COLUMN STANDARDIZATION  🔥 FIXED
         ####################################################
 
-        df.columns = [c.lower().strip() for c in df.columns]
+        df = self._flatten_columns(df)
+
+        # If we have close_* (e.g., close_aapl), normalize safely
+        close_cols = [c for c in df.columns if c.startswith("close")]
+
+        if "close" not in df.columns and len(close_cols) == 1:
+            df["close"] = df[close_cols[0]]
 
         if "adj close" in df.columns:
             df["close"] = df["adj close"]
@@ -213,7 +239,6 @@ class YahooProvider(MarketDataProvider):
         if interval not in self.ALLOWED_INTERVALS:
             raise ValueError(f"Unsupported interval: {interval}")
 
-        # 🔒 Safe extraction of min_rows from kwargs
         min_rows = kwargs.get("min_rows", self.DEFAULT_MIN_ROWS)
 
         df = self.fetcher.fetch(
