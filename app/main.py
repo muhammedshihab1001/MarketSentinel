@@ -8,23 +8,35 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response, Request, HTTPException
 from fastapi.responses import JSONResponse
 from prometheus_client import generate_latest
-from app.api.routes import drift,model_info,portfolio,universe,health
-from app.api.routes import predict
-from app.api.routes import performance
-from app.api.routes import equity  # 🔥 NEW
+
+from core.config.env_loader import init_env, get_int, get_env
+
+from app.api.routes import (
+    drift,
+    model_info,
+    portfolio,
+    universe,
+    health,
+    predict,
+    performance,
+    equity,
+    agent
+)
+
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
-from app.api.routes import agent
+
+
+# =====================================================
+# ENV INITIALIZATION (🔐 PRODUCTION SAFE)
+# =====================================================
+
+init_env()
 
 
 # =====================================================
 # LOGGING
 # =====================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
 
 logger = logging.getLogger("marketsentinel")
 
@@ -37,11 +49,9 @@ BOOT_ID = hashlib.sha256(
     str(time.time()).encode()
 ).hexdigest()[:12]
 
-STARTUP_TIMEOUT_SEC = int(
-    os.getenv("STARTUP_TIMEOUT_SEC", "120")
-)
+STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 120)
 
-APP_VERSION = os.getenv("APP_VERSION", "3.2.0")  # 🔥 bumped
+APP_VERSION = get_env("APP_VERSION", "3.2.0")
 
 
 # =====================================================
@@ -107,10 +117,10 @@ async def lifespan(app: FastAPI):
         # -------------------------------------------------
 
         loader = ModelLoader()
-        _ = loader.xgb
+        _ = loader.xgb  # trigger load
 
         readiness.models_loaded = True
-        readiness.schema_signature = loader._xgb_container.schema_signature
+        readiness.schema_signature = loader.schema_signature
         readiness.model_version = loader.xgb_version
         readiness.artifact_hash = loader.artifact_hash
         readiness.dataset_hash = loader.dataset_hash
@@ -166,7 +176,7 @@ app.add_exception_handler(Exception, global_exception_handler)
 
 
 # =====================================================
-# ROUTES
+# ROUTES (ALL PRESERVED)
 # =====================================================
 
 app.include_router(predict.router)
@@ -177,6 +187,7 @@ app.include_router(drift.router)
 app.include_router(portfolio.router)
 app.include_router(equity.router)
 app.include_router(agent.router)
+
 
 # =====================================================
 # ROOT
@@ -206,7 +217,6 @@ def metrics():
         generate_latest(),
         media_type="text/plain"
     )
-
 
 
 # =====================================================
