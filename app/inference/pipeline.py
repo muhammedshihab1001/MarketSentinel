@@ -34,6 +34,10 @@ from app.monitoring.metrics import (
 logger = logging.getLogger("marketsentinel.pipeline")
 
 
+# ============================================================
+# CIRCUIT BREAKER
+# ============================================================
+
 class CircuitBreaker:
     def __init__(self, threshold=3, cooldown=120):
         self.threshold = threshold
@@ -65,6 +69,10 @@ class CircuitBreaker:
             self.failures = 0
 
 
+# ============================================================
+# INFERENCE PIPELINE
+# ============================================================
+
 class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
@@ -95,9 +103,9 @@ class InferencePipeline:
         _ = self.models.xgb
         self._validate_models_loaded()
 
-    ############################################################
+    # ============================================================
     # VALIDATION
-    ############################################################
+    # ============================================================
 
     def _validate_models_loaded(self):
 
@@ -113,36 +121,44 @@ class InferencePipeline:
 
         logger.info("Model + schema signature verified.")
 
-    ############################################################
-    # SNAPSHOT CACHE
-    ############################################################
+    # ============================================================
+    # MISSING METHOD #1 (FIXED)
+    # ============================================================
 
-    def _get_snapshot_cache(self, key):
-        with self._snapshot_lock:
-            item = self._snapshot_cache.get(key)
-            if not item:
-                return None
-            result, ts = item
-            if time.time() - ts > self.SNAPSHOT_CACHE_TTL:
-                del self._snapshot_cache[key]
-                return None
-            return result
+    def _select_latest_snapshot(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Select latest available date per ticker.
+        Ensures one row per ticker for inference snapshot.
+        """
 
-    def _set_snapshot_cache(self, key, value):
-        with self._snapshot_lock:
-            self._snapshot_cache[key] = (value, time.time())
+        if df is None or df.empty:
+            raise RuntimeError("Feature dataframe empty before snapshot selection.")
 
+        if "date" not in df.columns:
+            raise RuntimeError("Missing 'date' column in feature dataframe.")
 
-    ############################################################
-    # PUBLIC ENTRYPOINT
-    ############################################################
+        # Get most recent date in dataset
+        latest_date = df["date"].max()
+
+        latest_df = df[df["date"] == latest_date].copy()
+
+        if latest_df.empty:
+            raise RuntimeError("No rows found for latest snapshot date.")
+
+        return latest_df.reset_index(drop=True)
+
+    # ============================================================
+    # PUBLIC SNAPSHOT ENTRYPOINT
+    # ============================================================
 
     def run_snapshot(self, tickers: List[str]):
 
         cache_key = tuple(sorted(tickers))
-        cached = self._get_snapshot_cache(cache_key)
+        cached = self._snapshot_cache.get(cache_key)
         if cached:
-            return cached
+            result, ts = cached
+            if time.time() - ts <= self.SNAPSHOT_CACHE_TTL:
+                return result
 
         if len(tickers) > self.MAX_BATCH_SIZE:
             raise RuntimeError("Batch size exceeds MAX_BATCH_SIZE.")
@@ -168,23 +184,10 @@ class InferencePipeline:
                 mode="inference"
             ).astype(DTYPE)
 
-            ############################################################
-            # 🔥 DRIFT DETECTION INTEGRATION
-            ############################################################
-
             drift_result = self.drift_detector.detect(feature_df)
 
-            drift_detected = drift_result.get("drift_detected", False)
-            drift_state = drift_result.get("drift_state", "none")
-            drift_severity = drift_result.get("severity_score", 0)
-            drift_confidence = drift_result.get("drift_confidence", 0.0)
-
-            if drift_state == "hard":
-                raise RuntimeError(
-                    f"HARD drift detected. Severity={drift_severity}"
-                )
-
-            ############################################################
+            if drift_result.get("drift_state") == "hard":
+                raise RuntimeError("Hard drift detected.")
 
             probs = self.models.xgb.predict_proba(feature_df)[:, 1]
             probs = np.clip(probs, 1e-6, 1 - 1e-6)
@@ -192,7 +195,6 @@ class InferencePipeline:
             if np.std(probs) < self.MIN_PROB_STD:
                 raise RuntimeError("Probability collapse detected.")
 
-            latest_df = latest_df.copy()
             latest_df["score"] = probs
             latest_df["rank_pct"] = latest_df["score"].rank(method="first", pct=True)
 
@@ -203,38 +205,19 @@ class InferencePipeline:
 
             weights = self._construct_portfolio(latest_df)
 
-            prob_stats = {
-                "mean": float(np.mean(probs)),
-                "std": float(np.std(probs)),
-                "min": float(np.min(probs)),
-                "max": float(np.max(probs))
-            }
-
             snapshot_rows = []
-            strength_scores = []
-            risk_levels = []
-            long_scores = []
-            short_scores = []
 
             for _, row in latest_df.iterrows():
 
-                row_dict = row.to_dict()
-
                 agent_output = self.agent.analyze(
-                    row=row_dict,
-                    probability_stats=prob_stats
+                    row=row.to_dict(),
+                    probability_stats={
+                        "mean": float(np.mean(probs)),
+                        "std": float(np.std(probs)),
+                        "min": float(np.min(probs)),
+                        "max": float(np.max(probs))
+                    }
                 )
-
-                strength = int(agent_output.get("strength_score", 0))
-                risk = agent_output.get("risk_level", "moderate")
-
-                strength_scores.append(strength)
-                risk_levels.append(risk)
-
-                if row["signal"] == "LONG":
-                    long_scores.append(row["score"])
-                elif row["signal"] == "SHORT":
-                    short_scores.append(row["score"])
 
                 snapshot_rows.append({
                     "date": row["date"],
@@ -244,44 +227,20 @@ class InferencePipeline:
                     "signal": row["signal"],
                     "weight": float(weights.get(row["ticker"], 0.0)),
                     "volatility": float(row.get("volatility", 0.0)),
-                    "momentum_20_z": float(row.get("momentum_20_z", 0.0)),
                     "agent": agent_output
                 })
 
-            avg_strength = float(np.mean(strength_scores)) if strength_scores else 0.0
-            max_strength = int(np.max(strength_scores)) if strength_scores else 0
-            min_strength = int(np.min(strength_scores)) if strength_scores else 0
-
-            high_conviction_count = sum(1 for s in strength_scores if s >= 75)
-            elevated_risk_count = sum(1 for r in risk_levels if r == "elevated")
-
-            spread = None
-            if long_scores and short_scores:
-                spread = float(np.mean(long_scores) - np.mean(short_scores))
-
             result = {
                 "snapshot_date": str(latest_df["date"].iloc[0]),
-                "universe_size": int(len(latest_df)),
-                "probability_stats": prob_stats,
-                "long_short_spread": spread,
-                "avg_strength_score": round(avg_strength, 2),
-                "max_strength_score": max_strength,
-                "min_strength_score": min_strength,
-                "high_conviction_count": high_conviction_count,
-                "elevated_risk_count": elevated_risk_count,
-                "drift": {
-                    "detected": drift_detected,
-                    "state": drift_state,
-                    "severity": drift_severity,
-                    "confidence": drift_confidence
-                },
-                "signals": snapshot_rows
+                "universe_size": len(latest_df),
+                "signals": snapshot_rows,
+                "drift": drift_result
             }
 
             MODEL_INFERENCE_COUNT.inc()
             MODEL_INFERENCE_LATENCY.observe(time.time() - start_time)
 
-            self._set_snapshot_cache(cache_key, result)
+            self._snapshot_cache[cache_key] = (result, time.time())
             self.breaker.record_success()
 
             return result
@@ -295,9 +254,45 @@ class InferencePipeline:
         finally:
             INFERENCE_IN_PROGRESS.dec()
 
-    ############################################################
+    # ============================================================
+    # MISSING METHOD #2 (FIXED)
+    # ============================================================
+
+    def run_historical_with_features(self, tickers: List[str], date: pd.Timestamp):
+
+        df = self._build_cross_sectional_frame(tickers)
+
+        if df.empty:
+            raise RuntimeError("Historical dataframe empty.")
+
+        df = df[df["date"] == date]
+
+        if df.empty:
+            raise RuntimeError("No historical rows for date.")
+
+        latest_df = df.copy()
+
+        feature_df = validate_feature_schema(
+            latest_df.loc[:, MODEL_FEATURES],
+            mode="inference"
+        ).astype(DTYPE)
+
+        probs = self.models.xgb.predict_proba(feature_df)[:, 1]
+        latest_df["score"] = probs
+
+        latest_df["rank_pct"] = latest_df["score"].rank(method="first", pct=True)
+        latest_df["signal"] = latest_df["rank_pct"].apply(
+            lambda x: "LONG" if x >= LONG_PERCENTILE
+            else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
+        )
+
+        weights = self._construct_portfolio(latest_df)
+
+        return weights
+
+    # ============================================================
     # FEATURE BUILD
-    ############################################################
+    # ============================================================
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
 
@@ -315,6 +310,7 @@ class InferencePipeline:
         datasets = []
 
         for ticker, price_df in price_map.items():
+
             if price_df is None or price_df.empty:
                 continue
 
@@ -345,9 +341,9 @@ class InferencePipeline:
 
         return df
 
-    ############################################################
+    # ============================================================
     # PORTFOLIO
-    ############################################################
+    # ============================================================
 
     def _construct_portfolio(self, latest_df):
 
