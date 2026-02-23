@@ -1,20 +1,16 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from datetime import date
-from typing import List, Optional, Dict, Any
+from typing import List
 
 
 MAX_FORECAST_DAYS = 90
 
 
 # =========================================================
-# EXISTING FORECAST REQUEST (UNCHANGED)
+# EXISTING FORECAST REQUEST (UPDATED TO V2 STYLE)
 # =========================================================
 
 class PredictionRequest(BaseModel):
-    """
-    Request schema for stock forecasting.
-    Designed for production-safe inference.
-    """
 
     ticker: str = Field(
         default="AAPL",
@@ -40,21 +36,26 @@ class PredictionRequest(BaseModel):
         description="Number of days to forecast (max 90)"
     )
 
-    @validator("ticker")
-    def normalize_ticker(cls, v):
+    # ------------------------------
+    # Pydantic V2 Validators
+    # ------------------------------
+
+    @field_validator("ticker")
+    @classmethod
+    def normalize_ticker(cls, v: str) -> str:
         return v.upper()
 
-    @validator("end_date")
-    def validate_dates(cls, v, values):
+    @field_validator("end_date")
+    @classmethod
+    def validate_dates(cls, v, info):
 
-        start = values.get("start_date")
+        start = info.data.get("start_date")
 
         if v and start and v <= start:
             raise ValueError("end_date must be after start_date")
 
         if v and start:
             delta = (v - start).days
-
             if delta > MAX_FORECAST_DAYS:
                 raise ValueError(
                     f"Forecast window cannot exceed {MAX_FORECAST_DAYS} days"
@@ -62,11 +63,13 @@ class PredictionRequest(BaseModel):
 
         return v
 
-    @validator("start_date", pre=True, always=True)
+    @field_validator("start_date", mode="before")
+    @classmethod
     def default_start(cls, v):
         return v or date.today()
 
-    @validator("forecast_days")
+    @field_validator("forecast_days")
+    @classmethod
     def validate_forecast_days(cls, v):
         if v and v > MAX_FORECAST_DAYS:
             raise ValueError(
@@ -76,13 +79,10 @@ class PredictionRequest(BaseModel):
 
 
 # =========================================================
-# NEW SIGNAL EXPLANATION RESPONSE MODEL
+# SIGNAL EXPLANATION RESPONSE
 # =========================================================
 
 class SignalExplanationResponse(BaseModel):
-    """
-    Detailed explanation output for a single ticker signal.
-    """
 
     ticker: str
     score: float
@@ -99,9 +99,10 @@ class SignalExplanationResponse(BaseModel):
 
 
 class SignalExplanationMeta(BaseModel):
-    """
-    Metadata block for explanation endpoint.
-    """
+
+    model_config = {
+        "protected_namespaces": ()
+    }
 
     model_version: str
     schema_signature: str
@@ -113,9 +114,6 @@ class SignalExplanationMeta(BaseModel):
 
 
 class SignalExplanationEnvelope(BaseModel):
-    """
-    Full API response structure.
-    """
 
     meta: SignalExplanationMeta
     explanation: SignalExplanationResponse
