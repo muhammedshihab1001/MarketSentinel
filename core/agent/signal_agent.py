@@ -43,8 +43,10 @@ class SignalAgent:
         probability_stats: Dict[str, float],
     ) -> Dict[str, Any]:
 
+        # 🔥 Regression alpha score (scaled 0–1)
         score = self._safe_float(row.get("score"), 0.5)
         rank_pct = self._safe_float(row.get("rank_pct"), 0.5)
+
         signal = row.get("signal", "NEUTRAL")
 
         volatility = self._safe_float(row.get("volatility"), 0.0)
@@ -65,17 +67,19 @@ class SignalAgent:
         )
 
         if std_dispersion < self.DISPERSION_WEAK:
-            warnings.append("Low cross-sectional dispersion detected.")
+            warnings.append("Low cross-sectional signal dispersion detected.")
 
         ####################################################
-        # 1️⃣ Confidence
+        # 1️⃣ Confidence (based on cross-sectional rank)
         ####################################################
 
-        if score >= self.HIGH_CONF_THRESHOLD:
+        if rank_pct >= 0.9:
+            confidence = "very_high"
+        elif rank_pct >= 0.75:
             confidence = "high"
-        elif score >= self.MOD_CONF_THRESHOLD:
+        elif rank_pct >= 0.60:
             confidence = "moderate"
-        elif score >= self.LOW_CONF_THRESHOLD:
+        elif rank_pct >= 0.50:
             confidence = "low"
         else:
             confidence = "very_low"
@@ -133,18 +137,18 @@ class SignalAgent:
 
         strength = 0.0
 
-        # Distance from neutral probability
-        strength += abs(score - 0.5) * 100
+        # Alpha intensity (distance from neutral)
+        strength += abs(score - 0.5) * 120
 
-        # Rank boost
-        strength += abs(rank_pct - 0.5) * 50
+        # Rank importance
+        strength += abs(rank_pct - 0.5) * 80
 
         # Momentum alignment boost
         if (
             (signal == "LONG" and momentum_z > 0) or
             (signal == "SHORT" and momentum_z < 0)
         ):
-            strength += 10
+            strength += 15
 
         # Trend alignment boost
         if (
@@ -155,7 +159,7 @@ class SignalAgent:
 
         # Volatility penalty
         if volatility_regime == "high_volatility":
-            strength -= 10
+            strength -= 15
 
         # Warning penalty
         strength -= len(warnings) * 5
@@ -166,22 +170,22 @@ class SignalAgent:
         # 7️⃣ Risk Level
         ####################################################
 
-        if confidence == "high" and strength_score >= 60:
+        if strength_score >= 80:
             risk_level = "low"
-        elif strength_score >= 75:
-            risk_level = "low"
-        elif strength_score >= 50:
+        elif strength_score >= 60:
             risk_level = "moderate"
-        else:
+        elif strength_score >= 40:
             risk_level = "elevated"
+        else:
+            risk_level = "high"
 
         ####################################################
-        # Explanation Text
+        # Explanation Text (Production-ready)
         ####################################################
 
         explanation = (
             f"{signal} signal with {confidence} conviction "
-            f"(score={score:.3f}, rank={rank_pct:.2f}). "
+            f"(alpha_score={score:.3f}, cross_rank={rank_pct:.2f}). "
             f"Trend: {trend}. "
             f"Volatility regime: {volatility_regime}. "
             f"Momentum: {momentum_state}."
