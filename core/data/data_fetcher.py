@@ -26,9 +26,7 @@ class StockPriceFetcher:
 
         df.columns = [str(c).lower().strip() for c in df.columns]
 
-        possible = ["date", "datetime", "timestamp", "index"]
-
-        for col in possible:
+        for col in ["date", "datetime", "timestamp", "index"]:
             if col in df.columns:
                 df.rename(columns={col: "date"}, inplace=True)
                 return df
@@ -54,25 +52,40 @@ class StockPriceFetcher:
         return s.dt.tz_convert("UTC")
 
     ########################################################
-    # SAFE MULTIINDEX FLATTENER (HARDENED)
+    # 🔥 SMART MULTIINDEX FLATTENER (FIELD-AWARE)
     ########################################################
 
     def _flatten_columns(self, df):
 
         if isinstance(df.columns, pd.MultiIndex):
 
-            flat_cols = []
+            normalized = []
 
             for col in df.columns:
 
-                # Join levels safely
-                joined = "_".join(
-                    [str(level).strip() for level in col if level]
-                )
+                # col is tuple like ('Open','AAPL') or ('AAPL','Open')
+                lower = [str(x).lower().strip() for x in col]
 
-                flat_cols.append(joined.lower())
+                detected = None
 
-            df.columns = flat_cols
+                for field in [
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "adj close",
+                    "volume"
+                ]:
+                    if field in lower:
+                        detected = field.replace(" ", "_")
+                        break
+
+                if detected is None:
+                    normalized.append(lower[0])
+                else:
+                    normalized.append(detected)
+
+            df.columns = normalized
 
         else:
             df.columns = [
@@ -80,7 +93,7 @@ class StockPriceFetcher:
                 for c in df.columns
             ]
 
-        # 🔥 Ensure uniqueness
+        # Remove duplicates safely
         if len(set(df.columns)) != len(df.columns):
             logger.warning("Duplicate columns detected after flattening.")
             df = df.loc[:, ~df.columns.duplicated()]
@@ -88,7 +101,7 @@ class StockPriceFetcher:
         return df
 
     ########################################################
-    # VALIDATION (Soft OHLC Repair)
+    # VALIDATION (UNCHANGED LOGIC)
     ########################################################
 
     def _validate_prices(self, df):
@@ -99,14 +112,6 @@ class StockPriceFetcher:
 
             if col not in df.columns:
                 raise RuntimeError(f"Missing required column: {col}")
-
-            if isinstance(df[col], pd.DataFrame):
-                if df[col].shape[1] == 1:
-                    df[col] = df[col].iloc[:, 0]
-                else:
-                    raise RuntimeError(
-                        f"Ambiguous column structure for {col}"
-                    )
 
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -160,13 +165,13 @@ class StockPriceFetcher:
             try:
 
                 df = yf.download(
-                    tickers=ticker,  # 🔥 force single ticker
+                    tickers=ticker,
                     start=start,
                     end=end,
                     interval=interval,
                     progress=False,
                     auto_adjust=False,
-                    threads=False,  # 🔥 prevent yfinance internal threading
+                    threads=False,
                     group_by="column"
                 )
 
