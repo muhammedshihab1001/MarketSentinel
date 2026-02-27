@@ -1,5 +1,5 @@
 import pandas as pd
-from training.indicators.technical import TechnicalIndicators
+from core.indicators.technical_indicators import TechnicalIndicators
 
 
 def test_rsi_flat_market_equals_50():

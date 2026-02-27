@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-from training.indicators.technical import TechnicalIndicators
+from core.indicators.technical_indicators import TechnicalIndicators
 
 
 # ---------------------------------------------------
@@ -49,7 +49,6 @@ def test_rsi_uptrend():
 
     rsi = TechnicalIndicators.rsi(df)
 
-    # last value should indicate strength
     assert rsi.iloc[-1] > 60
 
 
