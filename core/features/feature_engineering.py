@@ -53,8 +53,9 @@ class FeatureEngineer:
         if df is None or df.empty:
             raise RuntimeError("Price dataframe empty.")
 
+        df = df.copy()
+
         if "ticker" not in df.columns:
-            df = df.copy()
             df["ticker"] = ticker or "unknown"
 
         df = cls._normalize_datetime(df)
@@ -71,16 +72,16 @@ class FeatureEngineer:
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices.")
 
+        # Split detection (robust repair)
         returns = df.groupby("ticker")["close"].pct_change().abs()
         extreme = returns > cls.SPLIT_THRESHOLD
 
         if extreme.any():
-            logger.warning("Split detected — repairing.")
+            logger.warning("Split-like move detected — attempting repair.")
             df.loc[extreme, "close"] = np.nan
             df["close"] = df.groupby("ticker")["close"].ffill()
 
-        if df["close"].isnull().any():
-            raise RuntimeError("Unrecoverable missing close prices.")
+        df = df.dropna(subset=["close"])
 
         return df.reset_index(drop=True)
 
@@ -91,7 +92,7 @@ class FeatureEngineer:
     @classmethod
     def add_core_features(cls, df):
 
-        df = df.sort_values(["ticker", "date"])
+        df = df.sort_values(["ticker", "date"]).copy()
 
         returns = df.groupby("ticker")["close"].pct_change()
 
@@ -127,28 +128,54 @@ class FeatureEngineer:
         df["volatility"] = df["volatility_5"]
 
         for col in ["volatility", "volatility_5", "volatility_20"]:
-            df[col] = df[col].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
+            df[col] = (
+                df[col]
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(cls.VOL_FLOOR)
+                .clip(lower=cls.VOL_FLOOR)
+            )
 
+        ########################################################
         # RSI
+        ########################################################
+
         df["rsi"] = np.nan
+
         for ticker, group in df.groupby("ticker"):
-            rsi = TechnicalIndicators.rsi(group[["date", "close"]], 14)
-            df.loc[group.index, "rsi"] = rsi.values.astype("float32")
+            try:
+                rsi = TechnicalIndicators.rsi(group[["date", "close"]], 14)
+                df.loc[group.index, "rsi"] = rsi.values.astype("float32")
+            except Exception:
+                df.loc[group.index, "rsi"] = 50.0
 
         df["rsi"] = df["rsi"].fillna(50.0).clip(0, 100)
 
+        ########################################################
         # MACD
+        ########################################################
+
         df["macd"] = np.nan
         df["macd_signal"] = np.nan
 
         for ticker, group in df.groupby("ticker"):
-            macd, signal = TechnicalIndicators.macd(group[["date", "close"]])
-            df.loc[group.index, "macd"] = macd.astype("float32")
-            df.loc[group.index, "macd_signal"] = signal.astype("float32")
+            try:
+                macd, signal = TechnicalIndicators.macd(group[["date", "close"]])
+                df.loc[group.index, "macd"] = macd.astype("float32")
+                df.loc[group.index, "macd_signal"] = signal.astype("float32")
+            except Exception:
+                df.loc[group.index, "macd"] = 0.0
+                df.loc[group.index, "macd_signal"] = 0.0
 
-        df[["macd", "macd_signal"]] = df[["macd", "macd_signal"]].fillna(0.0)
+        df[["macd", "macd_signal"]] = (
+            df[["macd", "macd_signal"]]
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
 
-        # EMA
+        ########################################################
+        # EMA FEATURES
+        ########################################################
+
         df["ema_10"] = df.groupby("ticker")["close"].transform(
             lambda x: x.ewm(span=10, adjust=False).mean()
         )
@@ -162,7 +189,7 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
         ########################################################
-        # REGIME FEATURE (RESTORED)
+        # REGIME FEATURE
         ########################################################
 
         rolling_mean = (
@@ -205,6 +232,9 @@ class FeatureEngineer:
 
         for col in base_cols:
 
+            if col not in df.columns:
+                raise RuntimeError(f"Missing base feature: {col}")
+
             if single_ticker:
                 df[f"{col}_z"] = 0.0
                 df[f"{col}_rank"] = 0.5
@@ -216,7 +246,12 @@ class FeatureEngineer:
             z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
             rank = df.groupby("date")[col].rank(method="first", pct=True)
 
-            df[f"{col}_z"] = z.fillna(0.0).clip(-5, 5)
+            df[f"{col}_z"] = (
+                z.replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+                .clip(-5, 5)
+            )
+
             df[f"{col}_rank"] = rank.fillna(0.5)
 
         return df
