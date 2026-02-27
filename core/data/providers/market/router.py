@@ -36,7 +36,6 @@ class MarketProviderRouter:
     PROVIDER_TIMEOUT_WARN = 8.0
     FAILURE_COOLDOWN = 20
 
-    # 🔥 Yahoo concurrency limit (safe default = 1)
     YAHOO_MAX_CONCURRENT = int(os.getenv("YAHOO_MAX_CONCURRENT", 1))
 
     ALLOWED_INTERVALS = {
@@ -55,7 +54,6 @@ class MarketProviderRouter:
         self._provider_failures = {}
         self._lock = threading.Lock()
 
-        # 🔥 Semaphore only affects Yahoo
         self._yahoo_semaphore = threading.Semaphore(
             self.YAHOO_MAX_CONCURRENT
         )
@@ -145,6 +143,78 @@ class MarketProviderRouter:
             self._provider_failures[name] = time.time()
 
     ############################################################
+    # PROVIDER EXECUTION
+    ############################################################
+
+    def _validate_response(self, df, ticker):
+
+        if df is None:
+            raise RuntimeError(f"Provider returned None for {ticker}")
+
+        if not hasattr(df, "columns"):
+            raise RuntimeError(f"Invalid response type for {ticker}")
+
+        missing = self.REQUIRED_COLUMNS - set(df.columns)
+
+        if missing:
+            raise RuntimeError(
+                f"Provider schema violation for {ticker}. Missing={missing}"
+            )
+
+        if len(df) == 0:
+            raise RuntimeError(f"Empty dataset returned for {ticker}")
+
+        return df
+
+    def _execute_provider(
+        self,
+        name,
+        provider,
+        ticker,
+        start,
+        end,
+        interval,
+        min_rows
+    ):
+
+        start_time = time.time()
+
+        semaphore_context = (
+            self._yahoo_semaphore
+            if name == "yahoo"
+            else nullcontext()
+        )
+
+        with semaphore_context:
+            df = provider.fetch(
+                ticker,
+                start,
+                end,
+                interval,
+                min_rows=min_rows
+            )
+
+        latency = time.time() - start_time
+
+        if latency > self.PROVIDER_TIMEOUT_WARN:
+            logger.warning(
+                "Slow provider detected → %s (%.2fs)",
+                name,
+                latency
+            )
+
+        df = self._validate_response(df, ticker)
+
+        logger.info(
+            "Market data served → provider=%s ticker=%s rows=%s",
+            name,
+            ticker,
+            len(df)
+        )
+
+        return df.copy()
+
+    ############################################################
     # MAIN FETCH ENTRY
     ############################################################
 
@@ -163,11 +233,12 @@ class MarketProviderRouter:
         if min_rows is None:
             min_rows = self.DEFAULT_MIN_ROWS
 
-        # 🔥 If specific provider explicitly requested
         if provider is not None:
+
             provider = provider.lower()
 
             for name, provider_obj in self.providers:
+
                 if name == provider:
 
                     if not self._provider_allowed(name):
@@ -183,13 +254,17 @@ class MarketProviderRouter:
                             interval,
                             min_rows
                         )
+
                     except Exception:
                         self._record_failure(name)
                         raise
 
             raise RuntimeError(f"Requested provider not available: {provider}")
 
-        # 🔥 Sequential fallback (safe, no nested pools)
+        ########################################################
+        # SEQUENTIAL FALLBACK
+        ########################################################
+
         for name, provider_obj in self.providers:
 
             if not self._provider_allowed(name):
@@ -218,55 +293,3 @@ class MarketProviderRouter:
                 self._record_failure(name)
 
         raise RuntimeError(f"All market providers failed for {ticker}")
-
-    ############################################################
-    # EXECUTION WITH YAHOO THROTTLE
-    ############################################################
-
-    def _execute_provider(
-        self,
-        name,
-        provider,
-        ticker,
-        start,
-        end,
-        interval,
-        min_rows
-    ):
-
-        start_time = time.time()
-
-        # 🔥 Apply Yahoo semaphore only when needed
-        semaphore_context = (
-            self._yahoo_semaphore
-            if name == "yahoo"
-            else nullcontext()
-        )
-
-        with semaphore_context:
-
-            df = provider.fetch(
-                ticker,
-                start,
-                end,
-                interval,
-                min_rows=min_rows
-            )
-
-        latency = time.time() - start_time
-
-        if latency > self.PROVIDER_TIMEOUT_WARN:
-            logger.warning(
-                "Slow provider detected → %s (%.2fs)",
-                name,
-                latency
-            )
-
-        logger.info(
-            "Market data served → provider=%s ticker=%s rows=%s",
-            name,
-            ticker,
-            len(df) if df is not None else 0
-        )
-
-        return df.copy()
