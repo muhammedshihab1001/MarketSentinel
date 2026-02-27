@@ -8,13 +8,34 @@ from app.agent.llm_explainer import LLMExplainer
 router = APIRouter()
 logger = logging.getLogger("marketsentinel.agent")
 
-explainer = LLMExplainer()
+# =========================================================
+# LAZY LLM EXPLAINER (SAFE INIT)
+# =========================================================
 
+_explainer_instance: LLMExplainer | None = None
+
+
+def get_explainer() -> LLMExplainer:
+    global _explainer_instance
+    if _explainer_instance is None:
+        logger.info("Initializing LLMExplainer (lazy)")
+        _explainer_instance = LLMExplainer()
+    return _explainer_instance
+
+
+# =========================================================
+# ROUTE
+# =========================================================
 
 @router.post("/agent/explain")
 async def explain_signal(ticker: str):
 
     try:
+        if not ticker or not isinstance(ticker, str):
+            raise HTTPException(status_code=400, detail="Invalid ticker")
+
+        ticker = ticker.upper().strip()
+
         pipeline = InferencePipeline()
 
         # Run snapshot safely in threadpool
@@ -36,7 +57,12 @@ async def explain_signal(ticker: str):
         agent_output = row.get("agent", {})
         probability_stats = snapshot.get("probability_stats", {})
 
-        # LLM explanation
+        # -------------------------------------------------
+        # LLM EXPLANATION
+        # -------------------------------------------------
+
+        explainer = get_explainer()
+
         explanation = await explainer.explain(
             signal_row=row,
             agent_output=agent_output,
