@@ -9,20 +9,24 @@ logger = logging.getLogger("marketsentinel.regime")
 @dataclass(frozen=True)
 class RegimeConfig:
 
-    trend_window: int = 200
-    volatility_window: int = 50
+    # Slightly shorter windows for Yahoo-quality data
+    trend_window: int = 150
+    volatility_window: int = 40
 
-    bull_vol_threshold: float = 0.02
-    bear_vol_threshold: float = 0.025
+    # Relaxed volatility thresholds
+    bull_vol_threshold: float = 0.03
+    bear_vol_threshold: float = 0.03
 
-    trend_buffer: float = 0.01
-    crash_vol_threshold: float = 0.04
+    trend_buffer: float = 0.007
+    crash_vol_threshold: float = 0.05
 
-    persistence_days: int = 5
+    persistence_days: int = 4
 
     EPSILON: float = 1e-8
     MAX_DAILY_RETURN: float = 0.60
-    HYSTERESIS_BUFFER: float = 0.005
+    HYSTERESIS_BUFFER: float = 0.003
+
+    MIN_VOL_FLOOR: float = 0.005
 
 
 class MarketRegimeDetector:
@@ -102,10 +106,14 @@ class MarketRegimeDetector:
                 logger.warning("Extreme return detected — fallback.")
                 return self._neutral_regime(df)
 
+            ########################################################
             # STRICTLY CAUSAL TREND
+            ########################################################
+
             ma_long = (
                 close
-                .rolling(cfg.trend_window, min_periods=cfg.trend_window)
+                .rolling(cfg.trend_window,
+                         min_periods=cfg.trend_window)
                 .mean()
             )
 
@@ -114,7 +122,10 @@ class MarketRegimeDetector:
                 (ma_long + cfg.EPSILON)
             )
 
+            ########################################################
             # STRICTLY CAUSAL VOLATILITY
+            ########################################################
+
             raw_vol = (
                 returns
                 .rolling(cfg.volatility_window,
@@ -122,7 +133,17 @@ class MarketRegimeDetector:
                 .std()
             )
 
-            volatility = raw_vol.ewm(span=10, adjust=False).mean()
+            volatility = raw_vol.ewm(
+                span=10,
+                adjust=False
+            ).mean()
+
+            # Apply minimum volatility floor to avoid collapse
+            volatility = volatility.clip(lower=cfg.MIN_VOL_FLOOR)
+
+            ########################################################
+            # REGIME CLASSIFICATION
+            ########################################################
 
             regime = np.full(len(df), "SIDEWAYS", dtype=object)
 
@@ -150,7 +171,15 @@ class MarketRegimeDetector:
             regime[bull] = "BULL"
             regime[bear] = "BEAR"
 
+            ########################################################
+            # APPLY PERSISTENCE
+            ########################################################
+
             regime = self._apply_persistence(regime)
+
+            ########################################################
+            # OUTPUT
+            ########################################################
 
             df["regime"] = regime
             df["market_regime"] = regime
