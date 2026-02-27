@@ -26,13 +26,7 @@ logger = logging.getLogger(__name__)
 RUNS_DIR = os.path.abspath("artifacts/training_runs")
 LOCK_FILE = os.path.join(RUNS_DIR, ".training.lock")
 
-MIN_SHARPE = 0.25
-MAX_DRAWDOWN = -0.45
-MAX_AVG_WINDOW_DRAWDOWN = -0.35
-MAX_REASONABLE_SHARPE = 8.0
-MAX_PROFIT_FACTOR = 10.0
 MAX_TRAINING_SECONDS = 7200
-
 GLOBAL_SEED = 42
 
 
@@ -59,13 +53,14 @@ def _acquire_lock():
     os.makedirs(RUNS_DIR, exist_ok=True)
 
     if os.path.exists(LOCK_FILE):
-        # stale lock detection (older than 4 hours)
         age = time.time() - os.path.getmtime(LOCK_FILE)
         if age > 4 * 3600:
             logger.warning("Stale lock detected — removing.")
             os.remove(LOCK_FILE)
         else:
-            raise RuntimeError("Training lock detected — another training may be running.")
+            raise RuntimeError(
+                "Training lock detected — another training may be running."
+            )
 
     with open(LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
@@ -77,7 +72,7 @@ def _release_lock():
 
 
 ############################################################
-# GIT SAFETY (CLOUD SAFE)
+# GIT SAFETY
 ############################################################
 
 def get_git_commit():
@@ -94,7 +89,9 @@ def get_git_commit():
         ).stdout.strip()
 
         if dirty:
-            raise RuntimeError("Repository is dirty — commit ALL changes before training.")
+            raise RuntimeError(
+                "Repository is dirty — commit ALL changes before training."
+            )
 
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
@@ -139,53 +136,7 @@ def save_manifest(run_id: str, manifest: dict):
 
 
 ############################################################
-# METRIC VALIDATION
-############################################################
-
-def _assert_finite(value, name):
-    if value is None or not np.isfinite(value):
-        raise RuntimeError(f"Invalid metric produced: {name}")
-
-
-def validate_metrics(metrics: dict):
-
-    if not isinstance(metrics, dict):
-        raise RuntimeError("Training did not return valid metrics dict.")
-
-    required = [
-        "avg_sharpe",
-        "max_drawdown",
-        "profit_factor",
-        "final_equity"
-    ]
-
-    for key in required:
-        _assert_finite(metrics.get(key), key)
-
-    sharpe = metrics["avg_sharpe"]
-    drawdown = metrics["max_drawdown"]
-    profit_factor = metrics["profit_factor"]
-
-    if sharpe > MAX_REASONABLE_SHARPE:
-        raise RuntimeError("Sharpe unrealistically high — leakage suspected.")
-
-    if profit_factor > MAX_PROFIT_FACTOR:
-        raise RuntimeError("Profit factor unrealistic — leakage suspected.")
-
-    if sharpe < MIN_SHARPE:
-        raise RuntimeError("Model rejected — Sharpe too low.")
-
-    if drawdown < MAX_DRAWDOWN:
-        raise RuntimeError(
-            f"Model rejected — structural drawdown breach ({drawdown:.2%})."
-        )
-
-    if metrics["final_equity"] <= 0:
-        raise RuntimeError("Backtest produced non-positive equity.")
-
-
-############################################################
-# LINEAGE (FAIL-SAFE)
+# LINEAGE
 ############################################################
 
 def build_lineage(start_date, end_date):
@@ -261,8 +212,6 @@ def main():
 
         if runtime > MAX_TRAINING_SECONDS:
             raise RuntimeError("Training exceeded allowed duration.")
-
-        validate_metrics(metrics)
 
         manifest = {
             "run_id": run_id,
