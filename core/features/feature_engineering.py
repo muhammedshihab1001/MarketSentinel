@@ -72,7 +72,6 @@ class FeatureEngineer:
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices.")
 
-        # Split detection (robust repair)
         returns = df.groupby("ticker")["close"].pct_change().abs()
         extreme = returns > cls.SPLIT_THRESHOLD
 
@@ -95,32 +94,29 @@ class FeatureEngineer:
         df = df.sort_values(["ticker", "date"]).copy()
 
         returns = df.groupby("ticker")["close"].pct_change()
-
         lo, hi = cls.RETURN_CLAMP
+
         df["return"] = returns.clip(lo, hi)
 
         df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
         df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
         df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
 
-        df["momentum_20"] = (
-            df.groupby("ticker")["close"]
-            .pct_change(20)
-            .clip(-1, 1)
-        )
+        # NEW momentum layers (stronger signal diversity)
+        df["momentum_5"] = df.groupby("ticker")["close"].pct_change(5).clip(-1, 1)
+        df["momentum_20"] = df.groupby("ticker")["close"].pct_change(20).clip(-1, 1)
+        df["momentum_60"] = df.groupby("ticker")["close"].pct_change(60).clip(-2, 2)
 
         grp = df.groupby("ticker")["return"]
 
         df["volatility_5"] = (
-            grp.rolling(5, min_periods=5)
-            .std(ddof=0)
+            grp.rolling(5, min_periods=5).std(ddof=0)
             .shift(1)
             .reset_index(level=0, drop=True)
         )
 
         df["volatility_20"] = (
-            grp.rolling(20, min_periods=20)
-            .std(ddof=0)
+            grp.rolling(20, min_periods=20).std(ddof=0)
             .shift(1)
             .reset_index(level=0, drop=True)
         )
@@ -166,8 +162,10 @@ class FeatureEngineer:
                 df.loc[group.index, "macd"] = 0.0
                 df.loc[group.index, "macd_signal"] = 0.0
 
-        df[["macd", "macd_signal"]] = (
-            df[["macd", "macd_signal"]]
+        df["macd_hist"] = df["macd"] - df["macd_signal"]
+
+        df[["macd", "macd_signal", "macd_hist"]] = (
+            df[["macd", "macd_signal", "macd_hist"]]
             .replace([np.inf, -np.inf], np.nan)
             .fillna(0.0)
         )
@@ -189,7 +187,7 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
         ########################################################
-        # REGIME FEATURE
+        # IMPROVED REGIME FEATURE (continuous, not binary)
         ########################################################
 
         rolling_mean = (
@@ -206,8 +204,7 @@ class FeatureEngineer:
             rolling_std + cls.EPSILON
         )
 
-        df["regime_feature"] = np.where(zscore > 0.5, 1.0, 0.0)
-        df["regime_feature"] = df["regime_feature"].fillna(0.0)
+        df["regime_feature"] = zscore.clip(-3, 3).fillna(0.0)
 
         return df
 
@@ -221,11 +218,15 @@ class FeatureEngineer:
         df = df.sort_values(["date", "ticker"]).copy()
 
         base_cols = [
+            "momentum_5",
             "momentum_20",
+            "momentum_60",
             "return_lag5",
             "rsi",
             "volatility",
             "ema_ratio",
+            "macd_hist",
+            "regime_feature",
         ]
 
         single_ticker = df["ticker"].nunique() <= 1
