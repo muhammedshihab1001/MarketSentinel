@@ -2,6 +2,7 @@ import os
 import logging
 import time
 import threading
+from contextlib import nullcontext
 
 from core.data.providers.market.yahoo_provider import YahooProvider
 
@@ -35,8 +36,8 @@ class MarketProviderRouter:
     PROVIDER_TIMEOUT_WARN = 8.0
     FAILURE_COOLDOWN = 20
 
-    # 🔥 SAFE YAHOO CONCURRENCY LIMIT
-    YAHOO_MAX_CONCURRENT = int(os.getenv("YAHOO_MAX_CONCURRENT", 2))
+    # 🔥 Yahoo concurrency limit (safe default = 1)
+    YAHOO_MAX_CONCURRENT = int(os.getenv("YAHOO_MAX_CONCURRENT", 1))
 
     ALLOWED_INTERVALS = {
         "1d", "D",
@@ -54,7 +55,7 @@ class MarketProviderRouter:
         self._provider_failures = {}
         self._lock = threading.Lock()
 
-        # 🔥 Yahoo concurrency semaphore
+        # 🔥 Semaphore only affects Yahoo
         self._yahoo_semaphore = threading.Semaphore(
             self.YAHOO_MAX_CONCURRENT
         )
@@ -73,6 +74,8 @@ class MarketProviderRouter:
             self.YAHOO_MAX_CONCURRENT
         )
 
+    ############################################################
+    # PROVIDER REGISTRATION
     ############################################################
 
     def _register_providers(self):
@@ -124,10 +127,13 @@ class MarketProviderRouter:
 
         with self._lock:
             last_fail = self._provider_failures.get(name)
+
             if not last_fail:
                 return True
+
             if time.time() - last_fail > self.FAILURE_COOLDOWN:
                 return True
+
             return False
 
     def _record_failure(self, name):
@@ -139,7 +145,7 @@ class MarketProviderRouter:
             self._provider_failures[name] = time.time()
 
     ############################################################
-    # MAIN FETCH
+    # MAIN FETCH ENTRY
     ############################################################
 
     def fetch(
@@ -157,9 +163,8 @@ class MarketProviderRouter:
         if min_rows is None:
             min_rows = self.DEFAULT_MIN_ROWS
 
-        # 🔥 If specific provider requested
+        # 🔥 If specific provider explicitly requested
         if provider is not None:
-
             provider = provider.lower()
 
             for name, provider_obj in self.providers:
@@ -168,19 +173,23 @@ class MarketProviderRouter:
                     if not self._provider_allowed(name):
                         raise RuntimeError(f"Provider {name} in cooldown.")
 
-                    return self._execute_provider(
-                        name,
-                        provider_obj,
-                        ticker,
-                        start,
-                        end,
-                        interval,
-                        min_rows
-                    )
+                    try:
+                        return self._execute_provider(
+                            name,
+                            provider_obj,
+                            ticker,
+                            start,
+                            end,
+                            interval,
+                            min_rows
+                        )
+                    except Exception:
+                        self._record_failure(name)
+                        raise
 
             raise RuntimeError(f"Requested provider not available: {provider}")
 
-        # 🔥 Sequential fallback
+        # 🔥 Sequential fallback (safe, no nested pools)
         for name, provider_obj in self.providers:
 
             if not self._provider_allowed(name):
@@ -227,17 +236,15 @@ class MarketProviderRouter:
 
         start_time = time.time()
 
-        # 🔥 Apply Yahoo semaphore only for Yahoo
-        if name == "yahoo":
-            with self._yahoo_semaphore:
-                df = provider.fetch(
-                    ticker,
-                    start,
-                    end,
-                    interval,
-                    min_rows=min_rows
-                )
-        else:
+        # 🔥 Apply Yahoo semaphore only when needed
+        semaphore_context = (
+            self._yahoo_semaphore
+            if name == "yahoo"
+            else nullcontext()
+        )
+
+        with semaphore_context:
+
             df = provider.fetch(
                 ticker,
                 start,
