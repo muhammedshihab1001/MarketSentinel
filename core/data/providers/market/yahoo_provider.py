@@ -30,20 +30,15 @@ class YahooProvider(MarketDataProvider):
     ########################################################
 
     @staticmethod
-    def _normalize_datetime(series):
+    def _normalize_datetime(series: pd.Series):
 
         if not isinstance(series, pd.Series):
             raise RuntimeError("Date column must be a pandas Series.")
 
-        dt = pd.to_datetime(series, errors="coerce")
+        dt = pd.to_datetime(series, errors="coerce", utc=True)
 
         if dt.isna().all():
             raise RuntimeError("Datetime parsing failed.")
-
-        if dt.dt.tz is None:
-            dt = dt.dt.tz_localize("UTC")
-        else:
-            dt = dt.dt.tz_convert("UTC")
 
         return dt
 
@@ -57,7 +52,9 @@ class YahooProvider(MarketDataProvider):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [
                 "_".join(
-                    [str(level).strip().lower() for level in col if level]
+                    str(level).strip().lower()
+                    for level in col
+                    if level is not None and str(level).strip() != ""
                 )
                 for col in df.columns
             ]
@@ -67,7 +64,7 @@ class YahooProvider(MarketDataProvider):
         return df
 
     ########################################################
-    # STRICT COLUMN EXTRACTION (HARDENED)
+    # STRICT COLUMN EXTRACTION
     ########################################################
 
     @staticmethod
@@ -77,22 +74,24 @@ class YahooProvider(MarketDataProvider):
 
         for col in df.columns:
 
-            if col.startswith("open") and "open" not in col_map:
+            lc = col.lower()
+
+            if lc.startswith("open") and "open" not in col_map:
                 col_map["open"] = col
 
-            elif col.startswith("high") and "high" not in col_map:
+            elif lc.startswith("high") and "high" not in col_map:
                 col_map["high"] = col
 
-            elif col.startswith("low") and "low" not in col_map:
+            elif lc.startswith("low") and "low" not in col_map:
                 col_map["low"] = col
 
-            elif col.startswith("adj close") and "close" not in col_map:
+            elif lc.startswith("adj close") and "close" not in col_map:
                 col_map["close"] = col
 
-            elif col.startswith("close") and "close" not in col_map:
+            elif lc.startswith("close") and "close" not in col_map:
                 col_map["close"] = col
 
-            elif col.startswith("volume") and "volume" not in col_map:
+            elif lc.startswith("volume") and "volume" not in col_map:
                 col_map["volume"] = col
 
         required = {"open", "high", "low", "close", "volume"}
@@ -104,15 +103,15 @@ class YahooProvider(MarketDataProvider):
         clean = pd.DataFrame()
 
         for key in required:
+
             series = df[col_map[key]]
 
-            # 🔥 Force 1D Series
             if isinstance(series, pd.DataFrame):
                 if series.shape[1] == 1:
                     series = series.iloc[:, 0]
                 else:
                     raise RuntimeError(
-                        f"Ambiguous Yahoo column for {key}: multiple columns detected."
+                        f"Ambiguous Yahoo column for {key}: multiple columns."
                     )
 
             if not isinstance(series, pd.Series):
@@ -135,12 +134,13 @@ class YahooProvider(MarketDataProvider):
         df = self._flatten_columns(df)
 
         ####################################################
-        # HANDLE DATE
+        # HANDLE DATE COLUMN
         ####################################################
 
         if "date" not in df.columns:
 
             if isinstance(df.index, pd.DatetimeIndex):
+
                 idx = df.index
 
                 if idx.tz is None:
@@ -168,13 +168,10 @@ class YahooProvider(MarketDataProvider):
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
         for col in numeric_cols:
-
-            if not isinstance(clean[col], pd.Series):
-                raise RuntimeError(f"{col} column not 1D Series.")
-
             clean[col] = pd.to_numeric(clean[col], errors="coerce")
 
         clean.replace([np.inf, -np.inf], np.nan, inplace=True)
+
         clean.dropna(subset=["open", "high", "low", "close"], inplace=True)
 
         if clean.empty:
@@ -209,10 +206,10 @@ class YahooProvider(MarketDataProvider):
         # VOLUME SAFETY
         ####################################################
 
-        clean["volume"] = clean["volume"].clip(lower=0).fillna(0)
+        clean["volume"] = clean["volume"].fillna(0).clip(lower=0)
 
         ####################################################
-        # MIN HISTORY
+        # MIN HISTORY CHECK
         ####################################################
 
         if len(clean) < min_rows:
