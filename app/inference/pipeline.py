@@ -49,7 +49,7 @@ def get_shared_model_loader():
             if _SHARED_MODEL_LOADER is None:
                 logger.info("Initializing shared ModelLoader (pipeline)")
                 _SHARED_MODEL_LOADER = ModelLoader()
-                _ = _SHARED_MODEL_LOADER.xgb  # force load
+                _ = _SHARED_MODEL_LOADER.xgb
     return _SHARED_MODEL_LOADER
 
 
@@ -121,33 +121,40 @@ class InferencePipeline:
     # =========================================================
 
     def _validate_models_loaded(self):
-
-        version = self.models.xgb_version
-        schema_sig = self.models.schema_signature
-
-        if schema_sig != get_schema_signature():
+        if self.models.schema_signature != get_schema_signature():
             raise RuntimeError(
                 "Schema signature mismatch between training and inference."
             )
-
-        logger.info("Model + schema verified | version=%s", version)
+        logger.info(
+            "Model + schema verified | version=%s",
+            self.models.xgb_version
+        )
 
     # =========================================================
     # CROSS-SECTION ENFORCEMENT
     # =========================================================
 
-    def _enforce_full_universe(self, tickers: List[str]) -> Tuple[List[str], List[str]]:
+    def _enforce_full_universe(
+        self,
+        tickers: List[str]
+    ) -> Tuple[List[str], List[str]]:
 
-        production_universe = sorted(set(MarketUniverse.get_universe()))
-        requested = sorted(set([t.upper().strip() for t in tickers]))
-
-        if set(requested) == set(production_universe):
-            return production_universe, requested
-
-        logger.warning(
-            "Expanding inference to full production universe "
-            "to preserve cross-sectional integrity."
+        production_universe = sorted(
+            set(MarketUniverse.get_universe())
         )
+
+        requested = sorted(
+            set(str(t).upper().strip() for t in tickers)
+        )
+
+        if not requested:
+            raise RuntimeError("Empty ticker request.")
+
+        if set(requested) != set(production_universe):
+            logger.warning(
+                "Expanding inference to full universe "
+                "to preserve cross-sectional integrity."
+            )
 
         return production_universe, requested
 
@@ -155,17 +162,18 @@ class InferencePipeline:
 
     def run_snapshot(self, tickers: List[str]):
 
-        expanded_tickers, originally_requested = self._enforce_full_universe(tickers)
+        expanded_tickers, requested = \
+            self._enforce_full_universe(tickers)
 
-        cache_key = tuple(sorted(expanded_tickers))
+        cache_key = tuple(expanded_tickers)
 
         with self._snapshot_lock:
-            item = self._snapshot_cache.get(cache_key)
-            if item:
-                result, ts = item
+            cached = self._snapshot_cache.get(cache_key)
+            if cached:
+                result, ts = cached
                 if time.time() - ts <= self.SNAPSHOT_CACHE_TTL:
-                    if set(originally_requested) != set(expanded_tickers):
-                        return self._filter_snapshot(result, originally_requested)
+                    if set(requested) != set(expanded_tickers):
+                        return self._filter_snapshot(result, requested)
                     return result
 
         if len(expanded_tickers) > self.MAX_BATCH_SIZE:
@@ -178,28 +186,30 @@ class InferencePipeline:
         start_time = time.time()
 
         try:
+
             df = self._build_cross_sectional_frame(expanded_tickers)
             latest_df = self._select_latest_snapshot(df)
 
             universe = set(MarketUniverse.get_universe())
-            latest_df = latest_df[latest_df["ticker"].isin(universe)]
+            latest_df = latest_df[
+                latest_df["ticker"].isin(universe)
+            ]
 
             if latest_df.empty:
-                raise RuntimeError("All tickers filtered out after universe validation.")
+                raise RuntimeError("Universe filter removed all rows.")
 
             feature_df = validate_feature_schema(
                 latest_df.loc[:, MODEL_FEATURES],
                 mode="inference"
             ).astype(DTYPE)
 
-            # Drift detection
+            # ---------------- Drift ----------------
             try:
                 drift_result = self.drift_detector.detect(feature_df)
                 if drift_result.get("drift_state") == "hard":
-                    logger.error("Hard drift detected — continuing in degraded mode.")
                     drift_result["degraded"] = True
             except Exception as e:
-                logger.warning("Drift check failed — bypassing: %s", e)
+                logger.warning("Drift check failed: %s", e)
                 drift_result = {
                     "drift_detected": False,
                     "drift_state": "bypass",
@@ -207,20 +217,25 @@ class InferencePipeline:
                     "drift_confidence": 0.0
                 }
 
-            # Model inference
+            # ---------------- Model ----------------
             probs = self.models.xgb.predict_proba(feature_df)[:, 1]
             probs = np.clip(probs, 1e-6, 1 - 1e-6)
 
             if np.std(probs) < self.MIN_PROB_STD:
-                probs = np.full(len(feature_df), 0.5)
+                probs = np.full(len(probs), 0.5)
 
             latest_df = latest_df.copy()
             latest_df["score"] = probs
-            latest_df["rank_pct"] = latest_df["score"].rank(method="first", pct=True)
+            latest_df["rank_pct"] = latest_df["score"].rank(
+                method="first",
+                pct=True
+            )
 
             latest_df["signal"] = latest_df["rank_pct"].apply(
-                lambda x: "LONG" if x >= LONG_PERCENTILE
-                else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
+                lambda x:
+                "LONG" if x >= LONG_PERCENTILE
+                else "SHORT" if x <= SHORT_PERCENTILE
+                else "NEUTRAL"
             )
 
             weights = self._construct_portfolio(latest_df)
@@ -261,17 +276,23 @@ class InferencePipeline:
             }
 
             with self._snapshot_lock:
-                self._snapshot_cache[cache_key] = (result, time.time())
+                self._snapshot_cache[cache_key] = (
+                    result.copy(),
+                    time.time()
+                )
 
-            MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-            MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(
-                time.time() - start_time
-            )
+            MODEL_INFERENCE_COUNT.labels(
+                model="xgboost"
+            ).inc()
+
+            MODEL_INFERENCE_LATENCY.labels(
+                model="xgboost"
+            ).observe(time.time() - start_time)
 
             self.breaker.record_success()
 
-            if set(originally_requested) != set(expanded_tickers):
-                return self._filter_snapshot(result, originally_requested)
+            if set(requested) != set(expanded_tickers):
+                return self._filter_snapshot(result, requested)
 
             return result
 
@@ -286,27 +307,36 @@ class InferencePipeline:
 
     # =========================================================
 
-    def _filter_snapshot(self, snapshot: Dict, tickers: List[str]) -> Dict:
-        filtered_signals = [
+    def _filter_snapshot(
+        self,
+        snapshot: Dict,
+        tickers: List[str]
+    ) -> Dict:
+
+        filtered = [
             s for s in snapshot["signals"]
             if s["ticker"] in tickers
         ]
 
-        new_snapshot = snapshot.copy()
-        new_snapshot["signals"] = filtered_signals
-        new_snapshot["universe_size"] = len(filtered_signals)
+        new_snapshot = dict(snapshot)
+        new_snapshot["signals"] = filtered
+        new_snapshot["universe_size"] = len(filtered)
 
         return new_snapshot
 
     # =========================================================
 
-    def _select_latest_snapshot(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _select_latest_snapshot(self, df: pd.DataFrame):
+
         if df is None or df.empty:
-            raise RuntimeError("Feature dataframe empty before snapshot selection.")
+            raise RuntimeError("Feature dataframe empty.")
+
         latest_date = df["date"].max()
-        latest_df = df[df["date"] == latest_date].copy()
+        latest_df = df[df["date"] == latest_date]
+
         if latest_df.empty:
-            raise RuntimeError("No rows found for latest snapshot date.")
+            raise RuntimeError("No rows for latest snapshot.")
+
         return latest_df.reset_index(drop=True)
 
     # =========================================================
@@ -314,7 +344,9 @@ class InferencePipeline:
     def _build_cross_sectional_frame(self, tickers: List[str]):
 
         end_date = pd.Timestamp.utcnow()
-        start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
+        start_date = end_date - pd.Timedelta(
+            days=self.INFERENCE_LOOKBACK_DAYS
+        )
 
         price_map = self.market_data.get_price_data_batch(
             tickers=tickers,
@@ -327,6 +359,7 @@ class InferencePipeline:
         datasets = []
 
         for ticker, price_df in price_map.items():
+
             if price_df is None or price_df.empty:
                 continue
 
@@ -349,7 +382,10 @@ class InferencePipeline:
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
         latest_date = df["date"].max()
-        cutoff = latest_date - pd.Timedelta(days=self.CROSS_SECTIONAL_WINDOW_DAYS)
+        cutoff = latest_date - pd.Timedelta(
+            days=self.CROSS_SECTIONAL_WINDOW_DAYS
+        )
+
         df = df[df["date"] >= cutoff].copy()
 
         df = FeatureEngineer.add_cross_sectional_features(df)
@@ -361,10 +397,17 @@ class InferencePipeline:
 
     def _construct_portfolio(self, latest_df):
 
-        latest_df = latest_df.sort_values(["score", "ticker"])
+        latest_df = latest_df.sort_values(
+            ["score", "ticker"]
+        )
 
-        k_long = min(self.TOP_K, len(latest_df) // 2)
-        k_short = min(self.BOTTOM_K, len(latest_df) // 2)
+        n = len(latest_df)
+
+        if n < 2:
+            return {latest_df.iloc[0]["ticker"]: 0.0}
+
+        k_long = min(self.TOP_K, n // 2)
+        k_short = min(self.BOTTOM_K, n // 2)
 
         longs = latest_df.tail(k_long)
         shorts = latest_df.head(k_short)
@@ -374,9 +417,6 @@ class InferencePipeline:
 
         long_weights = (1.0 / long_vol)
         short_weights = (1.0 / short_vol)
-
-        if long_weights.sum() == 0 or short_weights.sum() == 0:
-            raise RuntimeError("Invalid volatility weights — division by zero.")
 
         long_weights /= long_weights.sum()
         short_weights /= short_weights.sum()
