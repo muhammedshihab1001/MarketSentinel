@@ -23,7 +23,7 @@ from core.monitoring.drift_detector import DriftDetector
 from core.artifacts.metadata_manager import MetadataManager
 
 from training.backtesting.walk_forward import WalkForwardValidator, FORWARD_DAYS
-from models.xgboost_model import build_xgboost_pipeline
+from core.models.xgboost import build_xgboost_pipeline
 
 logger = logging.getLogger("marketsentinel.train_xgb")
 
