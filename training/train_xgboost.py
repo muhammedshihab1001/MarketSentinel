@@ -35,7 +35,7 @@ MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
 
 # Production thresholds
-MIN_PRODUCTION_SHARPE = 0.10   # relaxed for noisy Yahoo data
+MIN_PRODUCTION_SHARPE = 0.10
 MAX_DRAWDOWN = -0.55
 MAX_REASONABLE_SHARPE = 5.0
 MAX_PROFIT_FACTOR = 10.0
@@ -73,9 +73,9 @@ def validate_production_metrics(metrics: dict):
         if not np.isfinite(metrics[key]):
             raise RuntimeError(f"Non-finite metric: {key}")
 
-    sharpe = metrics["avg_sharpe"]
-    drawdown = metrics["max_drawdown"]
-    profit_factor = metrics["profit_factor"]
+    sharpe = float(metrics["avg_sharpe"])
+    drawdown = float(metrics["max_drawdown"])
+    profit_factor = float(metrics["profit_factor"])
 
     logger.info(
         "Production validation | Sharpe=%.4f | DD=%.2f%% | PF=%.2f",
@@ -264,7 +264,7 @@ def final_trainer(train_df):
 
 
 ############################################################
-# EXPORT
+# EXPORT (ATOMIC POINTER UPDATE)
 ############################################################
 
 def export_artifacts(model, metrics, dataset_hash,
@@ -310,12 +310,17 @@ def export_artifacts(model, metrics, dataset_hash,
     MetadataManager.save_metadata(metadata, metadata_path)
 
     pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
+    tmp_pointer = pointer_path + ".tmp"
 
-    with open(pointer_path, "w", encoding="utf-8") as f:
+    with open(tmp_pointer, "w", encoding="utf-8") as f:
         json.dump({
             "model_version": str(timestamp),
             "updated_at": int(time.time())
         }, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp_pointer, pointer_path)
 
     logger.info("Artifacts exported safely.")
     return timestamp
@@ -325,7 +330,9 @@ def export_artifacts(model, metrics, dataset_hash,
 # MAIN
 ############################################################
 
-def main(start_date=None, end_date=None, create_baseline=False):
+def main(start_date=None, end_date=None,
+         create_baseline=False,
+         allow_soft_fail=False):
 
     t0 = time.time()
 
@@ -340,8 +347,15 @@ def main(start_date=None, end_date=None, create_baseline=False):
     validator = WalkForwardValidator(trainer)
     research_metrics = validator.run(raw_df.copy())
 
-    # 🔥 PRODUCTION VALIDATION BEFORE EXPORT
-    validate_production_metrics(research_metrics)
+    logger.info("Research metrics: %s", research_metrics)
+
+    try:
+        validate_production_metrics(research_metrics)
+    except RuntimeError as e:
+        if allow_soft_fail:
+            logger.warning("Soft-fail enabled: %s", str(e))
+        else:
+            raise
 
     final_df = build_final_target(raw_df)
     dataset_hash = compute_dataset_hash(final_df)
@@ -380,6 +394,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--create-baseline", action="store_true")
+    parser.add_argument("--allow-soft-fail", action="store_true")
     args = parser.parse_args()
 
-    main(create_baseline=args.create_baseline)
+    main(
+        create_baseline=args.create_baseline,
+        allow_soft_fail=args.allow_soft_fail
+    )
