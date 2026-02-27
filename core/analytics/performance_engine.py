@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional
 
 
 @dataclass
@@ -28,7 +28,7 @@ class PerformanceReport:
 class PerformanceEngine:
 
     TRADING_DAYS = 252
-    ROLLING_WINDOW = 63  # 3-month rolling window
+    ROLLING_WINDOW = 63  # 3 months
 
     ########################################################
     # CORE ENTRY
@@ -41,11 +41,8 @@ class PerformanceEngine:
         benchmark_returns: Optional[pd.Series] = None
     ) -> PerformanceReport:
 
-        if portfolio_df.empty:
-            raise RuntimeError("Portfolio dataframe empty.")
-
-        if forward_returns.empty:
-            raise RuntimeError("Forward returns dataframe empty.")
+        if portfolio_df.empty or forward_returns.empty:
+            raise RuntimeError("Insufficient data for evaluation.")
 
         portfolio_df = portfolio_df.copy()
         forward_returns = forward_returns.copy()
@@ -64,12 +61,9 @@ class PerformanceEngine:
         )
 
         if merged.empty:
-            raise RuntimeError(
-                "No overlapping data for performance evaluation."
-            )
+            raise RuntimeError("No overlapping data for evaluation.")
 
-        if merged["forward_return"].isnull().any():
-            raise RuntimeError("Null forward returns detected after merge.")
+        merged = merged.dropna(subset=["forward_return", "weight"])
 
         ########################################################
         # DAILY RETURNS
@@ -86,22 +80,25 @@ class PerformanceEngine:
             .sort_index()
         )
 
+        daily = daily.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
         if len(daily) < 2:
-            raise RuntimeError("Insufficient daily returns for evaluation.")
+            raise RuntimeError("Not enough daily returns.")
 
         ########################################################
         # EQUITY CURVE
         ########################################################
 
         equity = (1 + daily).cumprod()
-        cumulative_return = equity.iloc[-1] - 1
+        cumulative_return = float(equity.iloc[-1] - 1)
 
         ########################################################
-        # DRAWDOWN SERIES
+        # DRAWDOWN
         ########################################################
 
         rolling_max = equity.cummax()
         drawdown_series = (equity - rolling_max) / rolling_max
+        drawdown_series = drawdown_series.fillna(0.0)
 
         ########################################################
         # METRICS
@@ -109,8 +106,8 @@ class PerformanceEngine:
 
         sharpe = self._sharpe_ratio(daily)
         sortino = self._sortino_ratio(daily)
-        max_dd = drawdown_series.min()
-        max_dd_duration = self._max_drawdown_duration(equity)
+        max_dd = float(drawdown_series.min())
+        max_dd_duration = int(self._max_drawdown_duration(equity))
         ann_vol = self._annual_volatility(daily)
         ann_ret = self._annual_return(daily)
         calmar = self._calmar_ratio(ann_ret, max_dd)
@@ -127,12 +124,12 @@ class PerformanceEngine:
         rolling_volatility = self._rolling_volatility(daily)
 
         return PerformanceReport(
-            cumulative_return=float(cumulative_return),
+            cumulative_return=cumulative_return,
             sharpe_ratio=float(sharpe),
             sortino_ratio=float(sortino),
             calmar_ratio=float(calmar),
-            max_drawdown=float(max_dd),
-            max_drawdown_duration=int(max_dd_duration),
+            max_drawdown=max_dd,
+            max_drawdown_duration=max_dd_duration,
             hit_rate=float(hit),
             annual_volatility=float(ann_vol),
             annual_return=float(ann_ret),
@@ -151,136 +148,99 @@ class PerformanceEngine:
     ########################################################
 
     def _sharpe_ratio(self, daily_returns):
-
         std = daily_returns.std()
-
         if std == 0 or np.isnan(std):
             return 0.0
-
-        return (daily_returns.mean() / std) * np.sqrt(self.TRADING_DAYS)
+        return float((daily_returns.mean() / std) * np.sqrt(self.TRADING_DAYS))
 
     def _sortino_ratio(self, daily_returns):
-
         downside = daily_returns[daily_returns < 0]
-
         if len(downside) == 0:
             return 0.0
-
         downside_std = downside.std()
-
         if downside_std == 0 or np.isnan(downside_std):
             return 0.0
-
-        return (daily_returns.mean() / downside_std) * np.sqrt(self.TRADING_DAYS)
+        return float((daily_returns.mean() / downside_std) * np.sqrt(self.TRADING_DAYS))
 
     def _annual_volatility(self, daily_returns):
-        return daily_returns.std() * np.sqrt(self.TRADING_DAYS)
+        return float(daily_returns.std() * np.sqrt(self.TRADING_DAYS))
 
     def _annual_return(self, daily_returns):
-
         cumulative = (1 + daily_returns).prod()
         years = len(daily_returns) / self.TRADING_DAYS
-
         if years <= 0:
             return 0.0
-
-        return cumulative ** (1 / years) - 1
+        return float(cumulative ** (1 / years) - 1)
 
     def _max_drawdown_duration(self, equity_curve):
-
         rolling_max = equity_curve.cummax()
         drawdown = equity_curve < rolling_max
-
         duration = 0
         max_duration = 0
-
         for val in drawdown:
             if val:
                 duration += 1
                 max_duration = max(max_duration, duration)
             else:
                 duration = 0
-
         return max_duration
 
     def _calmar_ratio(self, annual_return, max_drawdown):
-
         if max_drawdown == 0:
             return 0.0
-
-        return annual_return / abs(max_drawdown)
+        return float(annual_return / abs(max_drawdown))
 
     def _hit_rate(self, daily_returns):
         return float((daily_returns > 0).mean())
 
     def _turnover(self, portfolio_df):
-
         pivot = (
             portfolio_df
             .pivot(index="date", columns="ticker", values="weight")
             .fillna(0)
             .sort_index()
         )
-
         diff = pivot.diff().abs()
         turnover = 0.5 * diff.sum(axis=1)
         turnover = turnover.iloc[1:]
-
-        return float(turnover.mean())
+        return float(turnover.mean()) if len(turnover) > 0 else 0.0
 
     def _beta(self, strategy_returns, benchmark_returns):
-
         if benchmark_returns is None:
             return None
-
-        aligned = strategy_returns.align(benchmark_returns, join="inner")[0]
-        bench = benchmark_returns.align(strategy_returns, join="inner")[0]
-
-        if len(aligned) < 2:
+        aligned_strategy, aligned_bench = strategy_returns.align(
+            benchmark_returns, join="inner"
+        )
+        if len(aligned_strategy) < 2:
             return None
-
-        cov = np.cov(aligned, bench)[0][1]
-        var = np.var(bench)
-
+        var = np.var(aligned_bench)
         if var == 0:
             return None
-
+        cov = np.cov(aligned_strategy, aligned_bench)[0][1]
         return float(cov / var)
 
     def _information_ratio(self, strategy_returns, benchmark_returns):
-
         if benchmark_returns is None:
             return None
-
         aligned_strategy, aligned_bench = strategy_returns.align(
-            benchmark_returns,
-            join="inner"
+            benchmark_returns, join="inner"
         )
-
         active = aligned_strategy - aligned_bench
-
         if active.std() == 0:
             return None
-
-        return float(
-            (active.mean() / active.std()) * np.sqrt(self.TRADING_DAYS)
-        )
+        return float((active.mean() / active.std()) * np.sqrt(self.TRADING_DAYS))
 
     ########################################################
-    # ROLLING METRICS
+    # ROLLING
     ########################################################
 
     def _rolling_sharpe(self, daily_returns):
-
         rolling = daily_returns.rolling(self.ROLLING_WINDOW)
-
-        return (
-            rolling.mean() /
-            rolling.std().replace(0, np.nan)
-        ) * np.sqrt(self.TRADING_DAYS)
+        sharpe = (rolling.mean() / rolling.std().replace(0, np.nan))
+        sharpe = sharpe * np.sqrt(self.TRADING_DAYS)
+        return sharpe.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     def _rolling_volatility(self, daily_returns):
-
-        return daily_returns.rolling(
-            self.ROLLING_WINDOW
-        ).std() * np.sqrt(self.TRADING_DAYS)
+        vol = daily_returns.rolling(self.ROLLING_WINDOW).std()
+        vol = vol * np.sqrt(self.TRADING_DAYS)
+        return vol.replace([np.inf, -np.inf], np.nan).fillna(0.0)
