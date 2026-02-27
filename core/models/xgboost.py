@@ -16,7 +16,7 @@ EPSILON = 1e-12
 
 
 ###################################################
-# CLASS WEIGHT (kept for compatibility)
+# CLASS WEIGHT (REGRESSION SAFE)
 ###################################################
 
 def compute_class_weight(y):
@@ -26,8 +26,13 @@ def compute_class_weight(y):
     pos = float(np.sum(y == 1))
     neg = float(np.sum(y == 0))
 
+    # 🔥 FIX: No hard failure in regression mode
     if pos == 0 or neg == 0:
-        raise RuntimeError("Label collapse detected.")
+        logger.warning(
+            "Label collapse detected (pos=%.0f neg=%.0f) — allowed in regression mode.",
+            pos, neg
+        )
+        return 1.0
 
     if min(pos, neg) < MIN_MINORITY_SAMPLES:
         logger.warning(
@@ -251,13 +256,13 @@ class SafeXGBClassifier:
         if np.std(scores) < MIN_SCORE_STD:
             logger.warning("Inference score collapse detected.")
 
-        # Convert regression scores to ranking-compatible probability-like output
+        # Convert regression scores to cross-sectional probability-like
         scaled = (scores - scores.min()) / (scores.max() - scores.min() + EPSILON)
 
         return np.column_stack([1 - scaled, scaled])
 
     ###################################################
-    # FEATURE IMPORTANCE (UNCHANGED)
+    # FEATURE IMPORTANCE
     ###################################################
 
     def export_feature_importance(self):
