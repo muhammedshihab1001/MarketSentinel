@@ -35,7 +35,7 @@ logger = logging.getLogger("marketsentinel.pipeline")
 
 
 # =========================================================
-# SHARED MODEL LOADER (TRUE SINGLETON PER PROCESS)
+# SHARED MODEL LOADER
 # =========================================================
 
 _SHARED_MODEL_LOADER = None
@@ -49,7 +49,7 @@ def get_shared_model_loader():
             if _SHARED_MODEL_LOADER is None:
                 logger.info("Initializing shared ModelLoader (pipeline)")
                 _SHARED_MODEL_LOADER = ModelLoader()
-                _ = _SHARED_MODEL_LOADER.xgb
+                _ = _SHARED_MODEL_LOADER.xgb  # force load
     return _SHARED_MODEL_LOADER
 
 
@@ -117,14 +117,20 @@ class InferencePipeline:
     # =========================================================
 
     def _validate_models_loaded(self):
-        container = self.models._xgb_container
-        if container is None:
-            raise RuntimeError("Model container missing.")
-        if container.schema_signature != get_schema_signature():
+
+        # Force reload via public API
+        version = self.models.xgb_version
+        schema_sig = self.models.schema_signature
+
+        if schema_sig != get_schema_signature():
             raise RuntimeError(
                 "Schema signature mismatch between training and inference."
             )
-        logger.info("Model + schema signature verified.")
+
+        logger.info(
+            "Model + schema verified | version=%s",
+            version
+        )
 
     # =========================================================
 
@@ -163,9 +169,7 @@ class InferencePipeline:
             df = self._build_cross_sectional_frame(tickers)
             latest_df = self._select_latest_snapshot(df)
 
-            # -------------------------------------------------
-            # Unknown ticker protection (soft drop)
-            # -------------------------------------------------
+            # Universe filter (soft drop)
             universe = set(MarketUniverse.get_universe())
             latest_df = latest_df[latest_df["ticker"].isin(universe)]
 
@@ -197,14 +201,7 @@ class InferencePipeline:
             # -------------------------------------------------
             # Model inference
             # -------------------------------------------------
-            try:
-                probs = self.models.xgb.predict_proba(feature_df)[:, 1]
-            except RuntimeError as e:
-                if "collapse" in str(e).lower():
-                    logger.warning("Probability collapse — fallback neutral.")
-                    probs = np.full(len(feature_df), 0.5)
-                else:
-                    raise
+            probs = self.models.xgb.predict_proba(feature_df)[:, 1]
 
             probs = np.clip(probs, 1e-6, 1 - 1e-6)
 
@@ -346,6 +343,9 @@ class InferencePipeline:
 
         long_weights = (1.0 / long_vol)
         short_weights = (1.0 / short_vol)
+
+        if long_weights.sum() == 0 or short_weights.sum() == 0:
+            raise RuntimeError("Invalid volatility weights — division by zero.")
 
         long_weights /= long_weights.sum()
         short_weights /= short_weights.sum()
