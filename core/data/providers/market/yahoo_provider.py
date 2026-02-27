@@ -32,6 +32,9 @@ class YahooProvider(MarketDataProvider):
     @staticmethod
     def _normalize_datetime(series):
 
+        if not isinstance(series, pd.Series):
+            raise RuntimeError("Date column must be a pandas Series.")
+
         dt = pd.to_datetime(series, errors="coerce")
 
         if dt.isna().all():
@@ -64,33 +67,32 @@ class YahooProvider(MarketDataProvider):
         return df
 
     ########################################################
-    # STRICT COLUMN EXTRACTION
+    # STRICT COLUMN EXTRACTION (HARDENED)
     ########################################################
 
     @staticmethod
     def _extract_ohlcv(df: pd.DataFrame, ticker: str):
 
-        # Identify candidate columns
         col_map = {}
 
         for col in df.columns:
 
-            if col.startswith("open"):
+            if col.startswith("open") and "open" not in col_map:
                 col_map["open"] = col
 
-            elif col.startswith("high"):
+            elif col.startswith("high") and "high" not in col_map:
                 col_map["high"] = col
 
-            elif col.startswith("low"):
+            elif col.startswith("low") and "low" not in col_map:
                 col_map["low"] = col
 
-            elif col.startswith("close"):
+            elif col.startswith("adj close") and "close" not in col_map:
                 col_map["close"] = col
 
-            elif col.startswith("adj close"):
+            elif col.startswith("close") and "close" not in col_map:
                 col_map["close"] = col
 
-            elif col.startswith("volume"):
+            elif col.startswith("volume") and "volume" not in col_map:
                 col_map["volume"] = col
 
         required = {"open", "high", "low", "close", "volume"}
@@ -99,13 +101,24 @@ class YahooProvider(MarketDataProvider):
             missing = required - set(col_map.keys())
             raise RuntimeError(f"Yahoo schema violation: {missing}")
 
-        clean = pd.DataFrame({
-            "open": df[col_map["open"]],
-            "high": df[col_map["high"]],
-            "low": df[col_map["low"]],
-            "close": df[col_map["close"]],
-            "volume": df[col_map["volume"]],
-        })
+        clean = pd.DataFrame()
+
+        for key in required:
+            series = df[col_map[key]]
+
+            # 🔥 Force 1D Series
+            if isinstance(series, pd.DataFrame):
+                if series.shape[1] == 1:
+                    series = series.iloc[:, 0]
+                else:
+                    raise RuntimeError(
+                        f"Ambiguous Yahoo column for {key}: multiple columns detected."
+                    )
+
+            if not isinstance(series, pd.Series):
+                raise RuntimeError(f"Invalid Yahoo column structure for {key}")
+
+            clean[key] = series
 
         return clean
 
@@ -119,8 +132,6 @@ class YahooProvider(MarketDataProvider):
             raise RuntimeError("Yahoo fetch returned invalid dataframe.")
 
         df = df.copy()
-
-        # Flatten columns FIRST
         df = self._flatten_columns(df)
 
         ####################################################
@@ -148,7 +159,6 @@ class YahooProvider(MarketDataProvider):
         ####################################################
 
         clean = self._extract_ohlcv(df, ticker)
-
         clean["date"] = df["date"]
 
         ####################################################
@@ -158,6 +168,10 @@ class YahooProvider(MarketDataProvider):
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
         for col in numeric_cols:
+
+            if not isinstance(clean[col], pd.Series):
+                raise RuntimeError(f"{col} column not 1D Series.")
+
             clean[col] = pd.to_numeric(clean[col], errors="coerce")
 
         clean.replace([np.inf, -np.inf], np.nan, inplace=True)
