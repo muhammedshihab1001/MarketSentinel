@@ -34,7 +34,7 @@ SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
 
-# Production thresholds (kept)
+# Production thresholds
 MIN_PRODUCTION_SHARPE = 0.10
 MAX_DRAWDOWN = -0.55
 MAX_REASONABLE_SHARPE = 5.0
@@ -54,7 +54,7 @@ def enforce_determinism():
 
 
 ############################################################
-# PRODUCTION METRIC VALIDATION (UNCHANGED)
+# PRODUCTION METRIC VALIDATION
 ############################################################
 
 def validate_production_metrics(metrics: dict):
@@ -105,7 +105,7 @@ def validate_production_metrics(metrics: dict):
 
 
 ############################################################
-# FEATURE CHECKSUM (UNCHANGED)
+# FEATURE CHECKSUM
 ############################################################
 
 def compute_feature_checksum():
@@ -117,7 +117,7 @@ def compute_feature_checksum():
 
 
 ############################################################
-# DATASET HASH (UNCHANGED)
+# DATASET HASH
 ############################################################
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
@@ -126,7 +126,7 @@ def compute_dataset_hash(df: pd.DataFrame) -> str:
 
 
 ############################################################
-# LOAD DATA (UNCHANGED)
+# LOAD DATA
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -185,10 +185,10 @@ def load_training_data(start_date, end_date):
 
 
 ############################################################
-# TARGET (CORRECT REGRESSION ALPHA)
+# REGRESSION TARGET (FORWARD LOG RETURN)
 ############################################################
 
-def build_final_target(df: pd.DataFrame):
+def build_target(df: pd.DataFrame):
 
     df = df.sort_values(["ticker", "date"]).copy()
 
@@ -204,12 +204,10 @@ def build_final_target(df: pd.DataFrame):
     df = df[counts >= MIN_CS_WIDTH]
 
     if df.empty:
-        raise RuntimeError(
-            "All dates dropped after cross-sectional width enforcement."
-        )
+        raise RuntimeError("All dates dropped after cross-sectional enforcement.")
 
     logger.info(
-        "Final regression training dataset | rows=%s | unique_dates=%s",
+        "Regression training dataset | rows=%s | unique_dates=%s",
         len(df),
         df["date"].nunique()
     )
@@ -218,12 +216,12 @@ def build_final_target(df: pd.DataFrame):
 
 
 ############################################################
-# TRAINERS (UNCHANGED)
+# TRAINERS
 ############################################################
 
 def trainer(train_df):
 
-    train_df = build_final_target(train_df)
+    train_df = build_target(train_df)
 
     X = validate_feature_schema(
         train_df.loc[:, MODEL_FEATURES],
@@ -240,7 +238,7 @@ def trainer(train_df):
 
 def final_trainer(train_df):
 
-    train_df = build_final_target(train_df)
+    train_df = build_target(train_df)
 
     X = validate_feature_schema(
         train_df.loc[:, MODEL_FEATURES],
@@ -272,14 +270,7 @@ def export_artifacts(model, metrics, dataset_hash,
     joblib.dump(model, tmp_path)
     os.replace(tmp_path, model_path)
 
-    def sha256(path):
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        return h.hexdigest()
-
-    artifact_hash = sha256(model_path)
+    artifact_hash = MetadataManager.hash_file(model_path)
 
     metadata = MetadataManager.create_metadata(
         model_name="xgboost",
@@ -302,17 +293,12 @@ def export_artifacts(model, metrics, dataset_hash,
     MetadataManager.save_metadata(metadata, metadata_path)
 
     pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
-    tmp_pointer = pointer_path + ".tmp"
 
-    with open(tmp_pointer, "w", encoding="utf-8") as f:
+    with open(pointer_path, "w", encoding="utf-8") as f:
         json.dump({
             "model_version": str(timestamp),
             "updated_at": int(time.time())
         }, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-
-    os.replace(tmp_pointer, pointer_path)
 
     logger.info("Artifacts exported safely.")
     return timestamp
@@ -349,7 +335,7 @@ def main(start_date=None, end_date=None,
         else:
             raise
 
-    final_df = build_final_target(raw_df)
+    final_df = build_target(raw_df)
     dataset_hash = compute_dataset_hash(final_df)
 
     final_model = final_trainer(raw_df)
