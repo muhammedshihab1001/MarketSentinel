@@ -5,6 +5,7 @@ import threading
 import hashlib
 import json
 from dataclasses import dataclass
+from typing import Optional
 
 from core.schema.feature_schema import (
     get_schema_signature,
@@ -27,7 +28,7 @@ class LoadedModel:
     training_code_hash: str
     artifact_hash: str
     feature_checksum: str
-    pointer_hash: str | None
+    pointer_hash: Optional[str]
 
 
 class ModelLoader:
@@ -57,11 +58,11 @@ class ModelLoader:
             return
 
         self._reload_lock = threading.Lock()
-        self._xgb_container: LoadedModel | None = None
+        self._xgb_container: Optional[LoadedModel] = None
         self._initialized = True
 
     ########################################################
-    # HASH
+    # HASH UTIL
     ########################################################
 
     def _sha256(self, path: str) -> str:
@@ -101,7 +102,7 @@ class ModelLoader:
         return base_dir
 
     ########################################################
-    # POINTER
+    # POINTER RESOLUTION
     ########################################################
 
     def _resolve_production_version(self, base_dir):
@@ -139,7 +140,7 @@ class ModelLoader:
         return model_path, metadata_path, version, pointer_hash
 
     ########################################################
-    # SAFE LOAD MODEL
+    # SAFE MODEL LOAD
     ########################################################
 
     def _safe_load_model(self, model_path):
@@ -159,7 +160,7 @@ class ModelLoader:
         return model
 
     ########################################################
-    # BASELINE LINEAGE (SOFT FAIL)
+    # BASELINE LINEAGE (SOFT VALIDATION)
     ########################################################
 
     def _validate_baseline_lineage(self, meta: dict):
@@ -181,7 +182,6 @@ class ModelLoader:
                     baseline_meta["training_code_hash"] != meta["training_code_hash"]:
                 logger.warning("Baseline training code hash mismatch.")
 
-            # ✅ NEW: Soft schema warning
             if baseline_meta.get("schema_signature") and \
                     baseline_meta["schema_signature"] != meta["schema_signature"]:
                 logger.warning("Baseline schema signature mismatch.")
@@ -190,7 +190,7 @@ class ModelLoader:
             logger.warning("Baseline lineage validation soft-failed: %s", e)
 
     ########################################################
-    # RELOAD
+    # RELOAD LOGIC
     ########################################################
 
     def _reload_xgb_if_needed(self):
@@ -240,7 +240,6 @@ class ModelLoader:
             if list(meta.get("features")) != list(MODEL_FEATURES):
                 raise RuntimeError("Metadata feature mismatch.")
 
-            # ✅ NEW: Defense-in-depth validation
             if meta.get("feature_count") != len(MODEL_FEATURES):
                 raise RuntimeError("Metadata feature_count mismatch.")
 
@@ -325,6 +324,7 @@ class ModelLoader:
     ########################################################
 
     def get_feature_importance(self):
+
         model = self.xgb
 
         if not hasattr(model, "export_feature_importance"):
