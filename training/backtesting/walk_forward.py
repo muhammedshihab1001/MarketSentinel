@@ -20,10 +20,11 @@ class WalkForwardValidator:
     MIN_TEST_DAYS = 20
     MIN_TRAIN_ROWS = 1500
     MIN_CROSS_SECTION = 10
-    MIN_PROB_STD = 1e-6
+    MIN_SCORE_STD = 1e-6
 
-    TOP_K = 3
-    BOTTOM_K = 3
+    # 🔥 Adjusted for hedge-fund style selection
+    TOP_K = 5
+    BOTTOM_K = 5
     TARGET_GROSS_EXPOSURE = 1.0
 
     TRANSACTION_COST = 0.001
@@ -47,8 +48,7 @@ class WalkForwardValidator:
         self.debug = debug
         self.regime_detector = MarketRegimeDetector()
 
-        # NEW: automatic direction detection
-        self._direction = 1  # 1 = normal, -1 = inverted
+        self._direction = 1
         self._direction_locked = False
 
     ########################################################
@@ -58,29 +58,19 @@ class WalkForwardValidator:
         return train_df[train_df["date"] < embargo_cut]
 
     ########################################################
+    # 🔥 REGRESSION TARGET (ALIGNED WITH TRAINING)
+    ########################################################
 
     def _build_fold_target(self, df):
 
         df = df.sort_values(["ticker", "date"]).copy()
 
-        df["forward_log_return"] = (
+        df["target"] = (
             df.groupby("ticker")["close"]
             .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
         )
 
-        df = df.dropna(subset=["forward_log_return"])
-
-        df["alpha_rank_pct"] = (
-            df.groupby("date")["forward_log_return"]
-            .rank(pct=True)
-        )
-
-        df["target"] = np.nan
-        df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
-        df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
-
         df = df.dropna(subset=["target"])
-        df["target"] = df["target"].astype(int)
 
         return df
 
@@ -150,7 +140,7 @@ class WalkForwardValidator:
 
             train_df = self._build_fold_target(train_df)
 
-            if train_df["target"].nunique() < 2:
+            if train_df["target"].std() < self.EPSILON:
                 start_idx += self.step_size
                 continue
 
@@ -173,19 +163,22 @@ class WalkForwardValidator:
                 X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
                 X = validate_feature_schema(X, mode="inference")
 
-                probs = model.predict_proba(X)[:, 1]
+                scores = model.predict_proba(X)[:, 1]
 
-                if np.std(probs) < self.MIN_PROB_STD:
+                if np.std(scores) < self.MIN_SCORE_STD:
                     continue
 
                 signal_slice = signal_slice.copy()
-                signal_slice["score"] = probs
+
+                # 🔥 Cross-sectional normalization improves stability
+                scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
+                signal_slice["score"] = scores
 
                 ranked = signal_slice.sort_values(["score", "ticker"])
 
                 longs, shorts = self._select_positions(ranked)
 
-                # DIAGNOSTIC: detect inversion on first window only
+                # 🔥 Automatic direction detection (first window only)
                 if not self._direction_locked:
 
                     test_merge = pd.merge(
@@ -208,18 +201,13 @@ class WalkForwardValidator:
                         test_merge["ticker"].isin(shorts["ticker"])
                     ]["ret"].mean()
 
-                    if self.debug:
-                        logger.info(
-                            "Direction check | long_mean=%.6f | short_mean=%.6f",
-                            long_mean, short_mean
-                        )
-
                     if long_mean < short_mean:
                         logger.warning("Signal appears inverted — auto-flipping.")
                         self._direction = -1
 
                     self._direction_locked = True
 
+                # 🔥 Volatility adjusted weights
                 long_vol = longs["volatility"].astype("float64").clip(lower=self.EPSILON)
                 short_vol = shorts["volatility"].astype("float64").clip(lower=self.EPSILON)
 
