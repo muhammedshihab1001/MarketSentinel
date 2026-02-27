@@ -34,8 +34,9 @@ class MarketDataService:
     MAX_ROWS = 15000
     MAX_DAILY_MOVE = 0.85
 
-    # 🔥 Adaptive concurrency
+    # 🔥 Hard cap for total parallelism (protect router + Yahoo)
     MAX_WORKERS = int(os.getenv("MARKET_MAX_WORKERS", 4))
+
     MEMORY_CACHE_TTL = 30
 
     _PROVIDER = None
@@ -57,6 +58,8 @@ class MarketDataService:
             ",".join(sorted(self.REQUIRED_COLUMNS)).encode()
         ).hexdigest()[:10]
 
+    ########################################################
+    # SANITIZATION
     ########################################################
 
     @staticmethod
@@ -95,7 +98,7 @@ class MarketDataService:
         return hashlib.sha256(payload).hexdigest()[:16]
 
     ########################################################
-    # VALIDATION (UNCHANGED LOGIC)
+    # VALIDATION (UNCHANGED)
     ########################################################
 
     def _validate_dataset(self, df: pd.DataFrame, ticker: str, min_rows: int):
@@ -128,9 +131,7 @@ class MarketDataService:
         if df[numeric_cols].isna().any().any():
             raise RuntimeError("NaN values detected in numeric columns.")
 
-        numeric_array = df[numeric_cols].values.astype(float)
-
-        if not np.isfinite(numeric_array).all():
+        if not np.isfinite(df[numeric_cols].values.astype(float)).all():
             raise RuntimeError("Non-finite prices detected.")
 
         df = df.sort_values("date").reset_index(drop=True)
@@ -151,7 +152,7 @@ class MarketDataService:
         return df.reset_index(drop=True)
 
     ########################################################
-    # RETRY FETCH (NON-BLOCKING BACKOFF)
+    # RETRY FETCH (FAST BACKOFF)
     ########################################################
 
     def _fetch_with_retry(
@@ -170,7 +171,6 @@ class MarketDataService:
 
             try:
 
-                # 🔥 REMOVE hard provider lock
                 df = self._fetcher.fetch(
                     ticker,
                     start,
@@ -193,7 +193,7 @@ class MarketDataService:
 
                 last_error = e
 
-                sleep = 0.6 + random.uniform(0, 0.4)
+                sleep = 0.4 + random.uniform(0.1, 0.4)
 
                 logger.warning(
                     "Fetch failed (%s) attempt %d/%d | %.2fs | %s",
@@ -211,7 +211,7 @@ class MarketDataService:
         ) from last_error
 
     ########################################################
-    # MEMORY CACHE (UNCHANGED)
+    # MEMORY CACHE
     ########################################################
 
     def _cache_key(self, ticker, start, end, interval, min_history):
@@ -278,7 +278,7 @@ class MarketDataService:
         return df
 
     ########################################################
-    # STABLE PARALLEL BATCH
+    # STABLE PARALLEL BATCH (PRODUCTION SAFE)
     ########################################################
 
     def get_price_data_batch(
@@ -295,7 +295,17 @@ class MarketDataService:
 
         tickers = list(dict.fromkeys(tickers))
 
-        worker_cap = min(self.MAX_WORKERS, max(2, len(tickers) // 4))
+        # 🔥 Strict worker cap — protect Yahoo semaphore
+        worker_cap = min(
+            self.MAX_WORKERS,
+            max(2, len(tickers) // 5)
+        )
+
+        logger.info(
+            "Batch fetch starting | tickers=%d | workers=%d",
+            len(tickers),
+            worker_cap
+        )
 
         with ThreadPoolExecutor(max_workers=worker_cap) as executor:
 
@@ -324,7 +334,7 @@ class MarketDataService:
                         str(e)
                     )
 
-        if len(results) == 0:
+        if not results:
             raise RuntimeError("All tickers failed during batch fetch.")
 
         if failures:
