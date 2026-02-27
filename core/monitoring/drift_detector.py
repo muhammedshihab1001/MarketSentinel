@@ -29,7 +29,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "20.1"  # 🔥 safe bump
+    BASELINE_VERSION = "20.1"
     DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
 
     MIN_SAMPLE_BASELINE = 150
@@ -68,6 +68,18 @@ class DriftDetector:
         ).lower() == "true"
 
         self._model_loader = ModelLoader()
+
+    ########################################################
+    # PUBLIC BASELINE CREATION (🔥 FIX)
+    ########################################################
+
+    def create_baseline(self, dataset: pd.DataFrame):
+        """
+        Explicit baseline creation used by training pipeline.
+        Preserves full governance + atomic write.
+        """
+        logger.info("Creating drift baseline explicitly (training mode).")
+        self._auto_regenerate_baseline(dataset)
 
     ########################################################
     # SAFE FEATURE BLOCK
@@ -128,14 +140,10 @@ class DriftDetector:
         os.replace(tmp_path, self.BASELINE_PATH)
 
     ########################################################
-    # SAFE MODEL VERSION RESOLUTION 🔥
+    # SAFE MODEL VERSION RESOLUTION
     ########################################################
 
     def _resolve_model_version(self) -> str:
-        """
-        Safely extract model version from ModelLoader
-        without assuming attribute names.
-        """
 
         if hasattr(self._model_loader, "xgb_version"):
             return str(self._model_loader.xgb_version)
@@ -149,7 +157,7 @@ class DriftDetector:
         return "unknown"
 
     ########################################################
-    # AUTO BASELINE REGEN (FIXED)
+    # AUTO BASELINE REGEN
     ########################################################
 
     def _auto_regenerate_baseline(self, dataset: pd.DataFrame):
@@ -192,7 +200,7 @@ class DriftDetector:
                 "baseline_version": self.BASELINE_VERSION,
                 "created_at": datetime.utcnow().isoformat(),
                 "schema_signature": get_schema_signature(),
-                "model_version": self._resolve_model_version(),  # 🔥 FIXED
+                "model_version": self._resolve_model_version(),
                 "feature_checksum": MetadataManager.fingerprint_features(
                     tuple(MODEL_FEATURES)
                 ),
@@ -202,73 +210,6 @@ class DriftDetector:
         }
 
         self._atomic_write(payload)
-
-    ########################################################
-    # LOAD VERIFIED BASELINE
-    ########################################################
-
-    def _load_verified_baseline(self, dataset: pd.DataFrame):
-
-        if not os.path.exists(self.BASELINE_PATH):
-            if self.AUTO_REGENERATE:
-                self._auto_regenerate_baseline(dataset)
-            else:
-                raise RuntimeError("Baseline missing.")
-
-        with open(self.BASELINE_PATH, encoding="utf-8") as f:
-            baseline = json.load(f)
-
-        if baseline["integrity_hash"] != self._baseline_hash(baseline):
-            raise RuntimeError("Baseline integrity failure.")
-
-        meta = baseline["meta"]
-
-        if meta["baseline_version"] != self.BASELINE_VERSION:
-            if self.AUTO_REGENERATE:
-                self._auto_regenerate_baseline(dataset)
-                return self._load_verified_baseline(dataset)
-            raise RuntimeError("Baseline version mismatch.")
-
-        if meta["schema_signature"] != get_schema_signature():
-            if self.AUTO_REGENERATE:
-                self._auto_regenerate_baseline(dataset)
-                return self._load_verified_baseline(dataset)
-            raise RuntimeError("Baseline schema mismatch.")
-
-        if meta.get("feature_checksum"):
-            current_checksum = MetadataManager.fingerprint_features(
-                tuple(MODEL_FEATURES)
-            )
-            if meta["feature_checksum"] != current_checksum:
-                if self.AUTO_REGENERATE:
-                    self._auto_regenerate_baseline(dataset)
-                    return self._load_verified_baseline(dataset)
-                raise RuntimeError("Feature checksum mismatch.")
-
-        return baseline
-
-    ########################################################
-    # PSI
-    ########################################################
-
-    def _psi(self, bin_edges, expected_counts, actual):
-
-        actual = np.asarray(actual, dtype=np.float64)
-        actual_counts = np.histogram(actual, bins=bin_edges)[0]
-
-        expected_perc = expected_counts / max(expected_counts.sum(), self.EPSILON)
-        actual_perc = actual_counts / max(actual_counts.sum(), self.EPSILON)
-
-        expected_perc = np.clip(expected_perc, self.MIN_BIN_PCT, None)
-        actual_perc = np.clip(actual_perc, self.MIN_BIN_PCT, None)
-
-        psi = np.sum(
-            (actual_perc - expected_perc) *
-            np.log((actual_perc + self.EPSILON) /
-                   (expected_perc + self.EPSILON))
-        )
-
-        return float(psi)
 
     ########################################################
     # DETECT (CONTRACT PRESERVED)
