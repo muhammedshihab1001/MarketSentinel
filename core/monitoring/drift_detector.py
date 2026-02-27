@@ -29,7 +29,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "20.1"
+    BASELINE_VERSION = "21.0"  # bumped due to extended meta contract
     DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
 
     MIN_SAMPLE_BASELINE = 150
@@ -70,19 +70,71 @@ class DriftDetector:
         self._model_loader = ModelLoader()
 
     ########################################################
-    # PUBLIC BASELINE CREATION (TRAINING CONTRACT SAFE)
+    # PUBLIC BASELINE CREATION (FULL TRAINING CONTRACT)
     ########################################################
 
     def create_baseline(
         self,
         dataset: pd.DataFrame,
-        dataset_hash: str | None = None
+        dataset_hash: str,
+        training_code_hash: str,
+        feature_checksum: str,
+        model_version: str,
+        allow_overwrite: bool = False
     ):
-        logger.info("Creating drift baseline explicitly (training mode).")
-        self._auto_regenerate_baseline(
-            dataset=dataset,
-            dataset_hash=dataset_hash
-        )
+
+        if os.path.exists(self.BASELINE_PATH) and not allow_overwrite:
+            raise RuntimeError(
+                "Baseline already exists. Use allow_overwrite=True to replace."
+            )
+
+        logger.info("Creating governed drift baseline.")
+
+        numeric = self._safe_feature_block(dataset)
+        baseline_features = {}
+
+        for col in MODEL_FEATURES:
+
+            series = numeric[col].dropna()
+
+            if len(series) < self.MIN_SAMPLE_BASELINE:
+                continue
+
+            mean = float(series.mean())
+            std = float(max(series.std(), self.EPSILON))
+            variance = float(max(series.var(), self.EPSILON))
+
+            quantiles = np.linspace(0, 1, 11)
+            bin_edges = np.unique(np.quantile(series, quantiles))
+
+            if len(bin_edges) < 2:
+                bin_edges = np.array([series.min(), series.max() + self.EPSILON])
+
+            expected_counts = np.histogram(series, bins=bin_edges)[0]
+
+            baseline_features[col] = {
+                "mean": mean,
+                "std": std,
+                "variance": variance,
+                "bin_edges": bin_edges.tolist(),
+                "expected_counts": expected_counts.tolist()
+            }
+
+        payload = {
+            "meta": {
+                "baseline_version": self.BASELINE_VERSION,
+                "created_at": datetime.utcnow().isoformat(),
+                "schema_signature": get_schema_signature(),
+                "model_version": model_version,
+                "dataset_hash": dataset_hash,
+                "training_code_hash": training_code_hash,
+                "feature_checksum": feature_checksum,
+                "feature_count": len(baseline_features)
+            },
+            "features": baseline_features
+        }
+
+        self._atomic_write(payload)
 
     ########################################################
     # SAFE FEATURE BLOCK
@@ -142,91 +194,13 @@ class DriftDetector:
         os.replace(tmp_path, self.BASELINE_PATH)
 
     ########################################################
-    # SAFE MODEL VERSION RESOLUTION
-    ########################################################
-
-    def _resolve_model_version(self) -> str:
-
-        if hasattr(self._model_loader, "xgb_version"):
-            return str(self._model_loader.xgb_version)
-
-        if hasattr(self._model_loader, "model_version"):
-            return str(self._model_loader.model_version)
-
-        if hasattr(self._model_loader, "version"):
-            return str(self._model_loader.version)
-
-        return "unknown"
-
-    ########################################################
-    # BASELINE CREATION
-    ########################################################
-
-    def _auto_regenerate_baseline(
-        self,
-        dataset: pd.DataFrame,
-        dataset_hash: str | None = None
-    ):
-
-        logger.warning("Auto-regenerating drift baseline.")
-
-        numeric = self._safe_feature_block(dataset)
-        baseline_features = {}
-
-        for col in MODEL_FEATURES:
-
-            series = numeric[col].dropna()
-            if len(series) < self.MIN_SAMPLE_BASELINE:
-                continue
-
-            mean = float(series.mean())
-            std = float(max(series.std(), self.EPSILON))
-            variance = float(max(series.var(), self.EPSILON))
-
-            quantiles = np.linspace(0, 1, 11)
-            bin_edges = np.unique(np.quantile(series, quantiles))
-
-            if len(bin_edges) < 2:
-                bin_edges = np.array([series.min(), series.max() + self.EPSILON])
-
-            expected_counts = np.histogram(series, bins=bin_edges)[0]
-
-            baseline_features[col] = {
-                "mean": mean,
-                "std": std,
-                "variance": variance,
-                "bin_edges": bin_edges.tolist(),
-                "expected_counts": expected_counts.tolist()
-            }
-
-        payload = {
-            "meta": {
-                "baseline_version": self.BASELINE_VERSION,
-                "created_at": datetime.utcnow().isoformat(),
-                "schema_signature": get_schema_signature(),
-                "model_version": self._resolve_model_version(),
-                "feature_checksum": MetadataManager.fingerprint_features(
-                    tuple(MODEL_FEATURES)
-                ),
-                "feature_count": len(baseline_features),
-                "dataset_hash": dataset_hash
-            },
-            "features": baseline_features
-        }
-
-        self._atomic_write(payload)
-
-    ########################################################
     # LOAD VERIFIED BASELINE
     ########################################################
 
-    def _load_verified_baseline(self, dataset: pd.DataFrame):
+    def _load_verified_baseline(self):
 
         if not os.path.exists(self.BASELINE_PATH):
-            if self.AUTO_REGENERATE:
-                self._auto_regenerate_baseline(dataset)
-            else:
-                raise RuntimeError("Baseline missing.")
+            raise RuntimeError("Baseline missing.")
 
         with open(self.BASELINE_PATH, encoding="utf-8") as f:
             baseline = json.load(f)
@@ -242,12 +216,12 @@ class DriftDetector:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Baseline schema mismatch.")
 
-        if meta.get("feature_checksum"):
-            current_checksum = MetadataManager.fingerprint_features(
-                tuple(MODEL_FEATURES)
-            )
-            if meta["feature_checksum"] != current_checksum:
-                raise RuntimeError("Feature checksum mismatch.")
+        current_checksum = MetadataManager.fingerprint_features(
+            tuple(MODEL_FEATURES)
+        )
+
+        if meta.get("feature_checksum") != current_checksum:
+            raise RuntimeError("Feature checksum mismatch.")
 
         return baseline
 
@@ -282,7 +256,7 @@ class DriftDetector:
 
         try:
 
-            baseline = self._load_verified_baseline(dataset)
+            baseline = self._load_verified_baseline()
 
             numeric = self._safe_feature_block(
                 dataset.tail(self.MAX_INFERENCE_ROWS)
@@ -335,10 +309,7 @@ class DriftDetector:
                     "drift": drift
                 }
 
-            severity_score = min(
-                int(severity_accumulator),
-                self.MAX_SEVERITY_CAP
-            )
+            severity_score = min(int(severity_accumulator), self.MAX_SEVERITY_CAP)
 
             drift_state = (
                 "hard" if severity_score >= self.HARD_SEVERITY_THRESHOLD
@@ -347,7 +318,6 @@ class DriftDetector:
             )
 
             drift_detected = drift_count > 0
-
             DRIFT_DETECTED.set(1 if drift_detected else 0)
 
             return {
