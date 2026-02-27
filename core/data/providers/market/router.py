@@ -3,7 +3,6 @@ import logging
 import pandas as pd
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core.data.providers.market.yahoo_provider import YahooProvider
 
@@ -35,8 +34,7 @@ class MarketProviderRouter:
     DEFAULT_MIN_ROWS = 50
     MAX_DAILY_MOVE = 0.90
     PROVIDER_TIMEOUT_WARN = 8.0
-    MAX_PROVIDER_WORKERS = 3
-    FAILURE_COOLDOWN = 30
+    FAILURE_COOLDOWN = 20  # slightly reduced for live snapshot stability
 
     ALLOWED_INTERVALS = {
         "1d", "D",
@@ -114,7 +112,7 @@ class MarketProviderRouter:
     def _provider_allowed(self, name):
 
         if self._single_provider_mode:
-            return True  # 🔥 disable cooldown logic if only one provider
+            return True
 
         with self._lock:
             last_fail = self._provider_failures.get(name)
@@ -127,11 +125,13 @@ class MarketProviderRouter:
     def _record_failure(self, name):
 
         if self._single_provider_mode:
-            return  # 🔥 no cooldown in single-provider mode
+            return
 
         with self._lock:
             self._provider_failures[name] = time.time()
 
+    ############################################################
+    # MAIN FETCH (SEQUENTIAL FALLBACK)
     ############################################################
 
     def fetch(
@@ -149,22 +149,38 @@ class MarketProviderRouter:
         if min_rows is None:
             min_rows = self.DEFAULT_MIN_ROWS
 
+        # 🔥 If specific provider requested
         if provider is not None:
+
             provider = provider.lower()
 
-            match = [
-                (name, p)
-                for name, p in self.providers
-                if name == provider
-            ]
+            for name, provider_obj in self.providers:
+                if name == provider:
 
-            if not match:
-                raise RuntimeError(f"Requested provider not available: {provider}")
+                    if not self._provider_allowed(name):
+                        raise RuntimeError(f"Provider {name} in cooldown.")
 
-            name, provider_obj = match[0]
+                    try:
+                        return self._attempt_provider(
+                            name,
+                            provider_obj,
+                            ticker,
+                            start,
+                            end,
+                            interval,
+                            min_rows
+                        )
+                    except Exception:
+                        self._record_failure(name)
+                        raise
+
+            raise RuntimeError(f"Requested provider not available: {provider}")
+
+        # 🔥 Sequential fallback (no nested thread pool)
+        for name, provider_obj in self.providers:
 
             if not self._provider_allowed(name):
-                raise RuntimeError(f"Provider {name} in cooldown.")
+                continue
 
             try:
                 return self._attempt_provider(
@@ -176,53 +192,17 @@ class MarketProviderRouter:
                     interval,
                     min_rows
                 )
+
             except Exception as e:
+
+                logger.warning(
+                    "Provider failed → %s | ticker=%s | error=%s",
+                    name,
+                    ticker,
+                    str(e)
+                )
+
                 self._record_failure(name)
-                raise
-
-        eligible = [
-            (name, provider_obj)
-            for name, provider_obj in self.providers
-            if self._provider_allowed(name)
-        ]
-
-        if not eligible:
-            raise RuntimeError("All providers in cooldown.")
-
-        futures = {}
-
-        with ThreadPoolExecutor(max_workers=self.MAX_PROVIDER_WORKERS) as executor:
-
-            for name, provider_obj in eligible:
-
-                futures[
-                    executor.submit(
-                        self._attempt_provider,
-                        name,
-                        provider_obj,
-                        ticker,
-                        start,
-                        end,
-                        interval,
-                        min_rows
-                    )
-                ] = name
-
-            for future in as_completed(futures):
-
-                name = futures[future]
-
-                try:
-                    return future.result()
-
-                except Exception as e:
-                    logger.warning(
-                        "Provider failed → %s | ticker=%s | error=%s",
-                        name,
-                        ticker,
-                        str(e)
-                    )
-                    self._record_failure(name)
 
         raise RuntimeError(f"All market providers failed for {ticker}")
 
