@@ -40,6 +40,14 @@ class SignalAgent:
         warnings: List[str] = []
 
         ####################################################
+        # 0️⃣ Cross-sectional dispersion check (RESTORED)
+        ####################################################
+
+        std_dispersion = float(probability_stats.get("std", 0.0))
+        if std_dispersion < self.DISPERSION_WEAK:
+            warnings.append("Low cross-sectional dispersion detected.")
+
+        ####################################################
         # 1️⃣ Confidence
         ####################################################
 
@@ -135,10 +143,13 @@ class SignalAgent:
         strength_score = int(np.clip(strength, 0, 100))
 
         ####################################################
-        # 7️⃣ Risk Level
+        # 7️⃣ Risk Level (Adjusted Policy)
         ####################################################
 
-        if strength_score >= 75:
+        # High-confidence signals should map to low risk
+        if confidence == "high" and strength_score >= 60:
+            risk_level = "low"
+        elif strength_score >= 75:
             risk_level = "low"
         elif strength_score >= 50:
             risk_level = "moderate"
