@@ -2,13 +2,14 @@ import logging
 import time
 import gc
 import hashlib
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Response, Request, HTTPException
 from fastapi.responses import JSONResponse
 from prometheus_client import generate_latest
 
-from core.config.env_loader import init_env, get_int, get_env
+from core.config.env_loader import init_env, get_int, get_env, get_bool
 
 from app.api.routes import (
     drift,
@@ -61,11 +62,21 @@ class ReadinessState:
     def __init__(self):
         self.models_loaded = False
         self.redis_connected = False
+
         self.schema_signature = None
         self.model_version = None
         self.artifact_hash = None
         self.dataset_hash = None
         self.training_code_hash = None
+
+        # -------------------------
+        # LLM STATE (NEW)
+        # -------------------------
+        self.llm_enabled = False
+        self.llm_model = None
+        self.llm_rate_limit = None
+        self.llm_cache_enabled = None
+
         self.boot_id = BOOT_ID
         self.start_time = int(time.time())
 
@@ -110,11 +121,11 @@ async def lifespan(app: FastAPI):
         logger.info("===================================")
 
         # -------------------------------------------------
-        # MODEL LOADING (INTERNAL SINGLETON)
+        # MODEL LOADING
         # -------------------------------------------------
 
         loader = ModelLoader()
-        _ = loader.xgb   # force model load
+        _ = loader.xgb
         loader.warmup()
 
         readiness.models_loaded = True
@@ -138,6 +149,25 @@ async def lifespan(app: FastAPI):
             logger.info("Redis connected.")
         else:
             logger.warning("Redis unavailable — degraded mode.")
+
+        # -------------------------------------------------
+        # LLM STATE CAPTURE (NEW)
+        # -------------------------------------------------
+
+        readiness.llm_enabled = get_bool("LLM_ENABLED", False)
+        readiness.llm_model = get_env("OPENAI_MODEL", None)
+        readiness.llm_rate_limit = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
+        readiness.llm_cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
+
+        if readiness.llm_enabled:
+            logger.info(
+                "LLM active | model=%s | rate_limit=%s/min | cache=%s",
+                readiness.llm_model,
+                readiness.llm_rate_limit,
+                readiness.llm_cache_enabled
+            )
+        else:
+            logger.info("LLM disabled at startup.")
 
         gc.collect()
 
@@ -239,6 +269,17 @@ def readiness_probe():
         "training_code_hash": readiness.training_code_hash,
         "redis_connected": readiness.redis_connected,
         "mode": "degraded" if not readiness.redis_connected else "normal",
+
+        # -------------------------
+        # LLM STATE (NEW)
+        # -------------------------
+        "llm": {
+            "enabled": readiness.llm_enabled,
+            "model": readiness.llm_model,
+            "rate_limit_per_min": readiness.llm_rate_limit,
+            "cache_enabled": readiness.llm_cache_enabled
+        },
+
         "uptime_seconds": int(time.time()) - readiness.start_time
     }
 
