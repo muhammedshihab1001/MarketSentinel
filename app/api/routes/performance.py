@@ -31,7 +31,7 @@ logger = logging.getLogger("marketsentinel.performance")
 MIN_HISTORY_ROWS = 60
 BENCHMARK_TICKER = "SPY"
 MIN_PROB_STD = 1e-6
-REQUEST_TIMEOUT = 60  # performance is heavy
+REQUEST_TIMEOUT = 60
 MAX_CONCURRENT = 2
 
 performance_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
@@ -56,14 +56,11 @@ async def compute_performance(days: int = 120):
     start_time = time.time()
 
     try:
-
         async with performance_semaphore:
-
             result = await asyncio.wait_for(
                 run_in_threadpool(_compute_performance_sync, days),
                 timeout=REQUEST_TIMEOUT
             )
-
         return result
 
     except asyncio.TimeoutError:
@@ -80,7 +77,7 @@ async def compute_performance(days: int = 120):
 
 
 # =========================================================
-# HEAVY SYNC LOGIC (UNCHANGED CORE)
+# HEAVY SYNC LOGIC
 # =========================================================
 
 def _compute_performance_sync(days: int):
@@ -119,7 +116,14 @@ def _compute_performance_sync(days: int):
 
         df = df.sort_values("date").reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-        df["forward_return"] = df["close"].shift(-1) / df["close"] - 1
+
+        df["forward_return"] = (
+            df["close"].shift(-1) / df["close"] - 1
+        )
+
+        df["forward_return"] = df["forward_return"].replace(
+            [np.inf, -np.inf], np.nan
+        )
 
         cleaned_history[ticker] = df
 
@@ -203,11 +207,11 @@ def _compute_performance_sync(days: int):
                     "date": row["date"],
                     "ticker": row["ticker"],
                     "signal": row["signal"],
-                    "weight": weights.get(row["ticker"], 0.0)
+                    "weight": float(weights.get(row["ticker"], 0.0))
                 })
 
         except Exception as e:
-            logger.warning(f"Skip {eval_date}: {str(e)}")
+            logger.warning(f"Skipping {eval_date}: {str(e)}")
 
     if not portfolio_records:
         raise RuntimeError("No portfolio history generated.")
@@ -226,7 +230,7 @@ def _compute_performance_sync(days: int):
         forward_frames.append(tmp)
 
     forward_df = pd.concat(forward_frames, ignore_index=True)
-    forward_df.dropna(inplace=True)
+    forward_df = forward_df.dropna(subset=["forward_return"])
 
     # =========================================================
     # STRATEGY PERFORMANCE
@@ -235,10 +239,10 @@ def _compute_performance_sync(days: int):
     report = engine.evaluate(portfolio_df, forward_df)
 
     # =========================================================
-    # BENCHMARK
+    # BENCHMARK (SOFT FAIL SAFE)
     # =========================================================
 
-    benchmark_map = market_data.get_price_data_batch(
+    benchmark_data = market_data.get_price_data_batch(
         tickers=[BENCHMARK_TICKER],
         start_date=start_str,
         end_date=end_str,
@@ -246,61 +250,71 @@ def _compute_performance_sync(days: int):
         min_history=MIN_HISTORY_ROWS
     )
 
-    benchmark_df = benchmark_map.get(BENCHMARK_TICKER)
+    benchmark_df = benchmark_data.get(BENCHMARK_TICKER)
 
-    if benchmark_df is None or benchmark_df.empty:
-        raise RuntimeError("Benchmark fetch failed.")
-
-    benchmark_df = benchmark_df.sort_values("date")
-    benchmark_df["date"] = pd.to_datetime(
-        benchmark_df["date"]
-    ).dt.normalize()
-
-    benchmark_df["forward_return"] = (
-        benchmark_df["close"].shift(-1) /
-        benchmark_df["close"] - 1
-    )
-
-    benchmark_returns = (
-        benchmark_df
-        .set_index("date")["forward_return"]
-        .reindex(report.daily_returns.index)
-        .dropna()
-    )
-
-    benchmark_equity = (1 + benchmark_returns).cumprod()
-    benchmark_cumulative = benchmark_equity.iloc[-1] - 1
-
-    aligned_strategy = report.daily_returns.loc[
-        benchmark_returns.index
-    ]
-
-    excess_returns = aligned_strategy - benchmark_returns
-
+    benchmark_cumulative = 0.0
+    alpha = 0.0
     info_ratio = 0.0
-    if excess_returns.std() > 0:
-        info_ratio = (
-            excess_returns.mean() /
-            excess_returns.std()
-        ) * (252 ** 0.5)
 
-    years = len(benchmark_returns) / 252
-    benchmark_annual = (
-        (1 + benchmark_cumulative) ** (1 / years) - 1
-        if years > 0 else 0.0
-    )
+    if benchmark_df is not None and not benchmark_df.empty:
 
-    alpha = report.annual_return - benchmark_annual
+        benchmark_df = benchmark_df.sort_values("date")
+        benchmark_df["date"] = pd.to_datetime(
+            benchmark_df["date"]
+        ).dt.normalize()
+
+        benchmark_df["forward_return"] = (
+            benchmark_df["close"].shift(-1) /
+            benchmark_df["close"] - 1
+        )
+
+        benchmark_returns = (
+            benchmark_df
+            .set_index("date")["forward_return"]
+            .reindex(report.daily_returns.index)
+            .dropna()
+        )
+
+        if len(benchmark_returns) > 2:
+
+            benchmark_equity = (1 + benchmark_returns).cumprod()
+            benchmark_cumulative = float(
+                benchmark_equity.iloc[-1] - 1
+            )
+
+            aligned_strategy = report.daily_returns.loc[
+                benchmark_returns.index
+            ]
+
+            excess_returns = aligned_strategy - benchmark_returns
+
+            if excess_returns.std() > 0:
+                info_ratio = float(
+                    (excess_returns.mean() /
+                     excess_returns.std()) * np.sqrt(252)
+                )
+
+            years = len(benchmark_returns) / 252
+            benchmark_annual = (
+                (1 + benchmark_cumulative) ** (1 / years) - 1
+                if years > 0 else 0.0
+            )
+
+            alpha = float(report.annual_return - benchmark_annual)
+
+    # =========================================================
+    # FINAL JSON SAFE RESPONSE
+    # =========================================================
 
     return {
         "strategy": {
-            "cumulative_return": report.cumulative_return,
-            "annual_return": report.annual_return,
-            "annual_volatility": report.annual_volatility,
-            "sharpe_ratio": report.sharpe_ratio,
-            "max_drawdown": report.max_drawdown,
-            "hit_rate": report.hit_rate,
-            "turnover": report.turnover,
+            "cumulative_return": float(report.cumulative_return),
+            "annual_return": float(report.annual_return),
+            "annual_volatility": float(report.annual_volatility),
+            "sharpe_ratio": float(report.sharpe_ratio),
+            "max_drawdown": float(report.max_drawdown),
+            "hit_rate": float(report.hit_rate),
+            "turnover": float(report.turnover),
         },
         "benchmark": {
             "ticker": BENCHMARK_TICKER,
