@@ -29,7 +29,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "21.1"  # bumped for lineage enforcement
+    BASELINE_VERSION = "21.1"
     DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
 
     MIN_SAMPLE_BASELINE = 150
@@ -70,7 +70,7 @@ class DriftDetector:
         self._model_loader = ModelLoader()
 
     ########################################################
-    # BASELINE CREATION (TRAINING CONTRACT)
+    # BASELINE CREATION
     ########################################################
 
     def create_baseline(
@@ -192,12 +192,7 @@ class DriftDetector:
     def _load_verified_baseline(self):
 
         if not os.path.exists(self.BASELINE_PATH):
-
-            if self.AUTO_REGENERATE:
-                logger.warning("Baseline missing — auto-regeneration enabled.")
-                raise RuntimeError("Baseline missing — must be created in training.")
-            else:
-                raise RuntimeError("Baseline missing.")
+            raise RuntimeError("Baseline missing.")
 
         with open(self.BASELINE_PATH, encoding="utf-8") as f:
             baseline = json.load(f)
@@ -223,7 +218,6 @@ class DriftDetector:
         if meta.get("feature_checksum") != current_checksum:
             raise RuntimeError("Feature checksum mismatch.")
 
-        # Soft lineage validation
         try:
             if meta.get("dataset_hash") and \
                     meta["dataset_hash"] != self._model_loader.dataset_hash:
@@ -232,7 +226,6 @@ class DriftDetector:
             if meta.get("training_code_hash") and \
                     meta["training_code_hash"] != self._model_loader.training_code_hash:
                 logger.warning("Baseline training code hash differs from loaded model.")
-
         except Exception:
             pass
 
@@ -356,5 +349,6 @@ class DriftDetector:
                 "drift_confidence": 1.0,
                 "coverage": 0.0,
                 "details": {},
-                "drift_state": "detector_failure"
+                "drift_state": "detector_failure",
+                "reason": "detector_failure"
             }
