@@ -29,7 +29,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "21.0"  # bumped due to extended meta contract
+    BASELINE_VERSION = "21.1"  # bumped for lineage enforcement
     DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
 
     MIN_SAMPLE_BASELINE = 150
@@ -70,7 +70,7 @@ class DriftDetector:
         self._model_loader = ModelLoader()
 
     ########################################################
-    # PUBLIC BASELINE CREATION (FULL TRAINING CONTRACT)
+    # BASELINE CREATION (TRAINING CONTRACT)
     ########################################################
 
     def create_baseline(
@@ -120,6 +120,9 @@ class DriftDetector:
                 "expected_counts": expected_counts.tolist()
             }
 
+        if len(baseline_features) == 0:
+            raise RuntimeError("Baseline feature set empty — insufficient training data.")
+
         payload = {
             "meta": {
                 "baseline_version": self.BASELINE_VERSION,
@@ -149,15 +152,8 @@ class DriftDetector:
         block = dataset.loc[:, MODEL_FEATURES].copy()
 
         for col in MODEL_FEATURES:
-            block[col] = pd.to_numeric(
-                block[col],
-                errors="coerce"
-            ).astype(DTYPE)
-
-            block[col] = block[col].replace(
-                [np.inf, -np.inf],
-                np.nan
-            )
+            block[col] = pd.to_numeric(block[col], errors="coerce").astype(DTYPE)
+            block[col] = block[col].replace([np.inf, -np.inf], np.nan)
 
         return block
 
@@ -171,11 +167,7 @@ class DriftDetector:
         clone = dict(payload)
         clone.pop("integrity_hash", None)
 
-        canonical = json.dumps(
-            clone,
-            sort_keys=True
-        ).encode()
-
+        canonical = json.dumps(clone, sort_keys=True).encode()
         return hashlib.sha256(canonical).hexdigest()
 
     ########################################################
@@ -200,7 +192,12 @@ class DriftDetector:
     def _load_verified_baseline(self):
 
         if not os.path.exists(self.BASELINE_PATH):
-            raise RuntimeError("Baseline missing.")
+
+            if self.AUTO_REGENERATE:
+                logger.warning("Baseline missing — auto-regeneration enabled.")
+                raise RuntimeError("Baseline missing — must be created in training.")
+            else:
+                raise RuntimeError("Baseline missing.")
 
         with open(self.BASELINE_PATH, encoding="utf-8") as f:
             baseline = json.load(f)
@@ -216,12 +213,28 @@ class DriftDetector:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Baseline schema mismatch.")
 
+        if meta.get("feature_count", 0) <= 0:
+            raise RuntimeError("Baseline feature_count invalid.")
+
         current_checksum = MetadataManager.fingerprint_features(
             tuple(MODEL_FEATURES)
         )
 
         if meta.get("feature_checksum") != current_checksum:
             raise RuntimeError("Feature checksum mismatch.")
+
+        # Soft lineage validation
+        try:
+            if meta.get("dataset_hash") and \
+                    meta["dataset_hash"] != self._model_loader.dataset_hash:
+                logger.warning("Baseline dataset hash differs from loaded model.")
+
+            if meta.get("training_code_hash") and \
+                    meta["training_code_hash"] != self._model_loader.training_code_hash:
+                logger.warning("Baseline training code hash differs from loaded model.")
+
+        except Exception:
+            pass
 
         return baseline
 
