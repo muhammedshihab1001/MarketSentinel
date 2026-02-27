@@ -53,7 +53,6 @@ async def equity_curve(days: int = 120):
     start_time = time.time()
 
     try:
-
         async with equity_semaphore:
             result = await asyncio.wait_for(
                 run_in_threadpool(_equity_curve_sync, days),
@@ -82,7 +81,7 @@ def _equity_curve_sync(days: int):
     loader = get_shared_model_loader()
     market_data = MarketDataService()
 
-    universe = MarketUniverse.get_universe()
+    universe = list(set(MarketUniverse.get_universe()))
 
     end_date = pd.Timestamp.utcnow().normalize()
     start_date = end_date - pd.Timedelta(days=days + 365)
@@ -124,7 +123,7 @@ def _equity_curve_sync(days: int):
     for ticker, df in cleaned_history.items():
 
         features = pipeline.feature_store.get_features(
-            df,
+            price_df=df,
             sentiment_df=None,
             ticker=ticker,
             training=False
@@ -156,7 +155,7 @@ def _equity_curve_sync(days: int):
     eval_dates = combined_dates[-days:]
 
     ############################################################
-    # 5️⃣ HISTORICAL SIGNAL GENERATION (CORRECTED)
+    # 5️⃣ HISTORICAL SIGNAL GENERATION
     ############################################################
 
     portfolio_records = []
@@ -243,7 +242,11 @@ def _equity_curve_sync(days: int):
         benchmark_df["close"] - 1
     )
 
-    benchmark_returns = benchmark_df.set_index("date")["forward_return"]
+    benchmark_returns = (
+        benchmark_df
+        .set_index("date")["forward_return"]
+        .dropna()
+    )
 
     ############################################################
     # 8️⃣ STRATEGY PERFORMANCE
@@ -255,15 +258,25 @@ def _equity_curve_sync(days: int):
         benchmark_returns=benchmark_returns
     )
 
+    ############################################################
+    # 9️⃣ ALIGN STRATEGY + BENCHMARK
+    ############################################################
+
     aligned_benchmark = benchmark_returns.reindex(
         report.equity_curve.index
     ).dropna()
 
+    if aligned_benchmark.empty:
+        raise RuntimeError("Benchmark alignment failed.")
+
+    aligned_strategy = report.equity_curve.loc[
+        aligned_benchmark.index
+    ]
+
     benchmark_equity = (1 + aligned_benchmark).cumprod()
-    aligned_strategy = report.equity_curve.loc[benchmark_equity.index]
 
     ############################################################
-    # 9️⃣ STRUCTURED OUTPUT
+    # 🔟 STRUCTURED OUTPUT
     ############################################################
 
     return {
