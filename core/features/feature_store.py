@@ -24,10 +24,13 @@ class FeatureStore:
 
     CACHE_VERSION = "v22"
     MAX_CACHE_FILES_PER_TICKER = 6
-    MIN_FILE_BYTES = 5_000
     MAX_TOTAL_CACHE_FILES = 2000
+    MIN_FILE_BYTES = 5_000
 
     _memory_cache = {}
+    _memory_cache_limit = 100  # prevent unbounded growth
+
+    ########################################################
 
     def __init__(self):
         os.makedirs(self.FEATURE_DIR, exist_ok=True)
@@ -50,9 +53,9 @@ class FeatureStore:
         if df.duplicated(subset=["ticker", "date"]).any():
             raise RuntimeError("Duplicate feature rows detected.")
 
-        arr = df.select_dtypes("number").to_numpy(dtype=float)
+        numeric = df.select_dtypes("number")
 
-        if not np.isfinite(arr).all():
+        if not np.isfinite(numeric.to_numpy(dtype=float)).all():
             raise RuntimeError("Non-finite feature values detected.")
 
     ########################################################
@@ -93,7 +96,7 @@ class FeatureStore:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     ########################################################
-    # STABLE DATASET HASH
+    # DATASET HASH
     ########################################################
 
     def _dataset_hash(
@@ -117,7 +120,28 @@ class FeatureStore:
         return h.hexdigest()[:20]
 
     ########################################################
-    # CACHE CLEANUP
+    # GLOBAL CACHE CLEANUP
+    ########################################################
+
+    def _cleanup_global_cache(self):
+
+        files = [
+            f for f in os.listdir(self.FEATURE_DIR)
+            if f.endswith(".parquet")
+        ]
+
+        if len(files) > self.MAX_TOTAL_CACHE_FILES:
+            files.sort()
+            excess = files[:-self.MAX_TOTAL_CACHE_FILES]
+
+            for f in excess:
+                try:
+                    os.remove(os.path.join(self.FEATURE_DIR, f))
+                except Exception:
+                    pass
+
+    ########################################################
+    # PER-TICKER CLEANUP
     ########################################################
 
     def _cleanup_old_cache(self, ticker: str):
@@ -136,6 +160,21 @@ class FeatureStore:
                     os.remove(os.path.join(self.FEATURE_DIR, f))
                 except Exception:
                     pass
+
+        self._cleanup_global_cache()
+
+    ########################################################
+    # MEMORY CACHE MANAGEMENT
+    ########################################################
+
+    def _set_memory_cache(self, key, df):
+
+        if len(self._memory_cache) >= self._memory_cache_limit:
+            # remove oldest inserted
+            oldest = next(iter(self._memory_cache))
+            self._memory_cache.pop(oldest, None)
+
+        self._memory_cache[key] = df
 
     ########################################################
     # MAIN ENTRY
@@ -163,7 +202,6 @@ class FeatureStore:
 
         ticker_safe = re.sub(r"[^A-Za-z0-9_]", "_", ticker)
 
-        # 🔥 FIXED: memory cache now matches disk versioning
         cache_key = (
             f"{self.CACHE_VERSION}_"
             f"{ticker_safe}_"
@@ -172,6 +210,10 @@ class FeatureStore:
             f"{self.engineer_hash}_"
             f"{self.env_hash}"
         )
+
+        ####################################################
+        # MEMORY CACHE
+        ####################################################
 
         if cache_key in self._memory_cache:
             return self._memory_cache[cache_key]
@@ -190,11 +232,14 @@ class FeatureStore:
                 df = pd.read_parquet(path)
                 self._validate_basic_integrity(df)
 
-                self._memory_cache[cache_key] = df
+                self._set_memory_cache(cache_key, df)
                 return df
             except Exception:
                 logger.warning("Corrupted feature cache removed.")
-                os.remove(path)
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
         ####################################################
         # REBUILD
@@ -205,7 +250,7 @@ class FeatureStore:
         df = self.engineer._validate_price_frame(price_df, ticker)
         df = self.engineer.add_core_features(df)
 
-        df = df.replace([np.inf, -np.inf], np.nan)
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
         numeric_cols = df.select_dtypes(include=[np.number]).columns
 
@@ -242,6 +287,6 @@ class FeatureStore:
 
         self._cleanup_old_cache(ticker)
 
-        self._memory_cache[cache_key] = df
+        self._set_memory_cache(cache_key, df)
 
         return df
