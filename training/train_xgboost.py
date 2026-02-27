@@ -34,7 +34,7 @@ SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
 
-# Production thresholds
+# Production thresholds (kept)
 MIN_PRODUCTION_SHARPE = 0.10
 MAX_DRAWDOWN = -0.55
 MAX_REASONABLE_SHARPE = 5.0
@@ -54,7 +54,7 @@ def enforce_determinism():
 
 
 ############################################################
-# PRODUCTION METRIC VALIDATION
+# PRODUCTION METRIC VALIDATION (UNCHANGED)
 ############################################################
 
 def validate_production_metrics(metrics: dict):
@@ -105,7 +105,7 @@ def validate_production_metrics(metrics: dict):
 
 
 ############################################################
-# FEATURE CHECKSUM
+# FEATURE CHECKSUM (UNCHANGED)
 ############################################################
 
 def compute_feature_checksum():
@@ -117,7 +117,7 @@ def compute_feature_checksum():
 
 
 ############################################################
-# DATASET HASH
+# DATASET HASH (UNCHANGED)
 ############################################################
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
@@ -126,7 +126,7 @@ def compute_dataset_hash(df: pd.DataFrame) -> str:
 
 
 ############################################################
-# LOAD DATA
+# LOAD DATA (UNCHANGED)
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -185,31 +185,19 @@ def load_training_data(start_date, end_date):
 
 
 ############################################################
-# TARGET
+# TARGET (CORRECT REGRESSION ALPHA)
 ############################################################
 
 def build_final_target(df: pd.DataFrame):
 
     df = df.sort_values(["ticker", "date"]).copy()
 
-    df["forward_log_return"] = (
+    df["target"] = (
         df.groupby("ticker")["close"]
         .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
     )
 
-    df = df.dropna(subset=["forward_log_return"])
-
-    df["alpha_rank_pct"] = (
-        df.groupby("date")["forward_log_return"]
-        .rank(pct=True)
-    )
-
-    df["target"] = np.nan
-    df.loc[df["alpha_rank_pct"] >= 0.7, "target"] = 1
-    df.loc[df["alpha_rank_pct"] <= 0.3, "target"] = 0
-
     df = df.dropna(subset=["target"])
-    df["target"] = df["target"].astype(int)
 
     MIN_CS_WIDTH = 8
     counts = df.groupby("date")["ticker"].transform("count")
@@ -221,7 +209,7 @@ def build_final_target(df: pd.DataFrame):
         )
 
     logger.info(
-        "Final training dataset | rows=%s | unique_dates=%s",
+        "Final regression training dataset | rows=%s | unique_dates=%s",
         len(df),
         df["date"].nunique()
     )
@@ -230,10 +218,12 @@ def build_final_target(df: pd.DataFrame):
 
 
 ############################################################
-# TRAINERS
+# TRAINERS (UNCHANGED)
 ############################################################
 
 def trainer(train_df):
+
+    train_df = build_final_target(train_df)
 
     X = validate_feature_schema(
         train_df.loc[:, MODEL_FEATURES],
@@ -250,6 +240,8 @@ def trainer(train_df):
 
 def final_trainer(train_df):
 
+    train_df = build_final_target(train_df)
+
     X = validate_feature_schema(
         train_df.loc[:, MODEL_FEATURES],
         mode="strict_contract"
@@ -264,7 +256,7 @@ def final_trainer(train_df):
 
 
 ############################################################
-# EXPORT (ATOMIC POINTER UPDATE)
+# EXPORT (UNCHANGED)
 ############################################################
 
 def export_artifacts(model, metrics, dataset_hash,
@@ -360,7 +352,7 @@ def main(start_date=None, end_date=None,
     final_df = build_final_target(raw_df)
     dataset_hash = compute_dataset_hash(final_df)
 
-    final_model = final_trainer(final_df)
+    final_model = final_trainer(raw_df)
 
     version = export_artifacts(
         final_model,
