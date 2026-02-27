@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import logging
 import os
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 from core.data.market_data_service import MarketDataService
 from core.features.feature_store import FeatureStore
@@ -54,6 +54,8 @@ def get_shared_model_loader():
 
 
 # =========================================================
+# CIRCUIT BREAKER
+# =========================================================
 
 class CircuitBreaker:
     def __init__(self, threshold=3, cooldown=120):
@@ -85,6 +87,8 @@ class CircuitBreaker:
 
 
 # =========================================================
+# INFERENCE PIPELINE
+# =========================================================
 
 class InferencePipeline:
 
@@ -109,7 +113,7 @@ class InferencePipeline:
         self.breaker = CircuitBreaker()
         self.agent = SignalAgent()
 
-        self._snapshot_cache: Dict = {}
+        self._snapshot_cache: Dict[Tuple[str, ...], Tuple[Dict, float]] = {}
         self._snapshot_lock = threading.Lock()
 
         self._validate_models_loaded()
@@ -118,7 +122,6 @@ class InferencePipeline:
 
     def _validate_models_loaded(self):
 
-        # Force reload via public API
         version = self.models.xgb_version
         schema_sig = self.models.schema_signature
 
@@ -127,36 +130,45 @@ class InferencePipeline:
                 "Schema signature mismatch between training and inference."
             )
 
-        logger.info(
-            "Model + schema verified | version=%s",
-            version
-        )
+        logger.info("Model + schema verified | version=%s", version)
 
     # =========================================================
+    # CROSS-SECTION ENFORCEMENT
+    # =========================================================
 
-    def _select_latest_snapshot(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            raise RuntimeError("Feature dataframe empty before snapshot selection.")
-        latest_date = df["date"].max()
-        latest_df = df[df["date"] == latest_date].copy()
-        if latest_df.empty:
-            raise RuntimeError("No rows found for latest snapshot date.")
-        return latest_df.reset_index(drop=True)
+    def _enforce_full_universe(self, tickers: List[str]) -> Tuple[List[str], List[str]]:
+
+        production_universe = sorted(set(MarketUniverse.get_universe()))
+        requested = sorted(set([t.upper().strip() for t in tickers]))
+
+        if set(requested) == set(production_universe):
+            return production_universe, requested
+
+        logger.warning(
+            "Expanding inference to full production universe "
+            "to preserve cross-sectional integrity."
+        )
+
+        return production_universe, requested
 
     # =========================================================
 
     def run_snapshot(self, tickers: List[str]):
 
-        cache_key = tuple(sorted(tickers))
+        expanded_tickers, originally_requested = self._enforce_full_universe(tickers)
+
+        cache_key = tuple(sorted(expanded_tickers))
 
         with self._snapshot_lock:
             item = self._snapshot_cache.get(cache_key)
             if item:
                 result, ts = item
                 if time.time() - ts <= self.SNAPSHOT_CACHE_TTL:
+                    if set(originally_requested) != set(expanded_tickers):
+                        return self._filter_snapshot(result, originally_requested)
                     return result
 
-        if len(tickers) > self.MAX_BATCH_SIZE:
+        if len(expanded_tickers) > self.MAX_BATCH_SIZE:
             raise RuntimeError("Batch size exceeds MAX_BATCH_SIZE.")
 
         if not self.breaker.allow():
@@ -166,10 +178,9 @@ class InferencePipeline:
         start_time = time.time()
 
         try:
-            df = self._build_cross_sectional_frame(tickers)
+            df = self._build_cross_sectional_frame(expanded_tickers)
             latest_df = self._select_latest_snapshot(df)
 
-            # Universe filter (soft drop)
             universe = set(MarketUniverse.get_universe())
             latest_df = latest_df[latest_df["ticker"].isin(universe)]
 
@@ -181,9 +192,7 @@ class InferencePipeline:
                 mode="inference"
             ).astype(DTYPE)
 
-            # -------------------------------------------------
-            # Drift detection (soft fail)
-            # -------------------------------------------------
+            # Drift detection
             try:
                 drift_result = self.drift_detector.detect(feature_df)
                 if drift_result.get("drift_state") == "hard":
@@ -198,11 +207,8 @@ class InferencePipeline:
                     "drift_confidence": 0.0
                 }
 
-            # -------------------------------------------------
             # Model inference
-            # -------------------------------------------------
             probs = self.models.xgb.predict_proba(feature_df)[:, 1]
-
             probs = np.clip(probs, 1e-6, 1 - 1e-6)
 
             if np.std(probs) < self.MIN_PROB_STD:
@@ -217,11 +223,7 @@ class InferencePipeline:
                 else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
             )
 
-            weights = (
-                self._construct_portfolio(latest_df)
-                if len(latest_df) >= 2
-                else {latest_df.iloc[0]["ticker"]: 0.0}
-            )
+            weights = self._construct_portfolio(latest_df)
 
             prob_stats = {
                 "mean": float(np.mean(probs)),
@@ -258,15 +260,19 @@ class InferencePipeline:
                 "signals": snapshot_rows
             }
 
+            with self._snapshot_lock:
+                self._snapshot_cache[cache_key] = (result, time.time())
+
             MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
             MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(
                 time.time() - start_time
             )
 
-            with self._snapshot_lock:
-                self._snapshot_cache[cache_key] = (result, time.time())
-
             self.breaker.record_success()
+
+            if set(originally_requested) != set(expanded_tickers):
+                return self._filter_snapshot(result, originally_requested)
+
             return result
 
         except Exception:
@@ -277,6 +283,31 @@ class InferencePipeline:
 
         finally:
             INFERENCE_IN_PROGRESS.dec()
+
+    # =========================================================
+
+    def _filter_snapshot(self, snapshot: Dict, tickers: List[str]) -> Dict:
+        filtered_signals = [
+            s for s in snapshot["signals"]
+            if s["ticker"] in tickers
+        ]
+
+        new_snapshot = snapshot.copy()
+        new_snapshot["signals"] = filtered_signals
+        new_snapshot["universe_size"] = len(filtered_signals)
+
+        return new_snapshot
+
+    # =========================================================
+
+    def _select_latest_snapshot(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            raise RuntimeError("Feature dataframe empty before snapshot selection.")
+        latest_date = df["date"].max()
+        latest_df = df[df["date"] == latest_date].copy()
+        if latest_df.empty:
+            raise RuntimeError("No rows found for latest snapshot date.")
+        return latest_df.reset_index(drop=True)
 
     # =========================================================
 
