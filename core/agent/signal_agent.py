@@ -18,6 +18,22 @@ class SignalAgent:
     DISPERSION_WEAK = 0.02
 
     ########################################################
+    # SAFE FLOAT
+    ########################################################
+
+    @staticmethod
+    def _safe_float(value, default=0.0):
+        try:
+            if value is None:
+                return default
+            val = float(value)
+            if not np.isfinite(val):
+                return default
+            return val
+        except Exception:
+            return default
+
+    ########################################################
     # PUBLIC API
     ########################################################
 
@@ -27,23 +43,27 @@ class SignalAgent:
         probability_stats: Dict[str, float],
     ) -> Dict[str, Any]:
 
-        score = float(row["score"])
-        rank_pct = float(row["rank_pct"])
-        signal = row["signal"]
+        score = self._safe_float(row.get("score"), 0.5)
+        rank_pct = self._safe_float(row.get("rank_pct"), 0.5)
+        signal = row.get("signal", "NEUTRAL")
 
-        volatility = float(row.get("volatility", 0.0))
-        rsi = float(row.get("rsi", 50.0))
-        ema_ratio = float(row.get("ema_ratio", 1.0))
-        momentum_z = float(row.get("momentum_20_z", 0.0))
-        regime_feature = float(row.get("regime_feature", 0.0))
+        volatility = self._safe_float(row.get("volatility"), 0.0)
+        rsi = self._safe_float(row.get("rsi"), 50.0)
+        ema_ratio = self._safe_float(row.get("ema_ratio"), 1.0)
+        momentum_z = self._safe_float(row.get("momentum_20_z"), 0.0)
+        regime_feature = self._safe_float(row.get("regime_feature"), 0.0)
 
         warnings: List[str] = []
 
         ####################################################
-        # 0️⃣ Cross-sectional dispersion check (RESTORED)
+        # 0️⃣ Cross-sectional dispersion check
         ####################################################
 
-        std_dispersion = float(probability_stats.get("std", 0.0))
+        std_dispersion = self._safe_float(
+            probability_stats.get("std"),
+            0.0
+        )
+
         if std_dispersion < self.DISPERSION_WEAK:
             warnings.append("Low cross-sectional dispersion detected.")
 
@@ -116,7 +136,7 @@ class SignalAgent:
         # Distance from neutral probability
         strength += abs(score - 0.5) * 100
 
-        # Rank distance boost
+        # Rank boost
         strength += abs(rank_pct - 0.5) * 50
 
         # Momentum alignment boost
@@ -143,10 +163,9 @@ class SignalAgent:
         strength_score = int(np.clip(strength, 0, 100))
 
         ####################################################
-        # 7️⃣ Risk Level (Adjusted Policy)
+        # 7️⃣ Risk Level
         ####################################################
 
-        # High-confidence signals should map to low risk
         if confidence == "high" and strength_score >= 60:
             risk_level = "low"
         elif strength_score >= 75:
