@@ -82,10 +82,28 @@ FORBIDDEN_REGEX = re.compile(
 )
 
 
+############################################################
+# INTERNAL UTILITIES
+############################################################
+
 def _check_forbidden_columns(df: pd.DataFrame):
     for col in df.columns:
         if FORBIDDEN_REGEX.search(col):
             raise RuntimeError(f"Lookahead column detected: {col}")
+
+
+def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensures numeric conversion without silent corruption.
+    """
+    df = df.copy()
+
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    return df
 
 
 ############################################################
@@ -137,11 +155,10 @@ def validate_feature_schema(
         feature_df = feature_df.loc[:, MODEL_FEATURES]
 
     ########################################################
-    # TYPE + CLEANUP
+    # NUMERIC + CLEANUP
     ########################################################
 
-    feature_df = feature_df.astype(DTYPE)
-    feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    feature_df = _safe_numeric_block(feature_df)
 
     ########################################################
     # CORE VALIDATION
@@ -163,7 +180,7 @@ def validate_feature_schema(
             logger.warning(f"Low variance core feature: {col}")
 
     ########################################################
-    # CROSS-SECTIONAL VALIDATION (FIXED)
+    # CROSS-SECTIONAL VALIDATION
     ########################################################
 
     for col in CROSS_SECTIONAL_FEATURES:
@@ -182,7 +199,6 @@ def validate_feature_schema(
 
             if mode == "strict_contract":
 
-                # Auto-neutralize safely
                 if col.endswith("_z"):
                     logger.warning(
                         "Neutralizing constant cross-sectional Z feature: %s",
