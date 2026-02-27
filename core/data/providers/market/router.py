@@ -1,6 +1,5 @@
 import os
 import logging
-import pandas as pd
 import time
 import threading
 
@@ -34,7 +33,10 @@ class MarketProviderRouter:
     DEFAULT_MIN_ROWS = 50
     MAX_DAILY_MOVE = 0.90
     PROVIDER_TIMEOUT_WARN = 8.0
-    FAILURE_COOLDOWN = 20  # slightly reduced for live snapshot stability
+    FAILURE_COOLDOWN = 20
+
+    # 🔥 SAFE YAHOO CONCURRENCY LIMIT
+    YAHOO_MAX_CONCURRENT = int(os.getenv("YAHOO_MAX_CONCURRENT", 2))
 
     ALLOWED_INTERVALS = {
         "1d", "D",
@@ -52,6 +54,11 @@ class MarketProviderRouter:
         self._provider_failures = {}
         self._lock = threading.Lock()
 
+        # 🔥 Yahoo concurrency semaphore
+        self._yahoo_semaphore = threading.Semaphore(
+            self.YAHOO_MAX_CONCURRENT
+        )
+
         self._register_providers()
 
         if not self.providers:
@@ -60,9 +67,10 @@ class MarketProviderRouter:
         self._single_provider_mode = len(self.providers) == 1
 
         logger.info(
-            "Market router ready | priority=%s | single_provider=%s",
+            "Market router ready | priority=%s | single_provider=%s | yahoo_max_concurrent=%s",
             [p[0] for p in self.providers],
-            self._single_provider_mode
+            self._single_provider_mode,
+            self.YAHOO_MAX_CONCURRENT
         )
 
     ############################################################
@@ -131,7 +139,7 @@ class MarketProviderRouter:
             self._provider_failures[name] = time.time()
 
     ############################################################
-    # MAIN FETCH (SEQUENTIAL FALLBACK)
+    # MAIN FETCH
     ############################################################
 
     def fetch(
@@ -160,30 +168,26 @@ class MarketProviderRouter:
                     if not self._provider_allowed(name):
                         raise RuntimeError(f"Provider {name} in cooldown.")
 
-                    try:
-                        return self._attempt_provider(
-                            name,
-                            provider_obj,
-                            ticker,
-                            start,
-                            end,
-                            interval,
-                            min_rows
-                        )
-                    except Exception:
-                        self._record_failure(name)
-                        raise
+                    return self._execute_provider(
+                        name,
+                        provider_obj,
+                        ticker,
+                        start,
+                        end,
+                        interval,
+                        min_rows
+                    )
 
             raise RuntimeError(f"Requested provider not available: {provider}")
 
-        # 🔥 Sequential fallback (no nested thread pool)
+        # 🔥 Sequential fallback
         for name, provider_obj in self.providers:
 
             if not self._provider_allowed(name):
                 continue
 
             try:
-                return self._attempt_provider(
+                return self._execute_provider(
                     name,
                     provider_obj,
                     ticker,
@@ -207,8 +211,10 @@ class MarketProviderRouter:
         raise RuntimeError(f"All market providers failed for {ticker}")
 
     ############################################################
+    # EXECUTION WITH YAHOO THROTTLE
+    ############################################################
 
-    def _attempt_provider(
+    def _execute_provider(
         self,
         name,
         provider,
@@ -221,13 +227,24 @@ class MarketProviderRouter:
 
         start_time = time.time()
 
-        df = provider.fetch(
-            ticker,
-            start,
-            end,
-            interval,
-            min_rows=min_rows
-        )
+        # 🔥 Apply Yahoo semaphore only for Yahoo
+        if name == "yahoo":
+            with self._yahoo_semaphore:
+                df = provider.fetch(
+                    ticker,
+                    start,
+                    end,
+                    interval,
+                    min_rows=min_rows
+                )
+        else:
+            df = provider.fetch(
+                ticker,
+                start,
+                end,
+                interval,
+                min_rows=min_rows
+            )
 
         latency = time.time() - start_time
 
