@@ -181,6 +181,11 @@ class ModelLoader:
                     baseline_meta["training_code_hash"] != meta["training_code_hash"]:
                 logger.warning("Baseline training code hash mismatch.")
 
+            # ✅ NEW: Soft schema warning
+            if baseline_meta.get("schema_signature") and \
+                    baseline_meta["schema_signature"] != meta["schema_signature"]:
+                logger.warning("Baseline schema signature mismatch.")
+
         except Exception as e:
             logger.warning("Baseline lineage validation soft-failed: %s", e)
 
@@ -235,6 +240,10 @@ class ModelLoader:
             if list(meta.get("features")) != list(MODEL_FEATURES):
                 raise RuntimeError("Metadata feature mismatch.")
 
+            # ✅ NEW: Defense-in-depth validation
+            if meta.get("feature_count") != len(MODEL_FEATURES):
+                raise RuntimeError("Metadata feature_count mismatch.")
+
             artifact_hash_actual = self._sha256(model_path)
 
             if meta["artifact_hash"] != artifact_hash_actual:
@@ -249,7 +258,6 @@ class ModelLoader:
                     meta["feature_checksum"] != feature_checksum_actual:
                 raise RuntimeError("Feature checksum mismatch.")
 
-            # Soft validation (no hard fail for free-data use case)
             self._validate_baseline_lineage(meta)
 
             new_container = LoadedModel(
@@ -263,7 +271,6 @@ class ModelLoader:
                 pointer_hash=pointer_hash
             )
 
-            # Atomic-style swap
             self._xgb_container = new_container
 
             MODEL_VERSION.labels(
