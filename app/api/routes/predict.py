@@ -42,6 +42,23 @@ def get_pipeline() -> InferencePipeline:
 
 
 # =========================================================
+# TEST COMPATIBILITY LOADER ACCESSOR
+# =========================================================
+
+def get_loader():
+    """
+    Compatibility accessor for legacy tests.
+
+    Tests patch:
+        app.api.routes.predict.get_loader
+
+    We now use get_shared_model_loader internally,
+    but we preserve this function to avoid breaking tests.
+    """
+    return get_shared_model_loader()
+
+
+# =========================================================
 # PRODUCTION LIMITS
 # =========================================================
 
