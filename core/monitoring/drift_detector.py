@@ -70,16 +70,19 @@ class DriftDetector:
         self._model_loader = ModelLoader()
 
     ########################################################
-    # PUBLIC BASELINE CREATION (🔥 FIX)
+    # PUBLIC BASELINE CREATION (TRAINING CONTRACT SAFE)
     ########################################################
 
-    def create_baseline(self, dataset: pd.DataFrame):
-        """
-        Explicit baseline creation used by training pipeline.
-        Preserves full governance + atomic write.
-        """
+    def create_baseline(
+        self,
+        dataset: pd.DataFrame,
+        dataset_hash: str | None = None
+    ):
         logger.info("Creating drift baseline explicitly (training mode).")
-        self._auto_regenerate_baseline(dataset)
+        self._auto_regenerate_baseline(
+            dataset=dataset,
+            dataset_hash=dataset_hash
+        )
 
     ########################################################
     # SAFE FEATURE BLOCK
@@ -88,7 +91,6 @@ class DriftDetector:
     def _safe_feature_block(self, dataset: pd.DataFrame):
 
         missing = set(MODEL_FEATURES) - set(dataset.columns)
-
         if missing:
             raise RuntimeError(f"Missing features: {missing}")
 
@@ -157,21 +159,23 @@ class DriftDetector:
         return "unknown"
 
     ########################################################
-    # AUTO BASELINE REGEN
+    # BASELINE CREATION
     ########################################################
 
-    def _auto_regenerate_baseline(self, dataset: pd.DataFrame):
+    def _auto_regenerate_baseline(
+        self,
+        dataset: pd.DataFrame,
+        dataset_hash: str | None = None
+    ):
 
         logger.warning("Auto-regenerating drift baseline.")
 
         numeric = self._safe_feature_block(dataset)
-
         baseline_features = {}
 
         for col in MODEL_FEATURES:
 
             series = numeric[col].dropna()
-
             if len(series) < self.MIN_SAMPLE_BASELINE:
                 continue
 
@@ -204,7 +208,8 @@ class DriftDetector:
                 "feature_checksum": MetadataManager.fingerprint_features(
                     tuple(MODEL_FEATURES)
                 ),
-                "feature_count": len(baseline_features)
+                "feature_count": len(baseline_features),
+                "dataset_hash": dataset_hash
             },
             "features": baseline_features
         }
@@ -212,7 +217,65 @@ class DriftDetector:
         self._atomic_write(payload)
 
     ########################################################
-    # DETECT (CONTRACT PRESERVED)
+    # LOAD VERIFIED BASELINE
+    ########################################################
+
+    def _load_verified_baseline(self, dataset: pd.DataFrame):
+
+        if not os.path.exists(self.BASELINE_PATH):
+            if self.AUTO_REGENERATE:
+                self._auto_regenerate_baseline(dataset)
+            else:
+                raise RuntimeError("Baseline missing.")
+
+        with open(self.BASELINE_PATH, encoding="utf-8") as f:
+            baseline = json.load(f)
+
+        if baseline["integrity_hash"] != self._baseline_hash(baseline):
+            raise RuntimeError("Baseline integrity failure.")
+
+        meta = baseline["meta"]
+
+        if meta["baseline_version"] != self.BASELINE_VERSION:
+            raise RuntimeError("Baseline version mismatch.")
+
+        if meta["schema_signature"] != get_schema_signature():
+            raise RuntimeError("Baseline schema mismatch.")
+
+        if meta.get("feature_checksum"):
+            current_checksum = MetadataManager.fingerprint_features(
+                tuple(MODEL_FEATURES)
+            )
+            if meta["feature_checksum"] != current_checksum:
+                raise RuntimeError("Feature checksum mismatch.")
+
+        return baseline
+
+    ########################################################
+    # PSI
+    ########################################################
+
+    def _psi(self, bin_edges, expected_counts, actual):
+
+        actual = np.asarray(actual, dtype=np.float64)
+        actual_counts = np.histogram(actual, bins=bin_edges)[0]
+
+        expected_perc = expected_counts / max(expected_counts.sum(), self.EPSILON)
+        actual_perc = actual_counts / max(actual_counts.sum(), self.EPSILON)
+
+        expected_perc = np.clip(expected_perc, self.MIN_BIN_PCT, None)
+        actual_perc = np.clip(actual_perc, self.MIN_BIN_PCT, None)
+
+        psi = np.sum(
+            (actual_perc - expected_perc) *
+            np.log((actual_perc + self.EPSILON) /
+                   (expected_perc + self.EPSILON))
+        )
+
+        return float(psi)
+
+    ########################################################
+    # DETECT
     ########################################################
 
     def detect(self, dataset: pd.DataFrame):
@@ -234,7 +297,6 @@ class DriftDetector:
             for col, stats in baseline["features"].items():
 
                 current = numeric[col].dropna()
-
                 if len(current) < self.MIN_SAMPLE_INFERENCE:
                     continue
 
@@ -278,12 +340,11 @@ class DriftDetector:
                 self.MAX_SEVERITY_CAP
             )
 
-            if severity_score >= self.HARD_SEVERITY_THRESHOLD:
-                drift_state = "hard"
-            elif severity_score >= self.SOFT_SEVERITY_THRESHOLD:
-                drift_state = "soft"
-            else:
-                drift_state = "none"
+            drift_state = (
+                "hard" if severity_score >= self.HARD_SEVERITY_THRESHOLD
+                else "soft" if severity_score >= self.SOFT_SEVERITY_THRESHOLD
+                else "none"
+            )
 
             drift_detected = drift_count > 0
 
