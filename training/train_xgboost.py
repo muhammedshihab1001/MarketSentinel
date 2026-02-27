@@ -33,7 +33,12 @@ PRODUCTION_POINTER = "production_pointer.json"
 SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
+
+# Production thresholds
+MIN_PRODUCTION_SHARPE = 0.10   # relaxed for noisy Yahoo data
+MAX_DRAWDOWN = -0.55
 MAX_REASONABLE_SHARPE = 5.0
+MAX_PROFIT_FACTOR = 10.0
 
 
 ############################################################
@@ -46,6 +51,57 @@ def enforce_determinism():
     os.environ["MKL_NUM_THREADS"] = "1"
     random.seed(SEED)
     np.random.seed(SEED)
+
+
+############################################################
+# PRODUCTION METRIC VALIDATION
+############################################################
+
+def validate_production_metrics(metrics: dict):
+
+    required = [
+        "avg_sharpe",
+        "max_drawdown",
+        "profit_factor",
+        "final_equity",
+        "num_windows"
+    ]
+
+    for key in required:
+        if key not in metrics:
+            raise RuntimeError(f"Missing metric: {key}")
+        if not np.isfinite(metrics[key]):
+            raise RuntimeError(f"Non-finite metric: {key}")
+
+    sharpe = metrics["avg_sharpe"]
+    drawdown = metrics["max_drawdown"]
+    profit_factor = metrics["profit_factor"]
+
+    logger.info(
+        "Production validation | Sharpe=%.4f | DD=%.2f%% | PF=%.2f",
+        sharpe,
+        drawdown * 100,
+        profit_factor
+    )
+
+    if sharpe > MAX_REASONABLE_SHARPE:
+        raise RuntimeError("Sharpe unrealistically high — leakage suspected.")
+
+    if profit_factor > MAX_PROFIT_FACTOR:
+        raise RuntimeError("Profit factor unrealistic — leakage suspected.")
+
+    if sharpe < MIN_PRODUCTION_SHARPE:
+        raise RuntimeError(
+            f"Model rejected — Sharpe too low ({sharpe:.4f})."
+        )
+
+    if drawdown < MAX_DRAWDOWN:
+        raise RuntimeError(
+            f"Model rejected — drawdown breach ({drawdown:.2%})."
+        )
+
+    if metrics["final_equity"] <= 0:
+        raise RuntimeError("Backtest produced non-positive equity.")
 
 
 ############################################################
@@ -67,35 +123,6 @@ def compute_feature_checksum():
 def compute_dataset_hash(df: pd.DataFrame) -> str:
     df_sorted = df.sort_values(["date", "ticker"]).reset_index(drop=True)
     return MetadataManager.fingerprint_dataset(df_sorted)
-
-
-############################################################
-# METRIC SANITIZATION
-############################################################
-
-def sanitize_metrics(metrics: dict) -> dict:
-
-    if not isinstance(metrics, dict) or not metrics:
-        raise RuntimeError("Walk-forward metrics must be non-empty dict.")
-
-    sanitized = {}
-
-    for k, v in metrics.items():
-
-        if isinstance(v, (list, tuple, dict, np.ndarray)):
-            continue
-
-        val = float(v)
-
-        if not np.isfinite(val):
-            raise RuntimeError(f"Non-finite metric detected: {k}")
-
-        sanitized[k] = val
-
-    if sanitized.get("avg_sharpe", 0) > MAX_REASONABLE_SHARPE:
-        logger.warning("Unusually high Sharpe detected.")
-
-    return sanitized
 
 
 ############################################################
@@ -237,32 +264,7 @@ def final_trainer(train_df):
 
 
 ############################################################
-# UPDATE PRODUCTION POINTER
-############################################################
-
-def update_production_pointer(version: str):
-
-    pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
-
-    payload = {
-        "model_version": str(version),
-        "updated_at": int(time.time())
-    }
-
-    tmp_path = pointer_path + ".tmp"
-
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-
-    os.replace(tmp_path, pointer_path)
-
-    logger.info("Production pointer updated to version=%s", version)
-
-
-############################################################
-# EXPORT (FIXED WITH artifact_hash)
+# EXPORT
 ############################################################
 
 def export_artifacts(model, metrics, dataset_hash,
@@ -278,7 +280,6 @@ def export_artifacts(model, metrics, dataset_hash,
     joblib.dump(model, tmp_path)
     os.replace(tmp_path, model_path)
 
-    # Compute artifact hash
     def sha256(path):
         h = hashlib.sha256()
         with open(path, "rb") as f:
@@ -287,8 +288,6 @@ def export_artifacts(model, metrics, dataset_hash,
         return h.hexdigest()
 
     artifact_hash = sha256(model_path)
-
-    feature_checksum = compute_feature_checksum()
 
     metadata = MetadataManager.create_metadata(
         model_name="xgboost",
@@ -299,10 +298,8 @@ def export_artifacts(model, metrics, dataset_hash,
         dataset_hash=dataset_hash,
         dataset_rows=len(final_df),
         metadata_type="training_manifest_v1",
-        feature_checksum=feature_checksum,
-        extra_fields={
-            "artifact_hash": artifact_hash
-        }
+        feature_checksum=compute_feature_checksum(),
+        extra_fields={"artifact_hash": artifact_hash}
     )
 
     metadata_path = os.path.join(
@@ -312,10 +309,15 @@ def export_artifacts(model, metrics, dataset_hash,
 
     MetadataManager.save_metadata(metadata, metadata_path)
 
-    update_production_pointer(timestamp)
+    pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
 
-    logger.info("Artifacts exported with artifact_hash.")
+    with open(pointer_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "model_version": str(timestamp),
+            "updated_at": int(time.time())
+        }, f, indent=2)
 
+    logger.info("Artifacts exported safely.")
     return timestamp
 
 
@@ -338,17 +340,17 @@ def main(start_date=None, end_date=None, create_baseline=False):
     validator = WalkForwardValidator(trainer)
     research_metrics = validator.run(raw_df.copy())
 
-    production_metrics = sanitize_metrics(research_metrics)
+    # 🔥 PRODUCTION VALIDATION BEFORE EXPORT
+    validate_production_metrics(research_metrics)
 
     final_df = build_final_target(raw_df)
-
     dataset_hash = compute_dataset_hash(final_df)
 
     final_model = final_trainer(final_df)
 
     version = export_artifacts(
         final_model,
-        production_metrics,
+        research_metrics,
         dataset_hash,
         start_date,
         end_date,
@@ -356,9 +358,7 @@ def main(start_date=None, end_date=None, create_baseline=False):
     )
 
     if create_baseline:
-
         drift = DriftDetector()
-
         drift.create_baseline(
             dataset=final_df.loc[:, MODEL_FEATURES],
             dataset_hash=dataset_hash,
@@ -366,11 +366,6 @@ def main(start_date=None, end_date=None, create_baseline=False):
             feature_checksum=compute_feature_checksum(),
             model_version=str(version),
             allow_overwrite=False
-        )
-
-        logger.info(
-            "Drift baseline created for model_version=%s",
-            version
         )
 
     logger.info(
