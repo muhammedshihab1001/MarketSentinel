@@ -232,7 +232,7 @@ class MetadataManager:
 
         CRITICAL_DIRS = [
             "training",
-            "models",
+            "core/models",
             "core/features",
             "core/schema",
             "core/data",
