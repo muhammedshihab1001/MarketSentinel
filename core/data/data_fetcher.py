@@ -40,7 +40,13 @@ class StockPriceFetcher:
     @staticmethod
     def _ensure_utc(series):
 
+        if not isinstance(series, pd.Series):
+            raise RuntimeError("Date column must be a pandas Series.")
+
         s = pd.to_datetime(series, errors="coerce")
+
+        if s.isna().all():
+            raise RuntimeError("Invalid datetime series.")
 
         if getattr(s.dt, "tz", None) is None:
             return s.dt.tz_localize("UTC")
@@ -48,16 +54,36 @@ class StockPriceFetcher:
         return s.dt.tz_convert("UTC")
 
     ########################################################
+    # SAFE MULTIINDEX FLATTENER (HARDENED)
+    ########################################################
 
     def _flatten_columns(self, df):
 
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
 
-        df.columns = [
-            str(c).lower().replace(" ", "_")
-            for c in df.columns
-        ]
+            flat_cols = []
+
+            for col in df.columns:
+
+                # Join levels safely
+                joined = "_".join(
+                    [str(level).strip() for level in col if level]
+                )
+
+                flat_cols.append(joined.lower())
+
+            df.columns = flat_cols
+
+        else:
+            df.columns = [
+                str(c).lower().replace(" ", "_")
+                for c in df.columns
+            ]
+
+        # 🔥 Ensure uniqueness
+        if len(set(df.columns)) != len(df.columns):
+            logger.warning("Duplicate columns detected after flattening.")
+            df = df.loc[:, ~df.columns.duplicated()]
 
         return df
 
@@ -70,6 +96,18 @@ class StockPriceFetcher:
         numeric = ["open", "high", "low", "close", "volume"]
 
         for col in numeric:
+
+            if col not in df.columns:
+                raise RuntimeError(f"Missing required column: {col}")
+
+            if isinstance(df[col], pd.DataFrame):
+                if df[col].shape[1] == 1:
+                    df[col] = df[col].iloc[:, 0]
+                else:
+                    raise RuntimeError(
+                        f"Ambiguous column structure for {col}"
+                    )
+
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -85,14 +123,14 @@ class StockPriceFetcher:
             raise RuntimeError("Negative volume detected.")
 
         ####################################################
-        # SOFT OHLC REPAIR (NO HARD FAILURE)
+        # SOFT OHLC REPAIR
         ####################################################
 
         df["high"] = df[["high", "open", "close"]].max(axis=1)
         df["low"] = df[["low", "open", "close"]].min(axis=1)
 
         ####################################################
-        # EXTREME RETURN GUARD (still strict)
+        # EXTREME RETURN GUARD
         ####################################################
 
         returns = df["close"].pct_change().abs()
@@ -104,7 +142,9 @@ class StockPriceFetcher:
         # VOLUME SPIKE GUARD
         ####################################################
 
-        vol_ratio = df["volume"] / (df["volume"].rolling(20).mean() + 1e-6)
+        vol_ratio = df["volume"] / (
+            df["volume"].rolling(20).mean() + 1e-6
+        )
 
         if vol_ratio.max() > self.MAX_VOLUME_SPIKE:
             logger.warning("Unusual volume spike detected.")
@@ -120,13 +160,14 @@ class StockPriceFetcher:
             try:
 
                 df = yf.download(
-                    ticker,
+                    tickers=ticker,  # 🔥 force single ticker
                     start=start,
                     end=end,
                     interval=interval,
                     progress=False,
                     auto_adjust=False,
-                    threads=False
+                    threads=False,  # 🔥 prevent yfinance internal threading
+                    group_by="column"
                 )
 
                 if df is None or df.empty:
@@ -199,7 +240,10 @@ class StockPriceFetcher:
         date_diff = df["date"].diff().dt.days
 
         if date_diff.max() > 10:
-            logger.warning("Large calendar gap detected for %s", ticker)
+            logger.warning(
+                "Large calendar gap detected for %s",
+                ticker
+            )
 
         df["ticker"] = ticker
 
