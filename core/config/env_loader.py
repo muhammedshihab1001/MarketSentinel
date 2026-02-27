@@ -33,12 +33,10 @@ def _configure_logging():
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
 
-    # Console logging (always enabled)
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
     root_logger.addHandler(console)
 
-    # Optional file logging (disabled in CI/Docker unless explicitly enabled)
     if os.getenv("ENABLE_FILE_LOGGING", "0") == "1":
 
         log_dir = os.getenv("LOG_DIR", "logs")
@@ -96,7 +94,6 @@ def _validate_market_providers():
         if os.getenv(key):
             available.append(provider)
 
-    # Yahoo fallback always available
     available.append("yahoo")
 
     os.environ["MARKET_PROVIDERS_ACTIVE"] = ",".join(available)
@@ -134,6 +131,31 @@ def _validate_news():
 
 
 # ============================================================
+# LLM VALIDATION (NEW)
+# ============================================================
+
+def _validate_llm():
+
+    llm_enabled = _as_bool(os.getenv("LLM_ENABLED", "0"))
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    if llm_enabled and not api_key:
+        logger.error("LLM_ENABLED=1 but OPENAI_API_KEY missing.")
+        raise RuntimeError("LLM misconfiguration: missing OPENAI_API_KEY")
+
+    if llm_enabled:
+        logger.info(
+            "LLM enabled | model=%s | rate_limit=%s/min",
+            model,
+            os.getenv("LLM_RATE_LIMIT_PER_MIN", "30")
+        )
+    else:
+        logger.info("LLM disabled.")
+
+
+# ============================================================
 # ENVIRONMENT FINGERPRINT
 # ============================================================
 
@@ -143,7 +165,8 @@ def _environment_fingerprint():
         sys.version +
         os.getenv("ENABLE_SENTIMENT", "") +
         os.getenv("MODEL_REGISTRY_PATH", "") +
-        os.getenv("FEATURE_STORE_PATH", "")
+        os.getenv("FEATURE_STORE_PATH", "") +
+        os.getenv("LLM_ENABLED", "")
     )
 
     fp = hashlib.sha256(payload.encode()).hexdigest()[:12]
@@ -170,30 +193,38 @@ def init_env():
 
         _configure_logging()
 
-        # Load .env only if present (safe for CI)
         if os.getenv("DOTENV_ENABLED", "1") == "1":
             load_dotenv(override=False)
 
-        # Safe defaults
         defaults = {
             "ENABLE_SENTIMENT": "0",
             "LOG_LEVEL": "INFO",
             "MODEL_REGISTRY_PATH": "artifacts/registry",
             "FEATURE_STORE_PATH": "artifacts/feature_store",
             "XGB_REGISTRY_DIR": "artifacts/xgboost",
+
+            # -------------------------
+            # LLM Defaults (NEW)
+            # -------------------------
+            "LLM_ENABLED": "0",
+            "OPENAI_MODEL": "gpt-4o-mini",
+            "OPENAI_TIMEOUT": "12",
+            "LLM_RATE_LIMIT_PER_MIN": "30",
+            "LLM_CACHE_ENABLED": "1",
+            "LLM_CACHE_TTL_SEC": "120",
+            "LLM_AUDIT_ENABLED": "1",
         }
 
         for key, value in defaults.items():
             os.environ.setdefault(key, value)
 
-        # Ensure required directories exist
         _ensure_path("MODEL_REGISTRY_PATH", "artifacts/registry")
         _ensure_path("FEATURE_STORE_PATH", "artifacts/feature_store")
         _ensure_path("XGB_REGISTRY_DIR", "artifacts/xgboost")
 
-        # Validate providers
         _validate_market_providers()
         _validate_news()
+        _validate_llm()
 
         _environment_fingerprint()
 
