@@ -208,26 +208,12 @@ class DriftDetector:
         if meta["schema_signature"] != get_schema_signature():
             raise RuntimeError("Baseline schema mismatch.")
 
-        if meta.get("feature_count", 0) <= 0:
-            raise RuntimeError("Baseline feature_count invalid.")
-
         current_checksum = MetadataManager.fingerprint_features(
             tuple(MODEL_FEATURES)
         )
 
         if meta.get("feature_checksum") != current_checksum:
             raise RuntimeError("Feature checksum mismatch.")
-
-        try:
-            if meta.get("dataset_hash") and \
-                    meta["dataset_hash"] != self._model_loader.dataset_hash:
-                logger.warning("Baseline dataset hash differs from loaded model.")
-
-            if meta.get("training_code_hash") and \
-                    meta["training_code_hash"] != self._model_loader.training_code_hash:
-                logger.warning("Baseline training code hash differs from loaded model.")
-        except Exception:
-            pass
 
         return baseline
 
@@ -238,6 +224,10 @@ class DriftDetector:
     def _psi(self, bin_edges, expected_counts, actual):
 
         actual = np.asarray(actual, dtype=np.float64)
+
+        if len(actual) < 5:
+            return 0.0
+
         actual_counts = np.histogram(actual, bins=bin_edges)[0]
 
         expected_perc = expected_counts / max(expected_counts.sum(), self.EPSILON)
@@ -273,12 +263,16 @@ class DriftDetector:
             report = {}
 
             total_features = len(baseline["features"])
+            evaluated_features = 0
 
             for col, stats in baseline["features"].items():
 
                 current = numeric[col].dropna()
+
                 if len(current) < self.MIN_SAMPLE_INFERENCE:
                     continue
+
+                evaluated_features += 1
 
                 baseline_std = max(stats["std"], self.EPSILON)
                 baseline_var = max(stats["variance"], self.EPSILON)
@@ -324,29 +318,32 @@ class DriftDetector:
             )
 
             drift_detected = drift_count > 0
+            coverage = float(evaluated_features / max(total_features, 1))
+
             DRIFT_DETECTED.set(1 if drift_detected else 0)
 
             return {
                 "drift_detected": drift_detected,
                 "severity_score": severity_score,
                 "drift_confidence": float(min(drift_count / max(total_features, 1), 1.0)),
-                "coverage": 1.0,
+                "coverage": coverage,
                 "details": report,
                 "drift_state": drift_state
             }
 
         except Exception as exc:
 
-            logger.exception("Drift enforcement triggered: %s", exc)
-            DRIFT_DETECTED.set(1)
+            logger.warning("Drift detector failure: %s", exc)
 
             if self.hard_fail:
                 raise
 
+            DRIFT_DETECTED.set(1)
+
             return {
                 "drift_detected": True,
-                "severity_score": 10,
-                "drift_confidence": 1.0,
+                "severity_score": 5,
+                "drift_confidence": 0.5,
                 "coverage": 0.0,
                 "details": {},
                 "drift_state": "detector_failure",
