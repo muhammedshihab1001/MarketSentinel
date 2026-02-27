@@ -8,8 +8,9 @@ logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
 MIN_SCORE_STD = 1e-6
-NUM_BOOST_ROUNDS = 800
-EARLY_STOPPING_ROUNDS = 75
+MIN_TARGET_STD = 1e-6
+NUM_BOOST_ROUNDS = 1200
+EARLY_STOPPING_ROUNDS = 100
 MIN_VALIDATION_ROWS = 300
 MIN_MINORITY_SAMPLES = 50
 EPSILON = 1e-12
@@ -26,7 +27,6 @@ def compute_class_weight(y):
     pos = float(np.sum(y == 1))
     neg = float(np.sum(y == 0))
 
-    # 🔥 FIX: No hard failure in regression mode
     if pos == 0 or neg == 0:
         logger.warning(
             "Label collapse detected (pos=%.0f neg=%.0f) — allowed in regression mode.",
@@ -88,13 +88,17 @@ class SafeXGBClassifier:
         X = X.copy().astype(np.float32)
         y = np.asarray(y, dtype=np.float32)
 
+        if np.std(y) < MIN_TARGET_STD:
+            raise RuntimeError("Target variance too small — cannot train alpha model.")
+
         self.training_rows = X.shape[0]
         self.training_cols = X.shape[1]
 
         logger.info(
-            "XGBoost training | rows=%s cols=%s",
+            "XGBoost training | rows=%s cols=%s | target_std=%.8f",
             self.training_rows,
-            self.training_cols
+            self.training_cols,
+            float(np.std(y))
         )
 
         ###################################################
@@ -141,18 +145,18 @@ class SafeXGBClassifier:
         )
 
         ###################################################
-        # PARAMETERS (REGRESSION ALPHA)
+        # IMPROVED PARAMETERS (ALPHA SAFE)
         ###################################################
 
         params = {
-            "max_depth": 4,
-            "eta": 0.02,
-            "subsample": 0.9,
-            "colsample_bytree": 0.9,
-            "min_child_weight": 8,
-            "gamma": 0.4,
-            "reg_alpha": 1.5,
-            "reg_lambda": 4.0,
+            "max_depth": 6,
+            "eta": 0.05,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "min_child_weight": 1,
+            "gamma": 0.0,
+            "reg_alpha": 0.1,
+            "reg_lambda": 1.0,
             "objective": "reg:squarederror",
             "eval_metric": "rmse",
             "tree_method": "hist",
@@ -215,7 +219,10 @@ class SafeXGBClassifier:
         if self.model.feature_names != self.feature_names:
             raise RuntimeError("Booster feature order mismatch.")
 
-        logger.info("XGBoost regression training completed successfully.")
+        logger.info(
+            "XGBoost regression training completed successfully | pred_std=%.8f",
+            float(np.std(preds))
+        )
 
         return self
 
@@ -256,7 +263,6 @@ class SafeXGBClassifier:
         if np.std(scores) < MIN_SCORE_STD:
             logger.warning("Inference score collapse detected.")
 
-        # Convert regression scores to cross-sectional probability-like
         scaled = (scores - scores.min()) / (scores.max() - scores.min() + EPSILON)
 
         return np.column_stack([1 - scaled, scaled])
