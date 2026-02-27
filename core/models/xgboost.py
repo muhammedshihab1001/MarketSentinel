@@ -7,16 +7,16 @@ import json
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
-MIN_PROB_STD = 1e-5
-NUM_BOOST_ROUNDS = 600
-EARLY_STOPPING_ROUNDS = 50
+MIN_SCORE_STD = 1e-6
+NUM_BOOST_ROUNDS = 800
+EARLY_STOPPING_ROUNDS = 75
 MIN_VALIDATION_ROWS = 300
 MIN_MINORITY_SAMPLES = 50
 EPSILON = 1e-12
 
 
 ###################################################
-# CLASS WEIGHT
+# CLASS WEIGHT (kept for compatibility)
 ###################################################
 
 def compute_class_weight(y):
@@ -39,15 +39,15 @@ def compute_class_weight(y):
     weight = float(np.clip(weight, 0.5, 10.0))
 
     logger.info(
-        "Class distribution | pos=%.0f neg=%.0f scale_pos_weight=%.3f",
-        pos, neg, weight
+        "Class distribution | pos=%.0f neg=%.0f (weight unused in regression mode)",
+        pos, neg
     )
 
     return weight
 
 
 ###################################################
-# SAFE PRODUCTION MODEL
+# SAFE PRODUCTION MODEL (REGRESSION ALPHA MODE)
 ###################################################
 
 class SafeXGBClassifier:
@@ -81,7 +81,7 @@ class SafeXGBClassifier:
             raise RuntimeError("NaN detected in training features.")
 
         X = X.copy().astype(np.float32)
-        y = np.asarray(y)
+        y = np.asarray(y, dtype=np.float32)
 
         self.training_rows = X.shape[0]
         self.training_cols = X.shape[1]
@@ -136,23 +136,22 @@ class SafeXGBClassifier:
         )
 
         ###################################################
-        # PARAMETERS
+        # PARAMETERS (REGRESSION ALPHA)
         ###################################################
 
         params = {
-            "max_depth": 3,
-            "eta": 0.03,
-            "subsample": 1.0,
-            "colsample_bytree": 1.0,
-            "min_child_weight": 6,
-            "gamma": 0.25,
-            "reg_alpha": 1.2,
-            "reg_lambda": 3.5,
-            "objective": "binary:logistic",
-            "eval_metric": "logloss",
+            "max_depth": 4,
+            "eta": 0.02,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+            "min_child_weight": 8,
+            "gamma": 0.4,
+            "reg_alpha": 1.5,
+            "reg_lambda": 4.0,
+            "objective": "reg:squarederror",
+            "eval_metric": "rmse",
             "tree_method": "hist",
             "device": "cpu",
-            "scale_pos_weight": self.pos_weight,
             "seed": SEED,
             "nthread": 1,
             "verbosity": 0,
@@ -205,17 +204,13 @@ class SafeXGBClassifier:
         if not np.all(np.isfinite(preds)):
             raise RuntimeError("Non-finite predictions detected.")
 
-        # 🔥 KEEP collapse guard during training only
-        if np.std(preds) < MIN_PROB_STD:
-            raise RuntimeError("Probability collapse detected during training.")
-
-        if np.any(preds < -EPSILON) or np.any(preds > 1 + EPSILON):
-            raise RuntimeError("Invalid probability range detected.")
+        if np.std(preds) < MIN_SCORE_STD:
+            raise RuntimeError("Score collapse detected during training.")
 
         if self.model.feature_names != self.feature_names:
             raise RuntimeError("Booster feature order mismatch.")
 
-        logger.info("XGBoost training completed successfully.")
+        logger.info("XGBoost regression training completed successfully.")
 
         return self
 
@@ -248,22 +243,21 @@ class SafeXGBClassifier:
             feature_names=self.feature_names
         )
 
-        probs = self.model.predict(dmatrix)
+        scores = self.model.predict(dmatrix)
 
-        if not np.all(np.isfinite(probs)):
-            raise RuntimeError("Non-finite inference probabilities.")
+        if not np.all(np.isfinite(scores)):
+            raise RuntimeError("Non-finite inference scores.")
 
-        # 🔥 REMOVED inference-time collapse exception
-        if np.std(probs) < MIN_PROB_STD:
-            logger.warning("Inference probability collapse detected.")
+        if np.std(scores) < MIN_SCORE_STD:
+            logger.warning("Inference score collapse detected.")
 
-        if np.any(probs < -EPSILON) or np.any(probs > 1 + EPSILON):
-            raise RuntimeError("Invalid probability range detected.")
+        # Convert regression scores to ranking-compatible probability-like output
+        scaled = (scores - scores.min()) / (scores.max() - scores.min() + EPSILON)
 
-        return np.column_stack([1 - probs, probs])
+        return np.column_stack([1 - scaled, scaled])
 
     ###################################################
-    # FEATURE IMPORTANCE
+    # FEATURE IMPORTANCE (UNCHANGED)
     ###################################################
 
     def export_feature_importance(self):
@@ -320,7 +314,7 @@ def build_xgboost_pipeline(y):
     model = SafeXGBClassifier(pos_weight)
 
     logger.info(
-        "XGBoost model built (deterministic CPU mode, early stopping safe)."
+        "XGBoost REGRESSION alpha model built (deterministic CPU mode)."
     )
 
     return model
