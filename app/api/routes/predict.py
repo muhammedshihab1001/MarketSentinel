@@ -41,20 +41,7 @@ def get_pipeline() -> InferencePipeline:
     return _pipeline
 
 
-# =========================================================
-# TEST COMPATIBILITY LOADER ACCESSOR
-# =========================================================
-
 def get_loader():
-    """
-    Compatibility accessor for legacy tests.
-
-    Tests patch:
-        app.api.routes.predict.get_loader
-
-    We now use get_shared_model_loader internally,
-    but we preserve this function to avoid breaking tests.
-    """
     return get_shared_model_loader()
 
 
@@ -189,7 +176,7 @@ async def live_snapshot():
 
 
 # =========================================================
-# SIGNAL EXPLANATION
+# SIGNAL EXPLANATION (FIXED — CROSS-SECTION ENFORCED)
 # =========================================================
 
 @router.get(
@@ -211,11 +198,17 @@ async def signal_explanation(ticker: str):
         pipeline = get_pipeline()
         loader = get_shared_model_loader()
 
+        # 🔒 ENFORCE FULL CROSS-SECTIONAL CONTEXT
+        universe_tickers = load_default_universe()
+
+        if ticker not in universe_tickers:
+            raise HTTPException(status_code=404, detail="Ticker not in production universe.")
+
         async with inference_semaphore:
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(
                     pipeline.run_snapshot,
-                    [ticker]
+                    universe_tickers
                 ),
                 timeout=REQUEST_TIMEOUT
             )
@@ -223,7 +216,15 @@ async def signal_explanation(ticker: str):
         if not isinstance(snapshot, dict) or not snapshot.get("signals"):
             raise HTTPException(status_code=404, detail="No signal generated.")
 
-        row = snapshot["signals"][0]
+        # Filter requested ticker from full universe result
+        row = next(
+            (s for s in snapshot["signals"] if s["ticker"] == ticker),
+            None
+        )
+
+        if row is None:
+            raise HTTPException(status_code=404, detail="Signal not found for ticker.")
+
         agent_data = row.get("agent", {})
 
         explanation = SignalExplanationResponse(
