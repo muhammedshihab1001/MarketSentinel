@@ -32,13 +32,11 @@ class MarketDataService:
     DEFAULT_MIN_HISTORY_ROWS = 60
     SAFE_LAG_DAYS = 2
     MAX_ROWS = 15000
-    MIN_FILE_BYTES = 5_000
     MAX_DAILY_MOVE = 0.85
 
-    MAX_WORKERS = int(os.getenv("MARKET_MAX_WORKERS", 6))
+    # 🔥 Adaptive concurrency
+    MAX_WORKERS = int(os.getenv("MARKET_MAX_WORKERS", 4))
     MEMORY_CACHE_TTL = 30
-
-    FAST_PROVIDER_MODE = os.getenv("MARKET_FAST_MODE", "true").lower() == "true"
 
     _PROVIDER = None
     _memory_cache = {}
@@ -54,13 +52,6 @@ class MarketDataService:
             MarketDataService._PROVIDER = MarketProviderRouter()
 
         self._fetcher = MarketDataService._PROVIDER
-
-        if self.FAST_PROVIDER_MODE and len(self._fetcher.providers) == 1:
-            self.MAX_WORKERS = min(self.MAX_WORKERS, 2)
-            logger.info(
-                "Single-provider FAST mode → worker cap set to %s",
-                self.MAX_WORKERS
-            )
 
         self.SCHEMA_HASH = hashlib.sha256(
             ",".join(sorted(self.REQUIRED_COLUMNS)).encode()
@@ -104,7 +95,7 @@ class MarketDataService:
         return hashlib.sha256(payload).hexdigest()[:16]
 
     ########################################################
-    # VALIDATION
+    # VALIDATION (UNCHANGED LOGIC)
     ########################################################
 
     def _validate_dataset(self, df: pd.DataFrame, ticker: str, min_rows: int):
@@ -160,7 +151,7 @@ class MarketDataService:
         return df.reset_index(drop=True)
 
     ########################################################
-    # RETRY FETCH
+    # RETRY FETCH (NON-BLOCKING BACKOFF)
     ########################################################
 
     def _fetch_with_retry(
@@ -170,7 +161,7 @@ class MarketDataService:
         end,
         interval,
         min_history,
-        retries=3
+        retries=2
     ):
 
         last_error = None
@@ -179,23 +170,14 @@ class MarketDataService:
 
             try:
 
-                if self.FAST_PROVIDER_MODE:
-                    df = self._fetcher.fetch(
-                        ticker,
-                        start,
-                        end,
-                        interval,
-                        min_rows=min_history,
-                        provider="yahoo"
-                    )
-                else:
-                    df = self._fetcher.fetch(
-                        ticker,
-                        start,
-                        end,
-                        interval,
-                        min_rows=min_history
-                    )
+                # 🔥 REMOVE hard provider lock
+                df = self._fetcher.fetch(
+                    ticker,
+                    start,
+                    end,
+                    interval,
+                    min_rows=min_history
+                )
 
                 validated = self._validate_dataset(
                     df,
@@ -211,7 +193,7 @@ class MarketDataService:
 
                 last_error = e
 
-                sleep = (2 ** attempt) + random.uniform(0, 0.5)
+                sleep = 0.6 + random.uniform(0, 0.4)
 
                 logger.warning(
                     "Fetch failed (%s) attempt %d/%d | %.2fs | %s",
@@ -229,7 +211,7 @@ class MarketDataService:
         ) from last_error
 
     ########################################################
-    # MEMORY CACHE
+    # MEMORY CACHE (UNCHANGED)
     ########################################################
 
     def _cache_key(self, ticker, start, end, interval, min_history):
@@ -251,7 +233,7 @@ class MarketDataService:
             self._memory_cache[key] = (df.copy(), time.time())
 
     ########################################################
-    # PUBLIC API
+    # SINGLE FETCH
     ########################################################
 
     def get_price_data(
@@ -281,11 +263,7 @@ class MarketDataService:
         if cached is not None:
             return cached
 
-        logger.info(
-            "Fetching dataset for %s (min_history=%d)",
-            ticker,
-            min_history
-        )
+        logger.info("Fetching dataset for %s", ticker)
 
         df = self._fetch_with_retry(
             ticker,
@@ -300,7 +278,7 @@ class MarketDataService:
         return df
 
     ########################################################
-    # PARALLEL BATCH FETCH (STABILIZED)
+    # STABLE PARALLEL BATCH
     ########################################################
 
     def get_price_data_batch(
@@ -317,7 +295,9 @@ class MarketDataService:
 
         tickers = list(dict.fromkeys(tickers))
 
-        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
+        worker_cap = min(self.MAX_WORKERS, max(2, len(tickers) // 4))
+
+        with ThreadPoolExecutor(max_workers=worker_cap) as executor:
 
             futures = {
                 executor.submit(
@@ -336,7 +316,6 @@ class MarketDataService:
 
                 try:
                     results[ticker] = future.result()
-
                 except Exception as e:
                     failures[ticker] = str(e)
                     logger.error(
@@ -345,24 +324,14 @@ class MarketDataService:
                         str(e)
                     )
 
-        total = len(tickers)
-        success = len(results)
-        failed = len(failures)
-
-        if success == 0:
-            logger.critical(
-                "Batch fetch total failure | tickers=%d | failed=%d",
-                total,
-                failed
-            )
+        if len(results) == 0:
             raise RuntimeError("All tickers failed during batch fetch.")
 
-        if failed > 0:
+        if failures:
             logger.warning(
-                "Batch partial failure | total=%d | success=%d | failed=%d",
-                total,
-                success,
-                failed
+                "Batch partial failure | success=%d | failed=%d",
+                len(results),
+                len(failures)
             )
 
-        return {t: results[t] for t in tickers if t in results}
+        return results
