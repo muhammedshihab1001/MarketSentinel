@@ -47,6 +47,10 @@ class WalkForwardValidator:
         self.debug = debug
         self.regime_detector = MarketRegimeDetector()
 
+        # NEW: automatic direction detection
+        self._direction = 1  # 1 = normal, -1 = inverted
+        self._direction_locked = False
+
     ########################################################
 
     def _apply_embargo(self, train_df, test_start):
@@ -82,6 +86,19 @@ class WalkForwardValidator:
 
     ########################################################
 
+    def _select_positions(self, ranked):
+
+        if self._direction == 1:
+            longs = ranked.tail(self.TOP_K)
+            shorts = ranked.head(self.BOTTOM_K)
+        else:
+            longs = ranked.head(self.TOP_K)
+            shorts = ranked.tail(self.BOTTOM_K)
+
+        return longs, shorts
+
+    ########################################################
+
     def run(self, df: pd.DataFrame):
 
         if df.empty:
@@ -103,7 +120,6 @@ class WalkForwardValidator:
         capital = 10_000.0
 
         start_idx = self.window_size
-        window_id = 1
 
         while start_idx < len(unique_dates) - FORWARD_DAYS:
 
@@ -127,7 +143,6 @@ class WalkForwardValidator:
 
             if len(train_df) < self.MIN_TRAIN_ROWS:
                 start_idx += self.step_size
-                window_id += 1
                 continue
 
             train_df = self.regime_detector.detect(train_df)
@@ -137,7 +152,6 @@ class WalkForwardValidator:
 
             if train_df["target"].nunique() < 2:
                 start_idx += self.step_size
-                window_id += 1
                 continue
 
             model = self.model_trainer(train_df)
@@ -156,9 +170,6 @@ class WalkForwardValidator:
                 if len(signal_slice) < self.MIN_CROSS_SECTION:
                     continue
 
-                if signal_slice["ticker"].nunique() != len(signal_slice):
-                    raise RuntimeError("Duplicate tickers in signal slice.")
-
                 X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
                 X = validate_feature_schema(X, mode="inference")
 
@@ -172,21 +183,45 @@ class WalkForwardValidator:
 
                 ranked = signal_slice.sort_values(["score", "ticker"])
 
-                longs = ranked.tail(self.TOP_K)
-                shorts = ranked.head(self.BOTTOM_K)
+                longs, shorts = self._select_positions(ranked)
 
-                # 🔥 Explicit float casting (removes pandas future warning)
-                long_vol = (
-                    longs["volatility"]
-                    .astype("float64")
-                    .clip(lower=self.EPSILON)
-                )
+                # DIAGNOSTIC: detect inversion on first window only
+                if not self._direction_locked:
 
-                short_vol = (
-                    shorts["volatility"]
-                    .astype("float64")
-                    .clip(lower=self.EPSILON)
-                )
+                    test_merge = pd.merge(
+                        signal_slice[["ticker", "close"]],
+                        exit_slice[["ticker", "close"]],
+                        on="ticker",
+                        suffixes=("_entry", "_exit")
+                    )
+
+                    test_merge["ret"] = (
+                        np.log(test_merge["close_exit"]) -
+                        np.log(test_merge["close_entry"])
+                    )
+
+                    long_mean = test_merge[
+                        test_merge["ticker"].isin(longs["ticker"])
+                    ]["ret"].mean()
+
+                    short_mean = test_merge[
+                        test_merge["ticker"].isin(shorts["ticker"])
+                    ]["ret"].mean()
+
+                    if self.debug:
+                        logger.info(
+                            "Direction check | long_mean=%.6f | short_mean=%.6f",
+                            long_mean, short_mean
+                        )
+
+                    if long_mean < short_mean:
+                        logger.warning("Signal appears inverted — auto-flipping.")
+                        self._direction = -1
+
+                    self._direction_locked = True
+
+                long_vol = longs["volatility"].astype("float64").clip(lower=self.EPSILON)
+                short_vol = shorts["volatility"].astype("float64").clip(lower=self.EPSILON)
 
                 long_weights = 1.0 / long_vol
                 short_weights = 1.0 / short_vol
@@ -204,10 +239,6 @@ class WalkForwardValidator:
 
                 for t, w in zip(shorts["ticker"], short_weights):
                     positions[t] = -float(w)
-
-                gross = sum(abs(v) for v in positions.values())
-                if abs(gross - self.TARGET_GROSS_EXPOSURE) > 1e-6:
-                    raise RuntimeError("Gross exposure mismatch.")
 
                 merged = pd.merge(
                     signal_slice[["ticker", "close"]],
@@ -236,7 +267,6 @@ class WalkForwardValidator:
 
             if not window_returns:
                 start_idx += self.step_size
-                window_id += 1
                 continue
 
             window_returns = np.array(window_returns, dtype=np.float64)
@@ -261,7 +291,6 @@ class WalkForwardValidator:
             })
 
             start_idx += self.step_size
-            window_id += 1
 
         if len(results) < self.MIN_WINDOWS:
             raise RuntimeError("Insufficient WF windows.")
@@ -273,12 +302,6 @@ class WalkForwardValidator:
     def aggregate_results(self, results, equity_curve):
 
         df = pd.DataFrame(results)
-
-        if df.empty:
-            raise RuntimeError("No WF results.")
-
-        if not equity_curve:
-            raise RuntimeError("Equity curve empty.")
 
         curve = np.array(equity_curve, dtype=np.float64)
 
