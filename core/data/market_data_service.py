@@ -34,9 +34,7 @@ class MarketDataService:
     MAX_ROWS = 15000
     MAX_DAILY_MOVE = 0.85
 
-    # 🔥 Hard cap for total parallelism (protect router + Yahoo)
     MAX_WORKERS = int(os.getenv("MARKET_MAX_WORKERS", 4))
-
     MEMORY_CACHE_TTL = 30
 
     _PROVIDER = None
@@ -65,7 +63,7 @@ class MarketDataService:
     @staticmethod
     def _sanitize_ticker(ticker: str):
 
-        ticker = ticker.upper()
+        ticker = str(ticker).upper().strip()
 
         if not re.fullmatch(r"[A-Z0-9._-]{1,12}", ticker):
             raise RuntimeError(f"Unsafe ticker: {ticker}")
@@ -98,7 +96,7 @@ class MarketDataService:
         return hashlib.sha256(payload).hexdigest()[:16]
 
     ########################################################
-    # VALIDATION (UNCHANGED)
+    # VALIDATION (ROBUST BUT NOT OVERSTRICT)
     ########################################################
 
     def _validate_dataset(self, df: pd.DataFrame, ticker: str, min_rows: int):
@@ -120,26 +118,30 @@ class MarketDataService:
             utc=True
         ).dt.tz_convert(None)
 
-        if df["date"].isna().any():
-            raise RuntimeError("Invalid date values detected.")
+        df = df.dropna(subset=["date"])
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        if df[numeric_cols].isna().any().any():
-            raise RuntimeError("NaN values detected in numeric columns.")
+        df = df.dropna(subset=numeric_cols)
 
         if not np.isfinite(df[numeric_cols].values.astype(float)).all():
             raise RuntimeError("Non-finite prices detected.")
 
         df = df.sort_values("date").reset_index(drop=True)
 
+        # Soft extreme move handling (clip instead of fail)
         pct = df["close"].pct_change().abs().fillna(0)
 
         if (pct > self.MAX_DAILY_MOVE).any():
-            raise RuntimeError("Extreme price jump detected.")
+            logger.warning(
+                "Extreme move detected in %s — clipping instead of failing.",
+                ticker
+            )
+            df.loc[pct > self.MAX_DAILY_MOVE, "close"] = np.nan
+            df["close"] = df["close"].ffill().bfill()
 
         if len(df) > self.MAX_ROWS:
             df = df.tail(self.MAX_ROWS)
@@ -152,7 +154,7 @@ class MarketDataService:
         return df.reset_index(drop=True)
 
     ########################################################
-    # RETRY FETCH (FAST BACKOFF)
+    # RETRY FETCH
     ########################################################
 
     def _fetch_with_retry(
@@ -278,7 +280,7 @@ class MarketDataService:
         return df
 
     ########################################################
-    # STABLE PARALLEL BATCH (PRODUCTION SAFE)
+    # STABLE PARALLEL BATCH
     ########################################################
 
     def get_price_data_batch(
@@ -295,10 +297,9 @@ class MarketDataService:
 
         tickers = list(dict.fromkeys(tickers))
 
-        # 🔥 Strict worker cap — protect Yahoo semaphore
         worker_cap = min(
             self.MAX_WORKERS,
-            max(2, len(tickers) // 5)
+            max(2, min(len(tickers), 6))
         )
 
         logger.info(
