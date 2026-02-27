@@ -95,7 +95,7 @@ class InferencePipeline:
     TARGET_GROSS_EXPOSURE = 1.0
     TOP_K = 3
     BOTTOM_K = 3
-    TOP_SELECTION = 5   # <-- NEW: Final 5 best picks
+    TOP_SELECTION = 5
 
     MIN_SCORE_STD = 1e-6
     WEIGHT_TOLERANCE = 1e-6
@@ -103,7 +103,6 @@ class InferencePipeline:
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
     CROSS_SECTIONAL_WINDOW_DAYS = int(os.getenv("CS_WINDOW_DAYS", "30"))
     MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "200"))
-    SNAPSHOT_CACHE_TTL = int(os.getenv("SNAPSHOT_CACHE_TTL", "15"))
 
     def __init__(self):
         self.market_data = MarketDataService()
@@ -113,9 +112,6 @@ class InferencePipeline:
         self.drift_detector = DriftDetector()
         self.breaker = CircuitBreaker()
         self.agent = SignalAgent()
-
-        self._snapshot_cache: Dict[Tuple[str, ...], Tuple[Dict, float]] = {}
-        self._snapshot_lock = threading.Lock()
 
         self._validate_models_loaded()
 
@@ -135,9 +131,13 @@ class InferencePipeline:
 
     def run_snapshot(self, tickers: List[str]):
 
-        expanded_tickers = sorted(set(MarketUniverse.get_universe()))
+        production_universe = sorted(set(MarketUniverse.get_universe()))
+        requested = sorted(set(str(t).upper().strip() for t in tickers))
 
-        if len(expanded_tickers) > self.MAX_BATCH_SIZE:
+        if not requested:
+            raise RuntimeError("Empty ticker request.")
+
+        if len(production_universe) > self.MAX_BATCH_SIZE:
             raise RuntimeError("Batch size exceeds MAX_BATCH_SIZE.")
 
         if not self.breaker.allow():
@@ -148,13 +148,25 @@ class InferencePipeline:
 
         try:
 
-            df = self._build_cross_sectional_frame(expanded_tickers)
+            df = self._build_cross_sectional_frame(production_universe)
             latest_df = self._select_latest_snapshot(df)
 
             feature_df = validate_feature_schema(
                 latest_df.loc[:, MODEL_FEATURES],
                 mode="inference"
             ).astype(DTYPE)
+
+            # ---------------- Drift Detection ----------------
+            try:
+                drift_result = self.drift_detector.detect(feature_df)
+            except Exception as e:
+                logger.warning("Drift check failed: %s", e)
+                drift_result = {
+                    "drift_detected": False,
+                    "drift_state": "bypass",
+                    "severity_score": 0,
+                    "drift_confidence": 0.0
+                }
 
             # ---------------- Model ----------------
             scores = self.models.xgb.predict_proba(feature_df)[:, 1]
@@ -166,7 +178,6 @@ class InferencePipeline:
             latest_df = latest_df.copy()
             latest_df["score"] = scores
 
-            # Cross-sectional ranking
             latest_df["rank_pct"] = latest_df["score"].rank(
                 method="first",
                 pct=True
@@ -206,7 +217,7 @@ class InferencePipeline:
                     "agent": agent_output
                 })
 
-            # 🚀 SELECT TOP 5 ALPHA PICKS
+            # Hedge-fund style final top 5 alpha selection
             alpha_sorted = sorted(
                 snapshot_rows,
                 key=lambda x: x["agent"]["strength_score"],
@@ -215,21 +226,24 @@ class InferencePipeline:
 
             top_5 = alpha_sorted[:self.TOP_SELECTION]
 
+            # If user requested subset
+            filtered_signals = [
+                s for s in snapshot_rows if s["ticker"] in requested
+            ]
+
             result = {
                 "snapshot_date": str(latest_df["date"].iloc[0]),
                 "universe_size": int(len(latest_df)),
                 "probability_stats": prob_stats,
+                "drift": drift_result,
                 "top_5": top_5,
-                "signals": snapshot_rows
+                "signals": filtered_signals
             }
 
-            MODEL_INFERENCE_COUNT.labels(
-                model="xgboost"
-            ).inc()
-
-            MODEL_INFERENCE_LATENCY.labels(
-                model="xgboost"
-            ).observe(time.time() - start_time)
+            MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
+            MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(
+                time.time() - start_time
+            )
 
             self.breaker.record_success()
             return result
@@ -313,9 +327,7 @@ class InferencePipeline:
 
     def _construct_portfolio(self, latest_df):
 
-        latest_df = latest_df.sort_values(
-            ["score", "ticker"]
-        )
+        latest_df = latest_df.sort_values(["score", "ticker"])
 
         n = len(latest_df)
         k_long = min(self.TOP_K, n // 2)
