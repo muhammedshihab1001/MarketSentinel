@@ -93,28 +93,34 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"]).copy()
 
+        # ---------------- Returns ----------------
+
         returns = df.groupby("ticker")["close"].pct_change()
         lo, hi = cls.RETURN_CLAMP
-
         df["return"] = returns.clip(lo, hi)
 
         df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
         df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
         df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
 
-        ########################################################
-        # Enhanced Momentum Stack
-        ########################################################
+        # Rolling mean return (NEW but safe)
+        df["return_mean_20"] = (
+            df.groupby("ticker")["return"]
+            .transform(lambda x: x.rolling(20, min_periods=5).mean())
+        ).clip(-0.2, 0.2)
+
+        # ---------------- Momentum Stack ----------------
 
         df["momentum_5"] = df.groupby("ticker")["close"].pct_change(5).clip(-1, 1)
         df["momentum_10"] = df.groupby("ticker")["close"].pct_change(10).clip(-1.5, 1.5)
         df["momentum_20"] = df.groupby("ticker")["close"].pct_change(20).clip(-1, 1)
         df["momentum_60"] = df.groupby("ticker")["close"].pct_change(60).clip(-2, 2)
 
-        # Acceleration (new alpha signal)
         df["momentum_accel"] = (
             df["momentum_10"] - df["momentum_20"]
         ).clip(-2, 2)
+
+        # ---------------- Volatility ----------------
 
         grp = df.groupby("ticker")["return"]
 
@@ -140,27 +146,23 @@ class FeatureEngineer:
                 .clip(lower=cls.VOL_FLOOR)
             )
 
-        ########################################################
-        # RSI
-        ########################################################
+        # ---------------- RSI ----------------
 
-        df["rsi"] = np.nan
+        df["rsi"] = 50.0
 
         for ticker, group in df.groupby("ticker"):
             try:
                 rsi = TechnicalIndicators.rsi(group[["date", "close"]], 14)
                 df.loc[group.index, "rsi"] = rsi.values.astype("float32")
             except Exception:
-                df.loc[group.index, "rsi"] = 50.0
+                pass
 
-        df["rsi"] = df["rsi"].fillna(50.0).clip(0, 100)
+        df["rsi"] = df["rsi"].clip(0, 100)
 
-        ########################################################
-        # MACD
-        ########################################################
+        # ---------------- MACD ----------------
 
-        df["macd"] = np.nan
-        df["macd_signal"] = np.nan
+        df["macd"] = 0.0
+        df["macd_signal"] = 0.0
 
         for ticker, group in df.groupby("ticker"):
             try:
@@ -168,8 +170,7 @@ class FeatureEngineer:
                 df.loc[group.index, "macd"] = macd.astype("float32")
                 df.loc[group.index, "macd_signal"] = signal.astype("float32")
             except Exception:
-                df.loc[group.index, "macd"] = 0.0
-                df.loc[group.index, "macd_signal"] = 0.0
+                pass
 
         df["macd_hist"] = df["macd"] - df["macd_signal"]
 
@@ -179,9 +180,7 @@ class FeatureEngineer:
             .fillna(0.0)
         )
 
-        ########################################################
-        # EMA FEATURES
-        ########################################################
+        # ---------------- EMA ----------------
 
         df["ema_10"] = df.groupby("ticker")["close"].transform(
             lambda x: x.ewm(span=10, adjust=False).mean()
@@ -195,9 +194,7 @@ class FeatureEngineer:
             df["ema_10"] / (df["ema_50"] + cls.EPSILON)
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
-        ########################################################
-        # Volatility Regime (continuous)
-        ########################################################
+        # ---------------- Regime Feature ----------------
 
         rolling_mean = (
             df.groupby("ticker")["volatility_20"]
@@ -233,6 +230,7 @@ class FeatureEngineer:
             "momentum_60",
             "momentum_accel",
             "return_lag5",
+            "return_mean_20",
             "rsi",
             "volatility",
             "ema_ratio",
@@ -255,7 +253,9 @@ class FeatureEngineer:
             cs_mean = df.groupby("date")[col].transform("mean")
             cs_std = df.groupby("date")[col].transform("std")
 
-            z = (df[col] - cs_mean) / (cs_std.replace(0, np.nan))
+            robust_std = cs_std.replace(0, np.nan)
+
+            z = (df[col] - cs_mean) / robust_std
             rank = df.groupby("date")[col].rank(method="first", pct=True)
 
             df[f"{col}_z"] = (
