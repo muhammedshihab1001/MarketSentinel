@@ -22,8 +22,8 @@ class WalkForwardValidator:
     MIN_CROSS_SECTION = 10
     MIN_SCORE_STD = 1e-6
 
-    TOP_K = 5
-    BOTTOM_K = 5
+    TOP_K = 10
+    BOTTOM_K = 10
     TARGET_GROSS_EXPOSURE = 1.0
 
     TRANSACTION_COST = 0.001
