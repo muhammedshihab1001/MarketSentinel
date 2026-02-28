@@ -1,14 +1,13 @@
 """
-MarketSentinel Institutional Evaluation Runner v2
+MarketSentinel Institutional Evaluation Runner v3
 Production-grade CI validator.
-Hard-fails on governance breach.
+Strict governance enforcement.
 """
 
 import sys
 import json
 import numpy as np
 import pandas as pd
-
 from pathlib import Path
 
 from core.config.env_loader import init_env
@@ -22,7 +21,6 @@ from core.market.universe import MarketUniverse
 from core.time.market_time import MarketTime
 from core.monitoring.drift_detector import DriftDetector
 from app.inference.model_loader import ModelLoader
-from core.artifacts.metadata_manager import MetadataManager
 from training.evaluate import evaluate_xgboost
 
 
@@ -36,7 +34,8 @@ MIN_SPREAD = 0.0
 MIN_SAMPLE_SIZE = 2000
 MIN_ACTIVE_SIGNALS = 500
 
-MAX_SHARPE_DEGRADATION = 0.10  # relative vs baseline
+MAX_SHARPE_DEGRADATION = 0.10
+MAX_ALLOWED_DRIFT = 0.35
 
 FORWARD_DAYS = 5
 LONG_PERCENTILE = 0.70
@@ -82,7 +81,7 @@ def align_to_model_features(df: pd.DataFrame) -> pd.DataFrame:
     missing = [f for f in MODEL_FEATURES if f not in df.columns]
 
     if missing:
-        print(f"WARNING: Missing features → {missing}")
+        print(f"WARNING: Missing features detected → {missing}")
         for col in missing:
             df[col] = 0.0
 
@@ -150,7 +149,7 @@ def build_dataset():
 
 
 # =========================================================
-# BASELINE COMPARISON
+# BASELINE COMPARISON (ROBUST)
 # =========================================================
 
 def compare_to_baseline(metrics):
@@ -161,16 +160,22 @@ def compare_to_baseline(metrics):
         print("No baseline contract found.")
         return
 
-    with open(baseline_path, "r") as f:
+    with open(baseline_path, "r", encoding="utf-8") as f:
         baseline = json.load(f)
 
-    baseline_sharpe = baseline.get("sharpe", None)
+    baseline_metrics = baseline.get("metrics", {})
+
+    baseline_sharpe = baseline_metrics.get("avg_sharpe")
 
     if baseline_sharpe is None:
         return
 
     if metrics["sharpe"] < baseline_sharpe - MAX_SHARPE_DEGRADATION:
-        raise RuntimeError("Sharpe degraded vs baseline.")
+        raise RuntimeError(
+            f"Sharpe degraded vs baseline. "
+            f"Current={metrics['sharpe']:.4f} "
+            f"Baseline={baseline_sharpe:.4f}"
+        )
 
 
 # =========================================================
@@ -185,10 +190,8 @@ def main() -> int:
     loader = ModelLoader()
     model = loader.xgb
 
-    metadata = MetadataManager.load_metadata()
-    if metadata is None:
-        print("FAIL: No model metadata.")
-        return 1
+    print(f"Evaluating model version: {loader.xgb_version}")
+    print(f"Schema signature: {loader.schema_signature[:12]}")
 
     df = build_dataset()
 
@@ -197,10 +200,14 @@ def main() -> int:
     forward_returns = df["forward_log_return"]
     dates = df["date"]
 
-    # Drift check
-    drift = DriftDetector()
-    drift_score = drift.compute_drift(X)
+    # Drift validation
+    drift_detector = DriftDetector()
+    drift_score = drift_detector.compute_drift(X)
+
     print(f"Drift score: {drift_score:.4f}")
+
+    if drift_score > MAX_ALLOWED_DRIFT:
+        raise RuntimeError("Drift exceeded governance limit.")
 
     probs = model.predict_proba(X)[:, 1]
 
@@ -233,8 +240,7 @@ def main() -> int:
     active_mask = preds != -1
 
     if np.sum(active_mask) < MIN_ACTIVE_SIGNALS:
-        print("FAIL: Too few active signals.")
-        return 1
+        raise RuntimeError("Too few active signals.")
 
     metrics = evaluate_xgboost(
         y_true=y[active_mask],
@@ -248,13 +254,13 @@ def main() -> int:
     print("Evaluation metrics:", metrics)
 
     if metrics["roc_auc"] < MIN_ROC_AUC:
-        return 1
+        raise RuntimeError("ROC AUC below threshold.")
 
     if metrics["sharpe"] < MIN_SHARPE:
-        return 1
+        raise RuntimeError("Sharpe below threshold.")
 
     if metrics["long_short_spread"] < MIN_SPREAD:
-        return 1
+        raise RuntimeError("Negative long-short spread.")
 
     compare_to_baseline(metrics)
 
