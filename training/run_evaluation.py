@@ -1,13 +1,15 @@
 """
-MarketSentinel Institutional Evaluation Runner
-Used by CI/CD pipeline.
+MarketSentinel Institutional Evaluation Runner v2
+Production-grade CI validator.
 Hard-fails on governance breach.
-Explicit exit codes for CI.
 """
 
 import sys
+import json
 import numpy as np
 import pandas as pd
+
+from pathlib import Path
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
@@ -18,7 +20,9 @@ from core.schema.feature_schema import (
 )
 from core.market.universe import MarketUniverse
 from core.time.market_time import MarketTime
+from core.monitoring.drift_detector import DriftDetector
 from app.inference.model_loader import ModelLoader
+from core.artifacts.metadata_manager import MetadataManager
 from training.evaluate import evaluate_xgboost
 
 
@@ -30,14 +34,17 @@ MIN_ROC_AUC = 0.50
 MIN_SHARPE = 0.10
 MIN_SPREAD = 0.0
 MIN_SAMPLE_SIZE = 2000
-FORWARD_DAYS = 5
+MIN_ACTIVE_SIGNALS = 500
 
+MAX_SHARPE_DEGRADATION = 0.10  # relative vs baseline
+
+FORWARD_DAYS = 5
 LONG_PERCENTILE = 0.70
 SHORT_PERCENTILE = 0.30
 
 
 # =========================================================
-# TARGET REBUILD (MUST MATCH TRAINING)
+# TARGET REBUILD
 # =========================================================
 
 def apply_cross_sectional_target(df):
@@ -67,27 +74,19 @@ def apply_cross_sectional_target(df):
 
 
 # =========================================================
-# FEATURE ALIGNMENT (CRITICAL FIX)
+# FEATURE ALIGNMENT
 # =========================================================
 
 def align_to_model_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensures evaluation dataset strictly matches MODEL_FEATURES.
-    Creates missing derived features safely if possible.
-    """
 
     missing = [f for f in MODEL_FEATURES if f not in df.columns]
 
     if missing:
-        print(f"WARNING: Missing features detected → {missing}")
-
-        # Safe fallback: create zero-filled columns for missing engineered features
+        print(f"WARNING: Missing features → {missing}")
         for col in missing:
             df[col] = 0.0
 
-    # Reorder strictly
     df = df.loc[:, MODEL_FEATURES]
-
     return df
 
 
@@ -130,13 +129,10 @@ def build_dataset():
         raise RuntimeError("No evaluation datasets built.")
 
     df = pd.concat(datasets, ignore_index=True)
-
     df = apply_cross_sectional_target(df)
 
-    # 🔥 Critical fix: align before validation
     X_aligned = align_to_model_features(df)
 
-    # Strict validation (CI contract)
     validate_feature_schema(
         X_aligned,
         mode="strict_contract"
@@ -154,17 +150,45 @@ def build_dataset():
 
 
 # =========================================================
-# MAIN ENTRY (CI SAFE)
+# BASELINE COMPARISON
+# =========================================================
+
+def compare_to_baseline(metrics):
+
+    baseline_path = Path("artifacts/xgboost/baseline_contract.json")
+
+    if not baseline_path.exists():
+        print("No baseline contract found.")
+        return
+
+    with open(baseline_path, "r") as f:
+        baseline = json.load(f)
+
+    baseline_sharpe = baseline.get("sharpe", None)
+
+    if baseline_sharpe is None:
+        return
+
+    if metrics["sharpe"] < baseline_sharpe - MAX_SHARPE_DEGRADATION:
+        raise RuntimeError("Sharpe degraded vs baseline.")
+
+
+# =========================================================
+# MAIN
 # =========================================================
 
 def main() -> int:
 
-    print("Starting CI evaluation...")
-
+    print("Starting Institutional CI evaluation...")
     init_env()
 
     loader = ModelLoader()
     model = loader.xgb
+
+    metadata = MetadataManager.load_metadata()
+    if metadata is None:
+        print("FAIL: No model metadata.")
+        return 1
 
     df = build_dataset()
 
@@ -172,6 +196,11 @@ def main() -> int:
     y = df["target"]
     forward_returns = df["forward_log_return"]
     dates = df["date"]
+
+    # Drift check
+    drift = DriftDetector()
+    drift_score = drift.compute_drift(X)
+    print(f"Drift score: {drift_score:.4f}")
 
     probs = model.predict_proba(X)[:, 1]
 
@@ -203,7 +232,7 @@ def main() -> int:
 
     active_mask = preds != -1
 
-    if np.sum(active_mask) < 500:
+    if np.sum(active_mask) < MIN_ACTIVE_SIGNALS:
         print("FAIL: Too few active signals.")
         return 1
 
@@ -219,18 +248,17 @@ def main() -> int:
     print("Evaluation metrics:", metrics)
 
     if metrics["roc_auc"] < MIN_ROC_AUC:
-        print("FAIL: ROC AUC below gate.")
         return 1
 
     if metrics["sharpe"] < MIN_SHARPE:
-        print("FAIL: Sharpe below gate.")
         return 1
 
     if metrics["long_short_spread"] < MIN_SPREAD:
-        print("FAIL: Negative spread.")
         return 1
 
-    print("CI evaluation passed.")
+    compare_to_baseline(metrics)
+
+    print("CI evaluation PASSED.")
     return 0
 
 
