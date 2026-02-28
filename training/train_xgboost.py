@@ -41,6 +41,7 @@ MAX_REASONABLE_SHARPE = 5.0
 MAX_PROFIT_FACTOR = 10.0
 
 TARGET_CLIP = 0.25
+MIN_CS_WIDTH = 8
 
 
 # ==========================================================
@@ -173,24 +174,30 @@ def load_training_data(start_date, end_date):
 
 
 # ==========================================================
-# TARGET + GROUPS
+# TARGET (CROSS-SECTIONAL NEUTRALIZED)
 # ==========================================================
 
 def build_target(df: pd.DataFrame):
 
-    df = df.sort_values(["ticker", "date"]).copy()
+    df = df.sort_values(["date", "ticker"]).copy()
 
-    df["target"] = (
+    df["raw_forward"] = (
         df.groupby("ticker")["close"]
         .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
     )
 
-    df = df.dropna(subset=["target"])
+    df = df.dropna(subset=["raw_forward"])
+
+    # Cross-sectional demeaning (CONSISTENT WITH WALK-FORWARD)
+    cs_mean = df.groupby("date")["raw_forward"].transform("mean")
+    df["target"] = df["raw_forward"] - cs_mean
+
     df["target"] = df["target"].clip(-TARGET_CLIP, TARGET_CLIP)
 
-    MIN_CS_WIDTH = 8
     counts = df.groupby("date")["ticker"].transform("count")
     df = df[counts >= MIN_CS_WIDTH]
+
+    df.drop(columns=["raw_forward"], inplace=True)
 
     if df.empty:
         raise RuntimeError("All dates dropped after cross-sectional enforcement.")
@@ -208,7 +215,11 @@ def build_groups(df: pd.DataFrame):
 
 def trainer(train_df):
 
-    train_df = build_target(train_df)
+    # IMPORTANT: assume target already built if coming from walk-forward
+    if "target" not in train_df.columns:
+        train_df = build_target(train_df)
+
+    train_df = train_df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
     X = validate_feature_schema(
         train_df.loc[:, MODEL_FEATURES],
@@ -227,6 +238,7 @@ def trainer(train_df):
 def final_trainer(train_df):
 
     train_df = build_target(train_df)
+    train_df = train_df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
     X = validate_feature_schema(
         train_df.loc[:, MODEL_FEATURES],
