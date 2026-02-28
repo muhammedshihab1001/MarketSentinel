@@ -291,9 +291,6 @@ def export_artifacts(model, metrics, dataset_hash,
         metadata_type="training_manifest_v1",
         extra_fields={
             "artifact_hash": artifact_hash,
-            "schema_signature": get_schema_signature(),
-            "schema_version": SCHEMA_VERSION,
-            "training_code_hash": compute_training_code_hash(),
             "feature_checksum": compute_feature_checksum(),
         }
     )
