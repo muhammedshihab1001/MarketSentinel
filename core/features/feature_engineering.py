@@ -23,7 +23,6 @@ class FeatureEngineer:
 
     @staticmethod
     def _normalize_datetime(df):
-
         df = df.copy()
 
         df["date"] = (
@@ -58,6 +57,8 @@ class FeatureEngineer:
             raise RuntimeError("Missing close column.")
 
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce")
+
         df = df.dropna(subset=["close"])
 
         if len(df) < cls.MIN_ROWS_REQUIRED:
@@ -106,6 +107,18 @@ class FeatureEngineer:
             0.6 * df["momentum_20"] +
             0.4 * df["momentum_60"]
         ).clip(-2, 2)
+
+        # VOLUME FEATURES (RESTORED)
+        df["volume_mean_20"] = (
+            df.groupby("ticker")["volume"]
+            .transform(lambda x: x.rolling(20, min_periods=5).mean())
+        )
+
+        df["volume_momentum"] = (
+            df["volume"] / (df["volume_mean_20"] + cls.EPSILON)
+        ).clip(0, 5)
+
+        df["dollar_volume"] = df["close"] * df["volume"]
 
         # VOLATILITY
         grp = df.groupby("ticker")["return"]
@@ -157,8 +170,7 @@ class FeatureEngineer:
             (df["close"] / (rolling_high + cls.EPSILON)) - 1
         ).clip(-1, 0)
 
-        # AMIHUD ILLIQUIDITY (NEW)
-        df["dollar_volume"] = df["close"] * df["volume"]
+        # AMIHUD
         df["amihud"] = (
             df["return"].abs() / (df["dollar_volume"] + cls.EPSILON)
         ).clip(0, 1)
@@ -182,13 +194,16 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # CROSS-SECTIONAL FEATURES
+    # CROSS SECTIONAL FEATURES
     ########################################################
 
     @classmethod
     def add_cross_sectional_features(cls, df):
 
         df = df.sort_values(["date", "ticker"]).copy()
+
+        valid_mask = df.groupby("date")["ticker"].transform("count") >= cls.MIN_CS_WIDTH
+        df = df[valid_mask].copy()
 
         base_cols = [
             "momentum_20",
@@ -199,13 +214,12 @@ class FeatureEngineer:
             "rsi",
             "volatility",
             "ema_ratio",
+            "volume_momentum",
+            "dollar_volume",
             "dist_from_52w_high",
             "regime_feature",
             "amihud",
         ]
-
-        valid_mask = df.groupby("date")["ticker"].transform("count") >= cls.MIN_CS_WIDTH
-        df = df[valid_mask].copy()
 
         for col in base_cols:
 
@@ -217,30 +231,37 @@ class FeatureEngineer:
 
             z = (df[col] - cs_mean) / (cs_std + cls.EPSILON)
 
-            df[f"{col}_z"] = (
-                z.replace([np.inf, -np.inf], np.nan)
-                .fillna(0.0)
-                .clip(-5, 5)
-            )
-
+            df[f"{col}_z"] = z.fillna(0.0).clip(-5, 5)
             df[f"{col}_rank"] = (
                 df.groupby("date")[col]
                 .rank(method="first", pct=True)
                 .fillna(0.5)
             )
 
-        # MARKET DISPERSION FEATURE (NEW)
+        # MARKET DISPERSION
         df["market_dispersion"] = (
-            df.groupby("date")["return"]
-            .transform("std")
-            .clip(0, 0.2)
+            df.groupby("date")["return"].transform("std").clip(0, 0.2)
         )
 
-        # BREADTH FEATURE (NEW)
+        # BREADTH
         df["breadth"] = (
             df.groupby("date")["return"]
             .transform(lambda x: (x > 0).mean())
         )
+
+        for col in ["market_dispersion", "breadth"]:
+
+            cs_mean = df.groupby("date")[col].transform("mean")
+            cs_std = df.groupby("date")[col].transform("std")
+
+            z = (df[col] - cs_mean) / (cs_std + cls.EPSILON)
+
+            df[f"{col}_z"] = z.fillna(0.0).clip(-5, 5)
+            df[f"{col}_rank"] = (
+                df.groupby("date")[col]
+                .rank(method="first", pct=True)
+                .fillna(0.5)
+            )
 
         return df
 
@@ -258,12 +279,12 @@ class FeatureEngineer:
         for col in numeric_cols:
             df[col] = df[col].fillna(0.0)
 
-        if not np.isfinite(df[numeric_cols].to_numpy()).all():
-            raise RuntimeError("Non-finite values remain.")
-
         missing = set(MODEL_FEATURES) - set(df.columns)
         if missing:
             raise RuntimeError(f"Missing features: {missing}")
+
+        if not np.isfinite(df[numeric_cols].to_numpy()).all():
+            raise RuntimeError("Non-finite values remain.")
 
         return df.reset_index(drop=True)
 
