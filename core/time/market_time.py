@@ -14,14 +14,18 @@ class MarketTime:
     ✔ atomic persistence
     ✔ lineage-safe time hashing
     ✔ walk-forward protection
+    ✔ configurable institutional training windows
     """
 
-    TIME_GOVERNANCE_VERSION = "3.0"
+    TIME_GOVERNANCE_VERSION = "3.1"
+
+    ########################################################
+    # UPDATED TRAINING WINDOWS (INCREASED DATA DEPTH)
+    ########################################################
 
     MODEL_WINDOWS = {
-        "xgboost": 3,
-        "lstm": 5,
-        "sarimax": 7
+        # Increased from 3 → 8 years for signal stability
+        "xgboost": 8,
     }
 
     WALK_FORWARD_MONTHS = 3
@@ -210,7 +214,7 @@ class MarketTime:
         return cls._utc_today()
 
     ########################################################
-    # VALIDATE WINDOWS
+    # VALIDATE YEARS
     ########################################################
 
     @classmethod
@@ -219,9 +223,9 @@ class MarketTime:
         if not isinstance(years, int):
             raise RuntimeError("Training window must be integer years.")
 
-        if years <= 0 or years > 20:
+        if years <= 0 or years > 15:
             raise RuntimeError(
-                "Training window outside institutional bounds."
+                "Training window outside institutional bounds (1–15 years allowed)."
             )
 
     ########################################################
