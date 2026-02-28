@@ -66,7 +66,6 @@ class FeatureEngineer:
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices.")
 
-        # Repair split-like events
         returns = df.groupby("ticker")["close"].pct_change().abs()
         extreme = returns > cls.SPLIT_THRESHOLD
 
@@ -86,11 +85,9 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"]).copy()
 
-        # ---------------- Returns ----------------
-
+        # RETURNS
         returns = df.groupby("ticker")["close"].pct_change()
-        lo, hi = cls.RETURN_CLAMP
-        df["return"] = returns.clip(lo, hi)
+        df["return"] = returns.clip(*cls.RETURN_CLAMP)
 
         df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
         df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
@@ -98,10 +95,10 @@ class FeatureEngineer:
         df["return_mean_20"] = (
             df.groupby("ticker")["return"]
             .transform(lambda x: x.rolling(20, min_periods=5).mean())
+            .shift(1)
         ).clip(-0.2, 0.2)
 
-        # ---------------- Momentum ----------------
-
+        # MOMENTUM
         df["momentum_20"] = df.groupby("ticker")["close"].pct_change(20)
         df["momentum_60"] = df.groupby("ticker")["close"].pct_change(60)
 
@@ -110,23 +107,7 @@ class FeatureEngineer:
             0.4 * df["momentum_60"]
         ).clip(-2, 2)
 
-        # ---------------- Volume & Liquidity ----------------
-
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-
-        df["volume_mean_20"] = (
-            df.groupby("ticker")["volume"]
-            .transform(lambda x: x.rolling(20, min_periods=5).mean())
-        )
-
-        df["volume_momentum"] = (
-            df["volume"] / (df["volume_mean_20"] + cls.EPSILON)
-        ).clip(0, 5)
-
-        df["dollar_volume"] = df["close"] * df["volume"]
-
-        # ---------------- Volatility ----------------
-
+        # VOLATILITY
         grp = df.groupby("ticker")["return"]
 
         df["volatility_20"] = (
@@ -137,15 +118,12 @@ class FeatureEngineer:
 
         df["volatility"] = (
             df["volatility_20"]
-            .replace([np.inf, -np.inf], np.nan)
             .fillna(cls.VOL_FLOOR)
             .clip(lower=cls.VOL_FLOOR)
         )
 
-        # ---------------- RSI ----------------
-
+        # RSI
         df["rsi"] = 50.0
-
         for ticker, group in df.groupby("ticker"):
             try:
                 rsi = TechnicalIndicators.rsi(group[["date", "close"]], 14)
@@ -155,8 +133,7 @@ class FeatureEngineer:
 
         df["rsi"] = df["rsi"].clip(0, 100)
 
-        # ---------------- EMA ----------------
-
+        # EMA
         df["ema_10"] = df.groupby("ticker")["close"].transform(
             lambda x: x.ewm(span=10, adjust=False).mean()
         )
@@ -169,19 +146,24 @@ class FeatureEngineer:
             df["ema_10"] / (df["ema_50"] + cls.EPSILON)
         ).clip(0.5, 1.5)
 
-        # ---------------- 52W High Distance ----------------
-
+        # DISTANCE FROM 52W HIGH
         rolling_high = (
             df.groupby("ticker")["close"]
             .transform(lambda x: x.rolling(252, min_periods=60).max())
+            .shift(1)
         )
 
         df["dist_from_52w_high"] = (
             (df["close"] / (rolling_high + cls.EPSILON)) - 1
         ).clip(-1, 0)
 
-        # ---------------- Regime Feature ----------------
+        # AMIHUD ILLIQUIDITY (NEW)
+        df["dollar_volume"] = df["close"] * df["volume"]
+        df["amihud"] = (
+            df["return"].abs() / (df["dollar_volume"] + cls.EPSILON)
+        ).clip(0, 1)
 
+        # REGIME FEATURE
         vol_mean = (
             df.groupby("ticker")["volatility"]
             .transform(lambda x: x.rolling(60, min_periods=20).mean())
@@ -200,7 +182,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # CROSS SECTIONAL FEATURES
+    # CROSS-SECTIONAL FEATURES
     ########################################################
 
     @classmethod
@@ -217,20 +199,18 @@ class FeatureEngineer:
             "rsi",
             "volatility",
             "ema_ratio",
-            "volume_momentum",
-            "dollar_volume",
             "dist_from_52w_high",
             "regime_feature",
+            "amihud",
         ]
+
+        valid_mask = df.groupby("date")["ticker"].transform("count") >= cls.MIN_CS_WIDTH
+        df = df[valid_mask].copy()
 
         for col in base_cols:
 
             if col not in df.columns:
                 continue
-
-            cs_width = df.groupby("date")[col].transform("count")
-
-            df = df[cs_width >= cls.MIN_CS_WIDTH]
 
             cs_mean = df.groupby("date")[col].transform("mean")
             cs_std = df.groupby("date")[col].transform("std")
@@ -248,6 +228,19 @@ class FeatureEngineer:
                 .rank(method="first", pct=True)
                 .fillna(0.5)
             )
+
+        # MARKET DISPERSION FEATURE (NEW)
+        df["market_dispersion"] = (
+            df.groupby("date")["return"]
+            .transform("std")
+            .clip(0, 0.2)
+        )
+
+        # BREADTH FEATURE (NEW)
+        df["breadth"] = (
+            df.groupby("date")["return"]
+            .transform(lambda x: (x > 0).mean())
+        )
 
         return df
 
