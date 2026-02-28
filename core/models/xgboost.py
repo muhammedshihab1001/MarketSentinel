@@ -7,15 +7,15 @@ import json
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
+NUM_BOOST_ROUNDS = 600
 MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
-NUM_BOOST_ROUNDS = 800   # Reduced but sufficient
 MIN_GROUP_SIZE = 5
 EPSILON = 1e-12
 
 
 ###################################################
-# SAFE RANKING MODEL (STABLE + PRODUCTION SAFE)
+# PRODUCTION RANKING MODEL (PAIRWISE RANKING)
 ###################################################
 
 class SafeXGBRanker:
@@ -23,11 +23,9 @@ class SafeXGBRanker:
     def __init__(self):
         self.model = None
         self.feature_names = None
-        self.feature_checksum = None
-        self.training_checksum = None
-        self.param_checksum = None
-        self.training_rows = None
         self.training_cols = None
+        self.feature_checksum = None
+        self.param_checksum = None
         self.importance_checksum = None
 
         np.random.seed(SEED)
@@ -39,7 +37,7 @@ class SafeXGBRanker:
     def fit(self, X, y, groups):
 
         if X is None or X.empty:
-            raise RuntimeError("Training feature matrix empty.")
+            raise RuntimeError("Training features empty.")
 
         if len(X) != len(y):
             raise RuntimeError("Feature/label length mismatch.")
@@ -47,7 +45,7 @@ class SafeXGBRanker:
         if X.isnull().any().any():
             raise RuntimeError("NaN detected in training features.")
 
-        X = X.copy().astype(np.float32)
+        X = X.astype(np.float32)
         y = np.asarray(y, dtype=np.float32)
 
         if np.std(y) < MIN_TARGET_STD:
@@ -57,39 +55,25 @@ class SafeXGBRanker:
             raise RuntimeError("Ranking requires group definition.")
 
         if min(groups) < MIN_GROUP_SIZE:
-            raise RuntimeError("Insufficient cross-sectional group size.")
+            raise RuntimeError("Cross-sectional group too small.")
 
         if sum(groups) != len(X):
             raise RuntimeError("Group sizes do not match training rows.")
 
-        self.training_rows = X.shape[0]
+        self.feature_names = list(X.columns)
         self.training_cols = X.shape[1]
-
-        logger.info(
-            "XGBoost ranking | rows=%s cols=%s | target_std=%.8f",
-            self.training_rows,
-            self.training_cols,
-            float(np.std(y)),
-        )
 
         ###################################################
         # LOCK FEATURE CONTRACT
         ###################################################
-
-        self.feature_names = list(X.columns)
 
         checksum_str = json.dumps(self.feature_names, sort_keys=False)
         self.feature_checksum = hashlib.sha256(
             checksum_str.encode()
         ).hexdigest()
 
-        training_bytes = X.to_numpy().tobytes()
-        self.training_checksum = hashlib.sha256(
-            training_bytes
-        ).hexdigest()
-
         ###################################################
-        # BUILD DMATRIX (FULL DATA TRAIN)
+        # BUILD DMATRIX
         ###################################################
 
         dtrain = xgb.DMatrix(
@@ -101,10 +85,12 @@ class SafeXGBRanker:
         dtrain.set_group(groups)
 
         ###################################################
-        # STABLE PARAMETERS (LESS OVER-REGULARIZED)
+        # RANKING PARAMETERS (PROPER OBJECTIVE)
         ###################################################
 
         params = {
+            "objective": "rank:pairwise",
+            "eval_metric": "ndcg",
             "max_depth": 6,
             "eta": 0.05,
             "subsample": 0.9,
@@ -113,10 +99,7 @@ class SafeXGBRanker:
             "gamma": 0.0,
             "reg_alpha": 0.1,
             "reg_lambda": 1.0,
-            "objective": "reg:squarederror",
-            "eval_metric": "rmse",
             "tree_method": "hist",
-            "device": "cpu",
             "seed": SEED,
             "nthread": 1,
             "verbosity": 0,
@@ -127,7 +110,7 @@ class SafeXGBRanker:
         ).hexdigest()
 
         ###################################################
-        # TRAIN (NO EARLY STOPPING — FULL FIT)
+        # TRAIN
         ###################################################
 
         self.model = xgb.train(
@@ -138,19 +121,19 @@ class SafeXGBRanker:
         )
 
         ###################################################
-        # TRAIN SANITY CHECK
+        # SANITY CHECK
         ###################################################
 
         preds = self.model.predict(dtrain)
 
         if not np.all(np.isfinite(preds)):
-            raise RuntimeError("Non-finite predictions detected.")
+            raise RuntimeError("Non-finite training predictions.")
 
         if np.std(preds) < MIN_SCORE_STD:
-            raise RuntimeError("Score collapse detected during training.")
+            raise RuntimeError("Score collapse during training.")
 
         logger.info(
-            "XGBoost ranking training completed | pred_std=%.8f",
+            "XGBoost ranking trained | pred_std=%.6f",
             float(np.std(preds)),
         )
 
@@ -169,7 +152,7 @@ class SafeXGBRanker:
             raise RuntimeError("Inference feature matrix empty.")
 
         if len(X.columns) != self.training_cols:
-            raise RuntimeError("Inference feature dimension mismatch.")
+            raise RuntimeError("Feature dimension mismatch.")
 
         missing = set(self.feature_names) - set(X.columns)
         if missing:
@@ -191,15 +174,6 @@ class SafeXGBRanker:
             raise RuntimeError("Non-finite inference scores.")
 
         return scores
-
-    ###################################################
-    # BACKWARD COMPAT
-    ###################################################
-
-    def predict_proba(self, X):
-        scores = self.predict(X)
-        scaled = 1.0 / (1.0 + np.exp(-np.clip(scores, -20, 20)))
-        return np.column_stack([1 - scaled, scaled])
 
     ###################################################
     # FEATURE IMPORTANCE
@@ -247,10 +221,8 @@ class SafeXGBRanker:
 
 def build_xgboost_pipeline():
 
-    model = SafeXGBRanker()
-
     logger.info(
-        "XGBoost alpha model built (stable training, deterministic CPU mode)."
+        "Building XGBoost Pairwise Ranking Model (production safe)"
     )
 
-    return model
+    return SafeXGBRanker()
