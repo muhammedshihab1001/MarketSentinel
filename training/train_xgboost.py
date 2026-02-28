@@ -40,7 +40,7 @@ MAX_DRAWDOWN = -0.55
 MAX_REASONABLE_SHARPE = 5.0
 MAX_PROFIT_FACTOR = 10.0
 
-TARGET_CLIP = 0.25
+TARGET_CLIP = 3.0  # increased because now we z-score
 MIN_CS_WIDTH = 8
 
 
@@ -174,13 +174,14 @@ def load_training_data(start_date, end_date):
 
 
 # ==========================================================
-# TARGET (CROSS-SECTIONAL NEUTRALIZED)
+# TARGET (CROSS-SECTIONAL Z-SCORE NORMALIZED)
 # ==========================================================
 
 def build_target(df: pd.DataFrame):
 
     df = df.sort_values(["date", "ticker"]).copy()
 
+    # Forward log return
     df["raw_forward"] = (
         df.groupby("ticker")["close"]
         .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
@@ -188,12 +189,21 @@ def build_target(df: pd.DataFrame):
 
     df = df.dropna(subset=["raw_forward"])
 
-    # Cross-sectional demeaning (CONSISTENT WITH WALK-FORWARD)
+    # Cross-sectional stats
     cs_mean = df.groupby("date")["raw_forward"].transform("mean")
-    df["target"] = df["raw_forward"] - cs_mean
+    cs_std = df.groupby("date")["raw_forward"].transform("std")
 
+    cs_std = cs_std.replace(0, np.nan)
+
+    # Z-score normalization
+    df["target"] = (df["raw_forward"] - cs_mean) / cs_std
+
+    df = df[np.isfinite(df["target"])]
+
+    # Clip AFTER normalization
     df["target"] = df["target"].clip(-TARGET_CLIP, TARGET_CLIP)
 
+    # Enforce cross-sectional width
     counts = df.groupby("date")["ticker"].transform("count")
     df = df[counts >= MIN_CS_WIDTH]
 
@@ -215,7 +225,6 @@ def build_groups(df: pd.DataFrame):
 
 def trainer(train_df):
 
-    # IMPORTANT: assume target already built if coming from walk-forward
     if "target" not in train_df.columns:
         train_df = build_target(train_df)
 
