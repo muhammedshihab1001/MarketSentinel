@@ -14,10 +14,12 @@ class BacktestEngine:
     REENTRY_COOLDOWN = 1
 
     MAX_POSITION_SIZE = 0.30
+    MIN_POSITION_SIZE = 0.05
     MAX_SINGLE_BAR_RETURN = 0.40
     MAX_GAP = 0.35
     MAX_TURNOVER = 8.0
 
+    VOL_TARGET = 0.02  # soft volatility stabilizer
     EPSILON = 1e-12
 
     ############################################################
@@ -55,6 +57,18 @@ class BacktestEngine:
 
     ############################################################
 
+    def _dynamic_position_size(self, base_size, equity, initial_cash):
+        """
+        Soft compounding position scaler.
+        Never exceeds MAX_POSITION_SIZE.
+        """
+        growth_factor = equity / initial_cash
+        scaled = base_size * np.clip(growth_factor, 0.5, 2.0)
+        scaled = np.clip(scaled, self.MIN_POSITION_SIZE, self.MAX_POSITION_SIZE)
+        return float(scaled)
+
+    ############################################################
+
     def run(
         self,
         prices,
@@ -88,7 +102,7 @@ class BacktestEngine:
         peak_equity = initial_cash
 
         prev_price = prices[0]
-        prev_signal = signals[0]  # 🔒 align signal timing strictly
+        prev_signal = signals[0]
 
         ####################################################
         # MAIN LOOP
@@ -118,9 +132,15 @@ class BacktestEngine:
                 and cooldown == 0
             ):
 
+                dynamic_size = self._dynamic_position_size(
+                    position_size,
+                    equity=cash,
+                    initial_cash=initial_cash
+                )
+
                 execution_price = price * (1 + slippage)
 
-                deploy_cash = cash * position_size
+                deploy_cash = cash * dynamic_size
                 deploy_cash = min(deploy_cash, cash)
 
                 shares = (
@@ -172,7 +192,6 @@ class BacktestEngine:
                 break
 
             peak_equity = max(peak_equity, portfolio_value)
-
             drawdown = (portfolio_value - peak_equity) / peak_equity
 
             if drawdown < self.MAX_DRAWDOWN_KILL:
