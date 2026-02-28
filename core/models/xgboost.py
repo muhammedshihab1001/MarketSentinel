@@ -8,18 +8,13 @@ import random
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
-NUM_BOOST_ROUNDS = 800
-EARLY_STOPPING_ROUNDS = 50
+NUM_BOOST_ROUNDS = 600
 
 MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
 MIN_GROUP_SIZE = 5
 EPSILON = 1e-12
 
-
-###################################################
-# PRODUCTION RANKING MODEL (INSTITUTIONAL GRADE)
-###################################################
 
 class SafeXGBRanker:
 
@@ -36,30 +31,6 @@ class SafeXGBRanker:
 
         random.seed(SEED)
         np.random.seed(SEED)
-
-    ###################################################
-    # INTERNAL: CREATE VALIDATION SPLIT
-    ###################################################
-
-    def _split_train_validation(self, X, y, groups):
-
-        # last 20% of groups used for validation
-        group_boundaries = np.cumsum(groups)
-        total_groups = len(groups)
-        val_groups = max(1, int(total_groups * 0.2))
-
-        split_idx = group_boundaries[-val_groups]
-
-        X_train = X.iloc[:split_idx]
-        y_train = y[:split_idx]
-
-        X_val = X.iloc[split_idx:]
-        y_val = y[split_idx:]
-
-        train_groups = groups[:-val_groups]
-        val_groups = groups[-val_groups:]
-
-        return X_train, y_train, train_groups, X_val, y_val, val_groups
 
     ###################################################
     # TRAIN
@@ -94,7 +65,6 @@ class SafeXGBRanker:
         self.feature_names = list(X.columns)
         self.training_cols = X.shape[1]
 
-        # fingerprint dataset for reproducibility
         self.training_fingerprint = hashlib.sha256(
             X.to_numpy().tobytes()
         ).hexdigest()
@@ -109,25 +79,16 @@ class SafeXGBRanker:
         ).hexdigest()
 
         ###################################################
-        # TRAIN/VALIDATION SPLIT
+        # DMATRIX
         ###################################################
 
-        X_train, y_train, train_groups, X_val, y_val, val_groups = \
-            self._split_train_validation(X, y, groups)
-
         dtrain = xgb.DMatrix(
-            X_train,
-            label=y_train,
+            X,
+            label=y,
             feature_names=self.feature_names,
         )
-        dtrain.set_group(train_groups)
 
-        dval = xgb.DMatrix(
-            X_val,
-            label=y_val,
-            feature_names=self.feature_names,
-        )
-        dval.set_group(val_groups)
+        dtrain.set_group(groups)
 
         ###################################################
         # PARAMETERS
@@ -155,15 +116,13 @@ class SafeXGBRanker:
         ).hexdigest()
 
         ###################################################
-        # TRAIN WITH EARLY STOPPING
+        # TRAIN
         ###################################################
 
         self.model = xgb.train(
             params,
             dtrain,
             num_boost_round=NUM_BOOST_ROUNDS,
-            evals=[(dtrain, "train"), (dval, "val")],
-            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
             verbose_eval=False,
         )
 
@@ -180,8 +139,7 @@ class SafeXGBRanker:
             raise RuntimeError("Score collapse detected.")
 
         logger.info(
-            "XGB Ranking trained | rounds=%d | pred_std=%.6f",
-            self.model.best_iteration,
+            "XGB Ranking trained | pred_std=%.6f",
             float(np.std(preds)),
         )
 
@@ -221,7 +179,6 @@ class SafeXGBRanker:
         if not np.all(np.isfinite(scores)):
             raise RuntimeError("Non-finite inference scores.")
 
-        # prevent extreme explosions
         scores = np.clip(scores, -50, 50)
 
         return scores
@@ -231,9 +188,6 @@ class SafeXGBRanker:
     ###################################################
 
     def export_feature_importance(self):
-
-        if self.model is None:
-            raise RuntimeError("Model not trained.")
 
         raw_gain = self.model.get_score(importance_type="gain")
 
@@ -266,14 +220,6 @@ class SafeXGBRanker:
         }
 
 
-###################################################
-# BUILD MODEL
-###################################################
-
 def build_xgboost_pipeline():
-
-    logger.info(
-        "Building Institutional XGBoost Pairwise Ranking Model"
-    )
-
+    logger.info("Building Institutional XGBoost Pairwise Ranking Model")
     return SafeXGBRanker()
