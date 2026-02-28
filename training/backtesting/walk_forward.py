@@ -22,7 +22,6 @@ class WalkForwardValidator:
     MIN_CROSS_SECTION = 10
     MIN_SCORE_STD = 1e-6
 
-    # 🔥 Adjusted for hedge-fund style selection
     TOP_K = 5
     BOTTOM_K = 5
     TARGET_GROSS_EXPOSURE = 1.0
@@ -58,7 +57,7 @@ class WalkForwardValidator:
         return train_df[train_df["date"] < embargo_cut]
 
     ########################################################
-    # 🔥 REGRESSION TARGET (ALIGNED WITH TRAINING)
+    # REGRESSION TARGET
     ########################################################
 
     def _build_fold_target(self, df):
@@ -86,6 +85,25 @@ class WalkForwardValidator:
             shorts = ranked.tail(self.BOTTOM_K)
 
         return longs, shorts
+
+    ########################################################
+    # 🔥 SAFE PREDICTION WRAPPER
+    ########################################################
+
+    def _predict_scores(self, model, X):
+        """
+        Supports both regression and classification safely.
+        """
+        if hasattr(model, "predict_proba"):
+            try:
+                proba = model.predict_proba(X)
+                if proba.ndim == 2 and proba.shape[1] > 1:
+                    return proba[:, 1]
+            except Exception:
+                pass
+
+        # Regression fallback
+        return model.predict(X)
 
     ########################################################
 
@@ -163,14 +181,13 @@ class WalkForwardValidator:
                 X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
                 X = validate_feature_schema(X, mode="inference")
 
-                scores = model.predict_proba(X)[:, 1]
+                scores = self._predict_scores(model, X)
 
                 if np.std(scores) < self.MIN_SCORE_STD:
                     continue
 
                 signal_slice = signal_slice.copy()
 
-                # 🔥 Cross-sectional normalization improves stability
                 scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
                 signal_slice["score"] = scores
 
@@ -178,7 +195,6 @@ class WalkForwardValidator:
 
                 longs, shorts = self._select_positions(ranked)
 
-                # 🔥 Automatic direction detection (first window only)
                 if not self._direction_locked:
 
                     test_merge = pd.merge(
@@ -207,7 +223,6 @@ class WalkForwardValidator:
 
                     self._direction_locked = True
 
-                # 🔥 Volatility adjusted weights
                 long_vol = longs["volatility"].astype("float64").clip(lower=self.EPSILON)
                 short_vol = shorts["volatility"].astype("float64").clip(lower=self.EPSILON)
 
