@@ -220,7 +220,6 @@ def build_target(df: pd.DataFrame):
 
 def trainer(train_df):
 
-    # 🔥 IMPORTANT: target built ONLY here
     train_df = build_target(train_df)
 
     X = validate_feature_schema(
@@ -254,7 +253,7 @@ def final_trainer(train_df):
 
 
 ############################################################
-# EXPORT (UNCHANGED)
+# EXPORT (FIXED — METRICS SAFE)
 ############################################################
 
 def export_artifacts(model, metrics, dataset_hash,
@@ -272,9 +271,20 @@ def export_artifacts(model, metrics, dataset_hash,
 
     artifact_hash = MetadataManager.hash_file(model_path)
 
+    # 🔥 Separate scalar metrics from time-series metrics
+    scalar_metrics = {
+        k: v for k, v in metrics.items()
+        if k != "equity_curve"
+    }
+
+    extra_fields = {
+        "artifact_hash": artifact_hash,
+        "equity_curve": metrics.get("equity_curve", [])
+    }
+
     metadata = MetadataManager.create_metadata(
         model_name="xgboost",
-        metrics=metrics,
+        metrics=scalar_metrics,
         features=tuple(MODEL_FEATURES),
         training_start=str(start_date),
         training_end=str(end_date),
@@ -282,7 +292,7 @@ def export_artifacts(model, metrics, dataset_hash,
         dataset_rows=len(final_df),
         metadata_type="training_manifest_v1",
         feature_checksum=compute_feature_checksum(),
-        extra_fields={"artifact_hash": artifact_hash}
+        extra_fields=extra_fields
     )
 
     metadata_path = os.path.join(
@@ -322,7 +332,6 @@ def main(start_date=None, end_date=None,
 
     raw_df = load_training_data(start_date, end_date)
 
-    # 🔥 PASS RAW DF — DO NOT BUILD TARGET BEFORE WALK-FORWARD
     validator = WalkForwardValidator(trainer)
     research_metrics = validator.run(raw_df.copy())
 
