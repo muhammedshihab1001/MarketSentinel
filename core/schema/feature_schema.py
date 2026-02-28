@@ -12,11 +12,11 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 # ============================================================
 
-SCHEMA_VERSION = "34.0"  # strict cross-sectional neutralization stabilization
+SCHEMA_VERSION = "40.0"  # institutional liquidity + regime upgrade
 
 
 ############################################################
-# SIGNAL CONTRACT (CANONICAL)
+# SIGNAL CONTRACT
 ############################################################
 
 LONG_PERCENTILE = 0.70
@@ -24,43 +24,62 @@ SHORT_PERCENTILE = 0.30
 
 
 ############################################################
-# CORE FEATURES
+# CORE FEATURES (UPDATED)
 ############################################################
 
 CORE_FEATURES: Tuple[str, ...] = (
+
+    # Returns
     "return",
     "return_lag1",
     "return_lag5",
-    "return_lag10",
-    "volatility",
-    "volatility_5",
-    "volatility_20",
+    "return_mean_20",
+
+    # Momentum
     "momentum_20",
+    "momentum_60",
+    "momentum_composite",
+
+    # Volatility
+    "volatility",
+    "volatility_20",
+
+    # Liquidity
+    "volume_momentum",
+    "dollar_volume",
+
+    # Technical
     "rsi",
-    "macd",
-    "macd_signal",
-    "ema_10",
-    "ema_50",
     "ema_ratio",
+
+    # Regime / structure
+    "dist_from_52w_high",
     "regime_feature",
 )
 
 
 ############################################################
-# CROSS-SECTIONAL FEATURES
+# CROSS-SECTIONAL FEATURES (AUTO-GENERATED PAIRS)
 ############################################################
 
-CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = (
-    "momentum_20_z",
-    "return_lag5_z",
-    "rsi_z",
-    "volatility_z",
-    "ema_ratio_z",
-    "momentum_20_rank",
-    "return_lag5_rank",
-    "rsi_rank",
-    "volatility_rank",
-    "ema_ratio_rank",
+BASE_CS_COLS: Tuple[str, ...] = (
+    "momentum_20",
+    "momentum_60",
+    "momentum_composite",
+    "return_lag5",
+    "return_mean_20",
+    "rsi",
+    "volatility",
+    "ema_ratio",
+    "volume_momentum",
+    "dollar_volume",
+    "dist_from_52w_high",
+    "regime_feature",
+)
+
+CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = tuple(
+    [f"{col}_z" for col in BASE_CS_COLS] +
+    [f"{col}_rank" for col in BASE_CS_COLS]
 )
 
 
@@ -73,7 +92,7 @@ MODEL_FEATURES: List[str] = list(
 )
 
 DTYPE = np.float32
-MIN_ROWS_TRAINING = 200
+MIN_ROWS_TRAINING = 300
 MIN_VARIANCE = 1e-8
 
 FORBIDDEN_REGEX = re.compile(
@@ -93,16 +112,10 @@ def _check_forbidden_columns(df: pd.DataFrame):
 
 
 def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensures numeric conversion without silent corruption.
-    """
     df = df.copy()
-
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
     return df
 
 
@@ -150,7 +163,10 @@ def validate_feature_schema(
 
         for col in MODEL_FEATURES:
             if col not in feature_df.columns:
-                feature_df[col] = 0.0
+                if col.endswith("_rank"):
+                    feature_df[col] = 0.5
+                else:
+                    feature_df[col] = 0.0
 
         feature_df = feature_df.loc[:, MODEL_FEATURES]
 
@@ -191,33 +207,15 @@ def validate_feature_schema(
         if finite_vals.nunique() <= 1:
 
             if mode == "training":
-                logger.warning(
-                    "Constant cross-sectional feature allowed in training fold: %s",
-                    col
-                )
                 continue
 
-            if mode == "strict_contract":
+            if col.endswith("_z"):
+                feature_df[col] = 0.0
+                continue
 
-                if col.endswith("_z"):
-                    logger.warning(
-                        "Neutralizing constant cross-sectional Z feature: %s",
-                        col
-                    )
-                    feature_df[col] = 0.0
-                    continue
-
-                if col.endswith("_rank"):
-                    logger.warning(
-                        "Neutralizing constant cross-sectional RANK feature: %s",
-                        col
-                    )
-                    feature_df[col] = 0.5
-                    continue
-
-                raise RuntimeError(
-                    f"Constant cross-sectional feature detected: {col}"
-                )
+            if col.endswith("_rank"):
+                feature_df[col] = 0.5
+                continue
 
     ########################################################
     # FINAL SANITY
