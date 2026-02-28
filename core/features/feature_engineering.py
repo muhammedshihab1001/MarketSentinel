@@ -10,11 +10,12 @@ logger = logging.getLogger(__name__)
 
 class FeatureEngineer:
 
-    MIN_ROWS_REQUIRED = 100
+    MIN_ROWS_REQUIRED = 120
     VOL_FLOOR = 1e-4
     RETURN_CLAMP = (-0.5, 0.5)
     SPLIT_THRESHOLD = 3.5
     EPSILON = 1e-9
+    MIN_CS_WIDTH = 5
 
     ########################################################
     # DATETIME NORMALIZATION
@@ -25,9 +26,6 @@ class FeatureEngineer:
 
         df = df.copy()
 
-        if "date" not in df.columns:
-            raise RuntimeError("Price dataframe requires 'date' column.")
-
         df["date"] = (
             pd.to_datetime(df["date"], utc=True, errors="coerce")
             .dt.tz_convert(None)
@@ -35,10 +33,6 @@ class FeatureEngineer:
         )
 
         df = df.dropna(subset=["date"])
-
-        if "ticker" not in df.columns:
-            df["ticker"] = "unknown"
-
         df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
         return df
@@ -61,7 +55,7 @@ class FeatureEngineer:
         df = cls._normalize_datetime(df)
 
         if "close" not in df.columns:
-            raise RuntimeError("Price dataframe requires 'close' column.")
+            raise RuntimeError("Missing close column.")
 
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
         df = df.dropna(subset=["close"])
@@ -72,17 +66,16 @@ class FeatureEngineer:
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices.")
 
+        # Repair split-like events
         returns = df.groupby("ticker")["close"].pct_change().abs()
         extreme = returns > cls.SPLIT_THRESHOLD
 
         if extreme.any():
-            logger.warning("Split-like move detected — attempting repair.")
+            logger.warning("Split-like move detected — repairing.")
             df.loc[extreme, "close"] = np.nan
             df["close"] = df.groupby("ticker")["close"].ffill()
 
-        df = df.dropna(subset=["close"])
-
-        return df.reset_index(drop=True)
+        return df.dropna(subset=["close"]).reset_index(drop=True)
 
     ########################################################
     # CORE FEATURES
@@ -101,7 +94,6 @@ class FeatureEngineer:
 
         df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
         df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
-        df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
 
         df["return_mean_20"] = (
             df.groupby("ticker")["return"]
@@ -110,35 +102,32 @@ class FeatureEngineer:
 
         # ---------------- Momentum ----------------
 
-        df["momentum_5"] = df.groupby("ticker")["close"].pct_change(5).clip(-1, 1)
-        df["momentum_10"] = df.groupby("ticker")["close"].pct_change(10).clip(-1.5, 1.5)
-        df["momentum_20"] = df.groupby("ticker")["close"].pct_change(20).clip(-1, 1)
-        df["momentum_60"] = df.groupby("ticker")["close"].pct_change(60).clip(-2, 2)
+        df["momentum_20"] = df.groupby("ticker")["close"].pct_change(20)
+        df["momentum_60"] = df.groupby("ticker")["close"].pct_change(60)
 
-        df["momentum_accel"] = (
-            df["momentum_10"] - df["momentum_20"]
-        ).clip(-2, 2)
-
-        # Momentum Composite (NEW but safe)
         df["momentum_composite"] = (
-            0.4 * df["momentum_20"] +
-            0.3 * df["momentum_60"] +
-            0.2 * df["momentum_10"] +
-            0.1 * df["momentum_5"]
+            0.6 * df["momentum_20"] +
+            0.4 * df["momentum_60"]
         ).clip(-2, 2)
 
-        # Mean Reversion (NEW but safe)
-        df["mean_reversion_1"] = (-df["return_lag1"]).clip(-0.2, 0.2)
+        # ---------------- Volume & Liquidity ----------------
+
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+        df["volume_mean_20"] = (
+            df.groupby("ticker")["volume"]
+            .transform(lambda x: x.rolling(20, min_periods=5).mean())
+        )
+
+        df["volume_momentum"] = (
+            df["volume"] / (df["volume_mean_20"] + cls.EPSILON)
+        ).clip(0, 5)
+
+        df["dollar_volume"] = df["close"] * df["volume"]
 
         # ---------------- Volatility ----------------
 
         grp = df.groupby("ticker")["return"]
-
-        df["volatility_5"] = (
-            grp.rolling(5, min_periods=5).std(ddof=0)
-            .shift(1)
-            .reset_index(level=0, drop=True)
-        )
 
         df["volatility_20"] = (
             grp.rolling(20, min_periods=20).std(ddof=0)
@@ -146,15 +135,12 @@ class FeatureEngineer:
             .reset_index(level=0, drop=True)
         )
 
-        df["volatility"] = df["volatility_5"]
-
-        for col in ["volatility", "volatility_5", "volatility_20"]:
-            df[col] = (
-                df[col]
-                .replace([np.inf, -np.inf], np.nan)
-                .fillna(cls.VOL_FLOOR)
-                .clip(lower=cls.VOL_FLOOR)
-            )
+        df["volatility"] = (
+            df["volatility_20"]
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(cls.VOL_FLOOR)
+            .clip(lower=cls.VOL_FLOOR)
+        )
 
         # ---------------- RSI ----------------
 
@@ -163,32 +149,11 @@ class FeatureEngineer:
         for ticker, group in df.groupby("ticker"):
             try:
                 rsi = TechnicalIndicators.rsi(group[["date", "close"]], 14)
-                df.loc[group.index, "rsi"] = rsi.values.astype("float32")
+                df.loc[group.index, "rsi"] = rsi.values
             except Exception:
                 pass
 
         df["rsi"] = df["rsi"].clip(0, 100)
-
-        # ---------------- MACD ----------------
-
-        df["macd"] = 0.0
-        df["macd_signal"] = 0.0
-
-        for ticker, group in df.groupby("ticker"):
-            try:
-                macd, signal = TechnicalIndicators.macd(group[["date", "close"]])
-                df.loc[group.index, "macd"] = macd.astype("float32")
-                df.loc[group.index, "macd_signal"] = signal.astype("float32")
-            except Exception:
-                pass
-
-        df["macd_hist"] = df["macd"] - df["macd_signal"]
-
-        df[["macd", "macd_signal", "macd_hist"]] = (
-            df[["macd", "macd_signal", "macd_hist"]]
-            .replace([np.inf, -np.inf], np.nan)
-            .fillna(0.0)
-        )
 
         # ---------------- EMA ----------------
 
@@ -202,42 +167,40 @@ class FeatureEngineer:
 
         df["ema_ratio"] = (
             df["ema_10"] / (df["ema_50"] + cls.EPSILON)
-        ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
+        ).clip(0.5, 1.5)
 
-        # ---------------- Regime Feature (RESTORED) ----------------
+        # ---------------- 52W High Distance ----------------
 
-        rolling_mean = (
-            df.groupby("ticker")["volatility_20"]
+        rolling_high = (
+            df.groupby("ticker")["close"]
+            .transform(lambda x: x.rolling(252, min_periods=60).max())
+        )
+
+        df["dist_from_52w_high"] = (
+            (df["close"] / (rolling_high + cls.EPSILON)) - 1
+        ).clip(-1, 0)
+
+        # ---------------- Regime Feature ----------------
+
+        vol_mean = (
+            df.groupby("ticker")["volatility"]
             .transform(lambda x: x.rolling(60, min_periods=20).mean())
         )
 
-        rolling_std = (
-            df.groupby("ticker")["volatility_20"]
-            .transform(lambda x: x.rolling(60, min_periods=20).std(ddof=0))
+        vol_std = (
+            df.groupby("ticker")["volatility"]
+            .transform(lambda x: x.rolling(60, min_periods=20).std())
         )
 
-        zscore = (df["volatility_20"] - rolling_mean) / (
-            rolling_std + cls.EPSILON
-        )
-
-        df["regime_feature"] = zscore.clip(-3, 3).fillna(0.0)
-
-        # ---------------- Market Relative Strength ----------------
-
-        market_ret_20 = (
-            df.groupby("date")["close"]
-            .transform("mean")
-            .pct_change(20)
-        )
-
-        df["rel_strength_20"] = (
-            df["momentum_20"] - market_ret_20
-        ).clip(-2, 2)
+        df["regime_feature"] = (
+            (df["volatility"] - vol_mean) /
+            (vol_std + cls.EPSILON)
+        ).clip(-3, 3).fillna(0.0)
 
         return df
 
     ########################################################
-    # CROSS SECTIONAL
+    # CROSS SECTIONAL FEATURES
     ########################################################
 
     @classmethod
@@ -246,42 +209,33 @@ class FeatureEngineer:
         df = df.sort_values(["date", "ticker"]).copy()
 
         base_cols = [
-            "momentum_5",
-            "momentum_10",
             "momentum_20",
             "momentum_60",
-            "momentum_accel",
             "momentum_composite",
-            "mean_reversion_1",
-            "rel_strength_20",
             "return_lag5",
             "return_mean_20",
             "rsi",
             "volatility",
             "ema_ratio",
-            "macd_hist",
+            "volume_momentum",
+            "dollar_volume",
+            "dist_from_52w_high",
             "regime_feature",
         ]
-
-        single_ticker = df["ticker"].nunique() <= 1
 
         for col in base_cols:
 
             if col not in df.columns:
                 continue
 
-            if single_ticker:
-                df[f"{col}_z"] = 0.0
-                df[f"{col}_rank"] = 0.5
-                continue
+            cs_width = df.groupby("date")[col].transform("count")
+
+            df = df[cs_width >= cls.MIN_CS_WIDTH]
 
             cs_mean = df.groupby("date")[col].transform("mean")
             cs_std = df.groupby("date")[col].transform("std")
 
-            robust_std = cs_std.replace(0, np.nan)
-
-            z = (df[col] - cs_mean) / robust_std
-            rank = df.groupby("date")[col].rank(method="first", pct=True)
+            z = (df[col] - cs_mean) / (cs_std + cls.EPSILON)
 
             df[f"{col}_z"] = (
                 z.replace([np.inf, -np.inf], np.nan)
@@ -289,7 +243,11 @@ class FeatureEngineer:
                 .clip(-5, 5)
             )
 
-            df[f"{col}_rank"] = rank.fillna(0.5)
+            df[f"{col}_rank"] = (
+                df.groupby("date")[col]
+                .rank(method="first", pct=True)
+                .fillna(0.5)
+            )
 
         return df
 
