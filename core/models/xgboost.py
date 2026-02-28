@@ -3,11 +3,14 @@ import numpy as np
 import logging
 import hashlib
 import json
+import random
 
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
-NUM_BOOST_ROUNDS = 600
+NUM_BOOST_ROUNDS = 800
+EARLY_STOPPING_ROUNDS = 50
+
 MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
 MIN_GROUP_SIZE = 5
@@ -15,20 +18,48 @@ EPSILON = 1e-12
 
 
 ###################################################
-# PRODUCTION RANKING MODEL (PAIRWISE RANKING)
+# PRODUCTION RANKING MODEL (INSTITUTIONAL GRADE)
 ###################################################
 
 class SafeXGBRanker:
 
     def __init__(self):
+
         self.model = None
         self.feature_names = None
         self.training_cols = None
+
         self.feature_checksum = None
         self.param_checksum = None
         self.importance_checksum = None
+        self.training_fingerprint = None
 
+        random.seed(SEED)
         np.random.seed(SEED)
+
+    ###################################################
+    # INTERNAL: CREATE VALIDATION SPLIT
+    ###################################################
+
+    def _split_train_validation(self, X, y, groups):
+
+        # last 20% of groups used for validation
+        group_boundaries = np.cumsum(groups)
+        total_groups = len(groups)
+        val_groups = max(1, int(total_groups * 0.2))
+
+        split_idx = group_boundaries[-val_groups]
+
+        X_train = X.iloc[:split_idx]
+        y_train = y[:split_idx]
+
+        X_val = X.iloc[split_idx:]
+        y_val = y[split_idx:]
+
+        train_groups = groups[:-val_groups]
+        val_groups = groups[-val_groups:]
+
+        return X_train, y_train, train_groups, X_val, y_val, val_groups
 
     ###################################################
     # TRAIN
@@ -58,10 +89,15 @@ class SafeXGBRanker:
             raise RuntimeError("Cross-sectional group too small.")
 
         if sum(groups) != len(X):
-            raise RuntimeError("Group sizes do not match training rows.")
+            raise RuntimeError("Group sizes mismatch.")
 
         self.feature_names = list(X.columns)
         self.training_cols = X.shape[1]
+
+        # fingerprint dataset for reproducibility
+        self.training_fingerprint = hashlib.sha256(
+            X.to_numpy().tobytes()
+        ).hexdigest()
 
         ###################################################
         # LOCK FEATURE CONTRACT
@@ -73,19 +109,28 @@ class SafeXGBRanker:
         ).hexdigest()
 
         ###################################################
-        # BUILD DMATRIX
+        # TRAIN/VALIDATION SPLIT
         ###################################################
+
+        X_train, y_train, train_groups, X_val, y_val, val_groups = \
+            self._split_train_validation(X, y, groups)
 
         dtrain = xgb.DMatrix(
-            X,
-            label=y,
+            X_train,
+            label=y_train,
             feature_names=self.feature_names,
         )
+        dtrain.set_group(train_groups)
 
-        dtrain.set_group(groups)
+        dval = xgb.DMatrix(
+            X_val,
+            label=y_val,
+            feature_names=self.feature_names,
+        )
+        dval.set_group(val_groups)
 
         ###################################################
-        # RANKING PARAMETERS (PROPER OBJECTIVE)
+        # PARAMETERS
         ###################################################
 
         params = {
@@ -110,13 +155,15 @@ class SafeXGBRanker:
         ).hexdigest()
 
         ###################################################
-        # TRAIN
+        # TRAIN WITH EARLY STOPPING
         ###################################################
 
         self.model = xgb.train(
             params,
             dtrain,
             num_boost_round=NUM_BOOST_ROUNDS,
+            evals=[(dtrain, "train"), (dval, "val")],
+            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
             verbose_eval=False,
         )
 
@@ -130,10 +177,11 @@ class SafeXGBRanker:
             raise RuntimeError("Non-finite training predictions.")
 
         if np.std(preds) < MIN_SCORE_STD:
-            raise RuntimeError("Score collapse during training.")
+            raise RuntimeError("Score collapse detected.")
 
         logger.info(
-            "XGBoost ranking trained | pred_std=%.6f",
+            "XGB Ranking trained | rounds=%d | pred_std=%.6f",
+            self.model.best_iteration,
             float(np.std(preds)),
         )
 
@@ -172,6 +220,9 @@ class SafeXGBRanker:
 
         if not np.all(np.isfinite(scores)):
             raise RuntimeError("Non-finite inference scores.")
+
+        # prevent extreme explosions
+        scores = np.clip(scores, -50, 50)
 
         return scores
 
@@ -222,7 +273,7 @@ class SafeXGBRanker:
 def build_xgboost_pipeline():
 
     logger.info(
-        "Building XGBoost Pairwise Ranking Model (production safe)"
+        "Building Institutional XGBoost Pairwise Ranking Model"
     )
 
     return SafeXGBRanker()
