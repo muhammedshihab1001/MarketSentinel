@@ -32,8 +32,10 @@ class WalkForwardValidator:
 
     SCORE_WINSOR_Q = 0.02
 
-    # Relaxed dispersion logic (adaptive)
-    MIN_DISPERSION = 0.05
+    # --- Adaptive dispersion controls ---
+    BASE_DISPERSION = 0.05        # floor
+    DISPERSION_PERCENTILE = 0.40  # dynamic threshold percentile
+    MIN_ACTIVE_POSITIONS = 4
 
     EPSILON = 1e-9
 
@@ -61,8 +63,6 @@ class WalkForwardValidator:
         embargo_cut = pd.Timestamp(test_start) - pd.Timedelta(days=self.embargo_days)
         return train_df[train_df["date"] < embargo_cut]
 
-    ########################################################
-    # TARGET (CROSS-SECTIONAL NEUTRALIZED)
     ########################################################
 
     def _build_fold_target(self, df):
@@ -119,6 +119,28 @@ class WalkForwardValidator:
             except Exception:
                 pass
         return model.predict(X)
+
+    ########################################################
+    # NEW: Adaptive Dispersion Gate
+    ########################################################
+
+    def _dispersion_gate(self, scores):
+        dispersion = float(np.std(scores))
+
+        # dynamic threshold
+        dynamic_threshold = max(
+            self.BASE_DISPERSION,
+            np.percentile(np.abs(scores), self.DISPERSION_PERCENTILE * 100)
+        )
+
+        if self.debug:
+            logger.info(
+                "Dispersion=%.4f | Threshold=%.4f",
+                dispersion,
+                dynamic_threshold
+            )
+
+        return dispersion >= dynamic_threshold
 
     ########################################################
 
@@ -214,8 +236,8 @@ class WalkForwardValidator:
                 scores = self._winsorize(scores)
                 scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
 
-                # Adaptive dispersion gate
-                if np.std(scores) < self.MIN_DISPERSION:
+                # adaptive dispersion gate
+                if not self._dispersion_gate(scores):
                     continue
 
                 signal_slice["score"] = scores
@@ -235,6 +257,9 @@ class WalkForwardValidator:
                 else:
                     longs = ranked.head(self.TOP_K)
                     shorts = ranked.tail(self.BOTTOM_K)
+
+                if len(longs) < self.MIN_ACTIVE_POSITIONS or len(shorts) < self.MIN_ACTIVE_POSITIONS:
+                    continue
 
                 long_alpha = self._softmax(longs["score"].values)
                 short_alpha = self._softmax(np.abs(shorts["score"].values))
