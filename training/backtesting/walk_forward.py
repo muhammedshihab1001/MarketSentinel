@@ -11,9 +11,6 @@ from training.backtesting.regime import MarketRegimeDetector
 
 logger = logging.getLogger("marketsentinel.walkforward")
 
-# ==========================================================
-# UPDATED HORIZON (STRUCTURAL FIX)
-# ==========================================================
 FORWARD_DAYS = 5
 
 
@@ -34,8 +31,6 @@ class WalkForwardValidator:
     MAX_SHARPE = 5.0
 
     SCORE_WINSOR_Q = 0.02
-
-    # --- Adaptive dispersion controls ---
     BASE_DISPERSION = 0.05
     DISPERSION_PERCENTILE = 0.40
     MIN_ACTIVE_POSITIONS = 4
@@ -57,9 +52,6 @@ class WalkForwardValidator:
         self.debug = debug
         self.regime_detector = MarketRegimeDetector()
 
-        self._direction = 1
-        self._direction_locked = False
-
     # ==========================================================
     # EMBARGO
     # ==========================================================
@@ -69,7 +61,7 @@ class WalkForwardValidator:
         return train_df[train_df["date"] < embargo_cut]
 
     # ==========================================================
-    # TARGET (CROSS-SECTIONAL NEUTRALIZED)
+    # TARGET — MATCH TRAINING (Z-SCORE NORMALIZED)
     # ==========================================================
 
     def _build_fold_target(self, df):
@@ -83,7 +75,11 @@ class WalkForwardValidator:
         df = df.dropna(subset=["raw_forward"])
 
         cs_mean = df.groupby("date")["raw_forward"].transform("mean")
-        df["target"] = df["raw_forward"] - cs_mean
+        cs_std = df.groupby("date")["raw_forward"].transform("std")
+        cs_std = cs_std.replace(0, np.nan)
+
+        df["target"] = (df["raw_forward"] - cs_mean) / cs_std
+        df = df[np.isfinite(df["target"])]
 
         df.drop(columns=["raw_forward"], inplace=True)
         return df
@@ -100,29 +96,11 @@ class WalkForwardValidator:
         e = np.exp(x)
         return e / (np.sum(e) + self.EPSILON)
 
-    def _auto_detect_direction(self, scores, forward_returns):
-        if self._direction_locked:
-            return
-
-        corr = np.corrcoef(scores, forward_returns)[0, 1]
-        if np.isnan(corr):
-            return
-
-        self._direction = 1 if corr >= 0 else -1
-        self._direction_locked = True
-
     def _predict_scores(self, model, X):
-        if hasattr(model, "predict_proba"):
-            try:
-                proba = model.predict_proba(X)
-                if proba.ndim == 2 and proba.shape[1] > 1:
-                    return proba[:, 1]
-            except Exception:
-                pass
         return model.predict(X)
 
     # ==========================================================
-    # ADAPTIVE DISPERSION GATE
+    # DISPERSION GATE
     # ==========================================================
 
     def _dispersion_gate(self, scores):
@@ -132,13 +110,6 @@ class WalkForwardValidator:
             self.BASE_DISPERSION,
             np.percentile(np.abs(scores), self.DISPERSION_PERCENTILE * 100)
         )
-
-        if self.debug:
-            logger.info(
-                "Dispersion=%.4f | Threshold=%.4f",
-                dispersion,
-                dynamic_threshold
-            )
 
         return dispersion >= dynamic_threshold
 
@@ -214,17 +185,16 @@ class WalkForwardValidator:
                 signal_slice = test_df[test_df["date"] == signal_date]
                 exit_slice = test_df[test_df["date"] == exit_date]
 
-                common_tickers = set(signal_slice["ticker"]) & set(exit_slice["ticker"])
-
-                if len(common_tickers) < self.MIN_CROSS_SECTION:
+                common = set(signal_slice["ticker"]) & set(exit_slice["ticker"])
+                if len(common) < self.MIN_CROSS_SECTION:
                     continue
 
                 signal_slice = signal_slice[
-                    signal_slice["ticker"].isin(common_tickers)
+                    signal_slice["ticker"].isin(common)
                 ].copy()
 
                 exit_slice = exit_slice[
-                    exit_slice["ticker"].isin(common_tickers)
+                    exit_slice["ticker"].isin(common)
                 ].copy()
 
                 X = signal_slice.loc[:, MODEL_FEATURES].astype(DTYPE)
@@ -243,21 +213,11 @@ class WalkForwardValidator:
 
                 signal_slice["score"] = scores
 
-                forward_ret = (
-                    np.log(exit_slice["close"].values) -
-                    np.log(signal_slice["close"].values)
-                )
-
-                self._auto_detect_direction(scores, forward_ret)
-
                 ranked = signal_slice.sort_values("score")
 
-                if self._direction == 1:
-                    longs = ranked.tail(self.TOP_K)
-                    shorts = ranked.head(self.BOTTOM_K)
-                else:
-                    longs = ranked.head(self.TOP_K)
-                    shorts = ranked.tail(self.BOTTOM_K)
+                # FIXED DIRECTION: Positive score = LONG
+                longs = ranked.tail(self.TOP_K)
+                shorts = ranked.head(self.BOTTOM_K)
 
                 if len(longs) < self.MIN_ACTIVE_POSITIONS or len(shorts) < self.MIN_ACTIVE_POSITIONS:
                     continue
@@ -305,8 +265,8 @@ class WalkForwardValidator:
                 for row in merged.itertuples():
                     if row.ticker in positions:
                         weight = positions[row.ticker]
-                        gross_cost = abs(weight) * self.TRANSACTION_COST
-                        period_ret += weight * row.ret - gross_cost
+                        cost = abs(weight) * self.TRANSACTION_COST
+                        period_ret += weight * row.ret - cost
 
                 window_returns.append(period_ret)
 
