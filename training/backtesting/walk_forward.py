@@ -30,6 +30,7 @@ class WalkForwardValidator:
     SLIPPAGE = 0.0005
     MAX_SHARPE = 5.0
 
+    SCORE_WINSOR_Q = 0.02
     EPSILON = 1e-9
 
     def __init__(
@@ -62,7 +63,6 @@ class WalkForwardValidator:
 
         df = df.sort_values(["ticker", "date"]).copy()
 
-        # Use log returns (stable & additive)
         df["target"] = (
             df.groupby("ticker")["close"]
             .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
@@ -73,14 +73,26 @@ class WalkForwardValidator:
 
     ########################################################
 
+    def _winsorize(self, x):
+        lower = np.quantile(x, self.SCORE_WINSOR_Q)
+        upper = np.quantile(x, 1 - self.SCORE_WINSOR_Q)
+        return np.clip(x, lower, upper)
+
+    ########################################################
+
     def _select_positions(self, ranked):
 
+        cs_size = len(ranked)
+
+        top_k = min(self.TOP_K, cs_size // 2)
+        bottom_k = min(self.BOTTOM_K, cs_size // 2)
+
         if self._direction == 1:
-            longs = ranked.tail(self.TOP_K)
-            shorts = ranked.head(self.BOTTOM_K)
+            longs = ranked.tail(top_k)
+            shorts = ranked.head(bottom_k)
         else:
-            longs = ranked.head(self.TOP_K)
-            shorts = ranked.tail(self.BOTTOM_K)
+            longs = ranked.head(top_k)
+            shorts = ranked.tail(bottom_k)
 
         return longs, shorts
 
@@ -160,10 +172,6 @@ class WalkForwardValidator:
             window_returns = []
             test_dates_sorted = sorted(test_df["date"].unique())
 
-            ########################################################
-            # STRICT NON-OVERLAPPING TRADES
-            ########################################################
-
             for i in range(0, len(test_dates_sorted) - FORWARD_DAYS, FORWARD_DAYS):
 
                 signal_date = test_dates_sorted[i]
@@ -172,7 +180,6 @@ class WalkForwardValidator:
                 signal_slice = test_df[test_df["date"] == signal_date]
                 exit_slice = test_df[test_df["date"] == exit_date]
 
-                # Ensure matching tradable universe
                 common_tickers = set(signal_slice["ticker"]) & set(exit_slice["ticker"])
 
                 if len(common_tickers) < self.MIN_CROSS_SECTION:
@@ -194,14 +201,16 @@ class WalkForwardValidator:
                 if np.std(scores) < self.MIN_SCORE_STD:
                     continue
 
+                scores = self._winsorize(scores)
                 scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
+
                 signal_slice["score"] = scores
 
                 ranked = signal_slice.sort_values(["score", "ticker"])
                 longs, shorts = self._select_positions(ranked)
 
                 ########################################################
-                # ROBUST DIRECTION CHECK (only first fold)
+                # DIRECTION CHECK (STABILIZED)
                 ########################################################
 
                 if not self._direction_locked:
@@ -226,18 +235,19 @@ class WalkForwardValidator:
                         merged_tmp["ticker"].isin(shorts["ticker"])
                     ]["ret"].mean()
 
-                    if long_mean < short_mean:
-                        logger.warning("Signal appears inverted — auto-flipping.")
-                        self._direction = -1
+                    if np.isfinite(long_mean) and np.isfinite(short_mean):
+                        if long_mean < short_mean:
+                            logger.warning("Signal appears inverted — auto-flipping.")
+                            self._direction = -1
 
                     self._direction_locked = True
 
                 ########################################################
-                # POSITION SIZING
+                # VOLATILITY WEIGHTING (ROBUST)
                 ########################################################
 
-                long_vol = longs["volatility"].astype("float64").clip(lower=self.EPSILON)
-                short_vol = shorts["volatility"].astype("float64").clip(lower=self.EPSILON)
+                long_vol = longs["volatility"].astype("float64").clip(lower=0.01)
+                short_vol = shorts["volatility"].astype("float64").clip(lower=0.01)
 
                 long_weights = 1.0 / long_vol
                 short_weights = 1.0 / short_vol
@@ -257,7 +267,7 @@ class WalkForwardValidator:
                     positions[t] = -float(w)
 
                 ########################################################
-                # EXECUTION & COST MODEL
+                # EXECUTION
                 ########################################################
 
                 merged = pd.merge(
@@ -295,10 +305,6 @@ class WalkForwardValidator:
                 capital *= np.exp(r)
                 capital = max(capital, 1.0)
                 equity_curve.append(capital)
-
-            ########################################################
-            # WINDOW SHARPE (robust annualization)
-            ########################################################
 
             vol = np.std(window_returns)
 
