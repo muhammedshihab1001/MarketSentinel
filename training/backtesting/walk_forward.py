@@ -57,8 +57,6 @@ class WalkForwardValidator:
         return train_df[train_df["date"] < embargo_cut]
 
     ########################################################
-    # REGRESSION TARGET
-    ########################################################
 
     def _build_fold_target(self, df):
 
@@ -70,7 +68,6 @@ class WalkForwardValidator:
         )
 
         df = df.dropna(subset=["target"])
-
         return df
 
     ########################################################
@@ -87,13 +84,9 @@ class WalkForwardValidator:
         return longs, shorts
 
     ########################################################
-    # 🔥 SAFE PREDICTION WRAPPER
-    ########################################################
 
     def _predict_scores(self, model, X):
-        """
-        Supports both regression and classification safely.
-        """
+
         if hasattr(model, "predict_proba"):
             try:
                 proba = model.predict_proba(X)
@@ -102,7 +95,6 @@ class WalkForwardValidator:
             except Exception:
                 pass
 
-        # Regression fallback
         return model.predict(X)
 
     ########################################################
@@ -167,7 +159,8 @@ class WalkForwardValidator:
             window_returns = []
             test_dates_sorted = sorted(test_df["date"].unique())
 
-            for i in range(len(test_dates_sorted) - FORWARD_DAYS):
+            # ✅ NON-OVERLAPPING TRADES
+            for i in range(0, len(test_dates_sorted) - FORWARD_DAYS, FORWARD_DAYS):
 
                 signal_date = test_dates_sorted[i]
                 exit_date = test_dates_sorted[i + FORWARD_DAYS]
@@ -187,12 +180,10 @@ class WalkForwardValidator:
                     continue
 
                 signal_slice = signal_slice.copy()
-
                 scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
                 signal_slice["score"] = scores
 
                 ranked = signal_slice.sort_values(["score", "ticker"])
-
                 longs, shorts = self._select_positions(ranked)
 
                 if not self._direction_locked:
