@@ -11,7 +11,7 @@ from training.backtesting.regime import MarketRegimeDetector
 
 logger = logging.getLogger("marketsentinel.walkforward")
 
-FORWARD_DAYS = 5
+FORWARD_DAYS = 10
 
 
 class WalkForwardValidator:
