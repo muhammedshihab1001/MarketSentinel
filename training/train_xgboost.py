@@ -8,6 +8,7 @@ import pandas as pd
 import argparse
 import hashlib
 import json
+import inspect
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
@@ -16,6 +17,8 @@ from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
+    get_schema_signature,
+    SCHEMA_VERSION
 )
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
@@ -54,7 +57,26 @@ def enforce_determinism():
 
 
 # ==========================================================
-# VALIDATION
+# HASH HELPERS
+# ==========================================================
+
+def compute_dataset_hash(df: pd.DataFrame) -> str:
+    df_sorted = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+    return MetadataManager.fingerprint_dataset(df_sorted)
+
+
+def compute_feature_checksum():
+    canonical = json.dumps(list(MODEL_FEATURES), sort_keys=False).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def compute_training_code_hash():
+    source = inspect.getsource(build_xgboost_pipeline)
+    return hashlib.sha256(source.encode()).hexdigest()
+
+
+# ==========================================================
+# METRIC VALIDATION
 # ==========================================================
 
 def validate_production_metrics(metrics: dict):
@@ -98,15 +120,6 @@ def validate_production_metrics(metrics: dict):
 
     if metrics["final_equity"] <= 0:
         raise RuntimeError("Backtest produced non-positive equity.")
-
-
-# ==========================================================
-# DATASET HASH
-# ==========================================================
-
-def compute_dataset_hash(df: pd.DataFrame) -> str:
-    df_sorted = df.sort_values(["date", "ticker"]).reset_index(drop=True)
-    return MetadataManager.fingerprint_dataset(df_sorted)
 
 
 # ==========================================================
@@ -202,8 +215,7 @@ def build_target(df: pd.DataFrame):
 
 
 def build_groups(df: pd.DataFrame):
-    groups = df.groupby("date").size().values.astype(int)
-    return groups
+    return df.groupby("date").size().values.astype(int)
 
 
 # ==========================================================
@@ -211,7 +223,6 @@ def build_groups(df: pd.DataFrame):
 # ==========================================================
 
 def trainer(train_df):
-
     train_df = build_target(train_df)
     train_df = train_df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
@@ -230,7 +241,6 @@ def trainer(train_df):
 
 
 def final_trainer(train_df):
-
     train_df = build_target(train_df)
     train_df = train_df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
@@ -262,30 +272,34 @@ def export_artifacts(model, metrics, dataset_hash,
     timestamp = int(time.time())
     model_path = os.path.join(MODEL_DIR, f"model_{timestamp}.pkl")
 
+    # attach fingerprint inside model
+    model.training_fingerprint = dataset_hash
+
     joblib.dump(model, model_path)
 
     artifact_hash = MetadataManager.hash_file(model_path)
 
-    scalar_metrics = {k: v for k, v in metrics.items() if k != "equity_curve"}
-
-    metadata = MetadataManager.create_metadata(
-        model_name="xgboost",
-        metrics=scalar_metrics,
-        features=tuple(MODEL_FEATURES),
-        training_start=str(start_date),
-        training_end=str(end_date),
-        dataset_hash=dataset_hash,
-        dataset_rows=len(final_df),
-        metadata_type="training_manifest_v1",
-        extra_fields={
-            "artifact_hash": artifact_hash
-        }
-    )
+    metadata = {
+        "metadata_type": "training_manifest_v1",
+        "schema_signature": get_schema_signature(),
+        "schema_version": SCHEMA_VERSION,
+        "features": list(MODEL_FEATURES),
+        "artifact_hash": artifact_hash,
+        "dataset_hash": dataset_hash,
+        "training_code_hash": compute_training_code_hash(),
+        "feature_checksum": compute_feature_checksum(),
+        "metrics": {k: v for k, v in metrics.items() if k != "equity_curve"},
+        "training_start": str(start_date),
+        "training_end": str(end_date),
+        "dataset_rows": len(final_df),
+        "created_at": int(time.time())
+    }
 
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{timestamp}.json")
-    MetadataManager.save_metadata(metadata, metadata_path)
 
-    #  FIXED: baseline creation restored
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
     if create_baseline:
         with open(BASELINE_CONTRACT, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
