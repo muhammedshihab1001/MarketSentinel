@@ -4,10 +4,6 @@ from typing import Dict, Any, List
 
 class SignalAgent:
 
-    HIGH_CONF_THRESHOLD = 0.75
-    MOD_CONF_THRESHOLD = 0.60
-    LOW_CONF_THRESHOLD = 0.52
-
     RSI_OVERBOUGHT = 70
     RSI_OVERSOLD = 30
 
@@ -15,11 +11,15 @@ class SignalAgent:
     EMA_BEARISH = 0.95
 
     MOMENTUM_STRONG = 1.0
-    DISPERSION_WEAK = 0.02
+    DISPERSION_WEAK = 0.05
 
-    ########################################################
+    Z_VERY_STRONG = 2.0
+    Z_STRONG = 1.25
+    Z_MODERATE = 0.75
+
+    # =========================================================
     # SAFE FLOAT
-    ########################################################
+    # =========================================================
 
     @staticmethod
     def _safe_float(value, default=0.0):
@@ -33,9 +33,9 @@ class SignalAgent:
         except Exception:
             return default
 
-    ########################################################
-    # PUBLIC API
-    ########################################################
+    # =========================================================
+    # MAIN ANALYSIS
+    # =========================================================
 
     def analyze(
         self,
@@ -43,10 +43,7 @@ class SignalAgent:
         probability_stats: Dict[str, float],
     ) -> Dict[str, Any]:
 
-        # 🔥 Regression alpha score (scaled 0–1)
-        score = self._safe_float(row.get("score"), 0.5)
-        rank_pct = self._safe_float(row.get("rank_pct"), 0.5)
-
+        score = self._safe_float(row.get("score"), 0.0)
         signal = row.get("signal", "NEUTRAL")
 
         volatility = self._safe_float(row.get("volatility"), 0.0)
@@ -57,36 +54,24 @@ class SignalAgent:
 
         warnings: List[str] = []
 
-        ####################################################
-        # 0️⃣ Cross-sectional dispersion check
-        ####################################################
+        # =====================================================
+        # 1️⃣ Confidence based on Z-score magnitude
+        # =====================================================
 
-        std_dispersion = self._safe_float(
-            probability_stats.get("std"),
-            0.0
-        )
+        abs_score = abs(score)
 
-        if std_dispersion < self.DISPERSION_WEAK:
-            warnings.append("Low cross-sectional signal dispersion detected.")
-
-        ####################################################
-        # 1️⃣ Confidence (based on cross-sectional rank)
-        ####################################################
-
-        if rank_pct >= 0.9:
+        if abs_score >= self.Z_VERY_STRONG:
             confidence = "very_high"
-        elif rank_pct >= 0.75:
+        elif abs_score >= self.Z_STRONG:
             confidence = "high"
-        elif rank_pct >= 0.60:
+        elif abs_score >= self.Z_MODERATE:
             confidence = "moderate"
-        elif rank_pct >= 0.50:
-            confidence = "low"
         else:
-            confidence = "very_low"
+            confidence = "low"
 
-        ####################################################
-        # 2️⃣ Volatility Context
-        ####################################################
+        # =====================================================
+        # 2️⃣ Volatility Regime
+        # =====================================================
 
         if regime_feature == 1.0:
             volatility_regime = "high_volatility"
@@ -94,18 +79,18 @@ class SignalAgent:
         else:
             volatility_regime = "normal"
 
-        ####################################################
+        # =====================================================
         # 3️⃣ RSI Context
-        ####################################################
+        # =====================================================
 
         if rsi > self.RSI_OVERBOUGHT:
-            warnings.append("RSI indicates overbought condition.")
+            warnings.append("RSI overbought.")
         elif rsi < self.RSI_OVERSOLD:
-            warnings.append("RSI indicates oversold condition.")
+            warnings.append("RSI oversold.")
 
-        ####################################################
+        # =====================================================
         # 4️⃣ Momentum Context
-        ####################################################
+        # =====================================================
 
         if momentum_z > self.MOMENTUM_STRONG:
             momentum_state = "strong_positive"
@@ -120,9 +105,9 @@ class SignalAgent:
         if signal == "SHORT" and momentum_z > 0:
             warnings.append("Momentum contradicts SHORT signal.")
 
-        ####################################################
+        # =====================================================
         # 5️⃣ Trend Context
-        ####################################################
+        # =====================================================
 
         if ema_ratio > self.EMA_BULLISH:
             trend = "bullish"
@@ -131,64 +116,48 @@ class SignalAgent:
         else:
             trend = "neutral"
 
-        ####################################################
-        # 6️⃣ Strength Score (0–100)
-        ####################################################
+        # =====================================================
+        # 6️⃣ Cross-sectional dispersion health
+        # =====================================================
 
-        strength = 0.0
+        dispersion = self._safe_float(
+            probability_stats.get("std"),
+            0.0
+        )
 
-        # Alpha intensity (distance from neutral)
-        strength += abs(score - 0.5) * 120
+        if dispersion < self.DISPERSION_WEAK:
+            warnings.append("Low cross-sectional dispersion.")
 
-        # Rank importance
-        strength += abs(rank_pct - 0.5) * 80
+        # =====================================================
+        # 7️⃣ Strength Score (based purely on Z-score magnitude)
+        # =====================================================
 
-        # Momentum alignment boost
-        if (
-            (signal == "LONG" and momentum_z > 0) or
-            (signal == "SHORT" and momentum_z < 0)
-        ):
-            strength += 15
+        strength_score = int(
+            np.clip(abs_score * 40, 0, 100)
+        )
 
-        # Trend alignment boost
-        if (
-            (signal == "LONG" and trend == "bullish") or
-            (signal == "SHORT" and trend == "bearish")
-        ):
-            strength += 10
+        # =====================================================
+        # 8️⃣ Risk Level
+        # =====================================================
 
-        # Volatility penalty
         if volatility_regime == "high_volatility":
-            strength -= 15
-
-        # Warning penalty
-        strength -= len(warnings) * 5
-
-        strength_score = int(np.clip(strength, 0, 100))
-
-        ####################################################
-        # 7️⃣ Risk Level
-        ####################################################
-
-        if strength_score >= 80:
-            risk_level = "low"
-        elif strength_score >= 60:
-            risk_level = "moderate"
-        elif strength_score >= 40:
             risk_level = "elevated"
-        else:
+        elif abs_score < 0.5:
             risk_level = "high"
+        elif abs_score < 1.0:
+            risk_level = "moderate"
+        else:
+            risk_level = "low"
 
-        ####################################################
-        # Explanation Text (Production-ready)
-        ####################################################
+        # =====================================================
+        # Explanation
+        # =====================================================
 
         explanation = (
-            f"{signal} signal with {confidence} conviction "
-            f"(alpha_score={score:.3f}, cross_rank={rank_pct:.2f}). "
-            f"Trend: {trend}. "
-            f"Volatility regime: {volatility_regime}. "
-            f"Momentum: {momentum_state}."
+            f"{signal} signal | alpha_z={score:.2f} | "
+            f"confidence={confidence}. "
+            f"Trend={trend}, Momentum={momentum_state}, "
+            f"VolatilityRegime={volatility_regime}."
         )
 
         return {
