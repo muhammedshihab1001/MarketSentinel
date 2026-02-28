@@ -29,6 +29,7 @@ logger = logging.getLogger("marketsentinel.train_xgb")
 
 MODEL_DIR = os.path.abspath("artifacts/xgboost")
 PRODUCTION_POINTER = "production_pointer.json"
+BASELINE_CONTRACT = os.path.join(MODEL_DIR, "baseline_contract.json")
 
 SEED = 42
 MIN_TRAINING_ROWS = 1200
@@ -104,6 +105,56 @@ def validate_production_metrics(metrics: dict):
 
 
 ############################################################
+# BASELINE GOVERNANCE
+############################################################
+
+def save_baseline_contract(metrics, dataset_hash, model_version):
+    contract = {
+        "avg_sharpe": metrics["avg_sharpe"],
+        "profit_factor": metrics["profit_factor"],
+        "max_drawdown": metrics["max_drawdown"],
+        "dataset_hash": dataset_hash,
+        "model_version": model_version,
+        "feature_checksum": compute_feature_checksum(),
+        "created_utc": int(time.time())
+    }
+
+    with open(BASELINE_CONTRACT, "w", encoding="utf-8") as f:
+        json.dump(contract, f, indent=2)
+
+    logger.info("Baseline contract saved.")
+
+
+def load_baseline_contract():
+    if not os.path.exists(BASELINE_CONTRACT):
+        return None
+    with open(BASELINE_CONTRACT, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def validate_against_baseline(metrics):
+    baseline = load_baseline_contract()
+
+    if not baseline:
+        logger.info("No baseline contract found. Skipping baseline comparison.")
+        return
+
+    sharpe_ratio = metrics["avg_sharpe"] / baseline["avg_sharpe"]
+    pf_ratio = metrics["profit_factor"] / baseline["profit_factor"]
+
+    if sharpe_ratio < 0.8:
+        raise RuntimeError("Sharpe degraded >20% vs baseline.")
+
+    if pf_ratio < 0.8:
+        raise RuntimeError("Profit factor degraded >20% vs baseline.")
+
+    if metrics["max_drawdown"] < baseline["max_drawdown"] - 0.10:
+        raise RuntimeError("Drawdown materially worse vs baseline.")
+
+    logger.info("Baseline comparison passed.")
+
+
+############################################################
 # FEATURE CHECKSUM
 ############################################################
 
@@ -125,7 +176,7 @@ def compute_dataset_hash(df: pd.DataFrame) -> str:
 
 
 ############################################################
-# LOAD DATA
+# DATA LOADING
 ############################################################
 
 def load_training_data(start_date, end_date):
@@ -137,7 +188,6 @@ def load_training_data(start_date, end_date):
     datasets = []
 
     for ticker in universe:
-
         price_df = market_data.get_price_data(
             ticker=ticker,
             start_date=start_date,
@@ -184,7 +234,7 @@ def load_training_data(start_date, end_date):
 
 
 ############################################################
-# REGRESSION TARGET
+# TARGET
 ############################################################
 
 def build_target(df: pd.DataFrame):
@@ -219,7 +269,6 @@ def build_target(df: pd.DataFrame):
 ############################################################
 
 def trainer(train_df):
-
     train_df = build_target(train_df)
 
     X = validate_feature_schema(
@@ -236,7 +285,6 @@ def trainer(train_df):
 
 
 def final_trainer(train_df):
-
     train_df = build_target(train_df)
 
     X = validate_feature_schema(
@@ -253,7 +301,7 @@ def final_trainer(train_df):
 
 
 ############################################################
-# EXPORT (FIXED — METRICS SAFE)
+# EXPORT
 ############################################################
 
 def export_artifacts(model, metrics, dataset_hash,
@@ -271,7 +319,6 @@ def export_artifacts(model, metrics, dataset_hash,
 
     artifact_hash = MetadataManager.hash_file(model_path)
 
-    # 🔥 Separate scalar metrics from time-series metrics
     scalar_metrics = {
         k: v for k, v in metrics.items()
         if k != "equity_curve"
@@ -339,6 +386,7 @@ def main(start_date=None, end_date=None,
 
     try:
         validate_production_metrics(research_metrics)
+        validate_against_baseline(research_metrics)
     except RuntimeError as e:
         if allow_soft_fail:
             logger.warning("Soft-fail enabled: %s", str(e))
@@ -360,6 +408,8 @@ def main(start_date=None, end_date=None,
     )
 
     if create_baseline:
+        save_baseline_contract(research_metrics, dataset_hash, version)
+
         drift = DriftDetector()
         drift.create_baseline(
             dataset=final_df.loc[:, MODEL_FEATURES],
