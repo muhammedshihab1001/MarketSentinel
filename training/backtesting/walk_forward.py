@@ -31,6 +31,7 @@ class WalkForwardValidator:
     MAX_SHARPE = 5.0
 
     SCORE_WINSOR_Q = 0.02
+    DISPERSION_THRESHOLD = 0.15
     EPSILON = 1e-9
 
     def __init__(
@@ -58,11 +59,10 @@ class WalkForwardValidator:
         return train_df[train_df["date"] < embargo_cut]
 
     ########################################################
-    # 🔥 IMPROVED TARGET (CROSS-SECTIONAL NEUTRALIZED)
+    # TARGET (CROSS-SECTIONAL NEUTRALIZED)
     ########################################################
 
     def _build_fold_target(self, df):
-
         df = df.sort_values(["ticker", "date"]).copy()
 
         df["raw_forward"] = (
@@ -72,12 +72,10 @@ class WalkForwardValidator:
 
         df = df.dropna(subset=["raw_forward"])
 
-        # Cross-sectional de-meaning (removes market beta)
         cs_mean = df.groupby("date")["raw_forward"].transform("mean")
         df["target"] = df["raw_forward"] - cs_mean
 
         df.drop(columns=["raw_forward"], inplace=True)
-
         return df
 
     ########################################################
@@ -89,26 +87,27 @@ class WalkForwardValidator:
 
     ########################################################
 
-    def _select_positions(self, ranked):
+    def _softmax(self, x):
+        x = x - np.max(x)
+        e = np.exp(x)
+        return e / (np.sum(e) + self.EPSILON)
 
-        cs_size = len(ranked)
+    ########################################################
 
-        top_k = min(self.TOP_K, cs_size // 2)
-        bottom_k = min(self.BOTTOM_K, cs_size // 2)
+    def _auto_detect_direction(self, scores, forward_returns):
+        if self._direction_locked:
+            return
 
-        if self._direction == 1:
-            longs = ranked.tail(top_k)
-            shorts = ranked.head(bottom_k)
-        else:
-            longs = ranked.head(top_k)
-            shorts = ranked.tail(bottom_k)
+        corr = np.corrcoef(scores, forward_returns)[0, 1]
+        if np.isnan(corr):
+            return
 
-        return longs, shorts
+        self._direction = 1 if corr >= 0 else -1
+        self._direction_locked = True
 
     ########################################################
 
     def _predict_scores(self, model, X):
-
         if hasattr(model, "predict_proba"):
             try:
                 proba = model.predict_proba(X)
@@ -116,7 +115,6 @@ class WalkForwardValidator:
                     return proba[:, 1]
             except Exception:
                 pass
-
         return model.predict(X)
 
     ########################################################
@@ -213,38 +211,52 @@ class WalkForwardValidator:
                 scores = self._winsorize(scores)
                 scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
 
+                # DISPERSION GATE
+                if np.std(scores) < self.DISPERSION_THRESHOLD:
+                    continue
+
                 signal_slice["score"] = scores
 
-                ranked = signal_slice.sort_values(["score", "ticker"])
-                longs, shorts = self._select_positions(ranked)
+                # AUTO DIRECTION DETECTION
+                forward_ret = (
+                    np.log(exit_slice["close"].values) -
+                    np.log(signal_slice["close"].values)
+                )
+                self._auto_detect_direction(scores, forward_ret)
 
-                ########################################################
-                # VOLATILITY WEIGHTING
-                ########################################################
+                ranked = signal_slice.sort_values("score")
 
-                long_vol = longs["volatility"].astype("float64").clip(lower=0.01)
-                short_vol = shorts["volatility"].astype("float64").clip(lower=0.01)
+                if self._direction == 1:
+                    longs = ranked.tail(self.TOP_K)
+                    shorts = ranked.head(self.BOTTOM_K)
+                else:
+                    longs = ranked.head(self.TOP_K)
+                    shorts = ranked.tail(self.BOTTOM_K)
 
-                long_weights = 1.0 / long_vol
-                short_weights = 1.0 / short_vol
+                # ALPHA WEIGHTING (SOFTMAX)
+                long_alpha = self._softmax(longs["score"].values)
+                short_alpha = self._softmax(np.abs(shorts["score"].values))
 
-                long_weights /= long_weights.sum()
-                short_weights /= short_weights.sum()
+                # VOL WEIGHTING
+                long_vol = longs["volatility"].clip(lower=0.01).values
+                short_vol = shorts["volatility"].clip(lower=0.01).values
 
-                long_weights *= self.TARGET_GROSS_EXPOSURE / 2
-                short_weights *= self.TARGET_GROSS_EXPOSURE / 2
+                long_w = long_alpha / long_vol
+                short_w = short_alpha / short_vol
+
+                long_w /= long_w.sum()
+                short_w /= short_w.sum()
+
+                long_w *= self.TARGET_GROSS_EXPOSURE / 2
+                short_w *= self.TARGET_GROSS_EXPOSURE / 2
 
                 positions = {}
 
-                for t, w in zip(longs["ticker"], long_weights):
+                for t, w in zip(longs["ticker"], long_w):
                     positions[t] = float(w)
 
-                for t, w in zip(shorts["ticker"], short_weights):
+                for t, w in zip(shorts["ticker"], short_w):
                     positions[t] = -float(w)
-
-                ########################################################
-                # EXECUTION
-                ########################################################
 
                 merged = pd.merge(
                     signal_slice[["ticker", "close"]],
