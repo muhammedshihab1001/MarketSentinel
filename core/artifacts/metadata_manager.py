@@ -54,6 +54,34 @@ class MetadataManager:
     }
 
     #####################################################
+    # FILE HASH (NEW — SAFE ADDITION)
+    #####################################################
+
+    @staticmethod
+    def hash_file(path: str) -> str:
+        """
+        Deterministic SHA256 hash of file contents.
+        Used for artifact integrity tracking.
+        """
+
+        if not os.path.exists(path):
+            raise RuntimeError(f"Cannot hash missing file: {path}")
+
+        if os.path.islink(path):
+            raise RuntimeError(f"Symlink detected in artifact: {path}")
+
+        hasher = hashlib.sha256()
+
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+
+        return hasher.hexdigest()
+
+    #####################################################
     # ATOMIC SAVE
     #####################################################
 
