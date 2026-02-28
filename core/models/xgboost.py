@@ -17,7 +17,7 @@ EPSILON = 1e-12
 
 
 ###################################################
-# CLASS WEIGHT (REGRESSION SAFE)
+# CLASS WEIGHT (LEGACY SAFE — UNUSED IN REGRESSION)
 ###################################################
 
 def compute_class_weight(y):
@@ -45,14 +45,15 @@ def compute_class_weight(y):
 
     logger.info(
         "Class distribution | pos=%.0f neg=%.0f (weight unused in regression mode)",
-        pos, neg
+        pos,
+        neg,
     )
 
     return weight
 
 
 ###################################################
-# SAFE PRODUCTION MODEL (REGRESSION ALPHA MODE)
+# SAFE REGRESSION MODEL
 ###################################################
 
 class SafeXGBClassifier:
@@ -98,7 +99,7 @@ class SafeXGBClassifier:
             "XGBoost training | rows=%s cols=%s | target_std=%.8f",
             self.training_rows,
             self.training_cols,
-            float(np.std(y))
+            float(np.std(y)),
         )
 
         ###################################################
@@ -118,7 +119,7 @@ class SafeXGBClassifier:
         ).hexdigest()
 
         ###################################################
-        # SAFE TIME SPLIT
+        # TIME SPLIT FOR EARLY STOPPING
         ###################################################
 
         n = len(X)
@@ -141,11 +142,11 @@ class SafeXGBClassifier:
         dtrain_part = xgb.DMatrix(
             X_train_part,
             label=y_train_part,
-            feature_names=self.feature_names
+            feature_names=self.feature_names,
         )
 
         ###################################################
-        # IMPROVED PARAMETERS (ALPHA SAFE)
+        # REGRESSION PARAMETERS (DETERMINISTIC SAFE)
         ###################################################
 
         params = {
@@ -179,7 +180,7 @@ class SafeXGBClassifier:
             dval_part = xgb.DMatrix(
                 X_val_part,
                 label=y_val_part,
-                feature_names=self.feature_names
+                feature_names=self.feature_names,
             )
 
             self.model = xgb.train(
@@ -188,7 +189,7 @@ class SafeXGBClassifier:
                 num_boost_round=NUM_BOOST_ROUNDS,
                 evals=[(dval_part, "validation")],
                 early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-                verbose_eval=False
+                verbose_eval=False,
             )
 
         else:
@@ -196,7 +197,7 @@ class SafeXGBClassifier:
                 params,
                 dtrain_part,
                 num_boost_round=NUM_BOOST_ROUNDS,
-                verbose_eval=False
+                verbose_eval=False,
             )
 
         ###################################################
@@ -205,7 +206,7 @@ class SafeXGBClassifier:
 
         dtrain_full = xgb.DMatrix(
             X,
-            feature_names=self.feature_names
+            feature_names=self.feature_names,
         )
 
         preds = self.model.predict(dtrain_full)
@@ -221,16 +222,16 @@ class SafeXGBClassifier:
 
         logger.info(
             "XGBoost regression training completed successfully | pred_std=%.8f",
-            float(np.std(preds))
+            float(np.std(preds)),
         )
 
         return self
 
     ###################################################
-    # INFERENCE
+    # TRUE REGRESSION PREDICTION
     ###################################################
 
-    def predict_proba(self, X):
+    def predict(self, X):
 
         if self.model is None:
             raise RuntimeError("Model not trained.")
@@ -252,7 +253,7 @@ class SafeXGBClassifier:
 
         dmatrix = xgb.DMatrix(
             X,
-            feature_names=self.feature_names
+            feature_names=self.feature_names,
         )
 
         scores = self.model.predict(dmatrix)
@@ -263,7 +264,21 @@ class SafeXGBClassifier:
         if np.std(scores) < MIN_SCORE_STD:
             logger.warning("Inference score collapse detected.")
 
-        scaled = (scores - scores.min()) / (scores.max() - scores.min() + EPSILON)
+        return scores
+
+    ###################################################
+    # BACKWARD-COMPATIBLE PROBA WRAPPER
+    ###################################################
+
+    def predict_proba(self, X):
+        """
+        Preserved for compatibility.
+        Uses regression scores without destructive min-max scaling.
+        """
+        scores = self.predict(X)
+
+        # Stable sigmoid transformation (monotonic, no fold distortion)
+        scaled = 1.0 / (1.0 + np.exp(-scores))
 
         return np.column_stack([1 - scaled, scaled])
 
@@ -296,7 +311,7 @@ class SafeXGBClassifier:
         sorted_imp = sorted(
             normalized.items(),
             key=lambda x: x[1],
-            reverse=True
+            reverse=True,
         )
 
         checksum_str = json.dumps(sorted_imp, sort_keys=False)
@@ -310,7 +325,7 @@ class SafeXGBClassifier:
 
         return {
             "feature_importance": sorted_imp,
-            "importance_checksum": self.importance_checksum
+            "importance_checksum": self.importance_checksum,
         }
 
 
