@@ -9,8 +9,8 @@ logger = logging.getLogger("marketsentinel.xgboost")
 SEED = 42
 MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
-NUM_BOOST_ROUNDS = 1500
-EARLY_STOPPING_ROUNDS = 150
+NUM_BOOST_ROUNDS = 2000
+EARLY_STOPPING_ROUNDS = 200
 MIN_VALIDATION_ROWS = 300
 MIN_MINORITY_SAMPLES = 50
 EPSILON = 1e-12
@@ -40,7 +40,7 @@ def compute_class_weight(y):
             pos, neg
         )
 
-    weight = neg / pos
+    weight = neg / (pos + EPSILON)
     weight = float(np.clip(weight, 0.5, 10.0))
 
     logger.info(
@@ -150,14 +150,14 @@ class SafeXGBClassifier:
         ###################################################
 
         params = {
-            "max_depth": 7,
-            "eta": 0.03,
-            "subsample": 0.85,
-            "colsample_bytree": 0.85,
-            "min_child_weight": 3,
-            "gamma": 0.1,
-            "reg_alpha": 0.5,
-            "reg_lambda": 2.0,
+            "max_depth": 6,
+            "eta": 0.02,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "min_child_weight": 5,
+            "gamma": 0.2,
+            "reg_alpha": 1.0,
+            "reg_lambda": 4.0,
             "objective": "reg:pseudohubererror",
             "eval_metric": "rmse",
             "tree_method": "hist",
@@ -272,7 +272,10 @@ class SafeXGBClassifier:
 
     def predict_proba(self, X):
         scores = self.predict(X)
-        scaled = 1.0 / (1.0 + np.exp(-scores))
+
+        # Stable sigmoid scaling
+        scaled = 1.0 / (1.0 + np.exp(-np.clip(scores, -20, 20)))
+
         return np.column_stack([1 - scaled, scaled])
 
     ###################################################
@@ -291,10 +294,10 @@ class SafeXGBClassifier:
             for name in self.feature_names
         }
 
-        total_gain = sum(importance.values())
+        total_gain = sum(importance.values()) + EPSILON
 
         normalized = {
-            k: (v / total_gain if total_gain > 0 else 0.0)
+            k: (v / total_gain)
             for k, v in importance.items()
         }
 
