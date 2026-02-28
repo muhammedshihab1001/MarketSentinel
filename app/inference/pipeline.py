@@ -58,6 +58,9 @@ def get_shared_model_loader():
 class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
+    MAX_UNIVERSE_WIDTH = 500
+    MIN_UNIVERSE_WIDTH = 15
+
     TOP_K = 10
     BOTTOM_K = 10
     TOP_SELECTION = 5
@@ -67,6 +70,7 @@ class InferencePipeline:
     WEIGHT_TOLERANCE = 1e-6
 
     SCORE_WINSOR_Q = 0.02
+    MIN_LIQUIDITY = 1e6  # liquidity filter
 
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
     CROSS_SECTIONAL_WINDOW_DAYS = int(os.getenv("CS_WINDOW_DAYS", "30"))
@@ -115,26 +119,26 @@ class InferencePipeline:
         try:
 
             df = self._build_cross_sectional_frame(production_universe)
+
+            if len(df["ticker"].unique()) < self.MIN_UNIVERSE_WIDTH:
+                raise RuntimeError("Universe too small for institutional scoring.")
+
             latest_df = self._select_latest_snapshot(df)
+
+            # Liquidity filter
+            latest_df = latest_df[
+                latest_df["dollar_volume"] > self.MIN_LIQUIDITY
+            ].copy()
+
+            if len(latest_df) < self.MIN_UNIVERSE_WIDTH:
+                raise RuntimeError("Insufficient liquid instruments.")
 
             feature_df = validate_feature_schema(
                 latest_df.loc[:, MODEL_FEATURES],
                 mode="inference"
             ).astype(DTYPE)
 
-            # Drift detection
-            try:
-                drift_result = self.drift_detector.detect(feature_df)
-            except Exception:
-                drift_result = {
-                    "drift_detected": False,
-                    "drift_state": "bypass",
-                    "severity_score": 0
-                }
-
-            # =========================================
-            # STRICT CROSS-SECTIONAL SCORING
-            # =========================================
+            drift_result = self._safe_drift(feature_df)
 
             raw_scores = self.models.xgb.predict(feature_df)
 
@@ -142,6 +146,7 @@ class InferencePipeline:
                 raise RuntimeError("Non-finite raw scores.")
 
             if np.std(raw_scores) < self.MIN_SCORE_STD:
+                logger.warning("Score dispersion too low — neutralizing.")
                 raw_scores = np.zeros(len(raw_scores))
 
             scores = self._winsorize(raw_scores)
@@ -150,49 +155,26 @@ class InferencePipeline:
             latest_df = latest_df.copy()
             latest_df["score"] = scores
 
-            # FIXED DIRECTION: positive = long
-            ranked = latest_df.sort_values("score")
+            ranked = latest_df.sort_values(
+                ["score", "ticker"],
+                ascending=[True, True]
+            )
 
-            longs = ranked.tail(self.TOP_K)
-            shorts = ranked.head(self.BOTTOM_K)
+            top_k = min(self.TOP_K, len(ranked) // 2)
+            bottom_k = min(self.BOTTOM_K, len(ranked) // 2)
+
+            longs = ranked.tail(top_k)
+            shorts = ranked.head(bottom_k)
 
             weights = self._construct_portfolio(longs, shorts)
 
-            # =========================================
-            # Agent explanation only
-            # =========================================
+            if drift_result.get("drift_detected"):
+                logger.warning("Drift detected — scaling exposure.")
+                for k in weights:
+                    weights[k] *= 0.5
 
-            prob_stats = {
-                "mean": float(np.mean(scores)),
-                "std": float(np.std(scores)),
-                "min": float(np.min(scores)),
-                "max": float(np.max(scores))
-            }
+            snapshot_rows = self._build_snapshot(latest_df, weights)
 
-            snapshot_rows = []
-
-            for _, row in latest_df.iterrows():
-
-                direction = "LONG" if row["score"] > 0 else "SHORT"
-
-                agent_output = self.agent.analyze(
-                    row={
-                        **row.to_dict(),
-                        "signal": direction,
-                        "rank_pct": 0.0,  # no longer used structurally
-                    },
-                    probability_stats=prob_stats
-                )
-
-                snapshot_rows.append({
-                    "date": row["date"],
-                    "ticker": row["ticker"],
-                    "score": float(row["score"]),
-                    "weight": float(weights.get(row["ticker"], 0.0)),
-                    "agent": agent_output
-                })
-
-            # Top 5 by score
             top_5 = sorted(
                 snapshot_rows,
                 key=lambda x: x["score"],
@@ -224,14 +206,55 @@ class InferencePipeline:
 
     # =========================================================
 
-    def _select_latest_snapshot(self, df: pd.DataFrame):
+    def _safe_drift(self, feature_df):
+        try:
+            return self.drift_detector.detect(feature_df)
+        except Exception:
+            return {
+                "drift_detected": False,
+                "drift_state": "bypass",
+                "severity_score": 0
+            }
 
+    # =========================================================
+
+    def _build_snapshot(self, df, weights):
+
+        prob_stats = {
+            "mean": float(df["score"].mean()),
+            "std": float(df["score"].std()),
+            "min": float(df["score"].min()),
+            "max": float(df["score"].max())
+        }
+
+        snapshot_rows = []
+
+        for _, row in df.iterrows():
+
+            direction = "LONG" if row["score"] > 0 else "SHORT"
+
+            agent_output = self.agent.analyze(
+                row={**row.to_dict(), "signal": direction},
+                probability_stats=prob_stats
+            )
+
+            snapshot_rows.append({
+                "date": row["date"],
+                "ticker": row["ticker"],
+                "score": float(row["score"]),
+                "weight": float(weights.get(row["ticker"], 0.0)),
+                "agent": agent_output
+            })
+
+        return snapshot_rows
+
+    # =========================================================
+
+    def _select_latest_snapshot(self, df: pd.DataFrame):
         latest_date = df["date"].max()
         latest_df = df[df["date"] == latest_date]
-
         if latest_df.empty:
             raise RuntimeError("No rows for latest snapshot.")
-
         return latest_df.reset_index(drop=True)
 
     # =========================================================
@@ -239,9 +262,7 @@ class InferencePipeline:
     def _build_cross_sectional_frame(self, tickers: List[str]):
 
         end_date = pd.Timestamp.utcnow()
-        start_date = end_date - pd.Timedelta(
-            days=self.INFERENCE_LOOKBACK_DAYS
-        )
+        start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
 
         price_map = self.market_data.get_price_data_batch(
             tickers=tickers,
@@ -277,9 +298,7 @@ class InferencePipeline:
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
         latest_date = df["date"].max()
-        cutoff = latest_date - pd.Timedelta(
-            days=self.CROSS_SECTIONAL_WINDOW_DAYS
-        )
+        cutoff = latest_date - pd.Timedelta(days=self.CROSS_SECTIONAL_WINDOW_DAYS)
 
         df = df[df["date"] >= cutoff].copy()
 
