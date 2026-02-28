@@ -102,10 +102,19 @@ class FeatureEngineer:
         df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
         df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
 
-        # NEW momentum layers (stronger signal diversity)
+        ########################################################
+        # Enhanced Momentum Stack
+        ########################################################
+
         df["momentum_5"] = df.groupby("ticker")["close"].pct_change(5).clip(-1, 1)
+        df["momentum_10"] = df.groupby("ticker")["close"].pct_change(10).clip(-1.5, 1.5)
         df["momentum_20"] = df.groupby("ticker")["close"].pct_change(20).clip(-1, 1)
         df["momentum_60"] = df.groupby("ticker")["close"].pct_change(60).clip(-2, 2)
+
+        # Acceleration (new alpha signal)
+        df["momentum_accel"] = (
+            df["momentum_10"] - df["momentum_20"]
+        ).clip(-2, 2)
 
         grp = df.groupby("ticker")["return"]
 
@@ -187,7 +196,7 @@ class FeatureEngineer:
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
         ########################################################
-        # IMPROVED REGIME FEATURE (continuous, not binary)
+        # Volatility Regime (continuous)
         ########################################################
 
         rolling_mean = (
@@ -219,8 +228,10 @@ class FeatureEngineer:
 
         base_cols = [
             "momentum_5",
+            "momentum_10",
             "momentum_20",
             "momentum_60",
+            "momentum_accel",
             "return_lag5",
             "rsi",
             "volatility",
