@@ -9,8 +9,8 @@ logger = logging.getLogger("marketsentinel.xgboost")
 SEED = 42
 MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
-NUM_BOOST_ROUNDS = 1200
-EARLY_STOPPING_ROUNDS = 100
+NUM_BOOST_ROUNDS = 1500
+EARLY_STOPPING_ROUNDS = 150
 MIN_VALIDATION_ROWS = 300
 MIN_MINORITY_SAMPLES = 50
 EPSILON = 1e-12
@@ -146,19 +146,19 @@ class SafeXGBClassifier:
         )
 
         ###################################################
-        # REGRESSION PARAMETERS (DETERMINISTIC SAFE)
+        # IMPROVED REGRESSION PARAMETERS
         ###################################################
 
         params = {
-            "max_depth": 6,
-            "eta": 0.05,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "min_child_weight": 1,
-            "gamma": 0.0,
-            "reg_alpha": 0.1,
-            "reg_lambda": 1.0,
-            "objective": "reg:squarederror",
+            "max_depth": 7,
+            "eta": 0.03,
+            "subsample": 0.85,
+            "colsample_bytree": 0.85,
+            "min_child_weight": 3,
+            "gamma": 0.1,
+            "reg_alpha": 0.5,
+            "reg_lambda": 2.0,
+            "objective": "reg:pseudohubererror",
             "eval_metric": "rmse",
             "tree_method": "hist",
             "device": "cpu",
@@ -271,15 +271,8 @@ class SafeXGBClassifier:
     ###################################################
 
     def predict_proba(self, X):
-        """
-        Preserved for compatibility.
-        Uses regression scores without destructive min-max scaling.
-        """
         scores = self.predict(X)
-
-        # Stable sigmoid transformation (monotonic, no fold distortion)
         scaled = 1.0 / (1.0 + np.exp(-scores))
-
         return np.column_stack([1 - scaled, scaled])
 
     ###################################################
@@ -292,9 +285,6 @@ class SafeXGBClassifier:
             raise RuntimeError("Model not trained.")
 
         raw_gain = self.model.get_score(importance_type="gain")
-
-        if not raw_gain:
-            raise RuntimeError("No feature importance available.")
 
         importance = {
             name: float(raw_gain.get(name, 0.0))
@@ -340,7 +330,7 @@ def build_xgboost_pipeline(y):
     model = SafeXGBClassifier(pos_weight)
 
     logger.info(
-        "XGBoost REGRESSION alpha model built (deterministic CPU mode)."
+        "XGBoost REGRESSION alpha model built (robust objective, deterministic CPU mode)."
     )
 
     return model
