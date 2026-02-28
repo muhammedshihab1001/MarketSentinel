@@ -31,11 +31,15 @@ class MarketDataService:
 
     DEFAULT_MIN_HISTORY_ROWS = 60
     SAFE_LAG_DAYS = 2
-    MAX_ROWS = 15000
+    MAX_ROWS = 20000
     MAX_DAILY_MOVE = 0.85
+
+    MIN_TRADING_DENSITY = 0.65  # % of expected trading days
 
     MAX_WORKERS = int(os.getenv("MARKET_MAX_WORKERS", 4))
     MEMORY_CACHE_TTL = 30
+
+    ENABLE_DISK_CACHE = True
 
     _PROVIDER = None
     _memory_cache = {}
@@ -52,10 +56,6 @@ class MarketDataService:
 
         self._fetcher = MarketDataService._PROVIDER
 
-        self.SCHEMA_HASH = hashlib.sha256(
-            ",".join(sorted(self.REQUIRED_COLUMNS)).encode()
-        ).hexdigest()[:10]
-
     ########################################################
     # SANITIZATION
     ########################################################
@@ -70,6 +70,8 @@ class MarketDataService:
 
         return ticker
 
+    ########################################################
+    # SAFE DATE CAP (NO FORWARD LEAKAGE)
     ########################################################
 
     @classmethod
@@ -87,16 +89,25 @@ class MarketDataService:
         return min(requested, safe_cutoff)
 
     ########################################################
+    # DATASET HASH
+    ########################################################
 
     def _dataset_hash(self, df: pd.DataFrame):
 
         df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
         payload = df.to_csv(index=False).encode()
-
         return hashlib.sha256(payload).hexdigest()[:16]
 
     ########################################################
-    # VALIDATION (ROBUST BUT NOT OVERSTRICT)
+    # DISK CACHE
+    ########################################################
+
+    def _disk_cache_path(self, ticker, start, end):
+        fname = f"{ticker}_{start}_{end}.parquet"
+        return self.DATA_DIR / fname
+
+    ########################################################
+    # VALIDATION
     ########################################################
 
     def _validate_dataset(self, df: pd.DataFrame, ticker: str, min_rows: int):
@@ -119,6 +130,11 @@ class MarketDataService:
         ).dt.tz_convert(None)
 
         df = df.dropna(subset=["date"])
+        df = df.sort_values("date").drop_duplicates("date")
+
+        # Remove forward rows accidentally returned
+        safe_cutoff = self._cap_to_safe_date(df["date"].max())
+        df = df[df["date"] <= safe_cutoff]
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
 
@@ -130,18 +146,27 @@ class MarketDataService:
         if not np.isfinite(df[numeric_cols].values.astype(float)).all():
             raise RuntimeError("Non-finite prices detected.")
 
-        df = df.sort_values("date").reset_index(drop=True)
+        # Remove zero-volume days
+        df = df[df["volume"] > 0]
 
-        # Soft extreme move handling (clip instead of fail)
+        # Clip extreme moves
         pct = df["close"].pct_change().abs().fillna(0)
 
         if (pct > self.MAX_DAILY_MOVE).any():
-            logger.warning(
-                "Extreme move detected in %s — clipping instead of failing.",
-                ticker
-            )
+            logger.warning("Extreme move detected in %s — clipping.", ticker)
             df.loc[pct > self.MAX_DAILY_MOVE, "close"] = np.nan
             df["close"] = df["close"].ffill().bfill()
+
+        # Density check
+        if len(df) > 30:
+            total_days = (df["date"].max() - df["date"].min()).days
+            expected = total_days / 7 * 5  # rough trading days
+            density = len(df) / max(expected, 1)
+
+            if density < self.MIN_TRADING_DENSITY:
+                raise RuntimeError(
+                    f"Low trading density ({density:.2f})"
+                )
 
         if len(df) > self.MAX_ROWS:
             df = df.tail(self.MAX_ROWS)
@@ -150,6 +175,8 @@ class MarketDataService:
             raise RuntimeError(
                 f"Insufficient history ({len(df)} < {min_rows})"
             )
+
+        df["__dataset_hash"] = self._dataset_hash(df)
 
         return df.reset_index(drop=True)
 
@@ -186,8 +213,6 @@ class MarketDataService:
                     ticker,
                     min_history
                 )
-
-                validated["__dataset_hash"] = self._dataset_hash(validated)
 
                 return validated
 
@@ -253,10 +278,13 @@ class MarketDataService:
         if min_history is None:
             min_history = self.DEFAULT_MIN_HISTORY_ROWS
 
+        start_date = pd.Timestamp(start_date).strftime("%Y-%m-%d")
+        end_date_str = end_date.strftime("%Y-%m-%d")
+
         cache_key = self._cache_key(
             ticker,
             start_date,
-            end_date.strftime("%Y-%m-%d"),
+            end_date_str,
             interval,
             min_history
         )
@@ -265,22 +293,41 @@ class MarketDataService:
         if cached is not None:
             return cached
 
+        disk_path = self._disk_cache_path(
+            ticker,
+            start_date,
+            end_date_str
+        )
+
+        if self.ENABLE_DISK_CACHE and disk_path.exists():
+            try:
+                df = pd.read_parquet(disk_path)
+                return df
+            except Exception:
+                pass
+
         logger.info("Fetching dataset for %s", ticker)
 
         df = self._fetch_with_retry(
             ticker,
             start_date,
-            end_date.strftime("%Y-%m-%d"),
+            end_date_str,
             interval,
             min_history
         )
+
+        if self.ENABLE_DISK_CACHE:
+            try:
+                df.to_parquet(disk_path)
+            except Exception:
+                pass
 
         self._set_memory_cache(cache_key, df)
 
         return df
 
     ########################################################
-    # STABLE PARALLEL BATCH
+    # PARALLEL BATCH
     ########################################################
 
     def get_price_data_batch(
@@ -303,7 +350,7 @@ class MarketDataService:
         )
 
         logger.info(
-            "Batch fetch starting | tickers=%d | workers=%d",
+            "Batch fetch | tickers=%d | workers=%d",
             len(tickers),
             worker_cap
         )
