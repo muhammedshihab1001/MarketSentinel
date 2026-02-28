@@ -34,7 +34,6 @@ SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
 
-# Production thresholds
 MIN_PRODUCTION_SHARPE = 0.10
 MAX_DRAWDOWN = -0.55
 MAX_REASONABLE_SHARPE = 5.0
@@ -185,7 +184,7 @@ def load_training_data(start_date, end_date):
 
 
 ############################################################
-# REGRESSION TARGET (FORWARD LOG RETURN)
+# REGRESSION TARGET
 ############################################################
 
 def build_target(df: pd.DataFrame):
@@ -221,6 +220,7 @@ def build_target(df: pd.DataFrame):
 
 def trainer(train_df):
 
+    # 🔥 IMPORTANT: target built ONLY here
     train_df = build_target(train_df)
 
     X = validate_feature_schema(
@@ -322,6 +322,7 @@ def main(start_date=None, end_date=None,
 
     raw_df = load_training_data(start_date, end_date)
 
+    # 🔥 PASS RAW DF — DO NOT BUILD TARGET BEFORE WALK-FORWARD
     validator = WalkForwardValidator(trainer)
     research_metrics = validator.run(raw_df.copy())
 
