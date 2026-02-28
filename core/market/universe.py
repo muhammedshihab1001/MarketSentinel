@@ -10,7 +10,7 @@ from pathlib import Path
 
 class MarketUniverse:
     """
-    Institutional Universe Controller (Production-Only Hardened)
+    Institutional Universe Controller (Production Hardened + Research Flexible)
 
     Guarantees:
     ✔ deterministic
@@ -22,6 +22,7 @@ class MarketUniverse:
     ✔ tamper detected
     ✔ version monotonic
     ✔ metadata compatible
+    ✔ research override safe
     """
 
     ###################################################
@@ -35,6 +36,9 @@ class MarketUniverse:
 
     REQUIRED_SIZE = 30
     MIN_FILE_BYTES = 50
+
+    # Optional research override (DOES NOT affect production)
+    ALLOW_RESEARCH_OVERRIDE = os.getenv("UNIVERSE_RESEARCH_MODE", "0") == "1"
 
     TICKER_REGEX = re.compile(r"^[A-Z0-9.\-]{1,10}$")
 
@@ -70,17 +74,7 @@ class MarketUniverse:
     ###################################################
 
     @classmethod
-    def _load_file(cls):
-
-        path = Path(cls.UNIVERSE_FILE)
-
-        if not path.exists():
-            raise RuntimeError(f"Universe file missing: {cls.UNIVERSE_FILE}")
-
-        if path.stat().st_size < cls.MIN_FILE_BYTES:
-            raise RuntimeError("Universe file corrupted.")
-
-        payload = json.loads(path.read_text())
+    def _validate_payload(cls, payload: Dict):
 
         required = {
             "version",
@@ -96,7 +90,6 @@ class MarketUniverse:
 
         version = payload["version"]
         created_utc = payload["created_utc"]
-        description = payload["description"]
         tickers = payload["tickers"]
         min_history_days = payload["min_history_days"]
 
@@ -111,10 +104,11 @@ class MarketUniverse:
         if not isinstance(tickers, list):
             raise RuntimeError("Universe tickers must be list.")
 
-        if len(tickers) != cls.REQUIRED_SIZE:
-            raise RuntimeError(
-                f"Production universe must contain exactly {cls.REQUIRED_SIZE} tickers."
-            )
+        if not cls.ALLOW_RESEARCH_OVERRIDE:
+            if len(tickers) != cls.REQUIRED_SIZE:
+                raise RuntimeError(
+                    f"Production universe must contain exactly {cls.REQUIRED_SIZE} tickers."
+                )
 
         parsed_version = cls._parse_version(version)
 
@@ -144,11 +138,28 @@ class MarketUniverse:
         return {
             "version": version,
             "created_utc": created_utc,
-            "description": description,
+            "description": payload["description"],
             "min_history_days": min_history_days,
             "tickers": tuple(sorted(normalized)),
             "ticker_set": set(normalized)
         }
+
+    ###################################################
+
+    @classmethod
+    def _load_file(cls):
+
+        path = Path(cls.UNIVERSE_FILE)
+
+        if not path.exists():
+            raise RuntimeError(f"Universe file missing: {cls.UNIVERSE_FILE}")
+
+        if path.stat().st_size < cls.MIN_FILE_BYTES:
+            raise RuntimeError("Universe file corrupted.")
+
+        payload = json.loads(path.read_text())
+
+        return cls._validate_payload(payload)
 
     ###################################################
 
@@ -169,6 +180,8 @@ class MarketUniverse:
         return cls._CACHE
 
     ###################################################
+    # PUBLIC API
+    ###################################################
 
     @classmethod
     def get_universe(cls) -> Tuple[str, ...]:
@@ -181,6 +194,10 @@ class MarketUniverse:
     @classmethod
     def get_version(cls) -> str:
         return cls._get_cached()["version"]
+
+    @classmethod
+    def size(cls) -> int:
+        return len(cls.get_universe())
 
     ###################################################
     # FINGERPRINT (METADATA CRITICAL)
