@@ -15,8 +15,6 @@ from core.schema.feature_schema import (
     validate_feature_schema,
     get_schema_signature,
     DTYPE,
-    LONG_PERCENTILE,
-    SHORT_PERCENTILE,
 )
 from core.market.universe import MarketUniverse
 
@@ -47,43 +45,10 @@ def get_shared_model_loader():
     if _SHARED_MODEL_LOADER is None:
         with _MODEL_LOCK:
             if _SHARED_MODEL_LOADER is None:
-                logger.info("Initializing shared ModelLoader (pipeline)")
+                logger.info("Initializing shared ModelLoader")
                 _SHARED_MODEL_LOADER = ModelLoader()
                 _ = _SHARED_MODEL_LOADER.xgb
     return _SHARED_MODEL_LOADER
-
-
-# =========================================================
-# CIRCUIT BREAKER
-# =========================================================
-
-class CircuitBreaker:
-    def __init__(self, threshold=3, cooldown=120):
-        self.threshold = threshold
-        self.cooldown = cooldown
-        self.failures = 0
-        self.last_failure = None
-        self._lock = threading.Lock()
-
-    def allow(self):
-        with self._lock:
-            if self.failures < self.threshold:
-                return True
-            if self.last_failure and (time.time() - self.last_failure) > self.cooldown:
-                logger.warning("Circuit breaker reset.")
-                self.failures = 0
-                return True
-            logger.critical("Inference blocked by circuit breaker.")
-            return False
-
-    def record_failure(self):
-        with self._lock:
-            self.failures += 1
-            self.last_failure = time.time()
-
-    def record_success(self):
-        with self._lock:
-            self.failures = 0
 
 
 # =========================================================
@@ -93,16 +58,18 @@ class CircuitBreaker:
 class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
-    TOP_K = 3
-    BOTTOM_K = 3
+    TOP_K = 10
+    BOTTOM_K = 10
     TOP_SELECTION = 5
 
     MIN_SCORE_STD = 1e-6
+    EPSILON = 1e-9
     WEIGHT_TOLERANCE = 1e-6
+
+    SCORE_WINSOR_Q = 0.02
 
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
     CROSS_SECTIONAL_WINDOW_DAYS = int(os.getenv("CS_WINDOW_DAYS", "30"))
-    MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "200"))
 
     def __init__(self):
         self.market_data = MarketDataService()
@@ -110,7 +77,6 @@ class InferencePipeline:
         self.models = get_shared_model_loader()
         self.cache = RedisCache()
         self.drift_detector = DriftDetector()
-        self.breaker = CircuitBreaker()
         self.agent = SignalAgent()
 
         self._validate_models_loaded()
@@ -119,29 +85,29 @@ class InferencePipeline:
 
     def _validate_models_loaded(self):
         if self.models.schema_signature != get_schema_signature():
-            raise RuntimeError(
-                "Schema signature mismatch between training and inference."
-            )
-        logger.info(
-            "Model + schema verified | version=%s",
-            self.models.xgb_version
-        )
+            raise RuntimeError("Schema signature mismatch.")
+        logger.info("Model verified | version=%s", self.models.xgb_version)
+
+    # =========================================================
+
+    def _winsorize(self, x):
+        lower = np.quantile(x, self.SCORE_WINSOR_Q)
+        upper = np.quantile(x, 1 - self.SCORE_WINSOR_Q)
+        return np.clip(x, lower, upper)
+
+    def _softmax(self, x):
+        x = x - np.max(x)
+        e = np.exp(x)
+        return e / (np.sum(e) + self.EPSILON)
 
     # =========================================================
 
     def run_snapshot(self, tickers: List[str]):
 
         production_universe = sorted(set(MarketUniverse.get_universe()))
-        requested = sorted(set(str(t).upper().strip() for t in tickers))
 
-        if not requested:
-            raise RuntimeError("Empty ticker request.")
-
-        if len(production_universe) > self.MAX_BATCH_SIZE:
-            raise RuntimeError("Batch size exceeds MAX_BATCH_SIZE.")
-
-        if not self.breaker.allow():
-            raise RuntimeError("Inference blocked by circuit breaker.")
+        if not production_universe:
+            raise RuntimeError("Universe empty.")
 
         INFERENCE_IN_PROGRESS.inc()
         start_time = time.time()
@@ -156,54 +122,45 @@ class InferencePipeline:
                 mode="inference"
             ).astype(DTYPE)
 
-            # ---------------- Drift Detection ----------------
+            # Drift detection
             try:
                 drift_result = self.drift_detector.detect(feature_df)
-            except Exception as e:
-                logger.warning("Drift check failed: %s", e)
+            except Exception:
                 drift_result = {
                     "drift_detected": False,
                     "drift_state": "bypass",
-                    "severity_score": 0,
-                    "drift_confidence": 0.0
+                    "severity_score": 0
                 }
 
-            # =================================================
-            # 🔥 UPDATED SCORING LOGIC (NO SIGMOID)
-            # =================================================
+            # =========================================
+            # STRICT CROSS-SECTIONAL SCORING
+            # =========================================
 
             raw_scores = self.models.xgb.predict(feature_df)
 
             if not np.all(np.isfinite(raw_scores)):
-                raise RuntimeError("Non-finite raw scores detected.")
+                raise RuntimeError("Non-finite raw scores.")
 
             if np.std(raw_scores) < self.MIN_SCORE_STD:
-                logger.warning("Raw score collapse — flattening.")
                 raw_scores = np.zeros(len(raw_scores))
 
+            scores = self._winsorize(raw_scores)
+            scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
+
             latest_df = latest_df.copy()
-            latest_df["raw_score"] = raw_scores
+            latest_df["score"] = scores
 
-            # Cross-sectional rank normalization (0–1 scale)
-            latest_df["score"] = latest_df["raw_score"].rank(
-                method="first",
-                pct=True
-            )
+            # FIXED DIRECTION: positive = long
+            ranked = latest_df.sort_values("score")
 
-            scores = latest_df["score"].values
+            longs = ranked.tail(self.TOP_K)
+            shorts = ranked.head(self.BOTTOM_K)
 
-            latest_df["rank_pct"] = latest_df["score"]
+            weights = self._construct_portfolio(longs, shorts)
 
-            latest_df["signal"] = latest_df["rank_pct"].apply(
-                lambda x:
-                "LONG" if x >= LONG_PERCENTILE
-                else "SHORT" if x <= SHORT_PERCENTILE
-                else "NEUTRAL"
-            )
-
-            # =================================================
-
-            weights = self._construct_portfolio(latest_df)
+            # =========================================
+            # Agent explanation only
+            # =========================================
 
             prob_stats = {
                 "mean": float(np.mean(scores)),
@@ -215,8 +172,15 @@ class InferencePipeline:
             snapshot_rows = []
 
             for _, row in latest_df.iterrows():
+
+                direction = "LONG" if row["score"] > 0 else "SHORT"
+
                 agent_output = self.agent.analyze(
-                    row=row.to_dict(),
+                    row={
+                        **row.to_dict(),
+                        "signal": direction,
+                        "rank_pct": 0.0,  # no longer used structurally
+                    },
                     probability_stats=prob_stats
                 )
 
@@ -224,31 +188,23 @@ class InferencePipeline:
                     "date": row["date"],
                     "ticker": row["ticker"],
                     "score": float(row["score"]),
-                    "rank_pct": float(row["rank_pct"]),
-                    "signal": row["signal"],
                     "weight": float(weights.get(row["ticker"], 0.0)),
                     "agent": agent_output
                 })
 
-            alpha_sorted = sorted(
+            # Top 5 by score
+            top_5 = sorted(
                 snapshot_rows,
-                key=lambda x: x["agent"]["strength_score"],
+                key=lambda x: x["score"],
                 reverse=True
-            )
-
-            top_5 = alpha_sorted[:self.TOP_SELECTION]
-
-            filtered_signals = [
-                s for s in snapshot_rows if s["ticker"] in requested
-            ]
+            )[:self.TOP_SELECTION]
 
             result = {
                 "snapshot_date": str(latest_df["date"].iloc[0]),
                 "universe_size": int(len(latest_df)),
-                "probability_stats": prob_stats,
                 "drift": drift_result,
                 "top_5": top_5,
-                "signals": filtered_signals
+                "signals": snapshot_rows
             }
 
             MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
@@ -256,13 +212,11 @@ class InferencePipeline:
                 time.time() - start_time
             )
 
-            self.breaker.record_success()
             return result
 
         except Exception:
             PIPELINE_FAILURES.labels(stage="snapshot").inc()
-            self.breaker.record_failure()
-            logger.exception("Snapshot inference failure.")
+            logger.exception("Snapshot failure.")
             raise
 
         finally:
@@ -336,35 +290,29 @@ class InferencePipeline:
 
     # =========================================================
 
-    def _construct_portfolio(self, latest_df):
+    def _construct_portfolio(self, longs, shorts):
 
-        latest_df = latest_df.sort_values(["score", "ticker"])
+        long_alpha = self._softmax(longs["score"].values)
+        short_alpha = self._softmax(np.abs(shorts["score"].values))
 
-        n = len(latest_df)
-        k_long = min(self.TOP_K, n // 2)
-        k_short = min(self.BOTTOM_K, n // 2)
+        long_vol = longs["volatility"].clip(lower=0.01).values
+        short_vol = shorts["volatility"].clip(lower=0.01).values
 
-        longs = latest_df.tail(k_long)
-        shorts = latest_df.head(k_short)
+        long_w = long_alpha / long_vol
+        short_w = short_alpha / short_vol
 
-        long_vol = longs["volatility"].replace(0, 1e-6)
-        short_vol = shorts["volatility"].replace(0, 1e-6)
+        long_w /= long_w.sum()
+        short_w /= short_w.sum()
 
-        long_weights = (1.0 / long_vol)
-        short_weights = (1.0 / short_vol)
-
-        long_weights /= long_weights.sum()
-        short_weights /= short_weights.sum()
-
-        long_weights *= self.TARGET_GROSS_EXPOSURE / 2
-        short_weights *= self.TARGET_GROSS_EXPOSURE / 2
+        long_w *= self.TARGET_GROSS_EXPOSURE / 2
+        short_w *= self.TARGET_GROSS_EXPOSURE / 2
 
         weights = {}
 
-        for t, w in zip(longs["ticker"], long_weights):
+        for t, w in zip(longs["ticker"], long_w):
             weights[t] = float(w)
 
-        for t, w in zip(shorts["ticker"], short_weights):
+        for t, w in zip(shorts["ticker"], short_w):
             weights[t] = -float(w)
 
         gross = sum(abs(v) for v in weights.values())
