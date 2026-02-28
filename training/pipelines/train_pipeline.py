@@ -1,3 +1,8 @@
+# ==========================================================
+# INSTITUTIONAL TRAINING PIPELINE WRAPPER
+# Baseline Promotion Aware
+# ==========================================================
+
 import time
 import datetime
 import os
@@ -9,6 +14,7 @@ import random
 import subprocess
 import tempfile
 import uuid
+import argparse
 
 import numpy as np
 import pandas as pd
@@ -30,9 +36,9 @@ MAX_TRAINING_SECONDS = 7200
 GLOBAL_SEED = 42
 
 
-############################################################
+# ==========================================================
 # DETERMINISM
-############################################################
+# ==========================================================
 
 def enforce_determinism():
     os.environ["PYTHONHASHSEED"] = str(GLOBAL_SEED)
@@ -45,9 +51,9 @@ def enforce_determinism():
     np.random.seed(GLOBAL_SEED)
 
 
-############################################################
-# LOCKING (CRASH-SAFE)
-############################################################
+# ==========================================================
+# LOCKING (CRASH SAFE)
+# ==========================================================
 
 def _acquire_lock():
     os.makedirs(RUNS_DIR, exist_ok=True)
@@ -71,9 +77,9 @@ def _release_lock():
         os.remove(LOCK_FILE)
 
 
-############################################################
+# ==========================================================
 # GIT SAFETY
-############################################################
+# ==========================================================
 
 def get_git_commit():
 
@@ -108,9 +114,9 @@ def get_git_commit():
         return "GIT_UNAVAILABLE"
 
 
-############################################################
+# ==========================================================
 # SAFE MANIFEST SAVE
-############################################################
+# ==========================================================
 
 def save_manifest(run_id: str, manifest: dict):
 
@@ -135,9 +141,9 @@ def save_manifest(run_id: str, manifest: dict):
     os.replace(temp_name, final_path)
 
 
-############################################################
+# ==========================================================
 # LINEAGE
-############################################################
+# ==========================================================
 
 def build_lineage(start_date, end_date):
 
@@ -171,11 +177,11 @@ def build_lineage(start_date, end_date):
     return lineage_payload
 
 
-############################################################
-# MAIN
-############################################################
+# ==========================================================
+# MAIN PIPELINE
+# ==========================================================
 
-def main():
+def main(create_baseline=False, promote_baseline=False):
 
     init_env()
     enforce_determinism()
@@ -203,10 +209,28 @@ def main():
 
         logger.info("Starting institutional XGBoost training...")
 
-        metrics = train_xgb(
-            start_date=start_date,
-            end_date=end_date
-        )
+        try:
+            metrics = train_xgb(
+                start_date=start_date,
+                end_date=end_date,
+                create_baseline=create_baseline,
+                promote_baseline=promote_baseline
+            )
+        except RuntimeError as e:
+
+            # 🔥 AUTO-FALLBACK LOGIC
+            if create_baseline and "Baseline already exists" in str(e):
+                logger.warning(
+                    "Baseline exists — retrying with promote mode."
+                )
+
+                metrics = train_xgb(
+                    start_date=start_date,
+                    end_date=end_date,
+                    promote_baseline=True
+                )
+            else:
+                raise
 
         runtime = time.time() - start
 
@@ -248,4 +272,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--create-baseline", action="store_true")
+    parser.add_argument("--promote-baseline", action="store_true")
+
+    args = parser.parse_args()
+
+    main(
+        create_baseline=args.create_baseline,
+        promote_baseline=args.promote_baseline
+    )

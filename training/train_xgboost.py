@@ -1,8 +1,3 @@
-# ===============================
-# FULLY UPGRADED TRAINING MODULE
-# Institutional Baseline Governance Enabled
-# ===============================
-
 import os
 import time
 import joblib
