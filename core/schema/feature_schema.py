@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 # ============================================================
 
-SCHEMA_VERSION = "40.0"  # institutional liquidity + regime upgrade
+SCHEMA_VERSION = "41.0"  # institutional market structure expansion
 
 
 ############################################################
@@ -24,7 +24,7 @@ SHORT_PERCENTILE = 0.30
 
 
 ############################################################
-# CORE FEATURES (UPDATED)
+# CORE FEATURES (EXPANDED)
 ############################################################
 
 CORE_FEATURES: Tuple[str, ...] = (
@@ -47,19 +47,24 @@ CORE_FEATURES: Tuple[str, ...] = (
     # Liquidity
     "volume_momentum",
     "dollar_volume",
+    "amihud",
 
     # Technical
     "rsi",
     "ema_ratio",
 
-    # Regime / structure
+    # Structure
     "dist_from_52w_high",
     "regime_feature",
+
+    # Market-level context
+    "market_dispersion",
+    "breadth",
 )
 
 
 ############################################################
-# CROSS-SECTIONAL FEATURES (AUTO-GENERATED PAIRS)
+# CROSS-SECTIONAL BASE COLUMNS
 ############################################################
 
 BASE_CS_COLS: Tuple[str, ...] = (
@@ -75,6 +80,9 @@ BASE_CS_COLS: Tuple[str, ...] = (
     "dollar_volume",
     "dist_from_52w_high",
     "regime_feature",
+    "amihud",
+    "market_dispersion",
+    "breadth",
 )
 
 CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = tuple(
@@ -94,6 +102,7 @@ MODEL_FEATURES: List[str] = list(
 DTYPE = np.float32
 MIN_ROWS_TRAINING = 300
 MIN_VARIANCE = 1e-8
+MIN_CS_VARIANCE = 1e-6
 
 FORBIDDEN_REGEX = re.compile(
     r"\b(future|next|forward|target|label|tomorrow|lead|horizon|lookahead|outcome|response)\b",
@@ -207,6 +216,7 @@ def validate_feature_schema(
         if finite_vals.nunique() <= 1:
 
             if mode == "training":
+                logger.warning("Constant CS feature in training: %s", col)
                 continue
 
             if col.endswith("_z"):
@@ -216,6 +226,9 @@ def validate_feature_schema(
             if col.endswith("_rank"):
                 feature_df[col] = 0.5
                 continue
+
+        if finite_vals.var(ddof=0) < MIN_CS_VARIANCE:
+            logger.warning("Low variance CS feature: %s", col)
 
     ########################################################
     # FINAL SANITY
