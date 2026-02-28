@@ -1,3 +1,8 @@
+# ===============================
+# FULLY UPGRADED TRAINING MODULE
+# Institutional Baseline Governance Enabled
+# ===============================
+
 import os
 import time
 import joblib
@@ -41,9 +46,9 @@ MAX_REASONABLE_SHARPE = 5.0
 MAX_PROFIT_FACTOR = 10.0
 
 
-############################################################
+# ==========================================================
 # DETERMINISM
-############################################################
+# ==========================================================
 
 def enforce_determinism():
     os.environ["PYTHONHASHSEED"] = str(SEED)
@@ -53,9 +58,9 @@ def enforce_determinism():
     np.random.seed(SEED)
 
 
-############################################################
+# ==========================================================
 # PRODUCTION METRIC VALIDATION
-############################################################
+# ==========================================================
 
 def validate_production_metrics(metrics: dict):
 
@@ -91,24 +96,22 @@ def validate_production_metrics(metrics: dict):
         raise RuntimeError("Profit factor unrealistic — leakage suspected.")
 
     if sharpe < MIN_PRODUCTION_SHARPE:
-        raise RuntimeError(
-            f"Model rejected — Sharpe too low ({sharpe:.4f})."
-        )
+        raise RuntimeError(f"Model rejected — Sharpe too low ({sharpe:.4f}).")
 
     if drawdown < MAX_DRAWDOWN:
-        raise RuntimeError(
-            f"Model rejected — drawdown breach ({drawdown:.2%})."
-        )
+        raise RuntimeError(f"Model rejected — drawdown breach ({drawdown:.2%}).")
 
     if metrics["final_equity"] <= 0:
         raise RuntimeError("Backtest produced non-positive equity.")
 
 
-############################################################
+# ==========================================================
 # BASELINE GOVERNANCE
-############################################################
+# ==========================================================
 
 def save_baseline_contract(metrics, dataset_hash, model_version):
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
     contract = {
         "avg_sharpe": metrics["avg_sharpe"],
         "profit_factor": metrics["profit_factor"],
@@ -134,7 +137,6 @@ def load_baseline_contract():
 
 def validate_against_baseline(metrics):
     baseline = load_baseline_contract()
-
     if not baseline:
         logger.info("No baseline contract found. Skipping baseline comparison.")
         return
@@ -154,30 +156,27 @@ def validate_against_baseline(metrics):
     logger.info("Baseline comparison passed.")
 
 
-############################################################
+# ==========================================================
 # FEATURE CHECKSUM
-############################################################
+# ==========================================================
 
 def compute_feature_checksum():
-    canonical = json.dumps(
-        list(MODEL_FEATURES),
-        sort_keys=False
-    ).encode()
+    canonical = json.dumps(list(MODEL_FEATURES), sort_keys=False).encode()
     return hashlib.sha256(canonical).hexdigest()
 
 
-############################################################
+# ==========================================================
 # DATASET HASH
-############################################################
+# ==========================================================
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
     df_sorted = df.sort_values(["date", "ticker"]).reset_index(drop=True)
     return MetadataManager.fingerprint_dataset(df_sorted)
 
 
-############################################################
+# ==========================================================
 # DATA LOADING
-############################################################
+# ==========================================================
 
 def load_training_data(start_date, end_date):
 
@@ -225,17 +224,14 @@ def load_training_data(start_date, end_date):
     if df.columns.duplicated().any():
         raise RuntimeError("Duplicate columns detected.")
 
-    _ = validate_feature_schema(
-        df.loc[:, MODEL_FEATURES],
-        mode="training"
-    )
+    validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="training")
 
     return df
 
 
-############################################################
+# ==========================================================
 # TARGET
-############################################################
+# ==========================================================
 
 def build_target(df: pd.DataFrame):
 
@@ -264,45 +260,35 @@ def build_target(df: pd.DataFrame):
     return df
 
 
-############################################################
+# ==========================================================
 # TRAINERS
-############################################################
+# ==========================================================
 
 def trainer(train_df):
     train_df = build_target(train_df)
 
-    X = validate_feature_schema(
-        train_df.loc[:, MODEL_FEATURES],
-        mode="training"
-    )
-
+    X = validate_feature_schema(train_df.loc[:, MODEL_FEATURES], mode="training")
     y = train_df["target"]
 
     pipeline = build_xgboost_pipeline(y)
     pipeline.fit(X, y)
-
     return pipeline
 
 
 def final_trainer(train_df):
     train_df = build_target(train_df)
 
-    X = validate_feature_schema(
-        train_df.loc[:, MODEL_FEATURES],
-        mode="strict_contract"
-    )
-
+    X = validate_feature_schema(train_df.loc[:, MODEL_FEATURES], mode="strict_contract")
     y = train_df["target"]
 
     pipeline = build_xgboost_pipeline(y)
     pipeline.fit(X, y)
-
     return pipeline
 
 
-############################################################
+# ==========================================================
 # EXPORT
-############################################################
+# ==========================================================
 
 def export_artifacts(model, metrics, dataset_hash,
                      start_date, end_date, final_df):
@@ -310,7 +296,6 @@ def export_artifacts(model, metrics, dataset_hash,
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     timestamp = int(time.time())
-
     model_path = os.path.join(MODEL_DIR, f"model_{timestamp}.pkl")
     tmp_path = os.path.join(MODEL_DIR, f"tmp_model_{timestamp}.pkl")
 
@@ -319,10 +304,7 @@ def export_artifacts(model, metrics, dataset_hash,
 
     artifact_hash = MetadataManager.hash_file(model_path)
 
-    scalar_metrics = {
-        k: v for k, v in metrics.items()
-        if k != "equity_curve"
-    }
+    scalar_metrics = {k: v for k, v in metrics.items() if k != "equity_curve"}
 
     extra_fields = {
         "artifact_hash": artifact_hash,
@@ -342,11 +324,7 @@ def export_artifacts(model, metrics, dataset_hash,
         extra_fields=extra_fields
     )
 
-    metadata_path = os.path.join(
-        MODEL_DIR,
-        f"metadata_{timestamp}.json"
-    )
-
+    metadata_path = os.path.join(MODEL_DIR, f"metadata_{timestamp}.json")
     MetadataManager.save_metadata(metadata, metadata_path)
 
     pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
@@ -361,12 +339,13 @@ def export_artifacts(model, metrics, dataset_hash,
     return timestamp
 
 
-############################################################
+# ==========================================================
 # MAIN
-############################################################
+# ==========================================================
 
 def main(start_date=None, end_date=None,
          create_baseline=False,
+         promote_baseline=False,
          allow_soft_fail=False):
 
     t0 = time.time()
@@ -395,7 +374,6 @@ def main(start_date=None, end_date=None,
 
     final_df = build_target(raw_df)
     dataset_hash = compute_dataset_hash(final_df)
-
     final_model = final_trainer(raw_df)
 
     version = export_artifacts(
@@ -407,10 +385,12 @@ def main(start_date=None, end_date=None,
         final_df
     )
 
-    if create_baseline:
-        save_baseline_contract(research_metrics, dataset_hash, version)
+    drift = DriftDetector()
 
-        drift = DriftDetector()
+    if create_baseline:
+        if os.path.exists(BASELINE_CONTRACT):
+            raise RuntimeError("Baseline already exists. Use --promote-baseline.")
+        save_baseline_contract(research_metrics, dataset_hash, version)
         drift.create_baseline(
             dataset=final_df.loc[:, MODEL_FEATURES],
             dataset_hash=dataset_hash,
@@ -420,10 +400,20 @@ def main(start_date=None, end_date=None,
             allow_overwrite=False
         )
 
-    logger.info(
-        "Training completed in %.2f minutes",
-        (time.time() - t0) / 60
-    )
+    if promote_baseline:
+        save_baseline_contract(research_metrics, dataset_hash, version)
+        drift.create_baseline(
+            dataset=final_df.loc[:, MODEL_FEATURES],
+            dataset_hash=dataset_hash,
+            training_code_hash=MetadataManager.fingerprint_training_code(),
+            feature_checksum=compute_feature_checksum(),
+            model_version=str(version),
+            allow_overwrite=True
+        )
+        logger.warning("Baseline PROMOTED (overwrite executed).")
+
+    logger.info("Training completed in %.2f minutes",
+                (time.time() - t0) / 60)
 
     return research_metrics
 
@@ -432,10 +422,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--create-baseline", action="store_true")
+    parser.add_argument("--promote-baseline", action="store_true")
     parser.add_argument("--allow-soft-fail", action="store_true")
+
     args = parser.parse_args()
 
     main(
         create_baseline=args.create_baseline,
+        promote_baseline=args.promote_baseline,
         allow_soft_fail=args.allow_soft_fail
     )
