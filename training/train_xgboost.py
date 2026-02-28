@@ -40,7 +40,7 @@ MAX_DRAWDOWN = -0.55
 MAX_REASONABLE_SHARPE = 5.0
 MAX_PROFIT_FACTOR = 10.0
 
-TARGET_CLIP = 0.25  # NEW: stabilizes extreme forward returns
+TARGET_CLIP = 0.25
 
 
 # ==========================================================
@@ -167,24 +167,13 @@ def load_training_data(start_date, end_date):
     df = FeatureEngineer.add_cross_sectional_features(df)
     df = FeatureEngineer.finalize(df)
 
-    if df.columns.duplicated().any():
-        raise RuntimeError("Duplicate columns detected.")
-
     validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="training")
-
-    # NEW: feature variance sanity check
-    low_var_cols = [
-        col for col in MODEL_FEATURES
-        if df[col].std() < 1e-8
-    ]
-    if low_var_cols:
-        logger.warning("Low variance features detected: %s", low_var_cols)
 
     return df
 
 
 # ==========================================================
-# TARGET
+# TARGET + GROUPS
 # ==========================================================
 
 def build_target(df: pd.DataFrame):
@@ -197,8 +186,6 @@ def build_target(df: pd.DataFrame):
     )
 
     df = df.dropna(subset=["target"])
-
-    # NEW: clip extreme forward returns
     df["target"] = df["target"].clip(-TARGET_CLIP, TARGET_CLIP)
 
     MIN_CS_WIDTH = 8
@@ -208,13 +195,11 @@ def build_target(df: pd.DataFrame):
     if df.empty:
         raise RuntimeError("All dates dropped after cross-sectional enforcement.")
 
-    logger.info(
-        "Regression training dataset | rows=%s | unique_dates=%s",
-        len(df),
-        df["date"].nunique()
-    )
-
     return df
+
+
+def build_groups(df: pd.DataFrame):
+    return df.groupby("date").size().values.astype(int)
 
 
 # ==========================================================
@@ -222,51 +207,60 @@ def build_target(df: pd.DataFrame):
 # ==========================================================
 
 def trainer(train_df):
+
     train_df = build_target(train_df)
 
-    X = validate_feature_schema(train_df.loc[:, MODEL_FEATURES], mode="training")
-    y = train_df["target"]
+    X = validate_feature_schema(
+        train_df.loc[:, MODEL_FEATURES],
+        mode="training"
+    )
 
-    pipeline = build_xgboost_pipeline(y)
-    pipeline.fit(X, y)
+    y = train_df["target"].values
+    groups = build_groups(train_df)
+
+    pipeline = build_xgboost_pipeline()
+    pipeline.fit(X, y, groups)
+
     return pipeline
 
 
 def final_trainer(train_df):
+
     train_df = build_target(train_df)
 
-    X = validate_feature_schema(train_df.loc[:, MODEL_FEATURES], mode="strict_contract")
-    y = train_df["target"]
+    X = validate_feature_schema(
+        train_df.loc[:, MODEL_FEATURES],
+        mode="strict_contract"
+    )
 
-    pipeline = build_xgboost_pipeline(y)
-    pipeline.fit(X, y)
+    y = train_df["target"].values
+    groups = build_groups(train_df)
+
+    pipeline = build_xgboost_pipeline()
+    pipeline.fit(X, y, groups)
+
     return pipeline
 
 
 # ==========================================================
-# EXPORT
+# EXPORT + BASELINE LOGIC
 # ==========================================================
 
 def export_artifacts(model, metrics, dataset_hash,
-                     start_date, end_date, final_df):
+                     start_date, end_date, final_df,
+                     create_baseline=False,
+                     promote_baseline=False):
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     timestamp = int(time.time())
     model_path = os.path.join(MODEL_DIR, f"model_{timestamp}.pkl")
-    tmp_path = os.path.join(MODEL_DIR, f"tmp_model_{timestamp}.pkl")
 
-    joblib.dump(model, tmp_path)
-    os.replace(tmp_path, model_path)
+    joblib.dump(model, model_path)
 
     artifact_hash = MetadataManager.hash_file(model_path)
 
     scalar_metrics = {k: v for k, v in metrics.items() if k != "equity_curve"}
-
-    extra_fields = {
-        "artifact_hash": artifact_hash,
-        "equity_curve": metrics.get("equity_curve", [])
-    }
 
     metadata = MetadataManager.create_metadata(
         model_name="xgboost",
@@ -278,21 +272,29 @@ def export_artifacts(model, metrics, dataset_hash,
         dataset_rows=len(final_df),
         metadata_type="training_manifest_v1",
         feature_checksum=compute_feature_checksum(),
-        extra_fields=extra_fields
+        extra_fields={
+            "artifact_hash": artifact_hash,
+            "equity_curve": metrics.get("equity_curve", [])
+        }
     )
 
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{timestamp}.json")
     MetadataManager.save_metadata(metadata, metadata_path)
 
-    pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
+    if create_baseline:
+        with open(BASELINE_CONTRACT, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+        logger.info("Baseline contract created.")
 
-    with open(pointer_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "model_version": str(timestamp),
-            "updated_at": int(time.time())
-        }, f, indent=2)
+    if promote_baseline:
+        pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
+        with open(pointer_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "model_version": str(timestamp),
+                "updated_at": int(time.time())
+            }, f, indent=2)
+        logger.info("Model promoted to production.")
 
-    logger.info("Artifacts exported safely.")
     return timestamp
 
 
@@ -300,18 +302,14 @@ def export_artifacts(model, metrics, dataset_hash,
 # MAIN
 # ==========================================================
 
-def main(start_date=None, end_date=None,
-         create_baseline=False,
+def main(create_baseline=False,
          promote_baseline=False,
          allow_soft_fail=False):
-
-    t0 = time.time()
 
     init_env()
     enforce_determinism()
 
-    if not start_date:
-        start_date, end_date = MarketTime.window_for("xgboost")
+    start_date, end_date = MarketTime.window_for("xgboost")
 
     raw_df = load_training_data(start_date, end_date)
 
@@ -332,19 +330,16 @@ def main(start_date=None, end_date=None,
     dataset_hash = compute_dataset_hash(final_df)
     final_model = final_trainer(raw_df)
 
-    version = export_artifacts(
+    export_artifacts(
         final_model,
         research_metrics,
         dataset_hash,
         start_date,
         end_date,
-        final_df
+        final_df,
+        create_baseline=create_baseline,
+        promote_baseline=promote_baseline
     )
-
-    logger.info("Training completed in %.2f minutes",
-                (time.time() - t0) / 60)
-
-    return research_metrics
 
 
 if __name__ == "__main__":
