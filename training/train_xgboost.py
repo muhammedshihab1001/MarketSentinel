@@ -19,7 +19,6 @@ from core.schema.feature_schema import (
 )
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
-from core.monitoring.drift_detector import DriftDetector
 from core.artifacts.metadata_manager import MetadataManager
 
 from training.backtesting.walk_forward import WalkForwardValidator, FORWARD_DAYS
@@ -32,16 +31,14 @@ PRODUCTION_POINTER = "production_pointer.json"
 BASELINE_CONTRACT = os.path.join(MODEL_DIR, "baseline_contract.json")
 
 SEED = 42
-MIN_TRAINING_ROWS = 1200
-MIN_UNIQUE_DATES = 250
+MIN_TRAINING_ROWS = 1500
+MIN_UNIQUE_DATES = 300
+MIN_CS_WIDTH = 10
 
 MIN_PRODUCTION_SHARPE = 0.10
 MAX_DRAWDOWN = -0.55
 MAX_REASONABLE_SHARPE = 5.0
 MAX_PROFIT_FACTOR = 10.0
-
-TARGET_CLIP = 3.0  # increased because now we z-score
-MIN_CS_WIDTH = 8
 
 
 # ==========================================================
@@ -81,7 +78,7 @@ def validate_production_metrics(metrics: dict):
     profit_factor = float(metrics["profit_factor"])
 
     logger.info(
-        "Production validation | Sharpe=%.4f | DD=%.2f%% | PF=%.2f",
+        "Validation | Sharpe=%.4f | DD=%.2f%% | PF=%.2f",
         sharpe,
         drawdown * 100,
         profit_factor
@@ -134,6 +131,7 @@ def load_training_data(start_date, end_date):
     datasets = []
 
     for ticker in universe:
+
         price_df = market_data.get_price_data(
             ticker=ticker,
             start_date=start_date,
@@ -170,18 +168,23 @@ def load_training_data(start_date, end_date):
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="training")
 
+    logger.info(
+        "Training dataset loaded | rows=%s | dates=%s",
+        len(df),
+        df["date"].nunique()
+    )
+
     return df
 
 
 # ==========================================================
-# TARGET (CROSS-SECTIONAL Z-SCORE NORMALIZED)
+# TARGET (PAIRWISE RANKING COMPATIBLE)
 # ==========================================================
 
 def build_target(df: pd.DataFrame):
 
     df = df.sort_values(["date", "ticker"]).copy()
 
-    # Forward log return
     df["raw_forward"] = (
         df.groupby("ticker")["close"]
         .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
@@ -189,34 +192,33 @@ def build_target(df: pd.DataFrame):
 
     df = df.dropna(subset=["raw_forward"])
 
-    # Cross-sectional stats
+    # Cross-sectional z-score normalization
     cs_mean = df.groupby("date")["raw_forward"].transform("mean")
     cs_std = df.groupby("date")["raw_forward"].transform("std")
-
     cs_std = cs_std.replace(0, np.nan)
 
-    # Z-score normalization
     df["target"] = (df["raw_forward"] - cs_mean) / cs_std
-
     df = df[np.isfinite(df["target"])]
 
-    # Clip AFTER normalization
-    df["target"] = df["target"].clip(-TARGET_CLIP, TARGET_CLIP)
-
-    # Enforce cross-sectional width
     counts = df.groupby("date")["ticker"].transform("count")
     df = df[counts >= MIN_CS_WIDTH]
 
     df.drop(columns=["raw_forward"], inplace=True)
 
     if df.empty:
-        raise RuntimeError("All dates dropped after cross-sectional enforcement.")
+        raise RuntimeError("All dates removed after CS filtering.")
 
     return df
 
 
 def build_groups(df: pd.DataFrame):
-    return df.groupby("date").size().values.astype(int)
+
+    groups = df.groupby("date").size().values.astype(int)
+
+    if min(groups) < MIN_CS_WIDTH:
+        raise RuntimeError("Group size violation.")
+
+    return groups
 
 
 # ==========================================================
@@ -264,7 +266,7 @@ def final_trainer(train_df):
 
 
 # ==========================================================
-# EXPORT + BASELINE LOGIC
+# EXPORT
 # ==========================================================
 
 def export_artifacts(model, metrics, dataset_hash,
@@ -294,18 +296,12 @@ def export_artifacts(model, metrics, dataset_hash,
         metadata_type="training_manifest_v1",
         feature_checksum=compute_feature_checksum(),
         extra_fields={
-            "artifact_hash": artifact_hash,
-            "equity_curve": metrics.get("equity_curve", [])
+            "artifact_hash": artifact_hash
         }
     )
 
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{timestamp}.json")
     MetadataManager.save_metadata(metadata, metadata_path)
-
-    if create_baseline:
-        with open(BASELINE_CONTRACT, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
-        logger.info("Baseline contract created.")
 
     if promote_baseline:
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
@@ -343,7 +339,7 @@ def main(create_baseline=False,
         validate_production_metrics(research_metrics)
     except RuntimeError as e:
         if allow_soft_fail:
-            logger.warning("Soft-fail enabled: %s", str(e))
+            logger.warning("Soft fail: %s", str(e))
         else:
             raise
 
