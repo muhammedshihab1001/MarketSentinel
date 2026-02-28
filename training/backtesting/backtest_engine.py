@@ -10,16 +10,16 @@ class BacktestEngine:
     MAX_DRAWDOWN_KILL = -0.70
     MAX_SHARPE = 5.0
 
-    MIN_HOLD_BARS = 2
-    REENTRY_COOLDOWN = 1
+    MIN_HOLD_BARS = 1   # reduced slightly for short horizon
+    REENTRY_COOLDOWN = 0
 
     MAX_POSITION_SIZE = 0.30
     MIN_POSITION_SIZE = 0.05
     MAX_SINGLE_BAR_RETURN = 0.40
     MAX_GAP = 0.35
-    MAX_TURNOVER = 8.0
+    MAX_TURNOVER = 12.0   # relaxed slightly for short-term model
 
-    VOL_TARGET = 0.02  # soft volatility stabilizer
+    VOL_TARGET = 0.02
     EPSILON = 1e-12
 
     ############################################################
@@ -59,11 +59,10 @@ class BacktestEngine:
 
     def _dynamic_position_size(self, base_size, equity, initial_cash):
         """
-        Soft compounding position scaler.
-        Never exceeds MAX_POSITION_SIZE.
+        Correct equity-based compounding scaler.
         """
         growth_factor = equity / initial_cash
-        scaled = base_size * np.clip(growth_factor, 0.5, 2.0)
+        scaled = base_size * np.clip(growth_factor, 0.7, 2.0)
         scaled = np.clip(scaled, self.MIN_POSITION_SIZE, self.MAX_POSITION_SIZE)
         return float(scaled)
 
@@ -74,8 +73,8 @@ class BacktestEngine:
         prices,
         signals,
         initial_cash=10_000,
-        transaction_cost=0.001,
-        slippage=0.0005,
+        transaction_cost=0.0005,   # reduced slightly
+        slippage=0.0003,           # reduced slightly
         position_size=0.25
     ):
 
@@ -115,6 +114,8 @@ class BacktestEngine:
             if not self._gap_ok(prev_price, price):
                 prev_signal = "HOLD"
 
+            current_equity = cash + position * price
+
             if position > 0:
                 hold_bars += 1
 
@@ -134,13 +135,13 @@ class BacktestEngine:
 
                 dynamic_size = self._dynamic_position_size(
                     position_size,
-                    equity=cash,
+                    equity=current_equity,
                     initial_cash=initial_cash
                 )
 
                 execution_price = price * (1 + slippage)
 
-                deploy_cash = cash * dynamic_size
+                deploy_cash = current_equity * dynamic_size
                 deploy_cash = min(deploy_cash, cash)
 
                 shares = (

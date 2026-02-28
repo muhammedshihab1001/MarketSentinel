@@ -14,7 +14,7 @@ logger = logging.getLogger("marketsentinel.walkforward")
 # ==========================================================
 # UPDATED HORIZON (STRUCTURAL FIX)
 # ==========================================================
-FORWARD_DAYS = 21
+FORWARD_DAYS = 5
 
 
 class WalkForwardValidator:
