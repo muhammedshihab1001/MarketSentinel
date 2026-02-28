@@ -119,7 +119,7 @@ class FeatureEngineer:
             df["momentum_10"] - df["momentum_20"]
         ).clip(-2, 2)
 
-        # 🔥 Momentum Composite (NEW)
+        # Momentum Composite (NEW but safe)
         df["momentum_composite"] = (
             0.4 * df["momentum_20"] +
             0.3 * df["momentum_60"] +
@@ -127,7 +127,7 @@ class FeatureEngineer:
             0.1 * df["momentum_5"]
         ).clip(-2, 2)
 
-        # 🔥 Short-Term Mean Reversion (NEW)
+        # Mean Reversion (NEW but safe)
         df["mean_reversion_1"] = (-df["return_lag1"]).clip(-0.2, 0.2)
 
         # ---------------- Volatility ----------------
@@ -204,7 +204,25 @@ class FeatureEngineer:
             df["ema_10"] / (df["ema_50"] + cls.EPSILON)
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
-        # ---------------- Market Relative Strength (NEW) ----------------
+        # ---------------- Regime Feature (RESTORED) ----------------
+
+        rolling_mean = (
+            df.groupby("ticker")["volatility_20"]
+            .transform(lambda x: x.rolling(60, min_periods=20).mean())
+        )
+
+        rolling_std = (
+            df.groupby("ticker")["volatility_20"]
+            .transform(lambda x: x.rolling(60, min_periods=20).std(ddof=0))
+        )
+
+        zscore = (df["volatility_20"] - rolling_mean) / (
+            rolling_std + cls.EPSILON
+        )
+
+        df["regime_feature"] = zscore.clip(-3, 3).fillna(0.0)
+
+        # ---------------- Market Relative Strength ----------------
 
         market_ret_20 = (
             df.groupby("date")["close"]
@@ -242,6 +260,7 @@ class FeatureEngineer:
             "volatility",
             "ema_ratio",
             "macd_hist",
+            "regime_feature",
         ]
 
         single_ticker = df["ticker"].nunique() <= 1
