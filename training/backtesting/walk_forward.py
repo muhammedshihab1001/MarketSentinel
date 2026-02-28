@@ -58,17 +58,26 @@ class WalkForwardValidator:
         return train_df[train_df["date"] < embargo_cut]
 
     ########################################################
+    # 🔥 IMPROVED TARGET (CROSS-SECTIONAL NEUTRALIZED)
+    ########################################################
 
     def _build_fold_target(self, df):
 
         df = df.sort_values(["ticker", "date"]).copy()
 
-        df["target"] = (
+        df["raw_forward"] = (
             df.groupby("ticker")["close"]
             .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
         )
 
-        df = df.dropna(subset=["target"])
+        df = df.dropna(subset=["raw_forward"])
+
+        # Cross-sectional de-meaning (removes market beta)
+        cs_mean = df.groupby("date")["raw_forward"].transform("mean")
+        df["target"] = df["raw_forward"] - cs_mean
+
+        df.drop(columns=["raw_forward"], inplace=True)
+
         return df
 
     ########################################################
@@ -210,40 +219,7 @@ class WalkForwardValidator:
                 longs, shorts = self._select_positions(ranked)
 
                 ########################################################
-                # DIRECTION CHECK (STABILIZED)
-                ########################################################
-
-                if not self._direction_locked:
-
-                    merged_tmp = pd.merge(
-                        signal_slice[["ticker", "close"]],
-                        exit_slice[["ticker", "close"]],
-                        on="ticker",
-                        suffixes=("_entry", "_exit")
-                    )
-
-                    merged_tmp["ret"] = (
-                        np.log(merged_tmp["close_exit"]) -
-                        np.log(merged_tmp["close_entry"])
-                    )
-
-                    long_mean = merged_tmp[
-                        merged_tmp["ticker"].isin(longs["ticker"])
-                    ]["ret"].mean()
-
-                    short_mean = merged_tmp[
-                        merged_tmp["ticker"].isin(shorts["ticker"])
-                    ]["ret"].mean()
-
-                    if np.isfinite(long_mean) and np.isfinite(short_mean):
-                        if long_mean < short_mean:
-                            logger.warning("Signal appears inverted — auto-flipping.")
-                            self._direction = -1
-
-                    self._direction_locked = True
-
-                ########################################################
-                # VOLATILITY WEIGHTING (ROBUST)
+                # VOLATILITY WEIGHTING
                 ########################################################
 
                 long_vol = longs["volatility"].astype("float64").clip(lower=0.01)
