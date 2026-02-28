@@ -9,15 +9,15 @@ logger = logging.getLogger("marketsentinel.xgboost")
 SEED = 42
 MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
-NUM_BOOST_ROUNDS = 2000
-EARLY_STOPPING_ROUNDS = 200
+NUM_BOOST_ROUNDS = 3000
+EARLY_STOPPING_ROUNDS = 150
 MIN_VALIDATION_ROWS = 300
 MIN_GROUP_SIZE = 5
 EPSILON = 1e-12
 
 
 ###################################################
-# SAFE RANKING MODEL
+# SAFE RANKING MODEL (UPGRADED)
 ###################################################
 
 class SafeXGBRanker:
@@ -88,30 +88,49 @@ class SafeXGBRanker:
         ).hexdigest()
 
         ###################################################
-        # DMATRIX WITH GROUPS
+        # TRAIN / VALIDATION SPLIT (CRITICAL FOR RANKING)
         ###################################################
+
+        split_idx = int(len(X) * 0.8)
+
+        if len(X) - split_idx < MIN_VALIDATION_ROWS:
+            split_idx = len(X) - MIN_VALIDATION_ROWS
+
+        X_train = X.iloc[:split_idx]
+        y_train = y[:split_idx]
+        groups_train = groups[:split_idx]
+
+        X_valid = X.iloc[split_idx:]
+        y_valid = y[split_idx:]
+        groups_valid = groups[split_idx:]
 
         dtrain = xgb.DMatrix(
-            X,
-            label=y,
+            X_train,
+            label=y_train,
             feature_names=self.feature_names,
         )
+        dtrain.set_group(groups_train)
 
-        dtrain.set_group(groups)
+        dvalid = xgb.DMatrix(
+            X_valid,
+            label=y_valid,
+            feature_names=self.feature_names,
+        )
+        dvalid.set_group(groups_valid)
 
         ###################################################
-        # RANKING PARAMETERS
+        # IMPROVED RANKING PARAMETERS
         ###################################################
 
         params = {
-            "max_depth": 7,
-            "eta": 0.03,
-            "subsample": 0.9,
-            "colsample_bytree": 0.9,
-            "min_child_weight": 3,
-            "gamma": 0.1,
-            "reg_alpha": 0.5,
-            "reg_lambda": 2.5,
+            "max_depth": 5,                 # shallower trees
+            "eta": 0.02,                    # slower learning
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "min_child_weight": 5,
+            "gamma": 0.2,
+            "reg_alpha": 1.0,
+            "reg_lambda": 3.0,
             "objective": "rank:pairwise",
             "eval_metric": "ndcg",
             "tree_method": "hist",
@@ -126,13 +145,15 @@ class SafeXGBRanker:
         ).hexdigest()
 
         ###################################################
-        # TRAIN
+        # TRAIN WITH EARLY STOPPING
         ###################################################
 
         self.model = xgb.train(
             params,
             dtrain,
             num_boost_round=NUM_BOOST_ROUNDS,
+            evals=[(dvalid, "validation")],
+            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
             verbose_eval=False,
         )
 
@@ -149,8 +170,9 @@ class SafeXGBRanker:
             raise RuntimeError("Score collapse detected during training.")
 
         logger.info(
-            "XGBoost ranking training completed | pred_std=%.8f",
+            "XGBoost ranking training completed | pred_std=%.8f | best_iter=%s",
             float(np.std(preds)),
+            self.model.best_iteration,
         )
 
         return self
@@ -249,7 +271,7 @@ def build_xgboost_pipeline():
     model = SafeXGBRanker()
 
     logger.info(
-        "XGBoost RANKING alpha model built (pairwise objective, deterministic CPU mode)."
+        "XGBoost RANKING alpha model built (pairwise objective, deterministic CPU mode, early stopping enabled)."
     )
 
     return model
