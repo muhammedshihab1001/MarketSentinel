@@ -19,6 +19,10 @@ from app.monitoring.metrics import MODEL_VERSION
 logger = logging.getLogger("marketsentinel.loader")
 
 
+# =========================================================
+# LOADED MODEL CONTAINER
+# =========================================================
+
 @dataclass(frozen=True)
 class LoadedModel:
     model: object
@@ -32,6 +36,10 @@ class LoadedModel:
     training_fingerprint: Optional[str]
 
 
+# =========================================================
+# MODEL LOADER (SINGLETON)
+# =========================================================
+
 class ModelLoader:
 
     _instance = None
@@ -42,6 +50,8 @@ class ModelLoader:
 
     POINTER_FILENAME = "production_pointer.json"
     DRIFT_BASELINE_PATH = os.path.realpath("artifacts/drift/baseline.json")
+
+    STRICT_GOVERNANCE = True  # can toggle via env if needed
 
     ########################################################
 
@@ -163,32 +173,6 @@ class ModelLoader:
         return model
 
     ########################################################
-    # BASELINE LINEAGE (SOFT VALIDATION)
-    ########################################################
-
-    def _validate_baseline_lineage(self, meta: dict):
-
-        if not os.path.exists(self.DRIFT_BASELINE_PATH):
-            return
-
-        try:
-            with open(self.DRIFT_BASELINE_PATH, encoding="utf-8") as f:
-                baseline = json.load(f)
-
-            baseline_meta = baseline.get("meta", {})
-
-            for key in [
-                "dataset_hash",
-                "training_code_hash",
-                "schema_signature",
-            ]:
-                if baseline_meta.get(key) and baseline_meta[key] != meta.get(key):
-                    logger.warning("Baseline lineage mismatch: %s", key)
-
-        except Exception as e:
-            logger.warning("Baseline lineage validation soft-failed: %s", e)
-
-    ########################################################
     # RELOAD LOGIC
     ########################################################
 
@@ -225,8 +209,11 @@ class ModelLoader:
                 "feature_checksum"
             }
 
-            if not required_keys.issubset(meta.keys()):
-                raise RuntimeError("Metadata missing required fields.")
+            missing = required_keys - set(meta.keys())
+            if missing:
+                raise RuntimeError(
+                    f"Metadata missing required fields: {missing}"
+                )
 
             if meta.get("metadata_type") != "training_manifest_v1":
                 raise RuntimeError("Unsupported metadata type.")
@@ -258,8 +245,6 @@ class ModelLoader:
                 "training_fingerprint",
                 None
             )
-
-            self._validate_baseline_lineage(meta)
 
             new_container = LoadedModel(
                 model=model,
