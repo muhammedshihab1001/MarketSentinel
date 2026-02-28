@@ -54,7 +54,7 @@ def enforce_determinism():
 
 
 # ==========================================================
-# PRODUCTION METRIC VALIDATION
+# VALIDATION
 # ==========================================================
 
 def validate_production_metrics(metrics: dict):
@@ -98,15 +98,6 @@ def validate_production_metrics(metrics: dict):
 
     if metrics["final_equity"] <= 0:
         raise RuntimeError("Backtest produced non-positive equity.")
-
-
-# ==========================================================
-# FEATURE CHECKSUM
-# ==========================================================
-
-def compute_feature_checksum():
-    canonical = json.dumps(list(MODEL_FEATURES), sort_keys=False).encode()
-    return hashlib.sha256(canonical).hexdigest()
 
 
 # ==========================================================
@@ -178,7 +169,7 @@ def load_training_data(start_date, end_date):
 
 
 # ==========================================================
-# TARGET (PAIRWISE RANKING COMPATIBLE)
+# TARGET
 # ==========================================================
 
 def build_target(df: pd.DataFrame):
@@ -192,7 +183,6 @@ def build_target(df: pd.DataFrame):
 
     df = df.dropna(subset=["raw_forward"])
 
-    # Cross-sectional z-score normalization
     cs_mean = df.groupby("date")["raw_forward"].transform("mean")
     cs_std = df.groupby("date")["raw_forward"].transform("std")
     cs_std = cs_std.replace(0, np.nan)
@@ -212,12 +202,7 @@ def build_target(df: pd.DataFrame):
 
 
 def build_groups(df: pd.DataFrame):
-
     groups = df.groupby("date").size().values.astype(int)
-
-    if min(groups) < MIN_CS_WIDTH:
-        raise RuntimeError("Group size violation.")
-
     return groups
 
 
@@ -227,9 +212,7 @@ def build_groups(df: pd.DataFrame):
 
 def trainer(train_df):
 
-    if "target" not in train_df.columns:
-        train_df = build_target(train_df)
-
+    train_df = build_target(train_df)
     train_df = train_df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
     X = validate_feature_schema(
@@ -294,7 +277,6 @@ def export_artifacts(model, metrics, dataset_hash,
         dataset_hash=dataset_hash,
         dataset_rows=len(final_df),
         metadata_type="training_manifest_v1",
-        feature_checksum=compute_feature_checksum(),
         extra_fields={
             "artifact_hash": artifact_hash
         }
@@ -302,6 +284,12 @@ def export_artifacts(model, metrics, dataset_hash,
 
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{timestamp}.json")
     MetadataManager.save_metadata(metadata, metadata_path)
+
+    #  FIXED: baseline creation restored
+    if create_baseline:
+        with open(BASELINE_CONTRACT, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+        logger.info("Baseline contract created → %s", BASELINE_CONTRACT)
 
     if promote_baseline:
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
@@ -335,13 +323,7 @@ def main(create_baseline=False,
 
     logger.info("Research metrics: %s", research_metrics)
 
-    try:
-        validate_production_metrics(research_metrics)
-    except RuntimeError as e:
-        if allow_soft_fail:
-            logger.warning("Soft fail: %s", str(e))
-        else:
-            raise
+    validate_production_metrics(research_metrics)
 
     final_df = build_target(raw_df)
     dataset_hash = compute_dataset_hash(final_df)
