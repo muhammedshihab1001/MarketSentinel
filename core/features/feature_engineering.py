@@ -103,13 +103,12 @@ class FeatureEngineer:
         df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
         df["return_lag10"] = df.groupby("ticker")["return"].shift(10)
 
-        # Rolling mean return (NEW but safe)
         df["return_mean_20"] = (
             df.groupby("ticker")["return"]
             .transform(lambda x: x.rolling(20, min_periods=5).mean())
         ).clip(-0.2, 0.2)
 
-        # ---------------- Momentum Stack ----------------
+        # ---------------- Momentum ----------------
 
         df["momentum_5"] = df.groupby("ticker")["close"].pct_change(5).clip(-1, 1)
         df["momentum_10"] = df.groupby("ticker")["close"].pct_change(10).clip(-1.5, 1.5)
@@ -119,6 +118,17 @@ class FeatureEngineer:
         df["momentum_accel"] = (
             df["momentum_10"] - df["momentum_20"]
         ).clip(-2, 2)
+
+        # 🔥 Momentum Composite (NEW)
+        df["momentum_composite"] = (
+            0.4 * df["momentum_20"] +
+            0.3 * df["momentum_60"] +
+            0.2 * df["momentum_10"] +
+            0.1 * df["momentum_5"]
+        ).clip(-2, 2)
+
+        # 🔥 Short-Term Mean Reversion (NEW)
+        df["mean_reversion_1"] = (-df["return_lag1"]).clip(-0.2, 0.2)
 
         # ---------------- Volatility ----------------
 
@@ -194,23 +204,17 @@ class FeatureEngineer:
             df["ema_10"] / (df["ema_50"] + cls.EPSILON)
         ).replace([np.inf, -np.inf], 1.0).fillna(1.0).clip(0.5, 1.5)
 
-        # ---------------- Regime Feature ----------------
+        # ---------------- Market Relative Strength (NEW) ----------------
 
-        rolling_mean = (
-            df.groupby("ticker")["volatility_20"]
-            .transform(lambda x: x.rolling(60, min_periods=20).mean())
+        market_ret_20 = (
+            df.groupby("date")["close"]
+            .transform("mean")
+            .pct_change(20)
         )
 
-        rolling_std = (
-            df.groupby("ticker")["volatility_20"]
-            .transform(lambda x: x.rolling(60, min_periods=20).std(ddof=0))
-        )
-
-        zscore = (df["volatility_20"] - rolling_mean) / (
-            rolling_std + cls.EPSILON
-        )
-
-        df["regime_feature"] = zscore.clip(-3, 3).fillna(0.0)
+        df["rel_strength_20"] = (
+            df["momentum_20"] - market_ret_20
+        ).clip(-2, 2)
 
         return df
 
@@ -229,13 +233,15 @@ class FeatureEngineer:
             "momentum_20",
             "momentum_60",
             "momentum_accel",
+            "momentum_composite",
+            "mean_reversion_1",
+            "rel_strength_20",
             "return_lag5",
             "return_mean_20",
             "rsi",
             "volatility",
             "ema_ratio",
             "macd_hist",
-            "regime_feature",
         ]
 
         single_ticker = df["ticker"].nunique() <= 1
@@ -243,7 +249,7 @@ class FeatureEngineer:
         for col in base_cols:
 
             if col not in df.columns:
-                raise RuntimeError(f"Missing base feature: {col}")
+                continue
 
             if single_ticker:
                 df[f"{col}_z"] = 0.0
