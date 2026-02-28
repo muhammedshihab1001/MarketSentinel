@@ -11,13 +11,12 @@ MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
 NUM_BOOST_ROUNDS = 3000
 EARLY_STOPPING_ROUNDS = 150
-MIN_VALIDATION_ROWS = 300
 MIN_GROUP_SIZE = 5
 EPSILON = 1e-12
 
 
 ###################################################
-# SAFE RANKING MODEL (UPGRADED)
+# SAFE RANKING MODEL (GROUP-SAFE + EARLY STOP)
 ###################################################
 
 class SafeXGBRanker:
@@ -61,6 +60,9 @@ class SafeXGBRanker:
         if min(groups) < MIN_GROUP_SIZE:
             raise RuntimeError("Insufficient cross-sectional group size.")
 
+        if sum(groups) != len(X):
+            raise RuntimeError("Group sizes do not match training rows.")
+
         self.training_rows = X.shape[0]
         self.training_cols = X.shape[1]
 
@@ -88,21 +90,31 @@ class SafeXGBRanker:
         ).hexdigest()
 
         ###################################################
-        # TRAIN / VALIDATION SPLIT (CRITICAL FOR RANKING)
+        # GROUP-SAFE TRAIN / VALIDATION SPLIT
         ###################################################
 
-        split_idx = int(len(X) * 0.8)
+        cumulative = np.cumsum(groups)
+        total_groups = len(groups)
 
-        if len(X) - split_idx < MIN_VALIDATION_ROWS:
-            split_idx = len(X) - MIN_VALIDATION_ROWS
+        split_group = int(total_groups * 0.8)
 
-        X_train = X.iloc[:split_idx]
-        y_train = y[:split_idx]
-        groups_train = groups[:split_idx]
+        # ensure at least 5 validation groups
+        if total_groups - split_group < 5:
+            split_group = total_groups - 5
 
-        X_valid = X.iloc[split_idx:]
-        y_valid = y[split_idx:]
-        groups_valid = groups[split_idx:]
+        split_row = cumulative[split_group - 1]
+
+        X_train = X.iloc[:split_row]
+        y_train = y[:split_row]
+        groups_train = groups[:split_group]
+
+        X_valid = X.iloc[split_row:]
+        y_valid = y[split_row:]
+        groups_valid = groups[split_group:]
+
+        ###################################################
+        # DMATRICES
+        ###################################################
 
         dtrain = xgb.DMatrix(
             X_train,
@@ -119,12 +131,12 @@ class SafeXGBRanker:
         dvalid.set_group(groups_valid)
 
         ###################################################
-        # IMPROVED RANKING PARAMETERS
+        # RANKING PARAMETERS (STABLE + CONSERVATIVE)
         ###################################################
 
         params = {
-            "max_depth": 5,                 # shallower trees
-            "eta": 0.02,                    # slower learning
+            "max_depth": 5,
+            "eta": 0.02,
             "subsample": 0.8,
             "colsample_bytree": 0.8,
             "min_child_weight": 5,
@@ -271,7 +283,7 @@ def build_xgboost_pipeline():
     model = SafeXGBRanker()
 
     logger.info(
-        "XGBoost RANKING alpha model built (pairwise objective, deterministic CPU mode, early stopping enabled)."
+        "XGBoost RANKING alpha model built (group-safe validation, deterministic CPU mode)."
     )
 
     return model
