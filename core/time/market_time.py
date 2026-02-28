@@ -6,29 +6,36 @@ import hashlib
 
 class MarketTime:
     """
-    Institutional Time Governor (Deterministic).
+    Institutional Time Governor (Production Grade v4.0)
 
     Guarantees:
-    ✔ reproducible training
+    ✔ deterministic training windows
     ✔ tamper-detected freeze file
     ✔ atomic persistence
-    ✔ lineage-safe time hashing
     ✔ walk-forward protection
-    ✔ configurable institutional training windows
+    ✔ dynamic env override support
+    ✔ institutional safety bounds
+    ✔ reproducible time_hash lineage
+    ✔ research vs production mode separation
     """
 
-    TIME_GOVERNANCE_VERSION = "3.1"
+    TIME_GOVERNANCE_VERSION = "4.0"
 
     ########################################################
-    # UPDATED TRAINING WINDOWS (INCREASED DATA DEPTH)
+    # CONFIGURABLE TRAINING WINDOWS
     ########################################################
 
-    MODEL_WINDOWS = {
-        # Increased from 3 → 8 years for signal stability
-        "xgboost": 8,
+    DEFAULT_WINDOWS = {
+        "xgboost": 5,   # 5-year rolling window (recommended)
     }
 
+    # Approx trading days per year
+    TRADING_DAYS_PER_YEAR = 252
+
     WALK_FORWARD_MONTHS = 3
+
+    MIN_YEARS = 1
+    MAX_YEARS = 15
 
     FREEZE_FILE = os.path.abspath(
         os.path.join("artifacts", "time_freeze.json")
@@ -39,7 +46,7 @@ class MarketTime:
     _frozen_today = None
 
     ########################################################
-    # UTC
+    # UTC TODAY
     ########################################################
 
     @staticmethod
@@ -47,7 +54,7 @@ class MarketTime:
         return datetime.datetime.utcnow().date()
 
     ########################################################
-    # HASH
+    # HASHING
     ########################################################
 
     @staticmethod
@@ -125,7 +132,7 @@ class MarketTime:
                 pass
 
     ########################################################
-    # FREEZE
+    # FREEZE CONTROL
     ########################################################
 
     @classmethod
@@ -134,9 +141,7 @@ class MarketTime:
         frozen = datetime.date.fromisoformat(date_str)
 
         if frozen > cls._utc_today():
-            raise RuntimeError(
-                "Cannot freeze time in the future."
-            )
+            raise RuntimeError("Cannot freeze time in the future.")
 
         cls._acquire_lock()
 
@@ -146,8 +151,7 @@ class MarketTime:
 
             payload = {
                 "frozen_today": date_str,
-                "governance_version":
-                    cls.TIME_GOVERNANCE_VERSION
+                "governance_version": cls.TIME_GOVERNANCE_VERSION
             }
 
             cls._atomic_write(
@@ -159,7 +163,7 @@ class MarketTime:
             cls._release_lock()
 
     ########################################################
-    # LOAD FREEZE (TAMPER SAFE)
+    # LOAD FREEZE
     ########################################################
 
     @classmethod
@@ -184,9 +188,7 @@ class MarketTime:
             )
 
             if frozen > cls._utc_today():
-                raise RuntimeError(
-                    "Freeze file contains future date."
-                )
+                raise RuntimeError("Freeze file contains future date.")
 
             return frozen
 
@@ -214,7 +216,7 @@ class MarketTime:
         return cls._utc_today()
 
     ########################################################
-    # VALIDATE YEARS
+    # WINDOW VALIDATION
     ########################################################
 
     @classmethod
@@ -223,11 +225,37 @@ class MarketTime:
         if not isinstance(years, int):
             raise RuntimeError("Training window must be integer years.")
 
-        if years <= 0 or years > 15:
+        if years < cls.MIN_YEARS or years > cls.MAX_YEARS:
             raise RuntimeError(
-                "Training window outside institutional bounds (1–15 years allowed)."
+                f"Training window outside institutional bounds "
+                f"({cls.MIN_YEARS}–{cls.MAX_YEARS} years allowed)."
             )
 
+    ########################################################
+    # ENV OVERRIDE SUPPORT
+    ########################################################
+
+    @classmethod
+    def _resolve_years(cls, model_name: str):
+
+        env_key = f"{model_name.upper()}_TRAIN_YEARS"
+
+        if env_key in os.environ:
+            years = int(os.environ[env_key])
+        else:
+            years = cls.DEFAULT_WINDOWS.get(model_name)
+
+        if years is None:
+            raise RuntimeError(
+                f"No training window configured for model: {model_name}"
+            )
+
+        cls._validate_years(years)
+
+        return years
+
+    ########################################################
+    # TRAINING WINDOW
     ########################################################
 
     @classmethod
@@ -237,31 +265,29 @@ class MarketTime:
 
         end = cls.today()
 
-        start = end - datetime.timedelta(
-            days=int(365.25 * years)
-        )
+        # Use trading-day approximation instead of calendar years
+        days = int(cls.TRADING_DAYS_PER_YEAR * years * 1.05)
+
+        start = end - datetime.timedelta(days=days)
 
         if start >= end:
-            raise RuntimeError(
-                "Invalid training window generated."
-            )
+            raise RuntimeError("Invalid training window generated.")
 
         return start.isoformat(), end.isoformat()
 
+    ########################################################
+    # WINDOW FOR MODEL
     ########################################################
 
     @classmethod
     def window_for(cls, model_name: str):
 
-        if model_name not in cls.MODEL_WINDOWS:
-            raise RuntimeError(
-                f"No training window configured for model: {model_name}"
-            )
-
-        years = cls.MODEL_WINDOWS[model_name]
+        years = cls._resolve_years(model_name)
 
         return cls.training_window(years)
 
+    ########################################################
+    # WALK FORWARD ANCHOR
     ########################################################
 
     @classmethod
@@ -276,7 +302,7 @@ class MarketTime:
         return anchor
 
     ########################################################
-    # SNAPSHOT
+    # SNAPSHOT CONTRACT
     ########################################################
 
     @classmethod
@@ -309,4 +335,17 @@ class MarketTime:
             canonical
         ).hexdigest()
 
+        contract["training_id"] = hashlib.sha256(
+            (contract["time_hash"] + model_name).encode()
+        ).hexdigest()
+
         return contract
+
+    ########################################################
+    # FREEZE STATUS
+    ########################################################
+
+    @classmethod
+    def is_frozen(cls):
+
+        return os.path.exists(cls.FREEZE_FILE)
