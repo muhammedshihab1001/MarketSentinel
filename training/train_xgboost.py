@@ -272,33 +272,34 @@ def export_artifacts(model, metrics, dataset_hash,
     timestamp = int(time.time())
     model_path = os.path.join(MODEL_DIR, f"model_{timestamp}.pkl")
 
-    # attach fingerprint inside model
+    # Attach fingerprint into model object
     model.training_fingerprint = dataset_hash
 
     joblib.dump(model, model_path)
 
     artifact_hash = MetadataManager.hash_file(model_path)
 
-    metadata = {
-        "metadata_type": "training_manifest_v1",
-        "schema_signature": get_schema_signature(),
-        "schema_version": SCHEMA_VERSION,
-        "features": list(MODEL_FEATURES),
-        "artifact_hash": artifact_hash,
-        "dataset_hash": dataset_hash,
-        "training_code_hash": compute_training_code_hash(),
-        "feature_checksum": compute_feature_checksum(),
-        "metrics": {k: v for k, v in metrics.items() if k != "equity_curve"},
-        "training_start": str(start_date),
-        "training_end": str(end_date),
-        "dataset_rows": len(final_df),
-        "created_at": int(time.time())
-    }
+    # --- Use official metadata factory ---
+    metadata = MetadataManager.create_metadata(
+        model_name="xgboost",
+        metrics={k: v for k, v in metrics.items() if k != "equity_curve"},
+        features=tuple(MODEL_FEATURES),
+        training_start=str(start_date),
+        training_end=str(end_date),
+        dataset_hash=dataset_hash,
+        dataset_rows=len(final_df),
+        metadata_type="training_manifest_v1",
+        extra_fields={
+            "artifact_hash": artifact_hash,
+            "schema_signature": get_schema_signature(),
+            "schema_version": SCHEMA_VERSION,
+            "training_code_hash": compute_training_code_hash(),
+            "feature_checksum": compute_feature_checksum(),
+        }
+    )
 
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{timestamp}.json")
-
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
+    MetadataManager.save_metadata(metadata, metadata_path)
 
     if create_baseline:
         with open(BASELINE_CONTRACT, "w", encoding="utf-8") as f:
