@@ -29,6 +29,7 @@ class LoadedModel:
     artifact_hash: str
     feature_checksum: str
     pointer_hash: Optional[str]
+    training_fingerprint: Optional[str]
 
 
 class ModelLoader:
@@ -150,12 +151,14 @@ class ModelLoader:
 
         model = joblib.load(model_path)
 
-        if not hasattr(model, "predict_proba"):
+        if not hasattr(model, "predict"):
             raise RuntimeError("Invalid model artifact.")
 
-        if hasattr(model, "feature_names"):
-            if list(model.feature_names) != list(MODEL_FEATURES):
-                raise RuntimeError("Model feature contract mismatch.")
+        if not hasattr(model, "feature_names"):
+            raise RuntimeError("Model missing feature_names contract.")
+
+        if list(model.feature_names) != list(MODEL_FEATURES):
+            raise RuntimeError("Model feature order mismatch.")
 
         return model
 
@@ -174,17 +177,13 @@ class ModelLoader:
 
             baseline_meta = baseline.get("meta", {})
 
-            if baseline_meta.get("dataset_hash") and \
-                    baseline_meta["dataset_hash"] != meta["dataset_hash"]:
-                logger.warning("Baseline dataset hash mismatch.")
-
-            if baseline_meta.get("training_code_hash") and \
-                    baseline_meta["training_code_hash"] != meta["training_code_hash"]:
-                logger.warning("Baseline training code hash mismatch.")
-
-            if baseline_meta.get("schema_signature") and \
-                    baseline_meta["schema_signature"] != meta["schema_signature"]:
-                logger.warning("Baseline schema signature mismatch.")
+            for key in [
+                "dataset_hash",
+                "training_code_hash",
+                "schema_signature",
+            ]:
+                if baseline_meta.get(key) and baseline_meta[key] != meta.get(key):
+                    logger.warning("Baseline lineage mismatch: %s", key)
 
         except Exception as e:
             logger.warning("Baseline lineage validation soft-failed: %s", e)
@@ -222,7 +221,8 @@ class ModelLoader:
                 "features",
                 "artifact_hash",
                 "dataset_hash",
-                "training_code_hash"
+                "training_code_hash",
+                "feature_checksum"
             }
 
             if not required_keys.issubset(meta.keys()):
@@ -240,9 +240,6 @@ class ModelLoader:
             if list(meta.get("features")) != list(MODEL_FEATURES):
                 raise RuntimeError("Metadata feature mismatch.")
 
-            if meta.get("feature_count") != len(MODEL_FEATURES):
-                raise RuntimeError("Metadata feature_count mismatch.")
-
             artifact_hash_actual = self._sha256(model_path)
 
             if meta["artifact_hash"] != artifact_hash_actual:
@@ -253,9 +250,14 @@ class ModelLoader:
             feature_checksum_actual = \
                 self._compute_feature_checksum(MODEL_FEATURES)
 
-            if meta.get("feature_checksum") and \
-                    meta["feature_checksum"] != feature_checksum_actual:
+            if meta["feature_checksum"] != feature_checksum_actual:
                 raise RuntimeError("Feature checksum mismatch.")
+
+            training_fingerprint = getattr(
+                model,
+                "training_fingerprint",
+                None
+            )
 
             self._validate_baseline_lineage(meta)
 
@@ -267,7 +269,8 @@ class ModelLoader:
                 training_code_hash=meta["training_code_hash"],
                 artifact_hash=artifact_hash_actual,
                 feature_checksum=feature_checksum_actual,
-                pointer_hash=pointer_hash
+                pointer_hash=pointer_hash,
+                training_fingerprint=training_fingerprint
             )
 
             self._xgb_container = new_container
@@ -277,7 +280,11 @@ class ModelLoader:
                 version=version
             ).set(1)
 
-            logger.info("Model loaded successfully | version=%s", version)
+            logger.info(
+                "Model loaded successfully | version=%s | artifact_hash=%s",
+                version,
+                artifact_hash_actual[:12]
+            )
 
             return new_container.model
 
