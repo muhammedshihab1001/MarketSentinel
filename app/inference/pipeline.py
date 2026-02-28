@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import logging
 import os
-from typing import List, Dict, Tuple
+from typing import List
 
 from core.data.market_data_service import MarketDataService
 from core.features.feature_store import FeatureStore
@@ -168,20 +168,31 @@ class InferencePipeline:
                     "drift_confidence": 0.0
                 }
 
-            # ---------------- Model ----------------
-            scores = self.models.xgb.predict_proba(feature_df)[:, 1]
+            # =================================================
+            # 🔥 UPDATED SCORING LOGIC (NO SIGMOID)
+            # =================================================
 
-            if np.std(scores) < self.MIN_SCORE_STD:
-                logger.warning("Score collapse — flattening.")
-                scores = np.full(len(scores), 0.5)
+            raw_scores = self.models.xgb.predict(feature_df)
+
+            if not np.all(np.isfinite(raw_scores)):
+                raise RuntimeError("Non-finite raw scores detected.")
+
+            if np.std(raw_scores) < self.MIN_SCORE_STD:
+                logger.warning("Raw score collapse — flattening.")
+                raw_scores = np.zeros(len(raw_scores))
 
             latest_df = latest_df.copy()
-            latest_df["score"] = scores
+            latest_df["raw_score"] = raw_scores
 
-            latest_df["rank_pct"] = latest_df["score"].rank(
+            # Cross-sectional rank normalization (0–1 scale)
+            latest_df["score"] = latest_df["raw_score"].rank(
                 method="first",
                 pct=True
             )
+
+            scores = latest_df["score"].values
+
+            latest_df["rank_pct"] = latest_df["score"]
 
             latest_df["signal"] = latest_df["rank_pct"].apply(
                 lambda x:
@@ -189,6 +200,8 @@ class InferencePipeline:
                 else "SHORT" if x <= SHORT_PERCENTILE
                 else "NEUTRAL"
             )
+
+            # =================================================
 
             weights = self._construct_portfolio(latest_df)
 
@@ -217,7 +230,6 @@ class InferencePipeline:
                     "agent": agent_output
                 })
 
-            # Hedge-fund style final top 5 alpha selection
             alpha_sorted = sorted(
                 snapshot_rows,
                 key=lambda x: x["agent"]["strength_score"],
@@ -226,7 +238,6 @@ class InferencePipeline:
 
             top_5 = alpha_sorted[:self.TOP_SELECTION]
 
-            # If user requested subset
             filtered_signals = [
                 s for s in snapshot_rows if s["ticker"] in requested
             ]
