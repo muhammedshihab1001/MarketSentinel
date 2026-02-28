@@ -11,7 +11,10 @@ from training.backtesting.regime import MarketRegimeDetector
 
 logger = logging.getLogger("marketsentinel.walkforward")
 
-FORWARD_DAYS = 10
+# ==========================================================
+# UPDATED HORIZON (STRUCTURAL FIX)
+# ==========================================================
+FORWARD_DAYS = 21
 
 
 class WalkForwardValidator:
@@ -33,8 +36,8 @@ class WalkForwardValidator:
     SCORE_WINSOR_Q = 0.02
 
     # --- Adaptive dispersion controls ---
-    BASE_DISPERSION = 0.05        # floor
-    DISPERSION_PERCENTILE = 0.40  # dynamic threshold percentile
+    BASE_DISPERSION = 0.05
+    DISPERSION_PERCENTILE = 0.40
     MIN_ACTIVE_POSITIONS = 4
 
     EPSILON = 1e-9
@@ -57,13 +60,17 @@ class WalkForwardValidator:
         self._direction = 1
         self._direction_locked = False
 
-    ########################################################
+    # ==========================================================
+    # EMBARGO
+    # ==========================================================
 
     def _apply_embargo(self, train_df, test_start):
         embargo_cut = pd.Timestamp(test_start) - pd.Timedelta(days=self.embargo_days)
         return train_df[train_df["date"] < embargo_cut]
 
-    ########################################################
+    # ==========================================================
+    # TARGET (CROSS-SECTIONAL NEUTRALIZED)
+    # ==========================================================
 
     def _build_fold_target(self, df):
         df = df.sort_values(["date", "ticker"]).copy()
@@ -81,21 +88,17 @@ class WalkForwardValidator:
         df.drop(columns=["raw_forward"], inplace=True)
         return df
 
-    ########################################################
+    # ==========================================================
 
     def _winsorize(self, x):
         lower = np.quantile(x, self.SCORE_WINSOR_Q)
         upper = np.quantile(x, 1 - self.SCORE_WINSOR_Q)
         return np.clip(x, lower, upper)
 
-    ########################################################
-
     def _softmax(self, x):
         x = x - np.max(x)
         e = np.exp(x)
         return e / (np.sum(e) + self.EPSILON)
-
-    ########################################################
 
     def _auto_detect_direction(self, scores, forward_returns):
         if self._direction_locked:
@@ -108,8 +111,6 @@ class WalkForwardValidator:
         self._direction = 1 if corr >= 0 else -1
         self._direction_locked = True
 
-    ########################################################
-
     def _predict_scores(self, model, X):
         if hasattr(model, "predict_proba"):
             try:
@@ -120,14 +121,13 @@ class WalkForwardValidator:
                 pass
         return model.predict(X)
 
-    ########################################################
-    # NEW: Adaptive Dispersion Gate
-    ########################################################
+    # ==========================================================
+    # ADAPTIVE DISPERSION GATE
+    # ==========================================================
 
     def _dispersion_gate(self, scores):
         dispersion = float(np.std(scores))
 
-        # dynamic threshold
         dynamic_threshold = max(
             self.BASE_DISPERSION,
             np.percentile(np.abs(scores), self.DISPERSION_PERCENTILE * 100)
@@ -142,7 +142,9 @@ class WalkForwardValidator:
 
         return dispersion >= dynamic_threshold
 
-    ########################################################
+    # ==========================================================
+    # MAIN WALK-FORWARD
+    # ==========================================================
 
     def run(self, df: pd.DataFrame):
 
@@ -236,7 +238,6 @@ class WalkForwardValidator:
                 scores = self._winsorize(scores)
                 scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
 
-                # adaptive dispersion gate
                 if not self._dispersion_gate(scores):
                     continue
 
@@ -340,7 +341,7 @@ class WalkForwardValidator:
 
         return self.aggregate_results(results, equity_curve)
 
-    ########################################################
+    # ==========================================================
 
     def aggregate_results(self, results, equity_curve):
 
