@@ -31,7 +31,10 @@ class WalkForwardValidator:
     MAX_SHARPE = 5.0
 
     SCORE_WINSOR_Q = 0.02
-    DISPERSION_THRESHOLD = 0.15
+
+    # Relaxed dispersion logic (adaptive)
+    MIN_DISPERSION = 0.05
+
     EPSILON = 1e-9
 
     def __init__(
@@ -63,7 +66,7 @@ class WalkForwardValidator:
     ########################################################
 
     def _build_fold_target(self, df):
-        df = df.sort_values(["ticker", "date"]).copy()
+        df = df.sort_values(["date", "ticker"]).copy()
 
         df["raw_forward"] = (
             df.groupby("ticker")["close"]
@@ -211,17 +214,17 @@ class WalkForwardValidator:
                 scores = self._winsorize(scores)
                 scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
 
-                # DISPERSION GATE
-                if np.std(scores) < self.DISPERSION_THRESHOLD:
+                # Adaptive dispersion gate
+                if np.std(scores) < self.MIN_DISPERSION:
                     continue
 
                 signal_slice["score"] = scores
 
-                # AUTO DIRECTION DETECTION
                 forward_ret = (
                     np.log(exit_slice["close"].values) -
                     np.log(signal_slice["close"].values)
                 )
+
                 self._auto_detect_direction(scores, forward_ret)
 
                 ranked = signal_slice.sort_values("score")
@@ -233,11 +236,9 @@ class WalkForwardValidator:
                     longs = ranked.head(self.TOP_K)
                     shorts = ranked.tail(self.BOTTOM_K)
 
-                # ALPHA WEIGHTING (SOFTMAX)
                 long_alpha = self._softmax(longs["score"].values)
                 short_alpha = self._softmax(np.abs(shorts["score"].values))
 
-                # VOL WEIGHTING
                 long_vol = longs["volatility"].clip(lower=0.01).values
                 short_vol = shorts["volatility"].clip(lower=0.01).values
 
