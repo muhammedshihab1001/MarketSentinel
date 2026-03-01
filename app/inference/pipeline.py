@@ -52,7 +52,7 @@ def get_shared_model_loader():
 
 
 # =========================================================
-# INFERENCE PIPELINE (HYBRID MULTI-AGENT)
+# INFERENCE PIPELINE (INSTITUTIONAL HYBRID)
 # =========================================================
 
 class InferencePipeline:
@@ -109,22 +109,16 @@ class InferencePipeline:
     # AGENTS
     # =========================================================
 
-    def _risk_agent(self, df, drift_result):
-        dispersion = df["market_dispersion"].iloc[0]
-
-        if dispersion < 0.01:
-            return 0.6
-        if drift_result.get("drift_detected"):
-            return 0.5
-        return 1.0
+    def _risk_agent(self, drift_result):
+        exposure_scale = drift_result.get("exposure_scale", 1.0)
+        return float(np.clip(exposure_scale, 0.0, 1.0))
 
     def _macro_agent(self, df):
         breadth = df["breadth"].iloc[0]
-
         if breadth > 0.65:
             return 1.1
         if breadth < 0.35:
-            return 0.7
+            return 0.75
         return 1.0
 
     def _technical_agent(self, row):
@@ -132,7 +126,7 @@ class InferencePipeline:
         momentum = row.get("momentum_composite", 0)
 
         if rsi > 70:
-            return 0.8
+            return 0.85
         if rsi < 30:
             return 1.1
         if momentum > 0:
@@ -143,8 +137,8 @@ class InferencePipeline:
 
     def run_snapshot(self, tickers: List[str]):
 
-        production_universe = sorted(set(MarketUniverse.get_universe()))
-        if not production_universe:
+        universe = sorted(set(tickers or MarketUniverse.get_universe()))
+        if not universe:
             raise RuntimeError("Universe empty.")
 
         INFERENCE_IN_PROGRESS.inc()
@@ -152,10 +146,9 @@ class InferencePipeline:
 
         try:
 
-            df = self._build_cross_sectional_frame(production_universe)
+            df = self._build_cross_sectional_frame(universe)
 
             latest_df = self._select_latest_snapshot(df)
-
             latest_df = latest_df[
                 latest_df["dollar_volume"] > self.MIN_LIQUIDITY
             ].copy()
@@ -175,34 +168,38 @@ class InferencePipeline:
             if np.std(raw_scores) < self.MIN_SCORE_STD:
                 raw_scores = np.zeros(len(raw_scores))
 
-            scores = self._winsorize(raw_scores)
-            scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
+            alpha_scores = self._winsorize(raw_scores)
+            alpha_scores = (
+                alpha_scores - alpha_scores.mean()
+            ) / (alpha_scores.std() + self.EPSILON)
 
-            latest_df = latest_df.copy()
-            latest_df["alpha_score"] = scores
+            latest_df["alpha_score"] = alpha_scores
 
-            # =============================
-            # MULTI-AGENT OVERLAY
-            # =============================
+            # -----------------------------
+            # Hybrid Overlay
+            # -----------------------------
 
-            risk_mult = self._risk_agent(latest_df, drift_result)
+            risk_mult = self._risk_agent(drift_result)
             macro_mult = self._macro_agent(latest_df)
 
-            hybrid_scores = []
+            final_scores = []
 
             for _, row in latest_df.iterrows():
                 tech_mult = self._technical_agent(row)
 
                 final_score = (
                     row["alpha_score"]
-                    * risk_mult
                     * macro_mult
                     * tech_mult
                 )
 
-                hybrid_scores.append(final_score)
+                final_scores.append(final_score)
 
-            latest_df["score"] = hybrid_scores
+            latest_df["score"] = np.array(final_scores)
+
+            # Score statistics for API
+            score_mean = float(latest_df["score"].mean())
+            score_std = float(latest_df["score"].std())
 
             ranked = latest_df.sort_values("score")
 
@@ -211,11 +208,17 @@ class InferencePipeline:
 
             weights = self._construct_portfolio(longs, shorts)
 
+            # Apply risk scaling to final weights
+            for k in weights:
+                weights[k] *= risk_mult
+
             snapshot_rows = self._build_snapshot(
                 latest_df,
                 weights,
+                macro_mult,
                 risk_mult,
-                macro_mult
+                score_mean,
+                score_std
             )
 
             top_5 = sorted(
@@ -228,8 +231,10 @@ class InferencePipeline:
                 "snapshot_date": str(latest_df["date"].iloc[0]),
                 "universe_size": int(len(latest_df)),
                 "drift": drift_result,
-                "risk_multiplier": risk_mult,
                 "macro_multiplier": macro_mult,
+                "risk_multiplier": risk_mult,
+                "score_mean": score_mean,
+                "score_std": score_std,
                 "top_5": top_5,
                 "signals": snapshot_rows
             }
@@ -258,12 +263,21 @@ class InferencePipeline:
             return {
                 "drift_detected": False,
                 "drift_state": "bypass",
-                "severity_score": 0
+                "severity_score": 0,
+                "exposure_scale": 1.0
             }
 
     # =========================================================
 
-    def _build_snapshot(self, df, weights, risk_mult, macro_mult):
+    def _build_snapshot(
+        self,
+        df,
+        weights,
+        macro_mult,
+        risk_mult,
+        score_mean,
+        score_std
+    ):
 
         snapshot_rows = []
 
@@ -273,17 +287,20 @@ class InferencePipeline:
 
             agent_output = self.agent.analyze(
                 row={**row.to_dict(), "signal": direction},
-                probability_stats=None
+                probability_stats={
+                    "mean": score_mean,
+                    "std": score_std
+                }
             )
 
             snapshot_rows.append({
                 "date": row["date"],
                 "ticker": row["ticker"],
                 "alpha_score": float(row["alpha_score"]),
-                "final_score": float(row["score"]),
+                "score": float(row["score"]),
                 "weight": float(weights.get(row["ticker"], 0.0)),
-                "risk_multiplier": float(risk_mult),
                 "macro_multiplier": float(macro_mult),
+                "risk_multiplier": float(risk_mult),
                 "agent": agent_output
             })
 
@@ -333,9 +350,8 @@ class InferencePipeline:
 
         latest_date = df["date"].max()
         cutoff = latest_date - pd.Timedelta(days=self.CROSS_SECTIONAL_WINDOW_DAYS)
-        df = df[df["date"] >= cutoff].copy()
 
-        return df
+        return df[df["date"] >= cutoff].copy()
 
     # =========================================================
 
