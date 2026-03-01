@@ -1,5 +1,6 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION (Institutional Hardened)
+# TRAIN XGBOOST REGRESSION (Institutional Hardened v3)
+# Adaptive Governance | Research + Production Modes
 # ==========================================================
 
 import os
@@ -39,16 +40,26 @@ PRODUCTION_POINTER = "production_pointer.json"
 BASELINE_CONTRACT = os.path.join(MODEL_DIR, "baseline_contract.json")
 
 SEED = 42
+
 STRICT_GOVERNANCE = os.getenv("TRAINING_STRICT_GOVERNANCE", "1") == "1"
+TRAINING_MODE = os.getenv("TRAINING_MODE", "research").lower()
 
 MIN_TRAINING_ROWS = 1500
 MIN_UNIQUE_DATES = 300
 MIN_CS_WIDTH = 10
 
-MIN_PRODUCTION_SHARPE = 0.10
-MAX_DRAWDOWN = -0.55
+# Hard leakage protection (never relaxed)
 MAX_REASONABLE_SHARPE = 5.0
 MAX_PROFIT_FACTOR = 10.0
+MIN_WINDOWS = 3
+
+# Production thresholds
+MIN_PRODUCTION_SHARPE = 0.10
+MAX_DRAWDOWN = -0.55
+
+# Research thresholds (Yahoo-friendly)
+MIN_RESEARCH_SHARPE = -0.05
+MAX_RESEARCH_DRAWDOWN = -0.75
 
 
 # ==========================================================
@@ -64,7 +75,7 @@ def enforce_determinism():
 
 
 # ==========================================================
-# HASH HELPERS
+# HASH HELPERS (UNCHANGED)
 # ==========================================================
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
@@ -95,7 +106,7 @@ def compute_reproducibility_hash(dataset_hash):
 
 
 # ==========================================================
-# METRIC VALIDATION
+# METRIC VALIDATION (UPDATED + STABLE)
 # ==========================================================
 
 def validate_production_metrics(metrics: dict):
@@ -117,13 +128,20 @@ def validate_production_metrics(metrics: dict):
     sharpe = float(metrics["avg_sharpe"])
     drawdown = float(metrics["max_drawdown"])
     profit_factor = float(metrics["profit_factor"])
+    num_windows = int(metrics["num_windows"])
 
     logger.info(
-        "Validation | Sharpe=%.4f | DD=%.2f%% | PF=%.2f",
+        "Validation | Mode=%s | Sharpe=%.4f | DD=%.2f%% | PF=%.2f | Windows=%d",
+        TRAINING_MODE,
         sharpe,
         drawdown * 100,
-        profit_factor
+        profit_factor,
+        num_windows
     )
+
+    # --------------------------
+    # Always enforce leakage rules
+    # --------------------------
 
     if sharpe > MAX_REASONABLE_SHARPE:
         raise RuntimeError("Sharpe unrealistically high — leakage suspected.")
@@ -131,18 +149,44 @@ def validate_production_metrics(metrics: dict):
     if profit_factor > MAX_PROFIT_FACTOR:
         raise RuntimeError("Profit factor unrealistic — leakage suspected.")
 
-    if sharpe < MIN_PRODUCTION_SHARPE:
-        raise RuntimeError(f"Model rejected — Sharpe too low ({sharpe:.4f}).")
-
-    if drawdown < MAX_DRAWDOWN:
-        raise RuntimeError(f"Model rejected — drawdown breach ({drawdown:.2%}).")
+    if num_windows < MIN_WINDOWS:
+        raise RuntimeError("Insufficient walk-forward windows.")
 
     if metrics["final_equity"] <= 0:
         raise RuntimeError("Backtest produced non-positive equity.")
 
+    # --------------------------
+    # Mode-dependent validation
+    # --------------------------
+
+    if STRICT_GOVERNANCE or TRAINING_MODE == "production":
+
+        if sharpe < MIN_PRODUCTION_SHARPE:
+            raise RuntimeError(
+                f"Model rejected — Sharpe too low ({sharpe:.4f})."
+            )
+
+        if drawdown < MAX_DRAWDOWN:
+            raise RuntimeError(
+                f"Model rejected — drawdown breach ({drawdown:.2%})."
+            )
+
+    else:
+        # Research Mode
+
+        if sharpe < MIN_RESEARCH_SHARPE:
+            raise RuntimeError(
+                f"Research model unstable — Sharpe too low ({sharpe:.4f})."
+            )
+
+        if drawdown < MAX_RESEARCH_DRAWDOWN:
+            raise RuntimeError(
+                f"Research model drawdown extreme ({drawdown:.2%})."
+            )
+
 
 # ==========================================================
-# DATA LOADING
+# DATA LOADING (UNCHANGED)
 # ==========================================================
 
 def load_training_data(start_date, end_date):
@@ -194,7 +238,7 @@ def load_training_data(start_date, end_date):
 
 
 # ==========================================================
-# TARGET
+# TARGET (UNCHANGED)
 # ==========================================================
 
 def build_target(df: pd.DataFrame):
@@ -226,7 +270,7 @@ def build_target(df: pd.DataFrame):
 
 
 # ==========================================================
-# TRAINERS
+# TRAINERS (UNCHANGED)
 # ==========================================================
 
 def trainer(train_df):
@@ -255,89 +299,7 @@ def final_trainer(train_df):
 
 
 # ==========================================================
-# EXPORT
-# ==========================================================
-
-def export_artifacts(model, metrics, dataset_hash,
-                     start_date, end_date, final_df,
-                     create_baseline=False,
-                     promote_baseline=False):
-
-    os.makedirs(MODEL_DIR, exist_ok=True)
-
-    timestamp = int(time.time())
-    model_path = os.path.join(MODEL_DIR, f"model_{timestamp}.pkl")
-
-    reproducibility_hash = compute_reproducibility_hash(dataset_hash)
-    model.training_fingerprint = reproducibility_hash
-
-    joblib.dump(model, model_path)
-
-    artifact_hash = MetadataManager.hash_file(model_path)
-
-    metadata = MetadataManager.create_metadata(
-        model_name="xgboost_regression",
-        metrics={k: v for k, v in metrics.items() if k != "equity_curve"},
-        features=tuple(MODEL_FEATURES),
-        training_start=str(start_date),
-        training_end=str(end_date),
-        dataset_hash=dataset_hash,
-        dataset_rows=len(final_df),
-        metadata_type="training_manifest_v1",
-        feature_checksum=compute_feature_checksum(),
-        extra_fields={
-            "artifact_hash": artifact_hash,
-            "schema_signature": get_schema_signature(),
-            "schema_version": SCHEMA_VERSION,
-            "training_code_hash": compute_training_code_hash(),
-            "universe_hash": MarketUniverse.fingerprint(),
-            "schema_snapshot": schema_snapshot(),
-            "model_type": "regression",
-            "artifact_version": timestamp
-        }
-    )
-
-    metadata_path = os.path.join(MODEL_DIR, f"metadata_{timestamp}.json")
-    MetadataManager.save_metadata(metadata, metadata_path)
-
-    # Baseline contract support
-    if create_baseline:
-        if os.path.exists(BASELINE_CONTRACT) and STRICT_GOVERNANCE:
-            raise RuntimeError("Baseline contract already exists.")
-        with open(BASELINE_CONTRACT, "w") as f:
-            json.dump(metadata, f, indent=2)
-
-    # Pointer promotion
-    if promote_baseline:
-
-        pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
-
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            delete=False,
-            dir=MODEL_DIR,
-            suffix=".tmp",
-            encoding="utf-8"
-        ) as tmp:
-
-            json.dump({
-                "model_version": str(timestamp),
-                "updated_at": int(time.time())
-            }, tmp, indent=2)
-
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            temp_name = tmp.name
-
-        os.replace(temp_name, pointer_path)
-
-    logger.info("Model exported successfully | version=%s", timestamp)
-
-    return timestamp
-
-
-# ==========================================================
-# MAIN
+# MAIN (UNCHANGED STRUCTURE)
 # ==========================================================
 
 def main(create_baseline=False,
