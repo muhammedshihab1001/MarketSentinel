@@ -22,13 +22,13 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v22"
+    CACHE_VERSION = "v23"  # bumped due to sanitization alignment
     MAX_CACHE_FILES_PER_TICKER = 6
     MAX_TOTAL_CACHE_FILES = 2000
     MIN_FILE_BYTES = 5_000
 
     _memory_cache = {}
-    _memory_cache_limit = 100  # prevent unbounded growth
+    _memory_cache_limit = 100
 
     ########################################################
 
@@ -120,7 +120,7 @@ class FeatureStore:
         return h.hexdigest()[:20]
 
     ########################################################
-    # GLOBAL CACHE CLEANUP
+    # CACHE CLEANUP
     ########################################################
 
     def _cleanup_global_cache(self):
@@ -139,10 +139,6 @@ class FeatureStore:
                     os.remove(os.path.join(self.FEATURE_DIR, f))
                 except Exception:
                     pass
-
-    ########################################################
-    # PER-TICKER CLEANUP
-    ########################################################
 
     def _cleanup_old_cache(self, ticker: str):
 
@@ -164,13 +160,12 @@ class FeatureStore:
         self._cleanup_global_cache()
 
     ########################################################
-    # MEMORY CACHE MANAGEMENT
+    # MEMORY CACHE
     ########################################################
 
     def _set_memory_cache(self, key, df):
 
         if len(self._memory_cache) >= self._memory_cache_limit:
-            # remove oldest inserted
             oldest = next(iter(self._memory_cache))
             self._memory_cache.pop(oldest, None)
 
@@ -231,7 +226,6 @@ class FeatureStore:
             try:
                 df = pd.read_parquet(path)
                 self._validate_basic_integrity(df)
-
                 self._set_memory_cache(cache_key, df)
                 return df
             except Exception:
@@ -250,16 +244,11 @@ class FeatureStore:
         df = self.engineer._validate_price_frame(price_df, ticker)
         df = self.engineer.add_core_features(df)
 
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        # Consistent sanitization
+        df = df.replace([np.inf, -np.inf], np.nan)
 
         numeric_cols = df.select_dtypes(include=[np.number]).columns
-
-        for col in numeric_cols:
-            if df[col].isnull().any():
-                if "volatility" in col:
-                    df[col] = df[col].fillna(1e-4)
-                else:
-                    df[col] = df[col].fillna(0.0)
+        df[numeric_cols] = df[numeric_cols].fillna(0.0)
 
         if not np.isfinite(df[numeric_cols].to_numpy()).all():
             raise RuntimeError("Non-finite values remain after sanitization.")
