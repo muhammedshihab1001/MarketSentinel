@@ -27,7 +27,6 @@ router = APIRouter()
 logger = logging.getLogger("marketsentinel.equity")
 
 MIN_HISTORY_ROWS = 60
-MIN_ASSETS_PER_DAY = 6
 BENCHMARK_TICKER = "SPY"
 REQUEST_TIMEOUT = 60
 MAX_CONCURRENT = 2
@@ -94,14 +93,17 @@ def _equity_curve_sync(days: int):
     end_date = pd.Timestamp.utcnow().normalize()
     start_date = end_date - pd.Timedelta(days=days + 365)
 
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
+
     # =========================================================
     # FETCH PRICE HISTORY
     # =========================================================
 
     price_history = market_data.get_price_data_batch(
         tickers=universe,
-        start_date=start_date.strftime("%Y-%m-%d"),
-        end_date=end_date.strftime("%Y-%m-%d"),
+        start_date=start_str,
+        end_date=end_str,
         interval="1d",
         min_history=MIN_HISTORY_ROWS
     )
@@ -126,7 +128,7 @@ def _equity_curve_sync(days: int):
         raise RuntimeError("No valid price data available.")
 
     # =========================================================
-    # BUILD FEATURES (UPDATED)
+    # BUILD FEATURES
     # =========================================================
 
     datasets = []
@@ -157,8 +159,7 @@ def _equity_curve_sync(days: int):
     full_df = FeatureEngineer.add_cross_sectional_features(full_df)
     full_df = FeatureEngineer.finalize(full_df)
 
-    combined_dates = sorted(full_df["date"].unique())
-    eval_dates = combined_dates[-days:]
+    eval_dates = sorted(full_df["date"].unique())[-days:]
 
     portfolio_records = []
     model = loader.xgb
@@ -171,7 +172,7 @@ def _equity_curve_sync(days: int):
 
         snapshot = full_df[full_df["date"] == eval_date].copy()
 
-        if snapshot["ticker"].nunique() < MIN_ASSETS_PER_DAY:
+        if snapshot["ticker"].nunique() < pipeline.MIN_UNIVERSE_WIDTH:
             continue
 
         feature_df = validate_feature_schema(
@@ -195,14 +196,12 @@ def _equity_curve_sync(days: int):
         if longs.empty or shorts.empty:
             continue
 
+        # Flexible portfolio construction
         weights = pipeline._construct_portfolio(longs, shorts)
 
-        # Safe drift scaling (baseline may not exist)
-        try:
-            drift_result = pipeline.drift_detector.detect(feature_df)
-            exposure_scale = drift_result.get("exposure_scale", 1.0)
-        except Exception:
-            exposure_scale = 1.0
+        # Use safe drift wrapper
+        drift_result = pipeline._safe_drift(feature_df)
+        exposure_scale = drift_result.get("exposure_scale", 1.0)
 
         for ticker in weights:
             weights[ticker] *= exposure_scale
@@ -236,18 +235,20 @@ def _equity_curve_sync(days: int):
     report = engine.evaluate(portfolio_df, forward_df)
 
     # =========================================================
-    # BENCHMARK (ALIGNED)
+    # BENCHMARK
     # =========================================================
 
-    benchmark_df = market_data.get_price_data(
-        ticker=BENCHMARK_TICKER,
-        start_date=start_date.strftime("%Y-%m-%d"),
-        end_date=end_date.strftime("%Y-%m-%d"),
+    benchmark_equity = []
+
+    benchmark_data = market_data.get_price_data_batch(
+        tickers=[BENCHMARK_TICKER],
+        start_date=start_str,
+        end_date=end_str,
         interval="1d",
         min_history=MIN_HISTORY_ROWS
     )
 
-    benchmark_equity = []
+    benchmark_df = benchmark_data.get(BENCHMARK_TICKER)
 
     if benchmark_df is not None and not benchmark_df.empty:
 
