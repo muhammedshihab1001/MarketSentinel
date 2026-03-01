@@ -18,7 +18,7 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "15.0"  # upgraded
+    METADATA_VERSION = "16.0"
     MIN_TRAINING_DAYS = 120
     MIN_METADATA_BYTES = 800
     MIN_FEATURE_COUNT = 10
@@ -42,6 +42,7 @@ class MetadataManager:
         "environment",
         "training_universe",
         "universe_hash",
+        "artifact_hash",
         "metadata_integrity_hash"
     ]
 
@@ -54,11 +55,12 @@ class MetadataManager:
         "universe_hash",
         "features",
         "feature_count",
+        "artifact_hash",
     }
 
-    #####################################################
-    # SAFE CANONICAL JSON
-    #####################################################
+    # =====================================================
+    # CANONICAL JSON
+    # =====================================================
 
     @staticmethod
     def _canonical_json(data: dict) -> bytes:
@@ -68,9 +70,9 @@ class MetadataManager:
             separators=(",", ":")
         ).encode()
 
-    #####################################################
+    # =====================================================
     # FILE HASH
-    #####################################################
+    # =====================================================
 
     @staticmethod
     def hash_file(path: str) -> str:
@@ -89,9 +91,9 @@ class MetadataManager:
 
         return hasher.hexdigest()
 
-    #####################################################
+    # =====================================================
     # DATASET FINGERPRINT
-    #####################################################
+    # =====================================================
 
     @staticmethod
     def fingerprint_dataset(df: pd.DataFrame) -> str:
@@ -127,9 +129,9 @@ class MetadataManager:
         arr = pd.util.hash_pandas_object(df, index=True).values
         return hashlib.sha256(arr.tobytes()).hexdigest()
 
-    #####################################################
-    # TRAINING CODE HASH
-    #####################################################
+    # =====================================================
+    # TRAINING CODE FINGERPRINT
+    # =====================================================
 
     @staticmethod
     def fingerprint_training_code():
@@ -178,12 +180,15 @@ class MetadataManager:
 
         return hasher.hexdigest()
 
-    #####################################################
+    # =====================================================
     # FEATURE CHECKSUM
-    #####################################################
+    # =====================================================
 
     @staticmethod
     def fingerprint_features(features: tuple) -> str:
+
+        if tuple(features) != tuple(MODEL_FEATURES):
+            raise RuntimeError("Feature list mismatch during checksum.")
 
         canonical = json.dumps(
             list(features),
@@ -192,9 +197,9 @@ class MetadataManager:
 
         return hashlib.sha256(canonical).hexdigest()
 
-    #####################################################
-    # METADATA SAVE (NEW - ATOMIC & SAFE)
-    #####################################################
+    # =====================================================
+    # SAVE METADATA (ATOMIC)
+    # =====================================================
 
     @staticmethod
     def save_metadata(metadata: dict, path: str):
@@ -223,9 +228,9 @@ class MetadataManager:
         if os.path.getsize(path) < MetadataManager.MIN_METADATA_BYTES:
             raise RuntimeError("Metadata file below minimum size.")
 
-    #####################################################
-    # METADATA LOAD + VERIFY (NEW)
-    #####################################################
+    # =====================================================
+    # LOAD + VERIFY
+    # =====================================================
 
     @staticmethod
     def load_metadata(path: str) -> dict:
@@ -243,9 +248,9 @@ class MetadataManager:
 
         return metadata
 
-    #####################################################
-    # INTEGRITY VERIFICATION (NEW)
-    #####################################################
+    # =====================================================
+    # VERIFY INTEGRITY
+    # =====================================================
 
     @staticmethod
     def verify_metadata_integrity(metadata: dict):
@@ -269,9 +274,9 @@ class MetadataManager:
         if recalculated != original_hash:
             raise RuntimeError("Metadata integrity verification failed.")
 
-    #####################################################
+    # =====================================================
     # METRIC VALIDATION
-    #####################################################
+    # =====================================================
 
     @staticmethod
     def _validate_metrics(metrics: dict):
@@ -286,9 +291,9 @@ class MetadataManager:
             if abs(val) > 1e6:
                 raise RuntimeError(f"Metric unrealistic: {k}")
 
-    #####################################################
+    # =====================================================
     # TRAINING WINDOW VALIDATION
-    #####################################################
+    # =====================================================
 
     @staticmethod
     def _validate_training_window(start, end):
@@ -304,9 +309,9 @@ class MetadataManager:
                 "Training window below institutional minimum."
             )
 
-    #####################################################
+    # =====================================================
     # CREATE METADATA
-    #####################################################
+    # =====================================================
 
     @staticmethod
     def create_metadata(
@@ -327,6 +332,9 @@ class MetadataManager:
 
         if tuple(features) != tuple(MODEL_FEATURES):
             raise RuntimeError("Feature schema mismatch.")
+
+        if len(features) < MetadataManager.MIN_FEATURE_COUNT:
+            raise RuntimeError("Feature count below institutional minimum.")
 
         MetadataManager._validate_metrics(metrics)
         MetadataManager._validate_training_window(
