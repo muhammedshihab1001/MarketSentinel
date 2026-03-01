@@ -13,6 +13,7 @@ from core.schema.feature_schema import (
     SCHEMA_VERSION,
 )
 
+from core.market.universe import MarketUniverse
 from core.artifacts.metadata_manager import MetadataManager
 from app.monitoring.metrics import MODEL_VERSION
 
@@ -34,6 +35,7 @@ class LoadedModel:
     feature_checksum: str
     pointer_hash: Optional[str]
     training_fingerprint: Optional[str]
+    universe_hash: Optional[str]
 
 
 # =========================================================
@@ -49,9 +51,8 @@ class ModelLoader:
     MIN_METADATA_BYTES = 500
 
     POINTER_FILENAME = "production_pointer.json"
-    DRIFT_BASELINE_PATH = os.path.realpath("artifacts/drift/baseline.json")
 
-    STRICT_GOVERNANCE = True  # can toggle via env if needed
+    STRICT_GOVERNANCE = os.getenv("MODEL_STRICT_GOVERNANCE", "1") == "1"
 
     ########################################################
 
@@ -206,7 +207,8 @@ class ModelLoader:
                 "artifact_hash",
                 "dataset_hash",
                 "training_code_hash",
-                "feature_checksum"
+                "feature_checksum",
+                "universe_hash",
             }
 
             missing = required_keys - set(meta.keys())
@@ -240,6 +242,11 @@ class ModelLoader:
             if meta["feature_checksum"] != feature_checksum_actual:
                 raise RuntimeError("Feature checksum mismatch.")
 
+            # Universe governance validation
+            universe_hash_current = MarketUniverse.fingerprint()
+            if meta["universe_hash"] != universe_hash_current:
+                raise RuntimeError("Universe fingerprint mismatch.")
+
             training_fingerprint = getattr(
                 model,
                 "training_fingerprint",
@@ -255,7 +262,8 @@ class ModelLoader:
                 artifact_hash=artifact_hash_actual,
                 feature_checksum=feature_checksum_actual,
                 pointer_hash=pointer_hash,
-                training_fingerprint=training_fingerprint
+                training_fingerprint=training_fingerprint,
+                universe_hash=meta["universe_hash"]
             )
 
             self._xgb_container = new_container
@@ -266,9 +274,10 @@ class ModelLoader:
             ).set(1)
 
             logger.info(
-                "Model loaded successfully | version=%s | artifact_hash=%s",
+                "Model loaded | version=%s | artifact_hash=%s | universe_hash=%s",
                 version,
-                artifact_hash_actual[:12]
+                artifact_hash_actual[:12],
+                meta["universe_hash"][:12]
             )
 
             return new_container.model
