@@ -15,26 +15,27 @@ FORWARD_DAYS = 5
 
 class WalkForwardValidator:
 
-    MIN_WINDOWS = 6
+    # ----------------------------------------------------------
+    # CONFIG (Simplified & CV-Friendly)
+    # ----------------------------------------------------------
+
+    MIN_WINDOWS = 4
     MIN_TEST_DAYS = 20
-    MIN_TRAIN_ROWS = 1500
-    MIN_CROSS_SECTION = 10
+    MIN_TRAIN_ROWS = 1200
+    MIN_CROSS_SECTION = 8
     MIN_SCORE_STD = 1e-6
     MIN_TARGET_STD = 1e-6
 
-    TOP_K = 10
-    BOTTOM_K = 10
+    TOP_K = 8
+    BOTTOM_K = 8
     TARGET_GROSS_EXPOSURE = 1.0
-    MAX_POSITION_WEIGHT = 0.15
+    MAX_POSITION_WEIGHT = 0.20
 
-    TRANSACTION_COST = 0.001
+    TRANSACTION_COST = 0.0008
     SLIPPAGE = 0.0005
     MAX_SHARPE = 5.0
 
-    SCORE_WINSOR_Q = 0.02
-    BASE_DISPERSION = 0.03
-    MIN_ACTIVE_POSITIONS = 4
-
+    SCORE_WINSOR_Q = 0.01
     EPSILON = 1e-9
 
     def __init__(
@@ -52,17 +53,17 @@ class WalkForwardValidator:
         self.debug = debug
         self.regime_detector = MarketRegimeDetector()
 
-    # ==========================================================
+    # ----------------------------------------------------------
     # EMBARGO
-    # ==========================================================
+    # ----------------------------------------------------------
 
     def _apply_embargo(self, train_df, test_start):
         embargo_cut = pd.Timestamp(test_start) - pd.Timedelta(days=self.embargo_days)
         return train_df[train_df["date"] < embargo_cut]
 
-    # ==========================================================
+    # ----------------------------------------------------------
     # TARGET BUILD
-    # ==========================================================
+    # ----------------------------------------------------------
 
     def _build_fold_target(self, df):
 
@@ -88,9 +89,9 @@ class WalkForwardValidator:
 
         return df
 
-    # ==========================================================
-    # SCORE STABILIZATION
-    # ==========================================================
+    # ----------------------------------------------------------
+    # UTILITIES
+    # ----------------------------------------------------------
 
     def _winsorize(self, x):
         lower = np.quantile(x, self.SCORE_WINSOR_Q)
@@ -102,10 +103,6 @@ class WalkForwardValidator:
         e = np.exp(x)
         return e / (np.sum(e) + self.EPSILON)
 
-    # ==========================================================
-    # TURNOVER
-    # ==========================================================
-
     def _compute_turnover(self, old_positions, new_positions):
         all_keys = set(old_positions.keys()) | set(new_positions.keys())
         turnover = 0.0
@@ -113,9 +110,9 @@ class WalkForwardValidator:
             turnover += abs(new_positions.get(k, 0.0) - old_positions.get(k, 0.0))
         return turnover
 
-    # ==========================================================
-    # MAIN WALK-FORWARD
-    # ==========================================================
+    # ----------------------------------------------------------
+    # WALK-FORWARD
+    # ----------------------------------------------------------
 
     def run(self, df: pd.DataFrame):
 
@@ -177,9 +174,6 @@ class WalkForwardValidator:
                 signal_date = test_dates_sorted[i]
                 exit_date = test_dates_sorted[i + FORWARD_DAYS]
 
-                if exit_date <= signal_date:
-                    continue
-
                 signal_slice = test_df[test_df["date"] == signal_date]
                 exit_slice = test_df[test_df["date"] == exit_date]
 
@@ -201,12 +195,7 @@ class WalkForwardValidator:
                 if not np.all(np.isfinite(scores)):
                     continue
 
-                score_std = np.std(scores)
-
-                if score_std < self.MIN_SCORE_STD:
-                    continue
-
-                if score_std < self.BASE_DISPERSION:
+                if np.std(scores) < self.MIN_SCORE_STD:
                     continue
 
                 scores = self._winsorize(scores)
@@ -218,14 +207,11 @@ class WalkForwardValidator:
                 longs = ranked.tail(self.TOP_K)
                 shorts = ranked.head(self.BOTTOM_K)
 
-                if len(longs) < self.MIN_ACTIVE_POSITIONS:
+                if len(longs) < 3:
                     continue
 
-                long_alpha = self._softmax(longs["score"].values)
-                short_alpha = self._softmax(np.abs(shorts["score"].values))
-
-                long_w = long_alpha / longs["volatility"].clip(lower=0.01).values
-                short_w = short_alpha / shorts["volatility"].clip(lower=0.01).values
+                long_w = self._softmax(longs["score"].values)
+                short_w = self._softmax(np.abs(shorts["score"].values))
 
                 long_w /= long_w.sum()
                 short_w /= short_w.sum()
@@ -240,11 +226,6 @@ class WalkForwardValidator:
 
                 for t, w in zip(shorts["ticker"], short_w):
                     positions[t] = -min(float(w), self.MAX_POSITION_WEIGHT)
-
-                gross = sum(abs(v) for v in positions.values())
-
-                if abs(gross - self.TARGET_GROSS_EXPOSURE) > 0.05:
-                    continue
 
                 turnover = self._compute_turnover(prev_positions, positions)
                 turnover_sum += turnover
@@ -261,8 +242,6 @@ class WalkForwardValidator:
                     np.log(merged["close_entry"] * (1 + self.SLIPPAGE))
                 )
 
-                merged["ret"] = merged["ret"].clip(-0.5, 0.5)
-
                 period_ret = 0.0
 
                 for row in merged.itertuples():
@@ -271,8 +250,12 @@ class WalkForwardValidator:
                         cost = abs(weight) * self.TRANSACTION_COST
                         period_ret += weight * row.ret - cost
 
+                capital *= np.exp(period_ret)
+                capital = max(capital, 1.0)
+
                 prev_positions = positions
                 window_returns.append(period_ret)
+                equity_curve.append(capital)
                 trade_count += 1
 
             if not window_returns:
@@ -280,11 +263,6 @@ class WalkForwardValidator:
                 continue
 
             window_returns = np.array(window_returns)
-
-            for r in window_returns:
-                capital *= np.exp(r)
-                capital = max(capital, 1.0)
-                equity_curve.append(capital)
 
             vol = np.std(window_returns)
             sharpe = 0.0 if vol < self.EPSILON else (
@@ -305,7 +283,7 @@ class WalkForwardValidator:
 
         return self.aggregate_results(results, equity_curve)
 
-    # ==========================================================
+    # ----------------------------------------------------------
 
     def aggregate_results(self, results, equity_curve):
 
