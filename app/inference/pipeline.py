@@ -1,6 +1,6 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v2 (Enhanced)
-# Governance Hardened + Risk Adaptive + Alpha Stabilized
+# INSTITUTIONAL INFERENCE PIPELINE v2.1 (CV-Stable Edition)
+# Governance Hardened + Risk Adaptive + Yahoo-Safe
 # =========================================================
 
 import time
@@ -65,7 +65,7 @@ class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
     TARGET_VOL = 0.12
-    MIN_UNIVERSE_WIDTH = 15
+    MIN_UNIVERSE_WIDTH = 12  # slightly relaxed for Yahoo data
     MIN_SCORE_STD = 1e-6
     MAX_POSITION_WEIGHT = 0.20
 
@@ -89,8 +89,6 @@ class InferencePipeline:
 
         self._validate_models_loaded()
 
-    # =========================================================
-    # MODEL CONTRACT CHECK
     # =========================================================
 
     def _validate_models_loaded(self):
@@ -120,18 +118,25 @@ class InferencePipeline:
         return float(np.clip(drift_result.get("exposure_scale", 1.0), 0.0, 1.0))
 
     def _macro_agent(self, df):
-        breadth = df["breadth"].iloc[0]
-        dispersion = df["market_dispersion"].iloc[0]
+        breadth = df.get("breadth")
+        dispersion = df.get("market_dispersion")
 
         mult = 1.0
 
-        if breadth > 0.65:
-            mult *= 1.1
-        elif breadth < 0.35:
-            mult *= 0.8
+        try:
+            if breadth is not None:
+                b = float(breadth.iloc[0])
+                if b > 0.65:
+                    mult *= 1.1
+                elif b < 0.35:
+                    mult *= 0.85
 
-        if dispersion < 0.01:
-            mult *= 0.7  # low opportunity regime
+            if dispersion is not None:
+                d = float(dispersion.iloc[0])
+                if d < 0.01:
+                    mult *= 0.8
+        except Exception:
+            pass
 
         return mult
 
@@ -142,9 +147,9 @@ class InferencePipeline:
         adj = 1.0
 
         if rsi > 70:
-            adj *= 0.85
+            adj *= 0.9
         elif rsi < 30:
-            adj *= 1.1
+            adj *= 1.05
 
         if momentum > 0:
             adj *= 1.05
@@ -169,9 +174,16 @@ class InferencePipeline:
             df = self._build_cross_sectional_frame(universe)
             latest_df = self._select_latest_snapshot(df)
 
-            # Dynamic liquidity filter
+            # Remove any residual NaNs
+            latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
+            latest_df = latest_df.dropna(subset=MODEL_FEATURES)
+
+            if latest_df.empty:
+                raise RuntimeError("Latest snapshot invalid.")
+
+            # Liquidity filter (Yahoo-friendly)
             liquidity_threshold = max(
-                self.BASE_LIQUIDITY,
+                self.BASE_LIQUIDITY * 0.5,
                 latest_df["dollar_volume"].median()
             )
 
@@ -204,14 +216,12 @@ class InferencePipeline:
             risk_mult = self._risk_agent(drift_result)
             macro_mult = self._macro_agent(latest_df)
 
-            final_scores = []
-
-            for _, row in latest_df.iterrows():
-                tech_mult = self._technical_agent(row)
-                score = row["raw_model_score"] * macro_mult * tech_mult
-                final_scores.append(score)
-
-            latest_df["score"] = np.array(final_scores)
+            latest_df["score"] = latest_df.apply(
+                lambda r: r["raw_model_score"]
+                * macro_mult
+                * self._technical_agent(r),
+                axis=1
+            )
 
             ranked = latest_df.sort_values(
                 ["score", "dollar_volume", "ticker"],
@@ -227,10 +237,14 @@ class InferencePipeline:
             for k in weights:
                 weights[k] *= risk_mult
 
-            # Volatility targeting
-            portfolio_vol = np.mean(longs["volatility"])
-            if portfolio_vol > EPSILON:
-                vol_scale = min(1.5, self.TARGET_VOL / portfolio_vol)
+            # Vol targeting using both sides
+            combined_vol = pd.concat([
+                longs["volatility"],
+                shorts["volatility"]
+            ]).mean()
+
+            if combined_vol > EPSILON:
+                vol_scale = min(1.5, self.TARGET_VOL / combined_vol)
                 for k in weights:
                     weights[k] *= vol_scale
 
@@ -258,7 +272,7 @@ class InferencePipeline:
                 approved = agent_output.get("trade_approved", True)
 
                 snapshot_rows.append({
-                    "date": row["date"],
+                    "date": str(row["date"]),
                     "ticker": row["ticker"],
                     "raw_model_score": float(row["raw_model_score"]),
                     "score": float(row["score"]),
@@ -269,7 +283,7 @@ class InferencePipeline:
                 })
 
             result = {
-                "snapshot_date": str(latest_df["date"].iloc[0]),
+                "snapshot_date": str(latest_df["date"].max()),
                 "universe_size": int(len(latest_df)),
                 "gross_exposure": float(sum(abs(x["weight"]) for x in snapshot_rows)),
                 "net_exposure": float(sum(x["weight"] for x in snapshot_rows)),
@@ -342,7 +356,6 @@ class InferencePipeline:
                     training=False
                 )
                 datasets.append(df)
-
             except Exception as e:
                 logger.warning("Feature build failed for %s: %s", ticker, str(e))
 
