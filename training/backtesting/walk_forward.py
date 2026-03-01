@@ -15,10 +15,6 @@ FORWARD_DAYS = 5
 
 class WalkForwardValidator:
 
-    # ----------------------------------------------------------
-    # CONFIG (CV-Stable)
-    # ----------------------------------------------------------
-
     MIN_WINDOWS = 4
     MIN_TEST_DAYS = 20
     MIN_TRAIN_ROWS = 1200
@@ -35,10 +31,11 @@ class WalkForwardValidator:
     TRANSACTION_COST = 0.0008
     SLIPPAGE = 0.0005
     MAX_SHARPE = 5.0
-    MAX_ABS_PERIOD_RETURN = 0.25  # anti-explosion safeguard
+    MAX_ABS_PERIOD_RETURN = 0.25
 
     SCORE_WINSOR_Q = 0.01
     EPSILON = 1e-9
+    TARGET_CLIP = 5.0  # match training
 
     def __init__(
         self,
@@ -78,6 +75,8 @@ class WalkForwardValidator:
         cs_std = df.groupby("date")["raw_forward"].transform("std").replace(0, np.nan)
 
         df["target"] = (df["raw_forward"] - cs_mean) / cs_std
+        df["target"] = np.clip(df["target"], -self.TARGET_CLIP, self.TARGET_CLIP)
+
         df = df[np.isfinite(df["target"])]
 
         if df["target"].std() < self.MIN_TARGET_STD:
@@ -107,8 +106,6 @@ class WalkForwardValidator:
         return turnover
 
     # ----------------------------------------------------------
-    # WALK-FORWARD
-    # ----------------------------------------------------------
 
     def run(self, df: pd.DataFrame):
 
@@ -125,7 +122,7 @@ class WalkForwardValidator:
 
         while start_idx < len(unique_dates) - FORWARD_DAYS:
 
-            prev_positions = {}  # RESET PER WINDOW (important fix)
+            prev_positions = {}
 
             train_dates = unique_dates.iloc[start_idx - self.window_size:start_idx]
             test_dates = unique_dates.iloc[start_idx:start_idx + self.step_size]
@@ -149,6 +146,7 @@ class WalkForwardValidator:
                 start_idx += self.step_size
                 continue
 
+            # Regime detection
             train_df = self.regime_detector.detect(train_df)
             test_df = self.regime_detector.detect(test_df)
 
@@ -171,16 +169,20 @@ class WalkForwardValidator:
                 signal_date = test_dates_sorted[i]
                 exit_date = test_dates_sorted[i + FORWARD_DAYS]
 
-                signal_slice = test_df[test_df["date"] == signal_date]
-                exit_slice = test_df[test_df["date"] == exit_date]
+                signal_slice = test_df[test_df["date"] == signal_date].copy()
+                exit_slice = test_df[test_df["date"] == exit_date].copy()
+
+                # Clean NaN feature rows
+                signal_slice = signal_slice.replace([np.inf, -np.inf], np.nan)
+                signal_slice = signal_slice.dropna(subset=MODEL_FEATURES)
 
                 common = set(signal_slice["ticker"]) & set(exit_slice["ticker"])
 
                 if len(common) < self.MIN_CROSS_SECTION:
                     continue
 
-                signal_slice = signal_slice[signal_slice["ticker"].isin(common)].copy()
-                exit_slice = exit_slice[exit_slice["ticker"].isin(common)].copy()
+                signal_slice = signal_slice[signal_slice["ticker"].isin(common)]
+                exit_slice = exit_slice[exit_slice["ticker"].isin(common)]
 
                 X = validate_feature_schema(
                     signal_slice.loc[:, MODEL_FEATURES],
@@ -204,14 +206,20 @@ class WalkForwardValidator:
                 longs = ranked.tail(self.TOP_K)
                 shorts = ranked.head(self.BOTTOM_K)
 
-                if len(longs) < 3:
+                if len(longs) < self.TOP_K or len(shorts) < self.BOTTOM_K:
                     continue
 
                 long_w = self._softmax(longs["score"].values)
                 short_w = self._softmax(np.abs(shorts["score"].values))
 
-                long_w *= self.TARGET_GROSS_EXPOSURE / 2
-                short_w *= self.TARGET_GROSS_EXPOSURE / 2
+                # Regime multiplier (light integration)
+                regime_multiplier = signal_slice["regime_multiplier"].iloc[0] \
+                    if "regime_multiplier" in signal_slice.columns else 1.0
+
+                gross = self.TARGET_GROSS_EXPOSURE * float(regime_multiplier)
+
+                long_w *= gross / 2
+                short_w *= gross / 2
 
                 positions = {}
 
@@ -244,7 +252,6 @@ class WalkForwardValidator:
                         cost = abs(weight) * self.TRANSACTION_COST
                         period_ret += weight * row.ret - cost
 
-                # Anti-explosion protection (Yahoo data safeguard)
                 period_ret = float(np.clip(
                     period_ret,
                     -self.MAX_ABS_PERIOD_RETURN,
