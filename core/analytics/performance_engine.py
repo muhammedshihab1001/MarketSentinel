@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
 
+EPSILON = 1e-12
+
+
 @dataclass
 class PerformanceReport:
     cumulative_return: float
@@ -24,31 +27,27 @@ class PerformanceReport:
     rolling_sharpe: pd.Series
     rolling_volatility: pd.Series
 
-    ########################################################
-    # SAFE SERIALIZATION (REQUIRED FOR API)
-    ########################################################
-
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "cumulative_return": self.cumulative_return,
-            "sharpe_ratio": self.sharpe_ratio,
-            "sortino_ratio": self.sortino_ratio,
-            "calmar_ratio": self.calmar_ratio,
-            "max_drawdown": self.max_drawdown,
-            "max_drawdown_duration": self.max_drawdown_duration,
-            "hit_rate": self.hit_rate,
-            "annual_volatility": self.annual_volatility,
-            "annual_return": self.annual_return,
-            "turnover": self.turnover,
-            "beta": self.beta,
-            "information_ratio": self.information_ratio,
+            "cumulative_return": float(self.cumulative_return),
+            "sharpe_ratio": float(self.sharpe_ratio),
+            "sortino_ratio": float(self.sortino_ratio),
+            "calmar_ratio": float(self.calmar_ratio),
+            "max_drawdown": float(self.max_drawdown),
+            "max_drawdown_duration": int(self.max_drawdown_duration),
+            "hit_rate": float(self.hit_rate),
+            "annual_volatility": float(self.annual_volatility),
+            "annual_return": float(self.annual_return),
+            "turnover": float(self.turnover),
+            "beta": None if self.beta is None else float(self.beta),
+            "information_ratio": None if self.information_ratio is None else float(self.information_ratio),
         }
 
 
 class PerformanceEngine:
 
     TRADING_DAYS = 252
-    ROLLING_WINDOW = 63  # ~3 months
+    ROLLING_WINDOW = 63
 
     ########################################################
     # CORE ENTRY
@@ -117,7 +116,7 @@ class PerformanceEngine:
         ########################################################
 
         rolling_max = equity.cummax()
-        drawdown_series = (equity - rolling_max) / rolling_max
+        drawdown_series = (equity - rolling_max) / (rolling_max + EPSILON)
         drawdown_series = drawdown_series.fillna(0.0)
 
         ########################################################
@@ -135,10 +134,6 @@ class PerformanceEngine:
         turnover = self._turnover(portfolio_df)
         beta = self._beta(daily, benchmark_returns)
         info_ratio = self._information_ratio(daily, benchmark_returns)
-
-        ########################################################
-        # ROLLING METRICS
-        ########################################################
 
         rolling_sharpe = self._rolling_sharpe(daily)
         rolling_volatility = self._rolling_volatility(daily)
@@ -167,30 +162,30 @@ class PerformanceEngine:
     # METRICS
     ########################################################
 
-    def _sharpe_ratio(self, daily_returns):
-        std = daily_returns.std()
-        if std <= 0 or np.isnan(std):
+    def _sharpe_ratio(self, daily):
+        std = daily.std()
+        if std <= EPSILON:
             return 0.0
-        return float((daily_returns.mean() / std) * np.sqrt(self.TRADING_DAYS))
+        return float((daily.mean() / std) * np.sqrt(self.TRADING_DAYS))
 
-    def _sortino_ratio(self, daily_returns):
-        downside = daily_returns[daily_returns < 0]
+    def _sortino_ratio(self, daily):
+        downside = daily[daily < 0]
         if len(downside) == 0:
             return 0.0
         downside_std = downside.std()
-        if downside_std <= 0 or np.isnan(downside_std):
+        if downside_std <= EPSILON:
             return 0.0
-        return float((daily_returns.mean() / downside_std) * np.sqrt(self.TRADING_DAYS))
+        return float((daily.mean() / downside_std) * np.sqrt(self.TRADING_DAYS))
 
-    def _annual_volatility(self, daily_returns):
-        std = daily_returns.std()
-        if std <= 0 or np.isnan(std):
+    def _annual_volatility(self, daily):
+        std = daily.std()
+        if std <= EPSILON:
             return 0.0
         return float(std * np.sqrt(self.TRADING_DAYS))
 
-    def _annual_return(self, daily_returns):
-        cumulative = (1.0 + daily_returns).prod()
-        years = len(daily_returns) / self.TRADING_DAYS
+    def _annual_return(self, daily):
+        cumulative = (1.0 + daily).prod()
+        years = len(daily) / self.TRADING_DAYS
         if years <= 0:
             return 0.0
         try:
@@ -198,9 +193,9 @@ class PerformanceEngine:
         except Exception:
             return 0.0
 
-    def _max_drawdown_duration(self, equity_curve):
-        rolling_max = equity_curve.cummax()
-        drawdown = equity_curve < rolling_max
+    def _max_drawdown_duration(self, equity):
+        rolling_max = equity.cummax()
+        drawdown = equity < rolling_max
         duration = 0
         max_duration = 0
         for val in drawdown:
@@ -212,12 +207,12 @@ class PerformanceEngine:
         return max_duration
 
     def _calmar_ratio(self, annual_return, max_drawdown):
-        if max_drawdown == 0:
+        if abs(max_drawdown) <= EPSILON:
             return 0.0
         return float(annual_return / abs(max_drawdown))
 
-    def _hit_rate(self, daily_returns):
-        return float((daily_returns > 0).mean())
+    def _hit_rate(self, daily):
+        return float((daily > 0).mean())
 
     def _turnover(self, portfolio_df):
         pivot = (
@@ -231,36 +226,30 @@ class PerformanceEngine:
         turnover = turnover.iloc[1:]
         return float(turnover.mean()) if len(turnover) > 0 else 0.0
 
-    def _beta(self, strategy_returns, benchmark_returns):
-        if benchmark_returns is None:
+    def _beta(self, strategy, benchmark):
+        if benchmark is None:
             return None
 
-        aligned_strategy, aligned_bench = strategy_returns.align(
-            benchmark_returns, join="inner"
-        )
-
-        if len(aligned_strategy) < 2:
+        aligned_s, aligned_b = strategy.align(benchmark, join="inner")
+        if len(aligned_s) < 2:
             return None
 
-        var = np.var(aligned_bench)
-        if var <= 0:
+        var = np.var(aligned_b)
+        if var <= EPSILON:
             return None
 
-        cov = np.cov(aligned_strategy, aligned_bench)[0][1]
+        cov = np.cov(aligned_s, aligned_b)[0][1]
         return float(cov / var)
 
-    def _information_ratio(self, strategy_returns, benchmark_returns):
-        if benchmark_returns is None:
+    def _information_ratio(self, strategy, benchmark):
+        if benchmark is None:
             return None
 
-        aligned_strategy, aligned_bench = strategy_returns.align(
-            benchmark_returns, join="inner"
-        )
-
-        active = aligned_strategy - aligned_bench
+        aligned_s, aligned_b = strategy.align(benchmark, join="inner")
+        active = aligned_s - aligned_b
         std = active.std()
 
-        if std <= 0 or np.isnan(std):
+        if std <= EPSILON:
             return None
 
         return float((active.mean() / std) * np.sqrt(self.TRADING_DAYS))
@@ -269,13 +258,13 @@ class PerformanceEngine:
     # ROLLING
     ########################################################
 
-    def _rolling_sharpe(self, daily_returns):
-        rolling = daily_returns.rolling(self.ROLLING_WINDOW)
+    def _rolling_sharpe(self, daily):
+        rolling = daily.rolling(self.ROLLING_WINDOW)
         sharpe = rolling.mean() / rolling.std().replace(0, np.nan)
         sharpe = sharpe * np.sqrt(self.TRADING_DAYS)
         return sharpe.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    def _rolling_volatility(self, daily_returns):
-        vol = daily_returns.rolling(self.ROLLING_WINDOW).std()
+    def _rolling_volatility(self, daily):
+        vol = daily.rolling(self.ROLLING_WINDOW).std()
         vol = vol * np.sqrt(self.TRADING_DAYS)
         return vol.replace([np.inf, -np.inf], np.nan).fillna(0.0)
