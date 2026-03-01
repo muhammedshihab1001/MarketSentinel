@@ -14,8 +14,6 @@ from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
     DTYPE,
-    LONG_PERCENTILE,
-    SHORT_PERCENTILE,
 )
 
 from app.inference.pipeline import InferencePipeline, get_shared_model_loader
@@ -78,7 +76,7 @@ async def compute_performance(days: int = 120):
 
 
 # =========================================================
-# SYNC HEAVY LOGIC
+# SYNC LOGIC
 # =========================================================
 
 def _compute_performance_sync(days: int):
@@ -130,24 +128,27 @@ def _compute_performance_sync(days: int):
         raise RuntimeError("No valid price data available.")
 
     # =========================================================
-    # BUILD FEATURES
+    # BUILD FEATURES (UPDATED — NO feature_store)
     # =========================================================
 
     feature_frames = []
 
     for ticker, df in cleaned_history.items():
 
-        features = pipeline.feature_store.get_features(
-            df,
-            sentiment_df=None,
-            ticker=ticker,
-            training=False
-        )
+        try:
+            features = FeatureEngineer.build_feature_pipeline(
+                price_df=df,
+                sentiment_df=None,
+                training=False
+            )
 
-        if features is None or features.empty:
-            continue
+            if features is None or features.empty:
+                continue
 
-        feature_frames.append(features)
+            feature_frames.append(features)
+
+        except Exception:
+            logger.warning("Feature build failed for %s", ticker)
 
     if not feature_frames:
         raise RuntimeError("No feature datasets built.")
@@ -161,6 +162,10 @@ def _compute_performance_sync(days: int):
     portfolio_records = []
     eval_dates = sorted(full_df["date"].unique())[-days:]
     model = loader.xgb
+
+    # =========================================================
+    # DAILY PORTFOLIO SIMULATION
+    # =========================================================
 
     for eval_date in eval_dates:
 
@@ -221,7 +226,7 @@ def _compute_performance_sync(days: int):
     report = engine.evaluate(portfolio_df, forward_df)
 
     # =========================================================
-    # BENCHMARK
+    # BENCHMARK (SPY)
     # =========================================================
 
     benchmark_data = market_data.get_price_data_batch(
