@@ -61,6 +61,14 @@ TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 
 
 # =========================================================
+# SAFE ATTRIBUTE ACCESS (CV FRIENDLY)
+# =========================================================
+
+def safe_attr(obj, attr, default=None):
+    return getattr(obj, attr, default)
+
+
+# =========================================================
 # DEFAULT UNIVERSE LOADER
 # =========================================================
 
@@ -75,8 +83,11 @@ def load_default_universe() -> List[str]:
     else:
         raise RuntimeError("No universe configuration file found.")
 
-    with open(universe_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(universe_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        raise RuntimeError("Failed to read universe config.")
 
     if isinstance(data, list):
         tickers = data
@@ -129,7 +140,6 @@ async def live_snapshot():
         if not signals:
             raise RuntimeError("No signals generated.")
 
-        # Count signals
         long_count = sum(1 for s in signals if s.get("weight", 0.0) > 0)
         short_count = sum(1 for s in signals if s.get("weight", 0.0) < 0)
 
@@ -144,11 +154,11 @@ async def live_snapshot():
         )
 
         meta = {
-            "model_version": loader.xgb_version,
-            "schema_signature": loader.schema_signature,
-            "dataset_hash": loader.dataset_hash,
-            "training_code_hash": loader.training_code_hash,
-            "artifact_hash": loader.artifact_hash,
+            "model_version": safe_attr(loader, "xgb_version"),
+            "schema_signature": safe_attr(loader, "schema_signature"),
+            "dataset_hash": safe_attr(loader, "dataset_hash"),
+            "artifact_hash": safe_attr(loader, "artifact_hash"),
+            "feature_checksum": safe_attr(loader, "feature_checksum"),
             "universe_size": len(tickers),
             "long_signals": long_count,
             "short_signals": short_count,
@@ -197,7 +207,6 @@ async def signal_explanation(ticker: str):
     try:
         pipeline = get_pipeline()
         loader = get_shared_model_loader()
-
         universe_tickers = load_default_universe()
 
         if ticker not in universe_tickers:
@@ -227,7 +236,6 @@ async def signal_explanation(ticker: str):
 
         agent_data = row.get("agent", {})
 
-        # Use pipeline signal if present
         direction = row.get("signal")
         if not direction:
             direction = "LONG" if row.get("score", 0) > 0 else "SHORT"
@@ -247,11 +255,10 @@ async def signal_explanation(ticker: str):
         )
 
         meta = SignalExplanationMeta(
-            model_version=loader.xgb_version,
-            schema_signature=loader.schema_signature,
-            dataset_hash=loader.dataset_hash,
-            training_code_hash=loader.training_code_hash,
-            artifact_hash=loader.artifact_hash,
+            model_version=safe_attr(loader, "xgb_version"),
+            schema_signature=safe_attr(loader, "schema_signature"),
+            dataset_hash=safe_attr(loader, "dataset_hash"),
+            artifact_hash=safe_attr(loader, "artifact_hash"),
             latency_ms=int((time.time() - start_time) * 1000),
             timestamp=int(time.time())
         )
