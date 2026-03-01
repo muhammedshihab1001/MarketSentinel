@@ -29,7 +29,6 @@ from core.schema.feature_schema import (
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
 from core.artifacts.metadata_manager import MetadataManager
-
 from training.backtesting.walk_forward import WalkForwardValidator, FORWARD_DAYS
 from core.models.xgboost import build_xgboost_pipeline
 
@@ -40,6 +39,8 @@ PRODUCTION_POINTER = "production_pointer.json"
 BASELINE_CONTRACT = os.path.join(MODEL_DIR, "baseline_contract.json")
 
 SEED = 42
+STRICT_GOVERNANCE = os.getenv("TRAINING_STRICT_GOVERNANCE", "1") == "1"
+
 MIN_TRAINING_ROWS = 1500
 MIN_UNIQUE_DATES = 300
 MIN_CS_WIDTH = 10
@@ -184,17 +185,10 @@ def load_training_data(start_date, end_date):
         raise RuntimeError("Insufficient unique dates.")
 
     df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
     df = FeatureEngineer.add_cross_sectional_features(df)
     df = FeatureEngineer.finalize(df)
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="training")
-
-    logger.info(
-        "Training dataset loaded | rows=%s | dates=%s",
-        len(df),
-        df["date"].nunique()
-    )
 
     return df
 
@@ -250,7 +244,8 @@ def trainer(train_df):
     pipeline = build_xgboost_pipeline()
     pipeline.fit(X, y)
 
-    pipeline.feature_names = list(MODEL_FEATURES)
+    if list(pipeline.feature_names) != list(MODEL_FEATURES):
+        raise RuntimeError("Feature order mismatch after training.")
 
     return pipeline
 
@@ -273,7 +268,8 @@ def export_artifacts(model, metrics, dataset_hash,
     timestamp = int(time.time())
     model_path = os.path.join(MODEL_DIR, f"model_{timestamp}.pkl")
 
-    model.training_fingerprint = compute_reproducibility_hash(dataset_hash)
+    reproducibility_hash = compute_reproducibility_hash(dataset_hash)
+    model.training_fingerprint = reproducibility_hash
 
     joblib.dump(model, model_path)
 
@@ -304,7 +300,14 @@ def export_artifacts(model, metrics, dataset_hash,
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{timestamp}.json")
     MetadataManager.save_metadata(metadata, metadata_path)
 
-    # pointer update only after everything validated
+    # Baseline contract support
+    if create_baseline:
+        if os.path.exists(BASELINE_CONTRACT) and STRICT_GOVERNANCE:
+            raise RuntimeError("Baseline contract already exists.")
+        with open(BASELINE_CONTRACT, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+    # Pointer promotion
     if promote_baseline:
 
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
@@ -328,8 +331,6 @@ def export_artifacts(model, metrics, dataset_hash,
 
         os.replace(temp_name, pointer_path)
 
-        logger.info("Production pointer updated -> %s", timestamp)
-
     logger.info("Model exported successfully | version=%s", timestamp)
 
     return timestamp
@@ -348,29 +349,35 @@ def main(create_baseline=False,
 
     start_date, end_date = MarketTime.window_for("xgboost")
 
-    raw_df = load_training_data(start_date, end_date)
+    try:
 
-    validator = WalkForwardValidator(trainer)
-    research_metrics = validator.run(raw_df.copy())
+        raw_df = load_training_data(start_date, end_date)
 
-    logger.info("Research metrics: %s", research_metrics)
+        validator = WalkForwardValidator(trainer)
+        research_metrics = validator.run(raw_df.copy())
 
-    validate_production_metrics(research_metrics)
+        validate_production_metrics(research_metrics)
 
-    final_df = build_target(raw_df)
-    dataset_hash = compute_dataset_hash(final_df)
-    final_model = final_trainer(raw_df)
+        final_df = build_target(raw_df)
+        dataset_hash = compute_dataset_hash(final_df)
+        final_model = final_trainer(raw_df)
 
-    export_artifacts(
-        final_model,
-        research_metrics,
-        dataset_hash,
-        start_date,
-        end_date,
-        final_df,
-        create_baseline=create_baseline,
-        promote_baseline=promote_baseline
-    )
+        export_artifacts(
+            final_model,
+            research_metrics,
+            dataset_hash,
+            start_date,
+            end_date,
+            final_df,
+            create_baseline=create_baseline,
+            promote_baseline=promote_baseline
+        )
+
+    except Exception as e:
+        if allow_soft_fail:
+            logger.warning("Training soft-failed: %s", str(e))
+        else:
+            raise
 
 
 if __name__ == "__main__":
