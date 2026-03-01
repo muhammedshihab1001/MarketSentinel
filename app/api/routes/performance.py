@@ -30,12 +30,11 @@ logger = logging.getLogger("marketsentinel.performance")
 
 MIN_HISTORY_ROWS = 60
 BENCHMARK_TICKER = "SPY"
-MIN_PROB_STD = 1e-6
+MIN_SCORE_STD = 1e-6
 REQUEST_TIMEOUT = 60
 MAX_CONCURRENT = 2
 
 performance_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
 _pipeline: InferencePipeline | None = None
 
 
@@ -46,6 +45,8 @@ def get_pipeline():
     return _pipeline
 
 
+# =========================================================
+# ASYNC ENTRYPOINT
 # =========================================================
 
 @router.get("/performance")
@@ -77,7 +78,7 @@ async def compute_performance(days: int = 120):
 
 
 # =========================================================
-# HEAVY SYNC LOGIC
+# SYNC HEAVY LOGIC
 # =========================================================
 
 def _compute_performance_sync(days: int):
@@ -96,7 +97,7 @@ def _compute_performance_sync(days: int):
     end_str = end_date.strftime("%Y-%m-%d")
 
     # =========================================================
-    # FETCH PRICE HISTORY
+    # FETCH PRICE DATA
     # =========================================================
 
     price_history = market_data.get_price_data_batch(
@@ -110,7 +111,6 @@ def _compute_performance_sync(days: int):
     cleaned_history = {}
 
     for ticker, df in price_history.items():
-
         if df is None or len(df) < MIN_HISTORY_ROWS:
             continue
 
@@ -160,7 +160,7 @@ def _compute_performance_sync(days: int):
     full_df = FeatureEngineer.finalize(full_df)
 
     # =========================================================
-    # HISTORICAL SIMULATION
+    # HISTORICAL SIMULATION (REGRESSION-BASED)
     # =========================================================
 
     portfolio_records = []
@@ -184,13 +184,17 @@ def _compute_performance_sync(days: int):
                 mode="inference"
             ).astype(DTYPE)
 
-            probs = model.predict_proba(feature_df)[:, 1]
-            probs = np.clip(probs, 1e-6, 1 - 1e-6)
+            # 🔥 REGRESSION SCORE
+            scores = model.predict(feature_df)
 
-            if np.std(probs) < MIN_PROB_STD:
-                probs = np.full_like(probs, 0.5)
+            if np.std(scores) < MIN_SCORE_STD:
+                continue
 
-            daily_slice["score"] = probs
+            # Z-score normalize cross-sectionally
+            scores = (scores - scores.mean()) / (scores.std() + 1e-12)
+
+            daily_slice["score"] = scores
+
             daily_slice["rank_pct"] = daily_slice["score"].rank(
                 method="first", pct=True
             )
@@ -200,7 +204,17 @@ def _compute_performance_sync(days: int):
                 else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
             )
 
-            weights = pipeline._construct_portfolio(daily_slice)
+            # Construct portfolio from LONG/SHORT only
+            long_slice = daily_slice[daily_slice["signal"] == "LONG"]
+            short_slice = daily_slice[daily_slice["signal"] == "SHORT"]
+
+            if long_slice.empty or short_slice.empty:
+                continue
+
+            weights = pipeline._construct_portfolio(
+                long_slice,
+                short_slice
+            )
 
             for _, row in daily_slice.iterrows():
                 portfolio_records.append({
@@ -239,7 +253,7 @@ def _compute_performance_sync(days: int):
     report = engine.evaluate(portfolio_df, forward_df)
 
     # =========================================================
-    # BENCHMARK (SOFT FAIL SAFE)
+    # BENCHMARK
     # =========================================================
 
     benchmark_data = market_data.get_price_data_batch(
@@ -301,10 +315,6 @@ def _compute_performance_sync(days: int):
             )
 
             alpha = float(report.annual_return - benchmark_annual)
-
-    # =========================================================
-    # FINAL JSON SAFE RESPONSE
-    # =========================================================
 
     return {
         "strategy": {
