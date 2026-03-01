@@ -41,6 +41,7 @@ SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
 MIN_CS_WIDTH = 8
+TARGET_CLIP = 5.0  # light protection for Yahoo anomalies
 
 
 # ==========================================================
@@ -54,7 +55,7 @@ def enforce_determinism():
 
 
 # ==========================================================
-# SIMPLE HASH UTIL (for artifact)
+# SIMPLE HASH UTIL
 # ==========================================================
 
 def sha256_file(path):
@@ -117,7 +118,6 @@ def export_artifacts(model,
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{version}.json")
 
     joblib.dump(model, model_path)
-
     artifact_hash = sha256_file(model_path)
 
     metadata = {
@@ -174,6 +174,11 @@ def load_training_data(start_date, end_date):
             end_date=end_date
         )
 
+        # Basic Yahoo cleaning
+        price_df = price_df.replace([np.inf, -np.inf], np.nan)
+        price_df = price_df.dropna(subset=["close"])
+        price_df = price_df[price_df["close"] > 0]
+
         dataset = store.get_features(
             price_df,
             sentiment_df=None,
@@ -199,6 +204,9 @@ def load_training_data(start_date, end_date):
     df = FeatureEngineer.add_cross_sectional_features(df)
     df = FeatureEngineer.finalize(df)
 
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=MODEL_FEATURES)
+
     validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="training")
 
     return df
@@ -223,6 +231,8 @@ def build_target(df: pd.DataFrame):
     cs_std = df.groupby("date")["raw_forward"].transform("std").replace(0, np.nan)
 
     df["target"] = (df["raw_forward"] - cs_mean) / cs_std
+    df["target"] = np.clip(df["target"], -TARGET_CLIP, TARGET_CLIP)
+
     df = df[np.isfinite(df["target"])]
 
     counts = df.groupby("date")["ticker"].transform("count")
@@ -255,7 +265,6 @@ def trainer(train_df):
     pipeline = build_xgboost_pipeline()
     pipeline.fit(X, y)
 
-    # attach reproducibility fingerprint
     dataset_hash = compute_dataset_hash(train_df)
     pipeline.training_fingerprint = compute_reproducibility_hash(dataset_hash)
 
