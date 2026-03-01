@@ -3,6 +3,7 @@ import logging
 import time
 import threading
 from contextlib import nullcontext
+from typing import Dict, Any
 
 from core.data.providers.market.yahoo_provider import YahooProvider
 
@@ -52,6 +53,7 @@ class MarketProviderRouter:
 
         self.providers = []
         self._provider_failures = {}
+        self._provider_stats: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
 
         self._yahoo_semaphore = threading.Semaphore(
@@ -94,6 +96,13 @@ class MarketProviderRouter:
             try:
                 provider = builder()
                 self.providers.append((name, provider))
+
+                self._provider_stats[name] = {
+                    "success": 0,
+                    "failure": 0,
+                    "avg_latency": 0.0
+                }
+
                 logger.info("Provider registered → %s", name)
 
             except Exception as e:
@@ -141,9 +150,10 @@ class MarketProviderRouter:
 
         with self._lock:
             self._provider_failures[name] = time.time()
+            self._provider_stats[name]["failure"] += 1
 
     ############################################################
-    # PROVIDER EXECUTION
+    # RESPONSE VALIDATION
     ############################################################
 
     def _validate_response(self, df, ticker):
@@ -164,7 +174,15 @@ class MarketProviderRouter:
         if len(df) == 0:
             raise RuntimeError(f"Empty dataset returned for {ticker}")
 
+        # OHLC integrity check
+        if not ((df["high"] >= df["low"]).all()):
+            raise RuntimeError(f"OHLC integrity violation for {ticker}")
+
         return df
+
+    ############################################################
+    # PROVIDER EXECUTION
+    ############################################################
 
     def _execute_provider(
         self,
@@ -205,11 +223,20 @@ class MarketProviderRouter:
 
         df = self._validate_response(df, ticker)
 
+        with self._lock:
+            stats = self._provider_stats[name]
+            stats["success"] += 1
+            stats["avg_latency"] = (
+                (stats["avg_latency"] * (stats["success"] - 1) + latency)
+                / stats["success"]
+            )
+
         logger.info(
-            "Market data served → provider=%s ticker=%s rows=%s",
+            "Market data served → provider=%s ticker=%s rows=%s latency=%.2fs",
             name,
             ticker,
-            len(df)
+            len(df),
+            latency
         )
 
         return df.copy()
@@ -293,3 +320,28 @@ class MarketProviderRouter:
                 self._record_failure(name)
 
         raise RuntimeError(f"All market providers failed for {ticker}")
+
+    ############################################################
+    # PROVIDER HEALTH SNAPSHOT (NEW)
+    ############################################################
+
+    def provider_health(self):
+
+        with self._lock:
+            snapshot = {}
+
+            for name, stats in self._provider_stats.items():
+
+                total = stats["success"] + stats["failure"]
+                failure_rate = (
+                    stats["failure"] / total if total > 0 else 0.0
+                )
+
+                snapshot[name] = {
+                    "success": stats["success"],
+                    "failure": stats["failure"],
+                    "failure_rate": round(failure_rate, 4),
+                    "avg_latency": round(stats["avg_latency"], 4)
+                }
+
+            return snapshot
