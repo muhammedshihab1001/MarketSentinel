@@ -6,7 +6,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import (
     InferencePipeline,
-    get_shared_model_loader,  # ✅ FIXED IMPORT LOCATION
+    get_shared_model_loader,
 )
 from core.market.universe import MarketUniverse
 from app.monitoring.metrics import (
@@ -110,8 +110,8 @@ def _portfolio_summary_sync():
 
     rejected_trades = len(results) - approved_trades
 
-    strength_scores = [
-        r.get("agent", {}).get("strength_score", 0.0)
+    agent_scores = [
+        r.get("agent", {}).get("agent_score", 0.0)
         for r in results
     ]
 
@@ -120,17 +120,17 @@ def _portfolio_summary_sync():
         for r in results
     ]
 
-    avg_strength = float(
-        sum(strength_scores) / len(strength_scores)
-    ) if strength_scores else 0.0
+    avg_strength = (
+        sum(agent_scores) / len(agent_scores)
+    ) if agent_scores else 0.0
 
-    avg_confidence = float(
+    avg_confidence = (
         sum(confidence_scores) / len(confidence_scores)
     ) if confidence_scores else 0.0
 
     high_conviction_count = sum(
         1 for r in results
-        if r.get("agent", {}).get("strength_score", 0.0) >= 75
+        if r.get("agent", {}).get("agent_score", 0.0) >= 0.75
     )
 
     elevated_risk_count = sum(
@@ -165,19 +165,23 @@ def _portfolio_summary_sync():
     top_5_preview = [
         {
             "ticker": r["ticker"],
-            "score": round(r["score"], 4),
-            "weight": round(r["weight"], 4),
-            "confidence": r.get("agent", {}).get("confidence"),
+            "score": round(r.get("raw_model_score", 0.0), 4),
+            "weight": round(r.get("weight", 0.0), 4),
+            "confidence": r.get("agent", {}).get("confidence_numeric"),
             "approved": r.get("agent", {}).get("trade_approved")
         }
-        for r in sorted(results, key=lambda x: x["score"], reverse=True)[:5]
+        for r in sorted(
+            results,
+            key=lambda x: x.get("raw_model_score", 0.0),
+            reverse=True
+        )[:5]
     ]
 
     return {
         "snapshot_date": snapshot.get("snapshot_date"),
         "universe_size": snapshot.get("universe_size"),
 
-        # Governance metadata
+        # Governance
         "model_version": loader.xgb_version,
         "schema_signature": loader.schema_signature,
 
@@ -193,7 +197,7 @@ def _portfolio_summary_sync():
         # Agent metrics
         "approved_trades": approved_trades,
         "rejected_trades": rejected_trades,
-        "avg_strength_score": round(avg_strength, 2),
+        "avg_strength_score": round(avg_strength, 3),
         "avg_confidence": round(avg_confidence, 3),
         "high_conviction_count": high_conviction_count,
         "elevated_risk_count": elevated_risk_count,
@@ -202,7 +206,7 @@ def _portfolio_summary_sync():
         "drift_detected": drift_detected,
         "drift_state": drift_state,
 
-        # Portfolio health
+        # Health
         "portfolio_health_score": health_score,
 
         # Preview
