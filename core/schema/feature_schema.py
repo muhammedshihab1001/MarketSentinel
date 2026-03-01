@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 # ============================================================
 
-SCHEMA_VERSION = "42.0"  # hybrid multi-agent + governance hardened
+SCHEMA_VERSION = "43.0"  # governance-stable hardened contract
 
 
 ############################################################
@@ -271,7 +271,7 @@ def get_schema_signature() -> str:
 
 
 ############################################################
-# SCHEMA SNAPSHOT (NEW)
+# SCHEMA SNAPSHOT
 ############################################################
 
 def schema_snapshot() -> Dict:
