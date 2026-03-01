@@ -18,12 +18,14 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "16.0"
+    METADATA_VERSION = "16.1"
     MIN_TRAINING_DAYS = 120
     MIN_METADATA_BYTES = 800
     MIN_FEATURE_COUNT = 10
     MIN_DATASET_ROWS = 500
     MIN_HASH_LENGTH = 64
+
+    STRICT_MODE = True  # CV-level governance (safe but not crazy)
 
     REQUIRED_METADATA_FIELDS = [
         "metadata_type",
@@ -130,105 +132,6 @@ class MetadataManager:
         return hashlib.sha256(arr.tobytes()).hexdigest()
 
     # =====================================================
-    # TRAINING CODE FINGERPRINT
-    # =====================================================
-
-    @staticmethod
-    def fingerprint_training_code():
-
-        hasher = hashlib.sha256()
-
-        CRITICAL_DIRS = [
-            "training",
-            "core/models",
-            "core/features",
-            "core/schema",
-            "core/data",
-            "core/time",
-            "core/market",
-            "core/artifacts",
-            "core/config",
-        ]
-
-        for root in sorted(CRITICAL_DIRS):
-
-            if not os.path.exists(root):
-                continue
-
-            for path, dirs, files in os.walk(root):
-
-                dirs.sort()
-                files = sorted(f for f in files if f.endswith(".py"))
-
-                for f in files:
-
-                    full = os.path.join(path, f)
-
-                    if os.path.islink(full):
-                        raise RuntimeError(
-                            f"Symlink detected in training code: {full}"
-                        )
-
-                    rel = os.path.relpath(full)
-                    hasher.update(rel.encode())
-
-                    with open(full, "rb") as fh:
-                        hasher.update(fh.read())
-
-        hasher.update(get_schema_signature().encode())
-        hasher.update(platform.python_version().encode())
-
-        return hasher.hexdigest()
-
-    # =====================================================
-    # FEATURE CHECKSUM
-    # =====================================================
-
-    @staticmethod
-    def fingerprint_features(features: tuple) -> str:
-
-        if tuple(features) != tuple(MODEL_FEATURES):
-            raise RuntimeError("Feature list mismatch during checksum.")
-
-        canonical = json.dumps(
-            list(features),
-            sort_keys=False
-        ).encode()
-
-        return hashlib.sha256(canonical).hexdigest()
-
-    # =====================================================
-    # SAVE METADATA (ATOMIC)
-    # =====================================================
-
-    @staticmethod
-    def save_metadata(metadata: dict, path: str):
-
-        if os.path.islink(path):
-            raise RuntimeError("Refusing to write metadata to symlink.")
-
-        directory = os.path.dirname(path)
-        os.makedirs(directory, exist_ok=True)
-
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            delete=False,
-            dir=directory,
-            suffix=".tmp",
-            encoding="utf-8"
-        ) as tmp:
-
-            json.dump(metadata, tmp, indent=2)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            temp_name = tmp.name
-
-        os.replace(temp_name, path)
-
-        if os.path.getsize(path) < MetadataManager.MIN_METADATA_BYTES:
-            raise RuntimeError("Metadata file below minimum size.")
-
-    # =====================================================
     # LOAD + VERIFY
     # =====================================================
 
@@ -255,6 +158,7 @@ class MetadataManager:
     @staticmethod
     def verify_metadata_integrity(metadata: dict):
 
+        # Required field check
         for field in MetadataManager.REQUIRED_METADATA_FIELDS:
             if field not in metadata:
                 raise RuntimeError(f"Missing required metadata field: {field}")
@@ -265,7 +169,7 @@ class MetadataManager:
             raise RuntimeError("Invalid metadata integrity hash.")
 
         metadata_copy = dict(metadata)
-        metadata_copy.pop("metadata_integrity_hash")
+        metadata_copy.pop("metadata_integrity_hash", None)
 
         recalculated = hashlib.sha256(
             MetadataManager._canonical_json(metadata_copy)
@@ -273,41 +177,6 @@ class MetadataManager:
 
         if recalculated != original_hash:
             raise RuntimeError("Metadata integrity verification failed.")
-
-    # =====================================================
-    # METRIC VALIDATION
-    # =====================================================
-
-    @staticmethod
-    def _validate_metrics(metrics: dict):
-
-        if not isinstance(metrics, dict) or not metrics:
-            raise RuntimeError("Metrics must be non-empty dict.")
-
-        for k, v in metrics.items():
-            val = float(v)
-            if not np.isfinite(val):
-                raise RuntimeError(f"Non-finite metric detected: {k}")
-            if abs(val) > 1e6:
-                raise RuntimeError(f"Metric unrealistic: {k}")
-
-    # =====================================================
-    # TRAINING WINDOW VALIDATION
-    # =====================================================
-
-    @staticmethod
-    def _validate_training_window(start, end):
-
-        start_dt = pd.to_datetime(start, utc=True)
-        end_dt = pd.to_datetime(end, utc=True)
-
-        if end_dt <= start_dt:
-            raise RuntimeError("Invalid training window.")
-
-        if (end_dt - start_dt).days < MetadataManager.MIN_TRAINING_DAYS:
-            raise RuntimeError(
-                "Training window below institutional minimum."
-            )
 
     # =====================================================
     # CREATE METADATA
@@ -323,24 +192,16 @@ class MetadataManager:
         dataset_hash,
         dataset_rows,
         metadata_type,
+        artifact_hash,
         extra_fields=None,
         feature_checksum=None,
     ):
 
         if dataset_rows < MetadataManager.MIN_DATASET_ROWS:
-            raise RuntimeError("dataset_rows below institutional minimum.")
+            raise RuntimeError("dataset_rows below minimum.")
 
         if tuple(features) != tuple(MODEL_FEATURES):
             raise RuntimeError("Feature schema mismatch.")
-
-        if len(features) < MetadataManager.MIN_FEATURE_COUNT:
-            raise RuntimeError("Feature count below institutional minimum.")
-
-        MetadataManager._validate_metrics(metrics)
-        MetadataManager._validate_training_window(
-            training_start,
-            training_end
-        )
 
         universe_snapshot = MarketUniverse.snapshot()
 
@@ -380,27 +241,24 @@ class MetadataManager:
             },
 
             "training_universe": universe_snapshot,
-            "universe_hash": universe_snapshot["universe_hash"]
+            "universe_hash": universe_snapshot["universe_hash"],
+
+            "artifact_hash": artifact_hash
         }
 
         if feature_checksum:
             metadata["feature_checksum"] = feature_checksum
 
         if extra_fields:
-
             forbidden = MetadataManager.IMMUTABLE_KEYS & set(extra_fields)
-
             if forbidden:
                 raise RuntimeError(
                     f"Attempt to override immutable metadata fields: {forbidden}"
                 )
-
             metadata.update(dict(extra_fields))
 
         metadata["metadata_integrity_hash"] = hashlib.sha256(
-            MetadataManager._canonical_json(
-                {k: v for k, v in metadata.items()}
-            )
+            MetadataManager._canonical_json(metadata)
         ).hexdigest()
 
         return metadata
