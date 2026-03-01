@@ -16,6 +16,7 @@ class FeatureEngineer:
     SPLIT_THRESHOLD = 3.5
     EPSILON = 1e-9
     MIN_CS_WIDTH = 5
+    Z_CLIP = 5.0
 
     ########################################################
     # DATETIME NORMALIZATION
@@ -67,6 +68,7 @@ class FeatureEngineer:
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices.")
 
+        # Split detection
         returns = df.groupby("ticker")["close"].pct_change().abs()
         extreme = returns > cls.SPLIT_THRESHOLD
 
@@ -100,18 +102,19 @@ class FeatureEngineer:
         ).clip(-0.2, 0.2)
 
         # MOMENTUM
-        df["momentum_20"] = df.groupby("ticker")["close"].pct_change(20)
-        df["momentum_60"] = df.groupby("ticker")["close"].pct_change(60)
+        df["momentum_20"] = df.groupby("ticker")["close"].pct_change(20).shift(1)
+        df["momentum_60"] = df.groupby("ticker")["close"].pct_change(60).shift(1)
 
         df["momentum_composite"] = (
             0.6 * df["momentum_20"] +
             0.4 * df["momentum_60"]
         ).clip(-2, 2)
 
-        # VOLUME FEATURES (RESTORED)
+        # VOLUME FEATURES
         df["volume_mean_20"] = (
             df.groupby("ticker")["volume"]
             .transform(lambda x: x.rolling(20, min_periods=5).mean())
+            .shift(1)
         )
 
         df["volume_momentum"] = (
@@ -124,7 +127,8 @@ class FeatureEngineer:
         grp = df.groupby("ticker")["return"]
 
         df["volatility_20"] = (
-            grp.rolling(20, min_periods=20).std(ddof=0)
+            grp.rolling(20, min_periods=20)
+            .std(ddof=0)
             .shift(1)
             .reset_index(level=0, drop=True)
         )
@@ -175,7 +179,7 @@ class FeatureEngineer:
             df["return"].abs() / (df["dollar_volume"] + cls.EPSILON)
         ).clip(0, 1)
 
-        # REGIME FEATURE
+        # REGIME FEATURE (stabilized)
         vol_mean = (
             df.groupby("ticker")["volatility"]
             .transform(lambda x: x.rolling(60, min_periods=20).mean())
@@ -202,7 +206,11 @@ class FeatureEngineer:
 
         df = df.sort_values(["date", "ticker"]).copy()
 
-        valid_mask = df.groupby("date")["ticker"].transform("count") >= cls.MIN_CS_WIDTH
+        valid_mask = (
+            df.groupby("date")["ticker"]
+            .transform("count") >= cls.MIN_CS_WIDTH
+        )
+
         df = df[valid_mask].copy()
 
         base_cols = [
@@ -226,12 +234,18 @@ class FeatureEngineer:
             if col not in df.columns:
                 continue
 
-            cs_mean = df.groupby("date")[col].transform("mean")
-            cs_std = df.groupby("date")[col].transform("std")
+            # winsorize before z-score
+            lower = df.groupby("date")[col].transform(lambda x: x.quantile(0.01))
+            upper = df.groupby("date")[col].transform(lambda x: x.quantile(0.99))
+            clipped = df[col].clip(lower, upper)
 
-            z = (df[col] - cs_mean) / (cs_std + cls.EPSILON)
+            cs_mean = clipped.groupby(df["date"]).transform("mean")
+            cs_std = clipped.groupby(df["date"]).transform("std")
 
-            df[f"{col}_z"] = z.fillna(0.0).clip(-5, 5)
+            z = (clipped - cs_mean) / (cs_std + cls.EPSILON)
+
+            df[f"{col}_z"] = z.fillna(0.0).clip(-cls.Z_CLIP, cls.Z_CLIP)
+
             df[f"{col}_rank"] = (
                 df.groupby("date")[col]
                 .rank(method="first", pct=True)
@@ -239,9 +253,13 @@ class FeatureEngineer:
             )
 
         # MARKET DISPERSION
-        df["market_dispersion"] = (
-            df.groupby("date")["return"].transform("std").clip(0, 0.2)
+        dispersion = (
+            df.groupby("date")["return"]
+            .transform("std")
+            .clip(0, 0.2)
         )
+
+        df["market_dispersion"] = dispersion
 
         # BREADTH
         df["breadth"] = (
@@ -256,7 +274,8 @@ class FeatureEngineer:
 
             z = (df[col] - cs_mean) / (cs_std + cls.EPSILON)
 
-            df[f"{col}_z"] = z.fillna(0.0).clip(-5, 5)
+            df[f"{col}_z"] = z.fillna(0.0).clip(-cls.Z_CLIP, cls.Z_CLIP)
+
             df[f"{col}_rank"] = (
                 df.groupby("date")[col]
                 .rank(method="first", pct=True)
@@ -299,10 +318,8 @@ class FeatureEngineer:
         sentiment_df=None,
         training=True,
     ):
-
         df = cls._validate_price_frame(price_df)
         df = cls.add_core_features(df)
         df = cls.add_cross_sectional_features(df)
         df = cls.finalize(df)
-
         return df
