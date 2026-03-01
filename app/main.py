@@ -49,12 +49,9 @@ logger = logging.getLogger("marketsentinel")
 # SYSTEM FINGERPRINT
 # =====================================================
 
-BOOT_ID = hashlib.sha256(
-    str(time.time()).encode()
-).hexdigest()[:12]
-
+BOOT_ID = hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
 STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 120)
-APP_VERSION = get_env("APP_VERSION", "4.0.0")  # bumped
+APP_VERSION = get_env("APP_VERSION", "4.0.0")
 
 
 # =====================================================
@@ -93,30 +90,6 @@ readiness = ReadinessState()
 
 
 # =====================================================
-# REQUEST MIDDLEWARE
-# =====================================================
-
-@app.middleware("http")
-async def request_context_middleware(request: Request, call_next):
-
-    request_id = str(uuid.uuid4())[:12]
-    start = time.time()
-
-    try:
-        response = await call_next(request)
-        latency = time.time() - start
-
-        response.headers["X-Request-ID"] = request_id
-        response.headers["X-Process-Time"] = str(round(latency, 4))
-
-        return response
-
-    except Exception:
-        logger.exception("Request failure | id=%s", request_id)
-        raise
-
-
-# =====================================================
 # GLOBAL EXCEPTION HANDLER
 # =====================================================
 
@@ -147,9 +120,9 @@ async def lifespan(app: FastAPI):
         logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("===================================")
 
-        # -------------------------------------------------
+        # -----------------------------
         # MODEL LOADING
-        # -------------------------------------------------
+        # -----------------------------
 
         loader = ModelLoader()
         _ = loader.xgb
@@ -165,43 +138,36 @@ async def lifespan(app: FastAPI):
         if readiness.schema_signature != get_schema_signature():
             raise RuntimeError("Runtime schema mismatch.")
 
-        # -------------------------------------------------
-        # REDIS CHECK
-        # -------------------------------------------------
+        # -----------------------------
+        # REDIS
+        # -----------------------------
 
         cache = RedisCache()
         readiness.redis_connected = cache.enabled
 
-        if readiness.redis_connected:
-            logger.info("Redis connected.")
-        else:
-            logger.warning("Redis unavailable — degraded mode.")
-
-        # -------------------------------------------------
-        # DRIFT BASELINE CHECK
-        # -------------------------------------------------
+        # -----------------------------
+        # DRIFT BASELINE
+        # -----------------------------
 
         try:
             detector = DriftDetector()
             detector._load_verified_baseline()
             readiness.drift_baseline_loaded = True
-            logger.info("Drift baseline verified.")
         except Exception:
-            logger.warning("Drift baseline missing or invalid.")
             readiness.drift_baseline_loaded = False
 
-        # -------------------------------------------------
-        # LLM STATE CAPTURE
-        # -------------------------------------------------
+        # -----------------------------
+        # LLM STATE
+        # -----------------------------
 
         readiness.llm_enabled = get_bool("LLM_ENABLED", False)
         readiness.llm_model = get_env("OPENAI_MODEL", None)
         readiness.llm_rate_limit = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
         readiness.llm_cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
 
-        # -------------------------------------------------
-        # SYSTEM RESOURCE SNAPSHOT
-        # -------------------------------------------------
+        # -----------------------------
+        # SYSTEM SNAPSHOT
+        # -----------------------------
 
         process = psutil.Process(os.getpid())
         readiness.boot_memory_mb = round(
@@ -209,7 +175,7 @@ async def lifespan(app: FastAPI):
         )
 
         readiness.config_fingerprint = hashlib.sha256(
-            str(os.environ).encode()
+            str(sorted(os.environ.items())).encode()
         ).hexdigest()[:16]
 
         gc.collect()
@@ -220,7 +186,6 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("Startup exceeded timeout.")
 
         logger.info("System ready in %.2fs", boot_time)
-        logger.info("Memory usage: %s MB", readiness.boot_memory_mb)
 
         yield
 
@@ -233,7 +198,7 @@ async def lifespan(app: FastAPI):
 
 
 # =====================================================
-# FASTAPI APP
+# FASTAPI APP (DEFINE FIRST)
 # =====================================================
 
 app = FastAPI(
@@ -246,7 +211,31 @@ app.add_exception_handler(Exception, global_exception_handler)
 
 
 # =====================================================
-# ROUTE REGISTRATION
+# REQUEST MIDDLEWARE (NOW SAFE)
+# =====================================================
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+
+    request_id = str(uuid.uuid4())[:12]
+    start = time.time()
+
+    try:
+        response = await call_next(request)
+        latency = time.time() - start
+
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time"] = str(round(latency, 4))
+
+        return response
+
+    except Exception:
+        logger.exception("Request failure | id=%s", request_id)
+        raise
+
+
+# =====================================================
+# ROUTES
 # =====================================================
 
 app.include_router(predict.router)
@@ -279,7 +268,7 @@ async def root():
 
 
 # =====================================================
-# PROMETHEUS
+# METRICS
 # =====================================================
 
 @app.get("/metrics")
