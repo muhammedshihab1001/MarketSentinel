@@ -1,3 +1,7 @@
+# =========================================================
+# INSTITUTIONAL INFERENCE PIPELINE (Governance Hardened)
+# =========================================================
+
 import time
 import threading
 import numpy as np
@@ -37,6 +41,10 @@ _SHARED_MODEL_LOADER = None
 _MODEL_LOCK = threading.Lock()
 
 
+# =========================================================
+# SHARED MODEL LOADER
+# =========================================================
+
 def get_shared_model_loader():
     global _SHARED_MODEL_LOADER
     if _SHARED_MODEL_LOADER is None:
@@ -47,6 +55,10 @@ def get_shared_model_loader():
                 _ = _SHARED_MODEL_LOADER.xgb
     return _SHARED_MODEL_LOADER
 
+
+# =========================================================
+# INFERENCE PIPELINE
+# =========================================================
 
 class InferencePipeline:
 
@@ -66,6 +78,8 @@ class InferencePipeline:
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
     CROSS_SECTIONAL_WINDOW_DAYS = int(os.getenv("CS_WINDOW_DAYS", "30"))
 
+    # =========================================================
+
     def __init__(self):
         self.market_data = MarketDataService()
         self.feature_store = FeatureStore()
@@ -77,12 +91,16 @@ class InferencePipeline:
         self._validate_models_loaded()
 
     # =========================================================
+    # MODEL CONTRACT CHECK
+    # =========================================================
 
     def _validate_models_loaded(self):
         if self.models.schema_signature != get_schema_signature():
             raise RuntimeError("Schema signature mismatch.")
         logger.info("Model verified | version=%s", self.models.xgb_version)
 
+    # =========================================================
+    # NUMERIC UTILITIES
     # =========================================================
 
     def _winsorize(self, x):
@@ -96,7 +114,7 @@ class InferencePipeline:
         return e / (np.sum(e) + EPSILON)
 
     # =========================================================
-    # AGENTS
+    # AGENT MULTIPLIERS
     # =========================================================
 
     def _risk_agent(self, drift_result):
@@ -115,6 +133,7 @@ class InferencePipeline:
         momentum = row.get("momentum_composite", 0)
 
         adjustment = 1.0
+
         if rsi > 70:
             adjustment *= 0.85
         elif rsi < 30:
@@ -125,6 +144,8 @@ class InferencePipeline:
 
         return float(adjustment)
 
+    # =========================================================
+    # MAIN SNAPSHOT
     # =========================================================
 
     def run_snapshot(self, tickers: List[str]):
@@ -165,13 +186,16 @@ class InferencePipeline:
                 raw_scores - raw_scores.mean()
             ) / (raw_scores.std() + EPSILON)
 
+            if not np.all(np.isfinite(raw_scores)):
+                raise RuntimeError("Non-finite model scores detected.")
+
             latest_df["raw_model_score"] = raw_scores
 
             risk_mult = self._risk_agent(drift_result)
             macro_mult = self._macro_agent(latest_df)
 
             # =====================================================
-            # SCORE ADJUSTMENT
+            # FINAL SCORE WITH AGENTS
             # =====================================================
 
             final_scores = []
@@ -189,10 +213,13 @@ class InferencePipeline:
 
             latest_df["score"] = np.array(final_scores)
 
-            # deterministic sort
+            if not np.all(np.isfinite(latest_df["score"])):
+                raise RuntimeError("Non-finite adjusted scores.")
+
+            # deterministic tie-break
             ranked = latest_df.sort_values(
-                ["score", "dollar_volume"],
-                ascending=[True, False]
+                ["score", "dollar_volume", "ticker"],
+                ascending=[True, False, True]
             )
 
             longs = ranked.tail(self.TOP_K)
@@ -203,16 +230,21 @@ class InferencePipeline:
 
             weights = self._construct_portfolio(longs, shorts)
 
-            # apply risk scaling
+            # Apply drift risk scaling
             for k in weights:
                 weights[k] *= risk_mult
 
-            # rescale after risk adjustment
+            # Re-normalize exposure
             gross = sum(abs(v) for v in weights.values())
-            if gross > 0:
+            if gross > EPSILON:
                 scale = self.TARGET_GROSS_EXPOSURE / gross
                 for k in weights:
                     weights[k] *= scale
+
+            # Final exposure sanity
+            gross_final = sum(abs(v) for v in weights.values())
+            if abs(gross_final - self.TARGET_GROSS_EXPOSURE) > 0.05:
+                logger.warning("Exposure drift detected: %.4f", gross_final)
 
             snapshot_rows = []
             approved = 0
@@ -284,6 +316,8 @@ class InferencePipeline:
             INFERENCE_IN_PROGRESS.dec()
 
     # =========================================================
+    # DRIFT SAFE WRAPPER
+    # =========================================================
 
     def _safe_drift(self, feature_df):
         try:
@@ -296,12 +330,12 @@ class InferencePipeline:
                 "exposure_scale": 1.0
             }
 
+    # =========================================================
+
     def _select_latest_snapshot(self, df):
         latest_date = df["date"].max()
         return df[df["date"] == latest_date].reset_index(drop=True)
 
-    # =========================================================
-    # FIXED CROSS SECTIONAL BUILD
     # =========================================================
 
     def _build_cross_sectional_frame(self, tickers):
@@ -319,7 +353,6 @@ class InferencePipeline:
 
         datasets = []
 
-        # Build per ticker core features only
         for ticker, price_df in price_map.items():
             if price_df is None or price_df.empty:
                 continue
@@ -328,9 +361,8 @@ class InferencePipeline:
                 df = FeatureEngineer.build_feature_pipeline(
                     price_df=price_df,
                     sentiment_df=None,
-                    training=False  # no CS here
+                    training=False
                 )
-
                 datasets.append(df)
 
             except Exception as e:
@@ -342,7 +374,6 @@ class InferencePipeline:
         df = pd.concat(datasets, ignore_index=True)
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
-        # NOW apply cross-sectional features
         df = FeatureEngineer.add_cross_sectional_features(df)
         df = FeatureEngineer.finalize(df)
 
@@ -351,6 +382,8 @@ class InferencePipeline:
 
         return df[df["date"] >= cutoff].copy()
 
+    # =========================================================
+    # PORTFOLIO CONSTRUCTION
     # =========================================================
 
     def _construct_portfolio(self, longs, shorts):
