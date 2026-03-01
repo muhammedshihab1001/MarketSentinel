@@ -1,6 +1,5 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v2.4 (CV-Optimized)
-# Multi-Agent Driven Selection
+# INSTITUTIONAL INFERENCE PIPELINE v2.5 (CV-Optimized Stable)
 # =========================================================
 
 import time
@@ -13,6 +12,7 @@ from typing import List
 
 from core.data.market_data_service import MarketDataService
 from core.features.feature_engineering import FeatureEngineer
+from core.features.feature_store import FeatureStore
 from core.monitoring.drift_detector import DriftDetector
 from core.schema.feature_schema import (
     MODEL_FEATURES,
@@ -66,8 +66,7 @@ class InferencePipeline:
     SCORE_WINSOR_Q = 0.02
     BASE_LIQUIDITY = 1e6
 
-    SNAPSHOT_CACHE_TTL = 5  # seconds (CV safe lightweight cache)
-
+    SNAPSHOT_CACHE_TTL = 5
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
 
     # ---------------------------------------------------------
@@ -78,6 +77,7 @@ class InferencePipeline:
         self.cache = RedisCache()
         self.drift_detector = DriftDetector()
         self.signal_agent = SignalAgent()
+        self.feature_store = FeatureStore()  # ✅ FIXED
 
         self._validate_models_loaded()
 
@@ -110,9 +110,12 @@ class InferencePipeline:
         if not universe:
             raise RuntimeError("Universe empty.")
 
-        cache_key = f"snapshot:{hash(tuple(universe))}"
+        # ✅ Proper stable cache key
+        cache_key = self.cache.build_key({
+            "type": "snapshot",
+            "tickers": universe
+        })
 
-        # Lightweight cache
         cached = self.cache.get(cache_key)
         if cached:
             return cached
@@ -123,7 +126,8 @@ class InferencePipeline:
         try:
 
             df = self._build_cross_sectional_frame(universe)
-            latest_df = df[df["date"] == df["date"].max()].copy()
+            latest_date = df["date"].max()
+            latest_df = df[df["date"] == latest_date].copy()
 
             latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
             latest_df = latest_df.dropna(subset=MODEL_FEATURES)
@@ -131,14 +135,15 @@ class InferencePipeline:
             if latest_df.empty:
                 raise RuntimeError("Latest snapshot invalid.")
 
-            liquidity_threshold = max(
-                self.BASE_LIQUIDITY * 0.5,
-                latest_df["dollar_volume"].median()
-            )
-
-            latest_df = latest_df[
-                latest_df["dollar_volume"] > liquidity_threshold
-            ].copy()
+            # Safe liquidity handling
+            if "dollar_volume" in latest_df.columns:
+                liquidity_threshold = max(
+                    self.BASE_LIQUIDITY * 0.5,
+                    latest_df["dollar_volume"].median()
+                )
+                latest_df = latest_df[
+                    latest_df["dollar_volume"] > liquidity_threshold
+                ]
 
             if len(latest_df) < self.MIN_UNIVERSE_WIDTH:
                 raise RuntimeError("Insufficient liquid instruments.")
@@ -183,7 +188,7 @@ class InferencePipeline:
                     "agent": agent_output
                 })
 
-            # Agent top selection
+            # Agent-driven top selection
             top_5 = sorted(
                 snapshot_rows,
                 key=lambda x: x["agent_score"],
@@ -197,22 +202,22 @@ class InferencePipeline:
 
             weights = self._construct_portfolio(longs, shorts)
 
-            # Apply drift exposure scaling
             for row in snapshot_rows:
                 base_weight = weights.get(row["ticker"], 0.0)
                 row["weight"] = float(base_weight * exposure_scale)
 
             result = {
-                "snapshot_date": str(latest_df["date"].max()),
+                "snapshot_date": str(latest_date),
                 "universe_size": int(len(latest_df)),
                 "gross_exposure": float(sum(abs(x["weight"]) for x in snapshot_rows)),
                 "net_exposure": float(sum(x["weight"] for x in snapshot_rows)),
+                "score_mean": float(np.mean(raw_scores)),
+                "score_std": float(np.std(raw_scores)),
                 "drift": drift_result,
                 "top_5": top_5,
                 "signals": snapshot_rows
             }
 
-            # Cache result (short TTL)
             self.cache.set(cache_key, result, ex=self.SNAPSHOT_CACHE_TTL)
 
             MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
