@@ -32,10 +32,6 @@ from app.monitoring.metrics import (
 logger = logging.getLogger("marketsentinel.pipeline")
 
 
-# =========================================================
-# SHARED MODEL LOADER
-# =========================================================
-
 _SHARED_MODEL_LOADER = None
 _MODEL_LOCK = threading.Lock()
 
@@ -50,10 +46,6 @@ def get_shared_model_loader():
                 _ = _SHARED_MODEL_LOADER.xgb
     return _SHARED_MODEL_LOADER
 
-
-# =========================================================
-# INFERENCE PIPELINE (HYBRID MULTI-AGENT)
-# =========================================================
 
 class InferencePipeline:
 
@@ -92,8 +84,6 @@ class InferencePipeline:
         logger.info("Model verified | version=%s", self.models.xgb_version)
 
     # =========================================================
-    # UTILS
-    # =========================================================
 
     def _winsorize(self, x):
         lower = np.quantile(x, self.SCORE_WINSOR_Q)
@@ -106,7 +96,7 @@ class InferencePipeline:
         return e / (np.sum(e) + self.EPSILON)
 
     # =========================================================
-    # AGENTS (Formalized)
+    # AGENTS
     # =========================================================
 
     def _risk_agent(self, drift_result):
@@ -149,7 +139,6 @@ class InferencePipeline:
         try:
 
             df = self._build_cross_sectional_frame(universe)
-
             latest_df = self._select_latest_snapshot(df)
 
             latest_df = latest_df[
@@ -177,10 +166,6 @@ class InferencePipeline:
             ) / (raw_scores.std() + self.EPSILON)
 
             latest_df["raw_model_score"] = raw_scores
-
-            # -----------------------------------
-            # MULTI-AGENT AGGREGATION
-            # -----------------------------------
 
             risk_mult = self._risk_agent(drift_result)
             macro_mult = self._macro_agent(latest_df)
@@ -222,11 +207,13 @@ class InferencePipeline:
 
             weights = self._construct_portfolio(longs, shorts)
 
-            # Risk scaling
+            # Apply risk scaling
             for k in weights:
                 weights[k] *= risk_mult
 
             snapshot_rows = []
+            approved = 0
+            rejected = 0
 
             for idx, (_, row) in enumerate(latest_df.iterrows()):
 
@@ -237,8 +224,14 @@ class InferencePipeline:
                     probability_stats={
                         "mean": score_mean,
                         "std": score_std
-                    }
+                    },
+                    drift_score=drift_result.get("severity_score", 0)
                 )
+
+                if agent_output["trade_approved"]:
+                    approved += 1
+                else:
+                    rejected += 1
 
                 snapshot_rows.append({
                     "date": row["date"],
@@ -252,21 +245,22 @@ class InferencePipeline:
                     "agent": agent_output
                 })
 
-            top_5 = sorted(
-                snapshot_rows,
-                key=lambda x: x["score"],
-                reverse=True
-            )[:self.TOP_SELECTION]
+            gross_exposure = sum(abs(x["weight"]) for x in snapshot_rows)
+            net_exposure = sum(x["weight"] for x in snapshot_rows)
 
             result = {
                 "snapshot_date": str(latest_df["date"].iloc[0]),
                 "universe_size": int(len(latest_df)),
+                "gross_exposure": float(gross_exposure),
+                "net_exposure": float(net_exposure),
+                "approved_trades": approved,
+                "rejected_trades": rejected,
                 "drift": drift_result,
                 "macro_multiplier": macro_mult,
                 "risk_multiplier": risk_mult,
                 "score_mean": score_mean,
                 "score_std": score_std,
-                "top_5": top_5,
+                "top_5": sorted(snapshot_rows, key=lambda x: x["score"], reverse=True)[:self.TOP_SELECTION],
                 "signals": snapshot_rows
             }
 
@@ -298,13 +292,9 @@ class InferencePipeline:
                 "exposure_scale": 1.0
             }
 
-    # =========================================================
-
     def _select_latest_snapshot(self, df):
         latest_date = df["date"].max()
         return df[df["date"] == latest_date].reset_index(drop=True)
-
-    # =========================================================
 
     def _build_cross_sectional_frame(self, tickers):
 
