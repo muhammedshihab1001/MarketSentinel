@@ -1,6 +1,6 @@
 # ==========================================================
 # INSTITUTIONAL TRAINING PIPELINE WRAPPER
-# Baseline Promotion Aware
+# Governance Hardened + Hybrid Multi-Agent Compatible
 # ==========================================================
 
 import time
@@ -15,17 +15,20 @@ import subprocess
 import tempfile
 import uuid
 import argparse
+import hashlib
 
 import numpy as np
 import pandas as pd
 
 from training.train_xgboost import main as train_xgb
-from core.schema.feature_schema import get_schema_signature
+from core.schema.feature_schema import (
+    get_schema_signature,
+    schema_snapshot
+)
 from core.artifacts.metadata_manager import MetadataManager
 from core.config.env_loader import init_env
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
-
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,7 @@ LOCK_FILE = os.path.join(RUNS_DIR, ".training.lock")
 
 MAX_TRAINING_SECONDS = 7200
 GLOBAL_SEED = 42
+STRICT_GOVERNANCE = os.getenv("TRAINING_STRICT_GOVERNANCE", "1") == "1"
 
 
 # ==========================================================
@@ -52,7 +56,7 @@ def enforce_determinism():
 
 
 # ==========================================================
-# LOCKING (CRASH SAFE)
+# LOCKING
 # ==========================================================
 
 def _acquire_lock():
@@ -94,7 +98,7 @@ def get_git_commit():
             text=True
         ).stdout.strip()
 
-        if dirty:
+        if dirty and STRICT_GOVERNANCE:
             raise RuntimeError(
                 "Repository is dirty — commit ALL changes before training."
             )
@@ -103,9 +107,6 @@ def get_git_commit():
             ["git", "rev-parse", "HEAD"],
             stderr=subprocess.DEVNULL
         ).decode().strip()
-
-        if len(commit) != 40:
-            raise RuntimeError("Invalid git commit hash.")
 
         return commit
 
@@ -121,7 +122,6 @@ def get_git_commit():
 def save_manifest(run_id: str, manifest: dict):
 
     os.makedirs(RUNS_DIR, exist_ok=True)
-
     final_path = os.path.join(RUNS_DIR, f"{run_id}.json")
 
     with tempfile.NamedTemporaryFile(
@@ -135,10 +135,29 @@ def save_manifest(run_id: str, manifest: dict):
         json.dump(manifest, tmp, indent=4, sort_keys=True)
         tmp.flush()
         os.fsync(tmp.fileno())
-
         temp_name = tmp.name
 
     os.replace(temp_name, final_path)
+
+
+# ==========================================================
+# ENV + HARDWARE FINGERPRINT
+# ==========================================================
+
+def build_environment_fingerprint():
+
+    payload = {
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "platform": platform.platform(),
+        "hostname": socket.gethostname(),
+        "cpu_count": os.cpu_count(),
+        "env_hash": os.getenv("ENV_FINGERPRINT"),
+    }
+
+    canonical = json.dumps(payload, sort_keys=True).encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 # ==========================================================
@@ -149,23 +168,23 @@ def build_lineage(start_date, end_date):
 
     try:
         universe_snapshot = MarketUniverse.snapshot()
+        universe_hash = MarketUniverse.fingerprint()
     except Exception:
         universe_snapshot = "UNAVAILABLE"
+        universe_hash = "UNAVAILABLE"
 
     lineage_payload = {
         "schema_signature": get_schema_signature(),
+        "schema_snapshot": schema_snapshot(),
         "training_code_hash": MetadataManager.fingerprint_training_code(),
         "git_commit": get_git_commit(),
-        "python_version": platform.python_version(),
-        "numpy_version": np.__version__,
-        "pandas_version": pd.__version__,
-        "platform": platform.platform(),
-        "hostname": socket.gethostname(),
+        "environment_fingerprint": build_environment_fingerprint(),
         "training_window": {
             "start": start_date,
             "end": end_date
         },
-        "training_universe": universe_snapshot
+        "training_universe": universe_snapshot,
+        "universe_hash": universe_hash
     }
 
     canonical = json.dumps(lineage_payload, sort_keys=True).encode()
@@ -218,7 +237,6 @@ def main(create_baseline=False, promote_baseline=False):
             )
         except RuntimeError as e:
 
-            # 🔥 AUTO-FALLBACK LOGIC
             if create_baseline and "Baseline already exists" in str(e):
                 logger.warning(
                     "Baseline exists — retrying with promote mode."
