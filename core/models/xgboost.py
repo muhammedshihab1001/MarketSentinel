@@ -9,13 +9,14 @@ import os
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
-NUM_BOOST_ROUNDS = 600
-EARLY_STOPPING_ROUNDS = 50
+NUM_BOOST_ROUNDS = 1200
+EARLY_STOPPING_ROUNDS = 75
+VALIDATION_SPLIT = 0.15
 
 MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
 MIN_PRED_ENTROPY = 0.01
-MAX_MODEL_SIZE_MB = 100
+MAX_MODEL_SIZE_MB = 150
 MAX_ABS_SCORE = 50
 EPSILON = 1e-12
 
@@ -34,6 +35,8 @@ class SafeXGBRegressor:
         self.training_fingerprint = None
         self.booster_checksum = None
         self.best_iteration = None
+        self.train_rmse = None
+        self.valid_rmse = None
 
         random.seed(SEED)
         np.random.seed(SEED)
@@ -63,14 +66,10 @@ class SafeXGBRegressor:
         self.training_cols = X.shape[1]
 
         ###################################################
-        # TRAINING FINGERPRINT (robust)
+        # TRAINING FINGERPRINT
         ###################################################
 
-        dataset_payload = (
-            X.to_numpy().tobytes() +
-            y.tobytes()
-        )
-
+        dataset_payload = X.to_numpy().tobytes() + y.tobytes()
         self.training_fingerprint = hashlib.sha256(dataset_payload).hexdigest()
 
         ###################################################
@@ -83,17 +82,28 @@ class SafeXGBRegressor:
         ).hexdigest()
 
         ###################################################
-        # DMATRIX
+        # TRAIN / VALID SPLIT
         ###################################################
 
+        split_idx = int(len(X) * (1 - VALIDATION_SPLIT))
+
+        X_train, X_valid = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_valid = y[:split_idx], y[split_idx:]
+
         dtrain = xgb.DMatrix(
-            X,
-            label=y,
+            X_train,
+            label=y_train,
+            feature_names=self.feature_names,
+        )
+
+        dvalid = xgb.DMatrix(
+            X_valid,
+            label=y_valid,
             feature_names=self.feature_names,
         )
 
         ###################################################
-        # PARAMETERS
+        # PARAMETERS (Stronger but Stable)
         ###################################################
 
         use_gpu = os.getenv("XGB_USE_GPU", "false").lower() == "true"
@@ -101,14 +111,14 @@ class SafeXGBRegressor:
         params = {
             "objective": "reg:squarederror",
             "eval_metric": "rmse",
-            "max_depth": 6,
-            "eta": 0.05,
-            "subsample": 0.9,
-            "colsample_bytree": 0.9,
-            "min_child_weight": 1,
-            "gamma": 0.0,
-            "reg_alpha": 0.1,
-            "reg_lambda": 1.0,
+            "max_depth": 7,
+            "eta": 0.03,
+            "subsample": 0.85,
+            "colsample_bytree": 0.85,
+            "min_child_weight": 2,
+            "gamma": 0.05,
+            "reg_alpha": 0.3,
+            "reg_lambda": 1.2,
             "tree_method": "gpu_hist" if use_gpu else "hist",
             "seed": SEED,
             "nthread": 1,
@@ -127,7 +137,7 @@ class SafeXGBRegressor:
             params,
             dtrain,
             num_boost_round=NUM_BOOST_ROUNDS,
-            evals=[(dtrain, "train")],
+            evals=[(dtrain, "train"), (dvalid, "valid")],
             early_stopping_rounds=EARLY_STOPPING_ROUNDS,
             verbose_eval=False,
         )
@@ -137,6 +147,20 @@ class SafeXGBRegressor:
             if hasattr(self.model, "best_iteration")
             else NUM_BOOST_ROUNDS
         )
+
+        self.train_rmse = float(self.model.eval(dtrain).split(":")[1])
+        self.valid_rmse = float(self.model.eval(dvalid).split(":")[1])
+
+        ###################################################
+        # OVERFIT CHECK
+        ###################################################
+
+        if self.valid_rmse > self.train_rmse * 1.5:
+            logger.warning(
+                "Potential overfitting detected | train_rmse=%.5f | valid_rmse=%.5f",
+                self.train_rmse,
+                self.valid_rmse
+            )
 
         ###################################################
         # MODEL SIZE CHECK
@@ -164,7 +188,6 @@ class SafeXGBRegressor:
         if pred_std < MIN_SCORE_STD:
             raise RuntimeError("Score collapse detected.")
 
-        # entropy check
         hist, _ = np.histogram(preds, bins=20)
         probs = hist / (hist.sum() + EPSILON)
         entropy = -np.sum(probs * np.log(probs + EPSILON))
@@ -173,9 +196,11 @@ class SafeXGBRegressor:
             raise RuntimeError("Prediction entropy too low.")
 
         logger.info(
-            "XGB Regression trained | pred_std=%.6f | entropy=%.4f",
+            "XGB trained | pred_std=%.6f | entropy=%.4f | train_rmse=%.5f | valid_rmse=%.5f",
             pred_std,
-            entropy
+            entropy,
+            self.train_rmse,
+            self.valid_rmse
         )
 
         return self
@@ -262,9 +287,11 @@ class SafeXGBRegressor:
             "best_iteration": self.best_iteration,
             "param_checksum": self.param_checksum,
             "feature_checksum": self.feature_checksum,
+            "train_rmse": self.train_rmse,
+            "valid_rmse": self.valid_rmse,
         }
 
 
 def build_xgboost_pipeline():
-    logger.info("Building Institutional XGBoost Regression Model")
+    logger.info("Building XGBoost Regression Model (Enhanced Version)")
     return SafeXGBRegressor()
