@@ -7,7 +7,7 @@ MAX_FORECAST_DAYS = 90
 
 
 # =========================================================
-# EXISTING FORECAST REQUEST (UPDATED TO V2 STYLE)
+# FORECAST REQUEST (UNCHANGED)
 # =========================================================
 
 class PredictionRequest(BaseModel):
@@ -35,10 +35,6 @@ class PredictionRequest(BaseModel):
         le=MAX_FORECAST_DAYS,
         description="Number of days to forecast (max 90)"
     )
-
-    # ------------------------------
-    # Pydantic V2 Validators
-    # ------------------------------
 
     @field_validator("ticker")
     @classmethod
@@ -79,21 +75,27 @@ class PredictionRequest(BaseModel):
 
 
 # =========================================================
-# SIGNAL EXPLANATION RESPONSE
+# MULTI-AGENT SIGNAL EXPLANATION (UPDATED)
 # =========================================================
 
 class SignalExplanationResponse(BaseModel):
 
     ticker: str
     score: float
-    rank_pct: float
     signal: str
-    strength_score: float
+
+    # Multi-agent fields
+    agent_score: float
+    alpha_strength: float
+    confidence_numeric: float
+    governance_score: int
+
     risk_level: str
-    confidence: str
     volatility_regime: str
     trend: str
-    momentum_state: str
+
+    drift_flag: bool
+
     warnings: List[str]
     explanation: str
 
@@ -107,7 +109,6 @@ class SignalExplanationMeta(BaseModel):
     model_version: str
     schema_signature: str
     dataset_hash: str
-    training_code_hash: str
     artifact_hash: str
     latency_ms: int
     timestamp: int
