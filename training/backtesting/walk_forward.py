@@ -4,7 +4,6 @@ import logging
 
 from core.schema.feature_schema import (
     MODEL_FEATURES,
-    DTYPE,
     validate_feature_schema,
 )
 from training.backtesting.regime import MarketRegimeDetector
@@ -33,7 +32,6 @@ class WalkForwardValidator:
 
     SCORE_WINSOR_Q = 0.02
     BASE_DISPERSION = 0.05
-    DISPERSION_PERCENTILE = 0.40
     MIN_ACTIVE_POSITIONS = 4
 
     EPSILON = 1e-9
@@ -95,7 +93,7 @@ class WalkForwardValidator:
         return e / (np.sum(e) + self.EPSILON)
 
     # ==========================================================
-    # TURNOVER CALCULATION
+    # TURNOVER
     # ==========================================================
 
     def _compute_turnover(self, old_positions, new_positions):
@@ -196,6 +194,10 @@ class WalkForwardValidator:
                 if np.std(scores) < self.MIN_SCORE_STD:
                     continue
 
+                # dispersion guard
+                if np.std(scores) < self.BASE_DISPERSION:
+                    continue
+
                 scores = self._winsorize(scores)
                 scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
 
@@ -228,6 +230,10 @@ class WalkForwardValidator:
                 for t, w in zip(shorts["ticker"], short_w):
                     positions[t] = -min(float(w), self.MAX_POSITION_WEIGHT)
 
+                gross = sum(abs(v) for v in positions.values())
+                if abs(gross - self.TARGET_GROSS_EXPOSURE) > 0.05:
+                    continue
+
                 turnover = self._compute_turnover(prev_positions, positions)
                 turnover_sum += turnover
 
@@ -242,6 +248,8 @@ class WalkForwardValidator:
                     np.log(merged["close_exit"] * (1 - self.SLIPPAGE)) -
                     np.log(merged["close_entry"] * (1 + self.SLIPPAGE))
                 )
+
+                merged["ret"] = merged["ret"].clip(-0.5, 0.5)
 
                 period_ret = 0.0
 
@@ -288,6 +296,9 @@ class WalkForwardValidator:
     # ==========================================================
 
     def aggregate_results(self, results, equity_curve):
+
+        if not results or not equity_curve:
+            raise RuntimeError("Walk-forward produced no valid windows.")
 
         df = pd.DataFrame(results)
         curve = np.array(equity_curve)
