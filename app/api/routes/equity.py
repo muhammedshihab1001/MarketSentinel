@@ -77,7 +77,7 @@ async def equity_curve(days: int = 120):
 
 
 # =========================================================
-# SYNC HEAVY LOGIC
+# SYNC LOGIC
 # =========================================================
 
 def _equity_curve_sync(days: int):
@@ -115,7 +115,10 @@ def _equity_curve_sync(days: int):
 
         df = df.sort_values("date").reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-        df["forward_return"] = df["close"].shift(-1) / df["close"] - 1
+
+        df["forward_return"] = (
+            df["close"].shift(-1) / df["close"] - 1
+        ).replace([np.inf, -np.inf], np.nan)
 
         cleaned_history[ticker] = df
 
@@ -123,24 +126,27 @@ def _equity_curve_sync(days: int):
         raise RuntimeError("No valid price data available.")
 
     # =========================================================
-    # BUILD FEATURES
+    # BUILD FEATURES (UPDATED)
     # =========================================================
 
     datasets = []
 
     for ticker, df in cleaned_history.items():
 
-        features = pipeline.feature_store.get_features(
-            price_df=df,
-            sentiment_df=None,
-            ticker=ticker,
-            training=False
-        )
+        try:
+            features = FeatureEngineer.build_feature_pipeline(
+                price_df=df,
+                sentiment_df=None,
+                training=False
+            )
 
-        if features is None or features.empty:
-            continue
+            if features is None or features.empty:
+                continue
 
-        datasets.append(features)
+            datasets.append(features)
+
+        except Exception:
+            logger.warning("Feature build failed for %s", ticker)
 
     if not datasets:
         raise RuntimeError("No feature datasets built.")
@@ -158,7 +164,7 @@ def _equity_curve_sync(days: int):
     model = loader.xgb
 
     # =========================================================
-    # PRODUCTION-ALIGNED HISTORICAL SIGNAL GENERATION
+    # HISTORICAL SIGNAL GENERATION
     # =========================================================
 
     for eval_date in eval_dates:
@@ -191,9 +197,12 @@ def _equity_curve_sync(days: int):
 
         weights = pipeline._construct_portfolio(longs, shorts)
 
-        # Apply risk scaling from drift detector
-        drift_result = pipeline.drift_detector.detect(feature_df)
-        exposure_scale = drift_result.get("exposure_scale", 1.0)
+        # Safe drift scaling (baseline may not exist)
+        try:
+            drift_result = pipeline.drift_detector.detect(feature_df)
+            exposure_scale = drift_result.get("exposure_scale", 1.0)
+        except Exception:
+            exposure_scale = 1.0
 
         for ticker in weights:
             weights[ticker] *= exposure_scale
@@ -227,7 +236,7 @@ def _equity_curve_sync(days: int):
     report = engine.evaluate(portfolio_df, forward_df)
 
     # =========================================================
-    # BENCHMARK
+    # BENCHMARK (ALIGNED)
     # =========================================================
 
     benchmark_df = market_data.get_price_data(
@@ -238,18 +247,31 @@ def _equity_curve_sync(days: int):
         min_history=MIN_HISTORY_ROWS
     )
 
-    benchmark_df = benchmark_df.sort_values("date")
-    benchmark_df["date"] = pd.to_datetime(
-        benchmark_df["date"]
-    ).dt.normalize()
+    benchmark_equity = []
 
-    benchmark_df["forward_return"] = (
-        benchmark_df["close"].shift(-1) /
-        benchmark_df["close"] - 1
-    )
+    if benchmark_df is not None and not benchmark_df.empty:
 
-    benchmark_returns = benchmark_df.set_index("date")["forward_return"].dropna()
-    benchmark_equity = (1 + benchmark_returns).cumprod()
+        benchmark_df = benchmark_df.sort_values("date")
+        benchmark_df["date"] = pd.to_datetime(
+            benchmark_df["date"]
+        ).dt.normalize()
+
+        benchmark_df["forward_return"] = (
+            benchmark_df["close"].shift(-1) /
+            benchmark_df["close"] - 1
+        )
+
+        benchmark_returns = (
+            benchmark_df
+            .set_index("date")["forward_return"]
+            .reindex(report.equity_curve.index)
+            .dropna()
+        )
+
+        if len(benchmark_returns) > 1:
+            benchmark_equity = (
+                (1 + benchmark_returns).cumprod().tolist()
+            )
 
     # =========================================================
     # OUTPUT
@@ -264,7 +286,7 @@ def _equity_curve_sync(days: int):
         },
         "benchmark": {
             "ticker": BENCHMARK_TICKER,
-            "equity": benchmark_equity.tolist()
+            "equity": benchmark_equity
         },
         "governance": {
             "model_version": loader.xgb_version,
