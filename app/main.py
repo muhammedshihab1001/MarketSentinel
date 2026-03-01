@@ -3,6 +3,8 @@ import time
 import gc
 import hashlib
 import os
+import psutil
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Response, Request, HTTPException
@@ -10,6 +12,7 @@ from fastapi.responses import JSONResponse
 from prometheus_client import generate_latest
 
 from core.config.env_loader import init_env, get_int, get_env, get_bool
+from core.schema.feature_schema import get_schema_signature
 
 from app.api.routes import (
     drift,
@@ -25,6 +28,7 @@ from app.api.routes import (
 
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
+from core.monitoring.drift_detector import DriftDetector
 
 
 # =====================================================
@@ -50,7 +54,7 @@ BOOT_ID = hashlib.sha256(
 ).hexdigest()[:12]
 
 STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 120)
-APP_VERSION = get_env("APP_VERSION", "3.3.1")
+APP_VERSION = get_env("APP_VERSION", "4.0.0")  # bumped
 
 
 # =====================================================
@@ -62,6 +66,7 @@ class ReadinessState:
     def __init__(self):
         self.models_loaded = False
         self.redis_connected = False
+        self.drift_baseline_loaded = False
 
         self.schema_signature = None
         self.model_version = None
@@ -69,9 +74,6 @@ class ReadinessState:
         self.dataset_hash = None
         self.training_code_hash = None
 
-        # -------------------------
-        # LLM STATE (NEW)
-        # -------------------------
         self.llm_enabled = False
         self.llm_model = None
         self.llm_rate_limit = None
@@ -79,6 +81,8 @@ class ReadinessState:
 
         self.boot_id = BOOT_ID
         self.start_time = int(time.time())
+        self.boot_memory_mb = None
+        self.config_fingerprint = None
 
     @property
     def ready(self):
@@ -86,6 +90,30 @@ class ReadinessState:
 
 
 readiness = ReadinessState()
+
+
+# =====================================================
+# REQUEST MIDDLEWARE
+# =====================================================
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+
+    request_id = str(uuid.uuid4())[:12]
+    start = time.time()
+
+    try:
+        response = await call_next(request)
+        latency = time.time() - start
+
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time"] = str(round(latency, 4))
+
+        return response
+
+    except Exception:
+        logger.exception("Request failure | id=%s", request_id)
+        raise
 
 
 # =====================================================
@@ -98,7 +126,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         raise exc
 
     logger.exception("Unhandled API error")
-
     return JSONResponse(
         status_code=500,
         content={"error": "internal_server_error"}
@@ -135,23 +162,36 @@ async def lifespan(app: FastAPI):
         readiness.dataset_hash = loader.dataset_hash
         readiness.training_code_hash = loader.training_code_hash
 
-        if not readiness.schema_signature:
-            raise RuntimeError("Schema signature missing at startup.")
+        if readiness.schema_signature != get_schema_signature():
+            raise RuntimeError("Runtime schema mismatch.")
 
         # -------------------------------------------------
         # REDIS CHECK
         # -------------------------------------------------
 
         cache = RedisCache()
+        readiness.redis_connected = cache.enabled
 
-        if cache.enabled:
-            readiness.redis_connected = True
+        if readiness.redis_connected:
             logger.info("Redis connected.")
         else:
             logger.warning("Redis unavailable — degraded mode.")
 
         # -------------------------------------------------
-        # LLM STATE CAPTURE (NEW)
+        # DRIFT BASELINE CHECK
+        # -------------------------------------------------
+
+        try:
+            detector = DriftDetector()
+            detector._load_verified_baseline()
+            readiness.drift_baseline_loaded = True
+            logger.info("Drift baseline verified.")
+        except Exception:
+            logger.warning("Drift baseline missing or invalid.")
+            readiness.drift_baseline_loaded = False
+
+        # -------------------------------------------------
+        # LLM STATE CAPTURE
         # -------------------------------------------------
 
         readiness.llm_enabled = get_bool("LLM_ENABLED", False)
@@ -159,15 +199,18 @@ async def lifespan(app: FastAPI):
         readiness.llm_rate_limit = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
         readiness.llm_cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
 
-        if readiness.llm_enabled:
-            logger.info(
-                "LLM active | model=%s | rate_limit=%s/min | cache=%s",
-                readiness.llm_model,
-                readiness.llm_rate_limit,
-                readiness.llm_cache_enabled
-            )
-        else:
-            logger.info("LLM disabled at startup.")
+        # -------------------------------------------------
+        # SYSTEM RESOURCE SNAPSHOT
+        # -------------------------------------------------
+
+        process = psutil.Process(os.getpid())
+        readiness.boot_memory_mb = round(
+            process.memory_info().rss / (1024 * 1024), 2
+        )
+
+        readiness.config_fingerprint = hashlib.sha256(
+            str(os.environ).encode()
+        ).hexdigest()[:16]
 
         gc.collect()
 
@@ -177,9 +220,7 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("Startup exceeded timeout.")
 
         logger.info("System ready in %.2fs", boot_time)
-        logger.info("Schema signature: %s", readiness.schema_signature)
-        logger.info("Model version: %s", readiness.model_version)
-        logger.info("Artifact hash: %s", readiness.artifact_hash)
+        logger.info("Memory usage: %s MB", readiness.boot_memory_mb)
 
         yield
 
@@ -268,18 +309,16 @@ def readiness_probe():
         "schema_signature": readiness.schema_signature,
         "training_code_hash": readiness.training_code_hash,
         "redis_connected": readiness.redis_connected,
+        "drift_baseline_loaded": readiness.drift_baseline_loaded,
+        "memory_mb": readiness.boot_memory_mb,
+        "config_fingerprint": readiness.config_fingerprint,
         "mode": "degraded" if not readiness.redis_connected else "normal",
-
-        # -------------------------
-        # LLM STATE (NEW)
-        # -------------------------
         "llm": {
             "enabled": readiness.llm_enabled,
             "model": readiness.llm_model,
             "rate_limit_per_min": readiness.llm_rate_limit,
             "cache_enabled": readiness.llm_cache_enabled
         },
-
         "uptime_seconds": int(time.time()) - readiness.start_time
     }
 
