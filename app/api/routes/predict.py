@@ -208,7 +208,7 @@ async def signal_explanation(ticker: str):
 
         agent_data = row.get("agent", {})
 
-        direction = row.get("signal", "NEUTRAL")
+        direction = agent_data.get("signal", "NEUTRAL")
 
         explanation = SignalExplanationResponse(
             ticker=row["ticker"],
