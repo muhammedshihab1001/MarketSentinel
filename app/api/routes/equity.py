@@ -14,6 +14,8 @@ from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
     DTYPE,
+    LONG_PERCENTILE,
+    SHORT_PERCENTILE,
 )
 
 from app.inference.pipeline import InferencePipeline, get_shared_model_loader
@@ -31,10 +33,9 @@ MIN_ASSETS_PER_DAY = 4
 BENCHMARK_TICKER = "SPY"
 REQUEST_TIMEOUT = 60
 MAX_CONCURRENT = 2
-MIN_PROB_STD = 1e-6
+MIN_SCORE_STD = 1e-6
 
 equity_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
 _pipeline: InferencePipeline | None = None
 
 
@@ -44,6 +45,10 @@ def get_pipeline():
         _pipeline = InferencePipeline()
     return _pipeline
 
+
+# =========================================================
+# ASYNC ENTRYPOINT
+# =========================================================
 
 @router.get("/equity-curve")
 async def equity_curve(days: int = 120):
@@ -58,7 +63,6 @@ async def equity_curve(days: int = 120):
                 run_in_threadpool(_equity_curve_sync, days),
                 timeout=REQUEST_TIMEOUT
             )
-
         return result
 
     except asyncio.TimeoutError:
@@ -74,6 +78,10 @@ async def equity_curve(days: int = 120):
         API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
 
 
+# =========================================================
+# SYNC HEAVY LOGIC
+# =========================================================
+
 def _equity_curve_sync(days: int):
 
     engine = PerformanceEngine()
@@ -86,9 +94,9 @@ def _equity_curve_sync(days: int):
     end_date = pd.Timestamp.utcnow().normalize()
     start_date = end_date - pd.Timedelta(days=days + 365)
 
-    ############################################################
-    # 1️⃣ FETCH PRICE HISTORY
-    ############################################################
+    # =========================================================
+    # FETCH PRICE HISTORY
+    # =========================================================
 
     price_history = market_data.get_price_data_batch(
         tickers=universe,
@@ -114,9 +122,9 @@ def _equity_curve_sync(days: int):
     if not cleaned_history:
         raise RuntimeError("No valid price data available.")
 
-    ############################################################
-    # 2️⃣ BUILD FEATURE DATASETS
-    ############################################################
+    # =========================================================
+    # BUILD FEATURE DATASETS
+    # =========================================================
 
     datasets = []
 
@@ -137,9 +145,9 @@ def _equity_curve_sync(days: int):
     if not datasets:
         raise RuntimeError("No feature datasets built.")
 
-    ############################################################
-    # 3️⃣ CROSS-SECTIONAL ALIGNMENT
-    ############################################################
+    # =========================================================
+    # CROSS-SECTIONAL ALIGNMENT
+    # =========================================================
 
     full_df = pd.concat(datasets, ignore_index=True)
     full_df = full_df.sort_values(["date", "ticker"]).reset_index(drop=True)
@@ -147,19 +155,15 @@ def _equity_curve_sync(days: int):
     full_df = FeatureEngineer.add_cross_sectional_features(full_df)
     full_df = FeatureEngineer.finalize(full_df)
 
-    ############################################################
-    # 4️⃣ EVALUATION DATES
-    ############################################################
-
     combined_dates = sorted(full_df["date"].unique())
     eval_dates = combined_dates[-days:]
 
-    ############################################################
-    # 5️⃣ HISTORICAL SIGNAL GENERATION
-    ############################################################
-
     portfolio_records = []
     model = loader.xgb
+
+    # =========================================================
+    # HISTORICAL SIGNAL GENERATION (REGRESSION)
+    # =========================================================
 
     for eval_date in eval_dates:
 
@@ -178,24 +182,41 @@ def _equity_curve_sync(days: int):
                 mode="inference"
             ).astype(DTYPE)
 
-            probs = model.predict_proba(feature_df)[:, 1]
-            probs = np.clip(probs, 1e-6, 1 - 1e-6)
+            scores = model.predict(feature_df)
 
-            if np.std(probs) < MIN_PROB_STD:
-                probs = np.full_like(probs, 0.5)
+            if np.std(scores) < MIN_SCORE_STD:
+                continue
 
-            snapshot["score"] = probs
+            # Cross-sectional z-score
+            scores = (scores - scores.mean()) / (scores.std() + 1e-12)
+
+            snapshot["score"] = scores
+
             snapshot["rank_pct"] = snapshot["score"].rank(
                 method="first", pct=True
             )
 
-            weights = pipeline._construct_portfolio(snapshot)
+            snapshot["signal"] = snapshot["rank_pct"].apply(
+                lambda x: "LONG" if x >= LONG_PERCENTILE
+                else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
+            )
+
+            long_slice = snapshot[snapshot["signal"] == "LONG"]
+            short_slice = snapshot[snapshot["signal"] == "SHORT"]
+
+            if long_slice.empty or short_slice.empty:
+                continue
+
+            weights = pipeline._construct_portfolio(
+                long_slice,
+                short_slice
+            )
 
             for _, row in snapshot.iterrows():
                 portfolio_records.append({
                     "date": eval_date,
                     "ticker": row["ticker"],
-                    "weight": weights.get(row["ticker"], 0.0)
+                    "weight": float(weights.get(row["ticker"], 0.0))
                 })
 
         except Exception as e:
@@ -206,9 +227,9 @@ def _equity_curve_sync(days: int):
 
     portfolio_df = pd.DataFrame(portfolio_records)
 
-    ############################################################
-    # 6️⃣ FORWARD RETURNS
-    ############################################################
+    # =========================================================
+    # FORWARD RETURNS
+    # =========================================================
 
     forward_frames = []
 
@@ -220,9 +241,9 @@ def _equity_curve_sync(days: int):
     forward_df = pd.concat(forward_frames, ignore_index=True)
     forward_df.dropna(inplace=True)
 
-    ############################################################
-    # 7️⃣ BENCHMARK RETURNS
-    ############################################################
+    # =========================================================
+    # BENCHMARK
+    # =========================================================
 
     benchmark_df = market_data.get_price_data(
         ticker=BENCHMARK_TICKER,
@@ -248,19 +269,15 @@ def _equity_curve_sync(days: int):
         .dropna()
     )
 
-    ############################################################
-    # 8️⃣ STRATEGY PERFORMANCE
-    ############################################################
+    # =========================================================
+    # STRATEGY PERFORMANCE
+    # =========================================================
 
     report = engine.evaluate(
         portfolio_df,
         forward_df,
         benchmark_returns=benchmark_returns
     )
-
-    ############################################################
-    # 9️⃣ ALIGN STRATEGY + BENCHMARK
-    ############################################################
 
     aligned_benchmark = benchmark_returns.reindex(
         report.equity_curve.index
@@ -275,9 +292,9 @@ def _equity_curve_sync(days: int):
 
     benchmark_equity = (1 + aligned_benchmark).cumprod()
 
-    ############################################################
-    # 🔟 STRUCTURED OUTPUT
-    ############################################################
+    # =========================================================
+    # OUTPUT
+    # =========================================================
 
     return {
         "summary": report.to_dict(),
