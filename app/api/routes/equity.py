@@ -14,8 +14,6 @@ from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
     DTYPE,
-    LONG_PERCENTILE,
-    SHORT_PERCENTILE,
 )
 
 from app.inference.pipeline import InferencePipeline, get_shared_model_loader
@@ -29,7 +27,7 @@ router = APIRouter()
 logger = logging.getLogger("marketsentinel.equity")
 
 MIN_HISTORY_ROWS = 60
-MIN_ASSETS_PER_DAY = 4
+MIN_ASSETS_PER_DAY = 6
 BENCHMARK_TICKER = "SPY"
 REQUEST_TIMEOUT = 60
 MAX_CONCURRENT = 2
@@ -84,6 +82,8 @@ async def equity_curve(days: int = 120):
 
 def _equity_curve_sync(days: int):
 
+    start_time = time.time()
+
     engine = PerformanceEngine()
     pipeline = get_pipeline()
     loader = get_shared_model_loader()
@@ -123,7 +123,7 @@ def _equity_curve_sync(days: int):
         raise RuntimeError("No valid price data available.")
 
     # =========================================================
-    # BUILD FEATURE DATASETS
+    # BUILD FEATURES
     # =========================================================
 
     datasets = []
@@ -145,10 +145,6 @@ def _equity_curve_sync(days: int):
     if not datasets:
         raise RuntimeError("No feature datasets built.")
 
-    # =========================================================
-    # CROSS-SECTIONAL ALIGNMENT
-    # =========================================================
-
     full_df = pd.concat(datasets, ignore_index=True)
     full_df = full_df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
@@ -162,65 +158,52 @@ def _equity_curve_sync(days: int):
     model = loader.xgb
 
     # =========================================================
-    # HISTORICAL SIGNAL GENERATION (REGRESSION)
+    # PRODUCTION-ALIGNED HISTORICAL SIGNAL GENERATION
     # =========================================================
 
     for eval_date in eval_dates:
 
         snapshot = full_df[full_df["date"] == eval_date].copy()
 
-        if snapshot.empty:
-            continue
-
         if snapshot["ticker"].nunique() < MIN_ASSETS_PER_DAY:
             continue
 
-        try:
+        feature_df = validate_feature_schema(
+            snapshot.loc[:, MODEL_FEATURES],
+            mode="inference"
+        ).astype(DTYPE)
 
-            feature_df = validate_feature_schema(
-                snapshot.loc[:, MODEL_FEATURES],
-                mode="inference"
-            ).astype(DTYPE)
+        scores = model.predict(feature_df)
 
-            scores = model.predict(feature_df)
+        if np.std(scores) < MIN_SCORE_STD:
+            continue
 
-            if np.std(scores) < MIN_SCORE_STD:
-                continue
+        scores = (scores - scores.mean()) / (scores.std() + 1e-12)
+        snapshot["score"] = scores
 
-            # Cross-sectional z-score
-            scores = (scores - scores.mean()) / (scores.std() + 1e-12)
+        ranked = snapshot.sort_values("score")
 
-            snapshot["score"] = scores
+        longs = ranked.tail(pipeline.TOP_K)
+        shorts = ranked.head(pipeline.BOTTOM_K)
 
-            snapshot["rank_pct"] = snapshot["score"].rank(
-                method="first", pct=True
-            )
+        if longs.empty or shorts.empty:
+            continue
 
-            snapshot["signal"] = snapshot["rank_pct"].apply(
-                lambda x: "LONG" if x >= LONG_PERCENTILE
-                else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
-            )
+        weights = pipeline._construct_portfolio(longs, shorts)
 
-            long_slice = snapshot[snapshot["signal"] == "LONG"]
-            short_slice = snapshot[snapshot["signal"] == "SHORT"]
+        # Apply risk scaling from drift detector
+        drift_result = pipeline.drift_detector.detect(feature_df)
+        exposure_scale = drift_result.get("exposure_scale", 1.0)
 
-            if long_slice.empty or short_slice.empty:
-                continue
+        for ticker in weights:
+            weights[ticker] *= exposure_scale
 
-            weights = pipeline._construct_portfolio(
-                long_slice,
-                short_slice
-            )
-
-            for _, row in snapshot.iterrows():
-                portfolio_records.append({
-                    "date": eval_date,
-                    "ticker": row["ticker"],
-                    "weight": float(weights.get(row["ticker"], 0.0))
-                })
-
-        except Exception as e:
-            logger.warning(f"Historical skip {eval_date} — {str(e)}")
+        for _, row in snapshot.iterrows():
+            portfolio_records.append({
+                "date": eval_date,
+                "ticker": row["ticker"],
+                "weight": float(weights.get(row["ticker"], 0.0))
+            })
 
     if not portfolio_records:
         raise RuntimeError("No portfolio history generated.")
@@ -240,6 +223,8 @@ def _equity_curve_sync(days: int):
 
     forward_df = pd.concat(forward_frames, ignore_index=True)
     forward_df.dropna(inplace=True)
+
+    report = engine.evaluate(portfolio_df, forward_df)
 
     # =========================================================
     # BENCHMARK
@@ -263,34 +248,8 @@ def _equity_curve_sync(days: int):
         benchmark_df["close"] - 1
     )
 
-    benchmark_returns = (
-        benchmark_df
-        .set_index("date")["forward_return"]
-        .dropna()
-    )
-
-    # =========================================================
-    # STRATEGY PERFORMANCE
-    # =========================================================
-
-    report = engine.evaluate(
-        portfolio_df,
-        forward_df,
-        benchmark_returns=benchmark_returns
-    )
-
-    aligned_benchmark = benchmark_returns.reindex(
-        report.equity_curve.index
-    ).dropna()
-
-    if aligned_benchmark.empty:
-        raise RuntimeError("Benchmark alignment failed.")
-
-    aligned_strategy = report.equity_curve.loc[
-        aligned_benchmark.index
-    ]
-
-    benchmark_equity = (1 + aligned_benchmark).cumprod()
+    benchmark_returns = benchmark_df.set_index("date")["forward_return"].dropna()
+    benchmark_equity = (1 + benchmark_returns).cumprod()
 
     # =========================================================
     # OUTPUT
@@ -299,14 +258,19 @@ def _equity_curve_sync(days: int):
     return {
         "summary": report.to_dict(),
         "series": {
-            "dates": [
-                d.strftime("%Y-%m-%d")
-                for d in benchmark_equity.index
-            ],
-            "strategy_equity": aligned_strategy.tolist(),
-            "benchmark_equity": benchmark_equity.tolist(),
-            "drawdown": report.drawdown_series.loc[
-                benchmark_equity.index
-            ].tolist(),
-        }
+            "dates": [d.strftime("%Y-%m-%d") for d in report.equity_curve.index],
+            "strategy_equity": report.equity_curve.tolist(),
+            "drawdown": report.drawdown_series.tolist(),
+        },
+        "benchmark": {
+            "ticker": BENCHMARK_TICKER,
+            "equity": benchmark_equity.tolist()
+        },
+        "governance": {
+            "model_version": loader.xgb_version,
+            "schema_signature": loader.schema_signature,
+            "artifact_hash": loader.artifact_hash,
+        },
+        "latency_ms": int((time.time() - start_time) * 1000),
+        "timestamp": int(time.time())
     }
