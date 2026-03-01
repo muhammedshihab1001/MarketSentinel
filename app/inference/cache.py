@@ -28,7 +28,7 @@ class RedisCache:
     MIN_TTL = 30
 
     MAX_PAYLOAD_BYTES = 256_000
-    CACHE_NAMESPACE_VERSION = "v7"  # bumped
+    CACHE_NAMESPACE_VERSION = "v8"  # bumped for clean version
 
     ###################################################
 
@@ -163,22 +163,16 @@ class RedisCache:
         )
 
     ###################################################
-    # SNAPSHOT VALIDATION (Aligned With Current Pipeline)
+    # SNAPSHOT VALIDATION
     ###################################################
 
     def _validate_snapshot(self, value):
 
         if not isinstance(value, dict):
-            raise RuntimeError("Cache payload must be snapshot dict.")
+            raise RuntimeError("Cache payload must be dict.")
 
-        required_top = {
-            "snapshot_date",
-            "universe_size",
-            "signals"
-        }
-
-        if not required_top.issubset(value.keys()):
-            raise RuntimeError("Snapshot missing required fields.")
+        if "signals" not in value:
+            raise RuntimeError("Snapshot missing signals.")
 
         if not isinstance(value["signals"], list):
             raise RuntimeError("Signals must be list.")
@@ -188,18 +182,11 @@ class RedisCache:
             if not isinstance(row, dict):
                 raise RuntimeError("Invalid signal row.")
 
-            required_row = {
-                "ticker",
-                "weight"
-            }
+            ticker = row.get("ticker")
+            weight = row.get("weight", 0)
 
-            if not required_row.issubset(row.keys()):
-                raise RuntimeError("Signal row missing fields.")
-
-            if not isinstance(row["ticker"], str):
+            if not isinstance(ticker, str):
                 raise RuntimeError("Invalid ticker type.")
-
-            weight = row["weight"]
 
             if not isinstance(weight, (int, float)):
                 raise RuntimeError("Invalid weight type.")
@@ -228,10 +215,15 @@ class RedisCache:
             if not data:
                 return None
 
+            if len(data) > self.MAX_PAYLOAD_BYTES:
+                logger.warning("Raw cache payload too large. Deleting.")
+                self.client.delete(key)
+                return None
+
             decompressed = zlib.decompress(data)
 
             if len(decompressed) > self.MAX_PAYLOAD_BYTES:
-                logger.warning("Oversized cache entry removed.")
+                logger.warning("Oversized decompressed cache entry removed.")
                 self.client.delete(key)
                 return None
 
@@ -255,15 +247,21 @@ class RedisCache:
             return None
 
     ###################################################
-    # SET (NOW SUPPORTS ex= LIKE REAL REDIS)
+    # SET
     ###################################################
 
-    def set(self, key: str, value, ttl: Optional[int] = None, ex: Optional[int] = None):
+    def set(
+        self,
+        key: str,
+        value,
+        ttl: Optional[int] = None,
+        ex: Optional[int] = None
+    ):
 
         """
-        Supports both:
+        Supports:
             set(key, value, ttl=...)
-            set(key, value, ex=...)   <-- native Redis style
+            set(key, value, ex=...)
         """
 
         self._maybe_reconnect()
@@ -275,7 +273,6 @@ class RedisCache:
 
             self._validate_snapshot(value)
 
-            # Priority: explicit ex > ttl > env default
             ttl_value = ex if ex is not None else ttl
 
             if ttl_value is None:
@@ -285,7 +282,7 @@ class RedisCache:
 
             ttl_value = max(self.MIN_TTL, min(ttl_value, self.MAX_TTL))
 
-            # Small jitter to avoid thundering herd
+            # Light jitter (avoid thundering herd)
             jitter = int(ttl_value * 0.15)
             final_ttl = ttl_value + random.randint(-jitter, jitter)
             final_ttl = max(self.MIN_TTL, min(final_ttl, self.MAX_TTL))
@@ -293,7 +290,8 @@ class RedisCache:
             serialized = self._canonical_json(value).encode()
 
             if len(serialized) > self.MAX_PAYLOAD_BYTES:
-                raise RuntimeError("Payload exceeds safe cache size.")
+                logger.warning("Cache payload too large. Skipping cache.")
+                return
 
             payload = zlib.compress(serialized)
 
