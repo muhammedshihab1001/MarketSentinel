@@ -1,4 +1,6 @@
 import logging
+import asyncio
+import time
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 
@@ -9,7 +11,22 @@ router = APIRouter()
 logger = logging.getLogger("marketsentinel.agent")
 
 # =========================================================
-# LAZY LLM EXPLAINER (SAFE INIT)
+# SINGLETON PIPELINE
+# =========================================================
+
+_pipeline: InferencePipeline | None = None
+
+
+def get_pipeline() -> InferencePipeline:
+    global _pipeline
+    if _pipeline is None:
+        logger.info("Initializing InferencePipeline (singleton)")
+        _pipeline = InferencePipeline()
+    return _pipeline
+
+
+# =========================================================
+# LAZY LLM EXPLAINER
 # =========================================================
 
 _explainer_instance: LLMExplainer | None = None
@@ -33,21 +50,26 @@ async def explain_signal(
     include_llm: bool = Query(True, description="Include LLM explanation")
 ):
 
+    start_time = time.time()
+
     try:
         if not ticker or not isinstance(ticker, str):
             raise HTTPException(status_code=400, detail="Invalid ticker")
 
         ticker = ticker.upper().strip()
 
-        pipeline = InferencePipeline()
+        pipeline = get_pipeline()
 
         # -------------------------------------------------
         # Run snapshot safely in threadpool
         # -------------------------------------------------
 
-        snapshot = await run_in_threadpool(
-            pipeline.run_snapshot,
-            [ticker]
+        snapshot = await asyncio.wait_for(
+            run_in_threadpool(
+                pipeline.run_snapshot,
+                [ticker]
+            ),
+            timeout=25
         )
 
         if not isinstance(snapshot, dict):
@@ -59,14 +81,13 @@ async def explain_signal(
             raise HTTPException(status_code=404, detail="Ticker not found")
 
         # -------------------------------------------------
-        # Find correct ticker row (safe)
+        # Find correct ticker row
         # -------------------------------------------------
 
-        row = None
-        for s in signals:
-            if s.get("ticker") == ticker:
-                row = s
-                break
+        row = next(
+            (s for s in signals if s.get("ticker") == ticker),
+            None
+        )
 
         if row is None:
             raise HTTPException(status_code=404, detail="Ticker not in snapshot")
@@ -74,13 +95,8 @@ async def explain_signal(
         agent_output = row.get("agent", {})
         drift_info = snapshot.get("drift", {})
 
-        probability_stats = {
-            "mean_score": snapshot.get("score_mean"),
-            "std_score": snapshot.get("score_std"),
-        }
-
         # -------------------------------------------------
-        # Optional LLM EXPLANATION
+        # Optional LLM Explanation
         # -------------------------------------------------
 
         llm_output = None
@@ -91,43 +107,53 @@ async def explain_signal(
             llm_output = await explainer.explain(
                 signal_row=row,
                 agent_output=agent_output,
-                probability_stats=probability_stats
+                probability_stats={
+                    "mean_score": snapshot.get("score_mean"),
+                    "std_score": snapshot.get("score_std"),
+                }
             )
 
         # -------------------------------------------------
-        # Structured Institutional Response
+        # Structured Response (Aligned With Current Schema)
         # -------------------------------------------------
 
         response = {
             "ticker": ticker,
             "snapshot_date": snapshot.get("snapshot_date"),
+
+            # Core signal
             "signal": agent_output.get("signal"),
-            "score": row.get("score"),
+            "raw_model_score": row.get("raw_model_score"),
             "weight": row.get("weight"),
 
-            # Hybrid breakdown
-            "alpha_confidence": agent_output.get("confidence"),
-            "strength_score": agent_output.get("strength_score"),
+            # Agent metrics
+            "agent_score": agent_output.get("agent_score"),
+            "confidence_numeric": agent_output.get("confidence_numeric"),
+            "governance_score": agent_output.get("governance_score"),
             "risk_level": agent_output.get("risk_level"),
-            "trend": agent_output.get("trend"),
-            "momentum": agent_output.get("momentum_state"),
-            "macro_regime": agent_output.get("macro_regime"),
             "volatility_regime": agent_output.get("volatility_regime"),
 
-            # Governance
+            # Drift governance
             "drift_state": drift_info.get("drift_state"),
             "drift_severity": drift_info.get("severity_score"),
             "exposure_scale": drift_info.get("exposure_scale"),
 
-            # Structured reasoning
+            # Reasoning
             "warnings": agent_output.get("warnings", []),
-            "reasoning": agent_output.get("reasoning", []),
+            "explanation": agent_output.get("explanation", ""),
 
             # Optional LLM narrative
-            "llm": llm_output
+            "llm": llm_output,
+
+            # Observability
+            "latency_ms": int((time.time() - start_time) * 1000),
+            "timestamp": int(time.time())
         }
 
         return response
+
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Agent explanation timeout")
 
     except HTTPException:
         raise
