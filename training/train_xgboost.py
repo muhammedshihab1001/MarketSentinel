@@ -1,3 +1,7 @@
+# ==========================================================
+# TRAIN XGBOOST REGRESSION (Institutional Version)
+# ==========================================================
+
 import os
 import time
 import joblib
@@ -68,8 +72,7 @@ def compute_dataset_hash(df: pd.DataFrame) -> str:
 
 
 def compute_feature_checksum():
-    canonical = json.dumps(list(MODEL_FEATURES), sort_keys=False).encode()
-    return hashlib.sha256(canonical).hexdigest()
+    return MetadataManager.fingerprint_features(tuple(MODEL_FEATURES))
 
 
 def compute_training_code_hash():
@@ -229,7 +232,7 @@ def build_target(df: pd.DataFrame):
 
 
 # ==========================================================
-# TRAINERS (REGRESSION SAFE)
+# TRAINERS
 # ==========================================================
 
 def trainer(train_df):
@@ -285,13 +288,12 @@ def export_artifacts(model, metrics, dataset_hash,
         dataset_hash=dataset_hash,
         dataset_rows=len(final_df),
         metadata_type="training_manifest_v1",
+        feature_checksum=compute_feature_checksum(),
         extra_fields={
             "artifact_hash": artifact_hash,
-            "feature_checksum": compute_feature_checksum(),
             "schema_snapshot": schema_snapshot(),
-            "universe_hash": MarketUniverse.fingerprint(),
-            "training_code_hash": compute_training_code_hash(),
-            "model_type": "regression"
+            "model_type": "regression",
+            "artifact_version": timestamp
         }
     )
 
@@ -323,6 +325,8 @@ def export_artifacts(model, metrics, dataset_hash,
             temp_name = tmp.name
 
         os.replace(temp_name, pointer_path)
+
+    logger.info("Model exported successfully | version=%s", timestamp)
 
     return timestamp
 
@@ -362,4 +366,20 @@ def main(create_baseline=False,
         final_df,
         create_baseline=create_baseline,
         promote_baseline=promote_baseline
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--create-baseline", action="store_true")
+    parser.add_argument("--promote-baseline", action="store_true")
+    parser.add_argument("--allow-soft-fail", action="store_true")
+
+    args = parser.parse_args()
+
+    main(
+        create_baseline=args.create_baseline,
+        promote_baseline=args.promote_baseline,
+        allow_soft_fail=args.allow_soft_fail
     )
