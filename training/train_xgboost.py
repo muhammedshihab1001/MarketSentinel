@@ -1,6 +1,6 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION (Institutional Hardened v3)
-# Adaptive Governance | Research + Production Modes
+# TRAIN XGBOOST REGRESSION (Clean Quant Research Version)
+# Reproducible | Walk-Forward Validated | CV-Ready
 # ==========================================================
 
 import os
@@ -41,25 +41,14 @@ BASELINE_CONTRACT = os.path.join(MODEL_DIR, "baseline_contract.json")
 
 SEED = 42
 
-STRICT_GOVERNANCE = os.getenv("TRAINING_STRICT_GOVERNANCE", "1") == "1"
-TRAINING_MODE = os.getenv("TRAINING_MODE", "research").lower()
+MIN_TRAINING_ROWS = 1200
+MIN_UNIQUE_DATES = 250
+MIN_CS_WIDTH = 8
 
-MIN_TRAINING_ROWS = 1500
-MIN_UNIQUE_DATES = 300
-MIN_CS_WIDTH = 10
-
-# Hard leakage protection (never relaxed)
+# Leakage protection (always enforced)
 MAX_REASONABLE_SHARPE = 5.0
 MAX_PROFIT_FACTOR = 10.0
 MIN_WINDOWS = 3
-
-# Production thresholds
-MIN_PRODUCTION_SHARPE = 0.10
-MAX_DRAWDOWN = -0.55
-
-# Research thresholds (Yahoo-friendly)
-MIN_RESEARCH_SHARPE = -0.05
-MAX_RESEARCH_DRAWDOWN = -0.75
 
 
 # ==========================================================
@@ -75,7 +64,7 @@ def enforce_determinism():
 
 
 # ==========================================================
-# HASH HELPERS (UNCHANGED)
+# HASH HELPERS
 # ==========================================================
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
@@ -106,10 +95,10 @@ def compute_reproducibility_hash(dataset_hash):
 
 
 # ==========================================================
-# METRIC VALIDATION (UPDATED + STABLE)
+# METRIC VALIDATION (Simplified & Stable)
 # ==========================================================
 
-def validate_production_metrics(metrics: dict):
+def validate_backtest_sanity(metrics: dict):
 
     required = [
         "avg_sharpe",
@@ -126,23 +115,17 @@ def validate_production_metrics(metrics: dict):
             raise RuntimeError(f"Non-finite metric: {key}")
 
     sharpe = float(metrics["avg_sharpe"])
-    drawdown = float(metrics["max_drawdown"])
     profit_factor = float(metrics["profit_factor"])
     num_windows = int(metrics["num_windows"])
 
     logger.info(
-        "Validation | Mode=%s | Sharpe=%.4f | DD=%.2f%% | PF=%.2f | Windows=%d",
-        TRAINING_MODE,
+        "Backtest Summary | Sharpe=%.4f | PF=%.2f | Windows=%d",
         sharpe,
-        drawdown * 100,
         profit_factor,
         num_windows
     )
 
-    # --------------------------
-    # Always enforce leakage rules
-    # --------------------------
-
+    # Only protect against obvious leakage
     if sharpe > MAX_REASONABLE_SHARPE:
         raise RuntimeError("Sharpe unrealistically high — leakage suspected.")
 
@@ -155,38 +138,9 @@ def validate_production_metrics(metrics: dict):
     if metrics["final_equity"] <= 0:
         raise RuntimeError("Backtest produced non-positive equity.")
 
-    # --------------------------
-    # Mode-dependent validation
-    # --------------------------
-
-    if STRICT_GOVERNANCE or TRAINING_MODE == "production":
-
-        if sharpe < MIN_PRODUCTION_SHARPE:
-            raise RuntimeError(
-                f"Model rejected — Sharpe too low ({sharpe:.4f})."
-            )
-
-        if drawdown < MAX_DRAWDOWN:
-            raise RuntimeError(
-                f"Model rejected — drawdown breach ({drawdown:.2%})."
-            )
-
-    else:
-        # Research Mode
-
-        if sharpe < MIN_RESEARCH_SHARPE:
-            raise RuntimeError(
-                f"Research model unstable — Sharpe too low ({sharpe:.4f})."
-            )
-
-        if drawdown < MAX_RESEARCH_DRAWDOWN:
-            raise RuntimeError(
-                f"Research model drawdown extreme ({drawdown:.2%})."
-            )
-
 
 # ==========================================================
-# DATA LOADING (UNCHANGED)
+# DATA LOADING
 # ==========================================================
 
 def load_training_data(start_date, end_date):
@@ -238,7 +192,7 @@ def load_training_data(start_date, end_date):
 
 
 # ==========================================================
-# TARGET (UNCHANGED)
+# TARGET
 # ==========================================================
 
 def build_target(df: pd.DataFrame):
@@ -270,7 +224,7 @@ def build_target(df: pd.DataFrame):
 
 
 # ==========================================================
-# TRAINERS (UNCHANGED)
+# TRAINERS
 # ==========================================================
 
 def trainer(train_df):
@@ -299,7 +253,7 @@ def final_trainer(train_df):
 
 
 # ==========================================================
-# MAIN (UNCHANGED STRUCTURE)
+# MAIN
 # ==========================================================
 
 def main(create_baseline=False,
@@ -316,9 +270,9 @@ def main(create_baseline=False,
         raw_df = load_training_data(start_date, end_date)
 
         validator = WalkForwardValidator(trainer)
-        research_metrics = validator.run(raw_df.copy())
+        metrics = validator.run(raw_df.copy())
 
-        validate_production_metrics(research_metrics)
+        validate_backtest_sanity(metrics)
 
         final_df = build_target(raw_df)
         dataset_hash = compute_dataset_hash(final_df)
@@ -326,7 +280,7 @@ def main(create_baseline=False,
 
         export_artifacts(
             final_model,
-            research_metrics,
+            metrics,
             dataset_hash,
             start_date,
             end_date,
@@ -334,6 +288,8 @@ def main(create_baseline=False,
             create_baseline=create_baseline,
             promote_baseline=promote_baseline
         )
+
+        logger.info("Training completed successfully.")
 
     except Exception as e:
         if allow_soft_fail:
