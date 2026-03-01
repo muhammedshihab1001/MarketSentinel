@@ -61,6 +61,10 @@ async def portfolio_summary():
         API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
 
 
+# =========================================================
+# SYNC EXECUTION
+# =========================================================
+
 def _portfolio_summary_sync():
 
     pipeline = get_pipeline()
@@ -80,9 +84,9 @@ def _portfolio_summary_sync():
     # SIGNAL COUNTS
     # ===============================
 
-    long_count = sum(1 for r in results if r.get("signal") == "LONG")
-    short_count = sum(1 for r in results if r.get("signal") == "SHORT")
-    neutral_count = sum(1 for r in results if r.get("signal") == "NEUTRAL")
+    long_count = sum(1 for r in results if r.get("weight", 0.0) > 0)
+    short_count = sum(1 for r in results if r.get("weight", 0.0) < 0)
+    neutral_count = sum(1 for r in results if r.get("weight", 0.0) == 0)
 
     # ===============================
     # EXPOSURE
@@ -95,6 +99,27 @@ def _portfolio_summary_sync():
     # AGENT METRICS
     # ===============================
 
+    approved_trades = sum(
+        1 for r in results
+        if r.get("agent", {}).get("trade_approved", False)
+    )
+
+    rejected_trades = len(results) - approved_trades
+
+    strength_scores = [
+        r.get("agent", {}).get("strength_score", 0.0)
+        for r in results
+    ]
+
+    avg_strength = float(sum(strength_scores) / len(strength_scores))
+
+    confidence_scores = [
+        r.get("agent", {}).get("confidence_numeric", 0.0)
+        for r in results
+    ]
+
+    avg_confidence = float(sum(confidence_scores) / len(confidence_scores))
+
     high_conviction_count = sum(
         1 for r in results
         if r.get("agent", {}).get("strength_score", 0.0) >= 75
@@ -105,14 +130,69 @@ def _portfolio_summary_sync():
         if r.get("agent", {}).get("risk_level") == "elevated"
     )
 
+    drift_detected = snapshot.get("drift", {}).get("drift_detected", False)
+    drift_state = snapshot.get("drift", {}).get("drift_state", "unknown")
+
+    # ===============================
+    # PORTFOLIO HEALTH SCORE
+    # ===============================
+
+    health_score = 100
+
+    if drift_detected:
+        health_score -= 15
+
+    if elevated_risk_count > len(results) * 0.3:
+        health_score -= 10
+
+    if avg_confidence < 0.4:
+        health_score -= 10
+
+    health_score = max(0, min(100, health_score))
+
+    # ===============================
+    # TOP 5 SUMMARY (FOR DASHBOARD)
+    # ===============================
+
+    top_5_preview = [
+        {
+            "ticker": r["ticker"],
+            "score": round(r["score"], 4),
+            "weight": round(r["weight"], 4),
+            "confidence": r.get("agent", {}).get("confidence"),
+            "approved": r.get("agent", {}).get("trade_approved")
+        }
+        for r in sorted(results, key=lambda x: x["score"], reverse=True)[:5]
+    ]
+
     return {
         "snapshot_date": snapshot.get("snapshot_date"),
         "universe_size": snapshot.get("universe_size"),
+
+        # Exposure
+        "gross_exposure": round(gross_exposure, 6),
+        "net_exposure": round(net_exposure, 6),
+
+        # Signal breakdown
         "long_count": long_count,
         "short_count": short_count,
         "neutral_count": neutral_count,
-        "gross_exposure": round(gross_exposure, 6),
-        "net_exposure": round(net_exposure, 6),
+
+        # Agent metrics
+        "approved_trades": approved_trades,
+        "rejected_trades": rejected_trades,
+        "avg_strength_score": round(avg_strength, 2),
+        "avg_confidence": round(avg_confidence, 3),
         "high_conviction_count": high_conviction_count,
         "elevated_risk_count": elevated_risk_count,
+
+        # Drift
+        "drift_detected": drift_detected,
+        "drift_state": drift_state,
+
+        # Portfolio health
+        "portfolio_health_score": health_score,
+
+        # Preview
+        "top_5_preview": top_5_preview,
     }
