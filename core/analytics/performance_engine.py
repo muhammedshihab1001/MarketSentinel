@@ -109,6 +109,10 @@ class PerformanceEngine:
         ########################################################
 
         equity = (1.0 + daily).cumprod()
+
+        # Prevent unrealistic runaway values
+        equity = equity.clip(lower=0.0)
+
         cumulative_return = float(equity.iloc[-1] - 1.0)
 
         ########################################################
@@ -163,7 +167,7 @@ class PerformanceEngine:
     ########################################################
 
     def _sharpe_ratio(self, daily):
-        std = daily.std()
+        std = daily.std(ddof=1)
         if std <= EPSILON:
             return 0.0
         return float((daily.mean() / std) * np.sqrt(self.TRADING_DAYS))
@@ -172,13 +176,13 @@ class PerformanceEngine:
         downside = daily[daily < 0]
         if len(downside) == 0:
             return 0.0
-        downside_std = downside.std()
+        downside_std = downside.std(ddof=1)
         if downside_std <= EPSILON:
             return 0.0
         return float((daily.mean() / downside_std) * np.sqrt(self.TRADING_DAYS))
 
     def _annual_volatility(self, daily):
-        std = daily.std()
+        std = daily.std(ddof=1)
         if std <= EPSILON:
             return 0.0
         return float(std * np.sqrt(self.TRADING_DAYS))
@@ -195,11 +199,11 @@ class PerformanceEngine:
 
     def _max_drawdown_duration(self, equity):
         rolling_max = equity.cummax()
-        drawdown = equity < rolling_max
+        underwater = equity < rolling_max
         duration = 0
         max_duration = 0
-        for val in drawdown:
-            if val:
+        for flag in underwater:
+            if flag:
                 duration += 1
                 max_duration = max(max_duration, duration)
             else:
@@ -218,12 +222,14 @@ class PerformanceEngine:
         pivot = (
             portfolio_df
             .pivot(index="date", columns="ticker", values="weight")
-            .fillna(0)
+            .fillna(0.0)
             .sort_index()
         )
+
         diff = pivot.diff().abs()
         turnover = 0.5 * diff.sum(axis=1)
         turnover = turnover.iloc[1:]
+
         return float(turnover.mean()) if len(turnover) > 0 else 0.0
 
     def _beta(self, strategy, benchmark):
@@ -234,11 +240,11 @@ class PerformanceEngine:
         if len(aligned_s) < 2:
             return None
 
-        var = np.var(aligned_b)
+        var = np.var(aligned_b, ddof=1)
         if var <= EPSILON:
             return None
 
-        cov = np.cov(aligned_s, aligned_b)[0][1]
+        cov = np.cov(aligned_s, aligned_b, ddof=1)[0][1]
         return float(cov / var)
 
     def _information_ratio(self, strategy, benchmark):
@@ -247,7 +253,7 @@ class PerformanceEngine:
 
         aligned_s, aligned_b = strategy.align(benchmark, join="inner")
         active = aligned_s - aligned_b
-        std = active.std()
+        std = active.std(ddof=1)
 
         if std <= EPSILON:
             return None
@@ -260,11 +266,11 @@ class PerformanceEngine:
 
     def _rolling_sharpe(self, daily):
         rolling = daily.rolling(self.ROLLING_WINDOW)
-        sharpe = rolling.mean() / rolling.std().replace(0, np.nan)
+        sharpe = rolling.mean() / rolling.std(ddof=1).replace(0, np.nan)
         sharpe = sharpe * np.sqrt(self.TRADING_DAYS)
         return sharpe.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     def _rolling_volatility(self, daily):
-        vol = daily.rolling(self.ROLLING_WINDOW).std()
+        vol = daily.rolling(self.ROLLING_WINDOW).std(ddof=1)
         vol = vol * np.sqrt(self.TRADING_DAYS)
         return vol.replace([np.inf, -np.inf], np.nan).fillna(0.0)
