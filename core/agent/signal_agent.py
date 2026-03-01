@@ -1,8 +1,12 @@
 import numpy as np
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 
 class SignalAgent:
+
+    # =========================================================
+    # THRESHOLDS (Institutional Tunables)
+    # =========================================================
 
     RSI_OVERBOUGHT = 70
     RSI_OVERSOLD = 30
@@ -18,6 +22,9 @@ class SignalAgent:
     Z_MODERATE = 0.75
 
     MAX_SCORE_SANITY = 10.0
+
+    MAX_POSITION_SIZE = 1.0
+    MIN_POSITION_SIZE = 0.0
 
     # =========================================================
     # SAFE FLOAT
@@ -57,13 +64,44 @@ class SignalAgent:
         return alignment  # 0–2
 
     # =========================================================
+    # CONFIDENCE NUMERIC
+    # =========================================================
+
+    def _confidence_numeric(self, abs_score: float) -> float:
+        return float(np.clip(abs_score / self.Z_VERY_STRONG, 0.0, 1.0))
+
+    # =========================================================
+    # POSITION SIZE SUGGESTION
+    # =========================================================
+
+    def _suggest_position_size(
+        self,
+        confidence_numeric: float,
+        risk_level: str,
+        volatility_regime: str,
+    ) -> float:
+
+        base = confidence_numeric
+
+        if risk_level == "elevated":
+            base *= 0.6
+        elif risk_level == "high":
+            base *= 0.75
+
+        if volatility_regime == "high_volatility":
+            base *= 0.7
+
+        return float(np.clip(base, self.MIN_POSITION_SIZE, self.MAX_POSITION_SIZE))
+
+    # =========================================================
     # MAIN ANALYSIS
     # =========================================================
 
     def analyze(
         self,
         row: Dict[str, Any],
-        probability_stats: Dict[str, float] | None,
+        probability_stats: Optional[Dict[str, float]] = None,
+        drift_score: Optional[float] = None,
     ) -> Dict[str, Any]:
 
         # -----------------------------------------------------
@@ -94,7 +132,7 @@ class SignalAgent:
 
         if abs(final_score) > self.MAX_SCORE_SANITY:
             warnings.append("Score unusually large.")
-            reasoning.append("Score clipped for sanity monitoring.")
+            final_score = np.sign(final_score) * self.MAX_SCORE_SANITY
 
         abs_score = abs(final_score)
 
@@ -107,20 +145,19 @@ class SignalAgent:
         else:
             confidence = "low"
 
+        confidence_numeric = self._confidence_numeric(abs_score)
+
         reasoning.append(f"Alpha classified as {confidence} strength.")
 
         # =====================================================
         # 2️⃣ Technical Assessment
         # =====================================================
 
-        # RSI
         if rsi > self.RSI_OVERBOUGHT:
             warnings.append("RSI overbought.")
-            reasoning.append("Overbought condition detected.")
         elif rsi < self.RSI_OVERSOLD:
-            reasoning.append("Oversold condition supports reversal potential.")
+            reasoning.append("Oversold condition supports reversal.")
 
-        # Trend
         if ema_ratio > self.EMA_BULLISH:
             trend = "bullish"
         elif ema_ratio < self.EMA_BEARISH:
@@ -128,9 +165,6 @@ class SignalAgent:
         else:
             trend = "neutral"
 
-        reasoning.append(f"Trend regime: {trend}.")
-
-        # Momentum
         if momentum_z > self.MOMENTUM_STRONG:
             momentum_state = "strong_positive"
         elif momentum_z < -self.MOMENTUM_STRONG:
@@ -138,12 +172,14 @@ class SignalAgent:
         else:
             momentum_state = "neutral"
 
-        reasoning.append(f"Momentum state: {momentum_state}.")
+        alignment = self._alignment_score(signal, momentum_z, ema_ratio)
 
-        if signal == "LONG" and momentum_z < 0:
-            warnings.append("Momentum contradicts LONG signal.")
-        if signal == "SHORT" and momentum_z > 0:
-            warnings.append("Momentum contradicts SHORT signal.")
+        if alignment == 2:
+            reasoning.append("Technical alignment strong.")
+        elif alignment == 1:
+            reasoning.append("Partial technical alignment.")
+        else:
+            warnings.append("Signal lacks technical confirmation.")
 
         # =====================================================
         # 3️⃣ Risk Assessment
@@ -151,7 +187,6 @@ class SignalAgent:
 
         if regime_feature > 1.5:
             volatility_regime = "high_volatility"
-            warnings.append("High volatility regime detected.")
         else:
             volatility_regime = "normal"
 
@@ -164,10 +199,8 @@ class SignalAgent:
         else:
             risk_level = "low"
 
-        reasoning.append(f"Risk level assessed as {risk_level}.")
-
         # =====================================================
-        # 4️⃣ Macro Assessment
+        # 4️⃣ Macro Regime
         # =====================================================
 
         if breadth > 0.65:
@@ -177,41 +210,59 @@ class SignalAgent:
         else:
             macro_regime = "neutral"
 
-        reasoning.append(f"Macro regime: {macro_regime}.")
-
         # =====================================================
         # 5️⃣ Cross-Sectional Health
         # =====================================================
 
         dispersion = 0.0
+        percentile = None
+
         if probability_stats:
             dispersion = self._safe_float(probability_stats.get("std"), 0.0)
+            percentile = probability_stats.get("percentile")
 
         if dispersion < self.DISPERSION_WEAK:
             warnings.append("Low cross-sectional dispersion.")
-            reasoning.append("Signal environment weak due to low dispersion.")
 
         # =====================================================
-        # 6️⃣ Alignment Score
+        # 6️⃣ Drift Awareness
         # =====================================================
 
-        alignment = self._alignment_score(signal, momentum_z, ema_ratio)
+        drift_flag = False
 
-        if alignment == 2:
-            reasoning.append("Technical alignment strong.")
-        elif alignment == 1:
-            reasoning.append("Partial technical alignment.")
-        else:
-            warnings.append("Signal lacks technical confirmation.")
-
-        # =====================================================
-        # 7️⃣ Strength Score (0–100 institutional scale)
-        # =====================================================
-
-        strength_score = int(np.clip(abs_score * 40 + alignment * 5, 0, 100))
+        if drift_score is not None:
+            drift_score = self._safe_float(drift_score, 0.0)
+            if drift_score > 0.5:
+                drift_flag = True
+                warnings.append("Feature distribution drift detected.")
+                confidence_numeric *= 0.7
 
         # =====================================================
-        # 8️⃣ Explanation Summary
+        # 7️⃣ Position Sizing Suggestion
+        # =====================================================
+
+        position_size_hint = self._suggest_position_size(
+            confidence_numeric,
+            risk_level,
+            volatility_regime
+        )
+
+        trade_approved = (
+            signal != "NEUTRAL"
+            and confidence_numeric > 0.3
+            and not drift_flag
+        )
+
+        # =====================================================
+        # 8️⃣ Institutional Strength Score (0–100)
+        # =====================================================
+
+        strength_score = int(
+            np.clip(abs_score * 40 + alignment * 5 + confidence_numeric * 20, 0, 100)
+        )
+
+        # =====================================================
+        # 9️⃣ Explanation
         # =====================================================
 
         explanation = (
@@ -224,12 +275,13 @@ class SignalAgent:
         )
 
         # =====================================================
-        # STRUCTURED OUTPUT
+        # RETURN STRUCTURED OUTPUT
         # =====================================================
 
         return {
             "signal": signal,
             "confidence": confidence,
+            "confidence_numeric": confidence_numeric,
             "strength_score": strength_score,
             "risk_level": risk_level,
             "volatility_regime": volatility_regime,
@@ -237,6 +289,9 @@ class SignalAgent:
             "momentum_state": momentum_state,
             "macro_regime": macro_regime,
             "alignment_score": alignment,
+            "position_size_hint": position_size_hint,
+            "trade_approved": trade_approved,
+            "drift_flag": drift_flag,
             "reasoning": reasoning,
             "warnings": warnings,
             "explanation": explanation,
