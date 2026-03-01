@@ -1,5 +1,5 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION (Institutional Version)
+# TRAIN XGBOOST REGRESSION (Institutional Hardened)
 # ==========================================================
 
 import os
@@ -291,6 +291,10 @@ def export_artifacts(model, metrics, dataset_hash,
         feature_checksum=compute_feature_checksum(),
         extra_fields={
             "artifact_hash": artifact_hash,
+            "schema_signature": get_schema_signature(),
+            "schema_version": SCHEMA_VERSION,
+            "training_code_hash": compute_training_code_hash(),
+            "universe_hash": MarketUniverse.fingerprint(),
             "schema_snapshot": schema_snapshot(),
             "model_type": "regression",
             "artifact_version": timestamp
@@ -300,11 +304,9 @@ def export_artifacts(model, metrics, dataset_hash,
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{timestamp}.json")
     MetadataManager.save_metadata(metadata, metadata_path)
 
-    if create_baseline:
-        with open(BASELINE_CONTRACT, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
-
+    # pointer update only after everything validated
     if promote_baseline:
+
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
 
         with tempfile.NamedTemporaryFile(
@@ -325,6 +327,8 @@ def export_artifacts(model, metrics, dataset_hash,
             temp_name = tmp.name
 
         os.replace(temp_name, pointer_path)
+
+        logger.info("Production pointer updated -> %s", timestamp)
 
     logger.info("Model exported successfully | version=%s", timestamp)
 
