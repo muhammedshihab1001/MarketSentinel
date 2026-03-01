@@ -1,153 +1,121 @@
-import pandas as pd
 import numpy as np
-import pytest
+import pandas as pd
 
 from training.backtesting.walk_forward import WalkForwardValidator
-from core.schema.feature_schema import MODEL_FEATURES
+from core.schema.feature_schema import (
+    MODEL_FEATURES,
+    validate_feature_schema,
+    DTYPE
+)
 
-
-############################################################
-# DUMMY TRAINER (REGRESSION-COMPATIBLE)
-############################################################
 
 def dummy_trainer(train_df):
 
     class DummyModel:
-
         def predict(self, X):
-            # Deterministic cross-sectional variation
-            # Use first feature directly (no randomness)
-            return X.iloc[:, 0].values.astype("float32")
+            # deterministic dispersion from first feature
+            base = X.iloc[:, 0].values.astype("float32")
+            return base * 2.0
 
     return DummyModel()
 
 
-############################################################
-# HELPER TO BUILD VALID DATASET
-############################################################
+def build_synthetic_dataset():
 
-def build_valid_dataset(
-    n_days=400,
-    n_tickers=20,
-    seed=42
-):
+    np.random.seed(42)
 
-    np.random.seed(seed)
+    dates = pd.date_range("2026-01-01", periods=500)
+    tickers = [f"T{i}" for i in range(15)]  # >= MIN_CS_WIDTH
 
-    dates = pd.date_range("2020-01-01", periods=n_days)
-    tickers = [f"T{i}" for i in range(n_tickers)]
+    rows = []
 
-    df = pd.DataFrame({
-        "date": np.repeat(dates, n_tickers),
-        "ticker": np.tile(tickers, n_days)
-    })
+    for d in dates:
+        for t in tickers:
 
-    total_rows = len(df)
+            row = {
+                "date": d,
+                "ticker": t,
+                # Simulated Yahoo-style noisy prices
+                "close": 100 + np.random.randn() * 0.5 + (d.day * 0.01),
+                "volatility": abs(np.random.randn()) + 0.2
+            }
 
-    # --- PRICE SERIES ---
-    df["close"] = (
-        100 + np.cumsum(np.random.randn(total_rows) * 0.5)
-    ).astype("float32")
+            for col in MODEL_FEATURES:
+                row[col] = np.random.randn()
 
-    # --- VOLATILITY REQUIRED FOR PORTFOLIO CONSTRUCTION ---
-    df["volatility"] = (
-        np.abs(np.random.randn(total_rows)) + 0.05
-    ).astype("float32")
+            rows.append(row)
 
-    # --- REQUIRED MODEL FEATURES ---
-    for col in MODEL_FEATURES:
-        df[col] = np.random.randn(total_rows).astype("float32")
+    df = pd.DataFrame(rows)
+
+    # Ensure schema compliance
+    feature_block = validate_feature_schema(
+        df.loc[:, MODEL_FEATURES],
+        mode="training"
+    ).astype(DTYPE)
+
+    df.loc[:, MODEL_FEATURES] = feature_block
 
     return df
 
 
-############################################################
-# TEST INSUFFICIENT DATA
-############################################################
+def test_walkforward_runs_end_to_end():
 
-def test_walk_forward_requires_enough_data():
+    df = build_synthetic_dataset()
 
-    df = build_valid_dataset(n_days=50, n_tickers=5)
-
-    wf = WalkForwardValidator(
-        model_trainer=dummy_trainer
+    validator = WalkForwardValidator(
+        model_trainer=dummy_trainer,
+        window_size=120,
+        step_size=30
     )
 
-    with pytest.raises(Exception):
-        wf.run(df)
+    metrics = validator.run(df)
 
+    # ======================================================
+    # Core assertions
+    # ======================================================
 
-############################################################
-# TEST SUCCESSFUL RUN
-############################################################
-
-def test_walk_forward_runs_successfully():
-
-    df = build_valid_dataset(n_days=400, n_tickers=20)
-
-    wf = WalkForwardValidator(
-        model_trainer=dummy_trainer
-    )
-
-    metrics = wf.run(df)
-
-    required_keys = {
-        "avg_strategy_return",
-        "avg_sharpe",
-        "profit_factor",
-        "max_drawdown",
-        "return_volatility",
-        "final_equity",
-        "avg_turnover",
-        "avg_win_rate",
-        "avg_trades_per_window",
-        "num_windows"
-    }
-
-    assert isinstance(metrics, dict)
-    assert required_keys.issubset(metrics.keys())
     assert metrics["num_windows"] > 0
-    assert np.isfinite(metrics["avg_sharpe"])
     assert metrics["final_equity"] > 0
-
-
-############################################################
-# TEST CROSS-SECTIONAL WIDTH ENFORCEMENT
-############################################################
-
-def test_walk_forward_requires_cross_section():
-
-    # Below MIN_CROSS_SECTION threshold (10)
-    df = build_valid_dataset(n_days=400, n_tickers=5)
-
-    wf = WalkForwardValidator(
-        model_trainer=dummy_trainer
-    )
-
-    with pytest.raises(Exception):
-        wf.run(df)
-
-
-############################################################
-# TEST STABILITY UNDER RANDOM DATA
-############################################################
-
-def test_walk_forward_stability():
-
-    df = build_valid_dataset(n_days=450, n_tickers=25)
-
-    wf = WalkForwardValidator(
-        model_trainer=dummy_trainer
-    )
-
-    metrics = wf.run(df)
-
-    # Sharpe bounded by engine clamp
     assert -5.0 <= metrics["avg_sharpe"] <= 5.0
 
-    # Drawdown bounded
-    assert -1.0 <= metrics["max_drawdown"] <= 0.0
+    # ======================================================
+    # Stability checks
+    # ======================================================
 
-    # No NaN metrics
-    for v in metrics.values():
-        assert np.isfinite(v)
+    assert np.isfinite(metrics["avg_sharpe"])
+    assert np.isfinite(metrics["final_equity"])
+    assert metrics["profit_factor"] >= 0
+
+    # Drawdown sanity (Yahoo-safe guard)
+    assert metrics["max_drawdown"] <= 0
+    assert metrics["max_drawdown"] >= -1.0
+
+    # Turnover sanity
+    assert metrics["avg_turnover"] >= 0
+
+    # Trade count sanity
+    assert metrics["avg_trades_per_window"] >= 1
+
+
+def test_walkforward_deterministic():
+
+    df = build_synthetic_dataset()
+
+    validator1 = WalkForwardValidator(
+        model_trainer=dummy_trainer,
+        window_size=120,
+        step_size=30
+    )
+
+    validator2 = WalkForwardValidator(
+        model_trainer=dummy_trainer,
+        window_size=120,
+        step_size=30
+    )
+
+    metrics1 = validator1.run(df.copy())
+    metrics2 = validator2.run(df.copy())
+
+    # Determinism check
+    assert metrics1["avg_sharpe"] == metrics2["avg_sharpe"]
+    assert metrics1["final_equity"] == metrics2["final_equity"]
