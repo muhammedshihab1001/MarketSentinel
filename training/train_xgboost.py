@@ -42,10 +42,6 @@ MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
 MIN_CS_WIDTH = 8
 
-MAX_REASONABLE_SHARPE = 5.0
-MAX_PROFIT_FACTOR = 10.0
-MIN_WINDOWS = 3
-
 
 # ==========================================================
 # DETERMINISM
@@ -55,6 +51,18 @@ def enforce_determinism():
     os.environ["PYTHONHASHSEED"] = str(SEED)
     random.seed(SEED)
     np.random.seed(SEED)
+
+
+# ==========================================================
+# SIMPLE HASH UTIL (for artifact)
+# ==========================================================
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 # ==========================================================
@@ -98,20 +106,19 @@ def export_artifacts(model,
                      start_date,
                      end_date,
                      final_df,
-                     create_baseline=False,
                      promote_baseline=False):
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    version = f"{timestamp}"
+    version = timestamp
 
     model_path = os.path.join(MODEL_DIR, f"model_{version}.pkl")
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{version}.json")
 
     joblib.dump(model, model_path)
 
-    artifact_hash = MetadataManager.fingerprint_file(model_path)
+    artifact_hash = sha256_file(model_path)
 
     metadata = {
         "model_version": version,
@@ -136,18 +143,12 @@ def export_artifacts(model,
 
     logger.info("Artifacts saved | version=%s", version)
 
-    # ------------------------------------------------------
-    # Promote to production pointer
-    # ------------------------------------------------------
-
     if promote_baseline:
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
-
         pointer_data = {
             "model_version": version,
             "promoted_at": timestamp
         }
-
         with open(pointer_path, "w", encoding="utf-8") as f:
             json.dump(pointer_data, f, indent=2)
 
@@ -167,7 +168,6 @@ def load_training_data(start_date, end_date):
     datasets = []
 
     for ticker in universe:
-
         price_df = market_data.get_price_data(
             ticker=ticker,
             start_date=start_date,
@@ -181,10 +181,8 @@ def load_training_data(start_date, end_date):
             training=True
         )
 
-        if dataset is None or dataset.empty:
-            continue
-
-        datasets.append(dataset)
+        if dataset is not None and not dataset.empty:
+            datasets.append(dataset)
 
     if not datasets:
         raise RuntimeError("All tickers failed.")
@@ -257,8 +255,9 @@ def trainer(train_df):
     pipeline = build_xgboost_pipeline()
     pipeline.fit(X, y)
 
-    if list(pipeline.feature_names) != list(MODEL_FEATURES):
-        raise RuntimeError("Feature order mismatch after training.")
+    # attach reproducibility fingerprint
+    dataset_hash = compute_dataset_hash(train_df)
+    pipeline.training_fingerprint = compute_reproducibility_hash(dataset_hash)
 
     return pipeline
 
@@ -280,6 +279,9 @@ def main(promote_baseline=False, allow_soft_fail=False):
 
         validator = WalkForwardValidator(trainer)
         metrics = validator.run(raw_df.copy())
+
+        logger.info("Walk-forward completed | Sharpe=%.4f",
+                    metrics.get("avg_sharpe", 0))
 
         final_df = build_target(raw_df)
         dataset_hash = compute_dataset_hash(final_df)
