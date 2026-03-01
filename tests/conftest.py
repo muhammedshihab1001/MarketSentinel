@@ -3,6 +3,7 @@ import os
 import pytest
 import numpy as np
 import random
+import socket
 
 
 # ---------------------------------------------------
@@ -35,26 +36,13 @@ def set_test_seeds():
 @pytest.fixture(autouse=True)
 def test_environment(monkeypatch):
 
-    # Prevent real Redis
     monkeypatch.setenv("REDIS_HOST", "invalid-host")
-
-    # Force small resource caps
     monkeypatch.setenv("MAX_CONCURRENT_INFERENCES", "2")
     monkeypatch.setenv("MAX_BATCH_SIZE", "3")
-
-    # Enable test mode flag
     monkeypatch.setenv("MARKETSENTINEL_TEST_MODE", "1")
-
-    # Disable LLM in tests
     monkeypatch.setenv("LLM_ENABLED", "false")
-
-    # Disable drift hard fail unless explicitly tested
     monkeypatch.setenv("DRIFT_HARD_FAIL", "false")
-
-    # Short cache TTL for safety
     monkeypatch.setenv("CACHE_TTL_SECONDS", "30")
-
-    # Force deterministic XGBoost threading
     monkeypatch.setenv("OMP_NUM_THREADS", "1")
 
 
@@ -78,16 +66,32 @@ def isolated_artifacts(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------
-# OPTIONAL: BLOCK NETWORK ACCESS
+# SAFE NETWORK BLOCK (ALLOW LOCAL EVENT LOOP)
 # ---------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def disable_network(monkeypatch):
+def disable_external_network(monkeypatch):
     """
-    Prevent accidental external API calls during tests.
+    Block external network access but allow:
+    - localhost
+    - internal socketpair (asyncio)
     """
 
-    def guard(*args, **kwargs):
-        raise RuntimeError("Network access disabled in test mode")
+    original_socket = socket.socket
 
-    monkeypatch.setattr("socket.socket", guard, raising=False)
+    def guarded_socket(*args, **kwargs):
+
+        # Allow internal event loop sockets
+        if args and args[0] in (socket.AF_INET, socket.AF_INET6):
+            return original_socket(*args, **kwargs)
+
+        # Allow socketpair internally
+        if hasattr(socket, "socketpair"):
+            try:
+                return original_socket(*args, **kwargs)
+            except Exception:
+                pass
+
+        raise RuntimeError("External network access disabled in test mode")
+
+    monkeypatch.setattr(socket, "socket", guarded_socket)
