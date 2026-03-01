@@ -35,7 +35,7 @@ def build_synthetic_dataset():
             row = {
                 "date": d,
                 "ticker": t,
-                # Simulated Yahoo-style noisy prices
+                # Simulated Yahoo-style noisy price
                 "close": 100 + np.random.randn() * 0.5 + (d.day * 0.01),
                 "volatility": abs(np.random.randn()) + 0.2
             }
@@ -47,7 +47,7 @@ def build_synthetic_dataset():
 
     df = pd.DataFrame(rows)
 
-    # Ensure schema compliance
+    # Ensure schema compliance + correct dtype
     feature_block = validate_feature_schema(
         df.loc[:, MODEL_FEATURES],
         mode="training"
@@ -86,18 +86,16 @@ def test_walkforward_runs_end_to_end():
     assert np.isfinite(metrics["final_equity"])
     assert metrics["profit_factor"] >= 0
 
-    # Drawdown sanity (Yahoo-safe guard)
+    # Drawdown sanity (Yahoo-safe)
     assert metrics["max_drawdown"] <= 0
     assert metrics["max_drawdown"] >= -1.0
 
     # Turnover sanity
     assert metrics["avg_turnover"] >= 0
-
-    # Trade count sanity
     assert metrics["avg_trades_per_window"] >= 1
 
 
-def test_walkforward_deterministic():
+def test_walkforward_is_deterministic():
 
     df = build_synthetic_dataset()
 
@@ -116,6 +114,5 @@ def test_walkforward_deterministic():
     metrics1 = validator1.run(df.copy())
     metrics2 = validator2.run(df.copy())
 
-    # Determinism check
     assert metrics1["avg_sharpe"] == metrics2["avg_sharpe"]
     assert metrics1["final_equity"] == metrics2["final_equity"]
