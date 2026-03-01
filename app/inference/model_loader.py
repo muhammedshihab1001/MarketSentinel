@@ -49,7 +49,6 @@ class ModelLoader:
 
     MIN_ARTIFACT_BYTES = 50_000
     MIN_METADATA_BYTES = 500
-
     POINTER_FILENAME = "production_pointer.json"
 
     STRICT_GOVERNANCE = os.getenv("MODEL_STRICT_GOVERNANCE", "1") == "1"
@@ -89,10 +88,7 @@ class ModelLoader:
     ########################################################
 
     def _compute_feature_checksum(self, feature_list):
-        canonical = json.dumps(
-            list(feature_list),
-            sort_keys=False
-        ).encode()
+        canonical = json.dumps(list(feature_list), sort_keys=False).encode()
         return hashlib.sha256(canonical).hexdigest()
 
     ########################################################
@@ -100,7 +96,6 @@ class ModelLoader:
     ########################################################
 
     def _get_registry_dir(self):
-
         base_dir = os.getenv(
             "XGB_REGISTRY_DIR",
             os.path.abspath("artifacts/xgboost")
@@ -114,35 +109,6 @@ class ModelLoader:
         return base_dir
 
     ########################################################
-    # AUTO DISCOVERY (SAFE BOOTSTRAP)
-    ########################################################
-
-    def _auto_create_pointer_if_safe(self, base_dir):
-
-        model_files = [
-            f for f in os.listdir(base_dir)
-            if f.startswith("model_") and f.endswith(".pkl")
-        ]
-
-        if len(model_files) != 1:
-            raise RuntimeError(
-                "production_pointer.json missing and multiple/no models found."
-            )
-
-        version = model_files[0].replace("model_", "").replace(".pkl", "")
-
-        pointer_path = os.path.join(base_dir, self.POINTER_FILENAME)
-
-        logger.warning(
-            "Auto-creating production pointer for version=%s", version
-        )
-
-        with open(pointer_path, "w", encoding="utf-8") as f:
-            json.dump({"model_version": version}, f)
-
-        return pointer_path
-
-    ########################################################
     # POINTER RESOLUTION
     ########################################################
 
@@ -151,13 +117,10 @@ class ModelLoader:
         pointer_path = os.path.join(base_dir, self.POINTER_FILENAME)
 
         if not os.path.exists(pointer_path):
-            pointer_path = self._auto_create_pointer_if_safe(base_dir)
+            raise RuntimeError("Production pointer missing.")
 
         if os.path.islink(pointer_path):
             raise RuntimeError("Symlinked production pointer detected.")
-
-        if os.path.getsize(pointer_path) < 20:
-            raise RuntimeError("Production pointer corrupted.")
 
         pointer_hash = self._sha256(pointer_path)
 
@@ -228,53 +191,51 @@ class ModelLoader:
 
             meta = MetadataManager.load_metadata(metadata_path)
 
-            required_keys = {
-                "metadata_type",
-                "schema_signature",
-                "schema_version",
-                "features",
-                "artifact_hash",
-                "dataset_hash",
-                "training_code_hash",
-                "feature_checksum",
-                "universe_hash",
-            }
+            # =====================================================
+            # GOVERNANCE VALIDATION
+            # =====================================================
 
-            missing = required_keys - set(meta.keys())
-            if missing:
-                raise RuntimeError(
-                    f"Metadata missing required fields: {missing}"
-                )
+            try:
 
-            if meta.get("metadata_type") != "training_manifest_v1":
-                raise RuntimeError("Unsupported metadata type.")
+                if meta.get("schema_signature") != get_schema_signature():
+                    raise RuntimeError("Schema signature mismatch.")
 
-            if meta.get("schema_signature") != get_schema_signature():
-                raise RuntimeError("Schema signature mismatch.")
+                if meta.get("schema_version") != SCHEMA_VERSION:
+                    raise RuntimeError("Schema version drift detected.")
 
-            if meta.get("schema_version") != SCHEMA_VERSION:
-                raise RuntimeError("Schema version drift detected.")
+                if list(meta.get("features")) != list(MODEL_FEATURES):
+                    raise RuntimeError("Metadata feature mismatch.")
 
-            if list(meta.get("features")) != list(MODEL_FEATURES):
-                raise RuntimeError("Metadata feature mismatch.")
+                artifact_hash_actual = self._sha256(model_path)
 
-            artifact_hash_actual = self._sha256(model_path)
+                if meta["artifact_hash"] != artifact_hash_actual:
+                    raise RuntimeError("Artifact tampering detected.")
 
-            if meta["artifact_hash"] != artifact_hash_actual:
-                raise RuntimeError("Artifact tampering detected.")
+                feature_checksum_actual = \
+                    self._compute_feature_checksum(MODEL_FEATURES)
+
+                if meta["feature_checksum"] != feature_checksum_actual:
+                    raise RuntimeError("Feature checksum mismatch.")
+
+                universe_hash_current = MarketUniverse.fingerprint()
+
+                if meta["universe_hash"] != universe_hash_current:
+                    raise RuntimeError("Universe fingerprint mismatch.")
+
+                # Validate training code hash
+                local_training_hash = \
+                    MetadataManager.fingerprint_training_code()
+
+                if meta["training_code_hash"] != local_training_hash:
+                    raise RuntimeError("Training code drift detected.")
+
+            except Exception as e:
+                if self.STRICT_GOVERNANCE:
+                    raise
+                else:
+                    logger.warning("Governance violation (soft mode): %s", str(e))
 
             model = self._safe_load_model(model_path)
-
-            feature_checksum_actual = \
-                self._compute_feature_checksum(MODEL_FEATURES)
-
-            if meta["feature_checksum"] != feature_checksum_actual:
-                raise RuntimeError("Feature checksum mismatch.")
-
-            universe_hash_current = MarketUniverse.fingerprint()
-
-            if meta["universe_hash"] != universe_hash_current:
-                raise RuntimeError("Universe fingerprint mismatch.")
 
             training_fingerprint = getattr(
                 model,
@@ -288,8 +249,8 @@ class ModelLoader:
                 schema_signature=meta["schema_signature"],
                 dataset_hash=meta["dataset_hash"],
                 training_code_hash=meta["training_code_hash"],
-                artifact_hash=artifact_hash_actual,
-                feature_checksum=feature_checksum_actual,
+                artifact_hash=meta["artifact_hash"],
+                feature_checksum=meta["feature_checksum"],
                 pointer_hash=pointer_hash,
                 training_fingerprint=training_fingerprint,
                 universe_hash=meta["universe_hash"]
@@ -303,10 +264,9 @@ class ModelLoader:
             ).set(1)
 
             logger.info(
-                "Model loaded | version=%s | artifact_hash=%s | universe_hash=%s",
+                "Model loaded | version=%s | artifact_hash=%s",
                 version,
-                artifact_hash_actual[:12],
-                meta["universe_hash"][:12]
+                meta["artifact_hash"][:12]
             )
 
             return new_container.model
