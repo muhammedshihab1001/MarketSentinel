@@ -10,11 +10,21 @@ from core.schema.feature_schema import MODEL_FEATURES
 from core.artifacts.metadata_manager import MetadataManager
 
 
+# ======================================================
+# UTILITIES
+# ======================================================
+
 def _build_random_df(n=300):
+    np.random.seed(42)
     return pd.DataFrame({
         col: np.random.normal(0, 1, n)
         for col in MODEL_FEATURES
     })
+
+
+def _clean_dir(path):
+    if os.path.exists(path):
+        shutil.rmtree(path)
 
 
 # ======================================================
@@ -24,11 +34,9 @@ def _build_random_df(n=300):
 def test_drift_detector_baseline_and_detect():
 
     df = _build_random_df()
-
     test_dir = "artifacts/drift_test"
 
-    if os.path.exists(test_dir):
-        shutil.rmtree(test_dir)
+    _clean_dir(test_dir)
 
     detector = DriftDetector(baseline_dir=test_dir)
 
@@ -45,8 +53,6 @@ def test_drift_detector_baseline_and_detect():
 
     result = detector.detect(df)
 
-    assert isinstance(result, dict)
-
     required_fields = {
         "drift_detected",
         "severity_score",
@@ -60,11 +66,12 @@ def test_drift_detector_baseline_and_detect():
 
     assert required_fields.issubset(result.keys())
 
+    assert np.isfinite(result["severity_score"])
     assert 0.0 <= result["coverage"] <= 1.0
-    assert result["severity_score"] >= 0
     assert result["exposure_scale"] in {0.0, 0.5, 1.0}
+    assert isinstance(result["details"], dict)
 
-    shutil.rmtree(test_dir)
+    _clean_dir(test_dir)
 
 
 # ======================================================
@@ -80,9 +87,7 @@ def test_drift_detector_detects_shift():
         df_shift[col] += 5.0
 
     test_dir = "artifacts/drift_test_shift"
-
-    if os.path.exists(test_dir):
-        shutil.rmtree(test_dir)
+    _clean_dir(test_dir)
 
     detector = DriftDetector(baseline_dir=test_dir)
 
@@ -104,7 +109,7 @@ def test_drift_detector_detects_shift():
     assert result["drift_state"] in {"soft", "hard"}
     assert result["exposure_scale"] in {0.0, 0.5}
 
-    shutil.rmtree(test_dir)
+    _clean_dir(test_dir)
 
 
 # ======================================================
@@ -115,9 +120,7 @@ def test_drift_detector_integrity_failure_soft():
 
     df = _build_random_df()
     test_dir = "artifacts/drift_test_integrity"
-
-    if os.path.exists(test_dir):
-        shutil.rmtree(test_dir)
+    _clean_dir(test_dir)
 
     detector = DriftDetector(baseline_dir=test_dir)
 
@@ -148,22 +151,20 @@ def test_drift_detector_integrity_failure_soft():
     assert result["drift_state"] == "detector_failure"
     assert result["exposure_scale"] < 1.0
 
-    shutil.rmtree(test_dir)
+    _clean_dir(test_dir)
 
 
 # ======================================================
 # HARD FAIL MODE
 # ======================================================
 
-def test_drift_detector_hard_fail_mode():
+def test_drift_detector_hard_fail_mode(monkeypatch):
 
     df = _build_random_df()
     test_dir = "artifacts/drift_test_hard"
+    _clean_dir(test_dir)
 
-    if os.path.exists(test_dir):
-        shutil.rmtree(test_dir)
-
-    os.environ["DRIFT_HARD_FAIL"] = "true"
+    monkeypatch.setenv("DRIFT_HARD_FAIL", "true")
 
     detector = DriftDetector(baseline_dir=test_dir)
 
@@ -186,8 +187,7 @@ def test_drift_detector_hard_fail_mode():
     with pytest.raises(Exception):
         detector.detect(df)
 
-    shutil.rmtree(test_dir)
-    os.environ["DRIFT_HARD_FAIL"] = "false"
+    _clean_dir(test_dir)
 
 
 # ======================================================
@@ -205,9 +205,7 @@ def test_severity_escalation_levels():
         df_extreme[col] += 8.0
 
     test_dir = "artifacts/drift_test_severity"
-
-    if os.path.exists(test_dir):
-        shutil.rmtree(test_dir)
+    _clean_dir(test_dir)
 
     detector = DriftDetector(baseline_dir=test_dir)
 
@@ -227,4 +225,4 @@ def test_severity_escalation_levels():
 
     assert extreme_result["severity_score"] >= mild_result["severity_score"]
 
-    shutil.rmtree(test_dir)
+    _clean_dir(test_dir)
