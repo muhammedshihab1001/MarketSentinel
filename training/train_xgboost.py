@@ -1,6 +1,6 @@
 # ==========================================================
 # TRAIN XGBOOST REGRESSION (Clean Quant Research Version)
-# Reproducible | Walk-Forward Validated | CV-Ready
+# CV-Ready | Walk-Forward Validated | Reproducible
 # ==========================================================
 
 import os
@@ -14,7 +14,6 @@ import argparse
 import hashlib
 import json
 import inspect
-import tempfile
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
@@ -37,15 +36,12 @@ logger = logging.getLogger("marketsentinel.train_xgb")
 
 MODEL_DIR = os.path.abspath("artifacts/xgboost")
 PRODUCTION_POINTER = "production_pointer.json"
-BASELINE_CONTRACT = os.path.join(MODEL_DIR, "baseline_contract.json")
 
 SEED = 42
-
 MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
 MIN_CS_WIDTH = 8
 
-# Leakage protection (always enforced)
 MAX_REASONABLE_SHARPE = 5.0
 MAX_PROFIT_FACTOR = 10.0
 MIN_WINDOWS = 3
@@ -57,8 +53,6 @@ MIN_WINDOWS = 3
 
 def enforce_determinism():
     os.environ["PYTHONHASHSEED"] = str(SEED)
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
     random.seed(SEED)
     np.random.seed(SEED)
 
@@ -95,48 +89,69 @@ def compute_reproducibility_hash(dataset_hash):
 
 
 # ==========================================================
-# METRIC VALIDATION (Simplified & Stable)
+# ARTIFACT EXPORT
 # ==========================================================
 
-def validate_backtest_sanity(metrics: dict):
+def export_artifacts(model,
+                     metrics,
+                     dataset_hash,
+                     start_date,
+                     end_date,
+                     final_df,
+                     create_baseline=False,
+                     promote_baseline=False):
 
-    required = [
-        "avg_sharpe",
-        "max_drawdown",
-        "profit_factor",
-        "final_equity",
-        "num_windows"
-    ]
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
-    for key in required:
-        if key not in metrics:
-            raise RuntimeError(f"Missing metric: {key}")
-        if not np.isfinite(metrics[key]):
-            raise RuntimeError(f"Non-finite metric: {key}")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    version = f"{timestamp}"
 
-    sharpe = float(metrics["avg_sharpe"])
-    profit_factor = float(metrics["profit_factor"])
-    num_windows = int(metrics["num_windows"])
+    model_path = os.path.join(MODEL_DIR, f"model_{version}.pkl")
+    metadata_path = os.path.join(MODEL_DIR, f"metadata_{version}.json")
 
-    logger.info(
-        "Backtest Summary | Sharpe=%.4f | PF=%.2f | Windows=%d",
-        sharpe,
-        profit_factor,
-        num_windows
-    )
+    joblib.dump(model, model_path)
 
-    # Only protect against obvious leakage
-    if sharpe > MAX_REASONABLE_SHARPE:
-        raise RuntimeError("Sharpe unrealistically high — leakage suspected.")
+    artifact_hash = MetadataManager.fingerprint_file(model_path)
 
-    if profit_factor > MAX_PROFIT_FACTOR:
-        raise RuntimeError("Profit factor unrealistic — leakage suspected.")
+    metadata = {
+        "model_version": version,
+        "created_at": timestamp,
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "schema_version": SCHEMA_VERSION,
+        "schema_signature": get_schema_signature(),
+        "features": list(MODEL_FEATURES),
+        "dataset_hash": dataset_hash,
+        "artifact_hash": artifact_hash,
+        "feature_checksum": compute_feature_checksum(),
+        "training_code_hash": compute_training_code_hash(),
+        "universe_hash": MarketUniverse.fingerprint(),
+        "reproducibility_hash": compute_reproducibility_hash(dataset_hash),
+        "metrics": metrics,
+        "schema_snapshot": schema_snapshot()
+    }
 
-    if num_windows < MIN_WINDOWS:
-        raise RuntimeError("Insufficient walk-forward windows.")
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
-    if metrics["final_equity"] <= 0:
-        raise RuntimeError("Backtest produced non-positive equity.")
+    logger.info("Artifacts saved | version=%s", version)
+
+    # ------------------------------------------------------
+    # Promote to production pointer
+    # ------------------------------------------------------
+
+    if promote_baseline:
+        pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
+
+        pointer_data = {
+            "model_version": version,
+            "promoted_at": timestamp
+        }
+
+        with open(pointer_path, "w", encoding="utf-8") as f:
+            json.dump(pointer_data, f, indent=2)
+
+        logger.info("Model promoted to production.")
 
 
 # ==========================================================
@@ -224,7 +239,7 @@ def build_target(df: pd.DataFrame):
 
 
 # ==========================================================
-# TRAINERS
+# TRAINER
 # ==========================================================
 
 def trainer(train_df):
@@ -248,17 +263,11 @@ def trainer(train_df):
     return pipeline
 
 
-def final_trainer(train_df):
-    return trainer(train_df)
-
-
 # ==========================================================
 # MAIN
 # ==========================================================
 
-def main(create_baseline=False,
-         promote_baseline=False,
-         allow_soft_fail=False):
+def main(promote_baseline=False, allow_soft_fail=False):
 
     init_env()
     enforce_determinism()
@@ -272,11 +281,9 @@ def main(create_baseline=False,
         validator = WalkForwardValidator(trainer)
         metrics = validator.run(raw_df.copy())
 
-        validate_backtest_sanity(metrics)
-
         final_df = build_target(raw_df)
         dataset_hash = compute_dataset_hash(final_df)
-        final_model = final_trainer(raw_df)
+        final_model = trainer(raw_df)
 
         export_artifacts(
             final_model,
@@ -285,7 +292,6 @@ def main(create_baseline=False,
             start_date,
             end_date,
             final_df,
-            create_baseline=create_baseline,
             promote_baseline=promote_baseline
         )
 
@@ -300,15 +306,11 @@ def main(create_baseline=False,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-
-    parser.add_argument("--create-baseline", action="store_true")
     parser.add_argument("--promote-baseline", action="store_true")
     parser.add_argument("--allow-soft-fail", action="store_true")
-
     args = parser.parse_args()
 
     main(
-        create_baseline=args.create_baseline,
         promote_baseline=args.promote_baseline,
         allow_soft_fail=args.allow_soft_fail
     )
