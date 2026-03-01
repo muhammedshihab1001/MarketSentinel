@@ -131,7 +131,7 @@ def _validate_news():
 
 
 # ============================================================
-# LLM VALIDATION (NEW)
+# LLM VALIDATION
 # ============================================================
 
 def _validate_llm():
@@ -166,7 +166,10 @@ def _environment_fingerprint():
         os.getenv("ENABLE_SENTIMENT", "") +
         os.getenv("MODEL_REGISTRY_PATH", "") +
         os.getenv("FEATURE_STORE_PATH", "") +
-        os.getenv("LLM_ENABLED", "")
+        os.getenv("XGB_REGISTRY_DIR", "") +
+        os.getenv("LLM_ENABLED", "") +
+        os.getenv("LOG_LEVEL", "") +
+        os.getenv("MARKET_PROVIDERS_ACTIVE", "")
     )
 
     fp = hashlib.sha256(payload.encode()).hexdigest()[:12]
@@ -191,10 +194,11 @@ def init_env():
         if _ENV_INITIALIZED:
             return
 
-        _configure_logging()
-
+        # Load dotenv FIRST so LOG_LEVEL etc. apply correctly
         if os.getenv("DOTENV_ENABLED", "1") == "1":
             load_dotenv(override=False)
+
+        _configure_logging()
 
         defaults = {
             "ENABLE_SENTIMENT": "0",
@@ -203,9 +207,6 @@ def init_env():
             "FEATURE_STORE_PATH": "artifacts/feature_store",
             "XGB_REGISTRY_DIR": "artifacts/xgboost",
 
-            # -------------------------
-            # LLM Defaults (NEW)
-            # -------------------------
             "LLM_ENABLED": "0",
             "OPENAI_MODEL": "gpt-4o-mini",
             "OPENAI_TIMEOUT": "12",
@@ -249,12 +250,22 @@ def get_env(key: str, default=None, required: bool = False):
 
 def get_int(key: str, default: int) -> int:
     val = os.getenv(key)
-    return int(val) if val is not None else default
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        raise RuntimeError(f"Invalid integer value for env {key}: {val}")
 
 
 def get_float(key: str, default: float) -> float:
     val = os.getenv(key)
-    return float(val) if val is not None else default
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        raise RuntimeError(f"Invalid float value for env {key}: {val}")
 
 
 def get_bool(key: str, default: bool = False) -> bool:
