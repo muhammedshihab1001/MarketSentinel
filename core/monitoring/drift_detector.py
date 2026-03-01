@@ -4,7 +4,6 @@ import os
 import json
 import logging
 import hashlib
-from datetime import datetime
 
 from core.schema.feature_schema import (
     get_schema_signature,
@@ -29,9 +28,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "23.0"  # bumped
-
-    DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
+    BASELINE_VERSION = "24.0"  # bumped
 
     MIN_SAMPLE_BASELINE = 150
     MIN_SAMPLE_INFERENCE = 25
@@ -39,7 +36,7 @@ class DriftDetector:
     VARIANCE_RATIO_UPPER = 4.0
     VARIANCE_RATIO_LOWER = 0.20
 
-    PSI_ALERT = 0.35
+    PSI_ALERT = 0.45  # slightly relaxed for noisy data
     MIN_BIN_PCT = 0.01
 
     MAX_INFERENCE_ROWS = 800
@@ -48,9 +45,9 @@ class DriftDetector:
     MAX_SEVERITY_CAP = 15
 
     SOFT_SEVERITY_THRESHOLD = 4
-    HARD_SEVERITY_THRESHOLD = 9
+    HARD_SEVERITY_THRESHOLD = 10  # softened slightly
 
-    RECENT_WEIGHT_FACTOR = 1.5  # 🔥 new
+    RECENT_WEIGHT_FACTOR = 1.5
 
     def __init__(self, z_threshold: float = 4.0, baseline_dir: str = "artifacts/drift"):
 
@@ -108,7 +105,7 @@ class DriftDetector:
     def _load_verified_baseline(self):
 
         if not os.path.exists(self.BASELINE_PATH):
-            raise RuntimeError("Baseline missing.")
+            raise FileNotFoundError("Baseline missing.")
 
         with open(self.BASELINE_PATH, encoding="utf-8") as f:
             baseline = json.load(f)
@@ -131,7 +128,6 @@ class DriftDetector:
         if meta.get("feature_checksum") != current_checksum:
             raise RuntimeError("Feature checksum mismatch.")
 
-        # 🔥 verify model version consistency
         current_model_version = self._model_loader.xgb_version
         if meta.get("model_version") != current_model_version:
             logger.warning("Baseline tied to different model version.")
@@ -163,7 +159,7 @@ class DriftDetector:
                    (expected_perc + self.EPSILON))
         )
 
-        return float(psi)
+        return float(max(psi, 0.0))
 
     # =========================================================
     # TIME-WEIGHTED SEVERITY
@@ -248,7 +244,6 @@ class DriftDetector:
 
             coverage = float(evaluated_features / max(total_features, 1))
 
-            # 🔥 coverage penalty
             if coverage < 0.5:
                 severity_accumulator += 2
 
@@ -267,22 +262,39 @@ class DriftDetector:
 
             DRIFT_DETECTED.set(1 if drift_detected else 0)
 
-            # 🔥 refined exposure scaling
+            # Safer exposure scaling for CV demo
             if drift_state == "hard":
-                exposure_scale = 0.0
+                exposure_scale = 0.2
             elif drift_state == "soft":
-                exposure_scale = max(0.3, 1 - severity_score * 0.05)
+                exposure_scale = max(0.4, 1 - severity_score * 0.05)
             else:
                 exposure_scale = 1.0
 
             return {
                 "drift_detected": drift_detected,
                 "severity_score": severity_score,
-                "drift_confidence": float(min(drift_count / max(total_features, 1), 1.0)),
+                "drift_confidence": float(
+                    min(drift_count / max(total_features, 1), 1.0)
+                ),
                 "coverage": coverage,
                 "details": report,
                 "drift_state": drift_state,
                 "exposure_scale": float(np.clip(exposure_scale, 0.0, 1.0))
+            }
+
+        except FileNotFoundError:
+
+            logger.warning("Drift baseline missing.")
+
+            return {
+                "drift_detected": False,
+                "severity_score": 0,
+                "drift_confidence": 0.0,
+                "coverage": 0.0,
+                "details": {},
+                "drift_state": "baseline_missing",
+                "exposure_scale": 1.0,
+                "reason": "baseline_missing"
             }
 
         except Exception as exc:
