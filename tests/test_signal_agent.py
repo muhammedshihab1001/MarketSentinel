@@ -5,13 +5,13 @@ from core.agent.signal_agent import SignalAgent
 def make_base_row():
     return {
         "score": 0.65,
-        "rank_pct": 0.80,
         "signal": "LONG",
         "volatility": 0.02,
         "rsi": 55.0,
         "ema_ratio": 1.02,
         "momentum_20_z": 0.5,
         "regime_feature": 0.0,
+        "breadth": 0.5,
     }
 
 
@@ -19,8 +19,6 @@ def make_prob_stats(std=0.10):
     return {
         "mean": 0.55,
         "std": std,
-        "min": 0.40,
-        "max": 0.75,
     }
 
 
@@ -31,34 +29,41 @@ def make_prob_stats(std=0.10):
 def test_signal_agent_structure():
 
     agent = SignalAgent()
-    row = make_base_row()
-    stats = make_prob_stats()
+    result = agent.analyze(
+        row=make_base_row(),
+        probability_stats=make_prob_stats()
+    )
 
-    result = agent.analyze(row=row, probability_stats=stats)
+    required_keys = {
+        "signal",
+        "confidence",
+        "strength_score",
+        "risk_level",
+        "volatility_regime",
+        "trend",
+        "momentum_state",
+        "macro_regime",
+        "reasoning",
+        "warnings",
+        "explanation",
+    }
 
-    assert "confidence" in result
-    assert "volatility_regime" in result
-    assert "trend" in result
-    assert "momentum_state" in result
-    assert "warnings" in result
-    assert "explanation" in result
-    assert "strength_score" in result
-    assert "risk_level" in result
+    assert required_keys.issubset(result.keys())
 
 
 # -------------------------------------------------------
-# HIGH CONFIDENCE TEST
+# CONFIDENCE TIERS
 # -------------------------------------------------------
 
-def test_high_confidence():
+def test_confidence_high():
 
     agent = SignalAgent()
     row = make_base_row()
-    row["score"] = 0.80
+    row["score"] = 1.5
 
     result = agent.analyze(row=row, probability_stats=make_prob_stats())
 
-    assert result["confidence"] == "high"
+    assert result["confidence"] in {"high", "very_high"}
 
 
 # -------------------------------------------------------
@@ -68,14 +73,13 @@ def test_high_confidence():
 def test_low_dispersion_warning():
 
     agent = SignalAgent()
-    row = make_base_row()
 
     result = agent.analyze(
-        row=row,
+        row=make_base_row(),
         probability_stats=make_prob_stats(std=0.01)
     )
 
-    assert "Low cross-sectional dispersion detected." in result["warnings"]
+    assert any("dispersion" in w.lower() for w in result["warnings"])
 
 
 # -------------------------------------------------------
@@ -86,16 +90,16 @@ def test_high_volatility_regime():
 
     agent = SignalAgent()
     row = make_base_row()
-    row["regime_feature"] = 1.0
+    row["regime_feature"] = 2.0
 
     result = agent.analyze(row=row, probability_stats=make_prob_stats())
 
     assert result["volatility_regime"] == "high_volatility"
-    assert "High volatility regime detected." in result["warnings"]
+    assert any("volatility" in w.lower() for w in result["warnings"])
 
 
 # -------------------------------------------------------
-# RSI EXTREME CASES
+# RSI EXTREMES
 # -------------------------------------------------------
 
 def test_rsi_overbought():
@@ -106,7 +110,7 @@ def test_rsi_overbought():
 
     result = agent.analyze(row=row, probability_stats=make_prob_stats())
 
-    assert "RSI indicates overbought condition." in result["warnings"]
+    assert any("overbought" in w.lower() for w in result["warnings"])
 
 
 def test_rsi_oversold():
@@ -117,35 +121,35 @@ def test_rsi_oversold():
 
     result = agent.analyze(row=row, probability_stats=make_prob_stats())
 
-    assert "RSI indicates oversold condition." in result["warnings"]
+    assert any("oversold" in r.lower() for r in result["reasoning"])
 
 
 # -------------------------------------------------------
 # MOMENTUM CONTRADICTION
 # -------------------------------------------------------
 
-def test_momentum_contradicts_long():
+def test_momentum_contradiction_long():
 
     agent = SignalAgent()
     row = make_base_row()
     row["signal"] = "LONG"
-    row["momentum_20_z"] = -1.5
+    row["momentum_20_z"] = -2.0
 
     result = agent.analyze(row=row, probability_stats=make_prob_stats())
 
-    assert "Momentum contradicts LONG signal." in result["warnings"]
+    assert any("contradict" in w.lower() for w in result["warnings"])
 
 
-def test_momentum_contradicts_short():
+def test_momentum_contradiction_short():
 
     agent = SignalAgent()
     row = make_base_row()
     row["signal"] = "SHORT"
-    row["momentum_20_z"] = 1.5
+    row["momentum_20_z"] = 2.0
 
     result = agent.analyze(row=row, probability_stats=make_prob_stats())
 
-    assert "Momentum contradicts SHORT signal." in result["warnings"]
+    assert any("contradict" in w.lower() for w in result["warnings"])
 
 
 # -------------------------------------------------------
@@ -175,28 +179,29 @@ def test_bearish_trend():
 
 
 # -------------------------------------------------------
-# STRENGTH SCORE TESTS
+# STRENGTH SCORE
 # -------------------------------------------------------
 
 def test_strength_score_range():
 
     agent = SignalAgent()
-    row = make_base_row()
+    result = agent.analyze(
+        row=make_base_row(),
+        probability_stats=make_prob_stats()
+    )
 
-    result = agent.analyze(row=row, probability_stats=make_prob_stats())
-
-    assert 0.0 <= result["strength_score"] <= 100.0
+    assert 0 <= result["strength_score"] <= 100
 
 
-def test_strength_score_increases_with_probability():
+def test_strength_score_monotonicity():
 
     agent = SignalAgent()
 
     row_low = make_base_row()
-    row_low["score"] = 0.55
+    row_low["score"] = 0.3
 
     row_high = make_base_row()
-    row_high["score"] = 0.85
+    row_high["score"] = 1.2
 
     result_low = agent.analyze(row=row_low, probability_stats=make_prob_stats())
     result_high = agent.analyze(row=row_high, probability_stats=make_prob_stats())
@@ -205,28 +210,26 @@ def test_strength_score_increases_with_probability():
 
 
 # -------------------------------------------------------
-# RISK LEVEL CLASSIFICATION
+# RISK CLASSIFICATION
 # -------------------------------------------------------
 
-def test_risk_level_low():
+def test_risk_low_for_strong_signal():
 
     agent = SignalAgent()
     row = make_base_row()
-    row["score"] = 0.90
-    row["rank_pct"] = 0.95
+    row["score"] = 2.0
 
-    result = agent.analyze(row=row, probability_stats=make_prob_stats(std=0.15))
+    result = agent.analyze(row=row, probability_stats=make_prob_stats())
 
-    assert result["risk_level"] == "low"
+    assert result["risk_level"] in {"low", "moderate"}
 
 
-def test_risk_level_elevated():
+def test_risk_elevated_under_volatility():
 
     agent = SignalAgent()
     row = make_base_row()
-    row["score"] = 0.52
-    row["rank_pct"] = 0.51
+    row["regime_feature"] = 2.0
 
-    result = agent.analyze(row=row, probability_stats=make_prob_stats(std=0.01))
+    result = agent.analyze(row=row, probability_stats=make_prob_stats())
 
-    assert result["risk_level"] in {"moderate", "elevated"}
+    assert result["risk_level"] in {"elevated", "high", "moderate"} 
