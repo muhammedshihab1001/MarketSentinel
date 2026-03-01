@@ -61,7 +61,7 @@ TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 
 
 # =========================================================
-# SAFE ATTRIBUTE ACCESS (CV FRIENDLY)
+# SAFE ATTRIBUTE ACCESS
 # =========================================================
 
 def safe_attr(obj, attr, default=None):
@@ -143,8 +143,9 @@ async def live_snapshot():
         long_count = sum(1 for s in signals if s.get("weight", 0.0) > 0)
         short_count = sum(1 for s in signals if s.get("weight", 0.0) < 0)
 
+        # Use new multi-agent score
         strength_scores = [
-            s.get("agent", {}).get("strength_score", 0.0)
+            s.get("agent", {}).get("agent_score", 0.0) * 100
             for s in signals
         ]
 
@@ -162,7 +163,7 @@ async def live_snapshot():
             "universe_size": len(tickers),
             "long_signals": long_count,
             "short_signals": short_count,
-            "avg_strength_score": avg_strength,
+            "avg_agent_score": avg_strength,
             "gross_exposure": snapshot.get("gross_exposure"),
             "net_exposure": snapshot.get("net_exposure"),
             "drift_state": snapshot.get("drift", {}).get("drift_state"),
@@ -242,14 +243,16 @@ async def signal_explanation(ticker: str):
 
         explanation = SignalExplanationResponse(
             ticker=row["ticker"],
-            score=row["score"],
+            score=row.get("score", row.get("raw_model_score", 0.0)),
             signal=direction,
-            strength_score=agent_data.get("strength_score", 0.0),
+            agent_score=agent_data.get("agent_score", 0.0),
+            alpha_strength=agent_data.get("alpha_strength", 0.0),
+            confidence_numeric=agent_data.get("confidence_numeric", 0.0),
+            governance_score=agent_data.get("governance_score", 0),
             risk_level=agent_data.get("risk_level", "unknown"),
-            confidence=agent_data.get("confidence", "unknown"),
             volatility_regime=agent_data.get("volatility_regime", "unknown"),
             trend=agent_data.get("trend", "unknown"),
-            momentum_state=agent_data.get("momentum_state", "unknown"),
+            drift_flag=agent_data.get("drift_flag", False),
             warnings=agent_data.get("warnings", []),
             explanation=agent_data.get("explanation", "")
         )
