@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v2.5 (CV-Optimized Stable)
+# INSTITUTIONAL INFERENCE PIPELINE v2.6 (Stable + Compatible)
 # =========================================================
 
 import time
@@ -77,7 +77,7 @@ class InferencePipeline:
         self.cache = RedisCache()
         self.drift_detector = DriftDetector()
         self.signal_agent = SignalAgent()
-        self.feature_store = FeatureStore()  # ✅ FIXED
+        self.feature_store = FeatureStore()
 
         self._validate_models_loaded()
 
@@ -110,7 +110,6 @@ class InferencePipeline:
         if not universe:
             raise RuntimeError("Universe empty.")
 
-        # ✅ Proper stable cache key
         cache_key = self.cache.build_key({
             "type": "snapshot",
             "tickers": universe
@@ -126,6 +125,7 @@ class InferencePipeline:
         try:
 
             df = self._build_cross_sectional_frame(universe)
+
             latest_date = df["date"].max()
             latest_df = df[df["date"] == latest_date].copy()
 
@@ -135,7 +135,6 @@ class InferencePipeline:
             if latest_df.empty:
                 raise RuntimeError("Latest snapshot invalid.")
 
-            # Safe liquidity handling
             if "dollar_volume" in latest_df.columns:
                 liquidity_threshold = max(
                     self.BASE_LIQUIDITY * 0.5,
@@ -188,14 +187,12 @@ class InferencePipeline:
                     "agent": agent_output
                 })
 
-            # Agent-driven top selection
             top_5 = sorted(
                 snapshot_rows,
                 key=lambda x: x["agent_score"],
                 reverse=True
             )[:self.TOP_SELECTION]
 
-            # Portfolio construction
             ranked = latest_df.sort_values("raw_model_score")
             longs = ranked.tail(self.TOP_K)
             shorts = ranked.head(self.BOTTOM_K)
@@ -291,11 +288,23 @@ class InferencePipeline:
         return df
 
     # ---------------------------------------------------------
+    # FLEXIBLE PORTFOLIO CONSTRUCTION (FIXED)
+    # ---------------------------------------------------------
 
     def _construct_portfolio(self, longs, shorts):
 
-        long_alpha = self._softmax(longs["raw_model_score"].values)
-        short_alpha = self._softmax(np.abs(shorts["raw_model_score"].values))
+        # 🔥 Support both raw_model_score and score (for historical routes)
+        score_col = None
+
+        if "raw_model_score" in longs.columns:
+            score_col = "raw_model_score"
+        elif "score" in longs.columns:
+            score_col = "score"
+        else:
+            raise RuntimeError("No score column available for portfolio construction.")
+
+        long_alpha = self._softmax(longs[score_col].values)
+        short_alpha = self._softmax(np.abs(shorts[score_col].values))
 
         long_w = long_alpha / (long_alpha.sum() + EPSILON)
         short_w = short_alpha / (short_alpha.sum() + EPSILON)
