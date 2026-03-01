@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline
+from app.inference.model_loader import get_shared_model_loader
 from core.market.universe import MarketUniverse
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
@@ -38,9 +39,7 @@ async def portfolio_summary():
     start_time = time.time()
 
     try:
-
         async with portfolio_semaphore:
-
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(_portfolio_summary_sync),
                 timeout=REQUEST_TIMEOUT
@@ -67,7 +66,10 @@ async def portfolio_summary():
 
 def _portfolio_summary_sync():
 
+    start_time = time.time()
+
     pipeline = get_pipeline()
+    loader = get_shared_model_loader()
     universe = MarketUniverse.get_universe()
 
     snapshot = pipeline.run_snapshot(universe)
@@ -111,14 +113,18 @@ def _portfolio_summary_sync():
         for r in results
     ]
 
-    avg_strength = float(sum(strength_scores) / len(strength_scores))
-
     confidence_scores = [
         r.get("agent", {}).get("confidence_numeric", 0.0)
         for r in results
     ]
 
-    avg_confidence = float(sum(confidence_scores) / len(confidence_scores))
+    avg_strength = float(
+        sum(strength_scores) / len(strength_scores)
+    ) if strength_scores else 0.0
+
+    avg_confidence = float(
+        sum(confidence_scores) / len(confidence_scores)
+    ) if confidence_scores else 0.0
 
     high_conviction_count = sum(
         1 for r in results
@@ -151,7 +157,7 @@ def _portfolio_summary_sync():
     health_score = max(0, min(100, health_score))
 
     # ===============================
-    # TOP 5 SUMMARY (FOR DASHBOARD)
+    # TOP 5 SUMMARY
     # ===============================
 
     top_5_preview = [
@@ -168,6 +174,10 @@ def _portfolio_summary_sync():
     return {
         "snapshot_date": snapshot.get("snapshot_date"),
         "universe_size": snapshot.get("universe_size"),
+
+        # Governance metadata
+        "model_version": loader.xgb_version,
+        "schema_signature": loader.schema_signature,
 
         # Exposure
         "gross_exposure": round(gross_exposure, 6),
@@ -195,4 +205,8 @@ def _portfolio_summary_sync():
 
         # Preview
         "top_5_preview": top_5_preview,
+
+        # Observability
+        "latency_ms": int((time.time() - start_time) * 1000),
+        "timestamp": int(time.time())
     }
