@@ -4,15 +4,19 @@ import logging
 import hashlib
 import json
 import random
+import os
 
 logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
 NUM_BOOST_ROUNDS = 600
+EARLY_STOPPING_ROUNDS = 50
 
 MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
 MIN_GROUP_SIZE = 5
+MIN_PRED_ENTROPY = 0.01
+MAX_MODEL_SIZE_MB = 100
 EPSILON = 1e-12
 
 
@@ -28,6 +32,8 @@ class SafeXGBRanker:
         self.param_checksum = None
         self.importance_checksum = None
         self.training_fingerprint = None
+        self.booster_checksum = None
+        self.best_iteration = None
 
         random.seed(SEED)
         np.random.seed(SEED)
@@ -65,12 +71,16 @@ class SafeXGBRanker:
         self.feature_names = list(X.columns)
         self.training_cols = X.shape[1]
 
+        ###################################################
+        # TRAINING FINGERPRINT
+        ###################################################
+
         self.training_fingerprint = hashlib.sha256(
             X.to_numpy().tobytes()
         ).hexdigest()
 
         ###################################################
-        # LOCK FEATURE CONTRACT
+        # FEATURE CHECKSUM
         ###################################################
 
         checksum_str = json.dumps(self.feature_names, sort_keys=False)
@@ -94,6 +104,8 @@ class SafeXGBRanker:
         # PARAMETERS
         ###################################################
 
+        use_gpu = os.getenv("XGB_USE_GPU", "false").lower() == "true"
+
         params = {
             "objective": "rank:pairwise",
             "eval_metric": "ndcg",
@@ -105,7 +117,7 @@ class SafeXGBRanker:
             "gamma": 0.0,
             "reg_alpha": 0.1,
             "reg_lambda": 1.0,
-            "tree_method": "hist",
+            "tree_method": "gpu_hist" if use_gpu else "hist",
             "seed": SEED,
             "nthread": 1,
             "verbosity": 0,
@@ -123,11 +135,27 @@ class SafeXGBRanker:
             params,
             dtrain,
             num_boost_round=NUM_BOOST_ROUNDS,
+            evals=[(dtrain, "train")],
+            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
             verbose_eval=False,
         )
 
+        self.best_iteration = self.model.best_iteration
+
         ###################################################
-        # SANITY CHECK
+        # MODEL SIZE CHECK
+        ###################################################
+
+        raw_model = self.model.save_raw()
+        model_size_mb = len(raw_model) / (1024 * 1024)
+
+        if model_size_mb > MAX_MODEL_SIZE_MB:
+            raise RuntimeError("Model artifact too large.")
+
+        self.booster_checksum = hashlib.sha256(raw_model).hexdigest()
+
+        ###################################################
+        # TRAINING SANITY CHECK
         ###################################################
 
         preds = self.model.predict(dtrain)
@@ -135,12 +163,23 @@ class SafeXGBRanker:
         if not np.all(np.isfinite(preds)):
             raise RuntimeError("Non-finite training predictions.")
 
-        if np.std(preds) < MIN_SCORE_STD:
+        pred_std = float(np.std(preds))
+
+        if pred_std < MIN_SCORE_STD:
             raise RuntimeError("Score collapse detected.")
 
+        # Entropy check
+        hist, _ = np.histogram(preds, bins=20)
+        probs = hist / (hist.sum() + EPSILON)
+        entropy = -np.sum(probs * np.log(probs + EPSILON))
+
+        if entropy < MIN_PRED_ENTROPY:
+            raise RuntimeError("Prediction entropy too low.")
+
         logger.info(
-            "XGB Ranking trained | pred_std=%.6f",
-            float(np.std(preds)),
+            "XGB Ranking trained | pred_std=%.6f | entropy=%.4f",
+            pred_std,
+            entropy
         )
 
         return self
@@ -181,6 +220,9 @@ class SafeXGBRanker:
 
         scores = np.clip(scores, -50, 50)
 
+        if np.std(scores) < MIN_SCORE_STD:
+            logger.warning("Inference score dispersion low.")
+
         return scores
 
     ###################################################
@@ -217,6 +259,8 @@ class SafeXGBRanker:
         return {
             "feature_importance": sorted_imp,
             "importance_checksum": self.importance_checksum,
+            "booster_checksum": self.booster_checksum,
+            "best_iteration": self.best_iteration,
         }
 
 
