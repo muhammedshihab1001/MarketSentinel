@@ -33,12 +33,13 @@ class MarketDataService:
     SAFE_LAG_DAYS = 2
     MAX_ROWS = 20000
     MAX_DAILY_MOVE = 0.85
+    MAX_PRICE_JUMP = 5.0
 
-    MIN_TRADING_DENSITY = 0.65  # % of expected trading days
+    MIN_TRADING_DENSITY = 0.65
+    MIN_UNIQUE_DAYS = 40
 
     MAX_WORKERS = int(os.getenv("MARKET_MAX_WORKERS", 4))
     MEMORY_CACHE_TTL = 30
-
     ENABLE_DISK_CACHE = True
 
     _PROVIDER = None
@@ -71,7 +72,7 @@ class MarketDataService:
         return ticker
 
     ########################################################
-    # SAFE DATE CAP (NO FORWARD LEAKAGE)
+    # SAFE DATE CAP
     ########################################################
 
     @classmethod
@@ -95,7 +96,7 @@ class MarketDataService:
     def _dataset_hash(self, df: pd.DataFrame):
 
         df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
-        payload = df.to_csv(index=False).encode()
+        payload = df[["date", "close", "volume"]].to_csv(index=False).encode()
         return hashlib.sha256(payload).hexdigest()[:16]
 
     ########################################################
@@ -132,7 +133,7 @@ class MarketDataService:
         df = df.dropna(subset=["date"])
         df = df.sort_values("date").drop_duplicates("date")
 
-        # Remove forward rows accidentally returned
+        # Remove forward leakage
         safe_cutoff = self._cap_to_safe_date(df["date"].max())
         df = df[df["date"] <= safe_cutoff]
 
@@ -146,27 +147,43 @@ class MarketDataService:
         if not np.isfinite(df[numeric_cols].values.astype(float)).all():
             raise RuntimeError("Non-finite prices detected.")
 
-        # Remove zero-volume days
+        # Remove zero-volume rows
         df = df[df["volume"] > 0]
 
-        # Clip extreme moves
+        if df["close"].nunique() < 5:
+            raise RuntimeError("Price series too flat.")
+
+        # OHLC consistency
+        if not ((df["high"] >= df["low"]) & 
+                (df["high"] >= df["close"]) &
+                (df["low"] <= df["close"])).all():
+            raise RuntimeError("OHLC inconsistency detected.")
+
+        # Clip extreme moves (split-like)
         pct = df["close"].pct_change().abs().fillna(0)
 
         if (pct > self.MAX_DAILY_MOVE).any():
-            logger.warning("Extreme move detected in %s — clipping.", ticker)
+            logger.warning("Extreme move detected in %s — smoothing.", ticker)
             df.loc[pct > self.MAX_DAILY_MOVE, "close"] = np.nan
             df["close"] = df["close"].ffill().bfill()
+
+        # Large absolute price jumps
+        if df["close"].max() / max(df["close"].min(), 1e-9) > self.MAX_PRICE_JUMP:
+            logger.warning("Large price scale change detected in %s", ticker)
 
         # Density check
         if len(df) > 30:
             total_days = (df["date"].max() - df["date"].min()).days
-            expected = total_days / 7 * 5  # rough trading days
+            expected = total_days / 7 * 5
             density = len(df) / max(expected, 1)
 
             if density < self.MIN_TRADING_DENSITY:
                 raise RuntimeError(
                     f"Low trading density ({density:.2f})"
                 )
+
+        if df["date"].nunique() < self.MIN_UNIQUE_DAYS:
+            raise RuntimeError("Too few unique trading days.")
 
         if len(df) > self.MAX_ROWS:
             df = df.tail(self.MAX_ROWS)
