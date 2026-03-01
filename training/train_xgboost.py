@@ -212,8 +212,7 @@ def build_target(df: pd.DataFrame):
     df = df.dropna(subset=["raw_forward"])
 
     cs_mean = df.groupby("date")["raw_forward"].transform("mean")
-    cs_std = df.groupby("date")["raw_forward"].transform("std")
-    cs_std = cs_std.replace(0, np.nan)
+    cs_std = df.groupby("date")["raw_forward"].transform("std").replace(0, np.nan)
 
     df["target"] = (df["raw_forward"] - cs_mean) / cs_std
     df = df[np.isfinite(df["target"])]
@@ -229,15 +228,12 @@ def build_target(df: pd.DataFrame):
     return df
 
 
-def build_groups(df: pd.DataFrame):
-    return df.groupby("date").size().values.astype(int)
-
-
 # ==========================================================
-# TRAINERS
+# TRAINERS (REGRESSION SAFE)
 # ==========================================================
 
 def trainer(train_df):
+
     train_df = build_target(train_df)
     train_df = train_df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
@@ -247,10 +243,9 @@ def trainer(train_df):
     )
 
     y = train_df["target"].values
-    groups = build_groups(train_df)
 
     pipeline = build_xgboost_pipeline()
-    pipeline.fit(X, y, groups)
+    pipeline.fit(X, y)
 
     pipeline.feature_names = list(MODEL_FEATURES)
 
@@ -282,7 +277,7 @@ def export_artifacts(model, metrics, dataset_hash,
     artifact_hash = MetadataManager.hash_file(model_path)
 
     metadata = MetadataManager.create_metadata(
-        model_name="xgboost",
+        model_name="xgboost_regression",
         metrics={k: v for k, v in metrics.items() if k != "equity_curve"},
         features=tuple(MODEL_FEATURES),
         training_start=str(start_date),
@@ -296,6 +291,7 @@ def export_artifacts(model, metrics, dataset_hash,
             "schema_snapshot": schema_snapshot(),
             "universe_hash": MarketUniverse.fingerprint(),
             "training_code_hash": compute_training_code_hash(),
+            "model_type": "regression"
         }
     )
 
@@ -308,6 +304,7 @@ def export_artifacts(model, metrics, dataset_hash,
 
     if promote_baseline:
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
+
         with tempfile.NamedTemporaryFile(
             mode="w",
             delete=False,
