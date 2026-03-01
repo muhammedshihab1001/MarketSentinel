@@ -4,8 +4,10 @@ import time
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from app.inference.pipeline import InferencePipeline
-from app.inference.model_loader import get_shared_model_loader
+from app.inference.pipeline import (
+    InferencePipeline,
+    get_shared_model_loader,  # ✅ FIXED IMPORT LOCATION
+)
 from core.market.universe import MarketUniverse
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
