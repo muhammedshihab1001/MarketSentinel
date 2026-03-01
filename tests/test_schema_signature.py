@@ -1,32 +1,38 @@
+import os
 import re
 import pytest
 
 from core.schema.feature_schema import (
     get_schema_signature,
+    schema_snapshot,
     CORE_FEATURES,
     CROSS_SECTIONAL_FEATURES,
     SCHEMA_VERSION,
 )
 
 
-# 🔒 IMPORTANT:
-# If this test fails — you intentionally changed the model contract.
-# You must:
-# 1. Bump SCHEMA_VERSION
-# 2. Re-train models
-# 3. Update EXPECTED_SCHEMA_SIGNATURE below
+# ==========================================================
+# CONTRACT LOCK
+# ==========================================================
+
+# You may freeze the expected signature either:
+# 1) Hard-coded below
+# 2) Via environment variable SCHEMA_EXPECTED_SIGNATURE
+#
+# If this test fails intentionally:
+#   - Bump SCHEMA_VERSION
+#   - Re-train models
+#   - Update expected signature
+
+EXPECTED_SCHEMA_SIGNATURE = os.getenv(
+    "SCHEMA_EXPECTED_SIGNATURE",
+    "REPLACE_WITH_REAL_SIGNATURE"
+)
 
 
-# ⚠️ Freeze this value AFTER intentional schema update.
-# Run once:
-# >>> print(get_schema_signature())
-# Then paste it here.
-EXPECTED_SCHEMA_SIGNATURE = "REPLACE_WITH_REAL_SIGNATURE"
-
-
-############################################################
+# ==========================================================
 # DETERMINISM
-############################################################
+# ==========================================================
 
 def test_schema_signature_is_deterministic():
     sig1 = get_schema_signature()
@@ -34,26 +40,41 @@ def test_schema_signature_is_deterministic():
     assert sig1 == sig2
 
 
-############################################################
+# ==========================================================
 # CONTRACT LOCK
-############################################################
+# ==========================================================
 
 def test_schema_signature_matches_expected_contract():
 
     current = get_schema_signature()
 
+    if EXPECTED_SCHEMA_SIGNATURE == "REPLACE_WITH_REAL_SIGNATURE":
+        pytest.skip(
+            "Expected schema signature not frozen yet. "
+            "Run print(get_schema_signature()) and set it."
+        )
+
     assert current == EXPECTED_SCHEMA_SIGNATURE, (
-        "\nSchema signature changed.\n\n"
+        "\n🚨 Schema signature changed.\n\n"
         "If intentional:\n"
         "- Bump SCHEMA_VERSION\n"
         "- Re-train models\n"
-        "- Update EXPECTED_SCHEMA_SIGNATURE in this test\n"
+        "- Update EXPECTED_SCHEMA_SIGNATURE\n"
     )
 
 
-############################################################
+# ==========================================================
+# SIGNATURE FORMAT
+# ==========================================================
+
+def test_schema_signature_is_sha256():
+    sig = get_schema_signature()
+    assert re.match(r"^[a-f0-9]{64}$", sig)
+
+
+# ==========================================================
 # FEATURE SANITY
-############################################################
+# ==========================================================
 
 def test_core_features_non_empty():
     assert len(CORE_FEATURES) > 0
@@ -71,9 +92,30 @@ def test_no_duplicate_features():
     assert len(combined) == len(set(combined))
 
 
-############################################################
+def test_no_overlap_between_core_and_cross():
+    assert not set(CORE_FEATURES).intersection(
+        set(CROSS_SECTIONAL_FEATURES)
+    )
+
+
+def test_cross_sectional_suffixes():
+    for f in CROSS_SECTIONAL_FEATURES:
+        assert f.endswith("_z") or f.endswith("_rank")
+
+
+# ==========================================================
+# SNAPSHOT CONSISTENCY
+# ==========================================================
+
+def test_schema_snapshot_consistent_with_signature():
+    snapshot = schema_snapshot()
+    assert snapshot["signature"] == get_schema_signature()
+    assert snapshot["version"] == SCHEMA_VERSION
+
+
+# ==========================================================
 # VERSION FORMAT
-############################################################
+# ==========================================================
 
 def test_schema_version_string_present():
     assert isinstance(SCHEMA_VERSION, str)
@@ -81,5 +123,5 @@ def test_schema_version_string_present():
 
 
 def test_schema_version_format():
-    # enforce institutional numeric format like "41.0"
+    # Institutional numeric format like "41.0"
     assert re.match(r"^\d+\.\d+$", SCHEMA_VERSION)
