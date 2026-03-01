@@ -34,16 +34,21 @@ class SignalAgent:
             return default
 
     # =========================================================
-    # MAIN ANALYSIS
+    # MAIN ANALYSIS (HYBRID MULTI-AGENT)
     # =========================================================
 
     def analyze(
         self,
         row: Dict[str, Any],
-        probability_stats: Dict[str, float],
+        probability_stats: Dict[str, float] | None,
     ) -> Dict[str, Any]:
 
-        score = self._safe_float(row.get("score"), 0.0)
+        # -----------------------------------------------------
+        # Core Inputs
+        # -----------------------------------------------------
+
+        alpha_score = self._safe_float(row.get("alpha_score", row.get("score")), 0.0)
+        final_score = self._safe_float(row.get("score"), 0.0)
         signal = row.get("signal", "NEUTRAL")
 
         volatility = self._safe_float(row.get("volatility"), 0.0)
@@ -51,14 +56,16 @@ class SignalAgent:
         ema_ratio = self._safe_float(row.get("ema_ratio"), 1.0)
         momentum_z = self._safe_float(row.get("momentum_20_z"), 0.0)
         regime_feature = self._safe_float(row.get("regime_feature"), 0.0)
+        breadth = self._safe_float(row.get("breadth"), 0.5)
 
         warnings: List[str] = []
+        reasoning: List[str] = []
 
         # =====================================================
-        # 1️⃣ Confidence based on Z-score magnitude
+        # 1️⃣ Alpha Confidence
         # =====================================================
 
-        abs_score = abs(score)
+        abs_score = abs(final_score)
 
         if abs_score >= self.Z_VERY_STRONG:
             confidence = "very_high"
@@ -69,46 +76,20 @@ class SignalAgent:
         else:
             confidence = "low"
 
-        # =====================================================
-        # 2️⃣ Volatility Regime
-        # =====================================================
-
-        if regime_feature == 1.0:
-            volatility_regime = "high_volatility"
-            warnings.append("High volatility regime detected.")
-        else:
-            volatility_regime = "normal"
+        reasoning.append(f"Alpha strength classified as {confidence}.")
 
         # =====================================================
-        # 3️⃣ RSI Context
+        # 2️⃣ Technical Agent
         # =====================================================
 
+        # RSI
         if rsi > self.RSI_OVERBOUGHT:
             warnings.append("RSI overbought.")
+            reasoning.append("Overbought condition detected.")
         elif rsi < self.RSI_OVERSOLD:
-            warnings.append("RSI oversold.")
+            reasoning.append("Oversold condition supports reversal potential.")
 
-        # =====================================================
-        # 4️⃣ Momentum Context
-        # =====================================================
-
-        if momentum_z > self.MOMENTUM_STRONG:
-            momentum_state = "strong_positive"
-        elif momentum_z < -self.MOMENTUM_STRONG:
-            momentum_state = "strong_negative"
-        else:
-            momentum_state = "neutral"
-
-        if signal == "LONG" and momentum_z < 0:
-            warnings.append("Momentum contradicts LONG signal.")
-
-        if signal == "SHORT" and momentum_z > 0:
-            warnings.append("Momentum contradicts SHORT signal.")
-
-        # =====================================================
-        # 5️⃣ Trend Context
-        # =====================================================
-
+        # Trend
         if ema_ratio > self.EMA_BULLISH:
             trend = "bullish"
         elif ema_ratio < self.EMA_BEARISH:
@@ -116,29 +97,32 @@ class SignalAgent:
         else:
             trend = "neutral"
 
-        # =====================================================
-        # 6️⃣ Cross-sectional dispersion health
-        # =====================================================
+        reasoning.append(f"Trend regime: {trend}.")
 
-        dispersion = self._safe_float(
-            probability_stats.get("std"),
-            0.0
-        )
+        # Momentum
+        if momentum_z > self.MOMENTUM_STRONG:
+            momentum_state = "strong_positive"
+        elif momentum_z < -self.MOMENTUM_STRONG:
+            momentum_state = "strong_negative"
+        else:
+            momentum_state = "neutral"
 
-        if dispersion < self.DISPERSION_WEAK:
-            warnings.append("Low cross-sectional dispersion.")
+        reasoning.append(f"Momentum state: {momentum_state}.")
 
-        # =====================================================
-        # 7️⃣ Strength Score (based purely on Z-score magnitude)
-        # =====================================================
-
-        strength_score = int(
-            np.clip(abs_score * 40, 0, 100)
-        )
+        if signal == "LONG" and momentum_z < 0:
+            warnings.append("Momentum contradicts LONG signal.")
+        if signal == "SHORT" and momentum_z > 0:
+            warnings.append("Momentum contradicts SHORT signal.")
 
         # =====================================================
-        # 8️⃣ Risk Level
+        # 3️⃣ Risk Agent
         # =====================================================
+
+        if regime_feature > 1.5:
+            volatility_regime = "high_volatility"
+            warnings.append("High volatility regime detected.")
+        else:
+            volatility_regime = "normal"
 
         if volatility_regime == "high_volatility":
             risk_level = "elevated"
@@ -149,24 +133,66 @@ class SignalAgent:
         else:
             risk_level = "low"
 
+        reasoning.append(f"Risk level assessed as {risk_level}.")
+
         # =====================================================
-        # Explanation
+        # 4️⃣ Macro Agent (Breadth-based)
+        # =====================================================
+
+        if breadth > 0.65:
+            macro_regime = "risk_on"
+        elif breadth < 0.35:
+            macro_regime = "risk_off"
+        else:
+            macro_regime = "neutral"
+
+        reasoning.append(f"Macro regime inferred as {macro_regime}.")
+
+        # =====================================================
+        # 5️⃣ Cross-Sectional Health
+        # =====================================================
+
+        dispersion = 0.0
+        if probability_stats:
+            dispersion = self._safe_float(probability_stats.get("std"), 0.0)
+
+        if dispersion < self.DISPERSION_WEAK:
+            warnings.append("Low cross-sectional dispersion.")
+            reasoning.append("Signal environment weak due to low dispersion.")
+
+        # =====================================================
+        # 6️⃣ Strength Score (0–100)
+        # =====================================================
+
+        strength_score = int(np.clip(abs_score * 40, 0, 100))
+
+        # =====================================================
+        # 7️⃣ Summary Explanation
         # =====================================================
 
         explanation = (
-            f"{signal} signal | alpha_z={score:.2f} | "
-            f"confidence={confidence}. "
-            f"Trend={trend}, Momentum={momentum_state}, "
-            f"VolatilityRegime={volatility_regime}."
+            f"{signal} | alpha={alpha_score:.2f} | "
+            f"final={final_score:.2f} | "
+            f"confidence={confidence} | "
+            f"trend={trend} | "
+            f"macro={macro_regime} | "
+            f"risk={risk_level}"
         )
 
+        # =====================================================
+        # Structured Output
+        # =====================================================
+
         return {
+            "signal": signal,
             "confidence": confidence,
+            "strength_score": strength_score,
+            "risk_level": risk_level,
             "volatility_regime": volatility_regime,
             "trend": trend,
             "momentum_state": momentum_state,
-            "strength_score": strength_score,
-            "risk_level": risk_level,
+            "macro_regime": macro_regime,
+            "reasoning": reasoning,
             "warnings": warnings,
             "explanation": explanation,
         }
