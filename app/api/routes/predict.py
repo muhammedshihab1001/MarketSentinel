@@ -26,10 +26,6 @@ from app.api.schemas import (
 router = APIRouter()
 logger = logging.getLogger("marketsentinel.api")
 
-# =========================================================
-# SAFE SINGLETON PIPELINE
-# =========================================================
-
 _pipeline: InferencePipeline | None = None
 
 
@@ -41,16 +37,12 @@ def get_pipeline() -> InferencePipeline:
     return _pipeline
 
 
-# =========================================================
-# PRODUCTION LIMITS
-# =========================================================
-
 MAX_CONCURRENT_INFERENCES = int(os.getenv("MAX_CONCURRENT_INFERENCES", "4"))
 REQUEST_TIMEOUT = int(os.getenv("INFERENCE_TIMEOUT_SEC", "25"))
 MIN_BATCH_SIZE = 4
 
 PRIMARY_UNIVERSE_PATH = Path(
-    os.getenv("PRODUCTION_UNIVERSE_PATH", "config/universe_production.json")
+    os.getenv("PRODUCTION_UNIVERSE_PATH", "config/universe.json")
 )
 
 FALLBACK_UNIVERSE_PATH = Path("config/universe.json")
@@ -60,17 +52,9 @@ inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
 TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 
 
-# =========================================================
-# SAFE ATTRIBUTE ACCESS
-# =========================================================
-
 def safe_attr(obj, attr, default=None):
     return getattr(obj, attr, default)
 
-
-# =========================================================
-# DEFAULT UNIVERSE LOADER
-# =========================================================
 
 def load_default_universe() -> List[str]:
 
@@ -83,11 +67,8 @@ def load_default_universe() -> List[str]:
     else:
         raise RuntimeError("No universe configuration file found.")
 
-    try:
-        with open(universe_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        raise RuntimeError("Failed to read universe config.")
+    with open(universe_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
     if isinstance(data, list):
         tickers = data
@@ -132,18 +113,14 @@ async def live_snapshot():
                 timeout=REQUEST_TIMEOUT
             )
 
-        if not isinstance(snapshot, dict) or "signals" not in snapshot:
+        if not snapshot or "signals" not in snapshot:
             raise RuntimeError("Invalid snapshot structure.")
 
         signals = snapshot["signals"]
 
-        if not signals:
-            raise RuntimeError("No signals generated.")
-
         long_count = sum(1 for s in signals if s.get("weight", 0.0) > 0)
         short_count = sum(1 for s in signals if s.get("weight", 0.0) < 0)
 
-        # Use new multi-agent score
         strength_scores = [
             s.get("agent", {}).get("agent_score", 0.0) * 100
             for s in signals
@@ -222,28 +199,20 @@ async def signal_explanation(ticker: str):
                 timeout=REQUEST_TIMEOUT
             )
 
-        if not snapshot or "signals" not in snapshot:
-            raise HTTPException(status_code=500, detail="Invalid snapshot.")
+        signals = snapshot.get("signals", [])
 
-        signals = snapshot["signals"]
-
-        row = next(
-            (s for s in signals if s["ticker"] == ticker),
-            None
-        )
+        row = next((s for s in signals if s["ticker"] == ticker), None)
 
         if row is None:
             raise HTTPException(status_code=404, detail="Signal not found.")
 
         agent_data = row.get("agent", {})
 
-        direction = row.get("signal")
-        if not direction:
-            direction = "LONG" if row.get("score", 0) > 0 else "SHORT"
+        direction = row.get("signal", "NEUTRAL")
 
         explanation = SignalExplanationResponse(
             ticker=row["ticker"],
-            score=row.get("score", row.get("raw_model_score", 0.0)),
+            score=row.get("raw_model_score", 0.0),
             signal=direction,
             agent_score=agent_data.get("agent_score", 0.0),
             alpha_strength=agent_data.get("alpha_strength", 0.0),
@@ -251,7 +220,6 @@ async def signal_explanation(ticker: str):
             governance_score=agent_data.get("governance_score", 0),
             risk_level=agent_data.get("risk_level", "unknown"),
             volatility_regime=agent_data.get("volatility_regime", "unknown"),
-            trend=agent_data.get("trend", "unknown"),
             drift_flag=agent_data.get("drift_flag", False),
             warnings=agent_data.get("warnings", []),
             explanation=agent_data.get("explanation", "")
