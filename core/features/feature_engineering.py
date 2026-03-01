@@ -25,16 +25,13 @@ class FeatureEngineer:
     @staticmethod
     def _normalize_datetime(df):
         df = df.copy()
-
         df["date"] = (
             pd.to_datetime(df["date"], utc=True, errors="coerce")
             .dt.tz_convert(None)
             .dt.normalize()
         )
-
         df = df.dropna(subset=["date"])
         df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
-
         return df
 
     ########################################################
@@ -68,7 +65,6 @@ class FeatureEngineer:
         if (df["close"] <= 0).any():
             raise RuntimeError("Invalid close prices.")
 
-        # Split detection
         returns = df.groupby("ticker")["close"].pct_change().abs()
         extreme = returns > cls.SPLIT_THRESHOLD
 
@@ -80,7 +76,7 @@ class FeatureEngineer:
         return df.dropna(subset=["close"]).reset_index(drop=True)
 
     ########################################################
-    # CORE FEATURES (PER TICKER SAFE)
+    # CORE FEATURES (ENHANCED)
     ########################################################
 
     @classmethod
@@ -93,6 +89,9 @@ class FeatureEngineer:
 
         df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
         df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
+
+        # Short-term reversal
+        df["reversal_5"] = -df["return_lag5"]
 
         df["return_mean_20"] = (
             df.groupby("ticker")["return"]
@@ -108,19 +107,6 @@ class FeatureEngineer:
             0.6 * df["momentum_20"] +
             0.4 * df["momentum_60"]
         ).clip(-2, 2)
-
-        # Volume
-        df["volume_mean_20"] = (
-            df.groupby("ticker")["volume"]
-            .transform(lambda x: x.rolling(20, min_periods=5).mean())
-            .shift(1)
-        )
-
-        df["volume_momentum"] = (
-            df["volume"] / (df["volume_mean_20"] + cls.EPSILON)
-        ).clip(0, 5)
-
-        df["dollar_volume"] = df["close"] * df["volume"]
 
         # Volatility
         grp = df.groupby("ticker")["return"]
@@ -138,6 +124,37 @@ class FeatureEngineer:
             .clip(lower=cls.VOL_FLOOR)
         )
 
+        # Volatility-adjusted momentum
+        df["mom_vol_adj"] = (
+            df["momentum_composite"] /
+            (df["volatility"] + cls.EPSILON)
+        ).clip(-5, 5)
+
+        # Vol-of-vol
+        df["vol_of_vol"] = (
+            df.groupby("ticker")["volatility"]
+            .transform(lambda x: x.rolling(20, min_periods=5).std())
+        ).fillna(0)
+
+        # Skewness
+        df["return_skew_20"] = (
+            df.groupby("ticker")["return"]
+            .transform(lambda x: x.rolling(20, min_periods=5).skew())
+        ).fillna(0)
+
+        # Volume
+        df["volume_mean_20"] = (
+            df.groupby("ticker")["volume"]
+            .transform(lambda x: x.rolling(20, min_periods=5).mean())
+            .shift(1)
+        )
+
+        df["volume_momentum"] = (
+            df["volume"] / (df["volume_mean_20"] + cls.EPSILON)
+        ).clip(0, 5)
+
+        df["dollar_volume"] = df["close"] * df["volume"]
+
         # RSI
         df["rsi"] = 50.0
         for ticker, group in df.groupby("ticker"):
@@ -149,11 +166,10 @@ class FeatureEngineer:
 
         df["rsi"] = df["rsi"].clip(0, 100)
 
-        # EMA
+        # EMA ratio
         df["ema_10"] = df.groupby("ticker")["close"].transform(
             lambda x: x.ewm(span=10, adjust=False).mean()
         )
-
         df["ema_50"] = df.groupby("ticker")["close"].transform(
             lambda x: x.ewm(span=50, adjust=False).mean()
         )
@@ -162,7 +178,7 @@ class FeatureEngineer:
             df["ema_10"] / (df["ema_50"] + cls.EPSILON)
         ).clip(0.5, 1.5)
 
-        # 52W high distance
+        # 52-week high distance
         rolling_high = (
             df.groupby("ticker")["close"]
             .transform(lambda x: x.rolling(252, min_periods=60).max())
@@ -178,7 +194,7 @@ class FeatureEngineer:
             df["return"].abs() / (df["dollar_volume"] + cls.EPSILON)
         ).clip(0, 1)
 
-        # Regime
+        # Regime feature
         vol_mean = (
             df.groupby("ticker")["volatility"]
             .transform(lambda x: x.rolling(60, min_periods=20).mean())
@@ -194,10 +210,15 @@ class FeatureEngineer:
             (vol_std + cls.EPSILON)
         ).clip(-3, 3).fillna(0.0)
 
+        # Interaction feature
+        df["momentum_regime_interaction"] = (
+            df["momentum_composite"] * df["regime_feature"]
+        ).clip(-5, 5)
+
         return df
 
     ########################################################
-    # CROSS SECTIONAL FEATURES
+    # CROSS SECTIONAL FEATURES (STABILIZED)
     ########################################################
 
     @classmethod
@@ -215,40 +236,27 @@ class FeatureEngineer:
         if df.empty:
             raise RuntimeError("Cross-sectional width insufficient.")
 
-        # Market-level first
+        # Stabilized dispersion
         df["market_dispersion"] = (
             df.groupby("date")["return"]
             .transform("std")
-            .clip(0, 0.2)
+            .fillna(0)
         )
 
+        # Stabilized breadth
         df["breadth"] = (
             df.groupby("date")["return"]
             .transform(lambda x: (x > 0).mean())
+            .fillna(0.5)
         )
 
         base_cols = [
-            "momentum_20",
-            "momentum_60",
-            "momentum_composite",
-            "return_lag5",
-            "return_mean_20",
-            "rsi",
-            "volatility",
-            "ema_ratio",
-            "volume_momentum",
-            "dollar_volume",
-            "dist_from_52w_high",
-            "regime_feature",
-            "amihud",
-            "market_dispersion",
-            "breadth",
+            col for col in df.columns
+            if col not in ["date", "ticker"]
+            and df[col].dtype != "object"
         ]
 
         for col in base_cols:
-
-            if col not in df.columns:
-                continue
 
             lower = df.groupby("date")[col].transform(lambda x: x.quantile(0.01))
             upper = df.groupby("date")[col].transform(lambda x: x.quantile(0.99))
