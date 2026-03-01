@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import inspect
+import tempfile
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
@@ -18,7 +19,8 @@ from core.schema.feature_schema import (
     MODEL_FEATURES,
     validate_feature_schema,
     get_schema_signature,
-    SCHEMA_VERSION
+    SCHEMA_VERSION,
+    schema_snapshot
 )
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
@@ -73,6 +75,19 @@ def compute_feature_checksum():
 def compute_training_code_hash():
     source = inspect.getsource(build_xgboost_pipeline)
     return hashlib.sha256(source.encode()).hexdigest()
+
+
+def compute_reproducibility_hash(dataset_hash):
+    payload = {
+        "dataset_hash": dataset_hash,
+        "schema_signature": get_schema_signature(),
+        "schema_version": SCHEMA_VERSION,
+        "feature_checksum": compute_feature_checksum(),
+        "universe_hash": MarketUniverse.fingerprint(),
+        "training_code_hash": compute_training_code_hash()
+    }
+    canonical = json.dumps(payload, sort_keys=True).encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 # ==========================================================
@@ -237,25 +252,13 @@ def trainer(train_df):
     pipeline = build_xgboost_pipeline()
     pipeline.fit(X, y, groups)
 
+    pipeline.feature_names = list(MODEL_FEATURES)
+
     return pipeline
 
 
 def final_trainer(train_df):
-    train_df = build_target(train_df)
-    train_df = train_df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
-    X = validate_feature_schema(
-        train_df.loc[:, MODEL_FEATURES],
-        mode="strict_contract"
-    )
-
-    y = train_df["target"].values
-    groups = build_groups(train_df)
-
-    pipeline = build_xgboost_pipeline()
-    pipeline.fit(X, y, groups)
-
-    return pipeline
+    return trainer(train_df)
 
 
 # ==========================================================
@@ -272,14 +275,12 @@ def export_artifacts(model, metrics, dataset_hash,
     timestamp = int(time.time())
     model_path = os.path.join(MODEL_DIR, f"model_{timestamp}.pkl")
 
-    # Attach fingerprint into model object
-    model.training_fingerprint = dataset_hash
+    model.training_fingerprint = compute_reproducibility_hash(dataset_hash)
 
     joblib.dump(model, model_path)
 
     artifact_hash = MetadataManager.hash_file(model_path)
 
-    # --- Use official metadata factory ---
     metadata = MetadataManager.create_metadata(
         model_name="xgboost",
         metrics={k: v for k, v in metrics.items() if k != "equity_curve"},
@@ -292,6 +293,9 @@ def export_artifacts(model, metrics, dataset_hash,
         extra_fields={
             "artifact_hash": artifact_hash,
             "feature_checksum": compute_feature_checksum(),
+            "schema_snapshot": schema_snapshot(),
+            "universe_hash": MarketUniverse.fingerprint(),
+            "training_code_hash": compute_training_code_hash(),
         }
     )
 
@@ -301,16 +305,27 @@ def export_artifacts(model, metrics, dataset_hash,
     if create_baseline:
         with open(BASELINE_CONTRACT, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
-        logger.info("Baseline contract created → %s", BASELINE_CONTRACT)
 
     if promote_baseline:
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
-        with open(pointer_path, "w", encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            delete=False,
+            dir=MODEL_DIR,
+            suffix=".tmp",
+            encoding="utf-8"
+        ) as tmp:
+
             json.dump({
                 "model_version": str(timestamp),
                 "updated_at": int(time.time())
-            }, f, indent=2)
-        logger.info("Model promoted to production.")
+            }, tmp, indent=2)
+
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            temp_name = tmp.name
+
+        os.replace(temp_name, pointer_path)
 
     return timestamp
 
@@ -350,20 +365,4 @@ def main(create_baseline=False,
         final_df,
         create_baseline=create_baseline,
         promote_baseline=promote_baseline
-    )
-
-
-if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--create-baseline", action="store_true")
-    parser.add_argument("--promote-baseline", action="store_true")
-    parser.add_argument("--allow-soft-fail", action="store_true")
-
-    args = parser.parse_args()
-
-    main(
-        create_baseline=args.create_baseline,
-        promote_baseline=args.promote_baseline,
-        allow_soft_fail=args.allow_soft_fail
     )
