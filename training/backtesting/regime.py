@@ -9,11 +9,10 @@ logger = logging.getLogger("marketsentinel.regime")
 @dataclass(frozen=True)
 class RegimeConfig:
 
-    # Slightly shorter windows for Yahoo-quality data
+    # Shorter windows (Yahoo friendly)
     trend_window: int = 150
     volatility_window: int = 40
 
-    # Relaxed volatility thresholds
     bull_vol_threshold: float = 0.03
     bear_vol_threshold: float = 0.03
 
@@ -27,6 +26,10 @@ class RegimeConfig:
     HYSTERESIS_BUFFER: float = 0.003
 
     MIN_VOL_FLOOR: float = 0.005
+
+    # NEW (Yahoo stability)
+    RETURN_SMOOTH_SPAN: int = 5
+    TREND_SMOOTH_SPAN: int = 8
 
 
 class MarketRegimeDetector:
@@ -100,11 +103,20 @@ class MarketRegimeDetector:
             if close.isna().any():
                 return self._neutral_regime(df)
 
-            returns = close.pct_change()
+            raw_returns = close.pct_change()
 
-            if returns.abs().max() > cfg.MAX_DAILY_RETURN:
+            if raw_returns.abs().max() > cfg.MAX_DAILY_RETURN:
                 logger.warning("Extreme return detected — fallback.")
                 return self._neutral_regime(df)
+
+            ########################################################
+            # RETURN SMOOTHING (Yahoo stability)
+            ########################################################
+
+            returns = raw_returns.ewm(
+                span=cfg.RETURN_SMOOTH_SPAN,
+                adjust=False
+            ).mean()
 
             ########################################################
             # STRICTLY CAUSAL TREND
@@ -122,6 +134,12 @@ class MarketRegimeDetector:
                 (ma_long + cfg.EPSILON)
             )
 
+            # slight smoothing
+            trend_dev = trend_dev.ewm(
+                span=cfg.TREND_SMOOTH_SPAN,
+                adjust=False
+            ).mean()
+
             ########################################################
             # STRICTLY CAUSAL VOLATILITY
             ########################################################
@@ -138,7 +156,6 @@ class MarketRegimeDetector:
                 adjust=False
             ).mean()
 
-            # Apply minimum volatility floor to avoid collapse
             volatility = volatility.clip(lower=cfg.MIN_VOL_FLOOR)
 
             ########################################################
@@ -177,10 +194,6 @@ class MarketRegimeDetector:
 
             regime = self._apply_persistence(regime)
 
-            ########################################################
-            # OUTPUT
-            ########################################################
-
             df["regime"] = regime
             df["market_regime"] = regime
 
@@ -191,7 +204,7 @@ class MarketRegimeDetector:
             return self._neutral_regime(df)
 
     ########################################################
-    # MULTI ASSET (SAFE)
+    # MULTI ASSET
     ########################################################
 
     def detect(self, df: pd.DataFrame):
