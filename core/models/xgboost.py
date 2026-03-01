@@ -16,6 +16,7 @@ MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
 MIN_PRED_ENTROPY = 0.01
 MAX_MODEL_SIZE_MB = 100
+MAX_ABS_SCORE = 50
 EPSILON = 1e-12
 
 
@@ -62,12 +63,15 @@ class SafeXGBRegressor:
         self.training_cols = X.shape[1]
 
         ###################################################
-        # TRAINING FINGERPRINT
+        # TRAINING FINGERPRINT (robust)
         ###################################################
 
-        self.training_fingerprint = hashlib.sha256(
-            X.to_numpy().tobytes()
-        ).hexdigest()
+        dataset_payload = (
+            X.to_numpy().tobytes() +
+            y.tobytes()
+        )
+
+        self.training_fingerprint = hashlib.sha256(dataset_payload).hexdigest()
 
         ###################################################
         # FEATURE CHECKSUM
@@ -128,7 +132,11 @@ class SafeXGBRegressor:
             verbose_eval=False,
         )
 
-        self.best_iteration = self.model.best_iteration
+        self.best_iteration = (
+            self.model.best_iteration
+            if hasattr(self.model, "best_iteration")
+            else NUM_BOOST_ROUNDS
+        )
 
         ###################################################
         # MODEL SIZE CHECK
@@ -156,7 +164,7 @@ class SafeXGBRegressor:
         if pred_std < MIN_SCORE_STD:
             raise RuntimeError("Score collapse detected.")
 
-        # Entropy check
+        # entropy check
         hist, _ = np.histogram(preds, bins=20)
         probs = hist / (hist.sum() + EPSILON)
         entropy = -np.sum(probs * np.log(probs + EPSILON))
@@ -206,7 +214,7 @@ class SafeXGBRegressor:
         if not np.all(np.isfinite(scores)):
             raise RuntimeError("Non-finite inference scores.")
 
-        scores = np.clip(scores, -50, 50)
+        scores = np.clip(scores, -MAX_ABS_SCORE, MAX_ABS_SCORE)
 
         if np.std(scores) < MIN_SCORE_STD:
             logger.warning("Inference score dispersion low.")
@@ -218,6 +226,9 @@ class SafeXGBRegressor:
     ###################################################
 
     def export_feature_importance(self):
+
+        if self.model is None:
+            raise RuntimeError("Model not trained.")
 
         raw_gain = self.model.get_score(importance_type="gain")
 
@@ -249,6 +260,8 @@ class SafeXGBRegressor:
             "importance_checksum": self.importance_checksum,
             "booster_checksum": self.booster_checksum,
             "best_iteration": self.best_iteration,
+            "param_checksum": self.param_checksum,
+            "feature_checksum": self.feature_checksum,
         }
 
 
