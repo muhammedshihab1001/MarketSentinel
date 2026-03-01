@@ -1,13 +1,13 @@
 from pydantic import BaseModel, Field, field_validator
 from datetime import date
-from typing import List
+from typing import List, Optional
 
 
 MAX_FORECAST_DAYS = 90
 
 
 # =========================================================
-# FORECAST REQUEST (UNCHANGED)
+# FORECAST REQUEST
 # =========================================================
 
 class PredictionRequest(BaseModel):
@@ -19,17 +19,17 @@ class PredictionRequest(BaseModel):
         description="Stock ticker symbol (e.g. AAPL, TSLA)"
     )
 
-    start_date: date | None = Field(
+    start_date: Optional[date] = Field(
         default=None,
         description="Forecast start date (default = today)"
     )
 
-    end_date: date | None = Field(
+    end_date: Optional[date] = Field(
         default=None,
         description="Forecast end date"
     )
 
-    forecast_days: int | None = Field(
+    forecast_days: Optional[int] = Field(
         default=30,
         ge=1,
         le=MAX_FORECAST_DAYS,
@@ -44,7 +44,6 @@ class PredictionRequest(BaseModel):
     @field_validator("end_date")
     @classmethod
     def validate_dates(cls, v, info):
-
         start = info.data.get("start_date")
 
         if v and start and v <= start:
@@ -75,7 +74,7 @@ class PredictionRequest(BaseModel):
 
 
 # =========================================================
-# MULTI-AGENT SIGNAL EXPLANATION (UPDATED)
+# MULTI-AGENT SIGNAL EXPLANATION
 # =========================================================
 
 class SignalExplanationResponse(BaseModel):
@@ -84,7 +83,7 @@ class SignalExplanationResponse(BaseModel):
     score: float
     signal: str
 
-    # Multi-agent fields
+    # Multi-agent core metrics
     agent_score: float
     alpha_strength: float
     confidence_numeric: float
@@ -92,13 +91,16 @@ class SignalExplanationResponse(BaseModel):
 
     risk_level: str
     volatility_regime: str
-    trend: str
 
     drift_flag: bool
 
-    warnings: List[str]
+    warnings: List[str] = []
     explanation: str
 
+
+# =========================================================
+# META INFORMATION
+# =========================================================
 
 class SignalExplanationMeta(BaseModel):
 
@@ -113,6 +115,10 @@ class SignalExplanationMeta(BaseModel):
     latency_ms: int
     timestamp: int
 
+
+# =========================================================
+# ENVELOPE
+# =========================================================
 
 class SignalExplanationEnvelope(BaseModel):
 
