@@ -1,4 +1,4 @@
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional, List
 import hashlib
 import json
 import os
@@ -10,7 +10,7 @@ from pathlib import Path
 
 class MarketUniverse:
     """
-    Institutional Universe Controller (Production Hardened + Research Flexible)
+    Institutional Universe Controller (Hybrid Production-Grade)
 
     Guarantees:
     ✔ deterministic
@@ -22,23 +22,31 @@ class MarketUniverse:
     ✔ tamper detected
     ✔ version monotonic
     ✔ metadata compatible
-    ✔ research override safe
+    ✔ research override isolated
+    ✔ hybrid-system compatible
     """
 
     ###################################################
     # CONFIG
     ###################################################
 
-    UNIVERSE_FILE = os.getenv(
+    PRODUCTION_FILE = os.getenv(
         "UNIVERSE_PATH",
         "config/universe.json"
+    )
+
+    RESEARCH_FILE = os.getenv(
+        "UNIVERSE_RESEARCH_PATH",
+        "config/universe_research.json"
     )
 
     REQUIRED_SIZE = 30
     MIN_FILE_BYTES = 50
 
-    # Optional research override (DOES NOT affect production)
-    ALLOW_RESEARCH_OVERRIDE = os.getenv("UNIVERSE_RESEARCH_MODE", "0") == "1"
+    ALLOW_RESEARCH_OVERRIDE = os.getenv(
+        "UNIVERSE_RESEARCH_MODE",
+        "0"
+    ) == "1"
 
     TICKER_REGEX = re.compile(r"^[A-Z0-9.\-]{1,10}$")
 
@@ -61,11 +69,21 @@ class MarketUniverse:
     ###################################################
 
     @classmethod
+    def _active_file(cls) -> str:
+        if cls.ALLOW_RESEARCH_OVERRIDE and Path(cls.RESEARCH_FILE).exists():
+            return cls.RESEARCH_FILE
+        return cls.PRODUCTION_FILE
+
+    ###################################################
+
+    @classmethod
     def _hash_file(cls):
+
+        path = cls._active_file()
 
         h = hashlib.sha256()
 
-        with open(cls.UNIVERSE_FILE, "rb") as f:
+        with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
 
@@ -141,7 +159,8 @@ class MarketUniverse:
             "description": payload["description"],
             "min_history_days": min_history_days,
             "tickers": tuple(sorted(normalized)),
-            "ticker_set": set(normalized)
+            "ticker_set": set(normalized),
+            "file_path": cls._active_file()
         }
 
     ###################################################
@@ -149,10 +168,10 @@ class MarketUniverse:
     @classmethod
     def _load_file(cls):
 
-        path = Path(cls.UNIVERSE_FILE)
+        path = Path(cls._active_file())
 
         if not path.exists():
-            raise RuntimeError(f"Universe file missing: {cls.UNIVERSE_FILE}")
+            raise RuntimeError(f"Universe file missing: {path}")
 
         if path.stat().st_size < cls.MIN_FILE_BYTES:
             raise RuntimeError("Universe file corrupted.")
@@ -188,6 +207,15 @@ class MarketUniverse:
         return cls._get_cached()["tickers"]
 
     @classmethod
+    def contains(cls, ticker: str) -> bool:
+        return ticker.upper() in cls._get_cached()["ticker_set"]
+
+    @classmethod
+    def filter_valid(cls, tickers: List[str]) -> List[str]:
+        universe_set = cls._get_cached()["ticker_set"]
+        return sorted(set(t.upper() for t in tickers if t.upper() in universe_set))
+
+    @classmethod
     def get_min_history_days(cls):
         return cls._get_cached()["min_history_days"]
 
@@ -221,7 +249,7 @@ class MarketUniverse:
         return hashlib.sha256(canonical).hexdigest()
 
     ###################################################
-    # SNAPSHOT (METADATA SAFE)
+    # SNAPSHOT (API + BACKTEST SAFE)
     ###################################################
 
     @classmethod
@@ -236,10 +264,9 @@ class MarketUniverse:
             "min_history_days": cache["min_history_days"],
             "universe_hash": cls.fingerprint(),
             "universe_size": len(cache["tickers"]),
+            "file_path": cache["file_path"],
+            "research_mode": cls.ALLOW_RESEARCH_OVERRIDE,
             "tickers": list(cache["tickers"])
         }
-
-        if "universe_hash" not in snapshot:
-            raise RuntimeError("Universe snapshot construction failed.")
 
         return snapshot
