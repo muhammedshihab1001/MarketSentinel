@@ -9,10 +9,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# SCHEMA VERSION
+# SCHEMA VERSION (BUMPED)
 # ============================================================
 
-SCHEMA_VERSION = "43.0"  # governance-stable hardened contract
+SCHEMA_VERSION = "44.0"  # enhanced-alpha schema contract
 
 
 ############################################################
@@ -24,7 +24,7 @@ SHORT_PERCENTILE = 0.30
 
 
 ############################################################
-# CORE FEATURES
+# CORE FEATURES (ENHANCED)
 ############################################################
 
 CORE_FEATURES: Tuple[str, ...] = (
@@ -34,15 +34,20 @@ CORE_FEATURES: Tuple[str, ...] = (
     "return_lag1",
     "return_lag5",
     "return_mean_20",
+    "reversal_5",
 
     # Momentum
     "momentum_20",
     "momentum_60",
     "momentum_composite",
+    "mom_vol_adj",
+    "momentum_regime_interaction",
 
     # Volatility
     "volatility",
     "volatility_20",
+    "vol_of_vol",
+    "return_skew_20",
 
     # Liquidity
     "volume_momentum",
@@ -71,10 +76,15 @@ BASE_CS_COLS: Tuple[str, ...] = (
     "momentum_20",
     "momentum_60",
     "momentum_composite",
+    "mom_vol_adj",
+    "momentum_regime_interaction",
     "return_lag5",
     "return_mean_20",
+    "reversal_5",
     "rsi",
     "volatility",
+    "vol_of_vol",
+    "return_skew_20",
     "ema_ratio",
     "volume_momentum",
     "dollar_volume",
@@ -264,6 +274,7 @@ def get_schema_signature() -> str:
             "short_percentile": SHORT_PERCENTILE,
         },
         "version": SCHEMA_VERSION,
+        "feature_count": len(MODEL_FEATURES),
     }
 
     canonical = json.dumps(contract, sort_keys=True)
