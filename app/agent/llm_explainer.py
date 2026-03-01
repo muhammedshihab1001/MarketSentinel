@@ -31,14 +31,14 @@ class LLMExplainer:
         self.model_name = get_env("OPENAI_MODEL", "gpt-4o-mini")
         self.timeout = get_int("OPENAI_TIMEOUT", 12)
 
-        # 🔐 Rate limiting
+        # Rate limiting
         self.rate_limit_per_minute = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
 
-        # 📦 Cache
+        # Cache
         self.cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
-        self.cache_ttl_seconds = get_int("LLM_CACHE_TTL_SEC", 120)
+        self.cache_ttl_seconds = get_int("LLM_CACHE_TTL_SEC", 180)
 
-        # 📜 Audit logging
+        # Audit logging
         self.audit_enabled = get_bool("LLM_AUDIT_ENABLED", True)
 
         self._request_times = []
@@ -88,14 +88,18 @@ class LLMExplainer:
         payload = {
             "ticker": row.get("ticker"),
             "signal": row.get("signal"),
+            "alpha_score": row.get("alpha_score"),
             "score": row.get("score"),
-            "rank_pct": row.get("rank_pct"),
+            "weight": row.get("weight"),
             "confidence": agent.get("confidence"),
+            "risk_level": agent.get("risk_level"),
             "trend": agent.get("trend"),
+            "macro_regime": agent.get("macro_regime"),
             "volatility_regime": agent.get("volatility_regime"),
-            "momentum_state": agent.get("momentum_state"),
-            "prob_mean": stats.get("mean"),
-            "prob_std": stats.get("std"),
+            "strength_score": agent.get("strength_score"),
+            "drift_state": stats.get("drift_state"),
+            "severity_score": stats.get("severity_score"),
+            "score_std": stats.get("std"),
         }
 
         canonical = json.dumps(payload, sort_keys=True)
@@ -174,7 +178,7 @@ class LLMExplainer:
         self,
         signal_row: Dict[str, Any],
         agent_output: Dict[str, Any],
-        probability_stats: Dict[str, Any],
+        context_stats: Dict[str, Any],
     ) -> Dict[str, Any]:
 
         if not self.enabled:
@@ -184,12 +188,12 @@ class LLMExplainer:
             }
 
         ticker = signal_row.get("ticker")
-        signal = signal_row.get("signal")
+        signal = agent_output.get("signal")
 
         cache_key = self._cache_key(
             signal_row,
             agent_output,
-            probability_stats
+            context_stats
         )
 
         cached = self._get_cached(cache_key)
@@ -211,7 +215,7 @@ class LLMExplainer:
         prompt = self._build_prompt(
             signal_row,
             agent_output,
-            probability_stats
+            context_stats
         )
 
         try:
@@ -223,6 +227,7 @@ class LLMExplainer:
                         {
                             "role": "system",
                             "content": (
+                                "You are an institutional equity strategist. "
                                 "Return ONLY valid JSON with keys:\n"
                                 "summary, rationale, risk_commentary, outlook."
                             ),
@@ -248,7 +253,6 @@ class LLMExplainer:
             }
 
             self._set_cache(cache_key, result)
-
             self._audit_log(ticker, signal, result, cached=False)
 
             return result
@@ -292,25 +296,33 @@ class LLMExplainer:
             }
 
     ########################################################
-    # PROMPT BUILDER
+    # PROMPT BUILDER (HYBRID AWARE)
     ########################################################
 
     def _build_prompt(self, row, agent, stats):
 
         return f"""
 Ticker: {row.get("ticker")}
-Signal: {row.get("signal")}
-Score: {row.get("score")}
-Rank Percentile: {row.get("rank_pct")}
+Signal: {agent.get("signal")}
+Alpha Score: {row.get("alpha_score")}
+Final Hybrid Score: {row.get("score")}
+Position Weight: {row.get("weight")}
 
 Confidence: {agent.get("confidence")}
+Strength Score: {agent.get("strength_score")}
+Risk Level: {agent.get("risk_level")}
+
 Trend: {agent.get("trend")}
+Momentum: {agent.get("momentum_state")}
+Macro Regime: {agent.get("macro_regime")}
 Volatility Regime: {agent.get("volatility_regime")}
-Momentum State: {agent.get("momentum_state")}
+
+Drift State: {stats.get("drift_state")}
+Drift Severity: {stats.get("severity_score")}
+Cross-Sectional Dispersion: {stats.get("std")}
+
 Warnings: {agent.get("warnings")}
+Reasoning: {agent.get("reasoning")}
 
-Probability Mean: {stats.get("mean")}
-Probability Std: {stats.get("std")}
-
-Explain professionally.
+Provide a professional institutional-level explanation.
 """
