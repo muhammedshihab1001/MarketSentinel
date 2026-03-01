@@ -1,6 +1,9 @@
+# =========================================================
+# INSTITUTIONAL SIGNAL AGENT (Governance Hardened)
+# =========================================================
+
 import numpy as np
 from typing import Dict, Any, List, Optional
-
 
 EPSILON = 1e-12
 
@@ -89,7 +92,6 @@ class SignalAgent:
         if volatility <= 0:
             return confidence_numeric
 
-        # Penalize extreme volatility
         penalty = np.clip(volatility / 2.0, 0.0, 1.0)
         adjusted = confidence_numeric * (1 - 0.3 * penalty)
 
@@ -129,13 +131,21 @@ class SignalAgent:
         drift_score: Optional[float] = None,
     ) -> Dict[str, Any]:
 
+        # =====================================================
+        # SAFE INPUTS
+        # =====================================================
+
         raw_model_score = self._safe_float(
             row.get("raw_model_score", row.get("alpha_score", row.get("score"))),
             0.0
         )
 
         final_score = self._safe_float(row.get("score"), 0.0)
+        final_score = float(np.clip(final_score, -self.MAX_SCORE_SANITY, self.MAX_SCORE_SANITY))
+
         signal = row.get("signal", "NEUTRAL")
+        if signal not in {"LONG", "SHORT", "NEUTRAL"}:
+            signal = "NEUTRAL"
 
         volatility = self._safe_float(row.get("volatility"), 0.0)
         rsi = self._safe_float(row.get("rsi"), 50.0)
@@ -148,12 +158,8 @@ class SignalAgent:
         reasoning: List[str] = []
 
         # =====================================================
-        # SCORE SANITY
+        # CONFIDENCE CLASSIFICATION
         # =====================================================
-
-        if abs(final_score) > self.MAX_SCORE_SANITY:
-            warnings.append("Score unusually large.")
-            final_score = np.sign(final_score) * self.MAX_SCORE_SANITY
 
         abs_score = abs(final_score)
 
@@ -175,7 +181,7 @@ class SignalAgent:
         reasoning.append(f"Alpha classified as {confidence} strength.")
 
         # =====================================================
-        # TECHNICAL
+        # TECHNICAL ANALYSIS
         # =====================================================
 
         if rsi > self.RSI_OVERBOUGHT:
@@ -207,7 +213,7 @@ class SignalAgent:
             warnings.append("Signal lacks technical confirmation.")
 
         # =====================================================
-        # RISK
+        # RISK CLASSIFICATION
         # =====================================================
 
         if regime_feature > 1.5:
@@ -236,11 +242,10 @@ class SignalAgent:
             macro_regime = "neutral"
 
         # =====================================================
-        # CROSS SECTIONAL
+        # CROSS SECTIONAL DISPERSION
         # =====================================================
 
         dispersion = 0.0
-
         if probability_stats:
             dispersion = self._safe_float(probability_stats.get("std"), 0.0)
 
@@ -259,9 +264,10 @@ class SignalAgent:
                 drift_flag = True
                 warnings.append("Feature distribution drift detected.")
                 confidence_numeric *= 0.7
+                confidence_numeric = float(np.clip(confidence_numeric, 0.0, 1.0))
 
         # =====================================================
-        # GOVERNANCE SCORE (NEW)
+        # GOVERNANCE SCORE
         # =====================================================
 
         governance_score = int(
@@ -275,7 +281,7 @@ class SignalAgent:
         )
 
         # =====================================================
-        # TRADE APPROVAL LOGIC
+        # TRADE APPROVAL
         # =====================================================
 
         trade_approved = (
@@ -284,7 +290,6 @@ class SignalAgent:
             and not drift_flag
         )
 
-        # Stricter approval in elevated risk
         if risk_level == "elevated":
             trade_approved = trade_approved and (
                 confidence_numeric > self.HIGH_RISK_CONFIDENCE_THRESHOLD
@@ -315,7 +320,14 @@ class SignalAgent:
         )
 
         # =====================================================
-        # EXPLANATION
+        # DEDUP + SORT (DETERMINISM)
+        # =====================================================
+
+        warnings = sorted(set(warnings))
+        reasoning = sorted(set(reasoning))
+
+        # =====================================================
+        # EXPLANATION CONTRACT (Stable Format)
         # =====================================================
 
         explanation = (
