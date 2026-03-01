@@ -41,10 +41,6 @@ def get_pipeline() -> InferencePipeline:
     return _pipeline
 
 
-def get_loader():
-    return get_shared_model_loader()
-
-
 # =========================================================
 # PRODUCTION LIMITS
 # =========================================================
@@ -133,8 +129,8 @@ async def live_snapshot():
 
         signals = snapshot["signals"]
 
-        long_count = sum(1 for s in signals if s.get("signal") == "LONG")
-        short_count = sum(1 for s in signals if s.get("signal") == "SHORT")
+        long_count = sum(1 for s in signals if s["score"] > 0)
+        short_count = sum(1 for s in signals if s["score"] < 0)
 
         strength_scores = [
             s.get("agent", {}).get("strength_score", 0.0)
@@ -156,6 +152,9 @@ async def live_snapshot():
             "long_signals": long_count,
             "short_signals": short_count,
             "avg_strength_score": avg_strength,
+            "gross_exposure": snapshot.get("gross_exposure"),
+            "net_exposure": snapshot.get("net_exposure"),
+            "drift_state": snapshot.get("drift", {}).get("drift_state"),
             "latency_ms": int((time.time() - start_time) * 1000),
             "timestamp": int(time.time())
         }
@@ -176,7 +175,7 @@ async def live_snapshot():
 
 
 # =========================================================
-# SIGNAL EXPLANATION (FIXED — CROSS-SECTION ENFORCED)
+# SIGNAL EXPLANATION
 # =========================================================
 
 @router.get(
@@ -198,7 +197,6 @@ async def signal_explanation(ticker: str):
         pipeline = get_pipeline()
         loader = get_shared_model_loader()
 
-        # 🔒 ENFORCE FULL CROSS-SECTIONAL CONTEXT
         universe_tickers = load_default_universe()
 
         if ticker not in universe_tickers:
@@ -213,25 +211,21 @@ async def signal_explanation(ticker: str):
                 timeout=REQUEST_TIMEOUT
             )
 
-        if not isinstance(snapshot, dict) or not snapshot.get("signals"):
-            raise HTTPException(status_code=404, detail="No signal generated.")
-
-        # Filter requested ticker from full universe result
         row = next(
             (s for s in snapshot["signals"] if s["ticker"] == ticker),
             None
         )
 
         if row is None:
-            raise HTTPException(status_code=404, detail="Signal not found for ticker.")
+            raise HTTPException(status_code=404, detail="Signal not found.")
 
         agent_data = row.get("agent", {})
+        direction = "LONG" if row["score"] > 0 else "SHORT"
 
         explanation = SignalExplanationResponse(
             ticker=row["ticker"],
             score=row["score"],
-            rank_pct=row["rank_pct"],
-            signal=row["signal"],
+            signal=direction,
             strength_score=agent_data.get("strength_score", 0.0),
             risk_level=agent_data.get("risk_level", "unknown"),
             confidence=agent_data.get("confidence", "unknown"),
