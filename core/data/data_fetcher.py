@@ -3,17 +3,22 @@ import time
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import random
 
 logger = logging.getLogger(__name__)
 
 
 class StockPriceFetcher:
 
-    MAX_RETRIES = 3
-    RETRY_SLEEP = 2
+    MAX_RETRIES = 4
+    BASE_RETRY_SLEEP = 1.0
+    MAX_BACKOFF = 6.0
+
     MIN_ROWS = 100
     MAX_DAILY_RETURN = 0.60
     MAX_VOLUME_SPIKE = 50
+
+    REQUEST_TIMEOUT = 20  # 🔥 added timeout
 
     ########################################################
     # DATE EXTRACTION
@@ -38,9 +43,6 @@ class StockPriceFetcher:
     @staticmethod
     def _ensure_utc(series):
 
-        if not isinstance(series, pd.Series):
-            raise RuntimeError("Date column must be a pandas Series.")
-
         s = pd.to_datetime(series, errors="coerce")
 
         if s.isna().all():
@@ -52,7 +54,7 @@ class StockPriceFetcher:
         return s.dt.tz_convert("UTC")
 
     ########################################################
-    # 🔥 SMART MULTIINDEX FLATTENER (FIELD-AWARE)
+    # MULTIINDEX FLATTENER
     ########################################################
 
     def _flatten_columns(self, df):
@@ -63,7 +65,6 @@ class StockPriceFetcher:
 
             for col in df.columns:
 
-                # col is tuple like ('Open','AAPL') or ('AAPL','Open')
                 lower = [str(x).lower().strip() for x in col]
 
                 detected = None
@@ -80,10 +81,7 @@ class StockPriceFetcher:
                         detected = field.replace(" ", "_")
                         break
 
-                if detected is None:
-                    normalized.append(lower[0])
-                else:
-                    normalized.append(detected)
+                normalized.append(detected or lower[0])
 
             df.columns = normalized
 
@@ -93,7 +91,6 @@ class StockPriceFetcher:
                 for c in df.columns
             ]
 
-        # Remove duplicates safely
         if len(set(df.columns)) != len(df.columns):
             logger.warning("Duplicate columns detected after flattening.")
             df = df.loc[:, ~df.columns.duplicated()]
@@ -101,7 +98,7 @@ class StockPriceFetcher:
         return df
 
     ########################################################
-    # VALIDATION (UNCHANGED LOGIC)
+    # VALIDATION
     ########################################################
 
     def _validate_prices(self, df):
@@ -128,7 +125,7 @@ class StockPriceFetcher:
             raise RuntimeError("Negative volume detected.")
 
         ####################################################
-        # SOFT OHLC REPAIR
+        # OHLC REPAIR
         ####################################################
 
         df["high"] = df[["high", "open", "close"]].max(axis=1)
@@ -157,6 +154,8 @@ class StockPriceFetcher:
         return df
 
     ########################################################
+    # DOWNLOAD WITH BACKOFF
+    ########################################################
 
     def _download(self, ticker, start, end, interval):
 
@@ -164,29 +163,40 @@ class StockPriceFetcher:
 
             try:
 
-                df = yf.download(
-                    tickers=ticker,
+                # 🔥 Fresh session isolation
+                ticker_obj = yf.Ticker(ticker)
+
+                df = ticker_obj.history(
                     start=start,
                     end=end,
                     interval=interval,
-                    progress=False,
                     auto_adjust=False,
-                    threads=False,
-                    group_by="column"
+                    timeout=self.REQUEST_TIMEOUT
                 )
 
                 if df is None or df.empty:
                     raise RuntimeError("Yahoo returned empty frame.")
 
+                # Guard against HTML disguised as dataframe
+                if len(df.columns) <= 1:
+                    raise RuntimeError("Suspicious Yahoo response structure.")
+
                 return df
 
             except Exception as e:
 
+                backoff = min(
+                    (2 ** (attempt - 1)) * self.BASE_RETRY_SLEEP +
+                    random.uniform(0.2, 0.8),
+                    self.MAX_BACKOFF
+                )
+
                 logger.warning(
-                    "Fetch failed (%s) attempt %s/%s | %s",
+                    "Fetch failed (%s) attempt %d/%d | backoff %.2fs | %s",
                     ticker,
                     attempt,
                     self.MAX_RETRIES,
+                    backoff,
                     str(e)
                 )
 
@@ -195,8 +205,10 @@ class StockPriceFetcher:
                         f"Market fetch failed after retries: {ticker}"
                     )
 
-                time.sleep(self.RETRY_SLEEP)
+                time.sleep(backoff)
 
+    ########################################################
+    # PUBLIC FETCH
     ########################################################
 
     def fetch(self, ticker, start_date, end_date, interval="1d"):
