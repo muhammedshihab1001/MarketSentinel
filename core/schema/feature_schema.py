@@ -1,4 +1,4 @@
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 import pandas as pd
 import hashlib
 import numpy as np
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 # ============================================================
 
-SCHEMA_VERSION = "41.0"  # institutional market structure expansion
+SCHEMA_VERSION = "42.0"  # hybrid multi-agent + governance hardened
 
 
 ############################################################
@@ -24,7 +24,7 @@ SHORT_PERCENTILE = 0.30
 
 
 ############################################################
-# CORE FEATURES (EXPANDED)
+# CORE FEATURES
 ############################################################
 
 CORE_FEATURES: Tuple[str, ...] = (
@@ -126,6 +126,11 @@ def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     return df
+
+
+def _check_dtype_stability(df: pd.DataFrame):
+    if df.dtypes.nunique() > 1:
+        logger.debug("Mixed dtypes detected before cast.")
 
 
 ############################################################
@@ -240,6 +245,8 @@ def validate_feature_schema(
     if not np.isfinite(feature_df.values).all():
         raise RuntimeError("Non-finite values detected.")
 
+    _check_dtype_stability(feature_df)
+
     return feature_df.astype(DTYPE, copy=False)
 
 
@@ -261,3 +268,20 @@ def get_schema_signature() -> str:
 
     canonical = json.dumps(contract, sort_keys=True)
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+############################################################
+# SCHEMA SNAPSHOT (NEW)
+############################################################
+
+def schema_snapshot() -> Dict:
+
+    return {
+        "version": SCHEMA_VERSION,
+        "feature_count": len(MODEL_FEATURES),
+        "core_count": len(CORE_FEATURES),
+        "cross_count": len(CROSS_SECTIONAL_FEATURES),
+        "long_percentile": LONG_PERCENTILE,
+        "short_percentile": SHORT_PERCENTILE,
+        "signature": get_schema_signature(),
+    }
