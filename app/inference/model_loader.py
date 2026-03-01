@@ -114,6 +114,35 @@ class ModelLoader:
         return base_dir
 
     ########################################################
+    # AUTO DISCOVERY (SAFE BOOTSTRAP)
+    ########################################################
+
+    def _auto_create_pointer_if_safe(self, base_dir):
+
+        model_files = [
+            f for f in os.listdir(base_dir)
+            if f.startswith("model_") and f.endswith(".pkl")
+        ]
+
+        if len(model_files) != 1:
+            raise RuntimeError(
+                "production_pointer.json missing and multiple/no models found."
+            )
+
+        version = model_files[0].replace("model_", "").replace(".pkl", "")
+
+        pointer_path = os.path.join(base_dir, self.POINTER_FILENAME)
+
+        logger.warning(
+            "Auto-creating production pointer for version=%s", version
+        )
+
+        with open(pointer_path, "w", encoding="utf-8") as f:
+            json.dump({"model_version": version}, f)
+
+        return pointer_path
+
+    ########################################################
     # POINTER RESOLUTION
     ########################################################
 
@@ -122,7 +151,7 @@ class ModelLoader:
         pointer_path = os.path.join(base_dir, self.POINTER_FILENAME)
 
         if not os.path.exists(pointer_path):
-            raise RuntimeError("production_pointer.json missing.")
+            pointer_path = self._auto_create_pointer_if_safe(base_dir)
 
         if os.path.islink(pointer_path):
             raise RuntimeError("Symlinked production pointer detected.")
@@ -242,8 +271,8 @@ class ModelLoader:
             if meta["feature_checksum"] != feature_checksum_actual:
                 raise RuntimeError("Feature checksum mismatch.")
 
-            # Universe governance validation
             universe_hash_current = MarketUniverse.fingerprint()
+
             if meta["universe_hash"] != universe_hash_current:
                 raise RuntimeError("Universe fingerprint mismatch.")
 
@@ -329,7 +358,9 @@ class ModelLoader:
         model = self.xgb
 
         if not hasattr(model, "export_feature_importance"):
-            raise RuntimeError("Model does not support feature importance export.")
+            raise RuntimeError(
+                "Model does not support feature importance export."
+            )
 
         importance = model.export_feature_importance()
 
