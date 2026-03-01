@@ -41,7 +41,7 @@ SEED = 42
 MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
 MIN_CS_WIDTH = 8
-TARGET_CLIP = 5.0  # light protection for Yahoo anomalies
+TARGET_CLIP = 5.0
 
 
 # ==========================================================
@@ -55,7 +55,7 @@ def enforce_determinism():
 
 
 # ==========================================================
-# SIMPLE HASH UTIL
+# HASH UTILITIES
 # ==========================================================
 
 def sha256_file(path):
@@ -65,10 +65,6 @@ def sha256_file(path):
             h.update(chunk)
     return h.hexdigest()
 
-
-# ==========================================================
-# HASH HELPERS
-# ==========================================================
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
     df_sorted = df.sort_values(["date", "ticker"]).reset_index(drop=True)
@@ -106,7 +102,6 @@ def export_artifacts(model,
                      dataset_hash,
                      start_date,
                      end_date,
-                     final_df,
                      promote_baseline=False):
 
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -168,13 +163,16 @@ def load_training_data(start_date, end_date):
     datasets = []
 
     for ticker in universe:
+
         price_df = market_data.get_price_data(
             ticker=ticker,
             start_date=start_date,
             end_date=end_date
         )
 
-        # Basic Yahoo cleaning
+        if price_df is None or price_df.empty:
+            continue
+
         price_df = price_df.replace([np.inf, -np.inf], np.nan)
         price_df = price_df.dropna(subset=["close"])
         price_df = price_df[price_df["close"] > 0]
@@ -203,9 +201,6 @@ def load_training_data(start_date, end_date):
     df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
     df = FeatureEngineer.add_cross_sectional_features(df)
     df = FeatureEngineer.finalize(df)
-
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna(subset=MODEL_FEATURES)
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="training")
 
@@ -275,12 +270,17 @@ def trainer(train_df):
 # MAIN
 # ==========================================================
 
-def main(promote_baseline=False, allow_soft_fail=False):
+def main(start_date=None,
+         end_date=None,
+         create_baseline=False,
+         promote_baseline=False,
+         allow_soft_fail=False):
 
     init_env()
     enforce_determinism()
 
-    start_date, end_date = MarketTime.window_for("xgboost")
+    if start_date is None or end_date is None:
+        start_date, end_date = MarketTime.window_for("xgboost")
 
     try:
 
@@ -289,8 +289,10 @@ def main(promote_baseline=False, allow_soft_fail=False):
         validator = WalkForwardValidator(trainer)
         metrics = validator.run(raw_df.copy())
 
-        logger.info("Walk-forward completed | Sharpe=%.4f",
-                    metrics.get("avg_sharpe", 0))
+        logger.info(
+            "Walk-forward completed | Sharpe=%.4f",
+            metrics.get("avg_sharpe", 0)
+        )
 
         final_df = build_target(raw_df)
         dataset_hash = compute_dataset_hash(final_df)
@@ -302,23 +304,27 @@ def main(promote_baseline=False, allow_soft_fail=False):
             dataset_hash,
             start_date,
             end_date,
-            final_df,
             promote_baseline=promote_baseline
         )
 
         logger.info("Training completed successfully.")
 
+        return metrics   # 🔥 IMPORTANT FIX
+
     except Exception as e:
         if allow_soft_fail:
             logger.warning("Training soft-failed: %s", str(e))
+            return {}
         else:
             raise
 
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--promote-baseline", action="store_true")
     parser.add_argument("--allow-soft-fail", action="store_true")
+
     args = parser.parse_args()
 
     main(
