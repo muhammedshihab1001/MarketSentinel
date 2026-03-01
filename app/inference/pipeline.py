@@ -33,7 +33,6 @@ logger = logging.getLogger("marketsentinel.pipeline")
 
 EPSILON = 1e-12
 
-
 _SHARED_MODEL_LOADER = None
 _MODEL_LOCK = threading.Lock()
 
@@ -171,11 +170,13 @@ class InferencePipeline:
             risk_mult = self._risk_agent(drift_result)
             macro_mult = self._macro_agent(latest_df)
 
+            # =====================================================
+            # SCORE ADJUSTMENT
+            # =====================================================
+
             final_scores = []
-            score_components = []
 
             for _, row in latest_df.iterrows():
-
                 tech_mult = self._technical_agent(row)
 
                 final_score = (
@@ -186,15 +187,9 @@ class InferencePipeline:
 
                 final_scores.append(final_score)
 
-                score_components.append({
-                    "raw_model": float(row["raw_model_score"]),
-                    "macro_adj": float(macro_mult),
-                    "technical_adj": float(tech_mult),
-                    "risk_adj": float(risk_mult)
-                })
-
             latest_df["score"] = np.array(final_scores)
 
+            # deterministic sort
             ranked = latest_df.sort_values(
                 ["score", "dollar_volume"],
                 ascending=[True, False]
@@ -208,9 +203,16 @@ class InferencePipeline:
 
             weights = self._construct_portfolio(longs, shorts)
 
-            # Apply risk scaling
+            # apply risk scaling
             for k in weights:
                 weights[k] *= risk_mult
+
+            # rescale after risk adjustment
+            gross = sum(abs(v) for v in weights.values())
+            if gross > 0:
+                scale = self.TARGET_GROSS_EXPOSURE / gross
+                for k in weights:
+                    weights[k] *= scale
 
             snapshot_rows = []
             approved = 0
@@ -219,7 +221,7 @@ class InferencePipeline:
             score_mean = float(latest_df["score"].mean())
             score_std = float(latest_df["score"].std())
 
-            for idx, (_, row) in enumerate(latest_df.iterrows()):
+            for _, row in latest_df.iterrows():
 
                 direction = "LONG" if row["score"] > 0 else "SHORT"
 
@@ -229,6 +231,7 @@ class InferencePipeline:
                         "mean": score_mean,
                         "std": score_std
                     },
+                    drift_score=drift_result.get("severity_score", 0)
                 )
 
                 trade_approved = agent_output.get("trade_approved", True)
@@ -246,18 +249,14 @@ class InferencePipeline:
                     "weight": float(weights.get(row["ticker"], 0.0)) if trade_approved else 0.0,
                     "macro_multiplier": float(macro_mult),
                     "risk_multiplier": float(risk_mult),
-                    "score_components": score_components[idx],
                     "agent": agent_output
                 })
-
-            gross_exposure = sum(abs(x["weight"]) for x in snapshot_rows)
-            net_exposure = sum(x["weight"] for x in snapshot_rows)
 
             result = {
                 "snapshot_date": str(latest_df["date"].iloc[0]),
                 "universe_size": int(len(latest_df)),
-                "gross_exposure": float(gross_exposure),
-                "net_exposure": float(net_exposure),
+                "gross_exposure": float(sum(abs(x["weight"]) for x in snapshot_rows)),
+                "net_exposure": float(sum(x["weight"] for x in snapshot_rows)),
                 "approved_trades": approved,
                 "rejected_trades": rejected,
                 "drift": drift_result,
@@ -301,6 +300,10 @@ class InferencePipeline:
         latest_date = df["date"].max()
         return df[df["date"] == latest_date].reset_index(drop=True)
 
+    # =========================================================
+    # FIXED CROSS SECTIONAL BUILD
+    # =========================================================
+
     def _build_cross_sectional_frame(self, tickers):
 
         end_date = pd.Timestamp.utcnow()
@@ -316,24 +319,32 @@ class InferencePipeline:
 
         datasets = []
 
+        # Build per ticker core features only
         for ticker, price_df in price_map.items():
             if price_df is None or price_df.empty:
                 continue
 
-            df = FeatureEngineer.build_feature_pipeline(
-                price_df=price_df,
-                sentiment_df=None,
-                training=False
-            )
+            try:
+                df = FeatureEngineer.build_feature_pipeline(
+                    price_df=price_df,
+                    sentiment_df=None,
+                    training=False  # no CS here
+                )
 
-            if df is not None and not df.empty:
                 datasets.append(df)
+
+            except Exception as e:
+                logger.warning("Feature build failed for %s: %s", ticker, str(e))
 
         if not datasets:
             raise RuntimeError("All tickers failed feature build.")
 
         df = pd.concat(datasets, ignore_index=True)
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+        # NOW apply cross-sectional features
+        df = FeatureEngineer.add_cross_sectional_features(df)
+        df = FeatureEngineer.finalize(df)
 
         latest_date = df["date"].max()
         cutoff = latest_date - pd.Timedelta(days=self.CROSS_SECTIONAL_WINDOW_DAYS)
@@ -366,10 +377,5 @@ class InferencePipeline:
 
         for t, w in zip(shorts["ticker"], short_w):
             weights[t] = -min(float(w), self.MAX_POSITION_WEIGHT)
-
-        gross = sum(abs(v) for v in weights.values())
-
-        if abs(gross - self.TARGET_GROSS_EXPOSURE) > self.WEIGHT_TOLERANCE:
-            raise RuntimeError("Gross exposure mismatch.")
 
         return weights
