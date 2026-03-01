@@ -7,6 +7,7 @@ import random
 import time
 import zlib
 import numpy as np
+from typing import Optional
 
 from core.schema.feature_schema import get_schema_signature
 from core.market.universe import MarketUniverse
@@ -27,7 +28,7 @@ class RedisCache:
     MIN_TTL = 30
 
     MAX_PAYLOAD_BYTES = 256_000
-    CACHE_NAMESPACE_VERSION = "v6"  # bumped
+    CACHE_NAMESPACE_VERSION = "v7"  # bumped
 
     ###################################################
 
@@ -162,7 +163,7 @@ class RedisCache:
         )
 
     ###################################################
-    # SNAPSHOT VALIDATION
+    # SNAPSHOT VALIDATION (Aligned With Current Pipeline)
     ###################################################
 
     def _validate_snapshot(self, value):
@@ -173,7 +174,6 @@ class RedisCache:
         required_top = {
             "snapshot_date",
             "universe_size",
-            "top_5",
             "signals"
         }
 
@@ -190,7 +190,6 @@ class RedisCache:
 
             required_row = {
                 "ticker",
-                "score",
                 "weight"
             }
 
@@ -200,15 +199,16 @@ class RedisCache:
             if not isinstance(row["ticker"], str):
                 raise RuntimeError("Invalid ticker type.")
 
-            for field in ["score", "weight"]:
-                val = row[field]
-                if not isinstance(val, (int, float)):
-                    raise RuntimeError("Invalid numeric field.")
-                if not np.isfinite(val):
-                    raise RuntimeError("Non-finite numeric value.")
+            weight = row["weight"]
 
-            if abs(row["score"]) > 20:
-                raise RuntimeError("Unrealistic score detected.")
+            if not isinstance(weight, (int, float)):
+                raise RuntimeError("Invalid weight type.")
+
+            if not np.isfinite(weight):
+                raise RuntimeError("Non-finite weight.")
+
+            if abs(weight) > 1.0:
+                raise RuntimeError("Unrealistic weight detected.")
 
     ###################################################
     # GET
@@ -255,10 +255,16 @@ class RedisCache:
             return None
 
     ###################################################
-    # SET
+    # SET (NOW SUPPORTS ex= LIKE REAL REDIS)
     ###################################################
 
-    def set(self, key: str, value, ttl=None):
+    def set(self, key: str, value, ttl: Optional[int] = None, ex: Optional[int] = None):
+
+        """
+        Supports both:
+            set(key, value, ttl=...)
+            set(key, value, ex=...)   <-- native Redis style
+        """
 
         self._maybe_reconnect()
 
@@ -269,19 +275,19 @@ class RedisCache:
 
             self._validate_snapshot(value)
 
-            ttl = ttl or int(
-                os.getenv("CACHE_TTL_SECONDS", "180")
-            )
+            # Priority: explicit ex > ttl > env default
+            ttl_value = ex if ex is not None else ttl
 
-            ttl = max(self.MIN_TTL, min(ttl, self.MAX_TTL))
+            if ttl_value is None:
+                ttl_value = int(
+                    os.getenv("CACHE_TTL_SECONDS", "180")
+                )
 
-            # volatility-sensitive TTL (shorter if high risk)
-            risk_mult = value.get("risk_multiplier", 1.0)
-            if risk_mult < 0.8:
-                ttl = max(self.MIN_TTL, int(ttl * 0.5))
+            ttl_value = max(self.MIN_TTL, min(ttl_value, self.MAX_TTL))
 
-            jitter = int(ttl * 0.15)
-            final_ttl = ttl + random.randint(-jitter, jitter)
+            # Small jitter to avoid thundering herd
+            jitter = int(ttl_value * 0.15)
+            final_ttl = ttl_value + random.randint(-jitter, jitter)
             final_ttl = max(self.MIN_TTL, min(final_ttl, self.MAX_TTL))
 
             serialized = self._canonical_json(value).encode()
