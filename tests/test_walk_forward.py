@@ -7,7 +7,7 @@ from core.schema.feature_schema import MODEL_FEATURES
 
 
 ############################################################
-# DUMMY TRAINER (RANKING-COMPATIBLE)
+# DUMMY TRAINER (REGRESSION-COMPATIBLE)
 ############################################################
 
 def dummy_trainer(train_df):
@@ -15,9 +15,9 @@ def dummy_trainer(train_df):
     class DummyModel:
 
         def predict(self, X):
-            # create deterministic cross-sectional variation
-            base = X.iloc[:, 0].values
-            return base + np.random.normal(0, 0.01, len(base))
+            # Deterministic cross-sectional variation
+            # Use first feature directly (no randomness)
+            return X.iloc[:, 0].values.astype("float32")
 
     return DummyModel()
 
@@ -117,7 +117,8 @@ def test_walk_forward_runs_successfully():
 
 def test_walk_forward_requires_cross_section():
 
-    df = build_valid_dataset(n_days=400, n_tickers=5)  # below MIN_CROSS_SECTION
+    # Below MIN_CROSS_SECTION threshold (10)
+    df = build_valid_dataset(n_days=400, n_tickers=5)
 
     wf = WalkForwardValidator(
         model_trainer=dummy_trainer
@@ -141,6 +142,12 @@ def test_walk_forward_stability():
 
     metrics = wf.run(df)
 
-    # Ensure metrics within sane bounds
+    # Sharpe bounded by engine clamp
     assert -5.0 <= metrics["avg_sharpe"] <= 5.0
+
+    # Drawdown bounded
     assert -1.0 <= metrics["max_drawdown"] <= 0.0
+
+    # No NaN metrics
+    for v in metrics.values():
+        assert np.isfinite(v)
