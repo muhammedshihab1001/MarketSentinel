@@ -162,7 +162,7 @@ class FeatureEngineer:
             df["ema_10"] / (df["ema_50"] + cls.EPSILON)
         ).clip(0.5, 1.5)
 
-        # Distance from 52W high
+        # 52W high distance
         rolling_high = (
             df.groupby("ticker")["close"]
             .transform(lambda x: x.rolling(252, min_periods=60).max())
@@ -173,12 +173,12 @@ class FeatureEngineer:
             (df["close"] / (rolling_high + cls.EPSILON)) - 1
         ).clip(-1, 0)
 
-        # Amihud illiquidity
+        # Amihud
         df["amihud"] = (
             df["return"].abs() / (df["dollar_volume"] + cls.EPSILON)
         ).clip(0, 1)
 
-        # Regime feature
+        # Regime
         vol_mean = (
             df.groupby("ticker")["volatility"]
             .transform(lambda x: x.rolling(60, min_periods=20).mean())
@@ -197,7 +197,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # CROSS SECTIONAL FEATURES (CALL AFTER CONCAT)
+    # CROSS SECTIONAL FEATURES
     ########################################################
 
     @classmethod
@@ -215,6 +215,18 @@ class FeatureEngineer:
         if df.empty:
             raise RuntimeError("Cross-sectional width insufficient.")
 
+        # Market-level first
+        df["market_dispersion"] = (
+            df.groupby("date")["return"]
+            .transform("std")
+            .clip(0, 0.2)
+        )
+
+        df["breadth"] = (
+            df.groupby("date")["return"]
+            .transform(lambda x: (x > 0).mean())
+        )
+
         base_cols = [
             "momentum_20",
             "momentum_60",
@@ -229,9 +241,12 @@ class FeatureEngineer:
             "dist_from_52w_high",
             "regime_feature",
             "amihud",
+            "market_dispersion",
+            "breadth",
         ]
 
         for col in base_cols:
+
             if col not in df.columns:
                 continue
 
@@ -243,20 +258,10 @@ class FeatureEngineer:
             cs_std = clipped.groupby(df["date"]).transform("std")
 
             z = (clipped - cs_mean) / (cs_std + cls.EPSILON)
-
             df[f"{col}_z"] = z.fillna(0.0).clip(-cls.Z_CLIP, cls.Z_CLIP)
 
-        # Market-level features
-        df["market_dispersion"] = (
-            df.groupby("date")["return"]
-            .transform("std")
-            .clip(0, 0.2)
-        )
-
-        df["breadth"] = (
-            df.groupby("date")["return"]
-            .transform(lambda x: (x > 0).mean())
-        )
+            ranks = clipped.groupby(df["date"]).rank(pct=True)
+            df[f"{col}_rank"] = ranks.fillna(0.5).clip(0.0, 1.0)
 
         return df
 
@@ -296,11 +301,4 @@ class FeatureEngineer:
     ):
         df = cls._validate_price_frame(price_df)
         df = cls.add_core_features(df)
-
-        # IMPORTANT FIX:
-        # Cross-sectional features must NOT run per ticker in inference mode
-        if training:
-            df = cls.add_cross_sectional_features(df)
-
-        df = cls.finalize(df)
         return df
