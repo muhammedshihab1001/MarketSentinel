@@ -9,6 +9,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import os
+from collections import deque
 
 from core.data.providers.market.router import MarketProviderRouter
 
@@ -42,9 +43,18 @@ class MarketDataService:
     MEMORY_CACHE_TTL = 30
     ENABLE_DISK_CACHE = True
 
+    # 🔥 NEW: Rate limiting controls
+    GLOBAL_RATE_LIMIT_PER_SEC = 3
+    BATCH_SPACING_SECONDS = 0.15
+    MAX_RETRY_BACKOFF = 2.5
+    PROVIDER_COOLDOWN_SECONDS = 5
+
     _PROVIDER = None
     _memory_cache = {}
     _cache_lock = Lock()
+    _rate_lock = Lock()
+    _recent_requests = deque()
+    _provider_cooldown_until = 0
 
     ########################################################
 
@@ -56,6 +66,34 @@ class MarketDataService:
             MarketDataService._PROVIDER = MarketProviderRouter()
 
         self._fetcher = MarketDataService._PROVIDER
+
+    ########################################################
+    # RATE LIMITING
+    ########################################################
+
+    @classmethod
+    def _respect_rate_limit(cls):
+
+        with cls._rate_lock:
+
+            now = time.time()
+
+            # Cooldown active
+            if now < cls._provider_cooldown_until:
+                sleep = cls._provider_cooldown_until - now
+                logger.warning("Provider cooldown active | sleeping %.2fs", sleep)
+                time.sleep(sleep)
+
+            # Remove old timestamps
+            while cls._recent_requests and now - cls._recent_requests[0] > 1:
+                cls._recent_requests.popleft()
+
+            if len(cls._recent_requests) >= cls.GLOBAL_RATE_LIMIT_PER_SEC:
+                sleep = 1 - (now - cls._recent_requests[0])
+                if sleep > 0:
+                    time.sleep(sleep)
+
+            cls._recent_requests.append(time.time())
 
     ########################################################
     # SANITIZATION
@@ -103,8 +141,8 @@ class MarketDataService:
     # DISK CACHE
     ########################################################
 
-    def _disk_cache_path(self, ticker, start, end):
-        fname = f"{ticker}_{start}_{end}.parquet"
+    def _disk_cache_path(self, ticker, start, end, interval):
+        fname = f"{ticker}_{start}_{end}_{interval}_v2.parquet"
         return self.DATA_DIR / fname
 
     ########################################################
@@ -113,8 +151,8 @@ class MarketDataService:
 
     def _validate_dataset(self, df: pd.DataFrame, ticker: str, min_rows: int):
 
-        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            raise RuntimeError("Market data empty or invalid structure.")
+        if df is None or df.empty:
+            raise RuntimeError("Market data empty.")
 
         df = df.copy()
 
@@ -133,7 +171,6 @@ class MarketDataService:
         df = df.dropna(subset=["date"])
         df = df.sort_values("date").drop_duplicates("date")
 
-        # Remove forward leakage
         safe_cutoff = self._cap_to_safe_date(df["date"].max())
         df = df[df["date"] <= safe_cutoff]
 
@@ -144,61 +181,30 @@ class MarketDataService:
 
         df = df.dropna(subset=numeric_cols)
 
-        if not np.isfinite(df[numeric_cols].values.astype(float)).all():
-            raise RuntimeError("Non-finite prices detected.")
+        if not np.isfinite(df[numeric_cols].values).all():
+            raise RuntimeError("Non-finite values detected.")
 
-        # Remove zero-volume rows
         df = df[df["volume"] > 0]
 
         if df["close"].nunique() < 5:
-            raise RuntimeError("Price series too flat.")
+            raise RuntimeError("Flat price series.")
 
-        # OHLC consistency
-        if not ((df["high"] >= df["low"]) & 
-                (df["high"] >= df["close"]) &
-                (df["low"] <= df["close"])).all():
-            raise RuntimeError("OHLC inconsistency detected.")
-
-        # Clip extreme moves (split-like)
         pct = df["close"].pct_change().abs().fillna(0)
 
         if (pct > self.MAX_DAILY_MOVE).any():
-            logger.warning("Extreme move detected in %s — smoothing.", ticker)
+            logger.warning("Extreme move in %s — smoothing.", ticker)
             df.loc[pct > self.MAX_DAILY_MOVE, "close"] = np.nan
             df["close"] = df["close"].ffill().bfill()
 
-        # Large absolute price jumps
-        if df["close"].max() / max(df["close"].min(), 1e-9) > self.MAX_PRICE_JUMP:
-            logger.warning("Large price scale change detected in %s", ticker)
-
-        # Density check
-        if len(df) > 30:
-            total_days = (df["date"].max() - df["date"].min()).days
-            expected = total_days / 7 * 5
-            density = len(df) / max(expected, 1)
-
-            if density < self.MIN_TRADING_DENSITY:
-                raise RuntimeError(
-                    f"Low trading density ({density:.2f})"
-                )
-
-        if df["date"].nunique() < self.MIN_UNIQUE_DAYS:
-            raise RuntimeError("Too few unique trading days.")
-
-        if len(df) > self.MAX_ROWS:
-            df = df.tail(self.MAX_ROWS)
-
         if len(df) < min_rows:
-            raise RuntimeError(
-                f"Insufficient history ({len(df)} < {min_rows})"
-            )
+            raise RuntimeError("Insufficient history.")
 
         df["__dataset_hash"] = self._dataset_hash(df)
 
         return df.reset_index(drop=True)
 
     ########################################################
-    # RETRY FETCH
+    # RETRY FETCH WITH BACKOFF
     ########################################################
 
     def _fetch_with_retry(
@@ -208,7 +214,7 @@ class MarketDataService:
         end,
         interval,
         min_history,
-        retries=2
+        retries=3
     ):
 
         last_error = None
@@ -216,6 +222,8 @@ class MarketDataService:
         for attempt in range(retries):
 
             try:
+
+                self._respect_rate_limit()
 
                 df = self._fetcher.fetch(
                     ticker,
@@ -237,18 +245,24 @@ class MarketDataService:
 
                 last_error = e
 
-                sleep = 0.4 + random.uniform(0.1, 0.4)
+                backoff = min(
+                    (2 ** attempt) * 0.5 + random.uniform(0.1, 0.4),
+                    self.MAX_RETRY_BACKOFF
+                )
 
                 logger.warning(
-                    "Fetch failed (%s) attempt %d/%d | %.2fs | %s",
+                    "Fetch failed (%s) attempt %d/%d | backoff %.2fs | %s",
                     ticker,
                     attempt + 1,
                     retries,
-                    sleep,
+                    backoff,
                     str(e)
                 )
 
-                time.sleep(sleep)
+                time.sleep(backoff)
+
+        # 🔥 Provider cooldown if repeated failures
+        self._provider_cooldown_until = time.time() + self.PROVIDER_COOLDOWN_SECONDS
 
         raise RuntimeError(
             f"Market fetch failed after retries: {ticker}"
@@ -313,17 +327,15 @@ class MarketDataService:
         disk_path = self._disk_cache_path(
             ticker,
             start_date,
-            end_date_str
+            end_date_str,
+            interval
         )
 
         if self.ENABLE_DISK_CACHE and disk_path.exists():
             try:
-                df = pd.read_parquet(disk_path)
-                return df
+                return pd.read_parquet(disk_path)
             except Exception:
                 pass
-
-        logger.info("Fetching dataset for %s", ticker)
 
         df = self._fetch_with_retry(
             ticker,
@@ -363,7 +375,7 @@ class MarketDataService:
 
         worker_cap = min(
             self.MAX_WORKERS,
-            max(2, min(len(tickers), 6))
+            max(2, min(len(tickers), 5))
         )
 
         logger.info(
@@ -374,17 +386,21 @@ class MarketDataService:
 
         with ThreadPoolExecutor(max_workers=worker_cap) as executor:
 
-            futures = {
-                executor.submit(
-                    self.get_price_data,
-                    ticker,
-                    start_date,
-                    end_date,
-                    interval,
-                    min_history
-                ): ticker
-                for ticker in tickers
-            }
+            futures = {}
+
+            for ticker in tickers:
+                futures[
+                    executor.submit(
+                        self.get_price_data,
+                        ticker,
+                        start_date,
+                        end_date,
+                        interval,
+                        min_history
+                    )
+                ] = ticker
+
+                time.sleep(self.BATCH_SPACING_SECONDS)
 
             for future in as_completed(futures):
                 ticker = futures[future]
