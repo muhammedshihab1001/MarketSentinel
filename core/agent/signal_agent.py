@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL SIGNAL AGENT (Governance Hardened)
+# INSTITUTIONAL SIGNAL AGENT v2 (Multi-Agent Ready)
 # =========================================================
 
 import numpy as np
@@ -9,10 +9,6 @@ EPSILON = 1e-12
 
 
 class SignalAgent:
-
-    # =========================================================
-    # THRESHOLDS (Institutional Tunables)
-    # =========================================================
 
     RSI_OVERBOUGHT = 70
     RSI_OVERSOLD = 30
@@ -35,9 +31,7 @@ class SignalAgent:
     MIN_CONFIDENCE_TO_TRADE = 0.30
     HIGH_RISK_CONFIDENCE_THRESHOLD = 0.45
 
-    # =========================================================
-    # SAFE FLOAT
-    # =========================================================
+    # ---------------------------------------------------------
 
     @staticmethod
     def _safe_float(value, default=0.0):
@@ -51,9 +45,7 @@ class SignalAgent:
         except Exception:
             return default
 
-    # =========================================================
-    # ALIGNMENT CHECK
-    # =========================================================
+    # ---------------------------------------------------------
 
     def _alignment_score(self, signal, momentum_z, ema_ratio):
         alignment = 0
@@ -70,18 +62,12 @@ class SignalAgent:
             if ema_ratio < self.EMA_BEARISH:
                 alignment += 1
 
-        return alignment  # 0–2
+        return alignment
 
-    # =========================================================
-    # CONFIDENCE NUMERIC
-    # =========================================================
+    # ---------------------------------------------------------
 
     def _confidence_numeric(self, abs_score: float) -> float:
         return float(np.clip(abs_score / self.Z_VERY_STRONG, 0.0, 1.0))
-
-    # =========================================================
-    # VOLATILITY ADJUSTMENT
-    # =========================================================
 
     def _volatility_adjusted_confidence(
         self,
@@ -97,9 +83,7 @@ class SignalAgent:
 
         return float(np.clip(adjusted, 0.0, 1.0))
 
-    # =========================================================
-    # POSITION SIZE SUGGESTION
-    # =========================================================
+    # ---------------------------------------------------------
 
     def _suggest_position_size(
         self,
@@ -120,9 +104,9 @@ class SignalAgent:
 
         return float(np.clip(base, self.MIN_POSITION_SIZE, self.MAX_POSITION_SIZE))
 
-    # =========================================================
+    # ---------------------------------------------------------
     # MAIN ANALYSIS
-    # =========================================================
+    # ---------------------------------------------------------
 
     def analyze(
         self,
@@ -130,10 +114,6 @@ class SignalAgent:
         probability_stats: Optional[Dict[str, float]] = None,
         drift_score: Optional[float] = None,
     ) -> Dict[str, Any]:
-
-        # =====================================================
-        # SAFE INPUTS
-        # =====================================================
 
         raw_model_score = self._safe_float(
             row.get("raw_model_score", row.get("alpha_score", row.get("score"))),
@@ -157,63 +137,28 @@ class SignalAgent:
         warnings: List[str] = []
         reasoning: List[str] = []
 
-        # =====================================================
-        # CONFIDENCE CLASSIFICATION
-        # =====================================================
-
         abs_score = abs(final_score)
 
-        if abs_score >= self.Z_VERY_STRONG:
-            confidence = "very_high"
-        elif abs_score >= self.Z_STRONG:
-            confidence = "high"
-        elif abs_score >= self.Z_MODERATE:
-            confidence = "moderate"
-        else:
-            confidence = "low"
+        # =====================================================
+        # ALPHA COMPONENT
+        # =====================================================
 
+        alpha_strength = float(abs_score)
         confidence_numeric = self._confidence_numeric(abs_score)
         confidence_numeric = self._volatility_adjusted_confidence(
             confidence_numeric,
             volatility
         )
 
-        reasoning.append(f"Alpha classified as {confidence} strength.")
-
         # =====================================================
-        # TECHNICAL ANALYSIS
+        # TECHNICAL COMPONENT
         # =====================================================
-
-        if rsi > self.RSI_OVERBOUGHT:
-            warnings.append("RSI overbought.")
-        elif rsi < self.RSI_OVERSOLD:
-            reasoning.append("Oversold condition supports reversal.")
-
-        if ema_ratio > self.EMA_BULLISH:
-            trend = "bullish"
-        elif ema_ratio < self.EMA_BEARISH:
-            trend = "bearish"
-        else:
-            trend = "neutral"
-
-        if momentum_z > self.MOMENTUM_STRONG:
-            momentum_state = "strong_positive"
-        elif momentum_z < -self.MOMENTUM_STRONG:
-            momentum_state = "strong_negative"
-        else:
-            momentum_state = "neutral"
 
         alignment = self._alignment_score(signal, momentum_z, ema_ratio)
-
-        if alignment == 2:
-            reasoning.append("Technical alignment strong.")
-        elif alignment == 1:
-            reasoning.append("Partial technical alignment.")
-        else:
-            warnings.append("Signal lacks technical confirmation.")
+        technical_score = alignment / 2.0  # normalize to 0–1
 
         # =====================================================
-        # RISK CLASSIFICATION
+        # RISK COMPONENT
         # =====================================================
 
         if regime_feature > 1.5:
@@ -231,54 +176,28 @@ class SignalAgent:
             risk_level = "low"
 
         # =====================================================
-        # MACRO
-        # =====================================================
-
-        if breadth > 0.65:
-            macro_regime = "risk_on"
-        elif breadth < 0.35:
-            macro_regime = "risk_off"
-        else:
-            macro_regime = "neutral"
-
-        # =====================================================
-        # CROSS SECTIONAL DISPERSION
-        # =====================================================
-
-        dispersion = 0.0
-        if probability_stats:
-            dispersion = self._safe_float(probability_stats.get("std"), 0.0)
-
-        if dispersion < self.DISPERSION_WEAK:
-            warnings.append("Low cross-sectional dispersion.")
-
-        # =====================================================
-        # DRIFT
+        # DRIFT ADJUSTMENT
         # =====================================================
 
         drift_flag = False
-
         if drift_score is not None:
             drift_score = self._safe_float(drift_score, 0.0)
             if drift_score > 0.5:
                 drift_flag = True
-                warnings.append("Feature distribution drift detected.")
                 confidence_numeric *= 0.7
                 confidence_numeric = float(np.clip(confidence_numeric, 0.0, 1.0))
 
         # =====================================================
-        # GOVERNANCE SCORE
+        # COMPOSITE AGENT SCORE (For Orchestrator)
         # =====================================================
 
-        governance_score = int(
-            np.clip(
-                confidence_numeric * 50 +
-                alignment * 10 +
-                (0 if drift_flag else 10),
-                0,
-                100
-            )
-        )
+        agent_score = float(np.clip(
+            0.5 * confidence_numeric +
+            0.3 * technical_score +
+            0.2 * (0 if drift_flag else 1),
+            0.0,
+            1.0
+        ))
 
         # =====================================================
         # TRADE APPROVAL
@@ -290,15 +209,6 @@ class SignalAgent:
             and not drift_flag
         )
 
-        if risk_level == "elevated":
-            trade_approved = trade_approved and (
-                confidence_numeric > self.HIGH_RISK_CONFIDENCE_THRESHOLD
-            )
-
-        # =====================================================
-        # POSITION SIZE
-        # =====================================================
-
         position_size_hint = self._suggest_position_size(
             confidence_numeric,
             risk_level,
@@ -306,55 +216,38 @@ class SignalAgent:
         )
 
         # =====================================================
-        # STRENGTH SCORE
+        # GOVERNANCE SCORE
         # =====================================================
 
-        strength_score = int(
+        governance_score = int(
             np.clip(
-                abs_score * 40 +
-                alignment * 5 +
-                confidence_numeric * 20,
+                agent_score * 100,
                 0,
                 100
             )
         )
 
-        # =====================================================
-        # DEDUP + SORT (DETERMINISM)
-        # =====================================================
-
-        warnings = sorted(set(warnings))
-        reasoning = sorted(set(reasoning))
-
-        # =====================================================
-        # EXPLANATION CONTRACT (Stable Format)
-        # =====================================================
-
         explanation = (
             f"{signal} | raw={raw_model_score:.2f} | "
             f"final={final_score:.2f} | "
-            f"conf={confidence} | "
-            f"trend={trend} | "
-            f"macro={macro_regime} | "
+            f"agent_score={agent_score:.2f} | "
             f"risk={risk_level}"
         )
 
         return {
             "signal": signal,
-            "confidence": confidence,
+            "alpha_strength": alpha_strength,
             "confidence_numeric": confidence_numeric,
-            "strength_score": strength_score,
+            "technical_score": technical_score,
+            "agent_score": agent_score,
             "risk_level": risk_level,
             "volatility_regime": volatility_regime,
-            "trend": trend,
-            "momentum_state": momentum_state,
-            "macro_regime": macro_regime,
             "alignment_score": alignment,
             "position_size_hint": position_size_hint,
             "trade_approved": trade_approved,
             "drift_flag": drift_flag,
             "governance_score": governance_score,
-            "reasoning": reasoning,
-            "warnings": warnings,
+            "reasoning": sorted(set(reasoning)),
+            "warnings": sorted(set(warnings)),
             "explanation": explanation,
         }
