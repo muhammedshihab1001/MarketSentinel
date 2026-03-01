@@ -29,29 +29,29 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "21.1"
+    BASELINE_VERSION = "22.0"
     DEFAULT_BASELINE_DIR = os.path.realpath("artifacts/drift")
 
     MIN_SAMPLE_BASELINE = 150
-    MIN_SAMPLE_INFERENCE = 20
+    MIN_SAMPLE_INFERENCE = 25
 
-    VARIANCE_RATIO_UPPER = 3.5
-    VARIANCE_RATIO_LOWER = 0.25
+    VARIANCE_RATIO_UPPER = 4.0
+    VARIANCE_RATIO_LOWER = 0.20
 
-    PSI_ALERT = 0.30
+    PSI_ALERT = 0.35
     MIN_BIN_PCT = 0.01
 
-    MAX_INFERENCE_ROWS = 600
+    MAX_INFERENCE_ROWS = 800
 
     EPSILON = 1e-8
-    MAX_SEVERITY_CAP = 10
+    MAX_SEVERITY_CAP = 12
 
-    SOFT_SEVERITY_THRESHOLD = 3
-    HARD_SEVERITY_THRESHOLD = 7
+    SOFT_SEVERITY_THRESHOLD = 4
+    HARD_SEVERITY_THRESHOLD = 8
 
-    AUTO_REGENERATE = True
+    AUTO_REGENERATE = False
 
-    def __init__(self, z_threshold: float = 3.5, baseline_dir: str = "artifacts/drift"):
+    def __init__(self, z_threshold: float = 4.0, baseline_dir: str = "artifacts/drift"):
 
         self.z_threshold = z_threshold
         self.baseline_dir = os.path.realpath(baseline_dir)
@@ -69,9 +69,9 @@ class DriftDetector:
 
         self._model_loader = ModelLoader()
 
-    ########################################################
+    # =========================================================
     # BASELINE CREATION
-    ########################################################
+    # =========================================================
 
     def create_baseline(
         self,
@@ -121,7 +121,7 @@ class DriftDetector:
             }
 
         if len(baseline_features) == 0:
-            raise RuntimeError("Baseline feature set empty — insufficient training data.")
+            raise RuntimeError("Baseline feature set empty.")
 
         payload = {
             "meta": {
@@ -139,9 +139,9 @@ class DriftDetector:
 
         self._atomic_write(payload)
 
-    ########################################################
+    # =========================================================
     # SAFE FEATURE BLOCK
-    ########################################################
+    # =========================================================
 
     def _safe_feature_block(self, dataset: pd.DataFrame):
 
@@ -157,9 +157,9 @@ class DriftDetector:
 
         return block
 
-    ########################################################
+    # =========================================================
     # HASH
-    ########################################################
+    # =========================================================
 
     @staticmethod
     def _baseline_hash(payload: dict) -> str:
@@ -170,9 +170,9 @@ class DriftDetector:
         canonical = json.dumps(clone, sort_keys=True).encode()
         return hashlib.sha256(canonical).hexdigest()
 
-    ########################################################
+    # =========================================================
     # ATOMIC WRITE
-    ########################################################
+    # =========================================================
 
     def _atomic_write(self, payload: dict):
 
@@ -185,9 +185,9 @@ class DriftDetector:
 
         os.replace(tmp_path, self.BASELINE_PATH)
 
-    ########################################################
+    # =========================================================
     # LOAD VERIFIED BASELINE
-    ########################################################
+    # =========================================================
 
     def _load_verified_baseline(self):
 
@@ -217,9 +217,9 @@ class DriftDetector:
 
         return baseline
 
-    ########################################################
+    # =========================================================
     # PSI
-    ########################################################
+    # =========================================================
 
     def _psi(self, bin_edges, expected_counts, actual):
 
@@ -244,9 +244,9 @@ class DriftDetector:
 
         return float(psi)
 
-    ########################################################
-    # DETECT
-    ########################################################
+    # =========================================================
+    # DETECT (HYBRID-AWARE)
+    # =========================================================
 
     def detect(self, dataset: pd.DataFrame):
 
@@ -297,9 +297,9 @@ class DriftDetector:
                 if drift:
                     drift_count += 1
                     severity_accumulator += (
-                        min(z_score / self.z_threshold, 3) +
-                        min(abs(np.log(variance_ratio + self.EPSILON)), 3) +
-                        min(psi / self.PSI_ALERT, 3)
+                        min(z_score / self.z_threshold, 4) +
+                        min(abs(np.log(variance_ratio + self.EPSILON)), 4) +
+                        min(psi / self.PSI_ALERT, 4)
                     )
 
                 report[col] = {
@@ -308,6 +308,11 @@ class DriftDetector:
                     "psi": float(psi),
                     "drift": drift
                 }
+
+            # Cross-sectional stability metric
+            cs_stability = float(
+                numeric.std().mean()
+            )
 
             severity_score = min(int(severity_accumulator), self.MAX_SEVERITY_CAP)
 
@@ -327,8 +332,12 @@ class DriftDetector:
                 "severity_score": severity_score,
                 "drift_confidence": float(min(drift_count / max(total_features, 1), 1.0)),
                 "coverage": coverage,
+                "cross_sectional_stability": cs_stability,
                 "details": report,
-                "drift_state": drift_state
+                "drift_state": drift_state,
+                "exposure_scale": 0.0 if drift_state == "hard"
+                                   else 0.5 if drift_state == "soft"
+                                   else 1.0
             }
 
         except Exception as exc:
@@ -342,10 +351,11 @@ class DriftDetector:
 
             return {
                 "drift_detected": True,
-                "severity_score": 5,
+                "severity_score": 6,
                 "drift_confidence": 0.5,
                 "coverage": 0.0,
                 "details": {},
                 "drift_state": "detector_failure",
+                "exposure_scale": 0.3,
                 "reason": "detector_failure"
             }
