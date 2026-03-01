@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline
@@ -24,11 +24,14 @@ def get_explainer() -> LLMExplainer:
 
 
 # =========================================================
-# ROUTE
+# HYBRID AGENT EXPLANATION ROUTE
 # =========================================================
 
 @router.post("/agent/explain")
-async def explain_signal(ticker: str):
+async def explain_signal(
+    ticker: str = Query(..., description="Stock ticker symbol"),
+    include_llm: bool = Query(True, description="Include LLM explanation")
+):
 
     try:
         if not ticker or not isinstance(ticker, str):
@@ -38,7 +41,10 @@ async def explain_signal(ticker: str):
 
         pipeline = InferencePipeline()
 
+        # -------------------------------------------------
         # Run snapshot safely in threadpool
+        # -------------------------------------------------
+
         snapshot = await run_in_threadpool(
             pipeline.run_snapshot,
             [ticker]
@@ -52,30 +58,76 @@ async def explain_signal(ticker: str):
         if not signals or not isinstance(signals, list):
             raise HTTPException(status_code=404, detail="Ticker not found")
 
-        row = signals[0]
+        # -------------------------------------------------
+        # Find correct ticker row (safe)
+        # -------------------------------------------------
+
+        row = None
+        for s in signals:
+            if s.get("ticker") == ticker:
+                row = s
+                break
+
+        if row is None:
+            raise HTTPException(status_code=404, detail="Ticker not in snapshot")
 
         agent_output = row.get("agent", {})
-        probability_stats = snapshot.get("probability_stats", {})
+        drift_info = snapshot.get("drift", {})
 
-        # -------------------------------------------------
-        # LLM EXPLANATION
-        # -------------------------------------------------
-
-        explainer = get_explainer()
-
-        explanation = await explainer.explain(
-            signal_row=row,
-            agent_output=agent_output,
-            probability_stats=probability_stats
-        )
-
-        return {
-            "ticker": ticker,
-            "signal": row.get("signal"),
-            "score": row.get("score"),
-            "agent": agent_output,
-            "llm": explanation
+        probability_stats = {
+            "mean_score": snapshot.get("score_mean"),
+            "std_score": snapshot.get("score_std"),
         }
+
+        # -------------------------------------------------
+        # Optional LLM EXPLANATION
+        # -------------------------------------------------
+
+        llm_output = None
+
+        if include_llm:
+            explainer = get_explainer()
+
+            llm_output = await explainer.explain(
+                signal_row=row,
+                agent_output=agent_output,
+                probability_stats=probability_stats
+            )
+
+        # -------------------------------------------------
+        # Structured Institutional Response
+        # -------------------------------------------------
+
+        response = {
+            "ticker": ticker,
+            "snapshot_date": snapshot.get("snapshot_date"),
+            "signal": agent_output.get("signal"),
+            "score": row.get("score"),
+            "weight": row.get("weight"),
+
+            # Hybrid breakdown
+            "alpha_confidence": agent_output.get("confidence"),
+            "strength_score": agent_output.get("strength_score"),
+            "risk_level": agent_output.get("risk_level"),
+            "trend": agent_output.get("trend"),
+            "momentum": agent_output.get("momentum_state"),
+            "macro_regime": agent_output.get("macro_regime"),
+            "volatility_regime": agent_output.get("volatility_regime"),
+
+            # Governance
+            "drift_state": drift_info.get("drift_state"),
+            "drift_severity": drift_info.get("severity_score"),
+            "exposure_scale": drift_info.get("exposure_scale"),
+
+            # Structured reasoning
+            "warnings": agent_output.get("warnings", []),
+            "reasoning": agent_output.get("reasoning", []),
+
+            # Optional LLM narrative
+            "llm": llm_output
+        }
+
+        return response
 
     except HTTPException:
         raise
