@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL SIGNAL AGENT v2 (Multi-Agent Ready)
+# INSTITUTIONAL SIGNAL AGENT v2.1 (CV-Optimized Multi-Agent)
 # =========================================================
 
 import numpy as np
@@ -16,12 +16,7 @@ class SignalAgent:
     EMA_BULLISH = 1.05
     EMA_BEARISH = 0.95
 
-    MOMENTUM_STRONG = 1.0
-    DISPERSION_WEAK = 0.05
-
     Z_VERY_STRONG = 2.0
-    Z_STRONG = 1.25
-    Z_MODERATE = 0.75
 
     MAX_SCORE_SANITY = 10.0
 
@@ -29,8 +24,9 @@ class SignalAgent:
     MIN_POSITION_SIZE = 0.0
 
     MIN_CONFIDENCE_TO_TRADE = 0.30
-    HIGH_RISK_CONFIDENCE_THRESHOLD = 0.45
 
+    # ---------------------------------------------------------
+    # SAFE CAST
     # ---------------------------------------------------------
 
     @staticmethod
@@ -45,6 +41,8 @@ class SignalAgent:
         except Exception:
             return default
 
+    # ---------------------------------------------------------
+    # TECHNICAL ALIGNMENT
     # ---------------------------------------------------------
 
     def _alignment_score(self, signal, momentum_z, ema_ratio):
@@ -65,6 +63,8 @@ class SignalAgent:
         return alignment
 
     # ---------------------------------------------------------
+    # CONFIDENCE
+    # ---------------------------------------------------------
 
     def _confidence_numeric(self, abs_score: float) -> float:
         return float(np.clip(abs_score / self.Z_VERY_STRONG, 0.0, 1.0))
@@ -84,6 +84,8 @@ class SignalAgent:
         return float(np.clip(adjusted, 0.0, 1.0))
 
     # ---------------------------------------------------------
+    # POSITION SIZE
+    # ---------------------------------------------------------
 
     def _suggest_position_size(
         self,
@@ -95,9 +97,9 @@ class SignalAgent:
         base = confidence_numeric
 
         if risk_level == "elevated":
-            base *= 0.6
+            base *= 0.7
         elif risk_level == "high":
-            base *= 0.75
+            base *= 0.8
 
         if volatility_regime == "high_volatility":
             base *= 0.7
@@ -120,8 +122,9 @@ class SignalAgent:
             0.0
         )
 
-        final_score = self._safe_float(row.get("score"), 0.0)
-        final_score = float(np.clip(final_score, -self.MAX_SCORE_SANITY, self.MAX_SCORE_SANITY))
+        final_score = float(
+            np.clip(raw_model_score, -self.MAX_SCORE_SANITY, self.MAX_SCORE_SANITY)
+        )
 
         signal = row.get("signal", "NEUTRAL")
         if signal not in {"LONG", "SHORT", "NEUTRAL"}:
@@ -132,16 +135,15 @@ class SignalAgent:
         ema_ratio = self._safe_float(row.get("ema_ratio"), 1.0)
         momentum_z = self._safe_float(row.get("momentum_20_z"), 0.0)
         regime_feature = self._safe_float(row.get("regime_feature"), 0.0)
-        breadth = self._safe_float(row.get("breadth"), 0.5)
 
         warnings: List[str] = []
         reasoning: List[str] = []
 
         abs_score = abs(final_score)
 
-        # =====================================================
-        # ALPHA COMPONENT
-        # =====================================================
+        # -----------------------------------------------------
+        # Alpha strength
+        # -----------------------------------------------------
 
         alpha_strength = float(abs_score)
         confidence_numeric = self._confidence_numeric(abs_score)
@@ -150,16 +152,32 @@ class SignalAgent:
             volatility
         )
 
-        # =====================================================
-        # TECHNICAL COMPONENT
-        # =====================================================
+        # -----------------------------------------------------
+        # Cross-sectional awareness (lightweight CV logic)
+        # -----------------------------------------------------
+
+        if probability_stats:
+            std = self._safe_float(probability_stats.get("std"), 0.0)
+            if std < 0.05:
+                warnings.append("Low cross-sectional dispersion")
+                confidence_numeric *= 0.8
+
+        # -----------------------------------------------------
+        # Technical confirmation
+        # -----------------------------------------------------
 
         alignment = self._alignment_score(signal, momentum_z, ema_ratio)
-        technical_score = alignment / 2.0  # normalize to 0–1
+        technical_score = alignment / 2.0
 
-        # =====================================================
-        # RISK COMPONENT
-        # =====================================================
+        # RSI warnings
+        if signal == "LONG" and rsi > self.RSI_OVERBOUGHT:
+            warnings.append("RSI overbought")
+        if signal == "SHORT" and rsi < self.RSI_OVERSOLD:
+            warnings.append("RSI oversold")
+
+        # -----------------------------------------------------
+        # Risk regime
+        # -----------------------------------------------------
 
         if regime_feature > 1.5:
             volatility_regime = "high_volatility"
@@ -175,9 +193,9 @@ class SignalAgent:
         else:
             risk_level = "low"
 
-        # =====================================================
-        # DRIFT ADJUSTMENT
-        # =====================================================
+        # -----------------------------------------------------
+        # Drift penalty
+        # -----------------------------------------------------
 
         drift_flag = False
         if drift_score is not None:
@@ -185,11 +203,13 @@ class SignalAgent:
             if drift_score > 0.5:
                 drift_flag = True
                 confidence_numeric *= 0.7
-                confidence_numeric = float(np.clip(confidence_numeric, 0.0, 1.0))
+                warnings.append("Feature drift detected")
 
-        # =====================================================
-        # COMPOSITE AGENT SCORE (For Orchestrator)
-        # =====================================================
+        confidence_numeric = float(np.clip(confidence_numeric, 0.0, 1.0))
+
+        # -----------------------------------------------------
+        # Composite agent score
+        # -----------------------------------------------------
 
         agent_score = float(np.clip(
             0.5 * confidence_numeric +
@@ -198,10 +218,6 @@ class SignalAgent:
             0.0,
             1.0
         ))
-
-        # =====================================================
-        # TRADE APPROVAL
-        # =====================================================
 
         trade_approved = (
             signal != "NEUTRAL"
@@ -215,23 +231,13 @@ class SignalAgent:
             volatility_regime
         )
 
-        # =====================================================
-        # GOVERNANCE SCORE
-        # =====================================================
-
-        governance_score = int(
-            np.clip(
-                agent_score * 100,
-                0,
-                100
-            )
-        )
+        governance_score = int(np.clip(agent_score * 100, 0, 100))
 
         explanation = (
-            f"{signal} | raw={raw_model_score:.2f} | "
-            f"final={final_score:.2f} | "
-            f"agent_score={agent_score:.2f} | "
-            f"risk={risk_level}"
+            f"{signal} | score={final_score:.2f} | "
+            f"confidence={confidence_numeric:.2f} | "
+            f"risk={risk_level} | "
+            f"agent_score={agent_score:.2f}"
         )
 
         return {
