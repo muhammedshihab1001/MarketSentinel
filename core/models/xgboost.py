@@ -14,13 +14,12 @@ EARLY_STOPPING_ROUNDS = 50
 
 MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
-MIN_GROUP_SIZE = 5
 MIN_PRED_ENTROPY = 0.01
 MAX_MODEL_SIZE_MB = 100
 EPSILON = 1e-12
 
 
-class SafeXGBRanker:
+class SafeXGBRegressor:
 
     def __init__(self):
 
@@ -42,7 +41,7 @@ class SafeXGBRanker:
     # TRAIN
     ###################################################
 
-    def fit(self, X, y, groups):
+    def fit(self, X, y):
 
         if X is None or X.empty:
             raise RuntimeError("Training features empty.")
@@ -58,15 +57,6 @@ class SafeXGBRanker:
 
         if np.std(y) < MIN_TARGET_STD:
             raise RuntimeError("Target variance too small.")
-
-        if groups is None or len(groups) == 0:
-            raise RuntimeError("Ranking requires group definition.")
-
-        if min(groups) < MIN_GROUP_SIZE:
-            raise RuntimeError("Cross-sectional group too small.")
-
-        if sum(groups) != len(X):
-            raise RuntimeError("Group sizes mismatch.")
 
         self.feature_names = list(X.columns)
         self.training_cols = X.shape[1]
@@ -98,8 +88,6 @@ class SafeXGBRanker:
             feature_names=self.feature_names,
         )
 
-        dtrain.set_group(groups)
-
         ###################################################
         # PARAMETERS
         ###################################################
@@ -107,8 +95,8 @@ class SafeXGBRanker:
         use_gpu = os.getenv("XGB_USE_GPU", "false").lower() == "true"
 
         params = {
-            "objective": "rank:pairwise",
-            "eval_metric": "ndcg",
+            "objective": "reg:squarederror",
+            "eval_metric": "rmse",
             "max_depth": 6,
             "eta": 0.05,
             "subsample": 0.9,
@@ -177,7 +165,7 @@ class SafeXGBRanker:
             raise RuntimeError("Prediction entropy too low.")
 
         logger.info(
-            "XGB Ranking trained | pred_std=%.6f | entropy=%.4f",
+            "XGB Regression trained | pred_std=%.6f | entropy=%.4f",
             pred_std,
             entropy
         )
@@ -265,5 +253,5 @@ class SafeXGBRanker:
 
 
 def build_xgboost_pipeline():
-    logger.info("Building Institutional XGBoost Pairwise Ranking Model")
-    return SafeXGBRanker()
+    logger.info("Building Institutional XGBoost Regression Model")
+    return SafeXGBRegressor()
