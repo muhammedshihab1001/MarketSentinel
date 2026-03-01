@@ -61,6 +61,9 @@ class YahooProvider(MarketDataProvider):
         else:
             df.columns = [str(c).strip().lower() for c in df.columns]
 
+        # Remove duplicate columns
+        df = df.loc[:, ~df.columns.duplicated()]
+
         return df
 
     ########################################################
@@ -111,11 +114,8 @@ class YahooProvider(MarketDataProvider):
                     series = series.iloc[:, 0]
                 else:
                     raise RuntimeError(
-                        f"Ambiguous Yahoo column for {key}: multiple columns."
+                        f"Ambiguous Yahoo column for {key}"
                     )
-
-            if not isinstance(series, pd.Series):
-                raise RuntimeError(f"Invalid Yahoo column structure for {key}")
 
             clean[key] = series
 
@@ -128,7 +128,7 @@ class YahooProvider(MarketDataProvider):
     def _normalize(self, df, ticker, min_rows):
 
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            raise RuntimeError("Yahoo fetch returned invalid dataframe.")
+            raise RuntimeError("Yahoo fetch returned empty dataframe.")
 
         df = df.copy()
         df = self._flatten_columns(df)
@@ -196,17 +196,33 @@ class YahooProvider(MarketDataProvider):
         )
 
         ####################################################
-        # PRICE INVARIANT REPAIR
+        # PRICE REPAIR
         ####################################################
 
         clean["high"] = clean[["high", "open", "close"]].max(axis=1)
         clean["low"] = clean[["low", "open", "close"]].min(axis=1)
+
+        # Remove zero or negative prices
+        clean = clean[clean["close"] > 0]
+
+        ####################################################
+        # SMALL GAP REPAIR
+        ####################################################
+
+        clean["close"] = clean["close"].ffill().bfill()
 
         ####################################################
         # VOLUME SAFETY
         ####################################################
 
         clean["volume"] = clean["volume"].fillna(0).clip(lower=0)
+
+        ####################################################
+        # INTRADAY ADJUSTMENT
+        ####################################################
+
+        if min_rows < 60:
+            min_rows = max(min_rows, 30)
 
         ####################################################
         # MIN HISTORY CHECK
