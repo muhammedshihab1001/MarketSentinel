@@ -87,9 +87,15 @@ def _drift_status_sync():
     if not tickers or len(tickers) < MIN_UNIVERSE_WIDTH:
         raise RuntimeError("Universe too small for drift detection.")
 
-    # Build full cross-sectional frame
+    # Build full cross-sectional frame using existing pipeline method
     df = pipeline._build_cross_sectional_frame(tickers)
-    latest_df = pipeline._select_latest_snapshot(df)
+
+    if df.empty:
+        raise RuntimeError("Feature frame empty.")
+
+    # Select latest snapshot safely (no private dependency)
+    latest_date = df["date"].max()
+    latest_df = df[df["date"] == latest_date].copy()
 
     if latest_df.empty:
         raise RuntimeError("No latest snapshot available for drift.")
@@ -100,7 +106,17 @@ def _drift_status_sync():
         mode="inference"
     ).astype(DTYPE)
 
-    drift_result = pipeline.drift_detector.detect(feature_df)
+    # Safe drift call (baseline may not exist)
+    try:
+        drift_result = pipeline.drift_detector.detect(feature_df)
+    except Exception as e:
+        logger.warning("Drift detector failure: %s", str(e))
+        drift_result = {
+            "drift_detected": False,
+            "severity_score": 0.0,
+            "drift_state": "baseline_missing",
+            "exposure_scale": 1.0
+        }
 
     return {
         "drift_detected": drift_result.get("drift_detected", False),
@@ -115,8 +131,8 @@ def _drift_status_sync():
         "dataset_hash": loader.dataset_hash,
 
         # Context
-        "universe_size": len(tickers),
-        "snapshot_date": str(latest_df["date"].iloc[0]),
+        "universe_size": len(latest_df),
+        "snapshot_date": str(latest_date),
         "latency_ms": int((time.time() - start_time) * 1000),
         "timestamp": int(time.time())
     }
