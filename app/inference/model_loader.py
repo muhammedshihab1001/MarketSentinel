@@ -37,7 +37,7 @@ class LoadedModel:
 
 
 # =========================================================
-# MODEL LOADER (CV-FRIENDLY HARDENED)
+# MODEL LOADER
 # =========================================================
 
 class ModelLoader:
@@ -51,7 +51,7 @@ class ModelLoader:
 
     STRICT_GOVERNANCE = os.getenv("MODEL_STRICT_GOVERNANCE", "0") == "1"
 
-    ########################################################
+    # -----------------------------------------------------
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -60,7 +60,7 @@ class ModelLoader:
                     cls._instance = super().__new__(cls)
         return cls._instance
 
-    ########################################################
+    # -----------------------------------------------------
 
     def __init__(self):
         if hasattr(self, "_initialized"):
@@ -70,9 +70,9 @@ class ModelLoader:
         self._xgb_container: Optional[LoadedModel] = None
         self._initialized = True
 
-    ########################################################
+    # -----------------------------------------------------
     # HASH UTIL
-    ########################################################
+    # -----------------------------------------------------
 
     def _sha256(self, path: str) -> str:
         h = hashlib.sha256()
@@ -81,17 +81,17 @@ class ModelLoader:
                 h.update(chunk)
         return h.hexdigest()
 
-    ########################################################
+    # -----------------------------------------------------
     # FEATURE CHECKSUM
-    ########################################################
+    # -----------------------------------------------------
 
     def _compute_feature_checksum(self):
         canonical = json.dumps(list(MODEL_FEATURES), sort_keys=False).encode()
         return hashlib.sha256(canonical).hexdigest()
 
-    ########################################################
+    # -----------------------------------------------------
     # REGISTRY
-    ########################################################
+    # -----------------------------------------------------
 
     def _get_registry_dir(self):
         base_dir = os.getenv(
@@ -104,9 +104,9 @@ class ModelLoader:
 
         return base_dir
 
-    ########################################################
+    # -----------------------------------------------------
     # POINTER RESOLUTION
-    ########################################################
+    # -----------------------------------------------------
 
     def _resolve_production_version(self, base_dir):
 
@@ -135,9 +135,9 @@ class ModelLoader:
 
         return model_path, metadata_path, version, pointer_hash
 
-    ########################################################
+    # -----------------------------------------------------
     # SAFE MODEL LOAD
-    ########################################################
+    # -----------------------------------------------------
 
     def _safe_load_model(self, model_path):
 
@@ -157,9 +157,9 @@ class ModelLoader:
 
         return model
 
-    ########################################################
+    # -----------------------------------------------------
     # RELOAD LOGIC
-    ########################################################
+    # -----------------------------------------------------
 
     def _reload_xgb_if_needed(self):
 
@@ -183,14 +183,12 @@ class ModelLoader:
 
             meta = MetadataManager.load_metadata(metadata_path)
 
-            # =====================================================
-            # BASIC GOVERNANCE CHECKS (CV MODE)
-            # =====================================================
-
+            # Artifact integrity
             actual_hash = self._sha256(model_path)
             if meta.get("artifact_hash") != actual_hash:
                 raise RuntimeError("Artifact tampering detected.")
 
+            # Soft governance checks
             if meta.get("schema_signature") != get_schema_signature():
                 logger.warning("Schema signature mismatch.")
 
@@ -204,8 +202,7 @@ class ModelLoader:
                 logger.warning("Feature checksum drift detected.")
 
             try:
-                universe_hash_current = MarketUniverse.fingerprint()
-                if meta.get("universe_hash") != universe_hash_current:
+                if meta.get("universe_hash") != MarketUniverse.fingerprint():
                     logger.warning("Universe drift detected (soft).")
             except Exception:
                 pass
@@ -244,9 +241,9 @@ class ModelLoader:
 
             return new_container.model
 
-    ########################################################
+    # -----------------------------------------------------
     # PUBLIC ACCESSORS
-    ########################################################
+    # -----------------------------------------------------
 
     @property
     def xgb(self):
@@ -277,9 +274,15 @@ class ModelLoader:
         self._reload_xgb_if_needed()
         return self._xgb_container.training_fingerprint
 
-    ########################################################
+    # ✅ FIX ADDED
+    @property
+    def artifact_hash(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.artifact_hash
+
+    # -----------------------------------------------------
     # FEATURE IMPORTANCE
-    ########################################################
+    # -----------------------------------------------------
 
     def get_feature_importance(self):
 
@@ -292,9 +295,9 @@ class ModelLoader:
 
         return model.export_feature_importance()
 
-    ########################################################
+    # -----------------------------------------------------
     # WARMUP
-    ########################################################
+    # -----------------------------------------------------
 
     def warmup(self):
         logger.info("Model warmup triggered.")
