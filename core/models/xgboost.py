@@ -38,6 +38,8 @@ class SafeXGBRegressor:
         self.train_rmse = None
         self.valid_rmse = None
 
+        # strong determinism
+        os.environ["PYTHONHASHSEED"] = str(SEED)
         random.seed(SEED)
         np.random.seed(SEED)
 
@@ -82,7 +84,7 @@ class SafeXGBRegressor:
         ).hexdigest()
 
         ###################################################
-        # TRAIN / VALID SPLIT
+        # TRAIN / VALID SPLIT (Time ordered)
         ###################################################
 
         split_idx = int(len(X) * (1 - VALIDATION_SPLIT))
@@ -103,7 +105,7 @@ class SafeXGBRegressor:
         )
 
         ###################################################
-        # PARAMETERS (Stronger but Stable)
+        # PARAMETERS (Stable for Noisy Yahoo Data)
         ###################################################
 
         use_gpu = os.getenv("XGB_USE_GPU", "false").lower() == "true"
@@ -111,7 +113,7 @@ class SafeXGBRegressor:
         params = {
             "objective": "reg:squarederror",
             "eval_metric": "rmse",
-            "max_depth": 7,
+            "max_depth": 6,
             "eta": 0.03,
             "subsample": 0.85,
             "colsample_bytree": 0.85,
@@ -133,6 +135,8 @@ class SafeXGBRegressor:
         # TRAIN
         ###################################################
 
+        evals_result = {}
+
         self.model = xgb.train(
             params,
             dtrain,
@@ -140,6 +144,7 @@ class SafeXGBRegressor:
             evals=[(dtrain, "train"), (dvalid, "valid")],
             early_stopping_rounds=EARLY_STOPPING_ROUNDS,
             verbose_eval=False,
+            evals_result=evals_result
         )
 
         self.best_iteration = (
@@ -148,8 +153,9 @@ class SafeXGBRegressor:
             else NUM_BOOST_ROUNDS
         )
 
-        self.train_rmse = float(self.model.eval(dtrain).split(":")[1])
-        self.valid_rmse = float(self.model.eval(dvalid).split(":")[1])
+        # stable RMSE extraction
+        self.train_rmse = float(evals_result["train"]["rmse"][-1])
+        self.valid_rmse = float(evals_result["valid"]["rmse"][-1])
 
         ###################################################
         # OVERFIT CHECK
@@ -157,7 +163,7 @@ class SafeXGBRegressor:
 
         if self.valid_rmse > self.train_rmse * 1.5:
             logger.warning(
-                "Potential overfitting detected | train_rmse=%.5f | valid_rmse=%.5f",
+                "Potential overfitting | train_rmse=%.5f | valid_rmse=%.5f",
                 self.train_rmse,
                 self.valid_rmse
             )
@@ -178,7 +184,10 @@ class SafeXGBRegressor:
         # TRAINING SANITY CHECK
         ###################################################
 
-        preds = self.model.predict(dtrain)
+        preds = self.model.predict(
+            dtrain,
+            iteration_range=(0, self.best_iteration)
+        )
 
         if not np.all(np.isfinite(preds)):
             raise RuntimeError("Non-finite training predictions.")
@@ -234,7 +243,10 @@ class SafeXGBRegressor:
             feature_names=self.feature_names,
         )
 
-        scores = self.model.predict(dmatrix)
+        scores = self.model.predict(
+            dmatrix,
+            iteration_range=(0, self.best_iteration)
+        )
 
         if not np.all(np.isfinite(scores)):
             raise RuntimeError("Non-finite inference scores.")
@@ -289,9 +301,10 @@ class SafeXGBRegressor:
             "feature_checksum": self.feature_checksum,
             "train_rmse": self.train_rmse,
             "valid_rmse": self.valid_rmse,
+            "training_fingerprint": self.training_fingerprint,
         }
 
 
 def build_xgboost_pipeline():
-    logger.info("Building XGBoost Regression Model (Enhanced Version)")
+    logger.info("Building XGBoost Regression Model (Stable Version)")
     return SafeXGBRegressor()
