@@ -32,7 +32,7 @@ class WalkForwardValidator:
     MAX_SHARPE = 5.0
 
     SCORE_WINSOR_Q = 0.02
-    BASE_DISPERSION = 0.03   # lowered for regression stability
+    BASE_DISPERSION = 0.03
     MIN_ACTIVE_POSITIONS = 4
 
     EPSILON = 1e-9
@@ -65,6 +65,7 @@ class WalkForwardValidator:
     # ==========================================================
 
     def _build_fold_target(self, df):
+
         df = df.sort_values(["date", "ticker"]).copy()
 
         df["raw_forward"] = (
@@ -84,6 +85,7 @@ class WalkForwardValidator:
             return pd.DataFrame()
 
         df.drop(columns=["raw_forward"], inplace=True)
+
         return df
 
     # ==========================================================
@@ -107,12 +109,8 @@ class WalkForwardValidator:
     def _compute_turnover(self, old_positions, new_positions):
         all_keys = set(old_positions.keys()) | set(new_positions.keys())
         turnover = 0.0
-
         for k in all_keys:
-            old_w = old_positions.get(k, 0.0)
-            new_w = new_positions.get(k, 0.0)
-            turnover += abs(new_w - old_w)
-
+            turnover += abs(new_positions.get(k, 0.0) - old_positions.get(k, 0.0))
         return turnover
 
     # ==========================================================
@@ -186,6 +184,7 @@ class WalkForwardValidator:
                 exit_slice = test_df[test_df["date"] == exit_date]
 
                 common = set(signal_slice["ticker"]) & set(exit_slice["ticker"])
+
                 if len(common) < self.MIN_CROSS_SECTION:
                     continue
 
@@ -207,11 +206,9 @@ class WalkForwardValidator:
                 if score_std < self.MIN_SCORE_STD:
                     continue
 
-                # dispersion guard (regression-safe)
                 if score_std < self.BASE_DISPERSION:
                     continue
 
-                # stabilize scores
                 scores = self._winsorize(scores)
                 scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
 
@@ -224,7 +221,6 @@ class WalkForwardValidator:
                 if len(longs) < self.MIN_ACTIVE_POSITIONS:
                     continue
 
-                # volatility-adjusted softmax
                 long_alpha = self._softmax(longs["score"].values)
                 short_alpha = self._softmax(np.abs(shorts["score"].values))
 
@@ -246,6 +242,7 @@ class WalkForwardValidator:
                     positions[t] = -min(float(w), self.MAX_POSITION_WEIGHT)
 
                 gross = sum(abs(v) for v in positions.values())
+
                 if abs(gross - self.TARGET_GROSS_EXPOSURE) > 0.05:
                     continue
 
