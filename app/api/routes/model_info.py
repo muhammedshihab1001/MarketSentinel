@@ -73,7 +73,7 @@ def _model_info_sync():
 
 
 # =========================================================
-# FEATURE IMPORTANCE
+# FEATURE IMPORTANCE (FIXED CONTRACT)
 # =========================================================
 
 @router.get("/feature-importance")
@@ -109,12 +109,26 @@ def _feature_importance_sync():
     start_time = time.time()
     loader = get_shared_model_loader()
 
-    result = loader.get_feature_importance()
+    model_output = loader.get_feature_importance()
+
+    # Adapt model output to stable API contract
+    importance_pairs = model_output.get("feature_importance", [])
+
+    importance = [
+        {"feature": name, "importance": float(score)}
+        for name, score in importance_pairs
+    ]
 
     return {
-        "model_version": result["model_version"],
-        "feature_checksum": result["feature_checksum"],
-        "importance": result["importance"],
+        "model_version": loader.xgb_version,
+        "feature_checksum": model_output.get("feature_checksum"),
+        "importance_checksum": model_output.get("importance_checksum"),
+        "booster_checksum": model_output.get("booster_checksum"),
+        "best_iteration": model_output.get("best_iteration"),
+        "train_rmse": model_output.get("train_rmse"),
+        "valid_rmse": model_output.get("valid_rmse"),
+        "training_fingerprint": model_output.get("training_fingerprint"),
+        "importance": importance,
         "latency_ms": int((time.time() - start_time) * 1000),
         "timestamp": int(time.time())
     }
@@ -167,7 +181,7 @@ def _model_diagnostics_sync():
         "feature_checksum": loader.feature_checksum,
         "feature_count": len(MODEL_FEATURES),
 
-        # Model internals (institutional governance)
+        # Model internals
         "training_fingerprint": getattr(model, "training_fingerprint", None),
         "training_cols": getattr(model, "training_cols", None),
         "param_checksum": getattr(model, "param_checksum", None),
