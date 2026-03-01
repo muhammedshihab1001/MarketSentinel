@@ -1,6 +1,6 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v2.3
-# Multi-Agent Driven Selection (CV-Ready)
+# INSTITUTIONAL INFERENCE PIPELINE v2.4 (CV-Optimized)
+# Multi-Agent Driven Selection
 # =========================================================
 
 import time
@@ -55,7 +55,6 @@ def get_shared_model_loader():
 class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
-    TARGET_VOL = 0.12
     MIN_UNIVERSE_WIDTH = 12
     MIN_SCORE_STD = 1e-6
     MAX_POSITION_WEIGHT = 0.20
@@ -67,8 +66,11 @@ class InferencePipeline:
     SCORE_WINSOR_Q = 0.02
     BASE_LIQUIDITY = 1e6
 
+    SNAPSHOT_CACHE_TTL = 5  # seconds (CV safe lightweight cache)
+
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
-    CROSS_SECTIONAL_WINDOW_DAYS = int(os.getenv("CS_WINDOW_DAYS", "30"))
+
+    # ---------------------------------------------------------
 
     def __init__(self):
         self.market_data = MarketDataService()
@@ -108,6 +110,13 @@ class InferencePipeline:
         if not universe:
             raise RuntimeError("Universe empty.")
 
+        cache_key = f"snapshot:{hash(tuple(universe))}"
+
+        # Lightweight cache
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+
         INFERENCE_IN_PROGRESS.inc()
         start_time = time.time()
 
@@ -140,6 +149,7 @@ class InferencePipeline:
             ).astype(DTYPE)
 
             drift_result = self._safe_drift(feature_df)
+            exposure_scale = drift_result.get("exposure_scale", 1.0)
 
             raw_scores = self.models.xgb.predict(feature_df)
 
@@ -153,13 +163,7 @@ class InferencePipeline:
 
             latest_df["raw_model_score"] = raw_scores
 
-            # -------------------------------------------------
-            # RUN SIGNAL AGENT FOR ALL INSTRUMENTS
-            # -------------------------------------------------
-
             snapshot_rows = []
-            score_mean = float(raw_scores.mean())
-            score_std = float(raw_scores.std())
 
             for _, row in latest_df.iterrows():
 
@@ -167,7 +171,6 @@ class InferencePipeline:
 
                 agent_output = self.signal_agent.analyze(
                     row={**row.to_dict(), "signal": direction},
-                    probability_stats={"mean": score_mean, "std": score_std},
                     drift_score=drift_result.get("severity_score", 0)
                 )
 
@@ -180,28 +183,24 @@ class InferencePipeline:
                     "agent": agent_output
                 })
 
-            # -------------------------------------------------
-            # SELECT TOP 5 BY AGENT SCORE (MULTI-AGENT DRIVEN)
-            # -------------------------------------------------
-
+            # Agent top selection
             top_5 = sorted(
                 snapshot_rows,
                 key=lambda x: x["agent_score"],
                 reverse=True
             )[:self.TOP_SELECTION]
 
-            # -------------------------------------------------
-            # PORTFOLIO STILL BASED ON MODEL SCORE (STABLE)
-            # -------------------------------------------------
-
+            # Portfolio construction
             ranked = latest_df.sort_values("raw_model_score")
             longs = ranked.tail(self.TOP_K)
             shorts = ranked.head(self.BOTTOM_K)
 
             weights = self._construct_portfolio(longs, shorts)
 
+            # Apply drift exposure scaling
             for row in snapshot_rows:
-                row["weight"] = float(weights.get(row["ticker"], 0.0))
+                base_weight = weights.get(row["ticker"], 0.0)
+                row["weight"] = float(base_weight * exposure_scale)
 
             result = {
                 "snapshot_date": str(latest_df["date"].max()),
@@ -212,6 +211,9 @@ class InferencePipeline:
                 "top_5": top_5,
                 "signals": snapshot_rows
             }
+
+            # Cache result (short TTL)
+            self.cache.set(cache_key, result, ex=self.SNAPSHOT_CACHE_TTL)
 
             MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
             MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(
