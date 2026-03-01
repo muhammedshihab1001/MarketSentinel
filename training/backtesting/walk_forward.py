@@ -16,7 +16,7 @@ FORWARD_DAYS = 5
 class WalkForwardValidator:
 
     # ----------------------------------------------------------
-    # CONFIG (Simplified & CV-Friendly)
+    # CONFIG (CV-Stable)
     # ----------------------------------------------------------
 
     MIN_WINDOWS = 4
@@ -25,6 +25,7 @@ class WalkForwardValidator:
     MIN_CROSS_SECTION = 8
     MIN_SCORE_STD = 1e-6
     MIN_TARGET_STD = 1e-6
+    MIN_TRADES_PER_WINDOW = 2
 
     TOP_K = 8
     BOTTOM_K = 8
@@ -34,6 +35,7 @@ class WalkForwardValidator:
     TRANSACTION_COST = 0.0008
     SLIPPAGE = 0.0005
     MAX_SHARPE = 5.0
+    MAX_ABS_PERIOD_RETURN = 0.25  # anti-explosion safeguard
 
     SCORE_WINSOR_Q = 0.01
     EPSILON = 1e-9
@@ -54,15 +56,11 @@ class WalkForwardValidator:
         self.regime_detector = MarketRegimeDetector()
 
     # ----------------------------------------------------------
-    # EMBARGO
-    # ----------------------------------------------------------
 
     def _apply_embargo(self, train_df, test_start):
         embargo_cut = pd.Timestamp(test_start) - pd.Timedelta(days=self.embargo_days)
         return train_df[train_df["date"] < embargo_cut]
 
-    # ----------------------------------------------------------
-    # TARGET BUILD
     # ----------------------------------------------------------
 
     def _build_fold_target(self, df):
@@ -89,8 +87,6 @@ class WalkForwardValidator:
 
         return df
 
-    # ----------------------------------------------------------
-    # UTILITIES
     # ----------------------------------------------------------
 
     def _winsorize(self, x):
@@ -124,11 +120,12 @@ class WalkForwardValidator:
         results = []
         equity_curve = []
         capital = 10_000.0
-        prev_positions = {}
 
         start_idx = self.window_size
 
         while start_idx < len(unique_dates) - FORWARD_DAYS:
+
+            prev_positions = {}  # RESET PER WINDOW (important fix)
 
             train_dates = unique_dates.iloc[start_idx - self.window_size:start_idx]
             test_dates = unique_dates.iloc[start_idx:start_idx + self.step_size]
@@ -213,9 +210,6 @@ class WalkForwardValidator:
                 long_w = self._softmax(longs["score"].values)
                 short_w = self._softmax(np.abs(shorts["score"].values))
 
-                long_w /= long_w.sum()
-                short_w /= short_w.sum()
-
                 long_w *= self.TARGET_GROSS_EXPOSURE / 2
                 short_w *= self.TARGET_GROSS_EXPOSURE / 2
 
@@ -250,6 +244,13 @@ class WalkForwardValidator:
                         cost = abs(weight) * self.TRANSACTION_COST
                         period_ret += weight * row.ret - cost
 
+                # Anti-explosion protection (Yahoo data safeguard)
+                period_ret = float(np.clip(
+                    period_ret,
+                    -self.MAX_ABS_PERIOD_RETURN,
+                    self.MAX_ABS_PERIOD_RETURN
+                ))
+
                 capital *= np.exp(period_ret)
                 capital = max(capital, 1.0)
 
@@ -258,7 +259,7 @@ class WalkForwardValidator:
                 equity_curve.append(capital)
                 trade_count += 1
 
-            if not window_returns:
+            if len(window_returns) < self.MIN_TRADES_PER_WINDOW:
                 start_idx += self.step_size
                 continue
 
