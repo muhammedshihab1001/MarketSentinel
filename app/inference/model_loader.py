@@ -29,9 +29,13 @@ class LoadedModel:
     model: object
     version: str
     schema_signature: str
+    schema_version: str
     dataset_hash: str
     artifact_hash: str
     feature_checksum: str
+    universe_hash: str
+    training_code_hash: str
+    reproducibility_hash: Optional[str]
     pointer_hash: Optional[str]
     training_fingerprint: Optional[str]
 
@@ -183,12 +187,16 @@ class ModelLoader:
 
             meta = MetadataManager.load_metadata(metadata_path)
 
-            # Artifact integrity
+            # -----------------------
+            # Artifact Integrity
+            # -----------------------
             actual_hash = self._sha256(model_path)
             if meta.get("artifact_hash") != actual_hash:
                 raise RuntimeError("Artifact tampering detected.")
 
-            # Soft governance checks
+            # -----------------------
+            # Soft Governance Checks
+            # -----------------------
             if meta.get("schema_signature") != get_schema_signature():
                 logger.warning("Schema signature mismatch.")
 
@@ -219,9 +227,13 @@ class ModelLoader:
                 model=model,
                 version=version,
                 schema_signature=meta.get("schema_signature"),
+                schema_version=meta.get("schema_version"),
                 dataset_hash=meta.get("dataset_hash"),
                 artifact_hash=meta.get("artifact_hash"),
                 feature_checksum=meta.get("feature_checksum"),
+                universe_hash=meta.get("universe_hash"),
+                training_code_hash=meta.get("training_code_hash"),
+                reproducibility_hash=meta.get("reproducibility_hash"),
                 pointer_hash=pointer_hash,
                 training_fingerprint=training_fingerprint
             )
@@ -260,6 +272,11 @@ class ModelLoader:
         return self._xgb_container.schema_signature
 
     @property
+    def schema_version(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.schema_version
+
+    @property
     def feature_checksum(self):
         self._reload_xgb_if_needed()
         return self._xgb_container.feature_checksum
@@ -270,15 +287,29 @@ class ModelLoader:
         return self._xgb_container.dataset_hash
 
     @property
-    def training_fingerprint(self):
-        self._reload_xgb_if_needed()
-        return self._xgb_container.training_fingerprint
-
-    # ✅ FIX ADDED
-    @property
     def artifact_hash(self):
         self._reload_xgb_if_needed()
         return self._xgb_container.artifact_hash
+
+    @property
+    def universe_hash(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.universe_hash
+
+    @property
+    def training_code_hash(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.training_code_hash
+
+    @property
+    def reproducibility_hash(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.reproducibility_hash
+
+    @property
+    def training_fingerprint(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.training_fingerprint
 
     # -----------------------------------------------------
     # FEATURE IMPORTANCE
