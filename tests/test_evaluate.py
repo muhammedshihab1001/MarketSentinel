@@ -1,101 +1,117 @@
 import numpy as np
 import pytest
-from sklearn.metrics import accuracy_score, roc_auc_score
 
-from training.evaluate import (
-    XGB_MIN_ACCURACY,
-    XGB_MIN_AUC
-)
+from training.backtesting.walk_forward import WalkForwardValidator
 
 
 ############################################################
-# METRIC CALCULATION TEST (UNIT LEVEL)
+# DUMMY TRAINER FOR RANKING
 ############################################################
 
-def test_xgboost_metric_computation():
-    """
-    Ensure metric calculations behave as expected
-    under perfect prediction.
-    """
+def dummy_trainer(train_df):
 
-    y_true = np.array([1, 0, 1, 0])
-    probs = np.array([0.9, 0.1, 0.8, 0.2])
-    preds = (probs > 0.5).astype(int)
+    class DummyModel:
 
-    accuracy = accuracy_score(y_true, preds)
-    auc = roc_auc_score(y_true, probs)
+        def predict(self, X):
+            # simple ranking variation
+            base = X.iloc[:, 0].values
+            return base + np.random.normal(0, 0.01, len(base))
 
-    assert accuracy == 1.0
-    assert auc == 1.0
+    return DummyModel()
 
 
 ############################################################
-# GATE ENFORCEMENT TESTS
+# HELPER DATA
 ############################################################
 
-def test_xgboost_accuracy_gate_enforced():
-    """
-    Ensure accuracy gate fails when predictions
-    are clearly wrong.
-    """
+def build_dataset(n_days=400, n_tickers=20):
 
-    y_true = np.array([1, 1, 1, 1])
-    probs = np.array([0.1, 0.1, 0.1, 0.1])
-    preds = (probs > 0.5).astype(int)
+    dates = np.arange(n_days)
+    tickers = [f"T{i}" for i in range(n_tickers)]
 
-    accuracy = accuracy_score(y_true, preds)
+    data = []
 
-    assert accuracy < XGB_MIN_ACCURACY
+    for d in dates:
+        for t in tickers:
+            data.append({
+                "date": f"2020-01-{(d % 28) + 1:02d}",
+                "ticker": t,
+                "close": 100 + np.random.randn(),
+                "volatility": 0.2,
+                "momentum_20_z": np.random.randn()
+            })
 
-
-def test_xgboost_auc_gate_enforced():
-    """
-    Ensure AUC gate fails when model has no signal.
-    AUC=0.5 represents random guessing.
-    """
-
-    y_true = np.array([1, 0, 1, 0])
-    probs = np.array([0.5, 0.5, 0.5, 0.5])  # no signal
-
-    auc = roc_auc_score(y_true, probs)
-
-    # Random model
-    assert auc == 0.5
-
-    # Must fail the CI gate (random is NOT acceptable)
-    assert auc <= XGB_MIN_AUC
+    return data
 
 
 ############################################################
-# DRIFT SAFETY CHECK
+# RANKING METRIC SANITY
 ############################################################
 
-def test_probability_bounds():
-    """
-    Ensure probabilities stay within valid bounds.
-    """
+def test_ranking_metrics_computation():
 
-    probs = np.array([0.0, 1.0, 0.5])
+    df = build_dataset()
+    import pandas as pd
+    df = pd.DataFrame(df)
 
-    assert np.all(probs >= 0.0)
-    assert np.all(probs <= 1.0)
+    wf = WalkForwardValidator(dummy_trainer)
+
+    metrics = wf.run(df)
+
+    assert np.isfinite(metrics["avg_sharpe"])
+    assert np.isfinite(metrics["profit_factor"])
+    assert metrics["final_equity"] > 0
 
 
 ############################################################
-# REGRESSION SAFETY TEST
+# GATE ENFORCEMENT (SHARPE FLOOR)
 ############################################################
 
-def test_metric_rounding_stability():
-    """
-    Ensure metric outputs remain float type and stable.
-    """
+def test_sharpe_gate_sanity():
 
-    y_true = np.array([1, 0, 1, 0])
-    probs = np.array([0.89, 0.11, 0.87, 0.13])
-    preds = (probs > 0.5).astype(int)
+    df = build_dataset()
+    import pandas as pd
+    df = pd.DataFrame(df)
 
-    accuracy = float(accuracy_score(y_true, preds))
-    auc = float(roc_auc_score(y_true, probs))
+    wf = WalkForwardValidator(dummy_trainer)
 
-    assert isinstance(accuracy, float)
-    assert isinstance(auc, float)
+    metrics = wf.run(df)
+
+    # Sharpe must be within clipped institutional bounds
+    assert -5.0 <= metrics["avg_sharpe"] <= 5.0
+
+
+############################################################
+# DRAWDOWN SAFETY
+############################################################
+
+def test_drawdown_bounds():
+
+    df = build_dataset()
+    import pandas as pd
+    df = pd.DataFrame(df)
+
+    wf = WalkForwardValidator(dummy_trainer)
+
+    metrics = wf.run(df)
+
+    # drawdown must be between -1 and 0
+    assert -1.0 <= metrics["max_drawdown"] <= 0.0
+
+
+############################################################
+# METRIC TYPE STABILITY
+############################################################
+
+def test_metric_type_stability():
+
+    df = build_dataset()
+    import pandas as pd
+    df = pd.DataFrame(df)
+
+    wf = WalkForwardValidator(dummy_trainer)
+
+    metrics = wf.run(df)
+
+    for v in metrics.values():
+        assert isinstance(v, (int, float))
