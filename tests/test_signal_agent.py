@@ -2,6 +2,10 @@ import pytest
 from core.agent.signal_agent import SignalAgent
 
 
+# ======================================================
+# FIXED TEST INPUTS
+# ======================================================
+
 def make_base_row():
     return {
         "score": 0.65,
@@ -22,9 +26,9 @@ def make_prob_stats(std=0.10):
     }
 
 
-# -------------------------------------------------------
-# BASIC STRUCTURE TEST
-# -------------------------------------------------------
+# ======================================================
+# STRUCTURE CONTRACT LOCK
+# ======================================================
 
 def test_signal_agent_structure():
 
@@ -37,6 +41,7 @@ def test_signal_agent_structure():
     required_keys = {
         "signal",
         "confidence",
+        "confidence_numeric",
         "strength_score",
         "risk_level",
         "volatility_regime",
@@ -51,9 +56,26 @@ def test_signal_agent_structure():
     assert required_keys.issubset(result.keys())
 
 
-# -------------------------------------------------------
+# ======================================================
+# DETERMINISM
+# ======================================================
+
+def test_agent_is_deterministic():
+
+    agent = SignalAgent()
+
+    row = make_base_row()
+    stats = make_prob_stats()
+
+    r1 = agent.analyze(row=row, probability_stats=stats)
+    r2 = agent.analyze(row=row, probability_stats=stats)
+
+    assert r1 == r2
+
+
+# ======================================================
 # CONFIDENCE TIERS
-# -------------------------------------------------------
+# ======================================================
 
 def test_confidence_high():
 
@@ -64,11 +86,28 @@ def test_confidence_high():
     result = agent.analyze(row=row, probability_stats=make_prob_stats())
 
     assert result["confidence"] in {"high", "very_high"}
+    assert 0.0 <= result["confidence_numeric"] <= 1.0
 
 
-# -------------------------------------------------------
+def test_confidence_monotonicity():
+
+    agent = SignalAgent()
+
+    row_low = make_base_row()
+    row_low["score"] = 0.3
+
+    row_high = make_base_row()
+    row_high["score"] = 1.5
+
+    r_low = agent.analyze(row=row_low, probability_stats=make_prob_stats())
+    r_high = agent.analyze(row=row_high, probability_stats=make_prob_stats())
+
+    assert r_high["confidence_numeric"] > r_low["confidence_numeric"]
+
+
+# ======================================================
 # LOW DISPERSION WARNING
-# -------------------------------------------------------
+# ======================================================
 
 def test_low_dispersion_warning():
 
@@ -82,9 +121,9 @@ def test_low_dispersion_warning():
     assert any("dispersion" in w.lower() for w in result["warnings"])
 
 
-# -------------------------------------------------------
+# ======================================================
 # HIGH VOLATILITY REGIME
-# -------------------------------------------------------
+# ======================================================
 
 def test_high_volatility_regime():
 
@@ -98,9 +137,9 @@ def test_high_volatility_regime():
     assert any("volatility" in w.lower() for w in result["warnings"])
 
 
-# -------------------------------------------------------
+# ======================================================
 # RSI EXTREMES
-# -------------------------------------------------------
+# ======================================================
 
 def test_rsi_overbought():
 
@@ -124,9 +163,9 @@ def test_rsi_oversold():
     assert any("oversold" in r.lower() for r in result["reasoning"])
 
 
-# -------------------------------------------------------
+# ======================================================
 # MOMENTUM CONTRADICTION
-# -------------------------------------------------------
+# ======================================================
 
 def test_momentum_contradiction_long():
 
@@ -152,9 +191,9 @@ def test_momentum_contradiction_short():
     assert any("contradict" in w.lower() for w in result["warnings"])
 
 
-# -------------------------------------------------------
+# ======================================================
 # TREND DETECTION
-# -------------------------------------------------------
+# ======================================================
 
 def test_bullish_trend():
 
@@ -178,9 +217,9 @@ def test_bearish_trend():
     assert result["trend"] == "bearish"
 
 
-# -------------------------------------------------------
+# ======================================================
 # STRENGTH SCORE
-# -------------------------------------------------------
+# ======================================================
 
 def test_strength_score_range():
 
@@ -203,15 +242,15 @@ def test_strength_score_monotonicity():
     row_high = make_base_row()
     row_high["score"] = 1.2
 
-    result_low = agent.analyze(row=row_low, probability_stats=make_prob_stats())
-    result_high = agent.analyze(row=row_high, probability_stats=make_prob_stats())
+    r_low = agent.analyze(row=row_low, probability_stats=make_prob_stats())
+    r_high = agent.analyze(row=row_high, probability_stats=make_prob_stats())
 
-    assert result_high["strength_score"] > result_low["strength_score"]
+    assert r_high["strength_score"] > r_low["strength_score"]
 
 
-# -------------------------------------------------------
+# ======================================================
 # RISK CLASSIFICATION
-# -------------------------------------------------------
+# ======================================================
 
 def test_risk_low_for_strong_signal():
 
@@ -232,4 +271,4 @@ def test_risk_elevated_under_volatility():
 
     result = agent.analyze(row=row, probability_stats=make_prob_stats())
 
-    assert result["risk_level"] in {"elevated", "high", "moderate"} 
+    assert result["risk_level"] in {"elevated", "high", "moderate"}
