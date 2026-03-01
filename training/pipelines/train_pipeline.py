@@ -88,56 +88,28 @@ def _release_lock():
 def get_git_commit():
 
     if not os.path.exists(".git"):
-        logger.warning("No .git directory — running in container mode.")
+        logger.warning("No .git directory — container mode.")
         return "NO_GIT"
 
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True,
+        text=True
+    ).stdout.strip()
+
+    if dirty and STRICT_GOVERNANCE:
+        raise RuntimeError(
+            "Repository is dirty — commit ALL changes before training."
+        )
+
     try:
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True,
-            text=True
-        ).stdout.strip()
-
-        if dirty and STRICT_GOVERNANCE:
-            raise RuntimeError(
-                "Repository is dirty — commit ALL changes before training."
-            )
-
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             stderr=subprocess.DEVNULL
         ).decode().strip()
-
         return commit
-
-    except Exception as e:
-        logger.warning("Git metadata unavailable: %s", str(e))
+    except Exception:
         return "GIT_UNAVAILABLE"
-
-
-# ==========================================================
-# SAFE MANIFEST SAVE
-# ==========================================================
-
-def save_manifest(run_id: str, manifest: dict):
-
-    os.makedirs(RUNS_DIR, exist_ok=True)
-    final_path = os.path.join(RUNS_DIR, f"{run_id}.json")
-
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        delete=False,
-        dir=RUNS_DIR,
-        suffix=".tmp",
-        encoding="utf-8"
-    ) as tmp:
-
-        json.dump(manifest, tmp, indent=4, sort_keys=True)
-        tmp.flush()
-        os.fsync(tmp.fileno())
-        temp_name = tmp.name
-
-    os.replace(temp_name, final_path)
 
 
 # ==========================================================
@@ -166,17 +138,15 @@ def build_environment_fingerprint():
 
 def build_lineage(start_date, end_date):
 
-    try:
-        universe_snapshot = MarketUniverse.snapshot()
-        universe_hash = MarketUniverse.fingerprint()
-    except Exception:
-        universe_snapshot = "UNAVAILABLE"
-        universe_hash = "UNAVAILABLE"
+    universe_snapshot = MarketUniverse.snapshot()
+    universe_hash = MarketUniverse.fingerprint()
+
+    training_code_hash = MetadataManager.fingerprint_training_code()
 
     lineage_payload = {
         "schema_signature": get_schema_signature(),
         "schema_snapshot": schema_snapshot(),
-        "training_code_hash": MetadataManager.fingerprint_training_code(),
+        "training_code_hash": training_code_hash,
         "git_commit": get_git_commit(),
         "environment_fingerprint": build_environment_fingerprint(),
         "training_window": {
@@ -189,11 +159,38 @@ def build_lineage(start_date, end_date):
 
     canonical = json.dumps(lineage_payload, sort_keys=True).encode()
 
-    lineage_payload["lineage_hash"] = (
-        MetadataManager.hash_list([canonical.hex()])
-    )
+    lineage_payload["lineage_hash"] = hashlib.sha256(canonical).hexdigest()
 
     return lineage_payload
+
+
+# ==========================================================
+# SAFE MANIFEST SAVE
+# ==========================================================
+
+def save_manifest(run_id: str, manifest: dict):
+
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    final_path = os.path.join(RUNS_DIR, f"{run_id}.json")
+
+    manifest["manifest_hash"] = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True).encode()
+    ).hexdigest()
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        delete=False,
+        dir=RUNS_DIR,
+        suffix=".tmp",
+        encoding="utf-8"
+    ) as tmp:
+
+        json.dump(manifest, tmp, indent=4, sort_keys=True)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        temp_name = tmp.name
+
+    os.replace(temp_name, final_path)
 
 
 # ==========================================================
@@ -217,6 +214,11 @@ def main(create_baseline=False, promote_baseline=False):
         end_date
     )
 
+    # 🔒 Validate schema before training
+    current_schema = get_schema_signature()
+    if not current_schema:
+        raise RuntimeError("Schema signature invalid.")
+
     run_id = (
         datetime.datetime.utcnow().strftime("run_%Y_%m_%d_%H%M%S_%f")
         + "_" + uuid.uuid4().hex[:6]
@@ -226,29 +228,12 @@ def main(create_baseline=False, promote_baseline=False):
 
     try:
 
-        logger.info("Starting institutional XGBoost training...")
-
-        try:
-            metrics = train_xgb(
-                start_date=start_date,
-                end_date=end_date,
-                create_baseline=create_baseline,
-                promote_baseline=promote_baseline
-            )
-        except RuntimeError as e:
-
-            if create_baseline and "Baseline already exists" in str(e):
-                logger.warning(
-                    "Baseline exists — retrying with promote mode."
-                )
-
-                metrics = train_xgb(
-                    start_date=start_date,
-                    end_date=end_date,
-                    promote_baseline=True
-                )
-            else:
-                raise
+        metrics = train_xgb(
+            start_date=start_date,
+            end_date=end_date,
+            create_baseline=create_baseline,
+            promote_baseline=promote_baseline
+        )
 
         runtime = time.time() - start
 
