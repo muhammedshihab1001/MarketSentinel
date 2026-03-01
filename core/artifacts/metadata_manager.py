@@ -17,11 +17,10 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "13.0"  # bumped
+    METADATA_VERSION = "14.0"  # upgraded
     MIN_TRAINING_DAYS = 120
     MIN_METADATA_BYTES = 800
     MIN_FEATURE_COUNT = 10
-
     MIN_DATASET_ROWS = 500
     MIN_HASH_LENGTH = 64
 
@@ -57,6 +56,18 @@ class MetadataManager:
     }
 
     #####################################################
+    # SAFE CANONICAL JSON
+    #####################################################
+
+    @staticmethod
+    def _canonical_json(data: dict) -> bytes:
+        return json.dumps(
+            data,
+            sort_keys=True,
+            separators=(",", ":")
+        ).encode()
+
+    #####################################################
     # FILE HASH
     #####################################################
 
@@ -78,148 +89,7 @@ class MetadataManager:
         return hasher.hexdigest()
 
     #####################################################
-    # ATOMIC SAVE
-    #####################################################
-
-    @staticmethod
-    def save_metadata(metadata: dict, path: str):
-
-        directory = os.path.dirname(path) or "."
-        os.makedirs(directory, exist_ok=True)
-
-        tmp = path + ".tmp"
-
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-
-        os.replace(tmp, path)
-
-    #####################################################
-
-    @staticmethod
-    def load_metadata(path: str) -> dict:
-
-        if os.path.islink(path):
-            raise RuntimeError("Symlinked metadata detected.")
-
-        if not os.path.exists(path):
-            raise RuntimeError(f"Metadata missing: {path}")
-
-        if os.path.getsize(path) < MetadataManager.MIN_METADATA_BYTES:
-            raise RuntimeError("Metadata file suspiciously small.")
-
-        with open(path, encoding="utf-8") as f:
-            metadata = json.load(f)
-
-        missing = [
-            k for k in MetadataManager.REQUIRED_METADATA_FIELDS
-            if k not in metadata
-        ]
-
-        if missing:
-            raise RuntimeError(
-                f"Metadata missing required fields: {missing}"
-            )
-
-        if metadata["metadata_version"] != MetadataManager.METADATA_VERSION:
-            raise RuntimeError("Metadata version mismatch.")
-
-        expected = metadata.get("metadata_integrity_hash")
-        actual = MetadataManager._compute_metadata_hash(metadata)
-
-        if expected != actual:
-            raise RuntimeError(
-                "Metadata integrity failure — possible tampering."
-            )
-
-        if metadata["schema_signature"] != get_schema_signature():
-            raise RuntimeError("Schema mismatch with runtime.")
-
-        if metadata["schema_version"] != SCHEMA_VERSION:
-            raise RuntimeError("Schema version drift detected.")
-
-        if metadata["features"] != MODEL_FEATURES:
-            raise RuntimeError("Metadata feature contract mismatch.")
-
-        if metadata["feature_count"] != len(MODEL_FEATURES):
-            raise RuntimeError("Feature count mismatch.")
-
-        if metadata["dataset_rows"] < MetadataManager.MIN_DATASET_ROWS:
-            raise RuntimeError("Dataset too small for institutional training.")
-
-        if len(metadata["dataset_hash"]) != MetadataManager.MIN_HASH_LENGTH:
-            raise RuntimeError("Invalid dataset hash length.")
-
-        MetadataManager._validate_training_window(
-            metadata["training_window"]["start"],
-            metadata["training_window"]["end"]
-        )
-
-        MetadataManager._validate_metrics(metadata["metrics"])
-
-        return metadata
-
-    #####################################################
-    # HASH HELPERS
-    #####################################################
-
-    @staticmethod
-    def hash_list(items):
-
-        if not items:
-            raise RuntimeError("Cannot hash empty list.")
-
-        normalized = sorted(str(x) for x in items)
-
-        canonical = json.dumps(
-            normalized,
-            separators=(",", ":")
-        ).encode()
-
-        return hashlib.sha256(canonical).hexdigest()
-
-    #####################################################
-    # FEATURE CONTRACT
-    #####################################################
-
-    @staticmethod
-    def _validate_feature_contract(features, metadata_type):
-
-        frozen = tuple(features)
-
-        if metadata_type != "training_manifest_v1":
-            raise RuntimeError(f"Unknown metadata_type: {metadata_type}")
-
-        if frozen != tuple(MODEL_FEATURES):
-            raise RuntimeError("Tabular feature mismatch — schema drift.")
-
-        if len(frozen) < MetadataManager.MIN_FEATURE_COUNT:
-            raise RuntimeError(
-                "Feature contract below institutional minimum."
-            )
-
-    #####################################################
-    # METRIC VALIDATION
-    #####################################################
-
-    @staticmethod
-    def _validate_metrics(metrics: dict):
-
-        if not isinstance(metrics, dict) or not metrics:
-            raise RuntimeError("Metrics must be non-empty dict.")
-
-        for k, v in metrics.items():
-            val = float(v)
-            if not np.isfinite(val):
-                raise RuntimeError(f"Non-finite metric detected: {k}")
-
-            if abs(val) > 1e6:
-                raise RuntimeError(f"Metric unrealistic: {k}")
-
-    #####################################################
-    # DATASET HASH
+    # DATASET FINGERPRINT
     #####################################################
 
     @staticmethod
@@ -254,7 +124,6 @@ class MetadataManager:
             )
 
         arr = pd.util.hash_pandas_object(df, index=True).values
-
         return hashlib.sha256(arr.tobytes()).hexdigest()
 
     #####################################################
@@ -309,34 +178,38 @@ class MetadataManager:
         return hasher.hexdigest()
 
     #####################################################
-
-    @staticmethod
-    def capture_environment():
-
-        return {
-            "python": platform.python_version(),
-            "platform": platform.platform(),
-            "machine": platform.machine(),
-            "numpy": np.__version__,
-            "pandas": pd.__version__,
-        }
-
+    # FEATURE CHECKSUM
     #####################################################
 
     @staticmethod
-    def _compute_metadata_hash(metadata: dict):
-
-        clone = dict(metadata)
-        clone.pop("metadata_integrity_hash", None)
+    def fingerprint_features(features: tuple) -> str:
 
         canonical = json.dumps(
-            clone,
-            sort_keys=True,
-            separators=(",", ":")
+            list(features),
+            sort_keys=False
         ).encode()
 
         return hashlib.sha256(canonical).hexdigest()
 
+    #####################################################
+    # METRIC VALIDATION
+    #####################################################
+
+    @staticmethod
+    def _validate_metrics(metrics: dict):
+
+        if not isinstance(metrics, dict) or not metrics:
+            raise RuntimeError("Metrics must be non-empty dict.")
+
+        for k, v in metrics.items():
+            val = float(v)
+            if not np.isfinite(val):
+                raise RuntimeError(f"Non-finite metric detected: {k}")
+            if abs(val) > 1e6:
+                raise RuntimeError(f"Metric unrealistic: {k}")
+
+    #####################################################
+    # TRAINING WINDOW VALIDATION
     #####################################################
 
     @staticmethod
@@ -374,13 +247,10 @@ class MetadataManager:
         if dataset_rows < MetadataManager.MIN_DATASET_ROWS:
             raise RuntimeError("dataset_rows below institutional minimum.")
 
-        MetadataManager._validate_feature_contract(
-            features,
-            metadata_type
-        )
+        if tuple(features) != tuple(MODEL_FEATURES):
+            raise RuntimeError("Feature schema mismatch.")
 
         MetadataManager._validate_metrics(metrics)
-
         MetadataManager._validate_training_window(
             training_start,
             training_end
@@ -415,8 +285,13 @@ class MetadataManager:
             "training_code_hash":
                 MetadataManager.fingerprint_training_code(),
 
-            "environment":
-                MetadataManager.capture_environment(),
+            "environment": {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "machine": platform.machine(),
+                "numpy": np.__version__,
+                "pandas": pd.__version__,
+            },
 
             "training_universe": universe_snapshot,
             "universe_hash": universe_snapshot["universe_hash"]
@@ -431,27 +306,15 @@ class MetadataManager:
 
             if forbidden:
                 raise RuntimeError(
-                    f"extra_fields cannot override immutable keys: {forbidden}"
+                    f"Attempt to override immutable metadata fields: {forbidden}"
                 )
 
-            metadata.update(extra_fields)
+            metadata.update(dict(extra_fields))
 
-        metadata["metadata_integrity_hash"] = (
-            MetadataManager._compute_metadata_hash(metadata)
-        )
+        metadata["metadata_integrity_hash"] = hashlib.sha256(
+            MetadataManager._canonical_json(
+                {k: v for k, v in metadata.items()}
+            )
+        ).hexdigest()
 
         return metadata
-
-    ########################################################
-    # FEATURE CHECKSUM
-    ########################################################
-
-    @staticmethod
-    def fingerprint_features(features: tuple) -> str:
-
-        canonical = json.dumps(
-            list(features),
-            sort_keys=False
-        ).encode()
-
-        return hashlib.sha256(canonical).hexdigest()
