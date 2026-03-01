@@ -34,14 +34,11 @@ async def model_info():
     start_time = time.time()
 
     try:
-
         async with model_semaphore:
-
             result = await asyncio.wait_for(
                 run_in_threadpool(_model_info_sync),
                 timeout=REQUEST_TIMEOUT
             )
-
         return result
 
     except asyncio.TimeoutError:
@@ -59,6 +56,7 @@ async def model_info():
 
 def _model_info_sync():
 
+    start_time = time.time()
     loader = get_shared_model_loader()
 
     return {
@@ -68,7 +66,9 @@ def _model_info_sync():
         "training_code_hash": loader.training_code_hash,
         "artifact_hash": loader.artifact_hash,
         "feature_checksum": loader.feature_checksum,
-        "feature_count": len(MODEL_FEATURES)
+        "feature_count": len(MODEL_FEATURES),
+        "latency_ms": int((time.time() - start_time) * 1000),
+        "timestamp": int(time.time())
     }
 
 
@@ -84,14 +84,11 @@ async def feature_importance():
     start_time = time.time()
 
     try:
-
         async with model_semaphore:
-
             result = await asyncio.wait_for(
                 run_in_threadpool(_feature_importance_sync),
                 timeout=REQUEST_TIMEOUT
             )
-
         return result
 
     except asyncio.TimeoutError:
@@ -109,6 +106,7 @@ async def feature_importance():
 
 def _feature_importance_sync():
 
+    start_time = time.time()
     loader = get_shared_model_loader()
 
     result = loader.get_feature_importance()
@@ -116,8 +114,9 @@ def _feature_importance_sync():
     return {
         "model_version": result["model_version"],
         "feature_checksum": result["feature_checksum"],
-        "importance_checksum": result["importance"]["importance_checksum"],
-        "feature_importance": result["importance"]["feature_importance"]
+        "importance": result["importance"],
+        "latency_ms": int((time.time() - start_time) * 1000),
+        "timestamp": int(time.time())
     }
 
 
@@ -133,14 +132,11 @@ async def model_diagnostics() -> Dict[str, Any]:
     start_time = time.time()
 
     try:
-
         async with model_semaphore:
-
             result = await asyncio.wait_for(
                 run_in_threadpool(_model_diagnostics_sync),
                 timeout=REQUEST_TIMEOUT
             )
-
         return result
 
     except asyncio.TimeoutError:
@@ -158,6 +154,7 @@ async def model_diagnostics() -> Dict[str, Any]:
 
 def _model_diagnostics_sync():
 
+    start_time = time.time()
     loader = get_shared_model_loader()
     model = loader.xgb
 
@@ -169,8 +166,14 @@ def _model_diagnostics_sync():
         "training_code_hash": loader.training_code_hash,
         "feature_checksum": loader.feature_checksum,
         "feature_count": len(MODEL_FEATURES),
-        "training_rows": getattr(model, "training_rows", None),
+
+        # Model internals (institutional governance)
+        "training_fingerprint": getattr(model, "training_fingerprint", None),
         "training_cols": getattr(model, "training_cols", None),
         "param_checksum": getattr(model, "param_checksum", None),
-        "training_checksum": getattr(model, "training_checksum", None),
+        "booster_checksum": getattr(model, "booster_checksum", None),
+        "best_iteration": getattr(model, "best_iteration", None),
+
+        "latency_ms": int((time.time() - start_time) * 1000),
+        "timestamp": int(time.time())
     }
