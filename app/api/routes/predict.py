@@ -117,10 +117,7 @@ async def live_snapshot():
 
         async with inference_semaphore:
             snapshot = await asyncio.wait_for(
-                run_in_threadpool(
-                    pipeline.run_snapshot,
-                    tickers
-                ),
+                run_in_threadpool(pipeline.run_snapshot, tickers),
                 timeout=REQUEST_TIMEOUT
             )
 
@@ -129,8 +126,12 @@ async def live_snapshot():
 
         signals = snapshot["signals"]
 
-        long_count = sum(1 for s in signals if s["score"] > 0)
-        short_count = sum(1 for s in signals if s["score"] < 0)
+        if not signals:
+            raise RuntimeError("No signals generated.")
+
+        # Count signals
+        long_count = sum(1 for s in signals if s.get("weight", 0.0) > 0)
+        short_count = sum(1 for s in signals if s.get("weight", 0.0) < 0)
 
         strength_scores = [
             s.get("agent", {}).get("strength_score", 0.0)
@@ -200,19 +201,24 @@ async def signal_explanation(ticker: str):
         universe_tickers = load_default_universe()
 
         if ticker not in universe_tickers:
-            raise HTTPException(status_code=404, detail="Ticker not in production universe.")
+            raise HTTPException(
+                status_code=404,
+                detail="Ticker not in production universe."
+            )
 
         async with inference_semaphore:
             snapshot = await asyncio.wait_for(
-                run_in_threadpool(
-                    pipeline.run_snapshot,
-                    universe_tickers
-                ),
+                run_in_threadpool(pipeline.run_snapshot, universe_tickers),
                 timeout=REQUEST_TIMEOUT
             )
 
+        if not snapshot or "signals" not in snapshot:
+            raise HTTPException(status_code=500, detail="Invalid snapshot.")
+
+        signals = snapshot["signals"]
+
         row = next(
-            (s for s in snapshot["signals"] if s["ticker"] == ticker),
+            (s for s in signals if s["ticker"] == ticker),
             None
         )
 
@@ -220,7 +226,11 @@ async def signal_explanation(ticker: str):
             raise HTTPException(status_code=404, detail="Signal not found.")
 
         agent_data = row.get("agent", {})
-        direction = "LONG" if row["score"] > 0 else "SHORT"
+
+        # Use pipeline signal if present
+        direction = row.get("signal")
+        if not direction:
+            direction = "LONG" if row.get("score", 0) > 0 else "SHORT"
 
         explanation = SignalExplanationResponse(
             ticker=row["ticker"],
