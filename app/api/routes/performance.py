@@ -111,6 +111,7 @@ def _compute_performance_sync(days: int):
     cleaned_history = {}
 
     for ticker, df in price_history.items():
+
         if df is None or len(df) < MIN_HISTORY_ROWS:
             continue
 
@@ -128,7 +129,7 @@ def _compute_performance_sync(days: int):
         raise RuntimeError("No valid price data available.")
 
     # =========================================================
-    # BUILD FEATURES (UPDATED — NO feature_store)
+    # BUILD FEATURES (aligned with pipeline)
     # =========================================================
 
     feature_frames = []
@@ -171,7 +172,7 @@ def _compute_performance_sync(days: int):
 
         daily_slice = full_df[full_df["date"] == eval_date].copy()
 
-        if daily_slice["ticker"].nunique() < 5:
+        if daily_slice["ticker"].nunique() < pipeline.MIN_UNIVERSE_WIDTH:
             continue
 
         feature_df = validate_feature_schema(
@@ -187,6 +188,10 @@ def _compute_performance_sync(days: int):
         scores = (scores - scores.mean()) / (scores.std() + 1e-12)
         daily_slice["score"] = scores
 
+        # 🔥 apply drift scaling for consistency
+        drift_result = pipeline._safe_drift(feature_df)
+        exposure_scale = drift_result.get("exposure_scale", 1.0)
+
         ranked = daily_slice.sort_values("score")
 
         longs = ranked.tail(pipeline.TOP_K)
@@ -198,10 +203,11 @@ def _compute_performance_sync(days: int):
         weights = pipeline._construct_portfolio(longs, shorts)
 
         for _, row in daily_slice.iterrows():
+            base_weight = weights.get(row["ticker"], 0.0)
             portfolio_records.append({
                 "date": row["date"],
                 "ticker": row["ticker"],
-                "weight": float(weights.get(row["ticker"], 0.0))
+                "weight": float(base_weight * exposure_scale)
             })
 
     if not portfolio_records:
