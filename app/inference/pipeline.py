@@ -52,24 +52,24 @@ def get_shared_model_loader():
 
 
 # =========================================================
-# INFERENCE PIPELINE (INSTITUTIONAL HYBRID)
+# INFERENCE PIPELINE (HYBRID MULTI-AGENT)
 # =========================================================
 
 class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
     MIN_UNIVERSE_WIDTH = 15
+    MIN_SCORE_STD = 1e-6
+    EPSILON = 1e-9
+    WEIGHT_TOLERANCE = 1e-6
 
     TOP_K = 10
     BOTTOM_K = 10
     TOP_SELECTION = 5
 
-    MIN_SCORE_STD = 1e-6
-    EPSILON = 1e-9
-    WEIGHT_TOLERANCE = 1e-6
-
     SCORE_WINSOR_Q = 0.02
     MIN_LIQUIDITY = 1e6
+    MAX_POSITION_WEIGHT = 0.20
 
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
     CROSS_SECTIONAL_WINDOW_DAYS = int(os.getenv("CS_WINDOW_DAYS", "30"))
@@ -80,7 +80,7 @@ class InferencePipeline:
         self.models = get_shared_model_loader()
         self.cache = RedisCache()
         self.drift_detector = DriftDetector()
-        self.agent = SignalAgent()
+        self.signal_agent = SignalAgent()
 
         self._validate_models_loaded()
 
@@ -106,12 +106,11 @@ class InferencePipeline:
         return e / (np.sum(e) + self.EPSILON)
 
     # =========================================================
-    # AGENTS
+    # AGENTS (Formalized)
     # =========================================================
 
     def _risk_agent(self, drift_result):
-        exposure_scale = drift_result.get("exposure_scale", 1.0)
-        return float(np.clip(exposure_scale, 0.0, 1.0))
+        return float(np.clip(drift_result.get("exposure_scale", 1.0), 0.0, 1.0))
 
     def _macro_agent(self, df):
         breadth = df["breadth"].iloc[0]
@@ -125,13 +124,16 @@ class InferencePipeline:
         rsi = row.get("rsi", 50)
         momentum = row.get("momentum_composite", 0)
 
+        adjustment = 1.0
         if rsi > 70:
-            return 0.85
-        if rsi < 30:
-            return 1.1
+            adjustment *= 0.85
+        elif rsi < 30:
+            adjustment *= 1.1
+
         if momentum > 0:
-            return 1.05
-        return 1.0
+            adjustment *= 1.05
+
+        return float(adjustment)
 
     # =========================================================
 
@@ -149,6 +151,7 @@ class InferencePipeline:
             df = self._build_cross_sectional_frame(universe)
 
             latest_df = self._select_latest_snapshot(df)
+
             latest_df = latest_df[
                 latest_df["dollar_volume"] > self.MIN_LIQUIDITY
             ].copy()
@@ -166,60 +169,88 @@ class InferencePipeline:
             raw_scores = self.models.xgb.predict(feature_df)
 
             if np.std(raw_scores) < self.MIN_SCORE_STD:
-                raw_scores = np.zeros(len(raw_scores))
+                raise RuntimeError("Score dispersion too low.")
 
-            alpha_scores = self._winsorize(raw_scores)
-            alpha_scores = (
-                alpha_scores - alpha_scores.mean()
-            ) / (alpha_scores.std() + self.EPSILON)
+            raw_scores = self._winsorize(raw_scores)
+            raw_scores = (
+                raw_scores - raw_scores.mean()
+            ) / (raw_scores.std() + self.EPSILON)
 
-            latest_df["alpha_score"] = alpha_scores
+            latest_df["raw_model_score"] = raw_scores
 
-            # -----------------------------
-            # Hybrid Overlay
-            # -----------------------------
+            # -----------------------------------
+            # MULTI-AGENT AGGREGATION
+            # -----------------------------------
 
             risk_mult = self._risk_agent(drift_result)
             macro_mult = self._macro_agent(latest_df)
 
             final_scores = []
+            score_components = []
 
             for _, row in latest_df.iterrows():
+
                 tech_mult = self._technical_agent(row)
 
                 final_score = (
-                    row["alpha_score"]
+                    row["raw_model_score"]
                     * macro_mult
                     * tech_mult
                 )
 
                 final_scores.append(final_score)
 
+                score_components.append({
+                    "raw_model": float(row["raw_model_score"]),
+                    "macro_adj": float(macro_mult),
+                    "technical_adj": float(tech_mult),
+                    "risk_adj": float(risk_mult)
+                })
+
             latest_df["score"] = np.array(final_scores)
 
-            # Score statistics for API
             score_mean = float(latest_df["score"].mean())
             score_std = float(latest_df["score"].std())
 
-            ranked = latest_df.sort_values("score")
+            ranked = latest_df.sort_values(
+                ["score", "dollar_volume"],
+                ascending=[True, False]
+            )
 
             longs = ranked.tail(self.TOP_K)
             shorts = ranked.head(self.BOTTOM_K)
 
             weights = self._construct_portfolio(longs, shorts)
 
-            # Apply risk scaling to final weights
+            # Risk scaling
             for k in weights:
                 weights[k] *= risk_mult
 
-            snapshot_rows = self._build_snapshot(
-                latest_df,
-                weights,
-                macro_mult,
-                risk_mult,
-                score_mean,
-                score_std
-            )
+            snapshot_rows = []
+
+            for idx, (_, row) in enumerate(latest_df.iterrows()):
+
+                direction = "LONG" if row["score"] > 0 else "SHORT"
+
+                agent_output = self.signal_agent.analyze(
+                    row={**row.to_dict(), "signal": direction},
+                    probability_stats={
+                        "mean": score_mean,
+                        "std": score_std
+                    }
+                )
+
+                snapshot_rows.append({
+                    "date": row["date"],
+                    "ticker": row["ticker"],
+                    "raw_model_score": float(row["raw_model_score"]),
+                    "score": float(row["score"]),
+                    "weight": float(weights.get(row["ticker"], 0.0)),
+                    "macro_multiplier": float(macro_mult),
+                    "risk_multiplier": float(risk_mult),
+                    "score_components": score_components[idx],
+                    "agent": agent_output
+                })
 
             top_5 = sorted(
                 snapshot_rows,
@@ -266,45 +297,6 @@ class InferencePipeline:
                 "severity_score": 0,
                 "exposure_scale": 1.0
             }
-
-    # =========================================================
-
-    def _build_snapshot(
-        self,
-        df,
-        weights,
-        macro_mult,
-        risk_mult,
-        score_mean,
-        score_std
-    ):
-
-        snapshot_rows = []
-
-        for _, row in df.iterrows():
-
-            direction = "LONG" if row["score"] > 0 else "SHORT"
-
-            agent_output = self.agent.analyze(
-                row={**row.to_dict(), "signal": direction},
-                probability_stats={
-                    "mean": score_mean,
-                    "std": score_std
-                }
-            )
-
-            snapshot_rows.append({
-                "date": row["date"],
-                "ticker": row["ticker"],
-                "alpha_score": float(row["alpha_score"]),
-                "score": float(row["score"]),
-                "weight": float(weights.get(row["ticker"], 0.0)),
-                "macro_multiplier": float(macro_mult),
-                "risk_multiplier": float(risk_mult),
-                "agent": agent_output
-            })
-
-        return snapshot_rows
 
     # =========================================================
 
@@ -375,10 +367,10 @@ class InferencePipeline:
         weights = {}
 
         for t, w in zip(longs["ticker"], long_w):
-            weights[t] = float(w)
+            weights[t] = min(float(w), self.MAX_POSITION_WEIGHT)
 
         for t, w in zip(shorts["ticker"], short_w):
-            weights[t] = -float(w)
+            weights[t] = -min(float(w), self.MAX_POSITION_WEIGHT)
 
         gross = sum(abs(v) for v in weights.values())
 
