@@ -18,14 +18,13 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "16.1"
+    METADATA_VERSION = "16.2"
+
     MIN_TRAINING_DAYS = 120
     MIN_METADATA_BYTES = 800
     MIN_FEATURE_COUNT = 10
     MIN_DATASET_ROWS = 500
     MIN_HASH_LENGTH = 64
-
-    STRICT_MODE = True  # CV-level governance (safe but not crazy)
 
     REQUIRED_METADATA_FIELDS = [
         "metadata_type",
@@ -132,6 +131,99 @@ class MetadataManager:
         return hashlib.sha256(arr.tobytes()).hexdigest()
 
     # =====================================================
+    # FEATURE CHECKSUM
+    # =====================================================
+
+    @staticmethod
+    def fingerprint_features(features: tuple) -> str:
+
+        if tuple(features) != tuple(MODEL_FEATURES):
+            raise RuntimeError("Feature list mismatch during checksum.")
+
+        canonical = json.dumps(
+            list(features),
+            sort_keys=False
+        ).encode()
+
+        return hashlib.sha256(canonical).hexdigest()
+
+    # =====================================================
+    # TRAINING CODE FINGERPRINT
+    # =====================================================
+
+    @staticmethod
+    def fingerprint_training_code():
+
+        hasher = hashlib.sha256()
+
+        CRITICAL_DIRS = [
+            "training",
+            "core/models",
+            "core/features",
+            "core/schema",
+        ]
+
+        for root in sorted(CRITICAL_DIRS):
+
+            if not os.path.exists(root):
+                continue
+
+            for path, dirs, files in os.walk(root):
+
+                dirs.sort()
+                files = sorted(f for f in files if f.endswith(".py"))
+
+                for f in files:
+                    full = os.path.join(path, f)
+
+                    if os.path.islink(full):
+                        raise RuntimeError(
+                            f"Symlink detected in training code: {full}"
+                        )
+
+                    rel = os.path.relpath(full)
+                    hasher.update(rel.encode())
+
+                    with open(full, "rb") as fh:
+                        hasher.update(fh.read())
+
+        hasher.update(get_schema_signature().encode())
+        hasher.update(platform.python_version().encode())
+
+        return hasher.hexdigest()
+
+    # =====================================================
+    # SAVE METADATA (ATOMIC WRITE)
+    # =====================================================
+
+    @staticmethod
+    def save_metadata(metadata: dict, path: str):
+
+        if os.path.islink(path):
+            raise RuntimeError("Refusing to write metadata to symlink.")
+
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            delete=False,
+            dir=directory,
+            suffix=".tmp",
+            encoding="utf-8"
+        ) as tmp:
+
+            json.dump(metadata, tmp, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            temp_name = tmp.name
+
+        os.replace(temp_name, path)
+
+        if os.path.getsize(path) < MetadataManager.MIN_METADATA_BYTES:
+            raise RuntimeError("Metadata file below minimum size.")
+
+    # =====================================================
     # LOAD + VERIFY
     # =====================================================
 
@@ -158,7 +250,6 @@ class MetadataManager:
     @staticmethod
     def verify_metadata_integrity(metadata: dict):
 
-        # Required field check
         for field in MetadataManager.REQUIRED_METADATA_FIELDS:
             if field not in metadata:
                 raise RuntimeError(f"Missing required metadata field: {field}")
