@@ -5,6 +5,7 @@ import re
 import sys
 import uuid
 from typing import Optional
+from collections import OrderedDict
 
 import pandas as pd
 import numpy as np
@@ -22,12 +23,12 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v23"  # bumped due to sanitization alignment
+    CACHE_VERSION = "v24"  # bumped for LRU + stability
     MAX_CACHE_FILES_PER_TICKER = 6
     MAX_TOTAL_CACHE_FILES = 2000
     MIN_FILE_BYTES = 5_000
 
-    _memory_cache = {}
+    _memory_cache = OrderedDict()
     _memory_cache_limit = 100
 
     ########################################################
@@ -47,7 +48,7 @@ class FeatureStore:
 
     def _validate_basic_integrity(self, df: pd.DataFrame):
 
-        if "date" not in df.columns or "ticker" not in df.columns:
+        if not {"date", "ticker"}.issubset(df.columns):
             raise RuntimeError("Feature dataset missing core columns.")
 
         if df.duplicated(subset=["ticker", "date"]).any():
@@ -160,14 +161,16 @@ class FeatureStore:
         self._cleanup_global_cache()
 
     ########################################################
-    # MEMORY CACHE
+    # MEMORY CACHE (True LRU)
     ########################################################
 
     def _set_memory_cache(self, key, df):
 
-        if len(self._memory_cache) >= self._memory_cache_limit:
-            oldest = next(iter(self._memory_cache))
-            self._memory_cache.pop(oldest, None)
+        if key in self._memory_cache:
+            self._memory_cache.move_to_end(key)
+        else:
+            if len(self._memory_cache) >= self._memory_cache_limit:
+                self._memory_cache.popitem(last=False)
 
         self._memory_cache[key] = df
 
@@ -211,6 +214,7 @@ class FeatureStore:
         ####################################################
 
         if cache_key in self._memory_cache:
+            self._memory_cache.move_to_end(cache_key)
             return self._memory_cache[cache_key]
 
         path = os.path.join(
@@ -244,14 +248,11 @@ class FeatureStore:
         df = self.engineer._validate_price_frame(price_df, ticker)
         df = self.engineer.add_core_features(df)
 
-        # Consistent sanitization
+        # Robust sanitization (yfinance tolerant)
         df = df.replace([np.inf, -np.inf], np.nan)
 
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         df[numeric_cols] = df[numeric_cols].fillna(0.0)
-
-        if not np.isfinite(df[numeric_cols].to_numpy()).all():
-            raise RuntimeError("Non-finite values remain after sanitization.")
 
         df = df.sort_values(
             ["date", "ticker"]
@@ -260,17 +261,20 @@ class FeatureStore:
         self._validate_basic_integrity(df)
 
         ####################################################
-        # ATOMIC WRITE
+        # ATOMIC WRITE (Safe Parquet Fallback)
         ####################################################
 
         tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
 
-        df.to_parquet(
-            tmp_path,
-            index=False,
-            engine="pyarrow",
-            compression="zstd"
-        )
+        try:
+            df.to_parquet(
+                tmp_path,
+                index=False,
+                engine="pyarrow",
+                compression="zstd"
+            )
+        except Exception:
+            df.to_parquet(tmp_path, index=False)
 
         os.replace(tmp_path, path)
 
