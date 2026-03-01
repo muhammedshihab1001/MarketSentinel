@@ -24,7 +24,6 @@ from core.schema.feature_schema import (
     validate_feature_schema,
     get_schema_signature,
     SCHEMA_VERSION,
-    schema_snapshot
 )
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
@@ -94,12 +93,13 @@ def compute_reproducibility_hash(dataset_hash):
 
 
 # ==========================================================
-# ARTIFACT EXPORT
+# ARTIFACT EXPORT (UPDATED TO USE METADATAMANAGER)
 # ==========================================================
 
 def export_artifacts(model,
                      metrics,
                      dataset_hash,
+                     dataset_rows,
                      start_date,
                      end_date,
                      promote_baseline=False):
@@ -112,32 +112,35 @@ def export_artifacts(model,
     model_path = os.path.join(MODEL_DIR, f"model_{version}.pkl")
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{version}.json")
 
+    # Save model
     joblib.dump(model, model_path)
+
+    # Compute artifact hash
     artifact_hash = sha256_file(model_path)
 
-    metadata = {
-        "model_version": version,
-        "created_at": timestamp,
-        "start_date": str(start_date),
-        "end_date": str(end_date),
-        "schema_version": SCHEMA_VERSION,
-        "schema_signature": get_schema_signature(),
-        "features": list(MODEL_FEATURES),
-        "dataset_hash": dataset_hash,
-        "artifact_hash": artifact_hash,
-        "feature_checksum": compute_feature_checksum(),
-        "training_code_hash": compute_training_code_hash(),
-        "universe_hash": MarketUniverse.fingerprint(),
-        "reproducibility_hash": compute_reproducibility_hash(dataset_hash),
-        "metrics": metrics,
-        "schema_snapshot": schema_snapshot()
-    }
+    # Build metadata using institutional manager
+    metadata = MetadataManager.create_metadata(
+        model_name="xgboost_regressor",
+        metrics=metrics,
+        features=MODEL_FEATURES,
+        training_start=str(start_date),
+        training_end=str(end_date),
+        dataset_hash=dataset_hash,
+        dataset_rows=dataset_rows,
+        metadata_type="xgboost_model",
+        artifact_hash=artifact_hash,
+        feature_checksum=compute_feature_checksum(),
+        extra_fields={
+            "model_version": version,
+            "reproducibility_hash": compute_reproducibility_hash(dataset_hash),
+        }
+    )
 
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
+    MetadataManager.save_metadata(metadata, metadata_path)
 
     logger.info("Artifacts saved | version=%s", version)
 
+    # Promote to production
     if promote_baseline:
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
         pointer_data = {
@@ -208,7 +211,7 @@ def load_training_data(start_date, end_date):
 
 
 # ==========================================================
-# TARGET
+# TARGET BUILDING
 # ==========================================================
 
 def build_target(df: pd.DataFrame):
@@ -272,7 +275,6 @@ def trainer(train_df):
 
 def main(start_date=None,
          end_date=None,
-         create_baseline=False,
          promote_baseline=False,
          allow_soft_fail=False):
 
@@ -296,20 +298,21 @@ def main(start_date=None,
 
         final_df = build_target(raw_df)
         dataset_hash = compute_dataset_hash(final_df)
+
         final_model = trainer(raw_df)
 
         export_artifacts(
             final_model,
             metrics,
             dataset_hash,
-            start_date,
-            end_date,
+            dataset_rows=len(final_df),
+            start_date=start_date,
+            end_date=end_date,
             promote_baseline=promote_baseline
         )
 
         logger.info("Training completed successfully.")
-
-        return metrics   # 🔥 IMPORTANT FIX
+        return metrics
 
     except Exception as e:
         if allow_soft_fail:
