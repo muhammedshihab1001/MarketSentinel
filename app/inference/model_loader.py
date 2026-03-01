@@ -33,6 +33,7 @@ class LoadedModel:
     artifact_hash: str
     feature_checksum: str
     pointer_hash: Optional[str]
+    training_fingerprint: Optional[str]
 
 
 # =========================================================
@@ -186,7 +187,8 @@ class ModelLoader:
             # BASIC GOVERNANCE CHECKS (CV MODE)
             # =====================================================
 
-            if meta.get("artifact_hash") != self._sha256(model_path):
+            actual_hash = self._sha256(model_path)
+            if meta.get("artifact_hash") != actual_hash:
                 raise RuntimeError("Artifact tampering detected.")
 
             if meta.get("schema_signature") != get_schema_signature():
@@ -210,6 +212,12 @@ class ModelLoader:
 
             model = self._safe_load_model(model_path)
 
+            training_fingerprint = getattr(
+                model,
+                "training_fingerprint",
+                None
+            )
+
             new_container = LoadedModel(
                 model=model,
                 version=version,
@@ -218,6 +226,7 @@ class ModelLoader:
                 artifact_hash=meta.get("artifact_hash"),
                 feature_checksum=meta.get("feature_checksum"),
                 pointer_hash=pointer_hash,
+                training_fingerprint=training_fingerprint
             )
 
             self._xgb_container = new_container
@@ -257,6 +266,16 @@ class ModelLoader:
     def feature_checksum(self):
         self._reload_xgb_if_needed()
         return self._xgb_container.feature_checksum
+
+    @property
+    def dataset_hash(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.dataset_hash
+
+    @property
+    def training_fingerprint(self):
+        self._reload_xgb_if_needed()
+        return self._xgb_container.training_fingerprint
 
     ########################################################
     # FEATURE IMPORTANCE
