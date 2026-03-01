@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v2.1 (CV-Stable Edition)
+# INSTITUTIONAL INFERENCE PIPELINE v2.2 (CV-Stable + Multi-Agent Ready)
 # Governance Hardened + Risk Adaptive + Yahoo-Safe
 # =========================================================
 
@@ -42,10 +42,6 @@ _SHARED_MODEL_LOADER = None
 _MODEL_LOCK = threading.Lock()
 
 
-# =========================================================
-# SHARED MODEL LOADER
-# =========================================================
-
 def get_shared_model_loader():
     global _SHARED_MODEL_LOADER
     if _SHARED_MODEL_LOADER is None:
@@ -57,15 +53,11 @@ def get_shared_model_loader():
     return _SHARED_MODEL_LOADER
 
 
-# =========================================================
-# INFERENCE PIPELINE
-# =========================================================
-
 class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
     TARGET_VOL = 0.12
-    MIN_UNIVERSE_WIDTH = 12  # slightly relaxed for Yahoo data
+    MIN_UNIVERSE_WIDTH = 12
     MIN_SCORE_STD = 1e-6
     MAX_POSITION_WEIGHT = 0.20
 
@@ -89,16 +81,14 @@ class InferencePipeline:
 
         self._validate_models_loaded()
 
-    # =========================================================
+    # ---------------------------------------------------------
 
     def _validate_models_loaded(self):
         if self.models.schema_signature != get_schema_signature():
             raise RuntimeError("Schema signature mismatch.")
         logger.info("Model verified | version=%s", self.models.xgb_version)
 
-    # =========================================================
-    # NUMERIC UTILITIES
-    # =========================================================
+    # ---------------------------------------------------------
 
     def _winsorize(self, x):
         lower = np.quantile(x, self.SCORE_WINSOR_Q)
@@ -110,9 +100,9 @@ class InferencePipeline:
         e = np.exp(x)
         return e / (np.sum(e) + EPSILON)
 
-    # =========================================================
-    # AGENT MULTIPLIERS
-    # =========================================================
+    # ---------------------------------------------------------
+    # AGENTS
+    # ---------------------------------------------------------
 
     def _risk_agent(self, drift_result):
         return float(np.clip(drift_result.get("exposure_scale", 1.0), 0.0, 1.0))
@@ -156,9 +146,9 @@ class InferencePipeline:
 
         return adj
 
-    # =========================================================
+    # ---------------------------------------------------------
     # MAIN SNAPSHOT
-    # =========================================================
+    # ---------------------------------------------------------
 
     def run_snapshot(self, tickers: List[str]):
 
@@ -174,14 +164,12 @@ class InferencePipeline:
             df = self._build_cross_sectional_frame(universe)
             latest_df = self._select_latest_snapshot(df)
 
-            # Remove any residual NaNs
             latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
             latest_df = latest_df.dropna(subset=MODEL_FEATURES)
 
             if latest_df.empty:
                 raise RuntimeError("Latest snapshot invalid.")
 
-            # Liquidity filter (Yahoo-friendly)
             liquidity_threshold = max(
                 self.BASE_LIQUIDITY * 0.5,
                 latest_df["dollar_volume"].median()
@@ -200,7 +188,6 @@ class InferencePipeline:
             ).astype(DTYPE)
 
             drift_result = self._safe_drift(feature_df)
-
             raw_scores = self.models.xgb.predict(feature_df)
 
             if np.std(raw_scores) < self.MIN_SCORE_STD:
@@ -213,13 +200,9 @@ class InferencePipeline:
 
             latest_df["raw_model_score"] = raw_scores
 
-            risk_mult = self._risk_agent(drift_result)
-            macro_mult = self._macro_agent(latest_df)
-
+            # Apply technical adjustment only to ranking
             latest_df["score"] = latest_df.apply(
-                lambda r: r["raw_model_score"]
-                * macro_mult
-                * self._technical_agent(r),
+                lambda r: r["raw_model_score"] * self._technical_agent(r),
                 axis=1
             )
 
@@ -228,40 +211,20 @@ class InferencePipeline:
                 ascending=[True, False, True]
             )
 
-            longs = ranked.tail(self.TOP_K)
-            shorts = ranked.head(self.BOTTOM_K)
+            longs = ranked.tail(self.TOP_K).copy()
+            shorts = ranked.head(self.BOTTOM_K).copy()
 
             weights = self._construct_portfolio(longs, shorts)
 
-            # Apply risk scaling
-            for k in weights:
-                weights[k] *= risk_mult
-
-            # Vol targeting using both sides
-            combined_vol = pd.concat([
-                longs["volatility"],
-                shorts["volatility"]
-            ]).mean()
-
-            if combined_vol > EPSILON:
-                vol_scale = min(1.5, self.TARGET_VOL / combined_vol)
-                for k in weights:
-                    weights[k] *= vol_scale
-
-            # Normalize exposure
-            gross = sum(abs(v) for v in weights.values())
-            if gross > EPSILON:
-                scale = self.TARGET_GROSS_EXPOSURE / gross
-                for k in weights:
-                    weights[k] *= scale
-
-            snapshot_rows = []
+            # Agent approval BEFORE scaling
+            approved_weights = {}
             score_mean = float(latest_df["score"].mean())
             score_std = float(latest_df["score"].std())
 
-            for _, row in latest_df.iterrows():
+            for ticker, weight in weights.items():
 
-                direction = "LONG" if row["score"] > 0 else "SHORT"
+                row = latest_df[latest_df["ticker"] == ticker].iloc[0]
+                direction = "LONG" if weight > 0 else "SHORT"
 
                 agent_output = self.signal_agent.analyze(
                     row={**row.to_dict(), "signal": direction},
@@ -269,17 +232,50 @@ class InferencePipeline:
                     drift_score=drift_result.get("severity_score", 0)
                 )
 
-                approved = agent_output.get("trade_approved", True)
+                if agent_output.get("trade_approved", True):
+                    approved_weights[ticker] = weight
+                else:
+                    approved_weights[ticker] = 0.0
+
+            # Risk + Macro scale exposure
+            risk_mult = self._risk_agent(drift_result)
+            macro_mult = self._macro_agent(latest_df)
+
+            for k in approved_weights:
+                approved_weights[k] *= risk_mult * macro_mult
+
+            # Vol targeting
+            combined_vol = pd.concat([
+                longs["volatility"],
+                shorts["volatility"]
+            ]).mean()
+
+            if combined_vol > EPSILON:
+                vol_scale = min(1.5, self.TARGET_VOL / combined_vol)
+                for k in approved_weights:
+                    approved_weights[k] *= vol_scale
+
+            # Normalize exposure
+            gross = sum(abs(v) for v in approved_weights.values())
+            if gross > EPSILON:
+                scale = self.TARGET_GROSS_EXPOSURE / gross
+                for k in approved_weights:
+                    approved_weights[k] *= scale
+
+            snapshot_rows = []
+
+            for _, row in latest_df.iterrows():
+
+                weight = approved_weights.get(row["ticker"], 0.0)
 
                 snapshot_rows.append({
                     "date": str(row["date"]),
                     "ticker": row["ticker"],
                     "raw_model_score": float(row["raw_model_score"]),
                     "score": float(row["score"]),
-                    "weight": float(weights.get(row["ticker"], 0.0)) if approved else 0.0,
+                    "weight": float(weight),
                     "macro_multiplier": float(macro_mult),
                     "risk_multiplier": float(risk_mult),
-                    "agent": agent_output
                 })
 
             result = {
@@ -311,7 +307,7 @@ class InferencePipeline:
         finally:
             INFERENCE_IN_PROGRESS.dec()
 
-    # =========================================================
+    # ---------------------------------------------------------
 
     def _safe_drift(self, feature_df):
         try:
@@ -328,7 +324,7 @@ class InferencePipeline:
         latest_date = df["date"].max()
         return df[df["date"] == latest_date].reset_index(drop=True)
 
-    # =========================================================
+    # ---------------------------------------------------------
 
     def _build_cross_sectional_frame(self, tickers):
 
@@ -373,9 +369,7 @@ class InferencePipeline:
 
         return df[df["date"] >= cutoff].copy()
 
-    # =========================================================
-    # PORTFOLIO CONSTRUCTION
-    # =========================================================
+    # ---------------------------------------------------------
 
     def _construct_portfolio(self, longs, shorts):
 
