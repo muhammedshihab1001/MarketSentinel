@@ -5,6 +5,7 @@ import hashlib
 import pandas as pd
 import platform
 import numpy as np
+import tempfile
 
 from core.schema.feature_schema import (
     get_schema_signature,
@@ -17,7 +18,7 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "14.0"  # upgraded
+    METADATA_VERSION = "15.0"  # upgraded
     MIN_TRAINING_DAYS = 120
     MIN_METADATA_BYTES = 800
     MIN_FEATURE_COUNT = 10
@@ -190,6 +191,83 @@ class MetadataManager:
         ).encode()
 
         return hashlib.sha256(canonical).hexdigest()
+
+    #####################################################
+    # METADATA SAVE (NEW - ATOMIC & SAFE)
+    #####################################################
+
+    @staticmethod
+    def save_metadata(metadata: dict, path: str):
+
+        if os.path.islink(path):
+            raise RuntimeError("Refusing to write metadata to symlink.")
+
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            delete=False,
+            dir=directory,
+            suffix=".tmp",
+            encoding="utf-8"
+        ) as tmp:
+
+            json.dump(metadata, tmp, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            temp_name = tmp.name
+
+        os.replace(temp_name, path)
+
+        if os.path.getsize(path) < MetadataManager.MIN_METADATA_BYTES:
+            raise RuntimeError("Metadata file below minimum size.")
+
+    #####################################################
+    # METADATA LOAD + VERIFY (NEW)
+    #####################################################
+
+    @staticmethod
+    def load_metadata(path: str) -> dict:
+
+        if not os.path.exists(path):
+            raise RuntimeError("Metadata file missing.")
+
+        if os.path.islink(path):
+            raise RuntimeError("Symlink detected in metadata file.")
+
+        with open(path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+
+        MetadataManager.verify_metadata_integrity(metadata)
+
+        return metadata
+
+    #####################################################
+    # INTEGRITY VERIFICATION (NEW)
+    #####################################################
+
+    @staticmethod
+    def verify_metadata_integrity(metadata: dict):
+
+        for field in MetadataManager.REQUIRED_METADATA_FIELDS:
+            if field not in metadata:
+                raise RuntimeError(f"Missing required metadata field: {field}")
+
+        original_hash = metadata.get("metadata_integrity_hash")
+
+        if not original_hash or len(original_hash) < MetadataManager.MIN_HASH_LENGTH:
+            raise RuntimeError("Invalid metadata integrity hash.")
+
+        metadata_copy = dict(metadata)
+        metadata_copy.pop("metadata_integrity_hash")
+
+        recalculated = hashlib.sha256(
+            MetadataManager._canonical_json(metadata_copy)
+        ).hexdigest()
+
+        if recalculated != original_hash:
+            raise RuntimeError("Metadata integrity verification failed.")
 
     #####################################################
     # METRIC VALIDATION
