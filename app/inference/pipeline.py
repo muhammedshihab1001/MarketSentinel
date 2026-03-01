@@ -31,6 +31,8 @@ from app.monitoring.metrics import (
 
 logger = logging.getLogger("marketsentinel.pipeline")
 
+EPSILON = 1e-12
+
 
 _SHARED_MODEL_LOADER = None
 _MODEL_LOCK = threading.Lock()
@@ -52,7 +54,6 @@ class InferencePipeline:
     TARGET_GROSS_EXPOSURE = 1.0
     MIN_UNIVERSE_WIDTH = 15
     MIN_SCORE_STD = 1e-6
-    EPSILON = 1e-9
     WEIGHT_TOLERANCE = 1e-6
 
     TOP_K = 10
@@ -93,7 +94,7 @@ class InferencePipeline:
     def _softmax(self, x):
         x = x - np.max(x)
         e = np.exp(x)
-        return e / (np.sum(e) + self.EPSILON)
+        return e / (np.sum(e) + EPSILON)
 
     # =========================================================
     # AGENTS
@@ -163,7 +164,7 @@ class InferencePipeline:
             raw_scores = self._winsorize(raw_scores)
             raw_scores = (
                 raw_scores - raw_scores.mean()
-            ) / (raw_scores.std() + self.EPSILON)
+            ) / (raw_scores.std() + EPSILON)
 
             latest_df["raw_model_score"] = raw_scores
 
@@ -194,9 +195,6 @@ class InferencePipeline:
 
             latest_df["score"] = np.array(final_scores)
 
-            score_mean = float(latest_df["score"].mean())
-            score_std = float(latest_df["score"].std())
-
             ranked = latest_df.sort_values(
                 ["score", "dollar_volume"],
                 ascending=[True, False]
@@ -204,6 +202,9 @@ class InferencePipeline:
 
             longs = ranked.tail(self.TOP_K)
             shorts = ranked.head(self.BOTTOM_K)
+
+            if longs.empty or shorts.empty:
+                raise RuntimeError("Long/short selection failed.")
 
             weights = self._construct_portfolio(longs, shorts)
 
@@ -215,6 +216,9 @@ class InferencePipeline:
             approved = 0
             rejected = 0
 
+            score_mean = float(latest_df["score"].mean())
+            score_std = float(latest_df["score"].std())
+
             for idx, (_, row) in enumerate(latest_df.iterrows()):
 
                 direction = "LONG" if row["score"] > 0 else "SHORT"
@@ -225,10 +229,11 @@ class InferencePipeline:
                         "mean": score_mean,
                         "std": score_std
                     },
-                    drift_score=drift_result.get("severity_score", 0)
                 )
 
-                if agent_output["trade_approved"]:
+                trade_approved = agent_output.get("trade_approved", True)
+
+                if trade_approved:
                     approved += 1
                 else:
                     rejected += 1
@@ -238,7 +243,7 @@ class InferencePipeline:
                     "ticker": row["ticker"],
                     "raw_model_score": float(row["raw_model_score"]),
                     "score": float(row["score"]),
-                    "weight": float(weights.get(row["ticker"], 0.0)),
+                    "weight": float(weights.get(row["ticker"], 0.0)) if trade_approved else 0.0,
                     "macro_multiplier": float(macro_mult),
                     "risk_multiplier": float(risk_mult),
                     "score_components": score_components[idx],
@@ -345,11 +350,11 @@ class InferencePipeline:
         long_vol = longs["volatility"].clip(lower=0.01).values
         short_vol = shorts["volatility"].clip(lower=0.01).values
 
-        long_w = long_alpha / long_vol
-        short_w = short_alpha / short_vol
+        long_w = long_alpha / (long_vol + EPSILON)
+        short_w = short_alpha / (short_vol + EPSILON)
 
-        long_w /= long_w.sum()
-        short_w /= short_w.sum()
+        long_w /= (long_w.sum() + EPSILON)
+        short_w /= (short_w.sum() + EPSILON)
 
         long_w *= self.TARGET_GROSS_EXPOSURE / 2
         short_w *= self.TARGET_GROSS_EXPOSURE / 2
