@@ -1,92 +1,103 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
+import pytest
 
 from core.indicators.technical_indicators import TechnicalIndicators
 
 
-# ---------------------------------------------------
+############################################################
+# HELPER
+############################################################
+
+def build_df(prices):
+    return pd.DataFrame({
+        "date": pd.date_range("2022-01-01", periods=len(prices)),
+        "close": prices
+    })
+
+
+############################################################
 # BASIC EXECUTION
-# ---------------------------------------------------
+############################################################
 
 def test_rsi_runs_without_crashing():
 
-    df = pd.DataFrame({
-        "Close": np.linspace(100, 120, 50)
-    })
+    df = build_df(np.linspace(100, 120, 100))
 
-    rsi = TechnicalIndicators.rsi(df)
+    rsi = TechnicalIndicators.rsi(df, period=14)
 
     assert len(rsi) == len(df)
 
 
-# ---------------------------------------------------
-# BOUNDS CHECK (VERY IMPORTANT)
-# RSI MUST ALWAYS BE BETWEEN 0–100
-# ---------------------------------------------------
+############################################################
+# BOUNDS CHECK (CRITICAL)
+############################################################
 
 def test_rsi_bounds():
 
-    df = pd.DataFrame({
-        "Close": np.random.uniform(90, 110, 100)
-    })
+    df = build_df(np.random.uniform(90, 110, 200))
 
-    rsi = TechnicalIndicators.rsi(df).dropna()
+    rsi = TechnicalIndicators.rsi(df, period=14).dropna()
 
     assert (rsi >= 0).all()
     assert (rsi <= 100).all()
 
 
-# ---------------------------------------------------
-# MONOTONIC UP MARKET
-# RSI SHOULD BE HIGH
-# ---------------------------------------------------
+############################################################
+# STRONG UPTREND
+############################################################
 
-def test_rsi_uptrend():
+def test_rsi_strong_uptrend():
 
-    df = pd.DataFrame({
-        "Close": np.arange(100, 200)
-    })
+    df = build_df(np.linspace(100, 200, 200))
 
-    rsi = TechnicalIndicators.rsi(df)
+    rsi = TechnicalIndicators.rsi(df, period=14).dropna()
 
-    assert rsi.iloc[-1] > 60
+    assert rsi.iloc[-1] > 70
 
 
-# ---------------------------------------------------
-# MONOTONIC DOWN MARKET
-# RSI SHOULD BE LOW
-# ---------------------------------------------------
+############################################################
+# STRONG DOWNTREND
+############################################################
 
-def test_rsi_downtrend():
+def test_rsi_strong_downtrend():
 
-    df = pd.DataFrame({
-        "Close": np.arange(200, 100, -1)
-    })
+    df = build_df(np.linspace(200, 100, 200))
 
-    rsi = TechnicalIndicators.rsi(df)
+    rsi = TechnicalIndicators.rsi(df, period=14).dropna()
 
-    assert rsi.iloc[-1] < 40
+    assert rsi.iloc[-1] < 30
 
 
-# ---------------------------------------------------
+############################################################
 # FLAT MARKET
-# SHOULD NOT CRASH OR DIVIDE BY ZERO
-# ---------------------------------------------------
+############################################################
 
-def test_rsi_flat_market():
+def test_rsi_flat_market_equals_50():
 
-    df = pd.DataFrame({
-        "Close": [100] * 100
-    })
+    df = build_df([100.0] * 150)
 
-    rsi = TechnicalIndicators.rsi(df)
+    rsi = TechnicalIndicators.rsi(df, period=14).dropna()
+
+    assert np.allclose(rsi.values, 50.0, atol=1e-6)
+
+
+############################################################
+# NAN SAFETY
+############################################################
+
+def test_rsi_no_all_nan():
+
+    df = build_df([100.0] * 50)
+
+    rsi = TechnicalIndicators.rsi(df, period=14)
 
     assert not rsi.isnull().all()
 
 
-# ---------------------------------------------------
+############################################################
 # COLUMN VALIDATION
-# ---------------------------------------------------
+############################################################
 
 def test_rsi_missing_column():
 
@@ -94,8 +105,5 @@ def test_rsi_missing_column():
         "price": [1, 2, 3]
     })
 
-    try:
+    with pytest.raises(Exception):
         TechnicalIndicators.rsi(df)
-        assert False, "Expected failure for missing column"
-    except Exception:
-        assert True
