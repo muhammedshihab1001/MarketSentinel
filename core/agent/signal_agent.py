@@ -17,6 +17,8 @@ class SignalAgent:
     Z_STRONG = 1.25
     Z_MODERATE = 0.75
 
+    MAX_SCORE_SANITY = 10.0
+
     # =========================================================
     # SAFE FLOAT
     # =========================================================
@@ -34,7 +36,28 @@ class SignalAgent:
             return default
 
     # =========================================================
-    # MAIN ANALYSIS (HYBRID MULTI-AGENT)
+    # ALIGNMENT CHECK
+    # =========================================================
+
+    def _alignment_score(self, signal, momentum_z, ema_ratio):
+        alignment = 0
+
+        if signal == "LONG":
+            if momentum_z > 0:
+                alignment += 1
+            if ema_ratio > self.EMA_BULLISH:
+                alignment += 1
+
+        if signal == "SHORT":
+            if momentum_z < 0:
+                alignment += 1
+            if ema_ratio < self.EMA_BEARISH:
+                alignment += 1
+
+        return alignment  # 0–2
+
+    # =========================================================
+    # MAIN ANALYSIS
     # =========================================================
 
     def analyze(
@@ -47,7 +70,11 @@ class SignalAgent:
         # Core Inputs
         # -----------------------------------------------------
 
-        alpha_score = self._safe_float(row.get("alpha_score", row.get("score")), 0.0)
+        raw_model_score = self._safe_float(
+            row.get("raw_model_score", row.get("alpha_score", row.get("score"))),
+            0.0
+        )
+
         final_score = self._safe_float(row.get("score"), 0.0)
         signal = row.get("signal", "NEUTRAL")
 
@@ -62,8 +89,12 @@ class SignalAgent:
         reasoning: List[str] = []
 
         # =====================================================
-        # 1️⃣ Alpha Confidence
+        # 1️⃣ Score Sanity
         # =====================================================
+
+        if abs(final_score) > self.MAX_SCORE_SANITY:
+            warnings.append("Score unusually large.")
+            reasoning.append("Score clipped for sanity monitoring.")
 
         abs_score = abs(final_score)
 
@@ -76,10 +107,10 @@ class SignalAgent:
         else:
             confidence = "low"
 
-        reasoning.append(f"Alpha strength classified as {confidence}.")
+        reasoning.append(f"Alpha classified as {confidence} strength.")
 
         # =====================================================
-        # 2️⃣ Technical Agent
+        # 2️⃣ Technical Assessment
         # =====================================================
 
         # RSI
@@ -115,7 +146,7 @@ class SignalAgent:
             warnings.append("Momentum contradicts SHORT signal.")
 
         # =====================================================
-        # 3️⃣ Risk Agent
+        # 3️⃣ Risk Assessment
         # =====================================================
 
         if regime_feature > 1.5:
@@ -136,7 +167,7 @@ class SignalAgent:
         reasoning.append(f"Risk level assessed as {risk_level}.")
 
         # =====================================================
-        # 4️⃣ Macro Agent (Breadth-based)
+        # 4️⃣ Macro Assessment
         # =====================================================
 
         if breadth > 0.65:
@@ -146,7 +177,7 @@ class SignalAgent:
         else:
             macro_regime = "neutral"
 
-        reasoning.append(f"Macro regime inferred as {macro_regime}.")
+        reasoning.append(f"Macro regime: {macro_regime}.")
 
         # =====================================================
         # 5️⃣ Cross-Sectional Health
@@ -161,17 +192,30 @@ class SignalAgent:
             reasoning.append("Signal environment weak due to low dispersion.")
 
         # =====================================================
-        # 6️⃣ Strength Score (0–100)
+        # 6️⃣ Alignment Score
         # =====================================================
 
-        strength_score = int(np.clip(abs_score * 40, 0, 100))
+        alignment = self._alignment_score(signal, momentum_z, ema_ratio)
+
+        if alignment == 2:
+            reasoning.append("Technical alignment strong.")
+        elif alignment == 1:
+            reasoning.append("Partial technical alignment.")
+        else:
+            warnings.append("Signal lacks technical confirmation.")
 
         # =====================================================
-        # 7️⃣ Summary Explanation
+        # 7️⃣ Strength Score (0–100 institutional scale)
+        # =====================================================
+
+        strength_score = int(np.clip(abs_score * 40 + alignment * 5, 0, 100))
+
+        # =====================================================
+        # 8️⃣ Explanation Summary
         # =====================================================
 
         explanation = (
-            f"{signal} | alpha={alpha_score:.2f} | "
+            f"{signal} | raw={raw_model_score:.2f} | "
             f"final={final_score:.2f} | "
             f"confidence={confidence} | "
             f"trend={trend} | "
@@ -180,7 +224,7 @@ class SignalAgent:
         )
 
         # =====================================================
-        # Structured Output
+        # STRUCTURED OUTPUT
         # =====================================================
 
         return {
@@ -192,6 +236,7 @@ class SignalAgent:
             "trend": trend,
             "momentum_state": momentum_state,
             "macro_regime": macro_regime,
+            "alignment_score": alignment,
             "reasoning": reasoning,
             "warnings": warnings,
             "explanation": explanation,
