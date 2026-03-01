@@ -20,6 +20,7 @@ class WalkForwardValidator:
     MIN_TRAIN_ROWS = 1500
     MIN_CROSS_SECTION = 10
     MIN_SCORE_STD = 1e-6
+    MIN_TARGET_STD = 1e-6
 
     TOP_K = 10
     BOTTOM_K = 10
@@ -31,7 +32,7 @@ class WalkForwardValidator:
     MAX_SHARPE = 5.0
 
     SCORE_WINSOR_Q = 0.02
-    BASE_DISPERSION = 0.05
+    BASE_DISPERSION = 0.03   # lowered for regression stability
     MIN_ACTIVE_POSITIONS = 4
 
     EPSILON = 1e-9
@@ -60,6 +61,8 @@ class WalkForwardValidator:
         return train_df[train_df["date"] < embargo_cut]
 
     # ==========================================================
+    # TARGET BUILD
+    # ==========================================================
 
     def _build_fold_target(self, df):
         df = df.sort_values(["date", "ticker"]).copy()
@@ -77,9 +80,14 @@ class WalkForwardValidator:
         df["target"] = (df["raw_forward"] - cs_mean) / cs_std
         df = df[np.isfinite(df["target"])]
 
+        if df["target"].std() < self.MIN_TARGET_STD:
+            return pd.DataFrame()
+
         df.drop(columns=["raw_forward"], inplace=True)
         return df
 
+    # ==========================================================
+    # SCORE STABILIZATION
     # ==========================================================
 
     def _winsorize(self, x):
@@ -154,7 +162,7 @@ class WalkForwardValidator:
 
             train_df = self._build_fold_target(train_df)
 
-            if train_df["target"].std() < self.EPSILON:
+            if train_df.empty:
                 start_idx += self.step_size
                 continue
 
@@ -191,13 +199,19 @@ class WalkForwardValidator:
 
                 scores = model.predict(X)
 
-                if np.std(scores) < self.MIN_SCORE_STD:
+                if not np.all(np.isfinite(scores)):
                     continue
 
-                # dispersion guard
-                if np.std(scores) < self.BASE_DISPERSION:
+                score_std = np.std(scores)
+
+                if score_std < self.MIN_SCORE_STD:
                     continue
 
+                # dispersion guard (regression-safe)
+                if score_std < self.BASE_DISPERSION:
+                    continue
+
+                # stabilize scores
                 scores = self._winsorize(scores)
                 scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
 
@@ -210,6 +224,7 @@ class WalkForwardValidator:
                 if len(longs) < self.MIN_ACTIVE_POSITIONS:
                     continue
 
+                # volatility-adjusted softmax
                 long_alpha = self._softmax(longs["score"].values)
                 short_alpha = self._softmax(np.abs(shorts["score"].values))
 
