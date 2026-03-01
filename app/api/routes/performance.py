@@ -83,6 +83,8 @@ async def compute_performance(days: int = 120):
 
 def _compute_performance_sync(days: int):
 
+    start_time = time.time()
+
     engine = PerformanceEngine()
     pipeline = get_pipeline()
     loader = get_shared_model_loader()
@@ -117,10 +119,7 @@ def _compute_performance_sync(days: int):
         df = df.sort_values("date").reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"]).dt.normalize()
 
-        df["forward_return"] = (
-            df["close"].shift(-1) / df["close"] - 1
-        )
-
+        df["forward_return"] = df["close"].shift(-1) / df["close"] - 1
         df["forward_return"] = df["forward_return"].replace(
             [np.inf, -np.inf], np.nan
         )
@@ -159,10 +158,6 @@ def _compute_performance_sync(days: int):
     full_df = FeatureEngineer.add_cross_sectional_features(full_df)
     full_df = FeatureEngineer.finalize(full_df)
 
-    # =========================================================
-    # HISTORICAL SIMULATION (REGRESSION-BASED)
-    # =========================================================
-
     portfolio_records = []
     eval_dates = sorted(full_df["date"].unique())[-days:]
     model = loader.xgb
@@ -171,61 +166,38 @@ def _compute_performance_sync(days: int):
 
         daily_slice = full_df[full_df["date"] == eval_date].copy()
 
-        if daily_slice.empty:
+        if daily_slice["ticker"].nunique() < 5:
             continue
 
-        if daily_slice["ticker"].nunique() < 2:
+        feature_df = validate_feature_schema(
+            daily_slice.loc[:, MODEL_FEATURES],
+            mode="inference"
+        ).astype(DTYPE)
+
+        scores = model.predict(feature_df)
+
+        if np.std(scores) < MIN_SCORE_STD:
             continue
 
-        try:
+        scores = (scores - scores.mean()) / (scores.std() + 1e-12)
+        daily_slice["score"] = scores
 
-            feature_df = validate_feature_schema(
-                daily_slice.loc[:, MODEL_FEATURES],
-                mode="inference"
-            ).astype(DTYPE)
+        ranked = daily_slice.sort_values("score")
 
-            # 🔥 REGRESSION SCORE
-            scores = model.predict(feature_df)
+        longs = ranked.tail(pipeline.TOP_K)
+        shorts = ranked.head(pipeline.BOTTOM_K)
 
-            if np.std(scores) < MIN_SCORE_STD:
-                continue
+        if longs.empty or shorts.empty:
+            continue
 
-            # Z-score normalize cross-sectionally
-            scores = (scores - scores.mean()) / (scores.std() + 1e-12)
+        weights = pipeline._construct_portfolio(longs, shorts)
 
-            daily_slice["score"] = scores
-
-            daily_slice["rank_pct"] = daily_slice["score"].rank(
-                method="first", pct=True
-            )
-
-            daily_slice["signal"] = daily_slice["rank_pct"].apply(
-                lambda x: "LONG" if x >= LONG_PERCENTILE
-                else ("SHORT" if x <= SHORT_PERCENTILE else "NEUTRAL")
-            )
-
-            # Construct portfolio from LONG/SHORT only
-            long_slice = daily_slice[daily_slice["signal"] == "LONG"]
-            short_slice = daily_slice[daily_slice["signal"] == "SHORT"]
-
-            if long_slice.empty or short_slice.empty:
-                continue
-
-            weights = pipeline._construct_portfolio(
-                long_slice,
-                short_slice
-            )
-
-            for _, row in daily_slice.iterrows():
-                portfolio_records.append({
-                    "date": row["date"],
-                    "ticker": row["ticker"],
-                    "signal": row["signal"],
-                    "weight": float(weights.get(row["ticker"], 0.0))
-                })
-
-        except Exception as e:
-            logger.warning(f"Skipping {eval_date}: {str(e)}")
+        for _, row in daily_slice.iterrows():
+            portfolio_records.append({
+                "date": row["date"],
+                "ticker": row["ticker"],
+                "weight": float(weights.get(row["ticker"], 0.0))
+            })
 
     if not portfolio_records:
         raise RuntimeError("No portfolio history generated.")
@@ -245,10 +217,6 @@ def _compute_performance_sync(days: int):
 
     forward_df = pd.concat(forward_frames, ignore_index=True)
     forward_df = forward_df.dropna(subset=["forward_return"])
-
-    # =========================================================
-    # STRATEGY PERFORMANCE
-    # =========================================================
 
     report = engine.evaluate(portfolio_df, forward_df)
 
@@ -333,5 +301,12 @@ def _compute_performance_sync(days: int):
         "relative": {
             "alpha": float(alpha),
             "information_ratio": float(info_ratio),
-        }
+        },
+        "governance": {
+            "model_version": loader.xgb_version,
+            "schema_signature": loader.schema_signature,
+            "artifact_hash": loader.artifact_hash,
+        },
+        "latency_ms": int((time.time() - start_time) * 1000),
+        "timestamp": int(time.time())
     }
