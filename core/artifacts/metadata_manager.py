@@ -17,10 +17,13 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "12.2"
+    METADATA_VERSION = "13.0"  # bumped
     MIN_TRAINING_DAYS = 120
     MIN_METADATA_BYTES = 800
     MIN_FEATURE_COUNT = 10
+
+    MIN_DATASET_ROWS = 500
+    MIN_HASH_LENGTH = 64
 
     REQUIRED_METADATA_FIELDS = [
         "metadata_type",
@@ -54,15 +57,11 @@ class MetadataManager:
     }
 
     #####################################################
-    # FILE HASH (NEW — SAFE ADDITION)
+    # FILE HASH
     #####################################################
 
     @staticmethod
     def hash_file(path: str) -> str:
-        """
-        Deterministic SHA256 hash of file contents.
-        Used for artifact integrity tracking.
-        """
 
         if not os.path.exists(path):
             raise RuntimeError(f"Cannot hash missing file: {path}")
@@ -73,10 +72,7 @@ class MetadataManager:
         hasher = hashlib.sha256()
 
         with open(path, "rb") as f:
-            while True:
-                chunk = f.read(8192)
-                if not chunk:
-                    break
+            for chunk in iter(lambda: f.read(8192), b""):
                 hasher.update(chunk)
 
         return hasher.hexdigest()
@@ -127,6 +123,9 @@ class MetadataManager:
                 f"Metadata missing required fields: {missing}"
             )
 
+        if metadata["metadata_version"] != MetadataManager.METADATA_VERSION:
+            raise RuntimeError("Metadata version mismatch.")
+
         expected = metadata.get("metadata_integrity_hash")
         actual = MetadataManager._compute_metadata_hash(metadata)
 
@@ -147,8 +146,18 @@ class MetadataManager:
         if metadata["feature_count"] != len(MODEL_FEATURES):
             raise RuntimeError("Feature count mismatch.")
 
-        if metadata["dataset_rows"] <= 0:
-            raise RuntimeError("Invalid dataset_rows in metadata.")
+        if metadata["dataset_rows"] < MetadataManager.MIN_DATASET_ROWS:
+            raise RuntimeError("Dataset too small for institutional training.")
+
+        if len(metadata["dataset_hash"]) != MetadataManager.MIN_HASH_LENGTH:
+            raise RuntimeError("Invalid dataset hash length.")
+
+        MetadataManager._validate_training_window(
+            metadata["training_window"]["start"],
+            metadata["training_window"]["end"]
+        )
+
+        MetadataManager._validate_metrics(metadata["metrics"])
 
         return metadata
 
@@ -199,16 +208,15 @@ class MetadataManager:
     def _validate_metrics(metrics: dict):
 
         if not isinstance(metrics, dict) or not metrics:
-            raise RuntimeError("Metrics must be a non-empty dict.")
+            raise RuntimeError("Metrics must be non-empty dict.")
 
         for k, v in metrics.items():
-            try:
-                val = float(v)
-            except Exception:
-                raise RuntimeError(f"Metric must be numeric: {k}")
-
+            val = float(v)
             if not np.isfinite(val):
                 raise RuntimeError(f"Non-finite metric detected: {k}")
+
+            if abs(val) > 1e6:
+                raise RuntimeError(f"Metric unrealistic: {k}")
 
     #####################################################
     # DATASET HASH
@@ -363,8 +371,8 @@ class MetadataManager:
         feature_checksum=None,
     ):
 
-        if dataset_rows <= 0:
-            raise RuntimeError("dataset_rows must be positive.")
+        if dataset_rows < MetadataManager.MIN_DATASET_ROWS:
+            raise RuntimeError("dataset_rows below institutional minimum.")
 
         MetadataManager._validate_feature_contract(
             features,
@@ -379,9 +387,6 @@ class MetadataManager:
         )
 
         universe_snapshot = MarketUniverse.snapshot()
-
-        if "universe_hash" not in universe_snapshot:
-            raise RuntimeError("Universe snapshot invalid.")
 
         metadata = {
 
@@ -417,11 +422,7 @@ class MetadataManager:
             "universe_hash": universe_snapshot["universe_hash"]
         }
 
-        if feature_checksum is not None:
-
-            if not isinstance(feature_checksum, str) or len(feature_checksum) != 64:
-                raise RuntimeError("Invalid feature checksum format.")
-
+        if feature_checksum:
             metadata["feature_checksum"] = feature_checksum
 
         if extra_fields:
@@ -430,7 +431,7 @@ class MetadataManager:
 
             if forbidden:
                 raise RuntimeError(
-                    f"extra_fields cannot override immutable lineage keys: {forbidden}"
+                    f"extra_fields cannot override immutable keys: {forbidden}"
                 )
 
             metadata.update(extra_fields)
