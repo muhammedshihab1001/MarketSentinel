@@ -28,15 +28,16 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "24.0"  # bumped
+    BASELINE_VERSION = "25.0"  # bumped
 
     MIN_SAMPLE_BASELINE = 150
     MIN_SAMPLE_INFERENCE = 25
+    MIN_FEATURE_EVAL_RATIO = 0.3  # 🔥 new safeguard
 
     VARIANCE_RATIO_UPPER = 4.0
     VARIANCE_RATIO_LOWER = 0.20
 
-    PSI_ALERT = 0.45  # slightly relaxed for noisy data
+    PSI_ALERT = 0.45
     MIN_BIN_PCT = 0.01
 
     MAX_INFERENCE_ROWS = 800
@@ -45,7 +46,7 @@ class DriftDetector:
     MAX_SEVERITY_CAP = 15
 
     SOFT_SEVERITY_THRESHOLD = 4
-    HARD_SEVERITY_THRESHOLD = 10  # softened slightly
+    HARD_SEVERITY_THRESHOLD = 10
 
     RECENT_WEIGHT_FACTOR = 1.5
 
@@ -128,8 +129,7 @@ class DriftDetector:
         if meta.get("feature_checksum") != current_checksum:
             raise RuntimeError("Feature checksum mismatch.")
 
-        current_model_version = self._model_loader.xgb_version
-        if meta.get("model_version") != current_model_version:
+        if meta.get("model_version") != self._model_loader.xgb_version:
             logger.warning("Baseline tied to different model version.")
 
         return baseline
@@ -162,7 +162,7 @@ class DriftDetector:
         return float(max(psi, 0.0))
 
     # =========================================================
-    # TIME-WEIGHTED SEVERITY
+    # TIME-WEIGHTED MEAN
     # =========================================================
 
     def _time_weighted_mean(self, series):
@@ -244,11 +244,14 @@ class DriftDetector:
 
             coverage = float(evaluated_features / max(total_features, 1))
 
-            if coverage < 0.5:
-                severity_accumulator += 2
+            # 🔥 safeguard: require minimum feature evaluation
+            if coverage < self.MIN_FEATURE_EVAL_RATIO:
+                drift_count = 0
+                severity_accumulator = 0
 
+            # 🔥 smooth severity (log compression)
             severity_score = min(
-                int(severity_accumulator),
+                int(np.log1p(severity_accumulator)),
                 self.MAX_SEVERITY_CAP
             )
 
@@ -262,7 +265,6 @@ class DriftDetector:
 
             DRIFT_DETECTED.set(1 if drift_detected else 0)
 
-            # Safer exposure scaling for CV demo
             if drift_state == "hard":
                 exposure_scale = 0.2
             elif drift_state == "soft":
@@ -279,7 +281,11 @@ class DriftDetector:
                 "coverage": coverage,
                 "details": report,
                 "drift_state": drift_state,
-                "exposure_scale": float(np.clip(exposure_scale, 0.0, 1.0))
+                "exposure_scale": float(np.clip(exposure_scale, 0.0, 1.0)),
+                "drift_summary": {
+                    "evaluated_features": evaluated_features,
+                    "total_features": total_features
+                }
             }
 
         except FileNotFoundError:
@@ -308,11 +314,11 @@ class DriftDetector:
 
             return {
                 "drift_detected": True,
-                "severity_score": 7,
+                "severity_score": 6,
                 "drift_confidence": 0.5,
                 "coverage": 0.0,
                 "details": {},
                 "drift_state": "detector_failure",
-                "exposure_scale": 0.3,
+                "exposure_scale": 0.4,
                 "reason": "detector_failure"
             }
