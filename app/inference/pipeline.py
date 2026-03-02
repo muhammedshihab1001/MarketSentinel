@@ -1,6 +1,6 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v4.0
-# Hybrid Multi-Agent Compatible (Backward Safe)
+# INSTITUTIONAL INFERENCE PIPELINE v4.1
+# Hybrid Multi-Agent Consensus Enabled (Backward Safe)
 # =========================================================
 
 import time
@@ -25,6 +25,7 @@ from core.market.universe import MarketUniverse
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
 from core.agent.signal_agent import SignalAgent
+from core.agent.technical_risk_agent import TechnicalRiskAgent
 
 from app.monitoring.metrics import (
     MODEL_INFERENCE_COUNT,
@@ -76,7 +77,10 @@ class InferencePipeline:
         self.models = get_shared_model_loader()
         self.cache = RedisCache()
         self.drift_detector = DriftDetector()
+
+        # Agents
         self.signal_agent = SignalAgent()
+        self.technical_agent = TechnicalRiskAgent()
 
         self._validate_models_loaded()
 
@@ -100,8 +104,6 @@ class InferencePipeline:
         return e / (np.sum(e) + EPSILON)
 
     # ---------------------------------------------------------
-    # HYBRID CONTEXT BUILDER
-    # ---------------------------------------------------------
 
     def _build_agent_context(
         self,
@@ -109,9 +111,6 @@ class InferencePipeline:
         probability_stats: Dict[str, Any],
         drift_result: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """
-        Prepare structured context for hybrid agents.
-        """
         return {
             "row": row,
             "probability_stats": probability_stats,
@@ -200,7 +199,6 @@ class InferencePipeline:
             for _, row in latest_df.iterrows():
 
                 direction = "LONG" if row["raw_model_score"] > 0 else "SHORT"
-
                 row_dict = {**row.to_dict(), "signal": direction}
 
                 context = self._build_agent_context(
@@ -209,19 +207,35 @@ class InferencePipeline:
                     drift_result=drift_result
                 )
 
-                agent_output = self.signal_agent.analyze(context)
+                signal_output = self.signal_agent.analyze(context)
+                technical_output = self.technical_agent.analyze(context)
+
+                # Weighted Hybrid Consensus
+                total_weight = (
+                    self.signal_agent.weight +
+                    self.technical_agent.weight
+                )
+
+                hybrid_consensus_score = (
+                    signal_output["hybrid"]["score"] * self.signal_agent.weight +
+                    technical_output["score"] * self.technical_agent.weight
+                ) / total_weight
 
                 snapshot_rows.append({
                     "date": str(row["date"]),
                     "ticker": row["ticker"],
                     "raw_model_score": float(row["raw_model_score"]),
-                    "agent_score": float(agent_output["agent_score"]),
-                    "hybrid_score": float(agent_output["hybrid"]["score"]),
+                    "agent_score": float(signal_output["agent_score"]),  # original
+                    "technical_score": float(technical_output["score"]),
+                    "hybrid_consensus_score": float(hybrid_consensus_score),
                     "weight": 0.0,
-                    "agent": agent_output
+                    "agents": {
+                        "signal_agent": signal_output,
+                        "technical_agent": technical_output
+                    }
                 })
 
-            # Portfolio construction (UNCHANGED LOGIC)
+            # Portfolio construction (UNCHANGED)
             ranked = latest_df.sort_values("raw_model_score")
 
             longs = ranked.tail(min(self.TOP_K, len(ranked)))
@@ -233,6 +247,7 @@ class InferencePipeline:
                 base_weight = weights.get(row["ticker"], 0.0)
                 row["weight"] = float(base_weight * exposure_scale)
 
+            # Top 5 still based on model-driven agent_score
             top_5 = sorted(
                 snapshot_rows,
                 key=lambda x: x["agent_score"],
