@@ -1,3 +1,8 @@
+# =========================================================
+# HYBRID AGENT EXPLANATION ROUTE v2.0
+# Multi-Agent + Hybrid Consensus Compatible
+# =========================================================
+
 import logging
 import asyncio
 import time
@@ -53,9 +58,6 @@ async def explain_signal(
     start_time = time.time()
 
     try:
-        # -------------------------------------------------
-        # Basic Validation
-        # -------------------------------------------------
 
         if not ticker or not isinstance(ticker, str):
             raise HTTPException(status_code=400, detail="Invalid ticker")
@@ -63,10 +65,6 @@ async def explain_signal(
         ticker = ticker.upper().strip()
 
         pipeline = get_pipeline()
-
-        # -------------------------------------------------
-        # Run Snapshot Safely (Threadpool + Timeout)
-        # -------------------------------------------------
 
         snapshot = await asyncio.wait_for(
             run_in_threadpool(
@@ -84,10 +82,6 @@ async def explain_signal(
         if not signals:
             raise HTTPException(status_code=404, detail="Ticker not found")
 
-        # -------------------------------------------------
-        # Extract Ticker Row
-        # -------------------------------------------------
-
         row = next(
             (s for s in signals if s.get("ticker") == ticker),
             None
@@ -96,11 +90,19 @@ async def explain_signal(
         if row is None:
             raise HTTPException(status_code=404, detail="Ticker not in snapshot")
 
-        agent_output = row.get("agent", {})
+        # -------------------------------------------------
+        # Extract Agent Outputs (Hybrid Compatible)
+        # -------------------------------------------------
+
+        agents = row.get("agents", {})
+
+        signal_output = agents.get("signal_agent", {})
+        technical_output = agents.get("technical_agent", {})
+
         drift_info = snapshot.get("drift", {})
 
         # -------------------------------------------------
-        # Optional LLM Explanation (SAFE + SIGNATURE FIXED)
+        # Optional LLM Explanation
         # -------------------------------------------------
 
         llm_output = None
@@ -111,16 +113,9 @@ async def explain_signal(
             try:
                 llm_output = await explainer.explain(
                     signal_row=row,
-                    agent_output=agent_output,
-                    context_stats={
-                        "drift_state": drift_info.get("drift_state"),
-                        "severity_score": drift_info.get("severity_score"),
-                        "std": snapshot.get("score_std"),
-                    },
-                    probability_stats={
-                        "mean_score": snapshot.get("score_mean"),
-                        "std_score": snapshot.get("score_std"),
-                    }
+                    signal_output=signal_output,
+                    technical_output=technical_output,
+                    drift_stats=drift_info
                 )
             except Exception:
                 logger.exception("LLM explanation failed (non-blocking)")
@@ -130,38 +125,63 @@ async def explain_signal(
                 }
 
         # -------------------------------------------------
-        # Structured Response
+        # Structured Response (Hybrid-Aware)
         # -------------------------------------------------
 
         response = {
             "ticker": ticker,
             "snapshot_date": snapshot.get("snapshot_date"),
 
-            # Core Signal
-            "signal": agent_output.get("signal"),
+            # ----------------------------
+            # Core Model Output
+            # ----------------------------
             "raw_model_score": row.get("raw_model_score"),
             "weight": row.get("weight"),
 
-            # Agent Metrics
-            "agent_score": agent_output.get("agent_score"),
-            "confidence_numeric": agent_output.get("confidence_numeric"),
-            "governance_score": agent_output.get("governance_score"),
-            "risk_level": agent_output.get("risk_level"),
-            "volatility_regime": agent_output.get("volatility_regime"),
+            # ----------------------------
+            # Hybrid Scores
+            # ----------------------------
+            "agent_score": row.get("agent_score"),
+            "technical_score": row.get("technical_score"),
+            "hybrid_consensus_score": row.get("hybrid_consensus_score"),
 
+            # ----------------------------
+            # Signal Agent Details
+            # ----------------------------
+            "signal": signal_output.get("signal"),
+            "confidence_numeric": signal_output.get("confidence_numeric"),
+            "governance_score": signal_output.get("governance_score"),
+            "risk_level": signal_output.get("risk_level"),
+            "volatility_regime": signal_output.get("volatility_regime"),
+
+            # ----------------------------
+            # Technical Agent Details
+            # ----------------------------
+            "technical_bias": technical_output.get("bias"),
+            "technical_confidence": technical_output.get("confidence"),
+            "technical_component_scores": technical_output.get("component_scores"),
+
+            # ----------------------------
             # Drift Governance
+            # ----------------------------
             "drift_state": drift_info.get("drift_state"),
             "drift_severity": drift_info.get("severity_score"),
             "exposure_scale": drift_info.get("exposure_scale"),
 
+            # ----------------------------
             # Explanation Layer
-            "warnings": agent_output.get("warnings", []),
-            "explanation": agent_output.get("explanation", ""),
+            # ----------------------------
+            "warnings": signal_output.get("warnings", []),
+            "explanation": signal_output.get("explanation", ""),
 
+            # ----------------------------
             # Optional LLM Narrative
+            # ----------------------------
             "llm": llm_output,
 
+            # ----------------------------
             # Observability
+            # ----------------------------
             "latency_ms": int((time.time() - start_time) * 1000),
             "timestamp": int(time.time())
         }
