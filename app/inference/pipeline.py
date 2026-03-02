@@ -1,6 +1,7 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v4.4
+# INSTITUTIONAL INFERENCE PIPELINE v4.5
 # Stable | Drift-Aware | CV-Optimized | Noise-Controlled
+# Backward-Compatible Portfolio API
 # =========================================================
 
 import time
@@ -108,6 +109,17 @@ class InferencePipeline:
         return e / (np.sum(e) + EPSILON)
 
     # ---------------------------------------------------------
+    # BACKWARD COMPATIBILITY FIX (FOR EQUITY ROUTE)
+    # ---------------------------------------------------------
+
+    def _construct_portfolio(self, longs, shorts):
+        """
+        Backward-compatible wrapper.
+        Keeps equity route stable without modifying its logic.
+        """
+        return self._construct_portfolio_from_rows(longs, shorts)
+
+    # ---------------------------------------------------------
 
     def _build_agent_context(
         self,
@@ -160,7 +172,6 @@ class InferencePipeline:
             if latest_df.empty:
                 raise RuntimeError("Latest snapshot invalid.")
 
-            # Liquidity Filter (Stable for yfinance data)
             if "dollar_volume" in latest_df.columns:
                 q25 = latest_df["dollar_volume"].quantile(0.25)
                 liquidity_threshold = max(self.BASE_LIQUIDITY, q25)
@@ -179,10 +190,8 @@ class InferencePipeline:
             exposure_scale = drift_result.get("exposure_scale", 1.0)
 
             raw_scores = self.models.xgb.predict(feature_df)
-
             score_std = float(np.std(raw_scores))
 
-            # Stable dispersion control (no random noise)
             if score_std < self.MIN_SCORE_STD:
                 logger.warning("Low dispersion detected in snapshot scores.")
                 return {
