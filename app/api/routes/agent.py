@@ -53,6 +53,10 @@ async def explain_signal(
     start_time = time.time()
 
     try:
+        # -------------------------------------------------
+        # Basic Validation
+        # -------------------------------------------------
+
         if not ticker or not isinstance(ticker, str):
             raise HTTPException(status_code=400, detail="Invalid ticker")
 
@@ -61,7 +65,7 @@ async def explain_signal(
         pipeline = get_pipeline()
 
         # -------------------------------------------------
-        # Run snapshot safely in threadpool
+        # Run Snapshot Safely (Threadpool + Timeout)
         # -------------------------------------------------
 
         snapshot = await asyncio.wait_for(
@@ -69,19 +73,19 @@ async def explain_signal(
                 pipeline.run_snapshot,
                 [ticker]
             ),
-            timeout=25
+            timeout=180
         )
 
         if not isinstance(snapshot, dict):
             raise HTTPException(status_code=500, detail="Invalid snapshot response")
 
-        signals = snapshot.get("signals")
+        signals = snapshot.get("signals", [])
 
-        if not signals or not isinstance(signals, list):
+        if not signals:
             raise HTTPException(status_code=404, detail="Ticker not found")
 
         # -------------------------------------------------
-        # Find correct ticker row
+        # Extract Ticker Row
         # -------------------------------------------------
 
         row = next(
@@ -96,7 +100,7 @@ async def explain_signal(
         drift_info = snapshot.get("drift", {})
 
         # -------------------------------------------------
-        # Optional LLM Explanation
+        # Optional LLM Explanation (SAFE + SIGNATURE FIXED)
         # -------------------------------------------------
 
         llm_output = None
@@ -104,45 +108,57 @@ async def explain_signal(
         if include_llm:
             explainer = get_explainer()
 
-            llm_output = await explainer.explain(
-                signal_row=row,
-                agent_output=agent_output,
-                probability_stats={
-                    "mean_score": snapshot.get("score_mean"),
-                    "std_score": snapshot.get("score_std"),
+            try:
+                llm_output = await explainer.explain(
+                    signal_row=row,
+                    agent_output=agent_output,
+                    context_stats={
+                        "drift_state": drift_info.get("drift_state"),
+                        "severity_score": drift_info.get("severity_score"),
+                        "std": snapshot.get("score_std"),
+                    },
+                    probability_stats={
+                        "mean_score": snapshot.get("score_mean"),
+                        "std_score": snapshot.get("score_std"),
+                    }
+                )
+            except Exception:
+                logger.exception("LLM explanation failed (non-blocking)")
+                llm_output = {
+                    "llm_enabled": True,
+                    "error": "llm_runtime_failure"
                 }
-            )
 
         # -------------------------------------------------
-        # Structured Response (Aligned With Current Schema)
+        # Structured Response
         # -------------------------------------------------
 
         response = {
             "ticker": ticker,
             "snapshot_date": snapshot.get("snapshot_date"),
 
-            # Core signal
+            # Core Signal
             "signal": agent_output.get("signal"),
             "raw_model_score": row.get("raw_model_score"),
             "weight": row.get("weight"),
 
-            # Agent metrics
+            # Agent Metrics
             "agent_score": agent_output.get("agent_score"),
             "confidence_numeric": agent_output.get("confidence_numeric"),
             "governance_score": agent_output.get("governance_score"),
             "risk_level": agent_output.get("risk_level"),
             "volatility_regime": agent_output.get("volatility_regime"),
 
-            # Drift governance
+            # Drift Governance
             "drift_state": drift_info.get("drift_state"),
             "drift_severity": drift_info.get("severity_score"),
             "exposure_scale": drift_info.get("exposure_scale"),
 
-            # Reasoning
+            # Explanation Layer
             "warnings": agent_output.get("warnings", []),
             "explanation": agent_output.get("explanation", ""),
 
-            # Optional LLM narrative
+            # Optional LLM Narrative
             "llm": llm_output,
 
             # Observability
