@@ -1,7 +1,8 @@
 # =========================================================
-# PORTFOLIO DECISION AGENT v2.0
+# PORTFOLIO DECISION AGENT v2.1
 # Main Intelligence Layer
 # CV Showcase Optimized | Drift-Aware | Risk-Aware
+# Stability-Enhanced | Interview-Polished
 # =========================================================
 
 import numpy as np
@@ -51,6 +52,9 @@ class PortfolioDecisionAgent:
         confidence_values = []
         risk_distribution = {}
         liquidity_warnings = 0
+        long_count = 0
+        short_count = 0
+        hybrid_scores = []
 
         # =================================================
         # Build Detailed Selection
@@ -58,11 +62,14 @@ class PortfolioDecisionAgent:
 
         for stock in top_5:
 
-            signal_agent = stock["agents"]["signal_agent"]
-            tech_agent = stock["agents"]["technical_agent"]
+            signal_agent = stock.get("agents", {}).get("signal_agent", {})
+            tech_agent = stock.get("agents", {}).get("technical_agent", {})
 
             confidence = float(signal_agent.get("confidence_numeric", 0.0))
             confidence_values.append(confidence)
+
+            hybrid_score = float(stock.get("hybrid_consensus_score", 0.0))
+            hybrid_scores.append(hybrid_score)
 
             risk_level = signal_agent.get("risk_level", "unknown")
             risk_distribution[risk_level] = risk_distribution.get(risk_level, 0) + 1
@@ -75,21 +82,25 @@ class PortfolioDecisionAgent:
             if any("liquidity" in w.lower() for w in combined_warnings):
                 liquidity_warnings += 1
 
+            if stock.get("weight", 0.0) > 0:
+                long_count += 1
+            elif stock.get("weight", 0.0) < 0:
+                short_count += 1
+
             explanation = (
                 f"{stock['ticker']} selected due to strong hybrid score "
-                f"({stock['hybrid_consensus_score']:.2f}). "
+                f"({hybrid_score:.2f}). "
                 f"Model confidence: {confidence:.2f}, "
-                f"Technical alignment: {signal_agent.get('technical_score', 0):.2f}, "
                 f"Risk level: {risk_level}, "
                 f"Volatility regime: {signal_agent.get('volatility_regime', 'unknown')}."
             )
 
             detailed_selection.append({
                 "ticker": stock["ticker"],
-                "weight": stock["weight"],
-                "hybrid_score": stock["hybrid_consensus_score"],
-                "model_score": stock.get("raw_model_score", 0.0),
-                "confidence": confidence,
+                "weight": round(float(stock.get("weight", 0.0)), 6),
+                "hybrid_score": round(hybrid_score, 4),
+                "model_score": round(float(stock.get("raw_model_score", 0.0)), 4),
+                "confidence": round(confidence, 4),
                 "risk_level": risk_level,
                 "volatility_regime": signal_agent.get("volatility_regime"),
                 "technical_bias": tech_agent.get("bias"),
@@ -135,21 +146,27 @@ class PortfolioDecisionAgent:
         else:
             drift_risk = "low"
 
+        # Hybrid dispersion insight (CV-level touch)
+        hybrid_dispersion = float(np.std(hybrid_scores)) if hybrid_scores else 0.0
+
         # =================================================
         # Portfolio Findings Block
         # =================================================
 
         findings = {
-            "average_confidence": avg_confidence,
-            "confidence_dispersion": confidence_std,
-            "gross_exposure": gross_exposure,
-            "net_exposure": net_exposure,
+            "average_confidence": round(avg_confidence, 4),
+            "confidence_dispersion": round(confidence_std, 4),
+            "hybrid_score_dispersion_top5": round(hybrid_dispersion, 4),
+            "gross_exposure": round(gross_exposure, 4),
+            "net_exposure": round(net_exposure, 4),
             "portfolio_bias": portfolio_bias,
             "concentration_risk": concentration_risk,
             "risk_distribution": risk_distribution,
             "liquidity_warnings_in_top5": liquidity_warnings,
+            "long_positions_in_top5": long_count,
+            "short_positions_in_top5": short_count,
             "drift_state": drift_state,
-            "drift_severity": severity,
+            "drift_severity": round(severity, 4),
             "drift_risk_level": drift_risk
         }
 
@@ -164,7 +181,8 @@ class PortfolioDecisionAgent:
             f"Drift condition: {drift_state} (risk: {drift_risk}). "
             f"Gross exposure: {gross_exposure:.2f}, "
             f"Net exposure: {net_exposure:.2f}. "
-            f"Concentration risk assessed as {concentration_risk}."
+            f"Concentration risk assessed as {concentration_risk}. "
+            f"Signal dispersion among top selections: {hybrid_dispersion:.2f}."
         )
 
         # =================================================
