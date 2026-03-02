@@ -1,7 +1,7 @@
 # =========================================================
-# MODEL LOADER v2.1
+# MODEL LOADER v2.2
 # Hybrid Multi-Agent Compatible | CV-Optimized Governance
-# Pointer-Fallback Enabled | Baseline Compatible
+# Pointer-Fallback Enabled | Baseline Verified
 # =========================================================
 
 import os
@@ -44,6 +44,8 @@ class LoadedModel:
     reproducibility_hash: Optional[str]
     pointer_hash: Optional[str]
     training_fingerprint: Optional[str]
+    baseline_available: bool
+    baseline_hash: Optional[str]
 
 
 # =========================================================
@@ -58,6 +60,7 @@ class ModelLoader:
     MIN_ARTIFACT_BYTES = 20_000
     MIN_METADATA_BYTES = 300
     POINTER_FILENAME = "production_pointer.json"
+    BASELINE_PATH = os.path.abspath("artifacts/drift/baseline.json")
 
     STRICT_GOVERNANCE = os.getenv("MODEL_STRICT_GOVERNANCE", "0") == "1"
     ALLOW_POINTER_FALLBACK = os.getenv("MODEL_ALLOW_POINTER_FALLBACK", "1") == "1"
@@ -99,6 +102,38 @@ class ModelLoader:
     def _compute_feature_checksum(self):
         canonical = json.dumps(list(MODEL_FEATURES), separators=(",", ":")).encode()
         return hashlib.sha256(canonical).hexdigest()
+
+    # =====================================================
+    # BASELINE VERIFICATION (NEW – NO FEATURE LOSS)
+    # =====================================================
+
+    def _verify_baseline(self):
+
+        if not os.path.exists(self.BASELINE_PATH):
+            logger.warning("Baseline file missing.")
+            return False, None
+
+        try:
+            with open(self.BASELINE_PATH, encoding="utf-8") as f:
+                baseline = json.load(f)
+
+            integrity = baseline.get("integrity_hash")
+
+            clone = dict(baseline)
+            clone.pop("integrity_hash", None)
+
+            canonical = json.dumps(clone, sort_keys=True).encode()
+            computed = hashlib.sha256(canonical).hexdigest()
+
+            if integrity != computed:
+                logger.warning("Baseline integrity mismatch.")
+                return False, computed
+
+            return True, computed
+
+        except Exception:
+            logger.warning("Baseline unreadable or corrupted.")
+            return False, None
 
     # =====================================================
     # REGISTRY
@@ -254,6 +289,8 @@ class ModelLoader:
 
             model = self._safe_load_model(model_path)
 
+            baseline_available, baseline_hash = self._verify_baseline()
+
             training_fingerprint = getattr(
                 model,
                 "training_fingerprint",
@@ -272,7 +309,9 @@ class ModelLoader:
                 training_code_hash=meta.get("training_code_hash"),
                 reproducibility_hash=meta.get("reproducibility_hash"),
                 pointer_hash=pointer_hash,
-                training_fingerprint=training_fingerprint
+                training_fingerprint=training_fingerprint,
+                baseline_available=baseline_available,
+                baseline_hash=baseline_hash
             )
 
             self._xgb_container = new_container
@@ -283,15 +322,15 @@ class ModelLoader:
             ).set(1)
 
             logger.info(
-                "Model loaded | version=%s | artifact=%s",
+                "Model loaded | version=%s | baseline=%s",
                 version,
-                meta.get("artifact_hash", "")[:12]
+                "OK" if baseline_available else "MISSING"
             )
 
             return new_container.model
 
     # =====================================================
-    # PUBLIC ACCESSORS
+    # PUBLIC ACCESSORS (ALL PRESERVED)
     # =====================================================
 
     @property
@@ -348,8 +387,16 @@ class ModelLoader:
         self._reload_xgb_if_needed()
         return self._xgb_container.training_fingerprint
 
+    @property
+    def baseline_status(self):
+        self._reload_xgb_if_needed()
+        return {
+            "available": self._xgb_container.baseline_available,
+            "hash": self._xgb_container.baseline_hash
+        }
+
     # =====================================================
-    # FEATURE IMPORTANCE
+    # FEATURE IMPORTANCE (UNCHANGED)
     # =====================================================
 
     def get_feature_importance(self):
