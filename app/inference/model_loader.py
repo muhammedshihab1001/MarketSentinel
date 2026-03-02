@@ -1,6 +1,7 @@
 # =========================================================
-# MODEL LOADER v2.0
+# MODEL LOADER v2.1
 # Hybrid Multi-Agent Compatible | CV-Optimized Governance
+# Pointer-Fallback Enabled | Baseline Compatible
 # =========================================================
 
 import os
@@ -10,7 +11,7 @@ import threading
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 from core.schema.feature_schema import (
     get_schema_signature,
@@ -59,6 +60,7 @@ class ModelLoader:
     POINTER_FILENAME = "production_pointer.json"
 
     STRICT_GOVERNANCE = os.getenv("MODEL_STRICT_GOVERNANCE", "0") == "1"
+    ALLOW_POINTER_FALLBACK = os.getenv("MODEL_ALLOW_POINTER_FALLBACK", "1") == "1"
 
     # -----------------------------------------------------
 
@@ -117,12 +119,17 @@ class ModelLoader:
     # POINTER RESOLUTION
     # =====================================================
 
-    def _resolve_production_version(self, base_dir):
+    def _resolve_production_version(self, base_dir) -> Tuple[str, str, str, Optional[str]]:
 
         pointer_path = os.path.join(base_dir, self.POINTER_FILENAME)
 
         if not os.path.exists(pointer_path):
-            raise RuntimeError("Production pointer missing.")
+
+            if not self.ALLOW_POINTER_FALLBACK:
+                raise RuntimeError("Production pointer missing.")
+
+            logger.warning("Production pointer missing — falling back to latest model.")
+            return self._resolve_latest_version(base_dir)
 
         pointer_hash = self._sha256(pointer_path)
 
@@ -136,13 +143,35 @@ class ModelLoader:
         model_path = os.path.join(base_dir, f"model_{version}.pkl")
         metadata_path = os.path.join(base_dir, f"metadata_{version}.json")
 
-        if not os.path.exists(model_path):
-            raise RuntimeError("Production model missing.")
-
-        if not os.path.exists(metadata_path):
-            raise RuntimeError("Production metadata missing.")
+        if not os.path.exists(model_path) or not os.path.exists(metadata_path):
+            raise RuntimeError("Pointer references missing model artifacts.")
 
         return model_path, metadata_path, version, pointer_hash
+
+    # -----------------------------------------------------
+
+    def _resolve_latest_version(self, base_dir):
+
+        files = os.listdir(base_dir)
+        versions = []
+
+        for f in files:
+            if f.startswith("model_") and f.endswith(".pkl"):
+                version = f.replace("model_", "").replace(".pkl", "")
+                versions.append(version)
+
+        if not versions:
+            raise RuntimeError("No model artifacts found.")
+
+        latest_version = sorted(versions)[-1]
+
+        model_path = os.path.join(base_dir, f"model_{latest_version}.pkl")
+        metadata_path = os.path.join(base_dir, f"metadata_{latest_version}.json")
+
+        if not os.path.exists(metadata_path):
+            raise RuntimeError("Metadata missing for latest model.")
+
+        return model_path, metadata_path, latest_version, None
 
     # =====================================================
     # SAFE MODEL LOAD
@@ -158,7 +187,6 @@ class ModelLoader:
         if not hasattr(model, "predict"):
             raise RuntimeError("Invalid model artifact.")
 
-        # Feature contract enforcement (soft if not strict)
         if hasattr(model, "feature_names"):
             if list(model.feature_names) != list(MODEL_FEATURES):
                 msg = "Model feature order mismatch."
