@@ -83,8 +83,16 @@ class SignalExplanationResponse(BaseModel):
     score: float
     signal: str
 
-    # Multi-agent core metrics
+    # Primary model agent score (kept for backward compatibility)
     agent_score: float
+
+    # Hybrid consensus score (new)
+    hybrid_score: Optional[float] = None
+
+    # Technical confirmation score (new)
+    technical_score: Optional[float] = None
+
+    # Model intelligence details
     alpha_strength: float
     confidence_numeric: float
     governance_score: int
@@ -94,7 +102,7 @@ class SignalExplanationResponse(BaseModel):
 
     drift_flag: bool
 
-    warnings: List[str] = []
+    warnings: List[str] = Field(default_factory=list)
     explanation: str
 
 
