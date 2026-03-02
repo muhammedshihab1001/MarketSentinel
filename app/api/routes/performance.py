@@ -44,6 +44,32 @@ def get_pipeline():
 
 
 # =========================================================
+# INTERNAL PORTFOLIO BUILDER (Stable + CV-Level Clean)
+# =========================================================
+
+def construct_portfolio(longs: pd.DataFrame,
+                        shorts: pd.DataFrame) -> dict:
+    """
+    Equal-weight long/short portfolio.
+    Keeps project simple and stable.
+    """
+
+    weights = {}
+
+    if not longs.empty:
+        long_weight = 1.0 / len(longs)
+        for _, row in longs.iterrows():
+            weights[row["ticker"]] = float(long_weight)
+
+    if not shorts.empty:
+        short_weight = -1.0 / len(shorts)
+        for _, row in shorts.iterrows():
+            weights[row["ticker"]] = float(short_weight)
+
+    return weights
+
+
+# =========================================================
 # ASYNC ENTRYPOINT
 # =========================================================
 
@@ -129,7 +155,7 @@ def _compute_performance_sync(days: int):
         raise RuntimeError("No valid price data available.")
 
     # =========================================================
-    # BUILD FEATURES (aligned with pipeline)
+    # BUILD FEATURES
     # =========================================================
 
     feature_frames = []
@@ -182,13 +208,14 @@ def _compute_performance_sync(days: int):
 
         scores = model.predict(feature_df)
 
+        # Skip unstable low-dispersion days (yfinance noise control)
         if np.std(scores) < MIN_SCORE_STD:
             continue
 
         scores = (scores - scores.mean()) / (scores.std() + 1e-12)
         daily_slice["score"] = scores
 
-        # 🔥 apply drift scaling for consistency
+        # Drift scaling (kept from your original architecture)
         drift_result = pipeline._safe_drift(feature_df)
         exposure_scale = drift_result.get("exposure_scale", 1.0)
 
@@ -200,7 +227,8 @@ def _compute_performance_sync(days: int):
         if longs.empty or shorts.empty:
             continue
 
-        weights = pipeline._construct_portfolio(longs, shorts)
+        # 🔥 NEW: Local stable portfolio construction
+        weights = construct_portfolio(longs, shorts)
 
         for _, row in daily_slice.iterrows():
             base_weight = weights.get(row["ticker"], 0.0)
@@ -232,7 +260,7 @@ def _compute_performance_sync(days: int):
     report = engine.evaluate(portfolio_df, forward_df)
 
     # =========================================================
-    # BENCHMARK (SPY)
+    # BENCHMARK
     # =========================================================
 
     benchmark_data = market_data.get_price_data_batch(
@@ -252,10 +280,6 @@ def _compute_performance_sync(days: int):
     if benchmark_df is not None and not benchmark_df.empty:
 
         benchmark_df = benchmark_df.sort_values("date")
-        benchmark_df["date"] = pd.to_datetime(
-            benchmark_df["date"]
-        ).dt.normalize()
-
         benchmark_df["forward_return"] = (
             benchmark_df["close"].shift(-1) /
             benchmark_df["close"] - 1
