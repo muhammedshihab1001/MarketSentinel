@@ -1,6 +1,8 @@
 import logging
 import asyncio
 import time
+import os
+import json
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
@@ -11,6 +13,7 @@ from core.schema.feature_schema import (
     validate_feature_schema,
     DTYPE,
 )
+from core.monitoring.drift_detector import DriftDetector
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
@@ -72,6 +75,45 @@ async def drift_status():
 
 
 # =========================================================
+# BASELINE META HELPER
+# =========================================================
+
+def _get_baseline_meta():
+
+    detector = DriftDetector()
+    path = detector.BASELINE_PATH
+
+    if not os.path.exists(path):
+        return {
+            "baseline_exists": False,
+            "baseline_version": None,
+            "baseline_model_version": None,
+            "baseline_dataset_hash": None
+        }
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            baseline = json.load(f)
+
+        meta = baseline.get("meta", {})
+
+        return {
+            "baseline_exists": True,
+            "baseline_version": meta.get("baseline_version"),
+            "baseline_model_version": meta.get("model_version"),
+            "baseline_dataset_hash": meta.get("dataset_hash")
+        }
+
+    except Exception:
+        return {
+            "baseline_exists": False,
+            "baseline_version": None,
+            "baseline_model_version": None,
+            "baseline_dataset_hash": None
+        }
+
+
+# =========================================================
 # SYNC DRIFT LOGIC
 # =========================================================
 
@@ -87,26 +129,22 @@ def _drift_status_sync():
     if not tickers or len(tickers) < MIN_UNIVERSE_WIDTH:
         raise RuntimeError("Universe too small for drift detection.")
 
-    # Build full cross-sectional frame using existing pipeline method
     df = pipeline._build_cross_sectional_frame(tickers)
 
     if df.empty:
         raise RuntimeError("Feature frame empty.")
 
-    # Select latest snapshot safely (no private dependency)
     latest_date = df["date"].max()
     latest_df = df[df["date"] == latest_date].copy()
 
     if latest_df.empty:
         raise RuntimeError("No latest snapshot available for drift.")
 
-    # Validate schema before drift
     feature_df = validate_feature_schema(
         latest_df.loc[:, MODEL_FEATURES],
         mode="inference"
     ).astype(DTYPE)
 
-    # Safe drift call (baseline may not exist)
     try:
         drift_result = pipeline.drift_detector.detect(feature_df)
     except Exception as e:
@@ -118,13 +156,19 @@ def _drift_status_sync():
             "exposure_scale": 1.0
         }
 
+    baseline_meta = _get_baseline_meta()
+
     return {
+        # Core drift
         "drift_detected": drift_result.get("drift_detected", False),
         "severity_score": drift_result.get("severity_score", 0),
         "drift_state": drift_result.get("drift_state", "unknown"),
         "exposure_scale": drift_result.get("exposure_scale", 1.0),
 
-        # Governance
+        # Baseline governance
+        **baseline_meta,
+
+        # Model governance
         "model_version": loader.xgb_version,
         "schema_signature": loader.schema_signature,
         "artifact_hash": loader.artifact_hash,
