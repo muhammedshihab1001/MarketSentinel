@@ -1,3 +1,8 @@
+# =========================================================
+# PREDICTION & SNAPSHOT ROUTES v2.0
+# Hybrid Multi-Agent Compatible
+# =========================================================
+
 import time
 import asyncio
 import os
@@ -121,14 +126,14 @@ async def live_snapshot():
         long_count = sum(1 for s in signals if s.get("weight", 0.0) > 0)
         short_count = sum(1 for s in signals if s.get("weight", 0.0) < 0)
 
-        strength_scores = [
-            s.get("agent", {}).get("agent_score", 0.0) * 100
+        hybrid_scores = [
+            s.get("hybrid_consensus_score", s.get("agent_score", 0.0)) * 100
             for s in signals
         ]
 
         avg_strength = (
-            round(sum(strength_scores) / len(strength_scores), 2)
-            if strength_scores else 0.0
+            round(sum(hybrid_scores) / len(hybrid_scores), 2)
+            if hybrid_scores else 0.0
         )
 
         meta = {
@@ -140,7 +145,7 @@ async def live_snapshot():
             "universe_size": len(tickers),
             "long_signals": long_count,
             "short_signals": short_count,
-            "avg_agent_score": avg_strength,
+            "avg_hybrid_score": avg_strength,
             "gross_exposure": snapshot.get("gross_exposure"),
             "net_exposure": snapshot.get("net_exposure"),
             "drift_state": snapshot.get("drift", {}).get("drift_state"),
@@ -200,29 +205,30 @@ async def signal_explanation(ticker: str):
             )
 
         signals = snapshot.get("signals", [])
-
         row = next((s for s in signals if s["ticker"] == ticker), None)
 
         if row is None:
             raise HTTPException(status_code=404, detail="Signal not found.")
 
-        agent_data = row.get("agent", {})
+        # Hybrid-safe extraction
+        agents = row.get("agents", {})
+        signal_agent = agents.get("signal_agent", {})
 
-        direction = agent_data.get("signal", "NEUTRAL")
+        direction = signal_agent.get("signal", "NEUTRAL")
 
         explanation = SignalExplanationResponse(
             ticker=row["ticker"],
             score=row.get("raw_model_score", 0.0),
             signal=direction,
-            agent_score=agent_data.get("agent_score", 0.0),
-            alpha_strength=agent_data.get("alpha_strength", 0.0),
-            confidence_numeric=agent_data.get("confidence_numeric", 0.0),
-            governance_score=agent_data.get("governance_score", 0),
-            risk_level=agent_data.get("risk_level", "unknown"),
-            volatility_regime=agent_data.get("volatility_regime", "unknown"),
-            drift_flag=agent_data.get("drift_flag", False),
-            warnings=agent_data.get("warnings", []),
-            explanation=agent_data.get("explanation", "")
+            agent_score=row.get("hybrid_consensus_score", row.get("agent_score", 0.0)),
+            alpha_strength=signal_agent.get("alpha_strength", 0.0),
+            confidence_numeric=signal_agent.get("confidence_numeric", 0.0),
+            governance_score=signal_agent.get("governance_score", 0),
+            risk_level=signal_agent.get("risk_level", "unknown"),
+            volatility_regime=signal_agent.get("volatility_regime", "unknown"),
+            drift_flag=signal_agent.get("drift_flag", False),
+            warnings=signal_agent.get("warnings", []),
+            explanation=signal_agent.get("explanation", "")
         )
 
         meta = SignalExplanationMeta(
