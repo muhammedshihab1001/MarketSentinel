@@ -1,3 +1,9 @@
+# =========================================================
+# LLM EXPLAINER v2.0
+# Hybrid Multi-Agent Compatible
+# CV-Ready | Clean | Backward Safe
+# =========================================================
+
 import logging
 import asyncio
 import time
@@ -31,14 +37,11 @@ class LLMExplainer:
         self.model_name = get_env("OPENAI_MODEL", "gpt-4o-mini")
         self.timeout = get_int("OPENAI_TIMEOUT", 12)
 
-        # Rate limiting
         self.rate_limit_per_minute = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
 
-        # Cache
         self.cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
         self.cache_ttl_seconds = get_int("LLM_CACHE_TTL_SEC", 180)
 
-        # Audit logging
         self.audit_enabled = get_bool("LLM_AUDIT_ENABLED", True)
 
         self._request_times = []
@@ -83,24 +86,21 @@ class LLMExplainer:
     # CACHE
     ########################################################
 
-    def _cache_key(self, row, agent, stats, probability_stats):
+    def _cache_key(self, row, signal_output, technical_output, stats):
 
         payload = {
             "ticker": row.get("ticker"),
-            "signal": agent.get("signal"),
-            "alpha_score": row.get("alpha_score"),
-            "score": row.get("score"),
-            "weight": row.get("weight"),
-            "confidence": agent.get("confidence"),
-            "risk_level": agent.get("risk_level"),
-            "trend": agent.get("trend"),
-            "macro_regime": agent.get("macro_regime"),
-            "volatility_regime": agent.get("volatility_regime"),
-            "strength_score": agent.get("strength_score"),
+            "raw_model_score": row.get("raw_model_score"),
+            "agent_score": row.get("agent_score"),
+            "technical_score": row.get("technical_score"),
+            "hybrid_consensus_score": row.get("hybrid_consensus_score"),
+            "signal": signal_output.get("signal"),
+            "confidence": signal_output.get("confidence_numeric"),
+            "risk_level": signal_output.get("risk_level"),
+            "technical_bias": technical_output.get("bias"),
+            "technical_score": technical_output.get("score"),
             "drift_state": stats.get("drift_state"),
             "severity_score": stats.get("severity_score"),
-            "dispersion_std": stats.get("std"),
-            "probability_stats": probability_stats or {}
         }
 
         canonical = json.dumps(payload, sort_keys=True)
@@ -163,7 +163,6 @@ class LLMExplainer:
                 "cached": cached,
                 "status": "success" if "error" not in result else "error",
                 "response_hash": response_hash,
-                "env_fingerprint": os.getenv("ENV_FINGERPRINT"),
             }
 
             logger.info("LLM_AUDIT | %s", json.dumps(audit_record))
@@ -178,9 +177,9 @@ class LLMExplainer:
     async def explain(
         self,
         signal_row: Dict[str, Any],
-        agent_output: Dict[str, Any],
-        context_stats: Dict[str, Any],
-        probability_stats: Optional[Dict[str, Any]] = None,
+        signal_output: Dict[str, Any],
+        technical_output: Dict[str, Any],
+        drift_stats: Dict[str, Any],
     ) -> Dict[str, Any]:
 
         if not self.enabled:
@@ -190,13 +189,13 @@ class LLMExplainer:
             }
 
         ticker = signal_row.get("ticker")
-        signal = agent_output.get("signal")
+        signal = signal_output.get("signal")
 
         cache_key = self._cache_key(
             signal_row,
-            agent_output,
-            context_stats,
-            probability_stats
+            signal_output,
+            technical_output,
+            drift_stats
         )
 
         cached = self._get_cached(cache_key)
@@ -214,9 +213,9 @@ class LLMExplainer:
 
         prompt = self._build_prompt(
             signal_row,
-            agent_output,
-            context_stats,
-            probability_stats
+            signal_output,
+            technical_output,
+            drift_stats
         )
 
         try:
@@ -297,44 +296,31 @@ class LLMExplainer:
             }
 
     ########################################################
-    # PROMPT BUILDER (ALIGNED WITH ROUTE)
+    # PROMPT BUILDER (HYBRID AWARE)
     ########################################################
 
-    def _build_prompt(self, row, agent, stats, probability_stats):
-
-        prob_section = ""
-
-        if probability_stats:
-            prob_section = f"""
-Probability Context:
-Mean Score: {probability_stats.get("mean_score")}
-Std Dev: {probability_stats.get("std_score")}
-"""
+    def _build_prompt(self, row, signal_output, technical_output, drift_stats):
 
         return f"""
 Ticker: {row.get("ticker")}
-Signal: {agent.get("signal")}
-Alpha Score: {row.get("alpha_score")}
-Final Hybrid Score: {row.get("score")}
-Position Weight: {row.get("weight")}
 
-Confidence: {agent.get("confidence")}
-Strength Score: {agent.get("strength_score")}
-Risk Level: {agent.get("risk_level")}
+Raw Model Score: {row.get("raw_model_score")}
+Signal Agent Score: {row.get("agent_score")}
+Technical Agent Score: {row.get("technical_score")}
+Hybrid Consensus Score: {row.get("hybrid_consensus_score")}
 
-Trend: {agent.get("trend")}
-Momentum: {agent.get("momentum_state")}
-Macro Regime: {agent.get("macro_regime")}
-Volatility Regime: {agent.get("volatility_regime")}
+Final Signal: {signal_output.get("signal")}
+Confidence: {signal_output.get("confidence_numeric")}
+Risk Level: {signal_output.get("risk_level")}
+Volatility Regime: {signal_output.get("volatility_regime")}
 
-Drift State: {stats.get("drift_state")}
-Drift Severity: {stats.get("severity_score")}
-Cross-Sectional Dispersion: {stats.get("std")}
+Technical Bias: {technical_output.get("bias")}
+Technical Strength: {technical_output.get("score")}
 
-{prob_section}
+Drift State: {drift_stats.get("drift_state")}
+Drift Severity: {drift_stats.get("severity_score")}
 
-Warnings: {agent.get("warnings")}
-Reasoning: {agent.get("reasoning")}
+Warnings: {signal_output.get("warnings")}
 
-Provide a professional institutional-level explanation.
+Provide a professional institutional-style explanation suitable for an investment committee.
 """
