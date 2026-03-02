@@ -1,6 +1,7 @@
 import logging
 import pandas as pd
 import numpy as np
+import os
 
 from core.data.providers.market.base import MarketDataProvider
 from core.data.data_fetcher import StockPriceFetcher
@@ -19,6 +20,10 @@ class YahooProvider(MarketDataProvider):
         "1d", "1wk", "1mo",
         "1m", "5m", "15m"
     }
+
+    SOFT_FAIL_MODE = os.getenv("YAHOO_SOFT_FAIL", "1") == "1"
+    MIN_TRADING_DENSITY = 0.50
+    MAX_DAILY_MOVE = 0.85
 
     ########################################################
 
@@ -61,7 +66,6 @@ class YahooProvider(MarketDataProvider):
         else:
             df.columns = [str(c).strip().lower() for c in df.columns]
 
-        # Remove duplicate columns
         df = df.loc[:, ~df.columns.duplicated()]
 
         return df
@@ -71,7 +75,7 @@ class YahooProvider(MarketDataProvider):
     ########################################################
 
     @staticmethod
-    def _extract_ohlcv(df: pd.DataFrame, ticker: str):
+    def _extract_ohlcv(df: pd.DataFrame):
 
         col_map = {}
 
@@ -113,16 +117,14 @@ class YahooProvider(MarketDataProvider):
                 if series.shape[1] == 1:
                     series = series.iloc[:, 0]
                 else:
-                    raise RuntimeError(
-                        f"Ambiguous Yahoo column for {key}"
-                    )
+                    raise RuntimeError(f"Ambiguous Yahoo column for {key}")
 
             clean[key] = series
 
         return clean
 
     ########################################################
-    # CORE NORMALIZER
+    # CORE NORMALIZER (STABILIZED)
     ########################################################
 
     def _normalize(self, df, ticker, min_rows):
@@ -155,10 +157,10 @@ class YahooProvider(MarketDataProvider):
                 raise RuntimeError("Yahoo index is not datetime.")
 
         ####################################################
-        # EXTRACT STRICT OHLCV
+        # EXTRACT OHLCV
         ####################################################
 
-        clean = self._extract_ohlcv(df, ticker)
+        clean = self._extract_ohlcv(df)
         clean["date"] = df["date"]
 
         ####################################################
@@ -171,7 +173,6 @@ class YahooProvider(MarketDataProvider):
             clean[col] = pd.to_numeric(clean[col], errors="coerce")
 
         clean.replace([np.inf, -np.inf], np.nan, inplace=True)
-
         clean.dropna(subset=["open", "high", "low", "close"], inplace=True)
 
         if clean.empty:
@@ -202,37 +203,55 @@ class YahooProvider(MarketDataProvider):
         clean["high"] = clean[["high", "open", "close"]].max(axis=1)
         clean["low"] = clean[["low", "open", "close"]].min(axis=1)
 
-        # Remove zero or negative prices
         clean = clean[clean["close"] > 0]
 
         ####################################################
-        # SMALL GAP REPAIR
+        # EXTREME MOVE SMOOTHING
+        ####################################################
+
+        pct = clean["close"].pct_change().abs().fillna(0)
+        if (pct > self.MAX_DAILY_MOVE).any():
+            clean.loc[pct > self.MAX_DAILY_MOVE, "close"] = np.nan
+            clean["close"] = clean["close"].ffill().bfill()
+
+        ####################################################
+        # TRADING DENSITY CHECK (warning only)
+        ####################################################
+
+        unique_days = clean["date"].nunique()
+        span_days = (clean["date"].max() - clean["date"].min()).days + 1
+
+        if span_days > 0:
+            density = unique_days / span_days
+            if density < self.MIN_TRADING_DENSITY:
+                logger.warning(
+                    "Low trading density detected for %s (%.2f)",
+                    ticker,
+                    density
+                )
+
+        ####################################################
+        # GAP REPAIR
         ####################################################
 
         clean["close"] = clean["close"].ffill().bfill()
-
-        ####################################################
-        # VOLUME SAFETY
-        ####################################################
-
         clean["volume"] = clean["volume"].fillna(0).clip(lower=0)
 
         ####################################################
-        # INTRADAY ADJUSTMENT
-        ####################################################
-
-        if min_rows < 60:
-            min_rows = max(min_rows, 30)
-
-        ####################################################
-        # MIN HISTORY CHECK
+        # MIN HISTORY CHECK (adaptive)
         ####################################################
 
         if len(clean) < min_rows:
-            raise RuntimeError(
-                f"Insufficient history for {ticker} "
-                f"({len(clean)} < {min_rows})"
-            )
+            if self.SOFT_FAIL_MODE and len(clean) >= int(min_rows * 0.7):
+                logger.warning(
+                    "Short history accepted in soft mode for %s",
+                    ticker
+                )
+            else:
+                raise RuntimeError(
+                    f"Insufficient history for {ticker} "
+                    f"({len(clean)} < {min_rows})"
+                )
 
         clean["ticker"] = ticker
 
