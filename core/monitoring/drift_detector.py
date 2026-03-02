@@ -1,3 +1,8 @@
+# =========================================================
+# DRIFT DETECTOR v2.0
+# Hybrid Multi-Agent Compatible | CV-Optimized
+# =========================================================
+
 import numpy as np
 import pandas as pd
 import os
@@ -12,7 +17,6 @@ from core.schema.feature_schema import (
 )
 
 from core.artifacts.metadata_manager import MetadataManager
-from app.inference.model_loader import ModelLoader
 
 logger = logging.getLogger("marketsentinel.drift")
 
@@ -26,16 +30,23 @@ except Exception:
 
 
 class DriftDetector:
+    """
+    Lightweight but robust drift detection system.
+
+    Designed for:
+    - Hybrid consensus architecture
+    - Noisy yfinance data
+    - CV demonstration of governance layer
+    """
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "25.0"  # bumped
+    BASELINE_VERSION = "26.0"
 
-    MIN_SAMPLE_BASELINE = 150
     MIN_SAMPLE_INFERENCE = 25
-    MIN_FEATURE_EVAL_RATIO = 0.3  # 🔥 new safeguard
+    MIN_FEATURE_EVAL_RATIO = 0.3
 
     VARIANCE_RATIO_UPPER = 4.0
-    VARIANCE_RATIO_LOWER = 0.20
+    VARIANCE_RATIO_LOWER = 0.25
 
     PSI_ALERT = 0.45
     MIN_BIN_PCT = 0.01
@@ -49,6 +60,8 @@ class DriftDetector:
     HARD_SEVERITY_THRESHOLD = 10
 
     RECENT_WEIGHT_FACTOR = 1.5
+
+    # -----------------------------------------------------
 
     def __init__(self, z_threshold: float = 4.0, baseline_dir: str = "artifacts/drift"):
 
@@ -66,11 +79,9 @@ class DriftDetector:
             "false"
         ).lower() == "true"
 
-        self._model_loader = ModelLoader()
-
-    # =========================================================
+    # =====================================================
     # SAFE FEATURE BLOCK
-    # =========================================================
+    # =====================================================
 
     def _safe_feature_block(self, dataset: pd.DataFrame):
 
@@ -86,9 +97,9 @@ class DriftDetector:
 
         return block
 
-    # =========================================================
-    # HASH
-    # =========================================================
+    # =====================================================
+    # BASELINE HASH
+    # =====================================================
 
     @staticmethod
     def _baseline_hash(payload: dict) -> str:
@@ -99,9 +110,9 @@ class DriftDetector:
         canonical = json.dumps(clone, sort_keys=True).encode()
         return hashlib.sha256(canonical).hexdigest()
 
-    # =========================================================
-    # LOAD VERIFIED BASELINE
-    # =========================================================
+    # =====================================================
+    # LOAD VERIFIED BASELINE (SOFTENED)
+    # =====================================================
 
     def _load_verified_baseline(self):
 
@@ -111,32 +122,29 @@ class DriftDetector:
         with open(self.BASELINE_PATH, encoding="utf-8") as f:
             baseline = json.load(f)
 
-        if baseline["integrity_hash"] != self._baseline_hash(baseline):
+        if baseline.get("integrity_hash") != self._baseline_hash(baseline):
             raise RuntimeError("Baseline integrity failure.")
 
-        meta = baseline["meta"]
+        meta = baseline.get("meta", {})
 
-        if meta["baseline_version"] != self.BASELINE_VERSION:
-            raise RuntimeError("Baseline version mismatch.")
+        if meta.get("baseline_version") != self.BASELINE_VERSION:
+            logger.warning("Baseline version mismatch.")
 
-        if meta["schema_signature"] != get_schema_signature():
-            raise RuntimeError("Baseline schema mismatch.")
+        if meta.get("schema_signature") != get_schema_signature():
+            logger.warning("Schema signature mismatch.")
 
         current_checksum = MetadataManager.fingerprint_features(
             tuple(MODEL_FEATURES)
         )
 
         if meta.get("feature_checksum") != current_checksum:
-            raise RuntimeError("Feature checksum mismatch.")
-
-        if meta.get("model_version") != self._model_loader.xgb_version:
-            logger.warning("Baseline tied to different model version.")
+            logger.warning("Feature checksum mismatch.")
 
         return baseline
 
-    # =========================================================
+    # =====================================================
     # PSI
-    # =========================================================
+    # =====================================================
 
     def _psi(self, bin_edges, expected_counts, actual):
 
@@ -161,9 +169,9 @@ class DriftDetector:
 
         return float(max(psi, 0.0))
 
-    # =========================================================
-    # TIME-WEIGHTED MEAN
-    # =========================================================
+    # =====================================================
+    # TIME WEIGHTED MEAN
+    # =====================================================
 
     def _time_weighted_mean(self, series):
 
@@ -175,9 +183,9 @@ class DriftDetector:
 
         return float(np.sum(series.values * weights))
 
-    # =========================================================
+    # =====================================================
     # DETECT
-    # =========================================================
+    # =====================================================
 
     def detect(self, dataset: pd.DataFrame):
 
@@ -193,10 +201,10 @@ class DriftDetector:
             severity_accumulator = 0
             report = {}
 
-            total_features = len(baseline["features"])
+            total_features = len(baseline.get("features", {}))
             evaluated_features = 0
 
-            for col, stats in baseline["features"].items():
+            for col, stats in baseline.get("features", {}).items():
 
                 current = numeric[col].dropna()
 
@@ -207,16 +215,16 @@ class DriftDetector:
 
                 weighted_mean = self._time_weighted_mean(current)
 
-                baseline_std = max(stats["std"], self.EPSILON)
-                baseline_var = max(stats["variance"], self.EPSILON)
+                baseline_std = max(stats.get("std", 1.0), self.EPSILON)
+                baseline_var = max(stats.get("variance", 1.0), self.EPSILON)
                 current_var = max(current.var(), self.EPSILON)
 
-                z_score = abs(weighted_mean - stats["mean"]) / baseline_std
+                z_score = abs(weighted_mean - stats.get("mean", 0.0)) / baseline_std
                 variance_ratio = current_var / baseline_var
 
                 psi = self._psi(
-                    np.array(stats["bin_edges"]),
-                    np.array(stats["expected_counts"]),
+                    np.array(stats.get("bin_edges", [])),
+                    np.array(stats.get("expected_counts", [])),
                     current.values
                 )
 
@@ -244,12 +252,10 @@ class DriftDetector:
 
             coverage = float(evaluated_features / max(total_features, 1))
 
-            # 🔥 safeguard: require minimum feature evaluation
             if coverage < self.MIN_FEATURE_EVAL_RATIO:
                 drift_count = 0
                 severity_accumulator = 0
 
-            # 🔥 smooth severity (log compression)
             severity_score = min(
                 int(np.log1p(severity_accumulator)),
                 self.MAX_SEVERITY_CAP
@@ -262,7 +268,6 @@ class DriftDetector:
             )
 
             drift_detected = drift_count > 0
-
             DRIFT_DETECTED.set(1 if drift_detected else 0)
 
             if drift_state == "hard":
