@@ -1,6 +1,6 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION (Clean Quant Research Version)
-# CV-Ready | Walk-Forward Validated | Reproducible
+# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled)
+# CV-Ready | Walk-Forward Validated | Drift Governance
 # ==========================================================
 
 import os
@@ -30,10 +30,13 @@ from core.market.universe import MarketUniverse
 from core.artifacts.metadata_manager import MetadataManager
 from training.backtesting.walk_forward import WalkForwardValidator, FORWARD_DAYS
 from core.models.xgboost import build_xgboost_pipeline
+from core.monitoring.drift_detector import DriftDetector
 
 logger = logging.getLogger("marketsentinel.train_xgb")
 
 MODEL_DIR = os.path.abspath("artifacts/xgboost")
+DRIFT_DIR = os.path.abspath("artifacts/drift")
+BASELINE_PATH = os.path.join(DRIFT_DIR, "baseline.json")
 PRODUCTION_POINTER = "production_pointer.json"
 
 SEED = 42
@@ -93,7 +96,66 @@ def compute_reproducibility_hash(dataset_hash):
 
 
 # ==========================================================
-# ARTIFACT EXPORT (UPDATED TO USE METADATAMANAGER)
+# BASELINE BUILDER (NEW)
+# ==========================================================
+
+def build_baseline(df: pd.DataFrame, model_version: str, dataset_hash: str):
+
+    os.makedirs(DRIFT_DIR, exist_ok=True)
+
+    feature_block = df.loc[:, MODEL_FEATURES].copy()
+
+    features_payload = {}
+
+    for col in MODEL_FEATURES:
+
+        series = pd.to_numeric(feature_block[col], errors="coerce")
+        series = series.replace([np.inf, -np.inf], np.nan).dropna()
+
+        if len(series) < 50:
+            continue
+
+        mean = float(series.mean())
+        std = float(series.std())
+        variance = float(series.var())
+
+        counts, bin_edges = np.histogram(series, bins=10)
+
+        features_payload[col] = {
+            "mean": mean,
+            "std": std,
+            "variance": variance,
+            "bin_edges": bin_edges.tolist(),
+            "expected_counts": counts.tolist()
+        }
+
+    baseline = {
+        "meta": {
+            "baseline_version": DriftDetector.BASELINE_VERSION,
+            "schema_signature": get_schema_signature(),
+            "schema_version": SCHEMA_VERSION,
+            "feature_checksum": compute_feature_checksum(),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "dataset_hash": dataset_hash,
+            "model_version": model_version,
+            "universe_hash": MarketUniverse.fingerprint()
+        },
+        "features": features_payload
+    }
+
+    # integrity hash
+    clone = dict(baseline)
+    canonical = json.dumps(clone, sort_keys=True).encode()
+    baseline["integrity_hash"] = hashlib.sha256(canonical).hexdigest()
+
+    with open(BASELINE_PATH, "w", encoding="utf-8") as f:
+        json.dump(baseline, f, indent=2)
+
+    logger.info("Baseline created/updated at %s", BASELINE_PATH)
+
+
+# ==========================================================
+# ARTIFACT EXPORT
 # ==========================================================
 
 def export_artifacts(model,
@@ -102,7 +164,8 @@ def export_artifacts(model,
                      dataset_rows,
                      start_date,
                      end_date,
-                     promote_baseline=False):
+                     promote_baseline=False,
+                     create_baseline=False):
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -112,13 +175,9 @@ def export_artifacts(model,
     model_path = os.path.join(MODEL_DIR, f"model_{version}.pkl")
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{version}.json")
 
-    # Save model
     joblib.dump(model, model_path)
-
-    # Compute artifact hash
     artifact_hash = sha256_file(model_path)
 
-    # Build metadata using institutional manager
     metadata = MetadataManager.create_metadata(
         model_name="xgboost_regressor",
         metrics=metrics,
@@ -140,7 +199,21 @@ def export_artifacts(model,
 
     logger.info("Artifacts saved | version=%s", version)
 
-    # Promote to production
+    # -------------------------
+    # BASELINE CREATION
+    # -------------------------
+
+    if create_baseline or promote_baseline:
+        build_baseline(
+            df=metadata["dataset_preview"] if "dataset_preview" in metadata else None,
+            model_version=version,
+            dataset_hash=dataset_hash
+        )
+
+    # -------------------------
+    # PROMOTION
+    # -------------------------
+
     if promote_baseline:
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
         pointer_data = {
@@ -151,6 +224,8 @@ def export_artifacts(model,
             json.dump(pointer_data, f, indent=2)
 
         logger.info("Model promoted to production.")
+
+    return version
 
 
 # ==========================================================
@@ -275,6 +350,7 @@ def trainer(train_df):
 
 def main(start_date=None,
          end_date=None,
+         create_baseline=False,
          promote_baseline=False,
          allow_soft_fail=False):
 
@@ -291,11 +367,6 @@ def main(start_date=None,
         validator = WalkForwardValidator(trainer)
         metrics = validator.run(raw_df.copy())
 
-        logger.info(
-            "Walk-forward completed | Sharpe=%.4f",
-            metrics.get("avg_sharpe", 0)
-        )
-
         final_df = build_target(raw_df)
         dataset_hash = compute_dataset_hash(final_df)
 
@@ -308,7 +379,8 @@ def main(start_date=None,
             dataset_rows=len(final_df),
             start_date=start_date,
             end_date=end_date,
-            promote_baseline=promote_baseline
+            promote_baseline=promote_baseline,
+            create_baseline=create_baseline
         )
 
         logger.info("Training completed successfully.")
@@ -325,12 +397,14 @@ def main(start_date=None,
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--create-baseline", action="store_true")
     parser.add_argument("--promote-baseline", action="store_true")
     parser.add_argument("--allow-soft-fail", action="store_true")
 
     args = parser.parse_args()
 
     main(
+        create_baseline=args.create_baseline,
         promote_baseline=args.promote_baseline,
         allow_soft_fail=args.allow_soft_fail
     )
