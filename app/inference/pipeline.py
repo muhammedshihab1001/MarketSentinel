@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v3.0 (CV-Optimized Stable)
+# INSTITUTIONAL INFERENCE PIPELINE v3.2 (Agent-Safe Stable)
 # =========================================================
 
 import time
@@ -12,7 +12,6 @@ from typing import List
 
 from core.data.market_data_service import MarketDataService
 from core.features.feature_engineering import FeatureEngineer
-from core.features.feature_store import FeatureStore
 from core.monitoring.drift_detector import DriftDetector
 from core.schema.feature_schema import (
     MODEL_FEATURES,
@@ -55,7 +54,7 @@ def get_shared_model_loader():
 class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
-    MIN_UNIVERSE_WIDTH = 8              # softened for CV demo
+    MIN_UNIVERSE_WIDTH = 8
     MIN_SCORE_STD = 1e-6
     MAX_POSITION_WEIGHT = 0.20
 
@@ -64,7 +63,7 @@ class InferencePipeline:
     TOP_SELECTION = 5
 
     SCORE_WINSOR_Q = 0.02
-    BASE_LIQUIDITY = 5e5                # softer liquidity filter
+    BASE_LIQUIDITY = 5e5
 
     SNAPSHOT_CACHE_TTL = 5
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
@@ -77,7 +76,6 @@ class InferencePipeline:
         self.cache = RedisCache()
         self.drift_detector = DriftDetector()
         self.signal_agent = SignalAgent()
-        self.feature_store = FeatureStore()
 
         self._validate_models_loaded()
 
@@ -101,18 +99,22 @@ class InferencePipeline:
         return e / (np.sum(e) + EPSILON)
 
     # ---------------------------------------------------------
-    # MAIN SNAPSHOT
+    # MAIN SNAPSHOT (FIXED)
     # ---------------------------------------------------------
 
     def run_snapshot(self, tickers: List[str]):
 
-        universe = sorted(set(tickers or MarketUniverse.get_universe()))
-        if not universe:
+        # 🔥 Always build FULL universe for cross-sectional math
+        full_universe = list(MarketUniverse.get_universe())
+
+        if not full_universe:
             raise RuntimeError("Universe empty.")
+
+        requested = sorted(set(tickers)) if tickers else full_universe
 
         cache_key = self.cache.build_key({
             "type": "snapshot",
-            "tickers": universe
+            "requested": requested
         })
 
         cached = self.cache.get(cache_key)
@@ -124,10 +126,14 @@ class InferencePipeline:
 
         try:
 
-            df = self._build_cross_sectional_frame(universe)
+            # 🔥 Build CS frame using FULL universe
+            df = self._build_cross_sectional_frame(full_universe)
 
             latest_date = df["date"].max()
             latest_df = df[df["date"] == latest_date].copy()
+
+            # 🔥 Filter AFTER CS features built
+            latest_df = latest_df[latest_df["ticker"].isin(requested)]
 
             latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
             latest_df = latest_df.dropna(subset=MODEL_FEATURES)
@@ -135,27 +141,17 @@ class InferencePipeline:
             if latest_df.empty:
                 raise RuntimeError("Latest snapshot invalid.")
 
-            # -----------------------------
-            # Soft Liquidity Filter
-            # -----------------------------
+            # Soft liquidity filter
             if "dollar_volume" in latest_df.columns:
-
                 liquidity_threshold = max(
                     self.BASE_LIQUIDITY,
                     latest_df["dollar_volume"].quantile(0.25)
                 )
-
                 filtered = latest_df[
                     latest_df["dollar_volume"] > liquidity_threshold
                 ]
-
-                # fallback if too aggressive
                 if len(filtered) >= self.MIN_UNIVERSE_WIDTH:
                     latest_df = filtered
-
-            if len(latest_df) < self.MIN_UNIVERSE_WIDTH:
-                logger.warning("Universe too small — fallback to raw set.")
-                # do not crash for CV demo
 
             feature_df = validate_feature_schema(
                 latest_df.loc[:, MODEL_FEATURES],
@@ -167,11 +163,7 @@ class InferencePipeline:
 
             raw_scores = self.models.xgb.predict(feature_df)
 
-            # -----------------------------
-            # Dispersion Safety Fallback
-            # -----------------------------
             if np.std(raw_scores) < self.MIN_SCORE_STD:
-                logger.warning("Low score dispersion — applying small noise.")
                 raw_scores = raw_scores + np.random.normal(0, 1e-6, len(raw_scores))
 
             raw_scores = self._winsorize(raw_scores)
@@ -201,9 +193,7 @@ class InferencePipeline:
                     "agent": agent_output
                 })
 
-            # -----------------------------
-            # Portfolio Construction
-            # -----------------------------
+            # Portfolio
             ranked = latest_df.sort_values("raw_model_score")
 
             longs = ranked.tail(min(self.TOP_K, len(ranked)))
