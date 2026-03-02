@@ -134,7 +134,6 @@ def _equity_curve_sync(days: int):
     datasets = []
 
     for ticker, df in cleaned_history.items():
-
         try:
             features = FeatureEngineer.build_feature_pipeline(
                 price_df=df,
@@ -190,16 +189,26 @@ def _equity_curve_sync(days: int):
 
         ranked = snapshot.sort_values("score")
 
-        longs = ranked.tail(pipeline.TOP_K)
-        shorts = ranked.head(pipeline.BOTTOM_K)
+        longs_df = ranked.tail(pipeline.TOP_K)
+        shorts_df = ranked.head(pipeline.BOTTOM_K)
 
-        if longs.empty or shorts.empty:
+        if longs_df.empty or shorts_df.empty:
             continue
 
-        # Flexible portfolio construction
+        # Convert to row-style format expected by pipeline
+        longs = [
+            {"ticker": r["ticker"], "hybrid_consensus_score": r["score"]}
+            for _, r in longs_df.iterrows()
+        ]
+
+        shorts = [
+            {"ticker": r["ticker"], "hybrid_consensus_score": r["score"]}
+            for _, r in shorts_df.iterrows()
+        ]
+
         weights = pipeline._construct_portfolio(longs, shorts)
 
-        # Use safe drift wrapper
+        # Drift scaling (safe wrapper)
         drift_result = pipeline._safe_drift(feature_df)
         exposure_scale = drift_result.get("exposure_scale", 1.0)
 
@@ -266,7 +275,7 @@ def _equity_curve_sync(days: int):
             benchmark_df
             .set_index("date")["forward_return"]
             .reindex(report.equity_curve.index)
-            .dropna()
+            .fillna(0.0)
         )
 
         if len(benchmark_returns) > 1:
