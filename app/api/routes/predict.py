@@ -1,6 +1,7 @@
 # =========================================================
-# PREDICTION & SNAPSHOT ROUTES v2.0
+# PREDICTION & SNAPSHOT ROUTES v3.0
 # Hybrid Multi-Agent Compatible
+# CV-Optimized | Decision-Aware | Governance-Aware
 # =========================================================
 
 import time
@@ -34,6 +35,10 @@ logger = logging.getLogger("marketsentinel.api")
 _pipeline: InferencePipeline | None = None
 
 
+# =========================================================
+# PIPELINE SINGLETON
+# =========================================================
+
 def get_pipeline() -> InferencePipeline:
     global _pipeline
     if _pipeline is None:
@@ -41,6 +46,10 @@ def get_pipeline() -> InferencePipeline:
         _pipeline = InferencePipeline()
     return _pipeline
 
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 MAX_CONCURRENT_INFERENCES = int(os.getenv("MAX_CONCURRENT_INFERENCES", "4"))
 REQUEST_TIMEOUT = int(os.getenv("INFERENCE_TIMEOUT_SEC", "180"))
@@ -56,6 +65,10 @@ inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
 
 TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 
+
+# =========================================================
+# UTILS
+# =========================================================
 
 def safe_attr(obj, attr, default=None):
     return getattr(obj, attr, default)
@@ -136,6 +149,23 @@ async def live_snapshot():
             if hybrid_scores else 0.0
         )
 
+        # =====================================================
+        # NEW: Executive Summary
+        # =====================================================
+
+        top_5 = snapshot.get("top_5", [])
+        decision_report = snapshot.get("decision_report", {})
+        governance = snapshot.get("governance", {})
+        drift = snapshot.get("drift", {})
+
+        executive_summary = {
+            "top_5_tickers": [t["ticker"] for t in top_5],
+            "portfolio_bias": decision_report.get("portfolio_bias"),
+            "risk_regime": drift.get("drift_state"),
+            "gross_exposure": snapshot.get("gross_exposure"),
+            "net_exposure": snapshot.get("net_exposure")
+        }
+
         meta = {
             "model_version": safe_attr(loader, "xgb_version"),
             "schema_signature": safe_attr(loader, "schema_signature"),
@@ -146,14 +176,17 @@ async def live_snapshot():
             "long_signals": long_count,
             "short_signals": short_count,
             "avg_hybrid_score": avg_strength,
-            "gross_exposure": snapshot.get("gross_exposure"),
-            "net_exposure": snapshot.get("net_exposure"),
-            "drift_state": snapshot.get("drift", {}).get("drift_state"),
+            "drift_state": drift.get("drift_state"),
+            "baseline_status": governance.get("baseline_status"),
             "latency_ms": int((time.time() - start_time) * 1000),
             "timestamp": int(time.time())
         }
 
-        return {"meta": meta, "snapshot": snapshot}
+        return {
+            "meta": meta,
+            "executive_summary": executive_summary,
+            "snapshot": snapshot
+        }
 
     except asyncio.TimeoutError:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
@@ -210,16 +243,13 @@ async def signal_explanation(ticker: str):
         if row is None:
             raise HTTPException(status_code=404, detail="Signal not found.")
 
-        # Hybrid-safe extraction
         agents = row.get("agents", {})
         signal_agent = agents.get("signal_agent", {})
-
-        direction = signal_agent.get("signal", "NEUTRAL")
 
         explanation = SignalExplanationResponse(
             ticker=row["ticker"],
             score=row.get("raw_model_score", 0.0),
-            signal=direction,
+            signal=signal_agent.get("signal", "NEUTRAL"),
             agent_score=row.get("hybrid_consensus_score", row.get("agent_score", 0.0)),
             alpha_strength=signal_agent.get("alpha_strength", 0.0),
             confidence_numeric=signal_agent.get("confidence_numeric", 0.0),
