@@ -19,6 +19,9 @@ class PerformanceReport:
     annual_volatility: float
     annual_return: float
     turnover: float
+    skewness: float
+    downside_deviation: float
+    tracking_error: Optional[float]
     beta: Optional[float]
     information_ratio: Optional[float]
     daily_returns: pd.Series
@@ -39,6 +42,9 @@ class PerformanceReport:
             "annual_volatility": float(self.annual_volatility),
             "annual_return": float(self.annual_return),
             "turnover": float(self.turnover),
+            "skewness": float(self.skewness),
+            "downside_deviation": float(self.downside_deviation),
+            "tracking_error": None if self.tracking_error is None else float(self.tracking_error),
             "beta": None if self.beta is None else float(self.beta),
             "information_ratio": None if self.information_ratio is None else float(self.information_ratio),
         }
@@ -101,6 +107,9 @@ class PerformanceEngine:
 
         daily = daily.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
+        # Safety guard against absurd leverage artifacts
+        daily = daily.clip(lower=-0.5, upper=0.5)
+
         if len(daily) < 2:
             raise RuntimeError("Not enough daily returns.")
 
@@ -109,8 +118,6 @@ class PerformanceEngine:
         ########################################################
 
         equity = (1.0 + daily).cumprod()
-
-        # Prevent unrealistic runaway values
         equity = equity.clip(lower=0.0)
 
         cumulative_return = float(equity.iloc[-1] - 1.0)
@@ -136,6 +143,9 @@ class PerformanceEngine:
         calmar = self._calmar_ratio(ann_ret, max_dd)
         hit = self._hit_rate(daily)
         turnover = self._turnover(portfolio_df)
+        skewness = float(daily.skew())
+        downside_dev = self._downside_deviation(daily)
+        tracking_error = self._tracking_error(daily, benchmark_returns)
         beta = self._beta(daily, benchmark_returns)
         info_ratio = self._information_ratio(daily, benchmark_returns)
 
@@ -153,6 +163,9 @@ class PerformanceEngine:
             annual_volatility=ann_vol,
             annual_return=ann_ret,
             turnover=turnover,
+            skewness=skewness,
+            downside_deviation=downside_dev,
+            tracking_error=tracking_error,
             beta=beta,
             information_ratio=info_ratio,
             daily_returns=daily,
@@ -181,6 +194,12 @@ class PerformanceEngine:
             return 0.0
         return float((daily.mean() / downside_std) * np.sqrt(self.TRADING_DAYS))
 
+    def _downside_deviation(self, daily):
+        downside = daily[daily < 0]
+        if len(downside) == 0:
+            return 0.0
+        return float(downside.std(ddof=1) * np.sqrt(self.TRADING_DAYS))
+
     def _annual_volatility(self, daily):
         std = daily.std(ddof=1)
         if std <= EPSILON:
@@ -193,7 +212,7 @@ class PerformanceEngine:
         if years <= 0:
             return 0.0
         try:
-            return float(cumulative ** (1.0 / years) - 1.0)
+            return float(np.clip(cumulative, 0.0, 1e6) ** (1.0 / years) - 1.0)
         except Exception:
             return 0.0
 
@@ -231,6 +250,17 @@ class PerformanceEngine:
         turnover = turnover.iloc[1:]
 
         return float(turnover.mean()) if len(turnover) > 0 else 0.0
+
+    def _tracking_error(self, strategy, benchmark):
+        if benchmark is None:
+            return None
+
+        aligned_s, aligned_b = strategy.align(benchmark, join="inner")
+        active = aligned_s - aligned_b
+        std = active.std(ddof=1)
+        if std <= EPSILON:
+            return None
+        return float(std * np.sqrt(self.TRADING_DAYS))
 
     def _beta(self, strategy, benchmark):
         if benchmark is None:
