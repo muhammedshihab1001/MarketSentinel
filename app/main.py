@@ -1,3 +1,8 @@
+# =====================================================
+# MARKET SENTINEL APPLICATION ENTRYPOINT v2.0
+# Hybrid Multi-Agent | CV-Optimized Architecture
+# =====================================================
+
 import logging
 import time
 import gc
@@ -37,25 +42,20 @@ from core.monitoring.drift_detector import DriftDetector
 
 init_env()
 
-
-# =====================================================
-# LOGGING
-# =====================================================
-
 logger = logging.getLogger("marketsentinel")
 
 
 # =====================================================
-# SYSTEM FINGERPRINT
+# SYSTEM METADATA
 # =====================================================
 
 BOOT_ID = hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
 STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 120)
-APP_VERSION = get_env("APP_VERSION", "4.0.0")
+APP_VERSION = get_env("APP_VERSION", "4.1.0")
 
 
 # =====================================================
-# GLOBAL READINESS STATE
+# READINESS STATE
 # =====================================================
 
 class ReadinessState:
@@ -112,17 +112,17 @@ async def global_exception_handler(request: Request, exc: Exception):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
-    start_time = time.time()
+    boot_start = time.time()
 
     try:
         logger.info("===================================")
-        logger.info(" MarketSentinel Boot Sequence Start ")
+        logger.info(" MarketSentinel Boot Sequence ")
         logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("===================================")
 
-        # -----------------------------
+        # -------------------------------------------------
         # MODEL LOADING
-        # -----------------------------
+        # -------------------------------------------------
 
         loader = ModelLoader()
         _ = loader.xgb
@@ -136,18 +136,22 @@ async def lifespan(app: FastAPI):
         readiness.training_code_hash = loader.training_code_hash
 
         if readiness.schema_signature != get_schema_signature():
-            raise RuntimeError("Runtime schema mismatch.")
+            logger.warning("Runtime schema mismatch detected.")
 
-        # -----------------------------
-        # REDIS
-        # -----------------------------
+        # -------------------------------------------------
+        # REDIS (Soft)
+        # -------------------------------------------------
 
-        cache = RedisCache()
-        readiness.redis_connected = cache.enabled
+        try:
+            cache = RedisCache()
+            readiness.redis_connected = cache.enabled
+        except Exception:
+            readiness.redis_connected = False
+            logger.warning("Redis unavailable — continuing in degraded mode.")
 
-        # -----------------------------
-        # DRIFT BASELINE
-        # -----------------------------
+        # -------------------------------------------------
+        # DRIFT BASELINE (Soft)
+        # -------------------------------------------------
 
         try:
             detector = DriftDetector()
@@ -155,19 +159,20 @@ async def lifespan(app: FastAPI):
             readiness.drift_baseline_loaded = True
         except Exception:
             readiness.drift_baseline_loaded = False
+            logger.warning("Drift baseline not loaded (non-blocking).")
 
-        # -----------------------------
+        # -------------------------------------------------
         # LLM STATE
-        # -----------------------------
+        # -------------------------------------------------
 
         readiness.llm_enabled = get_bool("LLM_ENABLED", False)
         readiness.llm_model = get_env("OPENAI_MODEL", None)
         readiness.llm_rate_limit = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
         readiness.llm_cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
 
-        # -----------------------------
+        # -------------------------------------------------
         # SYSTEM SNAPSHOT
-        # -----------------------------
+        # -------------------------------------------------
 
         process = psutil.Process(os.getpid())
         readiness.boot_memory_mb = round(
@@ -180,10 +185,10 @@ async def lifespan(app: FastAPI):
 
         gc.collect()
 
-        boot_time = round(time.time() - start_time, 2)
+        boot_time = round(time.time() - boot_start, 2)
 
         if boot_time > STARTUP_TIMEOUT_SEC:
-            raise RuntimeError("Startup exceeded timeout.")
+            logger.warning("Startup exceeded expected timeout threshold.")
 
         logger.info("System ready in %.2fs", boot_time)
 
@@ -198,7 +203,7 @@ async def lifespan(app: FastAPI):
 
 
 # =====================================================
-# FASTAPI APP (DEFINE FIRST)
+# FASTAPI APP
 # =====================================================
 
 app = FastAPI(
@@ -211,7 +216,7 @@ app.add_exception_handler(Exception, global_exception_handler)
 
 
 # =====================================================
-# REQUEST MIDDLEWARE (NOW SAFE)
+# REQUEST MIDDLEWARE
 # =====================================================
 
 @app.middleware("http")
@@ -256,7 +261,8 @@ app.include_router(agent.router)
 @app.get("/")
 async def root():
     return {
-        "service": "MarketSentinel Portfolio Engine",
+        "service": "MarketSentinel Hybrid Portfolio Engine",
+        "architecture": "multi-agent-ml-governed",
         "status": "running",
         "boot_id": readiness.boot_id,
         "model_version": readiness.model_version,
