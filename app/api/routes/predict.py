@@ -38,7 +38,7 @@ def get_pipeline() -> InferencePipeline:
 
 
 MAX_CONCURRENT_INFERENCES = int(os.getenv("MAX_CONCURRENT_INFERENCES", "4"))
-REQUEST_TIMEOUT = int(os.getenv("INFERENCE_TIMEOUT_SEC", "25"))
+REQUEST_TIMEOUT = int(os.getenv("INFERENCE_TIMEOUT_SEC", "180"))
 MIN_BATCH_SIZE = 4
 
 PRIMARY_UNIVERSE_PATH = Path(

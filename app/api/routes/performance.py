@@ -29,7 +29,7 @@ logger = logging.getLogger("marketsentinel.performance")
 MIN_HISTORY_ROWS = 60
 BENCHMARK_TICKER = "SPY"
 MIN_SCORE_STD = 1e-6
-REQUEST_TIMEOUT = 60
+REQUEST_TIMEOUT = 180
 MAX_CONCURRENT = 2
 
 performance_semaphore = asyncio.Semaphore(MAX_CONCURRENT)

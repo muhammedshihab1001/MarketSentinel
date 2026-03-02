@@ -20,7 +20,7 @@ from app.monitoring.metrics import (
 router = APIRouter()
 logger = logging.getLogger("marketsentinel.drift")
 
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = 180
 MAX_CONCURRENT = 2
 MIN_UNIVERSE_WIDTH = 10
 

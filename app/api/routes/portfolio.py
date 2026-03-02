@@ -18,7 +18,7 @@ from app.monitoring.metrics import (
 router = APIRouter()
 logger = logging.getLogger("marketsentinel.portfolio")
 
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = 180
 MAX_CONCURRENT = 3
 
 portfolio_semaphore = asyncio.Semaphore(MAX_CONCURRENT)

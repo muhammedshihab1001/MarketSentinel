@@ -28,7 +28,7 @@ logger = logging.getLogger("marketsentinel.equity")
 
 MIN_HISTORY_ROWS = 60
 BENCHMARK_TICKER = "SPY"
-REQUEST_TIMEOUT = 60
+REQUEST_TIMEOUT = 180
 MAX_CONCURRENT = 2
 MIN_SCORE_STD = 1e-6
 
