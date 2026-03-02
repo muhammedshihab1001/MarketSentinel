@@ -5,7 +5,7 @@ import threading
 import hashlib
 import json
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from datetime import datetime
 
 from openai import AsyncOpenAI
@@ -83,11 +83,11 @@ class LLMExplainer:
     # CACHE
     ########################################################
 
-    def _cache_key(self, row, agent, stats):
+    def _cache_key(self, row, agent, stats, probability_stats):
 
         payload = {
             "ticker": row.get("ticker"),
-            "signal": row.get("signal"),
+            "signal": agent.get("signal"),
             "alpha_score": row.get("alpha_score"),
             "score": row.get("score"),
             "weight": row.get("weight"),
@@ -100,6 +100,7 @@ class LLMExplainer:
             "drift_state": stats.get("drift_state"),
             "severity_score": stats.get("severity_score"),
             "score_std": stats.get("std"),
+            "probability_stats": probability_stats or {}
         }
 
         canonical = json.dumps(payload, sort_keys=True)
@@ -171,7 +172,7 @@ class LLMExplainer:
             logger.warning("Failed to write LLM audit log.")
 
     ########################################################
-    # PUBLIC API
+    # PUBLIC API (UPDATED)
     ########################################################
 
     async def explain(
@@ -179,6 +180,7 @@ class LLMExplainer:
         signal_row: Dict[str, Any],
         agent_output: Dict[str, Any],
         context_stats: Dict[str, Any],
+        probability_stats: Optional[Dict[str, Any]] = None,   # 🔥 FIX
     ) -> Dict[str, Any]:
 
         if not self.enabled:
@@ -193,16 +195,14 @@ class LLMExplainer:
         cache_key = self._cache_key(
             signal_row,
             agent_output,
-            context_stats
+            context_stats,
+            probability_stats
         )
 
         cached = self._get_cached(cache_key)
         if cached:
             self._audit_log(ticker, signal, cached, cached=True)
-            return {
-                **cached,
-                "cached": True
-            }
+            return {**cached, "cached": True}
 
         if not self._check_rate_limit():
             result = {
@@ -215,7 +215,8 @@ class LLMExplainer:
         prompt = self._build_prompt(
             signal_row,
             agent_output,
-            context_stats
+            context_stats,
+            probability_stats
         )
 
         try:
@@ -296,10 +297,19 @@ class LLMExplainer:
             }
 
     ########################################################
-    # PROMPT BUILDER (HYBRID AWARE)
+    # PROMPT BUILDER (UPDATED)
     ########################################################
 
-    def _build_prompt(self, row, agent, stats):
+    def _build_prompt(self, row, agent, stats, probability_stats):
+
+        prob_section = ""
+        if probability_stats:
+            prob_section = f"""
+Probability Context:
+Mean Score: {probability_stats.get("mean")}
+Std Dev: {probability_stats.get("std")}
+Percentile Rank: {probability_stats.get("percentile")}
+"""
 
         return f"""
 Ticker: {row.get("ticker")}
@@ -320,6 +330,8 @@ Volatility Regime: {agent.get("volatility_regime")}
 Drift State: {stats.get("drift_state")}
 Drift Severity: {stats.get("severity_score")}
 Cross-Sectional Dispersion: {stats.get("std")}
+
+{prob_section}
 
 Warnings: {agent.get("warnings")}
 Reasoning: {agent.get("reasoning")}
