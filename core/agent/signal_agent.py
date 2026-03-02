@@ -1,10 +1,11 @@
 # =========================================================
-# INSTITUTIONAL SIGNAL AGENT v3.0
+# INSTITUTIONAL SIGNAL AGENT v3.1
 # Hybrid-Compatible Model Intelligence Agent
+# CV-Optimized | Lightweight | yfinance-aware
 # =========================================================
 
 import numpy as np
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 from core.agent.base_agent import BaseAgent
 
@@ -15,18 +16,18 @@ class SignalAgent(BaseAgent):
     """
     Primary Model Intelligence Agent.
 
-    This agent:
-    - Consumes ML model output
-    - Applies technical confirmation
-    - Applies volatility adjustment
-    - Applies drift penalty
-    - Produces structured hybrid-compatible output
+    Responsibilities:
+    - Consume ML model output
+    - Apply technical alignment
+    - Apply volatility adjustment
+    - Apply drift penalty
+    - Produce hybrid-compatible structured output
 
-    Backward compatible with existing pipeline.
+    Designed for CV showcase (clean architecture, not over-engineered).
     """
 
     name = "SignalAgent"
-    weight = 1.0  # Used later for consensus scoring
+    weight = 1.0
 
     RSI_OVERBOUGHT = 70
     RSI_OVERSOLD = 30
@@ -35,7 +36,6 @@ class SignalAgent(BaseAgent):
     EMA_BEARISH = 0.95
 
     Z_VERY_STRONG = 2.0
-
     MAX_SCORE_SANITY = 10.0
 
     MAX_POSITION_SIZE = 1.0
@@ -125,25 +125,12 @@ class SignalAgent(BaseAgent):
         return float(np.clip(base, self.MIN_POSITION_SIZE, self.MAX_POSITION_SIZE))
 
     # ---------------------------------------------------------
-    # HYBRID ANALYZE (BaseAgent Contract)
+    # MAIN ANALYZE (Hybrid Compatible)
     # ---------------------------------------------------------
 
     def analyze(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Hybrid-compatible analyze method.
 
-        Context expected:
-        {
-            "row": feature_row_dict,
-            "probability_stats": optional,
-            "drift_score": optional
-        }
-
-        Backward compatible with old usage:
-        If context is raw row dict, it still works.
-        """
-
-        # Backward compatibility layer
+        # Backward compatibility
         if "row" in context:
             row = context.get("row", {})
             probability_stats = context.get("probability_stats")
@@ -177,8 +164,12 @@ class SignalAgent(BaseAgent):
 
         abs_score = abs(final_score)
 
+        # -------------------------------------------------
         # Alpha strength
+        # -------------------------------------------------
+
         alpha_strength = float(abs_score)
+
         confidence_numeric = self._confidence_numeric(abs_score)
         confidence_numeric = self._volatility_adjusted_confidence(
             confidence_numeric,
@@ -192,7 +183,10 @@ class SignalAgent(BaseAgent):
                 warnings.append("Low cross-sectional dispersion")
                 confidence_numeric *= 0.8
 
+        # -------------------------------------------------
         # Technical confirmation
+        # -------------------------------------------------
+
         alignment = self._alignment_score(signal, momentum_z, ema_ratio)
         technical_score = alignment / 2.0
 
@@ -201,7 +195,10 @@ class SignalAgent(BaseAgent):
         if signal == "SHORT" and rsi < self.RSI_OVERSOLD:
             warnings.append("RSI oversold")
 
+        # -------------------------------------------------
         # Risk regime
+        # -------------------------------------------------
+
         if regime_feature > 1.5:
             volatility_regime = "high_volatility"
         else:
@@ -216,7 +213,10 @@ class SignalAgent(BaseAgent):
         else:
             risk_level = "low"
 
+        # -------------------------------------------------
         # Drift penalty
+        # -------------------------------------------------
+
         drift_flag = False
         if drift_score is not None:
             drift_score = self._safe_float(drift_score, 0.0)
@@ -227,7 +227,10 @@ class SignalAgent(BaseAgent):
 
         confidence_numeric = float(np.clip(confidence_numeric, 0.0, 1.0))
 
-        # Composite score
+        # -------------------------------------------------
+        # Composite agent score
+        # -------------------------------------------------
+
         agent_score = float(np.clip(
             0.5 * confidence_numeric +
             0.3 * technical_score +
@@ -251,18 +254,26 @@ class SignalAgent(BaseAgent):
         governance_score = int(np.clip(agent_score * 100, 0, 100))
 
         explanation = (
-            f"{signal} | score={final_score:.2f} | "
+            f"{signal} | model_score={final_score:.2f} | "
             f"confidence={confidence_numeric:.2f} | "
             f"risk={risk_level} | "
             f"agent_score={agent_score:.2f}"
         )
 
-        # Hybrid structured output (new)
+        # -------------------------------------------------
+        # Hybrid structured output
+        # -------------------------------------------------
+
         hybrid_output = {
             "agent_name": self.name,
             "weight": self.weight,
             "score": agent_score,
             "confidence": confidence_numeric,
+            "component_scores": {
+                "confidence": confidence_numeric,
+                "technical_alignment": technical_score,
+                "drift_penalty": 0 if drift_flag else 1
+            },
             "signals": {
                 "direction": signal,
                 "trade_approved": trade_approved
@@ -271,9 +282,8 @@ class SignalAgent(BaseAgent):
             "reasoning": sorted(set(reasoning))
         }
 
-        # Backward compatible return
         return {
-            # ---- old keys (pipeline safe) ----
+            # --- legacy safe ---
             "signal": signal,
             "alpha_strength": alpha_strength,
             "confidence_numeric": confidence_numeric,
@@ -290,6 +300,6 @@ class SignalAgent(BaseAgent):
             "warnings": sorted(set(warnings)),
             "explanation": explanation,
 
-            # ---- new hybrid structure ----
+            # --- hybrid ---
             "hybrid": hybrid_output
         }
