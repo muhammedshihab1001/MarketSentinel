@@ -1,7 +1,7 @@
 # =========================================================
-# INSTITUTIONAL SIGNAL AGENT v3.1
+# INSTITUTIONAL SIGNAL AGENT v3.2
 # Hybrid-Compatible Model Intelligence Agent
-# CV-Optimized | Lightweight | yfinance-aware
+# Drift-Aware | Regime-Aware | CV-Optimized
 # =========================================================
 
 import numpy as np
@@ -20,10 +20,10 @@ class SignalAgent(BaseAgent):
     - Consume ML model output
     - Apply technical alignment
     - Apply volatility adjustment
-    - Apply drift penalty
+    - Apply drift penalty (state-aware)
     - Produce hybrid-compatible structured output
 
-    Designed for CV showcase (clean architecture, not over-engineered).
+    Lightweight governance-focused architecture.
     """
 
     name = "SignalAgent"
@@ -125,7 +125,7 @@ class SignalAgent(BaseAgent):
         return float(np.clip(base, self.MIN_POSITION_SIZE, self.MAX_POSITION_SIZE))
 
     # ---------------------------------------------------------
-    # MAIN ANALYZE (Hybrid Compatible)
+    # MAIN ANALYZE
     # ---------------------------------------------------------
 
     def analyze(self, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -135,10 +135,12 @@ class SignalAgent(BaseAgent):
             row = context.get("row", {})
             probability_stats = context.get("probability_stats")
             drift_score = context.get("drift_score")
+            drift_state = context.get("drift_state")
         else:
             row = context
             probability_stats = None
             drift_score = None
+            drift_state = None
 
         raw_model_score = self._safe_float(
             row.get("raw_model_score", row.get("alpha_score", row.get("score"))),
@@ -214,16 +216,15 @@ class SignalAgent(BaseAgent):
             risk_level = "low"
 
         # -------------------------------------------------
-        # Drift penalty
+        # Drift penalty (STATE-AWARE)
         # -------------------------------------------------
 
         drift_flag = False
-        if drift_score is not None:
-            drift_score = self._safe_float(drift_score, 0.0)
-            if drift_score > 0.5:
-                drift_flag = True
-                confidence_numeric *= 0.7
-                warnings.append("Feature drift detected")
+
+        if drift_state in {"soft", "hard"}:
+            drift_flag = True
+            confidence_numeric *= 0.75
+            warnings.append(f"Drift state: {drift_state}")
 
         confidence_numeric = float(np.clip(confidence_numeric, 0.0, 1.0))
 
@@ -256,7 +257,9 @@ class SignalAgent(BaseAgent):
         explanation = (
             f"{signal} | model_score={final_score:.2f} | "
             f"confidence={confidence_numeric:.2f} | "
+            f"technical={technical_score:.2f} | "
             f"risk={risk_level} | "
+            f"drift={drift_state or 'none'} | "
             f"agent_score={agent_score:.2f}"
         )
 
