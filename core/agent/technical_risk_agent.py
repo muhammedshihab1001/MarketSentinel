@@ -1,7 +1,7 @@
 # =========================================================
-# TECHNICAL & RISK AGENT v2.0
+# TECHNICAL & RISK AGENT v2.1
 # Hybrid Multi-Agent Architecture
-# CV-Optimized | Lightweight | yfinance-aware
+# Drift-Aware | Regime-Aware | CV-Optimized
 # =========================================================
 
 import numpy as np
@@ -20,6 +20,7 @@ class TechnicalRiskAgent(BaseAgent):
     - RSI sanity
     - Volatility regime
     - Liquidity quality (important for yfinance data)
+    - Drift state awareness
 
     Produces independent score (0–1).
     """
@@ -40,6 +41,8 @@ class TechnicalRiskAgent(BaseAgent):
     @staticmethod
     def _safe_float(value, default=0.0):
         try:
+            if value is None:
+                return default
             val = float(value)
             if not np.isfinite(val):
                 return default
@@ -53,6 +56,7 @@ class TechnicalRiskAgent(BaseAgent):
 
         row = context.get("row", {})
         signal = row.get("signal", "NEUTRAL")
+        drift_state = context.get("drift_state")
 
         warnings: List[str] = []
         reasoning: List[str] = []
@@ -75,7 +79,6 @@ class TechnicalRiskAgent(BaseAgent):
         if abs(momentum_z) < 0.5:
             warnings.append("Weak momentum")
 
-        # Directional bias
         if momentum_z > self.MOMENTUM_STRONG:
             bias = "bullish"
         elif momentum_z < -self.MOMENTUM_STRONG:
@@ -135,26 +138,52 @@ class TechnicalRiskAgent(BaseAgent):
         score_components.append(liquidity_score)
 
         # -------------------------------------------------
+        # Drift Penalty (STATE AWARE)
+        # -------------------------------------------------
+
+        drift_penalty = 1.0
+
+        if drift_state == "soft":
+            drift_penalty = 0.85
+            warnings.append("Soft drift environment")
+
+        elif drift_state == "hard":
+            drift_penalty = 0.70
+            warnings.append("Hard drift regime")
+
+        score_components.append(drift_penalty)
+
+        # -------------------------------------------------
         # Final Score
         # -------------------------------------------------
 
         final_score = float(np.clip(np.mean(score_components), 0.0, 1.0))
-
         confidence = final_score
+
+        governance_score = int(np.clip(final_score * 100, 0, 100))
+
+        explanation = (
+            f"tech_score={final_score:.2f} | "
+            f"bias={bias} | "
+            f"drift={drift_state or 'none'}"
+        )
 
         return {
             "agent_name": self.name,
             "weight": self.weight,
             "score": final_score,
             "confidence": confidence,
-            "bias": bias,  # NEW (required by pipeline + LLM)
+            "bias": bias,
+            "governance_score": governance_score,
             "component_scores": {
                 "momentum": momentum_strength,
                 "ema": ema_score,
                 "rsi": rsi_score,
                 "volatility": vol_score,
-                "liquidity": liquidity_score
+                "liquidity": liquidity_score,
+                "drift_penalty": drift_penalty
             },
             "warnings": sorted(set(warnings)),
-            "reasoning": reasoning
+            "reasoning": reasoning,
+            "explanation": explanation
         }
