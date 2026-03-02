@@ -1,3 +1,8 @@
+# =========================================================
+# MARKET UNIVERSE CONTROLLER v2.0
+# Hybrid Multi-Agent Compatible | CV-Optimized
+# =========================================================
+
 from typing import Tuple, Dict, Optional, List
 import hashlib
 import json
@@ -10,22 +15,25 @@ from pathlib import Path
 
 class MarketUniverse:
     """
-    Institutional Universe Controller (CV-Optimized Hybrid)
+    Deterministic Universe Controller
 
     Guarantees:
     ✔ deterministic
     ✔ file-governed
-    ✔ audit safe
-    ✔ mutation proof
     ✔ thread safe
     ✔ tamper detected
-    ✔ metadata compatible
-    ✔ research override isolated
+    ✔ hybrid compatible
+    ✔ CV-polished architecture
+
+    Softened for:
+    - Personal project usage
+    - yfinance data noise
+    - Non-critical production use
     """
 
-    ###################################################
+    # -----------------------------------------------------
     # CONFIG
-    ###################################################
+    # -----------------------------------------------------
 
     PRODUCTION_FILE = os.getenv(
         "UNIVERSE_PATH",
@@ -45,26 +53,28 @@ class MarketUniverse:
         "0"
     ) == "1"
 
-    TICKER_REGEX = re.compile(r"^[A-Z0-9.\-]{1,10}$")
+    TICKER_REGEX = re.compile(r"^[A-Z0-9.\-]{1,12}$")
 
-    _CACHE = None
+    _CACHE: Optional[Dict] = None
     _LOCK = threading.RLock()
-    _FILE_HASH = None
-    _LAST_VERSION = None
-    _LAST_LOADED_AT = None
+    _FILE_HASH: Optional[str] = None
+    _LAST_VERSION: Optional[str] = None
+    _LAST_LOADED_AT: Optional[str] = None
 
-    ###################################################
+    # -----------------------------------------------------
+    # VERSION PARSER
+    # -----------------------------------------------------
 
     @staticmethod
     def _parse_version(version: str):
         try:
             return tuple(int(x) for x in version.split("."))
         except Exception:
-            raise RuntimeError(
-                "Universe version must be numeric format like '6.0'"
-            )
+            return (0,)
 
-    ###################################################
+    # -----------------------------------------------------
+    # FILE RESOLUTION
+    # -----------------------------------------------------
 
     @classmethod
     def _active_file(cls) -> str:
@@ -72,13 +82,14 @@ class MarketUniverse:
             return cls.RESEARCH_FILE
         return cls.PRODUCTION_FILE
 
-    ###################################################
+    # -----------------------------------------------------
+    # HASH FILE
+    # -----------------------------------------------------
 
     @classmethod
     def _hash_file(cls):
 
         path = cls._active_file()
-
         h = hashlib.sha256()
 
         with open(path, "rb") as f:
@@ -87,7 +98,9 @@ class MarketUniverse:
 
         return h.hexdigest()
 
-    ###################################################
+    # -----------------------------------------------------
+    # VALIDATE PAYLOAD
+    # -----------------------------------------------------
 
     @classmethod
     def _validate_payload(cls, payload: Dict):
@@ -104,15 +117,16 @@ class MarketUniverse:
         if missing:
             raise RuntimeError(f"Universe config missing fields: {missing}")
 
-        version = payload["version"]
+        version = str(payload["version"])
         created_utc = payload["created_utc"]
         tickers = payload["tickers"]
         min_history_days = payload["min_history_days"]
 
-        if not isinstance(version, str):
-            raise RuntimeError("Universe version must be string.")
-
-        datetime.fromisoformat(created_utc.replace("Z", "+00:00"))
+        # Validate timestamp (soft)
+        try:
+            datetime.fromisoformat(created_utc.replace("Z", "+00:00"))
+        except Exception:
+            raise RuntimeError("Invalid created_utc timestamp format.")
 
         if not isinstance(min_history_days, int) or min_history_days <= 0:
             raise RuntimeError("min_history_days must be positive integer.")
@@ -120,7 +134,7 @@ class MarketUniverse:
         if not isinstance(tickers, list):
             raise RuntimeError("Universe tickers must be list.")
 
-        # 🔥 CV-friendly enforcement: minimum size not exact size
+        # Soft enforcement of minimum size
         if not cls.ALLOW_RESEARCH_OVERRIDE:
             if len(tickers) < cls.REQUIRED_SIZE:
                 raise RuntimeError(
@@ -138,12 +152,12 @@ class MarketUniverse:
         for t in tickers:
 
             if not isinstance(t, str):
-                raise RuntimeError("Non-string ticker detected.")
+                continue
 
             t = t.strip().upper()
 
             if not cls.TICKER_REGEX.match(t):
-                raise RuntimeError(f"Invalid ticker format: {t}")
+                continue
 
             normalized.append(t)
 
@@ -162,7 +176,9 @@ class MarketUniverse:
             "file_path": cls._active_file()
         }
 
-    ###################################################
+    # -----------------------------------------------------
+    # LOAD FILE
+    # -----------------------------------------------------
 
     @classmethod
     def _load_file(cls):
@@ -173,7 +189,7 @@ class MarketUniverse:
             raise RuntimeError(f"Universe file missing: {path}")
 
         if path.stat().st_size < cls.MIN_FILE_BYTES:
-            raise RuntimeError("Universe file corrupted.")
+            raise RuntimeError("Universe file corrupted or too small.")
 
         payload = json.loads(path.read_text())
 
@@ -183,7 +199,9 @@ class MarketUniverse:
 
         return validated
 
-    ###################################################
+    # -----------------------------------------------------
+    # CACHE HANDLING
+    # -----------------------------------------------------
 
     @classmethod
     def _get_cached(cls):
@@ -195,15 +213,14 @@ class MarketUniverse:
             with cls._LOCK:
 
                 if cls._CACHE is None or cls._FILE_HASH != current_hash:
-
                     cls._CACHE = cls._load_file()
                     cls._FILE_HASH = current_hash
 
         return cls._CACHE
 
-    ###################################################
+    # -----------------------------------------------------
     # PUBLIC API
-    ###################################################
+    # -----------------------------------------------------
 
     @classmethod
     def get_universe(cls) -> Tuple[str, ...]:
@@ -216,7 +233,11 @@ class MarketUniverse:
     @classmethod
     def filter_valid(cls, tickers: List[str]) -> List[str]:
         universe_set = cls._get_cached()["ticker_set"]
-        return sorted(set(t.upper() for t in tickers if t.upper() in universe_set))
+        return sorted(set(
+            t.upper().strip()
+            for t in tickers
+            if isinstance(t, str) and t.upper().strip() in universe_set
+        ))
 
     @classmethod
     def get_min_history_days(cls):
@@ -230,9 +251,9 @@ class MarketUniverse:
     def size(cls) -> int:
         return len(cls.get_universe())
 
-    ###################################################
+    # -----------------------------------------------------
     # FINGERPRINT
-    ###################################################
+    # -----------------------------------------------------
 
     @classmethod
     def fingerprint(cls) -> str:
@@ -251,9 +272,9 @@ class MarketUniverse:
 
         return hashlib.sha256(canonical).hexdigest()
 
-    ###################################################
+    # -----------------------------------------------------
     # SNAPSHOT
-    ###################################################
+    # -----------------------------------------------------
 
     @classmethod
     def snapshot(cls) -> Dict:
