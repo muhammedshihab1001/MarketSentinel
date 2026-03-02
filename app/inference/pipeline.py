@@ -1,6 +1,7 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v4.1
-# Hybrid Multi-Agent Consensus Enabled (Backward Safe)
+# INSTITUTIONAL INFERENCE PIPELINE v4.2
+# Hybrid Multi-Agent Consensus Enhanced
+# CV-Optimized | Drift-Aware | Backward Safe
 # =========================================================
 
 import time
@@ -78,7 +79,6 @@ class InferencePipeline:
         self.cache = RedisCache()
         self.drift_detector = DriftDetector()
 
-        # Agents
         self.signal_agent = SignalAgent()
         self.technical_agent = TechnicalRiskAgent()
 
@@ -157,7 +157,7 @@ class InferencePipeline:
             if latest_df.empty:
                 raise RuntimeError("Latest snapshot invalid.")
 
-            # Liquidity filter
+            # Liquidity filter (yfinance-safe)
             if "dollar_volume" in latest_df.columns:
                 liquidity_threshold = max(
                     self.BASE_LIQUIDITY,
@@ -210,7 +210,6 @@ class InferencePipeline:
                 signal_output = self.signal_agent.analyze(context)
                 technical_output = self.technical_agent.analyze(context)
 
-                # Weighted Hybrid Consensus
                 total_weight = (
                     self.signal_agent.weight +
                     self.technical_agent.weight
@@ -225,32 +224,39 @@ class InferencePipeline:
                     "date": str(row["date"]),
                     "ticker": row["ticker"],
                     "raw_model_score": float(row["raw_model_score"]),
-                    "agent_score": float(signal_output["agent_score"]),  # original
+                    "agent_score": float(signal_output["agent_score"]),
                     "technical_score": float(technical_output["score"]),
                     "hybrid_consensus_score": float(hybrid_consensus_score),
                     "weight": 0.0,
+                    "drift_state": drift_result.get("drift_state"),
+                    "regime": "risk_off" if exposure_scale < 1.0 else "normal",
                     "agents": {
                         "signal_agent": signal_output,
                         "technical_agent": technical_output
                     }
                 })
 
-            # Portfolio construction (UNCHANGED)
-            ranked = latest_df.sort_values("raw_model_score")
+            # ==================================================
+            # Portfolio based on HYBRID consensus
+            # ==================================================
 
-            longs = ranked.tail(min(self.TOP_K, len(ranked)))
-            shorts = ranked.head(min(self.BOTTOM_K, len(ranked)))
+            ranked = sorted(
+                snapshot_rows,
+                key=lambda x: x["hybrid_consensus_score"]
+            )
 
-            weights = self._construct_portfolio(longs, shorts)
+            longs = ranked[-min(self.TOP_K, len(ranked)):]
+            shorts = ranked[:min(self.BOTTOM_K, len(ranked))]
+
+            weights = self._construct_portfolio_from_rows(longs, shorts)
 
             for row in snapshot_rows:
                 base_weight = weights.get(row["ticker"], 0.0)
                 row["weight"] = float(base_weight * exposure_scale)
 
-            # Top 5 still based on model-driven agent_score
             top_5 = sorted(
                 snapshot_rows,
-                key=lambda x: x["agent_score"],
+                key=lambda x: x["hybrid_consensus_score"],
                 reverse=True
             )[:min(self.TOP_SELECTION, len(snapshot_rows))]
 
@@ -342,12 +348,13 @@ class InferencePipeline:
 
     # ---------------------------------------------------------
 
-    def _construct_portfolio(self, longs, shorts):
+    def _construct_portfolio_from_rows(self, longs, shorts):
 
-        score_col = "raw_model_score" if "raw_model_score" in longs.columns else "score"
+        long_scores = np.array([x["hybrid_consensus_score"] for x in longs])
+        short_scores = np.array([abs(x["hybrid_consensus_score"]) for x in shorts])
 
-        long_alpha = self._softmax(longs[score_col].values)
-        short_alpha = self._softmax(np.abs(shorts[score_col].values))
+        long_alpha = self._softmax(long_scores)
+        short_alpha = self._softmax(short_scores)
 
         long_w = long_alpha / (long_alpha.sum() + EPSILON)
         short_w = short_alpha / (short_alpha.sum() + EPSILON)
@@ -357,10 +364,10 @@ class InferencePipeline:
 
         weights = {}
 
-        for t, w in zip(longs["ticker"], long_w):
-            weights[t] = min(float(w), self.MAX_POSITION_WEIGHT)
+        for row, w in zip(longs, long_w):
+            weights[row["ticker"]] = min(float(w), self.MAX_POSITION_WEIGHT)
 
-        for t, w in zip(shorts["ticker"], short_w):
-            weights[t] = -min(float(w), self.MAX_POSITION_WEIGHT)
+        for row, w in zip(shorts, short_w):
+            weights[row["ticker"]] = -min(float(w), self.MAX_POSITION_WEIGHT)
 
         return weights
