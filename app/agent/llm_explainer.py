@@ -1,7 +1,7 @@
 # =========================================================
-# LLM EXPLAINER v2.0
+# LLM EXPLAINER v3.0
 # Hybrid Multi-Agent Compatible
-# CV-Ready | Clean | Backward Safe
+# CV-Ready | Deterministic | Governance-Aware
 # =========================================================
 
 import logging
@@ -90,13 +90,10 @@ class LLMExplainer:
 
         payload = {
             "ticker": row.get("ticker"),
-            "raw_model_score": row.get("raw_model_score"),
-            "agent_score": row.get("agent_score"),
-            "technical_score": row.get("technical_score"),
             "hybrid_consensus_score": row.get("hybrid_consensus_score"),
-            "signal": signal_output.get("signal"),
             "confidence": signal_output.get("confidence_numeric"),
             "risk_level": signal_output.get("risk_level"),
+            "volatility_regime": signal_output.get("volatility_regime"),
             "technical_bias": technical_output.get("bias"),
             "technical_score": technical_output.get("score"),
             "drift_state": stats.get("drift_state"),
@@ -171,7 +168,7 @@ class LLMExplainer:
             logger.warning("Failed to write LLM audit log.")
 
     ########################################################
-    # PUBLIC API
+    # PUBLIC API (SINGLE STOCK)
     ########################################################
 
     async def explain(
@@ -237,7 +234,7 @@ class LLMExplainer:
                             "content": prompt
                         }
                     ],
-                    temperature=0.2,
+                    temperature=0.15,
                 ),
                 timeout=self.timeout
             )
@@ -264,6 +261,62 @@ class LLMExplainer:
             }
             self._audit_log(ticker, signal, result, cached=False)
             return result
+
+    ########################################################
+    # SNAPSHOT LEVEL EXPLANATION (NEW)
+    ########################################################
+
+    async def explain_portfolio(
+        self,
+        decision_report: Dict[str, Any]
+    ) -> Dict[str, Any]:
+
+        if not self.enabled:
+            return {"llm_enabled": False}
+
+        try:
+
+            prompt = f"""
+Portfolio Findings:
+{json.dumps(decision_report.get("portfolio_findings", {}), indent=2)}
+
+Executive Summary:
+{decision_report.get("executive_summary")}
+
+Provide a concise institutional commentary for an investment committee.
+Return JSON with keys:
+portfolio_summary, macro_risk_view, allocation_comment.
+"""
+
+            response = await asyncio.wait_for(
+                self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": "Return valid JSON only."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.2
+                ),
+                timeout=self.timeout
+            )
+
+            raw = response.choices[0].message.content.strip()
+
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = {"portfolio_summary": "Unavailable"}
+
+            return {
+                "llm_enabled": True,
+                "structured": parsed
+            }
+
+        except Exception:
+            return {
+                "llm_enabled": True,
+                "error": "portfolio_llm_unavailable"
+            }
 
     ########################################################
     # SAFE JSON PARSER
@@ -296,7 +349,7 @@ class LLMExplainer:
             }
 
     ########################################################
-    # PROMPT BUILDER (HYBRID AWARE)
+    # PROMPT BUILDER
     ########################################################
 
     def _build_prompt(self, row, signal_output, technical_output, drift_stats):
@@ -304,13 +357,8 @@ class LLMExplainer:
         return f"""
 Ticker: {row.get("ticker")}
 
-Raw Model Score: {row.get("raw_model_score")}
-Signal Agent Score: {row.get("agent_score")}
-Technical Agent Score: {row.get("technical_score")}
-Hybrid Consensus Score: {row.get("hybrid_consensus_score")}
-
-Final Signal: {signal_output.get("signal")}
-Confidence: {signal_output.get("confidence_numeric")}
+Hybrid Score: {row.get("hybrid_consensus_score")}
+Model Confidence: {signal_output.get("confidence_numeric")}
 Risk Level: {signal_output.get("risk_level")}
 Volatility Regime: {signal_output.get("volatility_regime")}
 
@@ -322,5 +370,5 @@ Drift Severity: {drift_stats.get("severity_score")}
 
 Warnings: {signal_output.get("warnings")}
 
-Provide a professional institutional-style explanation suitable for an investment committee.
+Provide professional institutional commentary.
 """
