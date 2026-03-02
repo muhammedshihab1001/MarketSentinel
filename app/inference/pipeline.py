@@ -1,7 +1,6 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v4.3
-# Hybrid Multi-Agent Consensus Enhanced
-# CV-Optimized | Drift-Aware | Decision-Report Enabled
+# INSTITUTIONAL INFERENCE PIPELINE v4.4
+# Stable | Drift-Aware | CV-Optimized | Noise-Controlled
 # =========================================================
 
 import time
@@ -95,11 +94,15 @@ class InferencePipeline:
     # ---------------------------------------------------------
 
     def _winsorize(self, x):
+        if len(x) < 3:
+            return x
         lower = np.quantile(x, self.SCORE_WINSOR_Q)
         upper = np.quantile(x, 1 - self.SCORE_WINSOR_Q)
         return np.clip(x, lower, upper)
 
     def _softmax(self, x):
+        if len(x) == 0:
+            return np.array([])
         x = x - np.max(x)
         e = np.exp(x)
         return e / (np.sum(e) + EPSILON)
@@ -149,22 +152,20 @@ class InferencePipeline:
 
             latest_date = df["date"].max()
             latest_df = df[df["date"] == latest_date].copy()
-
             latest_df = latest_df[latest_df["ticker"].isin(requested)]
+
             latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
             latest_df = latest_df.dropna(subset=MODEL_FEATURES)
 
             if latest_df.empty:
                 raise RuntimeError("Latest snapshot invalid.")
 
-            # Liquidity filter
+            # Liquidity Filter (Stable for yfinance data)
             if "dollar_volume" in latest_df.columns:
-                liquidity_threshold = max(
-                    self.BASE_LIQUIDITY,
-                    latest_df["dollar_volume"].quantile(0.25)
-                )
+                q25 = latest_df["dollar_volume"].quantile(0.25)
+                liquidity_threshold = max(self.BASE_LIQUIDITY, q25)
                 filtered = latest_df[
-                    latest_df["dollar_volume"] > liquidity_threshold
+                    latest_df["dollar_volume"] >= liquidity_threshold
                 ]
                 if len(filtered) >= self.MIN_UNIVERSE_WIDTH:
                     latest_df = filtered
@@ -179,8 +180,16 @@ class InferencePipeline:
 
             raw_scores = self.models.xgb.predict(feature_df)
 
-            if np.std(raw_scores) < self.MIN_SCORE_STD:
-                raw_scores += np.random.normal(0, 1e-6, len(raw_scores))
+            score_std = float(np.std(raw_scores))
+
+            # Stable dispersion control (no random noise)
+            if score_std < self.MIN_SCORE_STD:
+                logger.warning("Low dispersion detected in snapshot scores.")
+                return {
+                    "snapshot_date": str(latest_date),
+                    "signals": [],
+                    "warning": "Low score dispersion — snapshot skipped."
+                }
 
             raw_scores = self._winsorize(raw_scores)
             raw_scores = (
@@ -234,7 +243,6 @@ class InferencePipeline:
                     }
                 })
 
-            # Portfolio construction
             ranked = sorted(snapshot_rows, key=lambda x: x["hybrid_consensus_score"])
 
             longs = ranked[-min(self.TOP_K, len(ranked)):]
@@ -252,10 +260,6 @@ class InferencePipeline:
                 reverse=True
             )[:min(self.TOP_SELECTION, len(snapshot_rows))]
 
-            # ==================================================
-            # Decision Agent Layer (NEW)
-            # ==================================================
-
             snapshot_core = {
                 "snapshot_date": str(latest_date),
                 "model_version": self.models.xgb_version,
@@ -268,7 +272,6 @@ class InferencePipeline:
 
             decision_report = self.portfolio_agent.analyze_snapshot(snapshot_core)
 
-            # Governance
             governance = {
                 "baseline_status": self.models.baseline_status,
                 "schema_signature": self.models.schema_signature,
@@ -278,11 +281,12 @@ class InferencePipeline:
             result = {
                 **snapshot_core,
                 "universe_size": int(len(latest_df)),
-                "score_mean": float(np.mean(raw_scores)),
-                "score_std": float(np.std(raw_scores)),
+                "score_mean": probability_stats["mean"],
+                "score_std": probability_stats["std"],
                 "top_5": top_5,
                 "decision_report": decision_report,
-                "governance": governance
+                "governance": governance,
+                "snapshot_quality": "stable"
             }
 
             self.cache.set(cache_key, result, ex=self.SNAPSHOT_CACHE_TTL)
@@ -360,6 +364,9 @@ class InferencePipeline:
     # ---------------------------------------------------------
 
     def _construct_portfolio_from_rows(self, longs, shorts):
+
+        if not longs and not shorts:
+            return {}
 
         long_scores = np.array([x["hybrid_consensus_score"] for x in longs])
         short_scores = np.array([abs(x["hybrid_consensus_score"]) for x in shorts])
