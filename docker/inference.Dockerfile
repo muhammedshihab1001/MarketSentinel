@@ -1,5 +1,5 @@
 ############################################################
-# MarketSentinel — Inference Container (Production)
+# MarketSentinel — Inference Container (CV-Optimized)
 ############################################################
 
 FROM python:3.10-slim
@@ -16,29 +16,29 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
+    UVICORN_WORKERS=1 \
     APP_ENV=production
 
 WORKDIR /app
 
 ############################################################
-# System Dependencies (Minimal Runtime Only)
+# System Dependencies (Minimal + XGBoost Safe)
 ############################################################
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     tini \
     curl \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 ############################################################
-# Python Dependencies
+# Python Dependencies (Layer Optimized)
 ############################################################
 
-COPY requirements/base.txt requirements/base.txt
-COPY requirements/inference.txt requirements/inference.txt
+COPY requirements/ ./requirements/
 
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements/base.txt && \
     pip install --no-cache-dir -r requirements/inference.txt
 
 ############################################################
@@ -48,7 +48,7 @@ RUN pip install --upgrade pip && \
 RUN useradd -m -u 10001 appuser
 
 ############################################################
-# Application Code (Runtime Only)
+# Application Code
 ############################################################
 
 COPY app ./app
@@ -56,7 +56,6 @@ COPY core ./core
 COPY models ./models
 COPY config ./config
 
-# Artifacts directory created but NOT populated
 RUN mkdir -p /app/artifacts && \
     chown -R appuser:appuser /app
 
@@ -79,7 +78,7 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 ############################################################
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-CMD curl -f http://127.0.0.1:8000/live || exit 1
+CMD curl -f http://127.0.0.1:8000/docs || exit 1
 
 ############################################################
 # Server
@@ -88,6 +87,7 @@ CMD curl -f http://127.0.0.1:8000/live || exit 1
 CMD ["uvicorn", "app.main:app", \
      "--host", "0.0.0.0", \
      "--port", "8000", \
-     "--workers", "2", \
+     "--workers", "1", \
      "--loop", "uvloop", \
-     "--http", "httptools"]
+     "--http", "httptools", \
+     "--timeout-keep-alive", "30"]
