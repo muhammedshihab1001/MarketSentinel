@@ -99,7 +99,7 @@ class LLMExplainer:
             "strength_score": agent.get("strength_score"),
             "drift_state": stats.get("drift_state"),
             "severity_score": stats.get("severity_score"),
-            "score_std": stats.get("std"),
+            "dispersion_std": stats.get("std"),
             "probability_stats": probability_stats or {}
         }
 
@@ -172,7 +172,7 @@ class LLMExplainer:
             logger.warning("Failed to write LLM audit log.")
 
     ########################################################
-    # PUBLIC API (UPDATED)
+    # PUBLIC API
     ########################################################
 
     async def explain(
@@ -180,7 +180,7 @@ class LLMExplainer:
         signal_row: Dict[str, Any],
         agent_output: Dict[str, Any],
         context_stats: Dict[str, Any],
-        probability_stats: Optional[Dict[str, Any]] = None,   # 🔥 FIX
+        probability_stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
 
         if not self.enabled:
@@ -297,18 +297,18 @@ class LLMExplainer:
             }
 
     ########################################################
-    # PROMPT BUILDER (UPDATED)
+    # PROMPT BUILDER (ALIGNED WITH ROUTE)
     ########################################################
 
     def _build_prompt(self, row, agent, stats, probability_stats):
 
         prob_section = ""
+
         if probability_stats:
             prob_section = f"""
 Probability Context:
-Mean Score: {probability_stats.get("mean")}
-Std Dev: {probability_stats.get("std")}
-Percentile Rank: {probability_stats.get("percentile")}
+Mean Score: {probability_stats.get("mean_score")}
+Std Dev: {probability_stats.get("std_score")}
 """
 
         return f"""
