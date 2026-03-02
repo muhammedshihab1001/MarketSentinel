@@ -1,5 +1,5 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled)
+# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.1)
 # CV-Ready | Walk-Forward Validated | Drift Governance
 # ==========================================================
 
@@ -96,10 +96,10 @@ def compute_reproducibility_hash(dataset_hash):
 
 
 # ==========================================================
-# BASELINE BUILDER (NEW)
+# BASELINE BUILDER (FIXED)
 # ==========================================================
 
-def build_baseline(df: pd.DataFrame, model_version: str, dataset_hash: str):
+def build_baseline_from_dataframe(df: pd.DataFrame, model_version: str, dataset_hash: str):
 
     os.makedirs(DRIFT_DIR, exist_ok=True)
 
@@ -143,7 +143,6 @@ def build_baseline(df: pd.DataFrame, model_version: str, dataset_hash: str):
         "features": features_payload
     }
 
-    # integrity hash
     clone = dict(baseline)
     canonical = json.dumps(clone, sort_keys=True).encode()
     baseline["integrity_hash"] = hashlib.sha256(canonical).hexdigest()
@@ -164,6 +163,7 @@ def export_artifacts(model,
                      dataset_rows,
                      start_date,
                      end_date,
+                     training_df,
                      promote_baseline=False,
                      create_baseline=False):
 
@@ -199,20 +199,20 @@ def export_artifacts(model,
 
     logger.info("Artifacts saved | version=%s", version)
 
-    # -------------------------
-    # BASELINE CREATION
-    # -------------------------
+    # -----------------------------------------------------
+    # BASELINE CREATION (CLEAN)
+    # -----------------------------------------------------
 
     if create_baseline or promote_baseline:
-        build_baseline(
-            df=metadata["dataset_preview"] if "dataset_preview" in metadata else None,
+        build_baseline_from_dataframe(
+            df=training_df,
             model_version=version,
             dataset_hash=dataset_hash
         )
 
-    # -------------------------
+    # -----------------------------------------------------
     # PROMOTION
-    # -------------------------
+    # -----------------------------------------------------
 
     if promote_baseline:
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
@@ -379,6 +379,7 @@ def main(start_date=None,
             dataset_rows=len(final_df),
             start_date=start_date,
             end_date=end_date,
+            training_df=final_df,   # <-- FIXED
             promote_baseline=promote_baseline,
             create_baseline=create_baseline
         )
