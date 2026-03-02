@@ -1,7 +1,7 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v4.2
+# INSTITUTIONAL INFERENCE PIPELINE v4.3
 # Hybrid Multi-Agent Consensus Enhanced
-# CV-Optimized | Drift-Aware | Backward Safe
+# CV-Optimized | Drift-Aware | Decision-Report Enabled
 # =========================================================
 
 import time
@@ -27,6 +27,7 @@ from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
 from core.agent.signal_agent import SignalAgent
 from core.agent.technical_risk_agent import TechnicalRiskAgent
+from core.agent.portfolio_decision_agent import PortfolioDecisionAgent
 
 from app.monitoring.metrics import (
     MODEL_INFERENCE_COUNT,
@@ -38,7 +39,6 @@ from app.monitoring.metrics import (
 logger = logging.getLogger("marketsentinel.pipeline")
 
 EPSILON = 1e-12
-
 _SHARED_MODEL_LOADER = None
 _MODEL_LOCK = threading.Lock()
 
@@ -81,6 +81,7 @@ class InferencePipeline:
 
         self.signal_agent = SignalAgent()
         self.technical_agent = TechnicalRiskAgent()
+        self.portfolio_agent = PortfolioDecisionAgent()
 
         self._validate_models_loaded()
 
@@ -118,14 +119,13 @@ class InferencePipeline:
             "drift_state": drift_result.get("drift_state")
         }
 
-    # ---------------------------------------------------------
+    # =========================================================
     # MAIN SNAPSHOT
-    # ---------------------------------------------------------
+    # =========================================================
 
     def run_snapshot(self, tickers: List[str]):
 
         full_universe = list(MarketUniverse.get_universe())
-
         if not full_universe:
             raise RuntimeError("Universe empty.")
 
@@ -157,7 +157,7 @@ class InferencePipeline:
             if latest_df.empty:
                 raise RuntimeError("Latest snapshot invalid.")
 
-            # Liquidity filter (yfinance-safe)
+            # Liquidity filter
             if "dollar_volume" in latest_df.columns:
                 liquidity_threshold = max(
                     self.BASE_LIQUIDITY,
@@ -180,7 +180,7 @@ class InferencePipeline:
             raw_scores = self.models.xgb.predict(feature_df)
 
             if np.std(raw_scores) < self.MIN_SCORE_STD:
-                raw_scores = raw_scores + np.random.normal(0, 1e-6, len(raw_scores))
+                raw_scores += np.random.normal(0, 1e-6, len(raw_scores))
 
             raw_scores = self._winsorize(raw_scores)
             raw_scores = (
@@ -215,7 +215,7 @@ class InferencePipeline:
                     self.technical_agent.weight
                 )
 
-                hybrid_consensus_score = (
+                hybrid_score = (
                     signal_output["hybrid"]["score"] * self.signal_agent.weight +
                     technical_output["score"] * self.technical_agent.weight
                 ) / total_weight
@@ -226,24 +226,16 @@ class InferencePipeline:
                     "raw_model_score": float(row["raw_model_score"]),
                     "agent_score": float(signal_output["agent_score"]),
                     "technical_score": float(technical_output["score"]),
-                    "hybrid_consensus_score": float(hybrid_consensus_score),
+                    "hybrid_consensus_score": float(hybrid_score),
                     "weight": 0.0,
-                    "drift_state": drift_result.get("drift_state"),
-                    "regime": "risk_off" if exposure_scale < 1.0 else "normal",
                     "agents": {
                         "signal_agent": signal_output,
                         "technical_agent": technical_output
                     }
                 })
 
-            # ==================================================
-            # Portfolio based on HYBRID consensus
-            # ==================================================
-
-            ranked = sorted(
-                snapshot_rows,
-                key=lambda x: x["hybrid_consensus_score"]
-            )
+            # Portfolio construction
+            ranked = sorted(snapshot_rows, key=lambda x: x["hybrid_consensus_score"])
 
             longs = ranked[-min(self.TOP_K, len(ranked)):]
             shorts = ranked[:min(self.BOTTOM_K, len(ranked))]
@@ -260,18 +252,37 @@ class InferencePipeline:
                 reverse=True
             )[:min(self.TOP_SELECTION, len(snapshot_rows))]
 
-            result = {
+            # ==================================================
+            # Decision Agent Layer (NEW)
+            # ==================================================
+
+            snapshot_core = {
                 "snapshot_date": str(latest_date),
                 "model_version": self.models.xgb_version,
                 "schema_version": self.models.schema_version,
-                "universe_size": int(len(latest_df)),
                 "gross_exposure": float(sum(abs(x["weight"]) for x in snapshot_rows)),
                 "net_exposure": float(sum(x["weight"] for x in snapshot_rows)),
+                "drift": drift_result,
+                "signals": snapshot_rows
+            }
+
+            decision_report = self.portfolio_agent.analyze_snapshot(snapshot_core)
+
+            # Governance
+            governance = {
+                "baseline_status": self.models.baseline_status,
+                "schema_signature": self.models.schema_signature,
+                "dataset_hash": self.models.dataset_hash
+            }
+
+            result = {
+                **snapshot_core,
+                "universe_size": int(len(latest_df)),
                 "score_mean": float(np.mean(raw_scores)),
                 "score_std": float(np.std(raw_scores)),
-                "drift": drift_result,
                 "top_5": top_5,
-                "signals": snapshot_rows
+                "decision_report": decision_report,
+                "governance": governance
             }
 
             self.cache.set(cache_key, result, ex=self.SNAPSHOT_CACHE_TTL)
