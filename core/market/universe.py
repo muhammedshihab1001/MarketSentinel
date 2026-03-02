@@ -10,20 +10,17 @@ from pathlib import Path
 
 class MarketUniverse:
     """
-    Institutional Universe Controller (Hybrid Production-Grade)
+    Institutional Universe Controller (CV-Optimized Hybrid)
 
     Guarantees:
     ✔ deterministic
     ✔ file-governed
     ✔ audit safe
     ✔ mutation proof
-    ✔ lineage traceable
     ✔ thread safe
     ✔ tamper detected
-    ✔ version monotonic
     ✔ metadata compatible
     ✔ research override isolated
-    ✔ hybrid-system compatible
     """
 
     ###################################################
@@ -40,7 +37,7 @@ class MarketUniverse:
         "config/universe_research.json"
     )
 
-    REQUIRED_SIZE = 30
+    REQUIRED_SIZE = int(os.getenv("UNIVERSE_MIN_SIZE", "20"))
     MIN_FILE_BYTES = 50
 
     ALLOW_RESEARCH_OVERRIDE = os.getenv(
@@ -54,6 +51,7 @@ class MarketUniverse:
     _LOCK = threading.RLock()
     _FILE_HASH = None
     _LAST_VERSION = None
+    _LAST_LOADED_AT = None
 
     ###################################################
 
@@ -122,10 +120,11 @@ class MarketUniverse:
         if not isinstance(tickers, list):
             raise RuntimeError("Universe tickers must be list.")
 
+        # 🔥 CV-friendly enforcement: minimum size not exact size
         if not cls.ALLOW_RESEARCH_OVERRIDE:
-            if len(tickers) != cls.REQUIRED_SIZE:
+            if len(tickers) < cls.REQUIRED_SIZE:
                 raise RuntimeError(
-                    f"Production universe must contain exactly {cls.REQUIRED_SIZE} tickers."
+                    f"Production universe must contain at least {cls.REQUIRED_SIZE} tickers."
                 )
 
         parsed_version = cls._parse_version(version)
@@ -178,7 +177,11 @@ class MarketUniverse:
 
         payload = json.loads(path.read_text())
 
-        return cls._validate_payload(payload)
+        validated = cls._validate_payload(payload)
+
+        cls._LAST_LOADED_AT = datetime.utcnow().isoformat() + "Z"
+
+        return validated
 
     ###################################################
 
@@ -228,7 +231,7 @@ class MarketUniverse:
         return len(cls.get_universe())
 
     ###################################################
-    # FINGERPRINT (METADATA CRITICAL)
+    # FINGERPRINT
     ###################################################
 
     @classmethod
@@ -249,7 +252,7 @@ class MarketUniverse:
         return hashlib.sha256(canonical).hexdigest()
 
     ###################################################
-    # SNAPSHOT (API + BACKTEST SAFE)
+    # SNAPSHOT
     ###################################################
 
     @classmethod
@@ -257,7 +260,7 @@ class MarketUniverse:
 
         cache = cls._get_cached()
 
-        snapshot = {
+        return {
             "universe_version": cache["version"],
             "created_utc": cache["created_utc"],
             "description": cache["description"],
@@ -265,8 +268,8 @@ class MarketUniverse:
             "universe_hash": cls.fingerprint(),
             "universe_size": len(cache["tickers"]),
             "file_path": cache["file_path"],
+            "file_hash": cls._FILE_HASH,
+            "last_loaded_utc": cls._LAST_LOADED_AT,
             "research_mode": cls.ALLOW_RESEARCH_OVERRIDE,
             "tickers": list(cache["tickers"])
         }
-
-        return snapshot
