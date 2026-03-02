@@ -18,7 +18,7 @@ class FeatureEngineer:
     MIN_CS_WIDTH = 5
     Z_CLIP = 5.0
     MIN_VOLUME = 1.0
-    VAR_FLOOR = 1e-6  # 🔥 prevents low-variance collapse
+    VAR_FLOOR = 1e-6
 
     ########################################################
     # DATETIME NORMALIZATION
@@ -88,8 +88,14 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"]).copy()
 
-        returns = df.groupby("ticker")["close"].pct_change()
-        returns = returns.replace([np.inf, -np.inf], np.nan).fillna(0)
+        raw_returns = df.groupby("ticker")["close"].pct_change()
+        raw_returns = raw_returns.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        # 🔥 light smoothing (helps noisy Yahoo data)
+        returns = (
+            raw_returns.groupby(df["ticker"])
+            .transform(lambda x: x.rolling(3, min_periods=1).median())
+        )
 
         df["return"] = returns.clip(*cls.RETURN_CLAMP)
 
@@ -156,7 +162,6 @@ class FeatureEngineer:
 
         df["dollar_volume"] = df["close"] * df["volume"]
 
-        # RSI
         df["rsi"] = 50.0
         for ticker, group in df.groupby("ticker"):
             try:
@@ -167,7 +172,6 @@ class FeatureEngineer:
 
         df["rsi"] = df["rsi"].clip(0, 100)
 
-        # EMA features
         df["ema_10"] = df.groupby("ticker")["close"].transform(
             lambda x: x.ewm(span=10, adjust=False).mean()
         )
@@ -189,14 +193,12 @@ class FeatureEngineer:
             (df["close"] / (rolling_high + cls.EPSILON)) - 1
         ).clip(-1, 0)
 
-        # 🔥 stabilized Amihud (prevents near-zero variance)
         raw_amihud = df["return"].abs() / (df["dollar_volume"] + cls.EPSILON)
         df["amihud"] = raw_amihud.clip(0, 1)
 
         if df["amihud"].std() < cls.VAR_FLOOR:
             df["amihud"] += np.random.normal(0, 1e-6, len(df))
 
-        # Regime feature
         vol_mean = (
             df.groupby("ticker")["volatility"]
             .transform(lambda x: x.rolling(60, min_periods=20).mean())
@@ -219,7 +221,7 @@ class FeatureEngineer:
         return df
 
     ########################################################
-    # CROSS SECTIONAL FEATURES (STABILIZED)
+    # CROSS SECTIONAL FEATURES
     ########################################################
 
     @classmethod
@@ -227,9 +229,8 @@ class FeatureEngineer:
 
         df = df.sort_values(["date", "ticker"]).copy()
 
-        # 🔥 softer width filter
         counts = df.groupby("date")["ticker"].transform("count")
-        df = df[counts >= max(cls.MIN_CS_WIDTH, 3)].copy()
+        df = df[counts >= cls.MIN_CS_WIDTH].copy()
 
         if df.empty:
             raise RuntimeError("Cross-sectional width insufficient.")
@@ -239,9 +240,6 @@ class FeatureEngineer:
             .transform("std")
             .fillna(0)
         )
-
-        if df["market_dispersion"].std() < cls.VAR_FLOOR:
-            df["market_dispersion"] += np.random.normal(0, 1e-6, len(df))
 
         df["breadth"] = (
             df.groupby("date")["return"]
@@ -258,10 +256,7 @@ class FeatureEngineer:
             clipped = df[col].clip(lower, upper)
 
             cs_mean = clipped.groupby(df["date"]).transform("mean")
-            cs_std = clipped.groupby(df["date"]).transform("std")
-
-            # 🔥 variance floor
-            cs_std = cs_std.clip(lower=cls.VAR_FLOOR)
+            cs_std = clipped.groupby(df["date"]).transform("std").clip(lower=cls.VAR_FLOOR)
 
             z = (clipped - cs_mean) / (cs_std + cls.EPSILON)
             df[f"{col}_z"] = z.fillna(0.0).clip(-cls.Z_CLIP, cls.Z_CLIP)
