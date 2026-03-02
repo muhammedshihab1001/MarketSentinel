@@ -1,14 +1,32 @@
 # =========================================================
-# INSTITUTIONAL SIGNAL AGENT v2.1 (CV-Optimized Multi-Agent)
+# INSTITUTIONAL SIGNAL AGENT v3.0
+# Hybrid-Compatible Model Intelligence Agent
 # =========================================================
 
 import numpy as np
 from typing import Dict, Any, List, Optional
 
+from core.agent.base_agent import BaseAgent
+
 EPSILON = 1e-12
 
 
-class SignalAgent:
+class SignalAgent(BaseAgent):
+    """
+    Primary Model Intelligence Agent.
+
+    This agent:
+    - Consumes ML model output
+    - Applies technical confirmation
+    - Applies volatility adjustment
+    - Applies drift penalty
+    - Produces structured hybrid-compatible output
+
+    Backward compatible with existing pipeline.
+    """
+
+    name = "SignalAgent"
+    weight = 1.0  # Used later for consensus scoring
 
     RSI_OVERBOUGHT = 70
     RSI_OVERSOLD = 30
@@ -107,15 +125,33 @@ class SignalAgent:
         return float(np.clip(base, self.MIN_POSITION_SIZE, self.MAX_POSITION_SIZE))
 
     # ---------------------------------------------------------
-    # MAIN ANALYSIS
+    # HYBRID ANALYZE (BaseAgent Contract)
     # ---------------------------------------------------------
 
-    def analyze(
-        self,
-        row: Dict[str, Any],
-        probability_stats: Optional[Dict[str, float]] = None,
-        drift_score: Optional[float] = None,
-    ) -> Dict[str, Any]:
+    def analyze(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Hybrid-compatible analyze method.
+
+        Context expected:
+        {
+            "row": feature_row_dict,
+            "probability_stats": optional,
+            "drift_score": optional
+        }
+
+        Backward compatible with old usage:
+        If context is raw row dict, it still works.
+        """
+
+        # Backward compatibility layer
+        if "row" in context:
+            row = context.get("row", {})
+            probability_stats = context.get("probability_stats")
+            drift_score = context.get("drift_score")
+        else:
+            row = context
+            probability_stats = None
+            drift_score = None
 
         raw_model_score = self._safe_float(
             row.get("raw_model_score", row.get("alpha_score", row.get("score"))),
@@ -141,10 +177,7 @@ class SignalAgent:
 
         abs_score = abs(final_score)
 
-        # -----------------------------------------------------
         # Alpha strength
-        # -----------------------------------------------------
-
         alpha_strength = float(abs_score)
         confidence_numeric = self._confidence_numeric(abs_score)
         confidence_numeric = self._volatility_adjusted_confidence(
@@ -152,33 +185,23 @@ class SignalAgent:
             volatility
         )
 
-        # -----------------------------------------------------
-        # Cross-sectional awareness (lightweight CV logic)
-        # -----------------------------------------------------
-
+        # Cross-sectional awareness
         if probability_stats:
             std = self._safe_float(probability_stats.get("std"), 0.0)
             if std < 0.05:
                 warnings.append("Low cross-sectional dispersion")
                 confidence_numeric *= 0.8
 
-        # -----------------------------------------------------
         # Technical confirmation
-        # -----------------------------------------------------
-
         alignment = self._alignment_score(signal, momentum_z, ema_ratio)
         technical_score = alignment / 2.0
 
-        # RSI warnings
         if signal == "LONG" and rsi > self.RSI_OVERBOUGHT:
             warnings.append("RSI overbought")
         if signal == "SHORT" and rsi < self.RSI_OVERSOLD:
             warnings.append("RSI oversold")
 
-        # -----------------------------------------------------
         # Risk regime
-        # -----------------------------------------------------
-
         if regime_feature > 1.5:
             volatility_regime = "high_volatility"
         else:
@@ -193,10 +216,7 @@ class SignalAgent:
         else:
             risk_level = "low"
 
-        # -----------------------------------------------------
         # Drift penalty
-        # -----------------------------------------------------
-
         drift_flag = False
         if drift_score is not None:
             drift_score = self._safe_float(drift_score, 0.0)
@@ -207,10 +227,7 @@ class SignalAgent:
 
         confidence_numeric = float(np.clip(confidence_numeric, 0.0, 1.0))
 
-        # -----------------------------------------------------
-        # Composite agent score
-        # -----------------------------------------------------
-
+        # Composite score
         agent_score = float(np.clip(
             0.5 * confidence_numeric +
             0.3 * technical_score +
@@ -240,7 +257,23 @@ class SignalAgent:
             f"agent_score={agent_score:.2f}"
         )
 
+        # Hybrid structured output (new)
+        hybrid_output = {
+            "agent_name": self.name,
+            "weight": self.weight,
+            "score": agent_score,
+            "confidence": confidence_numeric,
+            "signals": {
+                "direction": signal,
+                "trade_approved": trade_approved
+            },
+            "warnings": sorted(set(warnings)),
+            "reasoning": sorted(set(reasoning))
+        }
+
+        # Backward compatible return
         return {
+            # ---- old keys (pipeline safe) ----
             "signal": signal,
             "alpha_strength": alpha_strength,
             "confidence_numeric": confidence_numeric,
@@ -256,4 +289,7 @@ class SignalAgent:
             "reasoning": sorted(set(reasoning)),
             "warnings": sorted(set(warnings)),
             "explanation": explanation,
+
+            # ---- new hybrid structure ----
+            "hybrid": hybrid_output
         }
