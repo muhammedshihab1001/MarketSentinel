@@ -1,5 +1,6 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v3.2 (Agent-Safe Stable)
+# INSTITUTIONAL INFERENCE PIPELINE v4.0
+# Hybrid Multi-Agent Compatible (Backward Safe)
 # =========================================================
 
 import time
@@ -8,7 +9,7 @@ import numpy as np
 import pandas as pd
 import logging
 import os
-from typing import List
+from typing import List, Dict, Any
 
 from core.data.market_data_service import MarketDataService
 from core.features.feature_engineering import FeatureEngineer
@@ -99,12 +100,31 @@ class InferencePipeline:
         return e / (np.sum(e) + EPSILON)
 
     # ---------------------------------------------------------
-    # MAIN SNAPSHOT (FIXED)
+    # HYBRID CONTEXT BUILDER
+    # ---------------------------------------------------------
+
+    def _build_agent_context(
+        self,
+        row: Dict[str, Any],
+        probability_stats: Dict[str, Any],
+        drift_result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Prepare structured context for hybrid agents.
+        """
+        return {
+            "row": row,
+            "probability_stats": probability_stats,
+            "drift_score": drift_result.get("severity_score", 0),
+            "drift_state": drift_result.get("drift_state")
+        }
+
+    # ---------------------------------------------------------
+    # MAIN SNAPSHOT
     # ---------------------------------------------------------
 
     def run_snapshot(self, tickers: List[str]):
 
-        # 🔥 Always build FULL universe for cross-sectional math
         full_universe = list(MarketUniverse.get_universe())
 
         if not full_universe:
@@ -126,22 +146,19 @@ class InferencePipeline:
 
         try:
 
-            # 🔥 Build CS frame using FULL universe
             df = self._build_cross_sectional_frame(full_universe)
 
             latest_date = df["date"].max()
             latest_df = df[df["date"] == latest_date].copy()
 
-            # 🔥 Filter AFTER CS features built
             latest_df = latest_df[latest_df["ticker"].isin(requested)]
-
             latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
             latest_df = latest_df.dropna(subset=MODEL_FEATURES)
 
             if latest_df.empty:
                 raise RuntimeError("Latest snapshot invalid.")
 
-            # Soft liquidity filter
+            # Liquidity filter
             if "dollar_volume" in latest_df.columns:
                 liquidity_threshold = max(
                     self.BASE_LIQUIDITY,
@@ -173,27 +190,38 @@ class InferencePipeline:
 
             latest_df["raw_model_score"] = raw_scores
 
+            probability_stats = {
+                "mean": float(np.mean(raw_scores)),
+                "std": float(np.std(raw_scores))
+            }
+
             snapshot_rows = []
 
             for _, row in latest_df.iterrows():
 
                 direction = "LONG" if row["raw_model_score"] > 0 else "SHORT"
 
-                agent_output = self.signal_agent.analyze(
-                    row={**row.to_dict(), "signal": direction},
-                    drift_score=drift_result.get("severity_score", 0)
+                row_dict = {**row.to_dict(), "signal": direction}
+
+                context = self._build_agent_context(
+                    row=row_dict,
+                    probability_stats=probability_stats,
+                    drift_result=drift_result
                 )
+
+                agent_output = self.signal_agent.analyze(context)
 
                 snapshot_rows.append({
                     "date": str(row["date"]),
                     "ticker": row["ticker"],
                     "raw_model_score": float(row["raw_model_score"]),
                     "agent_score": float(agent_output["agent_score"]),
+                    "hybrid_score": float(agent_output["hybrid"]["score"]),
                     "weight": 0.0,
                     "agent": agent_output
                 })
 
-            # Portfolio
+            # Portfolio construction (UNCHANGED LOGIC)
             ranked = latest_df.sort_values("raw_model_score")
 
             longs = ranked.tail(min(self.TOP_K, len(ranked)))
