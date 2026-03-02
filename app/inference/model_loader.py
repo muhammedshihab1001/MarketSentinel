@@ -1,3 +1,8 @@
+# =========================================================
+# MODEL LOADER v2.0
+# Hybrid Multi-Agent Compatible | CV-Optimized Governance
+# =========================================================
+
 import os
 import joblib
 import logging
@@ -34,14 +39,14 @@ class LoadedModel:
     artifact_hash: str
     feature_checksum: str
     universe_hash: str
-    training_code_hash: str
+    training_code_hash: Optional[str]
     reproducibility_hash: Optional[str]
     pointer_hash: Optional[str]
     training_fingerprint: Optional[str]
 
 
 # =========================================================
-# MODEL LOADER
+# MODEL LOADER (Singleton)
 # =========================================================
 
 class ModelLoader:
@@ -74,9 +79,9 @@ class ModelLoader:
         self._xgb_container: Optional[LoadedModel] = None
         self._initialized = True
 
-    # -----------------------------------------------------
+    # =====================================================
     # HASH UTIL
-    # -----------------------------------------------------
+    # =====================================================
 
     def _sha256(self, path: str) -> str:
         h = hashlib.sha256()
@@ -85,17 +90,17 @@ class ModelLoader:
                 h.update(chunk)
         return h.hexdigest()
 
-    # -----------------------------------------------------
+    # =====================================================
     # FEATURE CHECKSUM
-    # -----------------------------------------------------
+    # =====================================================
 
     def _compute_feature_checksum(self):
-        canonical = json.dumps(list(MODEL_FEATURES), sort_keys=False).encode()
+        canonical = json.dumps(list(MODEL_FEATURES), separators=(",", ":")).encode()
         return hashlib.sha256(canonical).hexdigest()
 
-    # -----------------------------------------------------
+    # =====================================================
     # REGISTRY
-    # -----------------------------------------------------
+    # =====================================================
 
     def _get_registry_dir(self):
         base_dir = os.getenv(
@@ -108,9 +113,9 @@ class ModelLoader:
 
         return base_dir
 
-    # -----------------------------------------------------
+    # =====================================================
     # POINTER RESOLUTION
-    # -----------------------------------------------------
+    # =====================================================
 
     def _resolve_production_version(self, base_dir):
 
@@ -139,9 +144,9 @@ class ModelLoader:
 
         return model_path, metadata_path, version, pointer_hash
 
-    # -----------------------------------------------------
+    # =====================================================
     # SAFE MODEL LOAD
-    # -----------------------------------------------------
+    # =====================================================
 
     def _safe_load_model(self, model_path):
 
@@ -153,17 +158,19 @@ class ModelLoader:
         if not hasattr(model, "predict"):
             raise RuntimeError("Invalid model artifact.")
 
-        if not hasattr(model, "feature_names"):
-            raise RuntimeError("Model missing feature_names contract.")
-
-        if list(model.feature_names) != list(MODEL_FEATURES):
-            raise RuntimeError("Model feature order mismatch.")
+        # Feature contract enforcement (soft if not strict)
+        if hasattr(model, "feature_names"):
+            if list(model.feature_names) != list(MODEL_FEATURES):
+                msg = "Model feature order mismatch."
+                if self.STRICT_GOVERNANCE:
+                    raise RuntimeError(msg)
+                logger.warning(msg)
 
         return model
 
-    # -----------------------------------------------------
+    # =====================================================
     # RELOAD LOGIC
-    # -----------------------------------------------------
+    # =====================================================
 
     def _reload_xgb_if_needed(self):
 
@@ -187,23 +194,25 @@ class ModelLoader:
 
             meta = MetadataManager.load_metadata(metadata_path)
 
-            # -----------------------
+            # -------------------------------------------------
             # Artifact Integrity
-            # -----------------------
+            # -------------------------------------------------
+
             actual_hash = self._sha256(model_path)
             if meta.get("artifact_hash") != actual_hash:
                 raise RuntimeError("Artifact tampering detected.")
 
-            # -----------------------
+            # -------------------------------------------------
             # Soft Governance Checks
-            # -----------------------
+            # -------------------------------------------------
+
             if meta.get("schema_signature") != get_schema_signature():
                 logger.warning("Schema signature mismatch.")
 
             if meta.get("schema_version") != SCHEMA_VERSION:
                 logger.warning("Schema version drift detected.")
 
-            if list(meta.get("features")) != list(MODEL_FEATURES):
+            if list(meta.get("features", [])) != list(MODEL_FEATURES):
                 logger.warning("Metadata feature mismatch.")
 
             if meta.get("feature_checksum") != self._compute_feature_checksum():
@@ -213,7 +222,7 @@ class ModelLoader:
                 if meta.get("universe_hash") != MarketUniverse.fingerprint():
                     logger.warning("Universe drift detected (soft).")
             except Exception:
-                pass
+                logger.warning("Universe fingerprint unavailable.")
 
             model = self._safe_load_model(model_path)
 
@@ -248,14 +257,14 @@ class ModelLoader:
             logger.info(
                 "Model loaded | version=%s | artifact=%s",
                 version,
-                meta["artifact_hash"][:12]
+                meta.get("artifact_hash", "")[:12]
             )
 
             return new_container.model
 
-    # -----------------------------------------------------
+    # =====================================================
     # PUBLIC ACCESSORS
-    # -----------------------------------------------------
+    # =====================================================
 
     @property
     def xgb(self):
@@ -311,9 +320,9 @@ class ModelLoader:
         self._reload_xgb_if_needed()
         return self._xgb_container.training_fingerprint
 
-    # -----------------------------------------------------
+    # =====================================================
     # FEATURE IMPORTANCE
-    # -----------------------------------------------------
+    # =====================================================
 
     def get_feature_importance(self):
 
@@ -326,9 +335,9 @@ class ModelLoader:
 
         return model.export_feature_importance()
 
-    # -----------------------------------------------------
+    # =====================================================
     # WARMUP
-    # -----------------------------------------------------
+    # =====================================================
 
     def warmup(self):
         logger.info("Model warmup triggered.")
