@@ -20,6 +20,8 @@ MAX_MODEL_SIZE_MB = 150
 MAX_ABS_SCORE = 50
 EPSILON = 1e-12
 
+STANDARDIZE_INFERENCE = True  # improves cross-sectional ranking stability
+
 
 class SafeXGBRegressor:
 
@@ -38,7 +40,6 @@ class SafeXGBRegressor:
         self.train_rmse = None
         self.valid_rmse = None
 
-        # strong determinism
         os.environ["PYTHONHASHSEED"] = str(SEED)
         random.seed(SEED)
         np.random.seed(SEED)
@@ -84,7 +85,7 @@ class SafeXGBRegressor:
         ).hexdigest()
 
         ###################################################
-        # TRAIN / VALID SPLIT (Time ordered)
+        # TIME ORDERED SPLIT
         ###################################################
 
         split_idx = int(len(X) * (1 - VALIDATION_SPLIT))
@@ -147,13 +148,12 @@ class SafeXGBRegressor:
             evals_result=evals_result
         )
 
-        self.best_iteration = (
-            self.model.best_iteration
-            if hasattr(self.model, "best_iteration")
-            else NUM_BOOST_ROUNDS
-        )
+        # Robust best_iteration handling
+        if hasattr(self.model, "best_iteration") and self.model.best_iteration is not None:
+            self.best_iteration = self.model.best_iteration
+        else:
+            self.best_iteration = NUM_BOOST_ROUNDS
 
-        # stable RMSE extraction
         self.train_rmse = float(evals_result["train"]["rmse"][-1])
         self.valid_rmse = float(evals_result["valid"]["rmse"][-1])
 
@@ -197,7 +197,7 @@ class SafeXGBRegressor:
         if pred_std < MIN_SCORE_STD:
             raise RuntimeError("Score collapse detected.")
 
-        hist, _ = np.histogram(preds, bins=20)
+        hist, _ = np.histogram(preds, bins=30)
         probs = hist / (hist.sum() + EPSILON)
         entropy = -np.sum(probs * np.log(probs + EPSILON))
 
@@ -253,8 +253,14 @@ class SafeXGBRegressor:
 
         scores = np.clip(scores, -MAX_ABS_SCORE, MAX_ABS_SCORE)
 
-        if np.std(scores) < MIN_SCORE_STD:
+        score_std = float(np.std(scores))
+
+        if score_std < MIN_SCORE_STD:
             logger.warning("Inference score dispersion low.")
+
+        # Optional cross-sectional normalization
+        if STANDARDIZE_INFERENCE and score_std > MIN_SCORE_STD:
+            scores = (scores - np.mean(scores)) / (score_std + EPSILON)
 
         return scores
 
@@ -306,5 +312,5 @@ class SafeXGBRegressor:
 
 
 def build_xgboost_pipeline():
-    logger.info("Building XGBoost Regression Model (Stable Version)")
+    logger.info("Building XGBoost Regression Model (Stable CV Version)")
     return SafeXGBRegressor()
