@@ -90,7 +90,6 @@ COPY --from=builder /usr/local /usr/local
 ############################################################
 
 COPY core ./core
-COPY models ./models
 COPY training ./training
 COPY config ./config
 

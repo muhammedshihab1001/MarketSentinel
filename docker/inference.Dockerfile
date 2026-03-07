@@ -53,7 +53,6 @@ RUN useradd -m -u 10001 appuser
 
 COPY app ./app
 COPY core ./core
-COPY models ./models
 COPY config ./config
 
 RUN mkdir -p /app/artifacts && \
