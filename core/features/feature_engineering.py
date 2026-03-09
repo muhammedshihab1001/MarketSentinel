@@ -266,28 +266,53 @@ class FeatureEngineer:
 
         return df
 
-    ########################################################
-    # FINALIZE
-    ########################################################
+# =========================================================
+# FINALIZE
+# =========================================================
 
-    @classmethod
-    def finalize(cls, df):
+@classmethod
+def finalize(cls, df):
 
-        df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.replace([np.inf, -np.inf], np.nan)
 
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
 
-        for col in numeric_cols:
-            df[col] = df[col].fillna(0.0)
+    # -----------------------------------------------------
+    # Rolling Median Repair (Low Variance Protection)
+    # -----------------------------------------------------
 
-        missing = set(MODEL_FEATURES) - set(df.columns)
-        if missing:
-            raise RuntimeError(f"Missing features: {missing}")
+    for col in numeric_cols:
 
-        if not np.isfinite(df[numeric_cols].to_numpy()).all():
-            raise RuntimeError("Non-finite values remain.")
+        if df[col].isna().any():
 
-        return df.reset_index(drop=True)
+            median_series = (
+                df.groupby("ticker")[col]
+                .transform(lambda x: x.rolling(20, min_periods=1).median())
+            )
+
+            df[col] = df[col].fillna(median_series)
+
+        df[col] = df[col].fillna(0.0)
+
+    # -----------------------------------------------------
+    # Variance Guard (Stable Stocks Protection)
+    # -----------------------------------------------------
+
+    for col in numeric_cols:
+
+        if df[col].std() < cls.VAR_FLOOR:
+            logger.warning(f"Low variance detected in {col} — injecting noise")
+            df[col] += np.random.normal(0, 1e-6, len(df))
+
+    missing = set(MODEL_FEATURES) - set(df.columns)
+
+    if missing:
+        raise RuntimeError(f"Missing features: {missing}")
+
+    if not np.isfinite(df[numeric_cols].to_numpy()).all():
+        raise RuntimeError("Non-finite values remain.")
+
+    return df.reset_index(drop=True)
 
     ########################################################
     # PIPELINE
