@@ -1,19 +1,49 @@
 # =========================================================
-# HYBRID AGENT EXPLANATION ROUTE v2.0
+# HYBRID AGENT EXPLANATION ROUTE v2.1
 # Multi-Agent + Hybrid Consensus Compatible
 # =========================================================
 
 import logging
 import asyncio
 import time
+from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline
 from app.agent.llm_explainer import LLMExplainer
 
+# political risk agent (lazy import to avoid startup penalty)
+try:
+    from core.agents.political_risk_agent import PoliticalRiskAgent
+except Exception:
+    PoliticalRiskAgent = None
+
 router = APIRouter()
 logger = logging.getLogger("marketsentinel.agent")
+
+
+# =========================================================
+# RESPONSE HELPERS
+# =========================================================
+
+def success(data):
+    return {
+        "success": True,
+        "data": data,
+        "error": None,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+def error(message):
+    return {
+        "success": False,
+        "data": None,
+        "error": message,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
 
 # =========================================================
 # SINGLETON PIPELINE
@@ -46,6 +76,74 @@ def get_explainer() -> LLMExplainer:
 
 
 # =========================================================
+# AGENT REGISTRY
+# =========================================================
+
+AVAILABLE_AGENTS = {
+    "signal_agent": True,
+    "technical_risk_agent": True,
+    "portfolio_decision_agent": True,
+    "political_risk_agent": PoliticalRiskAgent is not None
+}
+
+
+# =========================================================
+# LIST AVAILABLE AGENTS
+# =========================================================
+
+@router.get("/agents")
+def list_agents():
+    return success({
+        "agents": AVAILABLE_AGENTS
+    })
+
+
+# =========================================================
+# POLITICAL RISK AGENT
+# =========================================================
+
+@router.get("/agents/political-risk")
+async def political_risk(
+    ticker: str = Query(..., description="Stock ticker symbol"),
+    country: str = Query("US", description="Country code")
+):
+
+    if PoliticalRiskAgent is None:
+        raise HTTPException(
+            status_code=503,
+            detail="political_risk_agent_not_available"
+        )
+
+    try:
+
+        agent = PoliticalRiskAgent()
+
+        result = await asyncio.wait_for(
+            run_in_threadpool(
+                agent.get_political_risk,
+                ticker,
+                country
+            ),
+            timeout=30
+        )
+
+        return success(result)
+
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="political_risk_timeout"
+        )
+
+    except Exception as e:
+        logger.exception("Political risk agent failure")
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+# =========================================================
 # HYBRID AGENT EXPLANATION ROUTE
 # =========================================================
 
@@ -60,7 +158,7 @@ async def explain_signal(
     try:
 
         if not ticker or not isinstance(ticker, str):
-            raise HTTPException(status_code=400, detail="Invalid ticker")
+            raise HTTPException(status_code=400, detail="invalid_ticker")
 
         ticker = ticker.upper().strip()
 
@@ -75,12 +173,12 @@ async def explain_signal(
         )
 
         if not isinstance(snapshot, dict):
-            raise HTTPException(status_code=500, detail="Invalid snapshot response")
+            raise HTTPException(status_code=500, detail="invalid_snapshot_response")
 
         signals = snapshot.get("signals", [])
 
         if not signals:
-            raise HTTPException(status_code=404, detail="Ticker not found")
+            raise HTTPException(status_code=404, detail="ticker_not_found")
 
         row = next(
             (s for s in signals if s.get("ticker") == ticker),
@@ -88,10 +186,10 @@ async def explain_signal(
         )
 
         if row is None:
-            raise HTTPException(status_code=404, detail="Ticker not in snapshot")
+            raise HTTPException(status_code=404, detail="ticker_not_in_snapshot")
 
         # -------------------------------------------------
-        # Extract Agent Outputs (Hybrid Compatible)
+        # Extract Agent Outputs
         # -------------------------------------------------
 
         agents = row.get("agents", {})
@@ -125,71 +223,46 @@ async def explain_signal(
                 }
 
         # -------------------------------------------------
-        # Structured Response (Hybrid-Aware)
+        # Structured Response
         # -------------------------------------------------
 
         response = {
             "ticker": ticker,
             "snapshot_date": snapshot.get("snapshot_date"),
 
-            # ----------------------------
-            # Core Model Output
-            # ----------------------------
             "raw_model_score": row.get("raw_model_score"),
             "weight": row.get("weight"),
 
-            # ----------------------------
-            # Hybrid Scores
-            # ----------------------------
             "agent_score": row.get("agent_score"),
             "technical_score": row.get("technical_score"),
             "hybrid_consensus_score": row.get("hybrid_consensus_score"),
 
-            # ----------------------------
-            # Signal Agent Details
-            # ----------------------------
             "signal": signal_output.get("signal"),
             "confidence_numeric": signal_output.get("confidence_numeric"),
             "governance_score": signal_output.get("governance_score"),
             "risk_level": signal_output.get("risk_level"),
             "volatility_regime": signal_output.get("volatility_regime"),
 
-            # ----------------------------
-            # Technical Agent Details
-            # ----------------------------
             "technical_bias": technical_output.get("bias"),
             "technical_confidence": technical_output.get("confidence"),
             "technical_component_scores": technical_output.get("component_scores"),
 
-            # ----------------------------
-            # Drift Governance
-            # ----------------------------
             "drift_state": drift_info.get("drift_state"),
             "drift_severity": drift_info.get("severity_score"),
             "exposure_scale": drift_info.get("exposure_scale"),
 
-            # ----------------------------
-            # Explanation Layer
-            # ----------------------------
             "warnings": signal_output.get("warnings", []),
             "explanation": signal_output.get("explanation", ""),
 
-            # ----------------------------
-            # Optional LLM Narrative
-            # ----------------------------
             "llm": llm_output,
 
-            # ----------------------------
-            # Observability
-            # ----------------------------
             "latency_ms": int((time.time() - start_time) * 1000),
-            "timestamp": int(time.time())
         }
 
-        return response
+        return success(response)
 
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Agent explanation timeout")
+        raise HTTPException(status_code=504, detail="agent_timeout")
 
     except HTTPException:
         raise
