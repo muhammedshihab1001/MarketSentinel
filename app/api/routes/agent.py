@@ -1,26 +1,37 @@
 # =========================================================
-# HYBRID AGENT EXPLANATION ROUTE v2.1
+# HYBRID AGENT EXPLANATION ROUTE v3.0
 # Multi-Agent + Hybrid Consensus Compatible
 # =========================================================
 
 import logging
 import asyncio
 import time
+import os
+import re
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 
-from app.inference.pipeline import InferencePipeline
+from app.api.routes.predict import get_pipeline
 from app.agent.llm_explainer import LLMExplainer
+
+from app.monitoring.metrics import (
+    API_REQUEST_COUNT,
+    API_LATENCY,
+    API_ERROR_COUNT
+)
 
 # political risk agent (lazy import to avoid startup penalty)
 try:
-    from core.agents.political_risk_agent import PoliticalRiskAgent
+    from core.agent.political_risk_agent import PoliticalRiskAgent
 except Exception:
     PoliticalRiskAgent = None
 
-router = APIRouter()
+
+router = APIRouter(prefix="/agent", tags=["agent"])
 logger = logging.getLogger("marketsentinel.agent")
+
+TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 
 
 # =========================================================
@@ -46,32 +57,20 @@ def error(message):
 
 
 # =========================================================
-# SINGLETON PIPELINE
-# =========================================================
-
-_pipeline: InferencePipeline | None = None
-
-
-def get_pipeline() -> InferencePipeline:
-    global _pipeline
-    if _pipeline is None:
-        logger.info("Initializing InferencePipeline (singleton)")
-        _pipeline = InferencePipeline()
-    return _pipeline
-
-
-# =========================================================
 # LAZY LLM EXPLAINER
 # =========================================================
 
-_explainer_instance: LLMExplainer | None = None
+_explainer_instance = None
 
 
-def get_explainer() -> LLMExplainer:
+def get_explainer():
+
     global _explainer_instance
+
     if _explainer_instance is None:
         logger.info("Initializing LLMExplainer (lazy)")
         _explainer_instance = LLMExplainer()
+
     return _explainer_instance
 
 
@@ -93,28 +92,65 @@ AVAILABLE_AGENTS = {
 
 @router.get("/agents")
 def list_agents():
-    return success({
-        "agents": AVAILABLE_AGENTS
-    })
+
+    endpoint = "/agent/agents"
+    start_time = time.time()
+
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
+
+    try:
+
+        return success({
+            "agents": AVAILABLE_AGENTS
+        })
+
+    except Exception as e:
+
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        logger.exception("Agent listing failed")
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+    finally:
+
+        API_LATENCY.labels(endpoint=endpoint).observe(
+            time.time() - start_time
+        )
 
 
 # =========================================================
 # POLITICAL RISK AGENT
 # =========================================================
 
-@router.get("/agents/political-risk")
+@router.get("/political-risk")
 async def political_risk(
     ticker: str = Query(..., description="Stock ticker symbol"),
     country: str = Query("US", description="Country code")
 ):
 
-    if PoliticalRiskAgent is None:
-        raise HTTPException(
-            status_code=503,
-            detail="political_risk_agent_not_available"
-        )
+    endpoint = "/agent/political-risk"
+    start_time = time.time()
+
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
 
     try:
+
+        if PoliticalRiskAgent is None:
+            raise HTTPException(
+                status_code=503,
+                detail="political_risk_agent_not_available"
+            )
+
+        ticker = ticker.upper().strip()
+
+        if not TICKER_REGEX.match(ticker):
+            raise HTTPException(
+                status_code=400,
+                detail="invalid_ticker"
+            )
 
         agent = PoliticalRiskAgent()
 
@@ -130,30 +166,49 @@ async def political_risk(
         return success(result)
 
     except asyncio.TimeoutError:
+
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+
         raise HTTPException(
             status_code=504,
             detail="political_risk_timeout"
         )
 
+    except HTTPException:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        raise
+
     except Exception as e:
+
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         logger.exception("Political risk agent failure")
+
         raise HTTPException(
             status_code=500,
             detail=str(e)
         )
 
+    finally:
+
+        API_LATENCY.labels(endpoint=endpoint).observe(
+            time.time() - start_time
+        )
+
 
 # =========================================================
-# HYBRID AGENT EXPLANATION ROUTE
+# HYBRID AGENT EXPLANATION
 # =========================================================
 
-@router.post("/agent/explain")
+@router.post("/explain")
 async def explain_signal(
     ticker: str = Query(..., description="Stock ticker symbol"),
     include_llm: bool = Query(True, description="Include LLM explanation")
 ):
 
+    endpoint = "/agent/explain"
     start_time = time.time()
+
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
 
     try:
 
@@ -161,6 +216,9 @@ async def explain_signal(
             raise HTTPException(status_code=400, detail="invalid_ticker")
 
         ticker = ticker.upper().strip()
+
+        if not TICKER_REGEX.match(ticker):
+            raise HTTPException(status_code=400, detail="invalid_ticker")
 
         pipeline = get_pipeline()
 
@@ -173,12 +231,18 @@ async def explain_signal(
         )
 
         if not isinstance(snapshot, dict):
-            raise HTTPException(status_code=500, detail="invalid_snapshot_response")
+            raise HTTPException(
+                status_code=500,
+                detail="invalid_snapshot_response"
+            )
 
         signals = snapshot.get("signals", [])
 
         if not signals:
-            raise HTTPException(status_code=404, detail="ticker_not_found")
+            raise HTTPException(
+                status_code=404,
+                detail="ticker_not_found"
+            )
 
         row = next(
             (s for s in signals if s.get("ticker") == ticker),
@@ -186,11 +250,10 @@ async def explain_signal(
         )
 
         if row is None:
-            raise HTTPException(status_code=404, detail="ticker_not_in_snapshot")
-
-        # -------------------------------------------------
-        # Extract Agent Outputs
-        # -------------------------------------------------
+            raise HTTPException(
+                status_code=404,
+                detail="ticker_not_in_snapshot"
+            )
 
         agents = row.get("agents", {})
 
@@ -205,18 +268,23 @@ async def explain_signal(
 
         llm_output = None
 
-        if include_llm:
+        if include_llm and os.getenv("LLM_ENABLED", "0") == "1":
+
             explainer = get_explainer()
 
             try:
+
                 llm_output = await explainer.explain(
                     signal_row=row,
                     signal_output=signal_output,
                     technical_output=technical_output,
                     drift_stats=drift_info
                 )
+
             except Exception:
+
                 logger.exception("LLM explanation failed (non-blocking)")
+
                 llm_output = {
                     "llm_enabled": True,
                     "error": "llm_runtime_failure"
@@ -227,6 +295,7 @@ async def explain_signal(
         # -------------------------------------------------
 
         response = {
+
             "ticker": ticker,
             "snapshot_date": snapshot.get("snapshot_date"),
 
@@ -262,11 +331,30 @@ async def explain_signal(
         return success(response)
 
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="agent_timeout")
+
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+
+        raise HTTPException(
+            status_code=504,
+            detail="agent_timeout"
+        )
 
     except HTTPException:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         raise
 
     except Exception as e:
+
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         logger.exception("Agent explanation failed")
-        raise HTTPException(status_code=500, detail=str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+    finally:
+
+        API_LATENCY.labels(endpoint=endpoint).observe(
+            time.time() - start_time
+        )
