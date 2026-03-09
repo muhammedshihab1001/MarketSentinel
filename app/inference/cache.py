@@ -13,6 +13,8 @@ from core.schema.feature_schema import get_schema_signature
 from core.market.universe import MarketUniverse
 from app.inference.model_loader import ModelLoader
 
+from app.monitoring.metrics import CACHE_HITS, CACHE_MISSES
+
 logger = logging.getLogger("marketsentinel.cache")
 
 
@@ -28,7 +30,7 @@ class RedisCache:
     MIN_TTL = 30
 
     MAX_PAYLOAD_BYTES = 256_000
-    CACHE_NAMESPACE_VERSION = "v8"  # bumped for clean version
+    CACHE_NAMESPACE_VERSION = "v8"
 
     ###################################################
 
@@ -40,6 +42,16 @@ class RedisCache:
 
         self.schema_sig = get_schema_signature()
         self.universe_fp = MarketUniverse.fingerprint()
+
+        # -------------------------------------------------
+        # NEW: cache model fingerprint once
+        # -------------------------------------------------
+
+        try:
+            loader = ModelLoader()
+            self.model_fp = loader.xgb_version
+        except Exception:
+            self.model_fp = "unknown"
 
         self._connect()
 
@@ -118,18 +130,6 @@ class RedisCache:
         self._connect()
 
     ###################################################
-    # MODEL FINGERPRINT
-    ###################################################
-
-    def _model_fingerprint(self):
-
-        try:
-            loader = ModelLoader()
-            return loader.xgb_version
-        except Exception:
-            return "unknown"
-
-    ###################################################
     # CANONICAL JSON
     ###################################################
 
@@ -151,12 +151,10 @@ class RedisCache:
         raw = self._canonical_json(payload)
         fingerprint = hashlib.sha256(raw.encode()).hexdigest()
 
-        model_fp = self._model_fingerprint()
-
         return (
             f"{self.CACHE_NAMESPACE_VERSION}:"
             f"portfolio:"
-            f"{model_fp}:"
+            f"{self.model_fp}:"
             f"{self.schema_sig}:"
             f"{self.universe_fp}:"
             f"{fingerprint}"
@@ -213,11 +211,13 @@ class RedisCache:
             data = self.client.get(key)
 
             if not data:
+                CACHE_MISSES.inc()
                 return None
 
             if len(data) > self.MAX_PAYLOAD_BYTES:
                 logger.warning("Raw cache payload too large. Deleting.")
                 self.client.delete(key)
+                CACHE_MISSES.inc()
                 return None
 
             decompressed = zlib.decompress(data)
@@ -225,11 +225,14 @@ class RedisCache:
             if len(decompressed) > self.MAX_PAYLOAD_BYTES:
                 logger.warning("Oversized decompressed cache entry removed.")
                 self.client.delete(key)
+                CACHE_MISSES.inc()
                 return None
 
             obj = json.loads(decompressed)
 
             self._validate_snapshot(obj)
+
+            CACHE_HITS.inc()
 
             return obj
 
@@ -237,11 +240,14 @@ class RedisCache:
 
             logger.exception("Redis GET failure.")
 
+            # only disable if connection issue
             self.enabled = False
+
             self._retry_delay = min(
                 self._retry_delay * 2,
                 self.MAX_RETRY
             )
+
             self._disabled_until = time.time() + self._retry_delay
 
             return None
@@ -257,12 +263,6 @@ class RedisCache:
         ttl: Optional[int] = None,
         ex: Optional[int] = None
     ):
-
-        """
-        Supports:
-            set(key, value, ttl=...)
-            set(key, value, ex=...)
-        """
 
         self._maybe_reconnect()
 
@@ -282,10 +282,14 @@ class RedisCache:
 
             ttl_value = max(self.MIN_TTL, min(ttl_value, self.MAX_TTL))
 
-            # Light jitter (avoid thundering herd)
             jitter = int(ttl_value * 0.15)
+
             final_ttl = ttl_value + random.randint(-jitter, jitter)
-            final_ttl = max(self.MIN_TTL, min(final_ttl, self.MAX_TTL))
+
+            final_ttl = max(
+                self.MIN_TTL,
+                min(final_ttl, self.MAX_TTL)
+            )
 
             serialized = self._canonical_json(value).encode()
 
@@ -306,8 +310,10 @@ class RedisCache:
             logger.exception("Redis SET failure.")
 
             self.enabled = False
+
             self._retry_delay = min(
                 self._retry_delay * 2,
                 self.MAX_RETRY
             )
+
             self._disabled_until = time.time() + self._retry_delay
