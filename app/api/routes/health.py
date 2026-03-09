@@ -1,6 +1,7 @@
 import time
 import logging
 from fastapi import APIRouter
+from fastapi.responses import JSONResponse
 
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
@@ -10,6 +11,7 @@ from app.monitoring.metrics import (
 
 from app.inference.pipeline import get_shared_model_loader
 from core.schema.feature_schema import get_schema_signature
+
 
 router = APIRouter(prefix="/health", tags=["health"])
 logger = logging.getLogger("marketsentinel.health")
@@ -31,18 +33,25 @@ def liveness():
     start_time = time.time()
 
     try:
+
         return {
             "status": "alive",
             "service": "MarketSentinel",
             "timestamp": int(time.time())
         }
 
-    except Exception:
+    except Exception as e:
+
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.exception("Health check failure")
-        return {
-            "status": "error"
-        }
+        logger.exception("Health liveness check failure")
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error": str(e)
+            }
+        )
 
     finally:
         API_LATENCY.labels(endpoint=endpoint).observe(
@@ -69,7 +78,6 @@ def readiness():
 
         loader = get_shared_model_loader()
 
-        # Basic loader validation
         if loader.xgb is None:
             raise RuntimeError("Model not loaded")
 
@@ -85,12 +93,17 @@ def readiness():
         }
 
     except Exception as e:
+
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         logger.exception("Readiness check failed")
-        return {
-            "status": "not_ready",
-            "error": str(e)
-        }
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "error": str(e)
+            }
+        )
 
     finally:
         API_LATENCY.labels(endpoint=endpoint).observe(
@@ -118,6 +131,9 @@ def model_health():
         loader = get_shared_model_loader()
         model = loader.xgb
 
+        if model is None:
+            raise RuntimeError("Model not loaded")
+
         return {
             "status": "ok",
             "model_version": loader.xgb_version,
@@ -132,12 +148,17 @@ def model_health():
         }
 
     except Exception as e:
+
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         logger.exception("Model health check failed")
-        return {
-            "status": "error",
-            "error": str(e)
-        }
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error": str(e)
+            }
+        )
 
     finally:
         API_LATENCY.labels(endpoint=endpoint).observe(
