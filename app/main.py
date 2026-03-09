@@ -1,5 +1,5 @@
 # =====================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v2.1
+# MARKET SENTINEL APPLICATION ENTRYPOINT v2.2
 # Hybrid Multi-Agent | CV-Optimized Architecture
 # =====================================================
 
@@ -12,6 +12,7 @@ import psutil
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from collections import defaultdict, deque
 
 from fastapi import FastAPI, Response, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -57,6 +58,22 @@ APP_VERSION = get_env("APP_VERSION", "4.1.0")
 
 CORS_ORIGINS = get_env("CORS_ORIGINS", "*")
 CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS.split(",")]
+
+API_KEY = os.getenv("API_KEY")
+RATE_LIMIT = int(os.getenv("API_RATE_LIMIT_PER_MIN", "60"))
+
+WINDOW_SECONDS = 60
+
+PUBLIC_PATHS = {
+    "/",
+    "/live",
+    "/ready",
+    "/docs",
+    "/openapi.json",
+    "/metrics"
+}
+
+request_store = defaultdict(lambda: deque())
 
 
 # =====================================================
@@ -151,10 +168,6 @@ async def lifespan(app: FastAPI):
         logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("===================================")
 
-        # -------------------------------------------------
-        # MODEL LOADING
-        # -------------------------------------------------
-
         loader = ModelLoader()
         _ = loader.xgb
         loader.warmup()
@@ -169,20 +182,12 @@ async def lifespan(app: FastAPI):
         if readiness.schema_signature != get_schema_signature():
             logger.warning("Runtime schema mismatch detected.")
 
-        # -------------------------------------------------
-        # REDIS (Soft)
-        # -------------------------------------------------
-
         try:
             cache = RedisCache()
             readiness.redis_connected = cache.enabled
         except Exception:
             readiness.redis_connected = False
-            logger.warning("Redis unavailable — continuing in degraded mode.")
-
-        # -------------------------------------------------
-        # DRIFT BASELINE (Soft)
-        # -------------------------------------------------
+            logger.warning("Redis unavailable — degraded mode.")
 
         try:
             detector = DriftDetector()
@@ -190,22 +195,15 @@ async def lifespan(app: FastAPI):
             readiness.drift_baseline_loaded = True
         except Exception:
             readiness.drift_baseline_loaded = False
-            logger.warning("Drift baseline not loaded (non-blocking).")
-
-        # -------------------------------------------------
-        # LLM STATE
-        # -------------------------------------------------
+            logger.warning("Drift baseline not loaded.")
 
         readiness.llm_enabled = get_bool("LLM_ENABLED", False)
         readiness.llm_model = get_env("OPENAI_MODEL", None)
         readiness.llm_rate_limit = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
         readiness.llm_cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
 
-        # -------------------------------------------------
-        # SYSTEM SNAPSHOT
-        # -------------------------------------------------
-
         process = psutil.Process(os.getpid())
+
         readiness.boot_memory_mb = round(
             process.memory_info().rss / (1024 * 1024), 2
         )
@@ -219,13 +217,13 @@ async def lifespan(app: FastAPI):
         boot_time = round(time.time() - boot_start, 2)
 
         if boot_time > STARTUP_TIMEOUT_SEC:
-            logger.warning("Startup exceeded expected timeout threshold.")
+            logger.warning("Startup slow.")
 
         logger.info("System ready in %.2fs", boot_time)
 
         yield
 
-        logger.info("Shutting down MarketSentinel...")
+        logger.info("Shutting down MarketSentinel")
         gc.collect()
 
     except Exception:
@@ -247,7 +245,7 @@ app.add_exception_handler(Exception, global_exception_handler)
 
 
 # =====================================================
-# CORS MIDDLEWARE (React Frontend Support)
+# CORS
 # =====================================================
 
 app.add_middleware(
@@ -260,17 +258,55 @@ app.add_middleware(
 
 
 # =====================================================
-# REQUEST MIDDLEWARE
+# SECURITY + REQUEST MIDDLEWARE
 # =====================================================
 
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
 
+    path = request.url.path
+
+    # -------------------------------------------------
+    # API KEY CHECK
+    # -------------------------------------------------
+
+    if path not in PUBLIC_PATHS and API_KEY:
+
+        client_key = request.headers.get("X-API-KEY")
+
+        if client_key != API_KEY:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid API key"
+            )
+
+    # -------------------------------------------------
+    # RATE LIMIT
+    # -------------------------------------------------
+
+    client_ip = request.client.host
+    now = time.time()
+
+    queue = request_store[client_ip]
+
+    while queue and queue[0] < now - WINDOW_SECONDS:
+        queue.popleft()
+
+    if len(queue) >= RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded"
+        )
+
+    queue.append(now)
+
     request_id = str(uuid.uuid4())[:12]
     start = time.time()
 
     try:
+
         response = await call_next(request)
+
         latency = time.time() - start
 
         response.headers["X-Request-ID"] = request_id
