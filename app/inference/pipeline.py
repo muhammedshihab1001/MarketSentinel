@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v4.5
+# INSTITUTIONAL INFERENCE PIPELINE v4.6
 # Stable | Drift-Aware | CV-Optimized | Noise-Controlled
 # Backward-Compatible Portfolio API
 # =========================================================
@@ -28,6 +28,7 @@ from app.inference.cache import RedisCache
 from core.agent.signal_agent import SignalAgent
 from core.agent.technical_risk_agent import TechnicalRiskAgent
 from core.agent.portfolio_decision_agent import PortfolioDecisionAgent
+from core.agent.political_risk_agent import PoliticalRiskAgent   # NEW
 
 from app.monitoring.metrics import (
     MODEL_INFERENCE_COUNT,
@@ -83,6 +84,9 @@ class InferencePipeline:
         self.technical_agent = TechnicalRiskAgent()
         self.portfolio_agent = PortfolioDecisionAgent()
 
+        # NEW AGENT
+        self.political_agent = PoliticalRiskAgent()
+
         self._validate_models_loaded()
 
     # ---------------------------------------------------------
@@ -113,10 +117,6 @@ class InferencePipeline:
     # ---------------------------------------------------------
 
     def _construct_portfolio(self, longs, shorts):
-        """
-        Backward-compatible wrapper.
-        Keeps equity route stable without modifying its logic.
-        """
         return self._construct_portfolio_from_rows(longs, shorts)
 
     # ---------------------------------------------------------
@@ -125,13 +125,15 @@ class InferencePipeline:
         self,
         row: Dict[str, Any],
         probability_stats: Dict[str, Any],
-        drift_result: Dict[str, Any]
+        drift_result: Dict[str, Any],
+        political_risk_label: str   # NEW
     ) -> Dict[str, Any]:
         return {
             "row": row,
             "probability_stats": probability_stats,
             "drift_score": drift_result.get("severity_score", 0),
-            "drift_state": drift_result.get("drift_state")
+            "drift_state": drift_result.get("drift_state"),
+            "political_risk_label": political_risk_label  # NEW
         }
 
     # =========================================================
@@ -189,6 +191,13 @@ class InferencePipeline:
             drift_result = self._safe_drift(feature_df)
             exposure_scale = drift_result.get("exposure_scale", 1.0)
 
+            # -----------------------------------------------------
+            # POLITICAL RISK FETCH (ONCE PER SNAPSHOT)
+            # -----------------------------------------------------
+
+            political_result = self.political_agent.get_political_risk("GLOBAL")
+            political_label = political_result.get("risk_label", "LOW")
+
             raw_scores = self.models.xgb.predict(feature_df)
             score_std = float(np.std(raw_scores))
 
@@ -222,7 +231,8 @@ class InferencePipeline:
                 context = self._build_agent_context(
                     row=row_dict,
                     probability_stats=probability_stats,
-                    drift_result=drift_result
+                    drift_result=drift_result,
+                    political_risk_label=political_label
                 )
 
                 signal_output = self.signal_agent.analyze(context)
@@ -314,87 +324,3 @@ class InferencePipeline:
 
         finally:
             INFERENCE_IN_PROGRESS.dec()
-
-    # ---------------------------------------------------------
-
-    def _safe_drift(self, feature_df):
-        try:
-            return self.drift_detector.detect(feature_df)
-        except Exception:
-            return {
-                "drift_detected": False,
-                "drift_state": "bypass",
-                "severity_score": 0,
-                "exposure_scale": 1.0
-            }
-
-    # ---------------------------------------------------------
-
-    def _build_cross_sectional_frame(self, tickers):
-
-        end_date = pd.Timestamp.utcnow()
-        start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
-
-        price_map = self.market_data.get_price_data_batch(
-            tickers=tickers,
-            start_date=start_date.strftime("%Y-%m-%d"),
-            end_date=end_date.strftime("%Y-%m-%d"),
-            interval="1d",
-            min_history=60
-        )
-
-        datasets = []
-
-        for ticker, price_df in price_map.items():
-            if price_df is None or price_df.empty:
-                continue
-
-            try:
-                df = FeatureEngineer.build_feature_pipeline(
-                    price_df=price_df,
-                    sentiment_df=None,
-                    training=False
-                )
-                datasets.append(df)
-            except Exception:
-                logger.warning("Feature build failed for %s", ticker)
-
-        if not datasets:
-            raise RuntimeError("All tickers failed feature build.")
-
-        df = pd.concat(datasets, ignore_index=True)
-        df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
-        df = FeatureEngineer.add_cross_sectional_features(df)
-        df = FeatureEngineer.finalize(df)
-
-        return df
-
-    # ---------------------------------------------------------
-
-    def _construct_portfolio_from_rows(self, longs, shorts):
-
-        if not longs and not shorts:
-            return {}
-
-        long_scores = np.array([x["hybrid_consensus_score"] for x in longs])
-        short_scores = np.array([abs(x["hybrid_consensus_score"]) for x in shorts])
-
-        long_alpha = self._softmax(long_scores)
-        short_alpha = self._softmax(short_scores)
-
-        long_w = long_alpha / (long_alpha.sum() + EPSILON)
-        short_w = short_alpha / (short_alpha.sum() + EPSILON)
-
-        long_w *= self.TARGET_GROSS_EXPOSURE / 2
-        short_w *= self.TARGET_GROSS_EXPOSURE / 2
-
-        weights = {}
-
-        for row, w in zip(longs, long_w):
-            weights[row["ticker"]] = min(float(w), self.MAX_POSITION_WEIGHT)
-
-        for row, w in zip(shorts, short_w):
-            weights[row["ticker"]] = -min(float(w), self.MAX_POSITION_WEIGHT)
-
-        return weights
