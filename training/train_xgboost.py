@@ -1,5 +1,5 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.1)
+# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.2)
 # CV-Ready | Walk-Forward Validated | Drift Governance
 # ==========================================================
 
@@ -44,6 +44,9 @@ MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
 MIN_CS_WIDTH = 8
 TARGET_CLIP = 5.0
+
+# Threshold for detecting low variance targets
+LOW_VARIANCE_THRESHOLD = 1e-6
 
 
 # ==========================================================
@@ -96,7 +99,7 @@ def compute_reproducibility_hash(dataset_hash):
 
 
 # ==========================================================
-# BASELINE BUILDER (FIXED)
+# BASELINE BUILDER
 # ==========================================================
 
 def build_baseline_from_dataframe(df: pd.DataFrame, model_version: str, dataset_hash: str):
@@ -199,20 +202,12 @@ def export_artifacts(model,
 
     logger.info("Artifacts saved | version=%s", version)
 
-    # -----------------------------------------------------
-    # BASELINE CREATION (CLEAN)
-    # -----------------------------------------------------
-
     if create_baseline or promote_baseline:
         build_baseline_from_dataframe(
             df=training_df,
             model_version=version,
             dataset_hash=dataset_hash
         )
-
-    # -----------------------------------------------------
-    # PROMOTION
-    # -----------------------------------------------------
 
     if promote_baseline:
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
@@ -335,6 +330,20 @@ def trainer(train_df):
 
     y = train_df["target"].values
 
+    # ------------------------------------------------------
+    # LOW VARIANCE TARGET GUARD (NEW)
+    # ------------------------------------------------------
+
+    target_std = np.std(y)
+
+    if target_std < LOW_VARIANCE_THRESHOLD:
+        logger.warning(
+            "Target variance extremely low (%.8f) — injecting noise",
+            target_std
+        )
+        noise = np.random.normal(0, 1e-4, size=len(y))
+        y = y + noise
+
     pipeline = build_xgboost_pipeline()
     pipeline.fit(X, y)
 
@@ -379,7 +388,7 @@ def main(start_date=None,
             dataset_rows=len(final_df),
             start_date=start_date,
             end_date=end_date,
-            training_df=final_df,   # <-- FIXED
+            training_df=final_df,
             promote_baseline=promote_baseline,
             create_baseline=create_baseline
         )
