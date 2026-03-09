@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL SIGNAL AGENT v3.2
+# INSTITUTIONAL SIGNAL AGENT v3.3
 # Hybrid-Compatible Model Intelligence Agent
 # Drift-Aware | Regime-Aware | CV-Optimized
 # =========================================================
@@ -21,9 +21,8 @@ class SignalAgent(BaseAgent):
     - Apply technical alignment
     - Apply volatility adjustment
     - Apply drift penalty (state-aware)
+    - Apply political risk override
     - Produce hybrid-compatible structured output
-
-    Lightweight governance-focused architecture.
     """
 
     name = "SignalAgent"
@@ -136,11 +135,13 @@ class SignalAgent(BaseAgent):
             probability_stats = context.get("probability_stats")
             drift_score = context.get("drift_score")
             drift_state = context.get("drift_state")
+            political_risk_label = context.get("political_risk_label")
         else:
             row = context
             probability_stats = None
             drift_score = None
             drift_state = None
+            political_risk_label = context.get("political_risk_label")
 
         raw_model_score = self._safe_float(
             row.get("raw_model_score", row.get("alpha_score", row.get("score"))),
@@ -178,7 +179,6 @@ class SignalAgent(BaseAgent):
             volatility
         )
 
-        # Cross-sectional awareness
         if probability_stats:
             std = self._safe_float(probability_stats.get("std"), 0.0)
             if std < 0.05:
@@ -216,7 +216,7 @@ class SignalAgent(BaseAgent):
             risk_level = "low"
 
         # -------------------------------------------------
-        # Drift penalty (STATE-AWARE)
+        # Drift penalty
         # -------------------------------------------------
 
         drift_flag = False
@@ -225,6 +225,15 @@ class SignalAgent(BaseAgent):
             drift_flag = True
             confidence_numeric *= 0.75
             warnings.append(f"Drift state: {drift_state}")
+
+        # -------------------------------------------------
+        # Political Risk Override (NEW)
+        # -------------------------------------------------
+
+        if political_risk_label == "CRITICAL":
+            signal = "NEUTRAL"
+            warnings.append("Political risk CRITICAL — trading disabled")
+            reasoning.append("Political event risk override applied")
 
         confidence_numeric = float(np.clip(confidence_numeric, 0.0, 1.0))
 
@@ -244,6 +253,7 @@ class SignalAgent(BaseAgent):
             signal != "NEUTRAL"
             and confidence_numeric > self.MIN_CONFIDENCE_TO_TRADE
             and not drift_flag
+            and political_risk_label != "CRITICAL"
         )
 
         position_size_hint = self._suggest_position_size(
@@ -260,12 +270,9 @@ class SignalAgent(BaseAgent):
             f"technical={technical_score:.2f} | "
             f"risk={risk_level} | "
             f"drift={drift_state or 'none'} | "
+            f"political={political_risk_label or 'none'} | "
             f"agent_score={agent_score:.2f}"
         )
-
-        # -------------------------------------------------
-        # Hybrid structured output
-        # -------------------------------------------------
 
         hybrid_output = {
             "agent_name": self.name,
@@ -286,7 +293,6 @@ class SignalAgent(BaseAgent):
         }
 
         return {
-            # --- legacy safe ---
             "signal": signal,
             "alpha_strength": alpha_strength,
             "confidence_numeric": confidence_numeric,
@@ -302,7 +308,5 @@ class SignalAgent(BaseAgent):
             "reasoning": sorted(set(reasoning)),
             "warnings": sorted(set(warnings)),
             "explanation": explanation,
-
-            # --- hybrid ---
             "hybrid": hybrid_output
         }
