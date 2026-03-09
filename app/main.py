@@ -1,5 +1,5 @@
 # =====================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v2.2
+# MARKET SENTINEL APPLICATION ENTRYPOINT v2.3
 # Hybrid Multi-Agent | CV-Optimized Architecture
 # =====================================================
 
@@ -17,7 +17,7 @@ from collections import defaultdict, deque
 from fastapi import FastAPI, Response, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from prometheus_client import generate_latest
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from core.config.env_loader import init_env, get_int, get_env, get_bool
 from core.schema.feature_schema import get_schema_signature
@@ -66,11 +66,11 @@ WINDOW_SECONDS = 60
 
 PUBLIC_PATHS = {
     "/",
-    "/live",
-    "/ready",
     "/docs",
     "/openapi.json",
-    "/metrics"
+    "/metrics",
+    "/health/live",
+    "/health/ready"
 }
 
 request_store = defaultdict(lambda: deque())
@@ -266,10 +266,6 @@ async def request_context_middleware(request: Request, call_next):
 
     path = request.url.path
 
-    # -------------------------------------------------
-    # API KEY CHECK
-    # -------------------------------------------------
-
     if path not in PUBLIC_PATHS and API_KEY:
 
         client_key = request.headers.get("X-API-KEY")
@@ -279,10 +275,6 @@ async def request_context_middleware(request: Request, call_next):
                 status_code=401,
                 detail="Invalid API key"
             )
-
-    # -------------------------------------------------
-    # RATE LIMIT
-    # -------------------------------------------------
 
     client_ip = request.client.host
     now = time.time()
@@ -320,7 +312,7 @@ async def request_context_middleware(request: Request, call_next):
 
 
 # =====================================================
-# ROUTES
+# ROUTERS
 # =====================================================
 
 app.include_router(predict.router)
@@ -361,50 +353,5 @@ async def root():
 def metrics():
     return Response(
         generate_latest(),
-        media_type="text/plain"
+        media_type=CONTENT_TYPE_LATEST
     )
-
-
-# =====================================================
-# READINESS
-# =====================================================
-
-@app.get("/ready")
-def readiness_probe():
-
-    if not readiness.ready:
-        raise HTTPException(status_code=503, detail="service_not_ready")
-
-    return api_success({
-        "status": "ready",
-        "boot_id": readiness.boot_id,
-        "model_version": readiness.model_version,
-        "artifact_hash": readiness.artifact_hash,
-        "dataset_hash": readiness.dataset_hash,
-        "schema_signature": readiness.schema_signature,
-        "training_code_hash": readiness.training_code_hash,
-        "redis_connected": readiness.redis_connected,
-        "drift_baseline_loaded": readiness.drift_baseline_loaded,
-        "memory_mb": readiness.boot_memory_mb,
-        "config_fingerprint": readiness.config_fingerprint,
-        "mode": "degraded" if not readiness.redis_connected else "normal",
-        "llm": {
-            "enabled": readiness.llm_enabled,
-            "model": readiness.llm_model,
-            "rate_limit_per_min": readiness.llm_rate_limit,
-            "cache_enabled": readiness.llm_cache_enabled
-        },
-        "uptime_seconds": int(time.time()) - readiness.start_time
-    })
-
-
-# =====================================================
-# LIVENESS
-# =====================================================
-
-@app.get("/live")
-def liveness_probe():
-    return api_success({
-        "status": "alive",
-        "boot_id": readiness.boot_id
-    })
