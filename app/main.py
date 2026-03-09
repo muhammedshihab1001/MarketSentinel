@@ -1,5 +1,5 @@
 # =====================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v2.0
+# MARKET SENTINEL APPLICATION ENTRYPOINT v2.1
 # Hybrid Multi-Agent | CV-Optimized Architecture
 # =====================================================
 
@@ -11,9 +11,11 @@ import os
 import psutil
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Response, Request, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import generate_latest
 
 from core.config.env_loader import init_env, get_int, get_env, get_bool
@@ -53,6 +55,9 @@ BOOT_ID = hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
 STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 120)
 APP_VERSION = get_env("APP_VERSION", "4.1.0")
 
+CORS_ORIGINS = get_env("CORS_ORIGINS", "*")
+CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS.split(",")]
+
 
 # =====================================================
 # READINESS STATE
@@ -90,18 +95,44 @@ readiness = ReadinessState()
 
 
 # =====================================================
+# RESPONSE HELPERS
+# =====================================================
+
+def api_success(data):
+    return {
+        "success": True,
+        "data": data,
+        "error": None,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+def api_error(message):
+    return {
+        "success": False,
+        "data": None,
+        "error": message,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+# =====================================================
 # GLOBAL EXCEPTION HANDLER
 # =====================================================
 
 async def global_exception_handler(request: Request, exc: Exception):
 
     if isinstance(exc, HTTPException):
-        raise exc
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=api_error(exc.detail)
+        )
 
     logger.exception("Unhandled API error")
+
     return JSONResponse(
         status_code=500,
-        content={"error": "internal_server_error"}
+        content=api_error("internal_server_error")
     )
 
 
@@ -216,6 +247,19 @@ app.add_exception_handler(Exception, global_exception_handler)
 
 
 # =====================================================
+# CORS MIDDLEWARE (React Frontend Support)
+# =====================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
+
+
+# =====================================================
 # REQUEST MIDDLEWARE
 # =====================================================
 
@@ -260,7 +304,7 @@ app.include_router(agent.router)
 
 @app.get("/")
 async def root():
-    return {
+    return api_success({
         "service": "MarketSentinel Hybrid Portfolio Engine",
         "architecture": "multi-agent-ml-governed",
         "status": "running",
@@ -270,7 +314,7 @@ async def root():
         "version": APP_VERSION,
         "docs": "/docs",
         "metrics": "/metrics"
-    }
+    })
 
 
 # =====================================================
@@ -293,9 +337,9 @@ def metrics():
 def readiness_probe():
 
     if not readiness.ready:
-        return Response("Service not ready", status_code=503)
+        raise HTTPException(status_code=503, detail="service_not_ready")
 
-    return {
+    return api_success({
         "status": "ready",
         "boot_id": readiness.boot_id,
         "model_version": readiness.model_version,
@@ -315,7 +359,7 @@ def readiness_probe():
             "cache_enabled": readiness.llm_cache_enabled
         },
         "uptime_seconds": int(time.time()) - readiness.start_time
-    }
+    })
 
 
 # =====================================================
@@ -324,7 +368,7 @@ def readiness_probe():
 
 @app.get("/live")
 def liveness_probe():
-    return {
+    return api_success({
         "status": "alive",
         "boot_id": readiness.boot_id
-    }
+    })
