@@ -1,5 +1,5 @@
 # =========================================================
-# PREDICTION & SNAPSHOT ROUTES v3.0
+# PREDICTION & SNAPSHOT ROUTES v3.1
 # Hybrid Multi-Agent Compatible
 # CV-Optimized | Decision-Aware | Governance-Aware
 # =========================================================
@@ -11,7 +11,7 @@ import re
 import logging
 import json
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -29,10 +29,10 @@ from app.api.schemas import (
     SignalExplanationResponse,
 )
 
-router = APIRouter()
+router = APIRouter(prefix="/predict", tags=["prediction"])
 logger = logging.getLogger("marketsentinel.api")
 
-_pipeline: InferencePipeline | None = None
+_pipeline: Optional[InferencePipeline] = None
 
 
 # =========================================================
@@ -41,9 +41,11 @@ _pipeline: InferencePipeline | None = None
 
 def get_pipeline() -> InferencePipeline:
     global _pipeline
+
     if _pipeline is None:
         logger.info("Initializing InferencePipeline (singleton)")
         _pipeline = InferencePipeline()
+
     return _pipeline
 
 
@@ -116,16 +118,18 @@ def load_default_universe() -> List[str]:
 @router.get("/live-snapshot")
 async def live_snapshot():
 
-    endpoint = "/live-snapshot"
+    endpoint = "/predict/live-snapshot"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
 
     try:
+
         tickers = load_default_universe()
         pipeline = get_pipeline()
         loader = get_shared_model_loader()
 
         async with inference_semaphore:
+
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(pipeline.run_snapshot, tickers),
                 timeout=REQUEST_TIMEOUT
@@ -148,10 +152,6 @@ async def live_snapshot():
             round(sum(hybrid_scores) / len(hybrid_scores), 2)
             if hybrid_scores else 0.0
         )
-
-        # =====================================================
-        # NEW: Executive Summary
-        # =====================================================
 
         top_5 = snapshot.get("top_5", [])
         decision_report = snapshot.get("decision_report", {})
@@ -211,7 +211,7 @@ async def live_snapshot():
 )
 async def signal_explanation(ticker: str):
 
-    endpoint = "/signal-explanation"
+    endpoint = "/predict/signal-explanation"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
 
@@ -221,6 +221,7 @@ async def signal_explanation(ticker: str):
         raise HTTPException(status_code=400, detail="Invalid ticker format.")
 
     try:
+
         pipeline = get_pipeline()
         loader = get_shared_model_loader()
         universe_tickers = load_default_universe()
@@ -232,6 +233,7 @@ async def signal_explanation(ticker: str):
             )
 
         async with inference_semaphore:
+
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(pipeline.run_snapshot, universe_tickers),
                 timeout=REQUEST_TIMEOUT
@@ -250,7 +252,10 @@ async def signal_explanation(ticker: str):
             ticker=row["ticker"],
             score=row.get("raw_model_score", 0.0),
             signal=signal_agent.get("signal", "NEUTRAL"),
-            agent_score=row.get("hybrid_consensus_score", row.get("agent_score", 0.0)),
+            agent_score=row.get(
+                "hybrid_consensus_score",
+                row.get("agent_score", 0.0)
+            ),
             alpha_strength=signal_agent.get("alpha_strength", 0.0),
             confidence_numeric=signal_agent.get("confidence_numeric", 0.0),
             governance_score=signal_agent.get("governance_score", 0),
