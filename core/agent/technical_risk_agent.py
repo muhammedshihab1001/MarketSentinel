@@ -1,5 +1,5 @@
 # =========================================================
-# TECHNICAL & RISK AGENT v2.1
+# TECHNICAL & RISK AGENT v2.2
 # Hybrid Multi-Agent Architecture
 # Drift-Aware | Regime-Aware | CV-Optimized
 # =========================================================
@@ -11,27 +11,16 @@ from core.agent.base_agent import BaseAgent
 
 
 class TechnicalRiskAgent(BaseAgent):
-    """
-    Secondary Intelligence Agent.
-
-    Evaluates:
-    - Momentum strength
-    - EMA structure alignment
-    - RSI sanity
-    - Volatility regime
-    - Liquidity quality (important for yfinance data)
-    - Drift state awareness
-
-    Produces independent score (0–1).
-    """
 
     name = "TechnicalRiskAgent"
-    weight = 0.7  # Slightly lower than model agent
+    weight = 0.7
 
     RSI_OVERBOUGHT = 70
     RSI_OVERSOLD = 30
 
     HIGH_VOL_THRESHOLD = 1.5
+    LOW_VOL_THRESHOLD = -0.5
+
     LOW_LIQUIDITY_THRESHOLD = 5e5
 
     MOMENTUM_STRONG = 1.0
@@ -40,13 +29,19 @@ class TechnicalRiskAgent(BaseAgent):
 
     @staticmethod
     def _safe_float(value, default=0.0):
+
         try:
+
             if value is None:
                 return default
+
             val = float(value)
+
             if not np.isfinite(val):
                 return default
+
             return val
+
         except Exception:
             return default
 
@@ -67,17 +62,14 @@ class TechnicalRiskAgent(BaseAgent):
         regime_feature = self._safe_float(row.get("regime_feature"), 0.0)
         dollar_volume = self._safe_float(row.get("dollar_volume"), 0.0)
 
-        score_components = []
-
         # -------------------------------------------------
         # Momentum Strength
         # -------------------------------------------------
 
         momentum_strength = np.clip(abs(momentum_z) / 3.0, 0.0, 1.0)
-        score_components.append(momentum_strength)
 
         if abs(momentum_z) < 0.5:
-            warnings.append("Weak momentum")
+            warnings.append("Low momentum (stable asset)")
 
         if momentum_z > self.MOMENTUM_STRONG:
             bias = "bullish"
@@ -91,10 +83,10 @@ class TechnicalRiskAgent(BaseAgent):
         # -------------------------------------------------
 
         ema_score = np.clip(abs(ema_ratio - 1.0) * 5.0, 0.0, 1.0)
-        score_components.append(ema_score)
 
         if signal == "LONG" and ema_ratio < 1.0:
             warnings.append("EMA not supportive of long")
+
         if signal == "SHORT" and ema_ratio > 1.0:
             warnings.append("EMA not supportive of short")
 
@@ -105,59 +97,90 @@ class TechnicalRiskAgent(BaseAgent):
         if rsi > self.RSI_OVERBOUGHT:
             warnings.append("RSI overbought")
             rsi_score = 0.4
+
         elif rsi < self.RSI_OVERSOLD:
             warnings.append("RSI oversold")
             rsi_score = 0.4
+
         else:
             rsi_score = 1.0
-
-        score_components.append(rsi_score)
 
         # -------------------------------------------------
         # Volatility Regime
         # -------------------------------------------------
 
         if regime_feature > self.HIGH_VOL_THRESHOLD:
-            warnings.append("High volatility regime")
-            vol_score = 0.5
-        else:
-            vol_score = 1.0
 
-        score_components.append(vol_score)
+            warnings.append("High volatility regime")
+
+            vol_multiplier = 0.7
+
+        elif regime_feature < self.LOW_VOL_THRESHOLD:
+
+            reasoning.append("Low volatility stability regime")
+
+            vol_multiplier = 1.1
+
+        else:
+
+            vol_multiplier = 1.0
 
         # -------------------------------------------------
-        # Liquidity (Important for yfinance noise)
+        # Liquidity
         # -------------------------------------------------
 
         if dollar_volume < self.LOW_LIQUIDITY_THRESHOLD:
+
             warnings.append("Low liquidity (data reliability risk)")
+
             liquidity_score = 0.5
+
         else:
+
             liquidity_score = 1.0
 
-        score_components.append(liquidity_score)
-
         # -------------------------------------------------
-        # Drift Penalty (STATE AWARE)
+        # Drift Penalty
         # -------------------------------------------------
 
         drift_penalty = 1.0
 
         if drift_state == "soft":
+
             drift_penalty = 0.85
+
             warnings.append("Soft drift environment")
 
         elif drift_state == "hard":
+
             drift_penalty = 0.70
+
             warnings.append("Hard drift regime")
 
-        score_components.append(drift_penalty)
-
         # -------------------------------------------------
-        # Final Score
+        # SIGNAL SCORE (pure signal)
         # -------------------------------------------------
 
-        final_score = float(np.clip(np.mean(score_components), 0.0, 1.0))
+        signal_score = float(np.mean([
+            momentum_strength,
+            ema_score,
+            rsi_score
+        ]))
+
+        # -------------------------------------------------
+        # GATE MULTIPLIER (risk controls)
+        # -------------------------------------------------
+
+        gate_multiplier = (
+            liquidity_score *
+            drift_penalty *
+            vol_multiplier
+        )
+
+        final_score = float(
+            np.clip(signal_score * gate_multiplier, 0.0, 1.0)
+        )
+
         confidence = final_score
 
         governance_score = int(np.clip(final_score * 100, 0, 100))
@@ -179,9 +202,10 @@ class TechnicalRiskAgent(BaseAgent):
                 "momentum": momentum_strength,
                 "ema": ema_score,
                 "rsi": rsi_score,
-                "volatility": vol_score,
+                "signal_score": signal_score,
                 "liquidity": liquidity_score,
-                "drift_penalty": drift_penalty
+                "drift_penalty": drift_penalty,
+                "volatility_multiplier": vol_multiplier
             },
             "warnings": sorted(set(warnings)),
             "reasoning": reasoning,
