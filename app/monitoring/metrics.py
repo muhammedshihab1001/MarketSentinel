@@ -68,7 +68,7 @@ MODEL_VERSION = Gauge(
 
 SIGNAL_DISTRIBUTION = Counter(
     "signal_distribution_total",
-    "Distribution of BUY/SELL/HOLD",
+    "Distribution of LONG/SHORT signals",
     ["signal"]
 )
 
@@ -77,16 +77,6 @@ PREDICTION_CLASS_PROBABILITY = Histogram(
     "Prediction probability distribution",
     ["model"],
     buckets=(0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9)
-)
-
-FORECAST_HORIZON = Gauge(
-    "forecast_horizon_days",
-    "Forecast horizon length"
-)
-
-CONFIDENCE_SCORE = Gauge(
-    "prediction_confidence",
-    "Model confidence score"
 )
 
 
@@ -135,7 +125,7 @@ DRIFT_DETECTED = Gauge(
 
 
 # =====================================================
-# CACHE OBSERVABILITY (NEW)
+# CACHE OBSERVABILITY
 # =====================================================
 
 CACHE_HITS = Counter(
@@ -159,13 +149,7 @@ PIPELINE_FAILURES = Counter(
     ["stage"]
 )
 
-# concurrency pressure indicator
 INFERENCE_IN_PROGRESS = Gauge(
     "inference_in_progress",
     "Number of active inferences"
-)
-
-CIRCUIT_BREAKER_OPEN = Gauge(
-    "circuit_breaker_open",
-    "Circuit breaker state (1=open)"
 )
