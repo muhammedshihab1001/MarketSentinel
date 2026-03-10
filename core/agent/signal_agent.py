@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL SIGNAL AGENT v3.3
+# INSTITUTIONAL SIGNAL AGENT v3.4
 # Hybrid-Compatible Model Intelligence Agent
 # Drift-Aware | Regime-Aware | CV-Optimized
 # =========================================================
@@ -13,17 +13,6 @@ EPSILON = 1e-12
 
 
 class SignalAgent(BaseAgent):
-    """
-    Primary Model Intelligence Agent.
-
-    Responsibilities:
-    - Consume ML model output
-    - Apply technical alignment
-    - Apply volatility adjustment
-    - Apply drift penalty (state-aware)
-    - Apply political risk override
-    - Produce hybrid-compatible structured output
-    """
 
     name = "SignalAgent"
     weight = 1.0
@@ -41,6 +30,7 @@ class SignalAgent(BaseAgent):
     MIN_POSITION_SIZE = 0.0
 
     MIN_CONFIDENCE_TO_TRADE = 0.30
+    LOW_VOL_CONFIDENCE = 0.20
 
     # ---------------------------------------------------------
     # SAFE CAST
@@ -48,13 +38,18 @@ class SignalAgent(BaseAgent):
 
     @staticmethod
     def _safe_float(value, default=0.0):
+
         try:
             if value is None:
                 return default
+
             val = float(value)
+
             if not np.isfinite(val):
                 return default
+
             return val
+
         except Exception:
             return default
 
@@ -63,6 +58,7 @@ class SignalAgent(BaseAgent):
     # ---------------------------------------------------------
 
     def _alignment_score(self, signal, momentum_z, ema_ratio):
+
         alignment = 0
 
         if signal == "LONG":
@@ -96,6 +92,7 @@ class SignalAgent(BaseAgent):
             return confidence_numeric
 
         penalty = np.clip(volatility / 2.0, 0.0, 1.0)
+
         adjusted = confidence_numeric * (1 - 0.3 * penalty)
 
         return float(np.clip(adjusted, 0.0, 1.0))
@@ -121,7 +118,13 @@ class SignalAgent(BaseAgent):
         if volatility_regime == "high_volatility":
             base *= 0.7
 
-        return float(np.clip(base, self.MIN_POSITION_SIZE, self.MAX_POSITION_SIZE))
+        # defensive assets get slightly larger size
+        if volatility_regime == "low_volatility":
+            base *= 1.1
+
+        return float(
+            np.clip(base, self.MIN_POSITION_SIZE, self.MAX_POSITION_SIZE)
+        )
 
     # ---------------------------------------------------------
     # MAIN ANALYZE
@@ -129,14 +132,16 @@ class SignalAgent(BaseAgent):
 
     def analyze(self, context: Dict[str, Any]) -> Dict[str, Any]:
 
-        # Backward compatibility
         if "row" in context:
+
             row = context.get("row", {})
             probability_stats = context.get("probability_stats")
             drift_score = context.get("drift_score")
             drift_state = context.get("drift_state")
             political_risk_label = context.get("political_risk_label")
+
         else:
+
             row = context
             probability_stats = None
             drift_score = None
@@ -153,6 +158,7 @@ class SignalAgent(BaseAgent):
         )
 
         signal = row.get("signal", "NEUTRAL")
+
         if signal not in {"LONG", "SHORT", "NEUTRAL"}:
             signal = "NEUTRAL"
 
@@ -167,33 +173,37 @@ class SignalAgent(BaseAgent):
 
         abs_score = abs(final_score)
 
-        # -------------------------------------------------
-        # Alpha strength
-        # -------------------------------------------------
-
         alpha_strength = float(abs_score)
 
         confidence_numeric = self._confidence_numeric(abs_score)
+
         confidence_numeric = self._volatility_adjusted_confidence(
             confidence_numeric,
             volatility
         )
 
+        # -------------------------------------------------
+        # Low dispersion warning (no penalty)
+        # -------------------------------------------------
+
         if probability_stats:
+
             std = self._safe_float(probability_stats.get("std"), 0.0)
+
             if std < 0.05:
                 warnings.append("Low cross-sectional dispersion")
-                confidence_numeric *= 0.8
 
         # -------------------------------------------------
         # Technical confirmation
         # -------------------------------------------------
 
         alignment = self._alignment_score(signal, momentum_z, ema_ratio)
+
         technical_score = alignment / 2.0
 
         if signal == "LONG" and rsi > self.RSI_OVERBOUGHT:
             warnings.append("RSI overbought")
+
         if signal == "SHORT" and rsi < self.RSI_OVERSOLD:
             warnings.append("RSI oversold")
 
@@ -203,6 +213,8 @@ class SignalAgent(BaseAgent):
 
         if regime_feature > 1.5:
             volatility_regime = "high_volatility"
+        elif regime_feature < -0.5:
+            volatility_regime = "low_volatility"
         else:
             volatility_regime = "normal"
 
@@ -222,17 +234,23 @@ class SignalAgent(BaseAgent):
         drift_flag = False
 
         if drift_state in {"soft", "hard"}:
+
             drift_flag = True
+
             confidence_numeric *= 0.75
+
             warnings.append(f"Drift state: {drift_state}")
 
         # -------------------------------------------------
-        # Political Risk Override (NEW)
+        # Political Risk Override
         # -------------------------------------------------
 
         if political_risk_label == "CRITICAL":
+
             signal = "NEUTRAL"
+
             warnings.append("Political risk CRITICAL — trading disabled")
+
             reasoning.append("Political event risk override applied")
 
         confidence_numeric = float(np.clip(confidence_numeric, 0.0, 1.0))
@@ -249,9 +267,15 @@ class SignalAgent(BaseAgent):
             1.0
         ))
 
+        threshold = (
+            self.LOW_VOL_CONFIDENCE
+            if volatility_regime == "low_volatility"
+            else self.MIN_CONFIDENCE_TO_TRADE
+        )
+
         trade_approved = (
             signal != "NEUTRAL"
-            and confidence_numeric > self.MIN_CONFIDENCE_TO_TRADE
+            and confidence_numeric > threshold
             and not drift_flag
             and political_risk_label != "CRITICAL"
         )
