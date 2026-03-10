@@ -9,10 +9,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# SCHEMA VERSION (BUMPED)
+# SCHEMA VERSION
 # ============================================================
 
-SCHEMA_VERSION = "44.0"  # enhanced-alpha schema contract
+SCHEMA_VERSION = "44.0"
 
 
 ############################################################
@@ -24,45 +24,38 @@ SHORT_PERCENTILE = 0.30
 
 
 ############################################################
-# CORE FEATURES (ENHANCED)
+# CORE FEATURES
 ############################################################
 
 CORE_FEATURES: Tuple[str, ...] = (
 
-    # Returns
     "return",
     "return_lag1",
     "return_lag5",
     "return_mean_20",
     "reversal_5",
 
-    # Momentum
     "momentum_20",
     "momentum_60",
     "momentum_composite",
     "mom_vol_adj",
     "momentum_regime_interaction",
 
-    # Volatility
     "volatility",
     "volatility_20",
     "vol_of_vol",
     "return_skew_20",
 
-    # Liquidity
     "volume_momentum",
     "dollar_volume",
     "amihud",
 
-    # Technical
     "rsi",
     "ema_ratio",
 
-    # Structure
     "dist_from_52w_high",
     "regime_feature",
 
-    # Market-level context
     "market_dispersion",
     "breadth",
 )
@@ -110,6 +103,7 @@ MODEL_FEATURES: List[str] = list(
 )
 
 DTYPE = np.float32
+
 MIN_ROWS_TRAINING = 300
 MIN_VARIANCE = 1e-8
 MIN_CS_VARIANCE = 1e-6
@@ -131,14 +125,19 @@ def _check_forbidden_columns(df: pd.DataFrame):
 
 
 def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
+
     df = df.copy()
+
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
     return df
 
 
 def _check_dtype_stability(df: pd.DataFrame):
+
     if df.dtypes.nunique() > 1:
         logger.debug("Mixed dtypes detected before cast.")
 
@@ -164,18 +163,20 @@ def validate_feature_schema(
     _check_forbidden_columns(df)
 
     missing_core = set(CORE_FEATURES) - set(df.columns)
+
     if missing_core:
         raise RuntimeError(f"Missing core features: {missing_core}")
 
     feature_df = df.copy()
 
     ########################################################
-    # STRICT CONTRACT ENFORCEMENT
+    # STRICT CONTRACT
     ########################################################
 
     if mode in {"training", "strict_contract"}:
 
         missing_all = set(MODEL_FEATURES) - set(feature_df.columns)
+
         if missing_all:
             raise RuntimeError(
                 f"Missing required features under strict contract: {missing_all}"
@@ -183,10 +184,16 @@ def validate_feature_schema(
 
         feature_df = feature_df.loc[:, MODEL_FEATURES]
 
+    ########################################################
+    # INFERENCE MODE (SAFE FALLBACK)
+    ########################################################
+
     elif mode == "inference":
 
         for col in MODEL_FEATURES:
+
             if col not in feature_df.columns:
+
                 if col.endswith("_rank"):
                     feature_df[col] = 0.5
                 else:
@@ -195,7 +202,7 @@ def validate_feature_schema(
         feature_df = feature_df.loc[:, MODEL_FEATURES]
 
     ########################################################
-    # NUMERIC + CLEANUP
+    # NUMERIC CLEANUP
     ########################################################
 
     feature_df = _safe_numeric_block(feature_df)
@@ -207,6 +214,7 @@ def validate_feature_schema(
     for col in CORE_FEATURES:
 
         series = feature_df[col]
+
         finite_vals = series[np.isfinite(series)]
 
         if finite_vals.empty:
@@ -220,13 +228,17 @@ def validate_feature_schema(
             logger.warning(f"Low variance core feature: {col}")
 
     ########################################################
-    # CROSS-SECTIONAL VALIDATION
+    # CROSS SECTIONAL VALIDATION
     ########################################################
 
     for col in CROSS_SECTIONAL_FEATURES:
 
         series = feature_df[col]
+
         finite_vals = series[np.isfinite(series)]
+
+        if len(finite_vals) == 0:
+            continue
 
         if finite_vals.nunique() <= 1:
 
@@ -249,8 +261,9 @@ def validate_feature_schema(
     # FINAL SANITY
     ########################################################
 
-    if feature_df.isnull().any().any():
-        raise RuntimeError("NaN detected after schema validation.")
+    if mode != "inference":
+        if feature_df.isnull().any().any():
+            raise RuntimeError("NaN detected after schema validation.")
 
     if not np.isfinite(feature_df.values).all():
         raise RuntimeError("Non-finite values detected.")
@@ -278,7 +291,10 @@ def get_schema_signature() -> str:
     }
 
     canonical = json.dumps(contract, sort_keys=True)
-    return hashlib.sha256(canonical.encode()).hexdigest()
+
+    return hashlib.sha256(
+        canonical.encode()
+    ).hexdigest()
 
 
 ############################################################
