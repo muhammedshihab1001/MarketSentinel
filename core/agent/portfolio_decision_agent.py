@@ -1,28 +1,19 @@
 # =========================================================
-# PORTFOLIO DECISION AGENT v2.1
+# PORTFOLIO DECISION AGENT v2.2
 # Main Intelligence Layer
 # CV Showcase Optimized | Drift-Aware | Risk-Aware
 # Stability-Enhanced | Interview-Polished
 # =========================================================
 
 import numpy as np
+import os
 from typing import Dict, Any, List
 from datetime import datetime
 
 
 class PortfolioDecisionAgent:
-    """
-    Final decision-making intelligence layer.
 
-    Responsibilities:
-    - Select Top 5 stocks
-    - Generate structured explanation
-    - Produce executive report
-    - Summarize risk, drift, exposure, bias
-    - Provide CV-level portfolio intelligence
-    """
-
-    TOP_K = 5
+    TOP_K = int(os.getenv("TOP_N_STOCKS", "5"))
 
     # -----------------------------------------------------
     # MAIN ENTRY
@@ -34,7 +25,16 @@ class PortfolioDecisionAgent:
         drift_info = snapshot.get("drift", {})
 
         if not signals:
-            raise RuntimeError("Snapshot empty — cannot analyze.")
+
+            return {
+                "generated_at": datetime.utcnow().isoformat(),
+                "snapshot_date": snapshot.get("snapshot_date"),
+                "top_5_detailed": [],
+                "portfolio_findings": {
+                    "status": "no_signals"
+                },
+                "executive_summary": "No valid trading signals generated for this snapshot."
+            }
 
         # =================================================
         # Rank by hybrid consensus
@@ -82,9 +82,11 @@ class PortfolioDecisionAgent:
             if any("liquidity" in w.lower() for w in combined_warnings):
                 liquidity_warnings += 1
 
-            if stock.get("weight", 0.0) > 0:
+            weight = float(stock.get("weight", 0.0))
+
+            if weight > 0:
                 long_count += 1
-            elif stock.get("weight", 0.0) < 0:
+            elif weight < 0:
                 short_count += 1
 
             explanation = (
@@ -97,7 +99,7 @@ class PortfolioDecisionAgent:
 
             detailed_selection.append({
                 "ticker": stock["ticker"],
-                "weight": round(float(stock.get("weight", 0.0)), 6),
+                "weight": round(weight, 6),
                 "hybrid_score": round(hybrid_score, 4),
                 "model_score": round(float(stock.get("raw_model_score", 0.0)), 4),
                 "confidence": round(confidence, 4),
@@ -118,7 +120,6 @@ class PortfolioDecisionAgent:
         gross_exposure = float(snapshot.get("gross_exposure", 0.0))
         net_exposure = float(snapshot.get("net_exposure", 0.0))
 
-        # Portfolio bias detection
         if net_exposure > 0.05:
             portfolio_bias = "long_bias"
         elif net_exposure < -0.05:
@@ -126,8 +127,12 @@ class PortfolioDecisionAgent:
         else:
             portfolio_bias = "market_neutral"
 
-        # Concentration risk
-        max_weight = max(abs(s["weight"]) for s in top_5) if top_5 else 0.0
+        weights = [abs(float(s.get("weight", 0.0))) for s in top_5]
+
+        if weights:
+            max_weight = max(weights)
+        else:
+            max_weight = 0.0
 
         if max_weight > 0.18:
             concentration_risk = "high"
@@ -146,7 +151,6 @@ class PortfolioDecisionAgent:
         else:
             drift_risk = "low"
 
-        # Hybrid dispersion insight (CV-level touch)
         hybrid_dispersion = float(np.std(hybrid_scores)) if hybrid_scores else 0.0
 
         # =================================================
@@ -175,7 +179,7 @@ class PortfolioDecisionAgent:
         # =================================================
 
         executive_summary = (
-            f"Hybrid AI consensus selected top 5 equities with "
+            f"Hybrid AI consensus selected top {len(top_5)} equities with "
             f"average confidence {avg_confidence:.2f}. "
             f"Portfolio bias: {portfolio_bias.replace('_', ' ')}. "
             f"Drift condition: {drift_state} (risk: {drift_risk}). "
