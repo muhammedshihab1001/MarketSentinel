@@ -12,7 +12,9 @@ from core.schema.feature_schema import MODEL_FEATURES
 def dummy_trainer(train_df):
 
     class DummyModel:
+
         def predict(self, X):
+
             # deterministic regression-safe signal
             return X.iloc[:, 0].values.astype("float32")
 
@@ -20,12 +22,12 @@ def dummy_trainer(train_df):
 
 
 ############################################################
-# HELPER DATA
+# HELPER DATASET
 ############################################################
 
 def build_dataset(n_days=400, n_tickers=20, seed=42):
 
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
 
     dates = pd.date_range("2024-01-01", periods=n_days)
     tickers = [f"T{i}" for i in range(n_tickers)]
@@ -34,16 +36,16 @@ def build_dataset(n_days=400, n_tickers=20, seed=42):
 
     for d in dates:
         for t in tickers:
+
             row = {
                 "date": d,
                 "ticker": t,
-                "close": 100 + np.random.randn(),
-                "volatility": abs(np.random.randn()) + 0.1
+                "close": 100 + rng.normal(),
+                "volatility": abs(rng.normal()) + 0.1
             }
 
-            # Add all required model features
             for col in MODEL_FEATURES:
-                row[col] = np.random.randn()
+                row[col] = rng.normal()
 
             rows.append(row)
 
@@ -68,7 +70,7 @@ def test_metrics_computation():
 
 
 ############################################################
-# SHARPE GATE BOUNDS
+# SHARPE BOUNDS
 ############################################################
 
 def test_sharpe_bounds():
@@ -111,3 +113,31 @@ def test_metric_type_stability():
 
     for v in metrics.values():
         assert isinstance(v, (int, float))
+
+
+############################################################
+# METRIC KEYS EXIST
+############################################################
+
+def test_metric_keys_present():
+
+    df = build_dataset()
+
+    wf = WalkForwardValidator(dummy_trainer)
+
+    metrics = wf.run(df)
+
+    required = {
+        "avg_strategy_return",
+        "avg_sharpe",
+        "profit_factor",
+        "max_drawdown",
+        "return_volatility",
+        "final_equity",
+        "avg_turnover",
+        "avg_win_rate",
+        "avg_trades_per_window",
+        "num_windows",
+    }
+
+    assert required.issubset(metrics.keys())
