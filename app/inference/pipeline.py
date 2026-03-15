@@ -114,10 +114,19 @@ class InferencePipeline:
         logger.info("Model verified | version=%s", self.models.xgb_version)
 
     # =========================================================
-    # FEATURE FRAME BUILDER (NEW)
+    # FEATURE FRAME BUILDER
     # =========================================================
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
+        """
+        Fetch price data for all tickers, concatenate, then run the
+        full feature pipeline ONCE so cross-sectional features compute
+        correctly across the universe.
+
+        Previous bug: called build_feature_pipeline() per single ticker
+        inside a loop, so CS features (needing 5+ tickers/date) always
+        failed or produced zero-filled defaults.
+        """
 
         end_date = pd.Timestamp.utcnow()
 
@@ -126,39 +135,42 @@ class InferencePipeline:
         data, failures = self.market_data.get_price_data_batch(
             tickers,
             start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d")
+            end_date.strftime("%Y-%m-%d"),
         )
 
         if failures:
             logger.warning(
-                "Market data partial failure | success=%d | failed=%d",
+                "Market data partial failure | success=%d | failed=%d | tickers=%s",
                 len(data),
-                len(failures)
+                len(failures),
+                list(failures.keys()),
             )
 
-        frames = []
+        if not data:
+            raise RuntimeError("Market data fetch failed for all tickers.")
 
-        for ticker, df in data.items():
+        # Concatenate all tickers' price data first
+        combined_prices = pd.concat(
+            list(data.values()), ignore_index=True
+        )
 
-            try:
+        # Run full feature pipeline once on combined data
+        combined = FeatureEngineer.build_feature_pipeline(
+            combined_prices, training=False
+        )
 
-                feat = FeatureEngineer.build_feature_pipeline(df)
+        if combined.empty:
+            raise RuntimeError("Feature generation produced empty dataset.")
 
-                frames.append(feat)
-
-            except Exception:
-
-                logger.warning("Feature generation failed for %s", ticker)
-
-        if not frames:
-            raise RuntimeError("Feature generation failed for all tickers.")
-
-        combined = pd.concat(frames, ignore_index=True)
+        logger.info(
+            "Cross-sectional frame built | rows=%d tickers=%d",
+            len(combined), combined["ticker"].nunique(),
+        )
 
         return combined
 
     # =========================================================
-    # PORTFOLIO CONSTRUCTION (NEW)
+    # PORTFOLIO CONSTRUCTION
     # =========================================================
 
     def _construct_portfolio_from_rows(self, longs, shorts):
