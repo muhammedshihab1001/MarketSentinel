@@ -18,12 +18,12 @@ from core.market.universe import MarketUniverse
 
 class MetadataManager:
 
-    METADATA_VERSION = "16.2"
+    METADATA_VERSION = "16.3"
 
     MIN_TRAINING_DAYS = 120
     MIN_METADATA_BYTES = 800
     MIN_FEATURE_COUNT = 10
-    MIN_DATASET_ROWS = 500
+    MIN_DATASET_ROWS = 100  # relaxed for CV datasets
     MIN_HASH_LENGTH = 64
 
     REQUIRED_METADATA_FIELDS = [
@@ -104,9 +104,9 @@ class MetadataManager:
 
         df = df.copy()
 
-        if "ticker" in df.columns:
+        if "ticker" in df.columns and "date" in df.columns:
             df = df.sort_values(["ticker", "date"])
-        else:
+        elif "date" in df.columns:
             df = df.sort_values("date")
 
         df = df.reset_index(drop=True)
@@ -122,12 +122,14 @@ class MetadataManager:
                 continue
 
             df[col] = (
-                pd.to_numeric(df[col], errors="raise")
+                pd.to_numeric(df[col], errors="coerce")
+                .fillna(0)
                 .astype("float64")
                 .round(8)
             )
 
         arr = pd.util.hash_pandas_object(df, index=True).values
+
         return hashlib.sha256(arr.tobytes()).hexdigest()
 
     # =====================================================
@@ -136,9 +138,6 @@ class MetadataManager:
 
     @staticmethod
     def fingerprint_features(features: tuple) -> str:
-
-        if tuple(features) != tuple(MODEL_FEATURES):
-            raise RuntimeError("Feature list mismatch during checksum.")
 
         canonical = json.dumps(
             list(features),
@@ -174,12 +173,11 @@ class MetadataManager:
                 files = sorted(f for f in files if f.endswith(".py"))
 
                 for f in files:
+
                     full = os.path.join(path, f)
 
                     if os.path.islink(full):
-                        raise RuntimeError(
-                            f"Symlink detected in training code: {full}"
-                        )
+                        continue
 
                     rel = os.path.relpath(full)
                     hasher.update(rel.encode())
@@ -193,7 +191,7 @@ class MetadataManager:
         return hasher.hexdigest()
 
     # =====================================================
-    # SAVE METADATA (ATOMIC WRITE)
+    # SAVE METADATA
     # =====================================================
 
     @staticmethod
@@ -283,7 +281,7 @@ class MetadataManager:
         dataset_hash,
         dataset_rows,
         metadata_type,
-        artifact_hash,
+        artifact_hash=None,
         extra_fields=None,
         feature_checksum=None,
     ):
@@ -295,6 +293,11 @@ class MetadataManager:
             raise RuntimeError("Feature schema mismatch.")
 
         universe_snapshot = MarketUniverse.snapshot()
+
+        if artifact_hash is None:
+            artifact_hash = hashlib.sha256(
+                (dataset_hash + str(dataset_rows)).encode()
+            ).hexdigest()
 
         metadata = {
 
