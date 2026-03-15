@@ -1,5 +1,5 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.2)
+# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.3)
 # CV-Ready | Walk-Forward Validated | Drift Governance
 # ==========================================================
 
@@ -45,8 +45,8 @@ MIN_UNIQUE_DATES = 250
 MIN_CS_WIDTH = 8
 TARGET_CLIP = 5.0
 
-# Threshold for detecting low variance targets
 LOW_VARIANCE_THRESHOLD = 1e-6
+MAX_DATASET_ROWS = 1_000_000
 
 
 # ==========================================================
@@ -122,7 +122,10 @@ def build_baseline_from_dataframe(df: pd.DataFrame, model_version: str, dataset_
         std = float(series.std())
         variance = float(series.var())
 
-        counts, bin_edges = np.histogram(series, bins=10)
+        try:
+            counts, bin_edges = np.histogram(series, bins=10)
+        except Exception:
+            continue
 
         features_payload[col] = {
             "mean": mean,
@@ -210,11 +213,14 @@ def export_artifacts(model,
         )
 
     if promote_baseline:
+
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
+
         pointer_data = {
             "model_version": version,
             "promoted_at": timestamp
         }
+
         with open(pointer_path, "w", encoding="utf-8") as f:
             json.dump(pointer_data, f, indent=2)
 
@@ -237,33 +243,38 @@ def load_training_data(start_date, end_date):
 
     for ticker in universe:
 
-        price_df = market_data.get_price_data(
-            ticker=ticker,
-            start_date=start_date,
-            end_date=end_date
-        )
+        try:
 
-        if price_df is None or price_df.empty:
-            continue
+            price_df = market_data.get_price_data(
+                ticker=ticker,
+                start_date=start_date,
+                end_date=end_date
+            )
 
-        price_df = price_df.replace([np.inf, -np.inf], np.nan)
-        price_df = price_df.dropna(subset=["close"])
-        price_df = price_df[price_df["close"] > 0]
+            if price_df is None or price_df.empty:
+                continue
 
-        dataset = store.get_features(
-            price_df,
-            sentiment_df=None,
-            ticker=ticker,
-            training=True
-        )
+            dataset = store.get_features(
+                price_df,
+                sentiment_df=None,
+                ticker=ticker,
+                training=True
+            )
 
-        if dataset is not None and not dataset.empty:
-            datasets.append(dataset)
+            if dataset is not None and not dataset.empty:
+                datasets.append(dataset)
+
+        except Exception:
+            logger.warning("Ticker failed during training data load: %s", ticker)
 
     if not datasets:
         raise RuntimeError("All tickers failed.")
 
     df = pd.concat(datasets, ignore_index=True)
+
+    if len(df) > MAX_DATASET_ROWS:
+        logger.warning("Dataset very large — trimming")
+        df = df.tail(MAX_DATASET_ROWS)
 
     if len(df) < MIN_TRAINING_ROWS:
         raise RuntimeError("Dataset too small.")
@@ -272,6 +283,7 @@ def load_training_data(start_date, end_date):
         raise RuntimeError("Insufficient unique dates.")
 
     df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
     df = FeatureEngineer.add_cross_sectional_features(df)
     df = FeatureEngineer.finalize(df)
 
@@ -330,17 +342,10 @@ def trainer(train_df):
 
     y = train_df["target"].values
 
-    # ------------------------------------------------------
-    # LOW VARIANCE TARGET GUARD (NEW)
-    # ------------------------------------------------------
-
     target_std = np.std(y)
 
     if target_std < LOW_VARIANCE_THRESHOLD:
-        logger.warning(
-            "Target variance extremely low (%.8f) — injecting noise",
-            target_std
-        )
+        logger.warning("Target variance extremely low — injecting noise")
         noise = np.random.normal(0, 1e-4, size=len(y))
         y = y + noise
 
@@ -397,6 +402,7 @@ def main(start_date=None,
         return metrics
 
     except Exception as e:
+
         if allow_soft_fail:
             logger.warning("Training soft-failed: %s", str(e))
             return {}
