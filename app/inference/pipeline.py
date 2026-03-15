@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v4.7
+# INSTITUTIONAL INFERENCE PIPELINE v4.8
 # Stable | Drift-Aware | CV-Optimized | Noise-Controlled
 # =========================================================
 
@@ -24,6 +24,7 @@ from core.market.universe import MarketUniverse
 
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
+
 from core.agent.signal_agent import SignalAgent
 from core.agent.technical_risk_agent import TechnicalRiskAgent
 from core.agent.portfolio_decision_agent import PortfolioDecisionAgent
@@ -45,13 +46,21 @@ _MODEL_LOCK = threading.Lock()
 
 
 def get_shared_model_loader():
+
     global _SHARED_MODEL_LOADER
+
     if _SHARED_MODEL_LOADER is None:
+
         with _MODEL_LOCK:
+
             if _SHARED_MODEL_LOADER is None:
+
                 logger.info("Initializing shared ModelLoader")
+
                 _SHARED_MODEL_LOADER = ModelLoader()
+
                 _ = _SHARED_MODEL_LOADER.xgb
+
     return _SHARED_MODEL_LOADER
 
 
@@ -59,6 +68,7 @@ class InferencePipeline:
 
     TARGET_GROSS_EXPOSURE = 1.0
     MIN_UNIVERSE_WIDTH = int(os.getenv("MIN_UNIVERSE_WIDTH", "8"))
+
     MIN_SCORE_STD = 1e-6
     MAX_POSITION_WEIGHT = 0.20
 
@@ -75,16 +85,26 @@ class InferencePipeline:
     def __init__(self):
 
         self.market_data = MarketDataService()
+
         self.models = get_shared_model_loader()
+
         self.cache = RedisCache()
+
         self.drift_detector = DriftDetector()
 
         self.signal_agent = SignalAgent()
+
         self.technical_agent = TechnicalRiskAgent()
+
         self.portfolio_agent = PortfolioDecisionAgent()
+
         self.political_agent = PoliticalRiskAgent()
 
         self._validate_models_loaded()
+
+    # =========================================================
+    # MODEL VALIDATION
+    # =========================================================
 
     def _validate_models_loaded(self):
 
@@ -93,45 +113,116 @@ class InferencePipeline:
 
         logger.info("Model verified | version=%s", self.models.xgb_version)
 
+    # =========================================================
+    # FEATURE FRAME BUILDER (NEW)
+    # =========================================================
+
+    def _build_cross_sectional_frame(self, tickers: List[str]):
+
+        end_date = pd.Timestamp.utcnow()
+
+        start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
+
+        data, failures = self.market_data.get_price_data_batch(
+            tickers,
+            start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d")
+        )
+
+        if failures:
+            logger.warning(
+                "Market data partial failure | success=%d | failed=%d",
+                len(data),
+                len(failures)
+            )
+
+        frames = []
+
+        for ticker, df in data.items():
+
+            try:
+
+                feat = FeatureEngineer.build_feature_pipeline(df)
+
+                frames.append(feat)
+
+            except Exception:
+
+                logger.warning("Feature generation failed for %s", ticker)
+
+        if not frames:
+            raise RuntimeError("Feature generation failed for all tickers.")
+
+        combined = pd.concat(frames, ignore_index=True)
+
+        return combined
+
+    # =========================================================
+    # PORTFOLIO CONSTRUCTION (NEW)
+    # =========================================================
+
+    def _construct_portfolio_from_rows(self, longs, shorts):
+
+        weights = {}
+
+        if longs:
+
+            scores = np.array([x["hybrid_consensus_score"] for x in longs])
+
+            soft = np.exp(scores) / (np.sum(np.exp(scores)) + EPSILON)
+
+            for row, w in zip(longs, soft):
+
+                weights[row["ticker"]] = min(
+                    w * self.TARGET_GROSS_EXPOSURE / 2,
+                    self.MAX_POSITION_WEIGHT
+                )
+
+        if shorts:
+
+            scores = np.array([x["hybrid_consensus_score"] for x in shorts])
+
+            soft = np.exp(-scores) / (np.sum(np.exp(-scores)) + EPSILON)
+
+            for row, w in zip(shorts, soft):
+
+                weights[row["ticker"]] = -min(
+                    w * self.TARGET_GROSS_EXPOSURE / 2,
+                    self.MAX_POSITION_WEIGHT
+                )
+
+        return weights
+
+    # =========================================================
+    # WINSORIZE
+    # =========================================================
+
     def _winsorize(self, x):
 
         if len(x) < 3:
             return x
 
         lower = np.quantile(x, self.SCORE_WINSOR_Q)
+
         upper = np.quantile(x, 1 - self.SCORE_WINSOR_Q)
 
         return np.clip(x, lower, upper)
 
-    def _softmax(self, x):
+    # =========================================================
+    # DRIFT
+    # =========================================================
 
-        if len(x) == 0:
-            return np.array([])
+    def _safe_drift(self, feature_df):
 
-        x = x - np.max(x)
-        e = np.exp(x)
+        try:
+            return self.drift_detector.detect(feature_df)
+        except Exception:
+            logger.warning("Drift detector failed.")
+            return {"drift_state": "unknown", "severity_score": 0.0, "exposure_scale": 1.0}
 
-        return e / (np.sum(e) + EPSILON)
-
-    def _construct_portfolio(self, longs, shorts):
-
-        return self._construct_portfolio_from_rows(longs, shorts)
-
-    def _build_agent_context(
-        self,
-        row: Dict[str, Any],
-        probability_stats: Dict[str, Any],
-        drift_result: Dict[str, Any],
-        political_risk_label: str
-    ) -> Dict[str, Any]:
-
-        return {
-            "row": row,
-            "probability_stats": probability_stats,
-            "drift_score": drift_result.get("severity_score", 0),
-            "drift_state": drift_result.get("drift_state"),
-            "political_risk_label": political_risk_label
-        }
+    # =========================================================
+    # MAIN SNAPSHOT
+    # =========================================================
 
     def run_snapshot(self, tickers: List[str]):
 
@@ -163,25 +254,15 @@ class InferencePipeline:
             latest_date = df["date"].max()
 
             latest_df = df[df["date"] == latest_date].copy()
+
             latest_df = latest_df[latest_df["ticker"].isin(requested)]
 
             latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
+
             latest_df = latest_df.dropna(subset=MODEL_FEATURES)
 
             if latest_df.empty:
                 raise RuntimeError("Latest snapshot invalid.")
-
-            if "dollar_volume" in latest_df.columns:
-
-                q25 = latest_df["dollar_volume"].quantile(0.25)
-                liquidity_threshold = max(self.BASE_LIQUIDITY, q25)
-
-                filtered = latest_df[
-                    latest_df["dollar_volume"] >= liquidity_threshold
-                ]
-
-                if len(filtered) >= self.MIN_UNIVERSE_WIDTH:
-                    latest_df = filtered
 
             feature_df = validate_feature_schema(
                 latest_df.loc[:, MODEL_FEATURES],
@@ -192,26 +273,7 @@ class InferencePipeline:
 
             exposure_scale = drift_result.get("exposure_scale", 1.0)
 
-            try:
-                political_result = self.political_agent.get_political_risk("GLOBAL")
-                political_label = political_result.get("risk_label", "LOW")
-            except Exception:
-                logger.warning("Political risk unavailable")
-                political_label = "UNKNOWN"
-
             raw_scores = self.models.xgb.predict(feature_df)
-
-            score_std = float(np.std(raw_scores))
-
-            low_dispersion_mode = False
-
-            if score_std < self.MIN_SCORE_STD:
-
-                logger.warning(
-                    "Low dispersion detected — enabling adaptive scoring mode"
-                )
-
-                low_dispersion_mode = True
 
             raw_scores = self._winsorize(raw_scores)
 
@@ -236,14 +298,14 @@ class InferencePipeline:
 
                 row_dict = {**row.to_dict(), "signal": direction}
 
-                context = self._build_agent_context(
-                    row=row_dict,
-                    probability_stats=probability_stats,
-                    drift_result=drift_result,
-                    political_risk_label=political_label
-                )
+                context = {
+                    "row": row_dict,
+                    "probability_stats": probability_stats,
+                    "drift_state": drift_result.get("drift_state")
+                }
 
                 signal_output = self.signal_agent.analyze(context)
+
                 technical_output = self.technical_agent.analyze(context)
 
                 total_weight = (
@@ -276,6 +338,7 @@ class InferencePipeline:
             )
 
             longs = ranked[-min(self.TOP_K, len(ranked)):]
+
             shorts = ranked[:min(self.BOTTOM_K, len(ranked))]
 
             weights = self._construct_portfolio_from_rows(longs, shorts)
@@ -286,16 +349,9 @@ class InferencePipeline:
 
                 row["weight"] = float(base_weight * exposure_scale)
 
-            top_5 = sorted(
-                snapshot_rows,
-                key=lambda x: x["hybrid_consensus_score"],
-                reverse=True
-            )[:min(self.TOP_SELECTION, len(snapshot_rows))]
-
             snapshot_core = {
                 "snapshot_date": str(latest_date),
                 "model_version": self.models.xgb_version,
-                "schema_version": self.models.schema_version,
                 "gross_exposure": float(sum(abs(x["weight"]) for x in snapshot_rows)),
                 "net_exposure": float(sum(x["weight"] for x in snapshot_rows)),
                 "drift": drift_result,
@@ -304,22 +360,14 @@ class InferencePipeline:
 
             decision_report = self.portfolio_agent.analyze_snapshot(snapshot_core)
 
-            governance = {
-                "baseline_status": self.models.baseline_status,
-                "schema_signature": self.models.schema_signature,
-                "dataset_hash": self.models.dataset_hash
-            }
-
             result = {
                 **snapshot_core,
-                "universe_size": int(len(latest_df)),
-                "score_mean": probability_stats["mean"],
-                "score_std": probability_stats["std"],
-                "low_dispersion_mode": low_dispersion_mode,
-                "top_5": top_5,
-                "decision_report": decision_report,
-                "governance": governance,
-                "snapshot_quality": "stable"
+                "top_5": sorted(
+                    snapshot_rows,
+                    key=lambda x: x["hybrid_consensus_score"],
+                    reverse=True
+                )[:self.TOP_SELECTION],
+                "decision_report": decision_report
             }
 
             self.cache.set(cache_key, result, ex=self.SNAPSHOT_CACHE_TTL)
