@@ -2,6 +2,7 @@ import json
 import pytest
 
 from core.artifacts.metadata_manager import MetadataManager
+from core.schema.feature_schema import MODEL_FEATURES
 
 
 ############################################################
@@ -13,7 +14,7 @@ def _build_valid_metadata():
     return MetadataManager.create_metadata(
         model_name="xgboost",
         metrics={"sharpe": 1.2},
-        features=tuple(["f1"] * 10),
+        features=tuple(MODEL_FEATURES),   # FIXED
         training_start="2025-01-01",
         training_end="2026-01-01",
         dataset_hash="abc",
