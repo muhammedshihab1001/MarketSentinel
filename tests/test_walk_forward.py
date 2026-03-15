@@ -9,16 +9,25 @@ from core.schema.feature_schema import (
 )
 
 
+############################################################
+# DUMMY MODEL TRAINER
+############################################################
+
 def dummy_trainer(train_df):
 
     class DummyModel:
+
         def predict(self, X):
-            # deterministic dispersion from first feature
+            # deterministic dispersion using first feature
             base = X.iloc[:, 0].values.astype("float32")
             return base * 2.0
 
     return DummyModel()
 
+
+############################################################
+# SYNTHETIC DATASET
+############################################################
 
 def build_synthetic_dataset():
 
@@ -35,13 +44,18 @@ def build_synthetic_dataset():
             row = {
                 "date": d,
                 "ticker": t,
-                "close": 100 + rng.normal(0, 0.5) + (d.day * 0.01),
+
+                # small time trend prevents flat signals
+                "close": 100 + rng.normal(0, 0.5) + (d.day * 0.02),
+
                 "volatility": abs(rng.normal()) + 0.2,
+
                 "regime": "SIDEWAYS",
                 "market_regime": "SIDEWAYS",
                 "regime_multiplier": 1.0
             }
 
+            # populate schema features
             for col in MODEL_FEATURES:
                 row[col] = rng.normal()
 
@@ -49,7 +63,7 @@ def build_synthetic_dataset():
 
     df = pd.DataFrame(rows)
 
-    # Ensure schema compliance + dtype
+    # ensure schema compliance
     feature_block = validate_feature_schema(
         df.loc[:, MODEL_FEATURES],
         mode="training"
@@ -59,6 +73,10 @@ def build_synthetic_dataset():
 
     return df
 
+
+############################################################
+# END-TO-END WALK FORWARD TEST
+############################################################
 
 def test_walkforward_runs_end_to_end():
 
@@ -72,17 +90,17 @@ def test_walkforward_runs_end_to_end():
 
     metrics = validator.run(df)
 
-    # ======================================================
+    # ------------------------------------------------------
     # Core assertions
-    # ======================================================
+    # ------------------------------------------------------
 
     assert metrics["num_windows"] > 0
     assert metrics["final_equity"] > 0
     assert -5.0 <= metrics["avg_sharpe"] <= 5.0
 
-    # ======================================================
+    # ------------------------------------------------------
     # Stability checks
-    # ======================================================
+    # ------------------------------------------------------
 
     assert np.isfinite(metrics["avg_sharpe"])
     assert np.isfinite(metrics["final_equity"])
@@ -96,7 +114,10 @@ def test_walkforward_runs_end_to_end():
     assert metrics["avg_turnover"] >= 0
     assert metrics["avg_trades_per_window"] >= 1
 
-    # Ensure output keys exist
+    # ------------------------------------------------------
+    # Ensure all expected metrics exist
+    # ------------------------------------------------------
+
     required = {
         "avg_strategy_return",
         "avg_sharpe",
@@ -112,6 +133,10 @@ def test_walkforward_runs_end_to_end():
 
     assert required.issubset(metrics.keys())
 
+
+############################################################
+# DETERMINISM TEST
+############################################################
 
 def test_walkforward_is_deterministic():
 
