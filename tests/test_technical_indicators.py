@@ -25,7 +25,7 @@ def test_rsi_runs_without_crashing():
 
     df = build_df(np.linspace(100, 120, 100))
 
-    rsi = TechnicalIndicators.rsi(df, period=14)
+    rsi = TechnicalIndicators.rsi(df, window=14)
 
     assert isinstance(rsi, pd.Series)
     assert len(rsi) == len(df)
@@ -41,7 +41,7 @@ def test_rsi_bounds():
 
     df = build_df(rng.uniform(90, 110, 200))
 
-    rsi = TechnicalIndicators.rsi(df, period=14).dropna()
+    rsi = TechnicalIndicators.rsi(df, window=14).dropna()
 
     assert (rsi >= 0).all()
     assert (rsi <= 100).all()
@@ -55,7 +55,7 @@ def test_rsi_strong_uptrend():
 
     df = build_df(np.linspace(100, 200, 200))
 
-    rsi = TechnicalIndicators.rsi(df, period=14).dropna()
+    rsi = TechnicalIndicators.rsi(df, window=14).dropna()
 
     assert rsi.iloc[-1] > 70
 
@@ -68,7 +68,7 @@ def test_rsi_strong_downtrend():
 
     df = build_df(np.linspace(200, 100, 200))
 
-    rsi = TechnicalIndicators.rsi(df, period=14).dropna()
+    rsi = TechnicalIndicators.rsi(df, window=14).dropna()
 
     assert rsi.iloc[-1] < 30
 
@@ -81,7 +81,7 @@ def test_rsi_flat_market_equals_50():
 
     df = build_df([100.0] * 150)
 
-    rsi = TechnicalIndicators.rsi(df, period=14).dropna()
+    rsi = TechnicalIndicators.rsi(df, window=14).dropna()
 
     assert np.allclose(rsi.values, 50.0, atol=1e-6)
 
@@ -94,7 +94,7 @@ def test_rsi_no_all_nan():
 
     df = build_df([100.0] * 50)
 
-    rsi = TechnicalIndicators.rsi(df, period=14)
+    rsi = TechnicalIndicators.rsi(df, window=14)
 
     assert not rsi.isnull().all()
 
@@ -107,7 +107,7 @@ def test_rsi_short_series():
 
     df = build_df(np.linspace(100, 105, 10))
 
-    rsi = TechnicalIndicators.rsi(df, period=14)
+    rsi = TechnicalIndicators.rsi(df, window=14)
 
     assert len(rsi) == len(df)
 
