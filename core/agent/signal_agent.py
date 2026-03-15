@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL SIGNAL AGENT v3.4
+# INSTITUTIONAL SIGNAL AGENT v3.5
 # Hybrid-Compatible Model Intelligence Agent
 # Drift-Aware | Regime-Aware | CV-Optimized
 # =========================================================
@@ -118,7 +118,6 @@ class SignalAgent(BaseAgent):
         if volatility_regime == "high_volatility":
             base *= 0.7
 
-        # defensive assets get slightly larger size
         if volatility_regime == "low_volatility":
             base *= 1.1
 
@@ -183,7 +182,7 @@ class SignalAgent(BaseAgent):
         )
 
         # -------------------------------------------------
-        # Low dispersion warning (no penalty)
+        # Low dispersion warning
         # -------------------------------------------------
 
         if probability_stats:
@@ -192,6 +191,16 @@ class SignalAgent(BaseAgent):
 
             if std < 0.05:
                 warnings.append("Low cross-sectional dispersion")
+
+        # -------------------------------------------------
+        # Momentum contradiction detection ⭐ NEW
+        # -------------------------------------------------
+
+        if signal == "LONG" and momentum_z < 0:
+            warnings.append("Momentum contradicts LONG signal")
+
+        if signal == "SHORT" and momentum_z > 0:
+            warnings.append("Momentum contradicts SHORT signal")
 
         # -------------------------------------------------
         # Technical confirmation
