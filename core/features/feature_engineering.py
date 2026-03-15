@@ -176,6 +176,10 @@ class FeatureEngineer:
             0.4 * df["momentum_60"]
         ).clip(-2, 2)
 
+        ####################################################
+        # VOLATILITY
+        ####################################################
+
         grp = df.groupby("ticker")["return"]
 
         df["volatility_20"] = (
@@ -196,14 +200,33 @@ class FeatureEngineer:
             (df["volatility"] + cls.EPSILON)
         ).clip(-5, 5)
 
+        ####################################################
+        # LIQUIDITY
+        ####################################################
+
         df["volume"] = df["volume"].clip(
             lower=cls.MIN_VOLUME
         )
+
+        df["volume_mean_20"] = (
+            df.groupby("ticker")["volume"]
+            .transform(lambda x: x.rolling(20, min_periods=5).mean())
+            .shift(1)
+        )
+
+        df["volume_momentum"] = (
+            df["volume"] /
+            (df["volume_mean_20"] + cls.EPSILON)
+        ).clip(0, 5)
 
         df["dollar_volume"] = (
             df["close"] *
             df["volume"]
         )
+
+        ####################################################
+        # TECHNICALS
+        ####################################################
 
         df["rsi"] = 50.0
 
@@ -225,6 +248,62 @@ class FeatureEngineer:
                 pass
 
         df["rsi"] = df["rsi"].clip(0, 100)
+
+        ####################################################
+        # TREND STRUCTURE
+        ####################################################
+
+        df["ema_10"] = df.groupby("ticker")["close"].transform(
+            lambda x: x.ewm(span=10, adjust=False).mean()
+        )
+
+        df["ema_50"] = df.groupby("ticker")["close"].transform(
+            lambda x: x.ewm(span=50, adjust=False).mean()
+        )
+
+        df["ema_ratio"] = (
+            df["ema_10"] /
+            (df["ema_50"] + cls.EPSILON)
+        ).clip(0.5, 1.5)
+
+        ####################################################
+        # DISTANCE FROM HIGH
+        ####################################################
+
+        rolling_high = (
+            df.groupby("ticker")["close"]
+            .transform(lambda x: x.rolling(252, min_periods=60).max())
+            .shift(1)
+        )
+
+        df["dist_from_52w_high"] = (
+            (df["close"] /
+             (rolling_high + cls.EPSILON)) - 1
+        ).clip(-1, 0)
+
+        ####################################################
+        # REGIME
+        ####################################################
+
+        vol_mean = (
+            df.groupby("ticker")["volatility"]
+            .transform(lambda x: x.rolling(60, min_periods=20).mean())
+        )
+
+        vol_std = (
+            df.groupby("ticker")["volatility"]
+            .transform(lambda x: x.rolling(60, min_periods=20).std())
+        )
+
+        df["regime_feature"] = (
+            (df["volatility"] - vol_mean) /
+            (vol_std + cls.EPSILON)
+        ).clip(-3, 3).fillna(0)
+
+        df["momentum_regime_interaction"] = (
+            df["momentum_composite"] *
+            df["regime_feature"]
+        ).clip(-5, 5)
 
         return df
 
@@ -251,12 +330,27 @@ class FeatureEngineer:
 
             return df
 
-        base_cols = [
-            c for c in MODEL_FEATURES
-            if c in df.columns
-        ]
+        ####################################################
+        # MARKET CONTEXT
+        ####################################################
 
-        for col in base_cols:
+        df["market_dispersion"] = (
+            df.groupby("date")["return"]
+            .transform("std")
+            .fillna(0)
+        )
+
+        df["breadth"] = (
+            df.groupby("date")["return"]
+            .transform(lambda x: (x > 0).mean())
+            .fillna(0.5)
+        )
+
+        numeric_cols = df.select_dtypes(
+            include=[np.number]
+        ).columns
+
+        for col in numeric_cols:
 
             lower = df.groupby("date")[col].transform(
                 lambda x: x.quantile(0.01)
@@ -286,6 +380,12 @@ class FeatureEngineer:
             df[f"{col}_z"] = (
                 z.fillna(0.0)
                 .clip(-cls.Z_CLIP, cls.Z_CLIP)
+            )
+
+            df[f"{col}_rank"] = (
+                clipped.groupby(df["date"])
+                .rank(pct=True)
+                .fillna(0.5)
             )
 
         return df
