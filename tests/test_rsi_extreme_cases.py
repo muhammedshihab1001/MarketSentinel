@@ -5,24 +5,28 @@ from core.indicators.technical_indicators import TechnicalIndicators
 
 
 ############################################################
+# HELPER
+############################################################
+
+def build_df(prices):
+
+    return pd.DataFrame({
+        "date": pd.date_range("2025-01-01", periods=len(prices)),
+        "close": prices
+    })
+
+
+############################################################
 # FLAT MARKET
 ############################################################
 
 def test_rsi_flat_market_equals_50():
 
-    dates = pd.date_range("2025-01-01", periods=100)
+    df = build_df([100.0] * 100)
 
-    df = pd.DataFrame({
-        "date": dates,
-        "close": [100.0] * 100
-    })
+    rsi = TechnicalIndicators.rsi(df, period=14).dropna()
 
-    rsi = TechnicalIndicators.rsi(df, period=14)
-
-    # Drop initial NaNs from warmup window
-    rsi = rsi.dropna()
-
-    # RSI of flat market should be ~50
+    # Flat market RSI ≈ 50
     assert np.allclose(rsi.values, 50.0, atol=1e-6)
 
 
@@ -32,16 +36,11 @@ def test_rsi_flat_market_equals_50():
 
 def test_rsi_strong_uptrend():
 
-    dates = pd.date_range("2025-01-01", periods=100)
-
-    df = pd.DataFrame({
-        "date": dates,
-        "close": np.linspace(100, 200, 100)
-    })
+    df = build_df(np.linspace(100, 200, 100))
 
     rsi = TechnicalIndicators.rsi(df, period=14).dropna()
 
-    # Strong uptrend RSI should be high
+    # Strong uptrend should keep RSI mostly high
     assert (rsi > 70).mean() > 0.8
 
 
@@ -51,16 +50,11 @@ def test_rsi_strong_uptrend():
 
 def test_rsi_strong_downtrend():
 
-    dates = pd.date_range("2025-01-01", periods=100)
-
-    df = pd.DataFrame({
-        "date": dates,
-        "close": np.linspace(200, 100, 100)
-    })
+    df = build_df(np.linspace(200, 100, 100))
 
     rsi = TechnicalIndicators.rsi(df, period=14).dropna()
 
-    # Strong downtrend RSI should be low
+    # Strong downtrend should keep RSI mostly low
     assert (rsi < 30).mean() > 0.8
 
 
@@ -70,16 +64,37 @@ def test_rsi_strong_downtrend():
 
 def test_rsi_bounds():
 
-    dates = pd.date_range("2025-01-01", periods=100)
+    rng = np.random.default_rng(42)
 
-    prices = np.random.normal(100, 2, 100)
-
-    df = pd.DataFrame({
-        "date": dates,
-        "close": prices
-    })
+    df = build_df(rng.normal(100, 2, 100))
 
     rsi = TechnicalIndicators.rsi(df, period=14).dropna()
 
     assert (rsi >= 0).all()
     assert (rsi <= 100).all()
+
+
+############################################################
+# SHORT SERIES SAFETY
+############################################################
+
+def test_rsi_short_series():
+
+    df = build_df(np.linspace(100, 110, 10))
+
+    rsi = TechnicalIndicators.rsi(df, period=14)
+
+    assert len(rsi) == len(df)
+
+
+############################################################
+# OUTPUT TYPE
+############################################################
+
+def test_rsi_returns_series():
+
+    df = build_df(np.linspace(100, 110, 50))
+
+    rsi = TechnicalIndicators.rsi(df, period=14)
+
+    assert isinstance(rsi, pd.Series)
