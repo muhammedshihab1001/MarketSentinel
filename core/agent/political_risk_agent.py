@@ -1,126 +1,214 @@
-# =========================================================
-# POLITICAL RISK AGENT v1.0
-# Event Risk Detection using Free News Sources (GDELT)
-# Stateless | Cache Enabled | CV Portfolio Ready
-# =========================================================
+"""
+MarketSentinel v4.1.0
+
+Political Risk Agent — detects geopolitical / macro risk events
+using the free GDELT Project API (no API key required).
+
+Responsibilities:
+    - Fetch recent news headlines via GDELT
+    - Score headlines by risk keyword presence
+    - Produce a normalised risk score + label
+    - Cache results in Redis (TTL = 1 hour)
+    - Supply political_risk_label to SignalAgent context
+
+Output key: "political_risk_label"  ← must match SignalAgent.analyze() context key
+"""
 
 import logging
 import time
-import requests
-from typing import Dict, Any, List
+from typing import Any, Dict, List, Optional
 
-from app.inference.cache import RedisCache
+import requests
+
+from core.agent.base_agent import BaseAgent
 
 logger = logging.getLogger("marketsentinel.political_agent")
 
 
-class PoliticalRiskAgent:
-
+class PoliticalRiskAgent(BaseAgent):
     """
-    Detects geopolitical / macro risk events.
+    Stateless political risk scorer.
 
-    Data Source
-    -----------
-    GDELT Project API (free, no key required)
-
+    Data source: GDELT Project API (free, no key required).
     https://api.gdeltproject.org/api/v2/doc/doc
 
-    Risk Categories
-    ---------------
-    - elections
-    - war / conflict
-    - sanctions
-    - central bank policy
-    - geopolitical instability
+    Risk categories:
+        HIGH    — war, invasion, sanctions, nuclear
+        MEDIUM  — elections, central bank, regulation
+        LOW     — trade, inflation, budget
 
-    Returns normalized political risk score.
+    Output label fed into SignalAgent as "political_risk_label".
+    CRITICAL label triggers trading override in SignalAgent.
     """
 
+    name        = "PoliticalRiskAgent"
+    weight      = 0.6
+    description = (
+        "Detects geopolitical and macro risk events via GDELT headlines. "
+        "CRITICAL label overrides all trading signals in SignalAgent."
+    )
+
+    # ── GDELT endpoint ────────────────────────────────────────────────────────
     GDELT_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
 
-    CACHE_TTL = 3600
+    # ── Cache TTL ─────────────────────────────────────────────────────────────
+    CACHE_TTL = 3600       # 1 hour — political events don't change minute-to-minute
 
+    # ── Fetch settings ────────────────────────────────────────────────────────
+    MAX_ARTICLES   = 20
+    REQUEST_TIMEOUT = 10
+
+    # ── Risk keywords by tier ─────────────────────────────────────────────────
     KEYWORDS_HIGH = [
-        "war",
-        "military",
-        "invasion",
-        "attack",
-        "conflict",
-        "sanctions",
-        "nuclear",
+        "war", "military", "invasion", "attack",
+        "conflict", "sanctions", "nuclear",
     ]
-
     KEYWORDS_MEDIUM = [
-        "election",
-        "government",
-        "policy",
-        "central bank",
-        "interest rate",
-        "regulation",
-        "geopolitical",
+        "election", "government", "policy",
+        "central bank", "interest rate",
+        "regulation", "geopolitical",
     ]
-
     KEYWORDS_LOW = [
-        "trade",
-        "economic",
-        "inflation",
-        "budget",
+        "trade", "economic", "inflation", "budget",
     ]
 
-    def __init__(self):
+    # ── Risk label thresholds ─────────────────────────────────────────────────
+    THRESHOLD_CRITICAL = 0.75
+    THRESHOLD_HIGH     = 0.50
+    THRESHOLD_MEDIUM   = 0.25
 
-        self.cache = RedisCache()
+    # ────────────────────────────────────────────────────────────────────────
+    # INIT  (soft Redis dependency — won't crash if Redis is down)
+    # ────────────────────────────────────────────────────────────────────────
 
-    # -----------------------------------------------------
-    # FETCH NEWS
-    # -----------------------------------------------------
+    def __init__(self) -> None:
+        self._cache: Optional[Any] = None
+        try:
+            from app.inference.cache import RedisCache
+            self._cache = RedisCache()
+            logger.debug("PoliticalRiskAgent: Redis cache connected.")
+        except Exception as exc:
+            logger.warning(
+                "PoliticalRiskAgent: Redis unavailable — running without cache. "
+                "Reason: %s", exc,
+            )
+
+    # ────────────────────────────────────────────────────────────────────────
+    # BaseAgent CONTRACT
+    # ────────────────────────────────────────────────────────────────────────
+
+    def analyze(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        BaseAgent-compliant entry point.
+
+        Expects context keys:
+            ticker  : str  (e.g. "AAPL")
+            country : str  (e.g. "US", default "US")
+
+        Returns _format_output() compatible dict with political risk
+        embedded in signals under key "political_risk_label".
+        """
+        ticker  = context.get("ticker", "UNKNOWN")
+        country = context.get("country", "US")
+
+        result  = self.get_political_risk(ticker=ticker, country=country)
+
+        label   = result.get("political_risk_label", "LOW")
+        score   = self._safe_float(result.get("political_risk_score"), 0.0)
+
+        warnings:  List[str] = []
+        reasoning: List[str] = []
+
+        if label == "CRITICAL":
+            warnings.append("CRITICAL political risk — all trading overridden")
+        elif label == "HIGH":
+            warnings.append("HIGH political risk — confidence penalty recommended")
+
+        reasoning.append(
+            f"GDELT score={score:.2f} | label={label} | "
+            f"country={country} | source=gdelt"
+        )
+
+        output = self._format_output(
+            score=score,
+            confidence=score,     # confidence mirrors score for this agent
+            signals={
+                "political_risk_label": label,   # ← key SignalAgent reads
+                "political_risk_score": score,
+                "country":              country,
+            },
+            warnings=warnings,
+            reasoning=reasoning,
+        )
+
+        # Surface label at top level for easy context unpacking
+        output["political_risk_label"] = label
+        output["political_risk_score"] = score
+        output["top_events"]           = result.get("top_events", [])
+
+        return output
+
+    # ────────────────────────────────────────────────────────────────────────
+    # NEWS FETCH
+    # ────────────────────────────────────────────────────────────────────────
 
     def _fetch_news(self, country: str) -> List[str]:
-
+        """
+        Fetch recent headlines from GDELT.
+        Returns empty list on any failure — agent degrades gracefully.
+        """
         query = f"{country} election OR sanctions OR war OR central bank"
-
         params = {
-            "query": query,
-            "mode": "ArtList",
-            "maxrecords": 20,
-            "format": "json",
+            "query":      query,
+            "mode":       "ArtList",
+            "maxrecords": self.MAX_ARTICLES,
+            "format":     "json",
         }
 
         try:
-
             response = requests.get(
                 self.GDELT_ENDPOINT,
                 params=params,
-                timeout=10
+                timeout=self.REQUEST_TIMEOUT,
             )
 
             if response.status_code != 200:
+                logger.warning(
+                    "GDELT returned HTTP %d for country=%s",
+                    response.status_code, country,
+                )
                 return []
 
-            data = response.json()
-
+            data     = response.json()
             articles = data.get("articles", [])
 
             headlines = [
                 article.get("title", "")
                 for article in articles
                 if isinstance(article.get("title"), str)
+                and article.get("title", "").strip()
             ]
 
+            logger.debug(
+                "GDELT fetch: %d headlines for country=%s",
+                len(headlines), country,
+            )
             return headlines
 
-        except Exception:
-            logger.exception("Political risk news fetch failed")
+        except requests.Timeout:
+            logger.warning("GDELT fetch timed out for country=%s", country)
+            return []
+        except Exception as exc:
+            logger.warning("GDELT fetch failed for country=%s: %s", country, exc)
             return []
 
-    # -----------------------------------------------------
+    # ────────────────────────────────────────────────────────────────────────
     # KEYWORD SCORING
-    # -----------------------------------------------------
+    # ────────────────────────────────────────────────────────────────────────
 
     def _score_headline(self, text: str) -> float:
-
-        text = text.lower()
-
+        """Score a single headline by keyword presence. Max = 1.0."""
+        text  = text.lower()
         score = 0.0
 
         for word in self.KEYWORDS_HIGH:
@@ -137,78 +225,117 @@ class PoliticalRiskAgent:
 
         return min(score, 1.0)
 
-    # -----------------------------------------------------
-    # AGGREGATE SCORE
-    # -----------------------------------------------------
-
     def _aggregate_score(self, headlines: List[str]) -> float:
+        """
+        Aggregate headline scores.
 
+        Uses a blend of the MAX score (captures worst-case event) and
+        the MEAN of the top-5 scores (captures sustained risk) to avoid
+        both under-sensitivity (plain mean across 20 articles) and
+        over-sensitivity (single headline spike).
+        """
         if not headlines:
             return 0.0
 
-        scores = [self._score_headline(h) for h in headlines]
+        scores = sorted(
+            [self._score_headline(h) for h in headlines],
+            reverse=True,
+        )
 
-        if not scores:
-            return 0.0
+        max_score  = scores[0]
+        top5_mean  = float(sum(scores[:5]) / min(len(scores), 5))
 
-        return min(sum(scores) / len(scores), 1.0)
+        # 60% weight on worst-case, 40% on sustained signal
+        blended = 0.6 * max_score + 0.4 * top5_mean
 
-    # -----------------------------------------------------
-    # LABEL
-    # -----------------------------------------------------
+        return float(min(blended, 1.0))
+
+    # ────────────────────────────────────────────────────────────────────────
+    # RISK LABEL
+    # ────────────────────────────────────────────────────────────────────────
 
     def _label(self, score: float) -> str:
-
-        if score >= 0.75:
+        """Map score to risk label. CRITICAL triggers SignalAgent override."""
+        if score >= self.THRESHOLD_CRITICAL:
             return "CRITICAL"
-        elif score >= 0.5:
+        elif score >= self.THRESHOLD_HIGH:
             return "HIGH"
-        elif score >= 0.25:
+        elif score >= self.THRESHOLD_MEDIUM:
             return "MEDIUM"
         else:
             return "LOW"
 
-    # -----------------------------------------------------
-    # PUBLIC METHOD
-    # -----------------------------------------------------
+    # ────────────────────────────────────────────────────────────────────────
+    # PUBLIC ENTRY POINT
+    # ────────────────────────────────────────────────────────────────────────
 
     def get_political_risk(
         self,
-        ticker: str,
-        country: str = "US"
+        ticker:  str,
+        country: str = "US",
     ) -> Dict[str, Any]:
+        """
+        Return political risk assessment for a ticker / country pair.
 
-        cache_payload = {
-            "type": "political_risk",
-            "ticker": ticker,
-            "country": country,
-        }
+        Output keys
+        -----------
+        ticker                : str
+        political_risk_score  : float  in [0, 1]
+        political_risk_label  : str    "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
+        top_events            : List[str]  top 5 headlines
+        source                : str
+        timestamp             : int
+        cached                : bool
 
-        key = self.cache.build_key(cache_payload)
+        NOTE: key is "political_risk_label" — matches SignalAgent context key.
+        """
 
-        cached = self.cache.get(key)
+        # ── Cache lookup ──────────────────────────────────────────────────────
+        cache_key: Optional[str] = None
+        if self._cache is not None:
+            try:
+                cache_payload = {
+                    "type":    "political_risk",
+                    "ticker":  ticker,
+                    "country": country,
+                }
+                cache_key = self._cache.build_key(cache_payload)
+                cached    = self._cache.get(cache_key)
+                if cached:
+                    logger.debug(
+                        "Political risk cache hit | ticker=%s country=%s",
+                        ticker, country,
+                    )
+                    return cached
+            except Exception as exc:
+                logger.warning("Political risk cache read failed: %s", exc)
 
-        if cached:
-            return cached
-
+        # ── Fetch + score ─────────────────────────────────────────────────────
         headlines = self._fetch_news(country)
+        score     = self._aggregate_score(headlines)
+        label     = self._label(score)
 
-        score = self._aggregate_score(headlines)
-
-        label = self._label(score)
-
-        result = {
-            "ticker": ticker,
+        result: Dict[str, Any] = {
+            "ticker":               ticker,
             "political_risk_score": float(score),
-            "risk_label": label,
-            "top_events": headlines[:5],
-            "source": "gdelt",
-            "timestamp": int(time.time()),
+            "political_risk_label": label,          # ← correct key name
+            "top_events":           headlines[:5],
+            "source":               "gdelt",
+            "timestamp":            int(time.time()),
+            "cached":               False,
         }
 
-        try:
-            self.cache.set(key, result, ttl=self.CACHE_TTL)
-        except Exception:
-            logger.warning("Political risk cache write failed")
+        # ── Cache write ───────────────────────────────────────────────────────
+        if self._cache is not None and cache_key is not None:
+            try:
+                self._cache.set(cache_key, result, ttl=self.CACHE_TTL)
+            except Exception as exc:
+                logger.warning("Political risk cache write failed: %s", exc)
+
+        logger.info(
+            "Political risk assessed | ticker=%s country=%s "
+            "score=%.2f label=%s headlines=%d",
+            ticker, country, score, label, len(headlines),
+        )
 
         return result
