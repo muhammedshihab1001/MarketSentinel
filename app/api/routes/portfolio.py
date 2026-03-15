@@ -23,7 +23,7 @@ MAX_CONCURRENT = 3
 
 portfolio_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-_pipeline: InferencePipeline | None = None
+_pipeline = None
 
 
 def get_pipeline():
@@ -102,21 +102,25 @@ def _portfolio_summary_sync():
     # ===============================
     # AGENT METRICS
     # ===============================
+    # Signal rows use "agents" → "signal_agent" structure (set in pipeline.py)
+
+    def _get_signal_agent(r):
+        return r.get("agents", {}).get("signal_agent", {})
 
     approved_trades = sum(
         1 for r in results
-        if r.get("agent", {}).get("trade_approved", False)
+        if _get_signal_agent(r).get("trade_approved", False)
     )
 
     rejected_trades = len(results) - approved_trades
 
     agent_scores = [
-        r.get("agent", {}).get("agent_score", 0.0)
+        _get_signal_agent(r).get("agent_score", 0.0)
         for r in results
     ]
 
     confidence_scores = [
-        r.get("agent", {}).get("confidence_numeric", 0.0)
+        _get_signal_agent(r).get("confidence_numeric", 0.0)
         for r in results
     ]
 
@@ -130,12 +134,12 @@ def _portfolio_summary_sync():
 
     high_conviction_count = sum(
         1 for r in results
-        if r.get("agent", {}).get("agent_score", 0.0) >= 0.75
+        if _get_signal_agent(r).get("agent_score", 0.0) >= 0.75
     )
 
     elevated_risk_count = sum(
         1 for r in results
-        if r.get("agent", {}).get("risk_level") == "elevated"
+        if _get_signal_agent(r).get("risk_level") == "elevated"
     )
 
     drift_detected = snapshot.get("drift", {}).get("drift_detected", False)
@@ -167,8 +171,8 @@ def _portfolio_summary_sync():
             "ticker": r["ticker"],
             "score": round(r.get("raw_model_score", 0.0), 4),
             "weight": round(r.get("weight", 0.0), 4),
-            "confidence": r.get("agent", {}).get("confidence_numeric"),
-            "approved": r.get("agent", {}).get("trade_approved")
+            "confidence": _get_signal_agent(r).get("confidence_numeric"),
+            "approved": _get_signal_agent(r).get("trade_approved"),
         }
         for r in sorted(
             results,
@@ -179,7 +183,7 @@ def _portfolio_summary_sync():
 
     return {
         "snapshot_date": snapshot.get("snapshot_date"),
-        "universe_size": snapshot.get("universe_size"),
+        "universe_size": len(universe),
 
         # Governance
         "model_version": loader.xgb_version,
