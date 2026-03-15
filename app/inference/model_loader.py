@@ -1,5 +1,5 @@
 # =========================================================
-# MODEL LOADER v2.3
+# MODEL LOADER v2.4
 # Hybrid Multi-Agent Compatible | CV-Optimized Governance
 # Pointer-Fallback Enabled | Baseline Verified
 # =========================================================
@@ -33,19 +33,33 @@ logger = logging.getLogger("marketsentinel.loader")
 
 @dataclass(frozen=True)
 class LoadedModel:
+
     model: object
+
     version: str
+
     schema_signature: str
+
     schema_version: str
+
     dataset_hash: str
+
     artifact_hash: str
+
     feature_checksum: str
+
     universe_hash: str
+
     training_code_hash: Optional[str]
+
     reproducibility_hash: Optional[str]
+
     pointer_hash: Optional[str]
+
     training_fingerprint: Optional[str]
+
     baseline_available: bool
+
     baseline_hash: Optional[str]
 
 
@@ -60,19 +74,27 @@ class ModelLoader:
 
     MIN_ARTIFACT_BYTES = 20_000
     MIN_METADATA_BYTES = 300
+
     POINTER_FILENAME = "production_pointer.json"
+
     BASELINE_PATH = os.path.abspath("artifacts/drift/baseline.json")
 
     STRICT_GOVERNANCE = os.getenv("MODEL_STRICT_GOVERNANCE", "0") == "1"
+
     ALLOW_POINTER_FALLBACK = os.getenv("MODEL_ALLOW_POINTER_FALLBACK", "1") == "1"
 
     # -----------------------------------------------------
 
     def __new__(cls, *args, **kwargs):
+
         if cls._instance is None:
+
             with cls._instance_lock:
+
                 if cls._instance is None:
+
                     cls._instance = super().__new__(cls)
+
         return cls._instance
 
     # -----------------------------------------------------
@@ -83,6 +105,7 @@ class ModelLoader:
             return
 
         self._reload_lock = threading.Lock()
+
         self._xgb_container: Optional[LoadedModel] = None
 
         self._initialized = True
@@ -96,10 +119,23 @@ class ModelLoader:
         h = hashlib.sha256()
 
         with open(path, "rb") as f:
+
             for chunk in iter(lambda: f.read(1 << 20), b""):
+
                 h.update(chunk)
 
         return h.hexdigest()
+
+    # =====================================================
+    # VERSION PARSER
+    # =====================================================
+
+    def _parse_version(self, v: str):
+
+        try:
+            return tuple(int(x) for x in v.split("."))
+        except Exception:
+            return (0,)
 
     # =====================================================
     # FEATURE CHECKSUM
@@ -121,17 +157,21 @@ class ModelLoader:
     def _verify_baseline(self):
 
         if not os.path.exists(self.BASELINE_PATH):
+
             logger.warning("Baseline file missing.")
+
             return False, None
 
         try:
 
             with open(self.BASELINE_PATH, encoding="utf-8") as f:
+
                 baseline = json.load(f)
 
             integrity = baseline.get("integrity_hash")
 
             clone = dict(baseline)
+
             clone.pop("integrity_hash", None)
 
             canonical = json.dumps(clone, sort_keys=True).encode()
@@ -139,7 +179,9 @@ class ModelLoader:
             computed = hashlib.sha256(canonical).hexdigest()
 
             if integrity != computed:
+
                 logger.warning("Baseline integrity mismatch.")
+
                 return False, computed
 
             return True, computed
@@ -147,6 +189,7 @@ class ModelLoader:
         except Exception:
 
             logger.warning("Baseline unreadable or corrupted.")
+
             return False, None
 
     # =====================================================
@@ -187,6 +230,7 @@ class ModelLoader:
         pointer_hash = self._sha256(pointer_path)
 
         with open(pointer_path, encoding="utf-8") as f:
+
             pointer = json.load(f)
 
         version = pointer.get("model_version")
@@ -195,9 +239,11 @@ class ModelLoader:
             raise RuntimeError("Invalid production pointer format.")
 
         model_path = os.path.join(base_dir, f"model_{version}.pkl")
+
         metadata_path = os.path.join(base_dir, f"metadata_{version}.json")
 
         if not os.path.exists(model_path) or not os.path.exists(metadata_path):
+
             raise RuntimeError("Pointer references missing model artifacts.")
 
         return model_path, metadata_path, version, pointer_hash
@@ -211,19 +257,27 @@ class ModelLoader:
         versions = []
 
         for f in files:
+
             if f.startswith("model_") and f.endswith(".pkl"):
+
                 version = f.replace("model_", "").replace(".pkl", "")
+
                 versions.append(version)
 
         if not versions:
             raise RuntimeError("No model artifacts found.")
 
-        latest_version = sorted(versions)[-1]
+        latest_version = sorted(
+            versions,
+            key=self._parse_version
+        )[-1]
 
         model_path = os.path.join(base_dir, f"model_{latest_version}.pkl")
+
         metadata_path = os.path.join(base_dir, f"metadata_{latest_version}.json")
 
         if not os.path.exists(metadata_path):
+
             raise RuntimeError("Metadata missing for latest model.")
 
         return model_path, metadata_path, latest_version, None
@@ -286,12 +340,6 @@ class ModelLoader:
 
             if meta.get("artifact_hash") != actual_hash:
                 raise RuntimeError("Artifact tampering detected.")
-
-            if meta.get("schema_signature") != get_schema_signature():
-                logger.warning("Schema signature mismatch.")
-
-            if meta.get("schema_version") != SCHEMA_VERSION:
-                logger.warning("Schema version drift detected.")
 
             model = self._safe_load_model(model_path)
 
@@ -358,11 +406,6 @@ class ModelLoader:
         self._reload_xgb_if_needed()
         return getattr(self._xgb_container, "dataset_hash", None)
 
-    @property
-    def artifact_hash(self):
-        self._reload_xgb_if_needed()
-        return getattr(self._xgb_container, "artifact_hash", None)
-
     # =====================================================
     # FEATURE IMPORTANCE
     # =====================================================
@@ -390,7 +433,10 @@ class ModelLoader:
 
         try:
 
-            dummy = np.zeros((1, len(MODEL_FEATURES)))
+            dummy = np.zeros(
+                (1, len(MODEL_FEATURES)),
+                dtype=np.float32
+            )
 
             model.predict(dummy)
 
