@@ -395,6 +395,16 @@ class ModelLoader:
         self._reload_xgb_if_needed()
         return getattr(self._xgb_container, "dataset_hash", None)
 
+    @property
+    def artifact_hash(self):
+        self._reload_xgb_if_needed()
+        return getattr(self._xgb_container, "artifact_hash", None)
+
+    @property
+    def training_code_hash(self):
+        self._reload_xgb_if_needed()
+        return getattr(self._xgb_container, "training_code_hash", None)
+
     # =====================================================
     # FEATURE IMPORTANCE
     # =====================================================
