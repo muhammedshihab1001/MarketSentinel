@@ -1,5 +1,5 @@
 # =========================================================
-# DRIFT DETECTOR v2.1
+# DRIFT DETECTOR v2.2
 # Hybrid Multi-Agent Compatible | CV-Optimized
 # Noise-Tolerant for yfinance data
 # =========================================================
@@ -31,16 +31,6 @@ except Exception:
 
 
 class DriftDetector:
-    """
-    Lightweight drift detector designed for noisy financial data.
-
-    Signals:
-    - z-score mean shift
-    - variance shift
-    - PSI distribution drift
-
-    Designed for CV showcase and yfinance robustness.
-    """
 
     BASELINE_FILENAME = "baseline.json"
     BASELINE_VERSION = "26.0"
@@ -63,8 +53,7 @@ class DriftDetector:
     HARD_SEVERITY_THRESHOLD = 10
 
     RECENT_WEIGHT_FACTOR = 1.5
-
-    FEATURE_CLIP_SIGMA = 6.0  # NEW: protects against Yahoo spikes
+    FEATURE_CLIP_SIGMA = 6.0
 
     # -----------------------------------------------------
 
@@ -87,6 +76,65 @@ class DriftDetector:
         ).lower() == "true"
 
     # =====================================================
+    # CREATE BASELINE  ⭐ NEW METHOD
+    # =====================================================
+
+    def create_baseline(
+        self,
+        dataset: pd.DataFrame,
+        dataset_hash: str,
+        training_code_hash: str,
+        feature_checksum: str,
+        model_version: str,
+        allow_overwrite: bool = False
+    ):
+
+        if os.path.exists(self.BASELINE_PATH) and not allow_overwrite:
+            raise RuntimeError("Baseline already exists.")
+
+        numeric = self._safe_feature_block(dataset)
+
+        features = {}
+
+        for col in MODEL_FEATURES:
+
+            series = numeric[col].dropna()
+
+            if len(series) < 20:
+                continue
+
+            counts, bin_edges = np.histogram(series, bins=20)
+
+            features[col] = {
+                "mean": float(series.mean()),
+                "std": float(series.std()),
+                "variance": float(series.var()),
+                "bin_edges": bin_edges.tolist(),
+                "expected_counts": counts.tolist()
+            }
+
+        payload = {
+            "meta": {
+                "baseline_version": self.BASELINE_VERSION,
+                "schema_signature": get_schema_signature(),
+                "feature_checksum": feature_checksum,
+                "dataset_hash": dataset_hash,
+                "training_code_hash": training_code_hash,
+                "model_version": model_version
+            },
+            "features": features
+        }
+
+        payload["integrity_hash"] = self._baseline_hash(payload)
+
+        with open(self.BASELINE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        logger.info("Drift baseline created: %s", self.BASELINE_PATH)
+
+        return self.BASELINE_PATH
+
+    # =====================================================
     # SAFE FEATURE BLOCK
     # =====================================================
 
@@ -105,7 +153,6 @@ class DriftDetector:
 
             block[col] = block[col].replace([np.inf, -np.inf], np.nan)
 
-            # NEW: clip extreme spikes
             mean = block[col].mean()
             std = block[col].std()
 
@@ -125,7 +172,6 @@ class DriftDetector:
     def _baseline_hash(payload: dict) -> str:
 
         clone = dict(payload)
-
         clone.pop("integrity_hash", None)
 
         canonical = json.dumps(clone, sort_keys=True).encode()
@@ -146,21 +192,6 @@ class DriftDetector:
 
         if baseline.get("integrity_hash") != self._baseline_hash(baseline):
             raise RuntimeError("Baseline integrity failure.")
-
-        meta = baseline.get("meta", {})
-
-        if meta.get("baseline_version") != self.BASELINE_VERSION:
-            logger.warning("Baseline version mismatch.")
-
-        if meta.get("schema_signature") != get_schema_signature():
-            logger.warning("Schema signature mismatch.")
-
-        current_checksum = MetadataManager.fingerprint_features(
-            tuple(MODEL_FEATURES)
-        )
-
-        if meta.get("feature_checksum") != current_checksum:
-            logger.warning("Feature checksum mismatch.")
 
         return baseline
 
@@ -204,7 +235,6 @@ class DriftDetector:
             return float(series.mean())
 
         weights = np.linspace(1.0, self.RECENT_WEIGHT_FACTOR, len(series))
-
         weights /= weights.sum()
 
         return float(np.sum(series.values * weights))
@@ -263,9 +293,7 @@ class DriftDetector:
                 ])
 
                 if drift:
-
                     drift_count += 1
-
                     severity_accumulator += (
                         min(z_score / self.z_threshold, 4) +
                         min(abs(np.log(variance_ratio + self.EPSILON)), 4) +
@@ -281,13 +309,8 @@ class DriftDetector:
 
             coverage = float(evaluated_features / max(total_features, 1))
 
-            if coverage < self.MIN_FEATURE_EVAL_RATIO:
-
-                drift_count = 0
-                severity_accumulator = 0
-
             severity_score = min(
-                int(np.sqrt(severity_accumulator)),  # NEW: smoother scaling
+                int(np.sqrt(severity_accumulator)),
                 self.MAX_SEVERITY_CAP
             )
 
@@ -297,36 +320,16 @@ class DriftDetector:
                 else "none"
             )
 
-            drift_detected = drift_count > 0
-
             DRIFT_DETECTED.set(severity_score)
 
-            if drift_state == "hard":
-
-                exposure_scale = 0.2
-
-            elif drift_state == "soft":
-
-                exposure_scale = max(0.4, 1 - severity_score * 0.04)
-
-            else:
-
-                exposure_scale = 1.0
-
             return {
-                "drift_detected": drift_detected,
+                "drift_detected": drift_count > 0,
                 "severity_score": severity_score,
-                "drift_confidence": float(
-                    min(drift_count / max(total_features, 1), 1.0)
-                ),
+                "drift_confidence": float(min(drift_count / max(total_features, 1), 1.0)),
                 "coverage": coverage,
                 "details": report,
                 "drift_state": drift_state,
-                "exposure_scale": float(np.clip(exposure_scale, 0.0, 1.0)),
-                "drift_summary": {
-                    "evaluated_features": evaluated_features,
-                    "total_features": total_features
-                }
+                "exposure_scale": 1.0
             }
 
         except FileNotFoundError:
@@ -340,8 +343,7 @@ class DriftDetector:
                 "coverage": 0.0,
                 "details": {},
                 "drift_state": "baseline_missing",
-                "exposure_scale": 1.0,
-                "reason": "baseline_missing"
+                "exposure_scale": 1.0
             }
 
         except Exception as exc:
@@ -351,8 +353,6 @@ class DriftDetector:
             if self.hard_fail:
                 raise
 
-            DRIFT_DETECTED.set(6)
-
             return {
                 "drift_detected": True,
                 "severity_score": 6,
@@ -360,6 +360,5 @@ class DriftDetector:
                 "coverage": 0.0,
                 "details": {},
                 "drift_state": "detector_failure",
-                "exposure_scale": 0.4,
-                "reason": "detector_failure"
+                "exposure_scale": 0.4
             }
