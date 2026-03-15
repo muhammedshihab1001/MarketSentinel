@@ -1,3 +1,17 @@
+"""
+MarketSentinel v4.1.0
+
+Feature Store — per-ticker feature cache for INFERENCE.
+
+For training, use FeatureEngineer.build_feature_pipeline() directly
+on the full multi-ticker dataset so cross-sectional features compute
+correctly across the universe.
+
+For inference (single-ticker), this store computes core features and
+calls finalize() to fill missing CS columns with safe defaults
+(0.0 for _z, 0.5 for _rank).
+"""
+
 import os
 import logging
 import hashlib
@@ -23,7 +37,7 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v24"  # bumped for LRU + stability
+    CACHE_VERSION = "v25"  # bumped: now calls finalize() for MODEL_FEATURES alignment
     MAX_CACHE_FILES_PER_TICKER = 6
     MAX_TOTAL_CACHE_FILES = 2000
     MIN_FILE_BYTES = 5_000
@@ -185,6 +199,16 @@ class FeatureStore:
         ticker: str = "unknown",
         training: bool = False
     ):
+        """
+        Compute features for a single ticker (inference use case).
+
+        For training, use FeatureEngineer.build_feature_pipeline()
+        directly on the full multi-ticker dataset instead.
+
+        Returns a DataFrame with all MODEL_FEATURES columns present.
+        Missing cross-sectional columns are filled with safe defaults
+        by finalize() (0.0 for _z, 0.5 for _rank via schema fallback).
+        """
 
         if not self.REQUIRED_COLUMNS.issubset(price_df.columns):
             raise RuntimeError("Price dataframe missing required columns.")
@@ -243,16 +267,15 @@ class FeatureStore:
         # REBUILD
         ####################################################
 
-        logger.info("Feature cache miss — rebuilding.")
+        logger.info("Feature cache miss — rebuilding for %s.", ticker)
 
         df = self.engineer._validate_price_frame(price_df, ticker)
         df = self.engineer.add_core_features(df)
 
-        # Robust sanitization (yfinance tolerant)
-        df = df.replace([np.inf, -np.inf], np.nan)
-
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        df[numeric_cols] = df[numeric_cols].fillna(0.0)
+        # For single-ticker inference, CS features cannot be computed
+        # (need multiple tickers per date). finalize() will fill all
+        # missing MODEL_FEATURES columns with safe defaults.
+        df = self.engineer.finalize(df)
 
         df = df.sort_values(
             ["date", "ticker"]
