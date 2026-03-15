@@ -405,6 +405,11 @@ class ModelLoader:
         self._reload_xgb_if_needed()
         return getattr(self._xgb_container, "training_code_hash", None)
 
+    @property
+    def feature_checksum(self):
+        self._reload_xgb_if_needed()
+        return getattr(self._xgb_container, "feature_checksum", None)
+
     # =====================================================
     # FEATURE IMPORTANCE
     # =====================================================
