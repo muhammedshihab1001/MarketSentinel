@@ -9,7 +9,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import os
-from collections import deque
+from collections import deque, OrderedDict
 
 from core.data.providers.market.router import MarketProviderRouter
 
@@ -35,11 +35,13 @@ class MarketDataService:
     MAX_ROWS = 20000
     MAX_DAILY_MOVE = 0.85
 
-    MIN_TRADING_DENSITY = 0.55  # softened for Yahoo
+    MIN_TRADING_DENSITY = 0.55
     MIN_UNIQUE_DAYS = 40
 
     MAX_WORKERS = int(os.getenv("MARKET_MAX_WORKERS", 4))
     MEMORY_CACHE_TTL = 30
+    MEMORY_CACHE_MAX = 200
+
     ENABLE_DISK_CACHE = True
     SOFT_FAIL_MODE = os.getenv("MARKET_SOFT_FAIL", "1") == "1"
 
@@ -49,9 +51,11 @@ class MarketDataService:
     PROVIDER_COOLDOWN_SECONDS = 5
 
     _PROVIDER = None
-    _memory_cache = {}
+    _memory_cache = OrderedDict()
+
     _cache_lock = Lock()
     _rate_lock = Lock()
+
     _recent_requests = deque()
     _provider_cooldown_until = 0
 
@@ -84,7 +88,9 @@ class MarketDataService:
                 cls._recent_requests.popleft()
 
             if len(cls._recent_requests) >= cls.GLOBAL_RATE_LIMIT_PER_SEC:
+
                 sleep = 1 - (now - cls._recent_requests[0])
+
                 if sleep > 0:
                     time.sleep(sleep)
 
@@ -109,9 +115,9 @@ class MarketDataService:
     ########################################################
 
     @classmethod
-    def _cap_to_safe_date(cls, date_str: str):
+    def _cap_to_safe_date(cls, date_input):
 
-        requested = pd.Timestamp(date_str).tz_localize(None)
+        requested = pd.Timestamp(date_input).tz_localize(None)
 
         safe_cutoff = (
             pd.Timestamp.utcnow()
@@ -129,11 +135,13 @@ class MarketDataService:
     def _dataset_hash(self, df: pd.DataFrame):
 
         df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
         payload = df[["date", "close", "volume"]].to_csv(index=False).encode()
+
         return hashlib.sha256(payload).hexdigest()[:16]
 
     ########################################################
-    # VALIDATION (STABILIZED)
+    # VALIDATION
     ########################################################
 
     def _validate_dataset(self, df: pd.DataFrame, ticker: str, min_rows: int):
@@ -144,6 +152,7 @@ class MarketDataService:
         df = df.copy()
 
         missing = self.REQUIRED_COLUMNS - set(df.columns)
+
         if missing:
             raise RuntimeError(f"Schema violation. Missing={missing}")
 
@@ -161,6 +170,7 @@ class MarketDataService:
         df = df[df["volume"] > 0]
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
+
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -172,87 +182,42 @@ class MarketDataService:
         if df["close"].nunique() < 5:
             raise RuntimeError("Flat price series.")
 
-        # 🔥 Trading density check (softened)
         unique_days = df["date"].nunique()
+
         span_days = (df["date"].max() - df["date"].min()).days + 1
 
         if span_days > 0:
+
             density = unique_days / span_days
+
             if density < self.MIN_TRADING_DENSITY:
                 logger.warning("Low trading density detected for %s", ticker)
 
-        # 🔥 Smooth extreme moves
         pct = df["close"].pct_change().abs().fillna(0)
-        if (pct > self.MAX_DAILY_MOVE).any():
-            df.loc[pct > self.MAX_DAILY_MOVE, "close"] = np.nan
-            df["close"] = df["close"].ffill().bfill()
 
-        # 🔥 Ensure minimum rows (adaptive fallback)
+        if (pct > self.MAX_DAILY_MOVE).any():
+
+            df.loc[pct > self.MAX_DAILY_MOVE, ["open", "high", "low", "close"]] = np.nan
+
+            df[["open", "high", "low", "close"]] = df[
+                ["open", "high", "low", "close"]
+            ].ffill().bfill()
+
         if len(df) < min_rows:
+
             if self.SOFT_FAIL_MODE and len(df) >= int(min_rows * 0.7):
+
                 logger.warning(
                     "History slightly short for %s but accepted in soft mode.",
                     ticker
                 )
+
             else:
                 raise RuntimeError("Insufficient history.")
 
         df["__dataset_hash"] = self._dataset_hash(df)
 
         return df.reset_index(drop=True)
-
-    ########################################################
-    # RETRY FETCH
-    ########################################################
-
-    def _fetch_with_retry(
-        self,
-        ticker,
-        start,
-        end,
-        interval,
-        min_history,
-        retries=3
-    ):
-
-        last_error = None
-
-        for attempt in range(retries):
-
-            try:
-
-                self._respect_rate_limit()
-
-                df = self._fetcher.fetch(
-                    ticker,
-                    start,
-                    end,
-                    interval,
-                    min_rows=min_history
-                )
-
-                return self._validate_dataset(
-                    df,
-                    ticker,
-                    min_history
-                )
-
-            except Exception as e:
-
-                last_error = e
-
-                backoff = min(
-                    (2 ** attempt) * 0.5 + random.uniform(0.1, 0.4),
-                    self.MAX_RETRY_BACKOFF
-                )
-
-                time.sleep(backoff)
-
-        self._provider_cooldown_until = time.time() + self.PROVIDER_COOLDOWN_SECONDS
-
-        raise RuntimeError(
-            f"Market fetch failed after retries: {ticker}"
-        ) from last_error
 
     ########################################################
     # MEMORY CACHE
@@ -262,18 +227,31 @@ class MarketDataService:
         return f"{ticker}_{start}_{end}_{interval}_{min_history}"
 
     def _get_from_memory_cache(self, key):
+
         with self._cache_lock:
+
             item = self._memory_cache.get(key)
+
             if not item:
                 return None
+
             df, ts = item
+
             if time.time() - ts > self.MEMORY_CACHE_TTL:
+
                 del self._memory_cache[key]
+
                 return None
+
             return df.copy()
 
     def _set_memory_cache(self, key, df):
+
         with self._cache_lock:
+
+            if len(self._memory_cache) >= self.MEMORY_CACHE_MAX:
+                self._memory_cache.popitem(last=False)
+
             self._memory_cache[key] = (df.copy(), time.time())
 
     ########################################################
@@ -290,12 +268,14 @@ class MarketDataService:
     ):
 
         ticker = self._sanitize_ticker(ticker)
+
         end_date = self._cap_to_safe_date(end_date)
 
         if min_history is None:
             min_history = self.DEFAULT_MIN_HISTORY_ROWS
 
         start_date = pd.Timestamp(start_date).strftime("%Y-%m-%d")
+
         end_date_str = end_date.strftime("%Y-%m-%d")
 
         cache_key = self._cache_key(
@@ -307,16 +287,19 @@ class MarketDataService:
         )
 
         cached = self._get_from_memory_cache(cache_key)
+
         if cached is not None:
             return cached
 
-        df = self._fetch_with_retry(
+        df = self._fetcher.fetch(
             ticker,
             start_date,
             end_date_str,
             interval,
-            min_history
+            min_rows=min_history
         )
+
+        df = self._validate_dataset(df, ticker, min_history)
 
         self._set_memory_cache(cache_key, df)
 
@@ -350,6 +333,7 @@ class MarketDataService:
             futures = {}
 
             for ticker in tickers:
+
                 futures[
                     executor.submit(
                         self.get_price_data,
@@ -364,21 +348,26 @@ class MarketDataService:
                 time.sleep(self.BATCH_SPACING_SECONDS)
 
             for future in as_completed(futures):
+
                 ticker = futures[future]
 
                 try:
+
                     results[ticker] = future.result()
+
                 except Exception as e:
+
                     failures[ticker] = str(e)
 
         if not results:
             raise RuntimeError("All tickers failed during batch fetch.")
 
         if failures:
+
             logger.warning(
                 "Batch partial failure | success=%d | failed=%d",
                 len(results),
                 len(failures)
             )
 
-        return results
+        return results, failures
