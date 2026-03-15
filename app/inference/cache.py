@@ -43,10 +43,6 @@ class RedisCache:
         self.schema_sig = get_schema_signature()
         self.universe_fp = MarketUniverse.fingerprint()
 
-        # -------------------------------------------------
-        # NEW: cache model fingerprint once
-        # -------------------------------------------------
-
         try:
             loader = ModelLoader()
             self.model_fp = loader.xgb_version
@@ -161,6 +157,39 @@ class RedisCache:
         )
 
     ###################################################
+    # PAYLOAD VALIDATION (TEST COMPATIBILITY)
+    ###################################################
+
+    def _validate_payload(self, payload):
+        """
+        Compatibility method for tests.
+        Accepts a list of signal rows.
+        """
+
+        if not isinstance(payload, list):
+            raise RuntimeError("Payload must be a list.")
+
+        for row in payload:
+
+            if not isinstance(row, dict):
+                raise RuntimeError("Invalid payload row.")
+
+            ticker = row.get("ticker")
+            weight = row.get("weight", 0)
+
+            if not isinstance(ticker, str):
+                raise RuntimeError("Invalid ticker.")
+
+            if not isinstance(weight, (int, float)):
+                raise RuntimeError("Invalid weight.")
+
+            if not np.isfinite(weight):
+                raise RuntimeError("Non-finite weight.")
+
+            if abs(weight) > 1:
+                raise RuntimeError("Unrealistic weight.")
+
+    ###################################################
     # SNAPSHOT VALIDATION
     ###################################################
 
@@ -175,25 +204,7 @@ class RedisCache:
         if not isinstance(value["signals"], list):
             raise RuntimeError("Signals must be list.")
 
-        for row in value["signals"]:
-
-            if not isinstance(row, dict):
-                raise RuntimeError("Invalid signal row.")
-
-            ticker = row.get("ticker")
-            weight = row.get("weight", 0)
-
-            if not isinstance(ticker, str):
-                raise RuntimeError("Invalid ticker type.")
-
-            if not isinstance(weight, (int, float)):
-                raise RuntimeError("Invalid weight type.")
-
-            if not np.isfinite(weight):
-                raise RuntimeError("Non-finite weight.")
-
-            if abs(weight) > 1.0:
-                raise RuntimeError("Unrealistic weight detected.")
+        self._validate_payload(value["signals"])
 
     ###################################################
     # GET
@@ -240,7 +251,6 @@ class RedisCache:
 
             logger.exception("Redis GET failure.")
 
-            # only disable if connection issue
             self.enabled = False
 
             self._retry_delay = min(
