@@ -20,7 +20,7 @@ MAX_MODEL_SIZE_MB = 150
 MAX_ABS_SCORE = 50
 EPSILON = 1e-12
 
-STANDARDIZE_INFERENCE = True  # improves cross-sectional ranking stability
+STANDARDIZE_INFERENCE = True
 
 
 class SafeXGBRegressor:
@@ -36,9 +36,12 @@ class SafeXGBRegressor:
         self.importance_checksum = None
         self.training_fingerprint = None
         self.booster_checksum = None
+
         self.best_iteration = None
         self.train_rmse = None
         self.valid_rmse = None
+
+        self.model_type = "xgboost_regressor"
 
         os.environ["PYTHONHASHSEED"] = str(SEED)
         random.seed(SEED)
@@ -79,7 +82,7 @@ class SafeXGBRegressor:
         # FEATURE CHECKSUM
         ###################################################
 
-        checksum_str = json.dumps(self.feature_names, sort_keys=False)
+        checksum_str = json.dumps(self.feature_names)
         self.feature_checksum = hashlib.sha256(
             checksum_str.encode()
         ).hexdigest()
@@ -90,23 +93,32 @@ class SafeXGBRegressor:
 
         split_idx = int(len(X) * (1 - VALIDATION_SPLIT))
 
-        X_train, X_valid = X.iloc[:split_idx], X.iloc[split_idx:]
-        y_train, y_valid = y[:split_idx], y[split_idx:]
+        X_train = X.iloc[:split_idx]
+        y_train = y[:split_idx]
+
+        X_valid = X.iloc[split_idx:]
+        y_valid = y[split_idx:]
 
         dtrain = xgb.DMatrix(
             X_train,
             label=y_train,
-            feature_names=self.feature_names,
+            feature_names=self.feature_names
         )
 
-        dvalid = xgb.DMatrix(
-            X_valid,
-            label=y_valid,
-            feature_names=self.feature_names,
-        )
+        evals = [(dtrain, "train")]
+
+        if len(X_valid) >= 10:
+
+            dvalid = xgb.DMatrix(
+                X_valid,
+                label=y_valid,
+                feature_names=self.feature_names
+            )
+
+            evals.append((dvalid, "valid"))
 
         ###################################################
-        # PARAMETERS (Stable for Noisy Yahoo Data)
+        # PARAMETERS
         ###################################################
 
         use_gpu = os.getenv("XGB_USE_GPU", "false").lower() == "true"
@@ -142,20 +154,23 @@ class SafeXGBRegressor:
             params,
             dtrain,
             num_boost_round=NUM_BOOST_ROUNDS,
-            evals=[(dtrain, "train"), (dvalid, "valid")],
+            evals=evals,
             early_stopping_rounds=EARLY_STOPPING_ROUNDS,
             verbose_eval=False,
             evals_result=evals_result
         )
 
-        # Robust best_iteration handling
         if hasattr(self.model, "best_iteration") and self.model.best_iteration is not None:
             self.best_iteration = self.model.best_iteration
         else:
             self.best_iteration = NUM_BOOST_ROUNDS
 
         self.train_rmse = float(evals_result["train"]["rmse"][-1])
-        self.valid_rmse = float(evals_result["valid"]["rmse"][-1])
+
+        if "valid" in evals_result:
+            self.valid_rmse = float(evals_result["valid"]["rmse"][-1])
+        else:
+            self.valid_rmse = self.train_rmse
 
         ###################################################
         # OVERFIT CHECK
@@ -199,6 +214,7 @@ class SafeXGBRegressor:
 
         hist, _ = np.histogram(preds, bins=30)
         probs = hist / (hist.sum() + EPSILON)
+
         entropy = -np.sum(probs * np.log(probs + EPSILON))
 
         if entropy < MIN_PRED_ENTROPY:
@@ -230,6 +246,7 @@ class SafeXGBRegressor:
             raise RuntimeError("Feature dimension mismatch.")
 
         missing = set(self.feature_names) - set(X.columns)
+
         if missing:
             raise RuntimeError(f"Missing inference features: {missing}")
 
@@ -240,7 +257,7 @@ class SafeXGBRegressor:
 
         dmatrix = xgb.DMatrix(
             X,
-            feature_names=self.feature_names,
+            feature_names=self.feature_names
         )
 
         scores = self.model.predict(
@@ -258,7 +275,6 @@ class SafeXGBRegressor:
         if score_std < MIN_SCORE_STD:
             logger.warning("Inference score dispersion low.")
 
-        # Optional cross-sectional normalization
         if STANDARDIZE_INFERENCE and score_std > MIN_SCORE_STD:
             scores = (scores - np.mean(scores)) / (score_std + EPSILON)
 
@@ -273,7 +289,7 @@ class SafeXGBRegressor:
         if self.model is None:
             raise RuntimeError("Model not trained.")
 
-        raw_gain = self.model.get_score(importance_type="gain")
+        raw_gain = self.model.get_score(importance_type="gain") or {}
 
         importance = {
             name: float(raw_gain.get(name, 0.0))
@@ -290,10 +306,10 @@ class SafeXGBRegressor:
         sorted_imp = sorted(
             normalized.items(),
             key=lambda x: x[1],
-            reverse=True,
+            reverse=True
         )
 
-        checksum_str = json.dumps(sorted_imp, sort_keys=False)
+        checksum_str = json.dumps(sorted_imp)
         self.importance_checksum = hashlib.sha256(
             checksum_str.encode()
         ).hexdigest()
