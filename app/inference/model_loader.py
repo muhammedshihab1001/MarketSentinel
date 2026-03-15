@@ -11,6 +11,7 @@ import threading
 import hashlib
 import json
 import numpy as np
+import pandas as pd
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -125,17 +126,6 @@ class ModelLoader:
                 h.update(chunk)
 
         return h.hexdigest()
-
-    # =====================================================
-    # VERSION PARSER
-    # =====================================================
-
-    def _parse_version(self, v: str):
-
-        try:
-            return tuple(int(x) for x in v.split("."))
-        except Exception:
-            return (0,)
 
     # =====================================================
     # FEATURE CHECKSUM
@@ -267,10 +257,9 @@ class ModelLoader:
         if not versions:
             raise RuntimeError("No model artifacts found.")
 
-        latest_version = sorted(
-            versions,
-            key=self._parse_version
-        )[-1]
+        # Versions are timestamp-based (e.g. "20240115_143022")
+        # which sort correctly as plain strings — newest is last
+        latest_version = sorted(versions)[-1]
 
         model_path = os.path.join(base_dir, f"model_{latest_version}.pkl")
 
@@ -432,14 +421,17 @@ class ModelLoader:
         model = self.xgb
 
         try:
-
-            dummy = np.zeros(
-                (1, len(MODEL_FEATURES)),
-                dtype=np.float32
+            # SafeXGBRegressor.predict() expects a DataFrame with
+            # named columns matching MODEL_FEATURES, not a numpy array.
+            dummy = pd.DataFrame(
+                np.zeros((1, len(MODEL_FEATURES)), dtype=np.float32),
+                columns=MODEL_FEATURES,
             )
 
             model.predict(dummy)
 
-        except Exception:
+            logger.info("Model warmup inference OK.")
 
-            logger.warning("Model warmup inference failed (non-critical).")
+        except Exception as exc:
+
+            logger.warning("Model warmup inference failed (non-critical): %s", exc)
