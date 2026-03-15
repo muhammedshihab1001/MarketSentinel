@@ -5,12 +5,9 @@ from unittest.mock import patch
 from app.main import app
 
 
-client = TestClient(app)
-
-
-# -------------------------------------------------------
+############################################################
 # MOCK SNAPSHOT
-# -------------------------------------------------------
+############################################################
 
 def mock_snapshot():
 
@@ -42,13 +39,15 @@ def mock_snapshot():
     }
 
 
-# -------------------------------------------------------
+############################################################
 # SUCCESS CASE
-# -------------------------------------------------------
+############################################################
 
 @patch("app.api.routes.agent.get_explainer")
 @patch("app.api.routes.agent.InferencePipeline")
 def test_agent_explanation_success(mock_pipeline_cls, mock_explainer):
+
+    client = TestClient(app)
 
     # Mock pipeline
     mock_pipeline = mock_pipeline_cls.return_value
@@ -61,10 +60,14 @@ def test_agent_explanation_success(mock_pipeline_cls, mock_explainer):
 
     assert response.status_code == 200
 
-    data = response.json()
+    payload = response.json()
+
+    # Support wrapped API format
+    data = payload.get("data", payload)
 
     assert data["ticker"] == "AAPL"
     assert data["signal"] == "LONG"
+
     assert "agent" in data
     assert "llm" in data
 
@@ -76,25 +79,30 @@ def test_agent_explanation_success(mock_pipeline_cls, mock_explainer):
     assert agent_data["momentum_state"] == "strong_positive"
 
 
-# -------------------------------------------------------
+############################################################
 # INVALID TICKER
-# -------------------------------------------------------
+############################################################
 
 def test_invalid_ticker():
+
+    client = TestClient(app)
 
     response = client.post("/agent/explain", params={"ticker": ""})
 
     assert response.status_code == 400
 
 
-# -------------------------------------------------------
+############################################################
 # NO SIGNAL GENERATED
-# -------------------------------------------------------
+############################################################
 
 @patch("app.api.routes.agent.InferencePipeline")
 def test_no_signal(mock_pipeline_cls):
 
+    client = TestClient(app)
+
     mock_pipeline = mock_pipeline_cls.return_value
+
     mock_pipeline.run_snapshot.return_value = {
         "probability_stats": {},
         "signals": []
