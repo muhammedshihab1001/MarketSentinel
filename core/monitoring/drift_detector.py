@@ -1,5 +1,5 @@
 # =========================================================
-# DRIFT DETECTOR v2.2
+# DRIFT DETECTOR v2.3
 # Hybrid Multi-Agent Compatible | CV-Optimized
 # Noise-Tolerant for yfinance data
 # =========================================================
@@ -76,7 +76,7 @@ class DriftDetector:
         ).lower() == "true"
 
     # =====================================================
-    # CREATE BASELINE  ⭐ NEW METHOD
+    # CREATE BASELINE
     # =====================================================
 
     def create_baseline(
@@ -88,6 +88,9 @@ class DriftDetector:
         model_version: str,
         allow_overwrite: bool = False
     ):
+
+        if dataset is None or dataset.empty:
+            raise RuntimeError("Cannot create baseline from empty dataset.")
 
         if os.path.exists(self.BASELINE_PATH) and not allow_overwrite:
             raise RuntimeError("Baseline already exists.")
@@ -193,6 +196,11 @@ class DriftDetector:
         if baseline.get("integrity_hash") != self._baseline_hash(baseline):
             raise RuntimeError("Baseline integrity failure.")
 
+        meta = baseline.get("meta", {})
+
+        if meta.get("schema_signature") != get_schema_signature():
+            logger.warning("Schema mismatch detected.")
+
         return baseline
 
     # =====================================================
@@ -276,7 +284,6 @@ class DriftDetector:
                 current_var = max(current.var(), self.EPSILON)
 
                 z_score = abs(weighted_mean - stats.get("mean", 0.0)) / baseline_std
-
                 variance_ratio = current_var / baseline_var
 
                 psi = self._psi(
@@ -309,6 +316,10 @@ class DriftDetector:
 
             coverage = float(evaluated_features / max(total_features, 1))
 
+            if coverage < self.MIN_FEATURE_EVAL_RATIO:
+                drift_count = 0
+                severity_accumulator = 0
+
             severity_score = min(
                 int(np.sqrt(severity_accumulator)),
                 self.MAX_SEVERITY_CAP
@@ -320,6 +331,13 @@ class DriftDetector:
                 else "none"
             )
 
+            if drift_state == "hard":
+                exposure_scale = 0.2
+            elif drift_state == "soft":
+                exposure_scale = max(0.4, 1 - severity_score * 0.04)
+            else:
+                exposure_scale = 1.0
+
             DRIFT_DETECTED.set(severity_score)
 
             return {
@@ -329,7 +347,7 @@ class DriftDetector:
                 "coverage": coverage,
                 "details": report,
                 "drift_state": drift_state,
-                "exposure_scale": 1.0
+                "exposure_scale": float(exposure_scale)
             }
 
         except FileNotFoundError:
@@ -352,6 +370,8 @@ class DriftDetector:
 
             if self.hard_fail:
                 raise
+
+            DRIFT_DETECTED.set(6)
 
             return {
                 "drift_detected": True,
