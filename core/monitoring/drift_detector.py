@@ -1,6 +1,7 @@
 # =========================================================
-# DRIFT DETECTOR v2.0
+# DRIFT DETECTOR v2.1
 # Hybrid Multi-Agent Compatible | CV-Optimized
+# Noise-Tolerant for yfinance data
 # =========================================================
 
 import numpy as np
@@ -31,12 +32,14 @@ except Exception:
 
 class DriftDetector:
     """
-    Lightweight but robust drift detection system.
+    Lightweight drift detector designed for noisy financial data.
 
-    Designed for:
-    - Hybrid consensus architecture
-    - Noisy yfinance data
-    - CV demonstration of governance layer
+    Signals:
+    - z-score mean shift
+    - variance shift
+    - PSI distribution drift
+
+    Designed for CV showcase and yfinance robustness.
     """
 
     BASELINE_FILENAME = "baseline.json"
@@ -61,12 +64,16 @@ class DriftDetector:
 
     RECENT_WEIGHT_FACTOR = 1.5
 
+    FEATURE_CLIP_SIGMA = 6.0  # NEW: protects against Yahoo spikes
+
     # -----------------------------------------------------
 
     def __init__(self, z_threshold: float = 4.0, baseline_dir: str = "artifacts/drift"):
 
         self.z_threshold = z_threshold
+
         self.baseline_dir = os.path.realpath(baseline_dir)
+
         os.makedirs(self.baseline_dir, exist_ok=True)
 
         self.BASELINE_PATH = os.path.join(
@@ -86,14 +93,27 @@ class DriftDetector:
     def _safe_feature_block(self, dataset: pd.DataFrame):
 
         missing = set(MODEL_FEATURES) - set(dataset.columns)
+
         if missing:
             raise RuntimeError(f"Missing features: {missing}")
 
         block = dataset.loc[:, MODEL_FEATURES].copy()
 
         for col in MODEL_FEATURES:
+
             block[col] = pd.to_numeric(block[col], errors="coerce").astype(DTYPE)
+
             block[col] = block[col].replace([np.inf, -np.inf], np.nan)
+
+            # NEW: clip extreme spikes
+            mean = block[col].mean()
+            std = block[col].std()
+
+            if std > 0:
+                block[col] = block[col].clip(
+                    mean - self.FEATURE_CLIP_SIGMA * std,
+                    mean + self.FEATURE_CLIP_SIGMA * std
+                )
 
         return block
 
@@ -105,13 +125,15 @@ class DriftDetector:
     def _baseline_hash(payload: dict) -> str:
 
         clone = dict(payload)
+
         clone.pop("integrity_hash", None)
 
         canonical = json.dumps(clone, sort_keys=True).encode()
+
         return hashlib.sha256(canonical).hexdigest()
 
     # =====================================================
-    # LOAD VERIFIED BASELINE (SOFTENED)
+    # LOAD VERIFIED BASELINE
     # =====================================================
 
     def _load_verified_baseline(self):
@@ -148,6 +170,9 @@ class DriftDetector:
 
     def _psi(self, bin_edges, expected_counts, actual):
 
+        if len(bin_edges) < 2 or len(expected_counts) == 0:
+            return 0.0
+
         actual = np.asarray(actual, dtype=np.float64)
 
         if len(actual) < 5:
@@ -179,6 +204,7 @@ class DriftDetector:
             return float(series.mean())
 
         weights = np.linspace(1.0, self.RECENT_WEIGHT_FACTOR, len(series))
+
         weights /= weights.sum()
 
         return float(np.sum(series.values * weights))
@@ -220,6 +246,7 @@ class DriftDetector:
                 current_var = max(current.var(), self.EPSILON)
 
                 z_score = abs(weighted_mean - stats.get("mean", 0.0)) / baseline_std
+
                 variance_ratio = current_var / baseline_var
 
                 psi = self._psi(
@@ -236,7 +263,9 @@ class DriftDetector:
                 ])
 
                 if drift:
+
                     drift_count += 1
+
                     severity_accumulator += (
                         min(z_score / self.z_threshold, 4) +
                         min(abs(np.log(variance_ratio + self.EPSILON)), 4) +
@@ -253,11 +282,12 @@ class DriftDetector:
             coverage = float(evaluated_features / max(total_features, 1))
 
             if coverage < self.MIN_FEATURE_EVAL_RATIO:
+
                 drift_count = 0
                 severity_accumulator = 0
 
             severity_score = min(
-                int(np.log1p(severity_accumulator)),
+                int(np.sqrt(severity_accumulator)),  # NEW: smoother scaling
                 self.MAX_SEVERITY_CAP
             )
 
@@ -268,13 +298,19 @@ class DriftDetector:
             )
 
             drift_detected = drift_count > 0
-            DRIFT_DETECTED.set(1 if drift_detected else 0)
+
+            DRIFT_DETECTED.set(severity_score)
 
             if drift_state == "hard":
+
                 exposure_scale = 0.2
+
             elif drift_state == "soft":
-                exposure_scale = max(0.4, 1 - severity_score * 0.05)
+
+                exposure_scale = max(0.4, 1 - severity_score * 0.04)
+
             else:
+
                 exposure_scale = 1.0
 
             return {
@@ -315,7 +351,7 @@ class DriftDetector:
             if self.hard_fail:
                 raise
 
-            DRIFT_DETECTED.set(1)
+            DRIFT_DETECTED.set(6)
 
             return {
                 "drift_detected": True,
