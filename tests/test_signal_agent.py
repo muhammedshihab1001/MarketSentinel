@@ -1,10 +1,12 @@
 import pytest
+from copy import deepcopy
+
 from core.agent.signal_agent import SignalAgent
 
 
-# ======================================================
+############################################################
 # FIXED TEST INPUTS
-# ======================================================
+############################################################
 
 def make_base_context():
 
@@ -27,13 +29,14 @@ def make_base_context():
     }
 
 
-# ======================================================
+############################################################
 # STRUCTURE CONTRACT
-# ======================================================
+############################################################
 
 def test_signal_agent_structure():
 
     agent = SignalAgent()
+
     result = agent.analyze(make_base_context())
 
     required_keys = {
@@ -55,10 +58,14 @@ def test_signal_agent_structure():
 
     assert required_keys.issubset(result.keys())
 
+    assert isinstance(result["warnings"], list)
+    assert isinstance(result["reasoning"], list)
+    assert isinstance(result["explanation"], str)
 
-# ======================================================
+
+############################################################
 # DETERMINISM
-# ======================================================
+############################################################
 
 def test_agent_is_deterministic():
 
@@ -72,9 +79,9 @@ def test_agent_is_deterministic():
     assert r1 == r2
 
 
-# ======================================================
+############################################################
 # CONFIDENCE RANGE
-# ======================================================
+############################################################
 
 def test_confidence_range():
 
@@ -85,18 +92,18 @@ def test_confidence_range():
     assert 0.0 <= result["confidence_numeric"] <= 1.0
 
 
-# ======================================================
+############################################################
 # CONFIDENCE MONOTONICITY
-# ======================================================
+############################################################
 
 def test_confidence_monotonicity():
 
     agent = SignalAgent()
 
-    low = make_base_context()
+    low = deepcopy(make_base_context())
     low["row"]["raw_model_score"] = 0.2
 
-    high = make_base_context()
+    high = deepcopy(make_base_context())
     high["row"]["raw_model_score"] = 2.0
 
     r_low = agent.analyze(low)
@@ -105,9 +112,9 @@ def test_confidence_monotonicity():
     assert r_high["confidence_numeric"] > r_low["confidence_numeric"]
 
 
-# ======================================================
+############################################################
 # LOW DISPERSION WARNING
-# ======================================================
+############################################################
 
 def test_low_dispersion_warning():
 
@@ -121,9 +128,9 @@ def test_low_dispersion_warning():
     assert any("dispersion" in w.lower() for w in result["warnings"])
 
 
-# ======================================================
+############################################################
 # HIGH VOLATILITY REGIME
-# ======================================================
+############################################################
 
 def test_high_volatility_regime():
 
@@ -137,9 +144,9 @@ def test_high_volatility_regime():
     assert result["volatility_regime"] == "high_volatility"
 
 
-# ======================================================
+############################################################
 # RSI EXTREMES
-# ======================================================
+############################################################
 
 def test_rsi_overbought():
 
@@ -159,7 +166,6 @@ def test_rsi_oversold():
 
     context = make_base_context()
     context["row"]["rsi"] = 20
-
     context["row"]["signal"] = "SHORT"
 
     result = agent.analyze(context)
@@ -167,9 +173,9 @@ def test_rsi_oversold():
     assert any("oversold" in w.lower() for w in result["warnings"])
 
 
-# ======================================================
+############################################################
 # MOMENTUM CONTRADICTION
-# ======================================================
+############################################################
 
 def test_momentum_contradiction_long():
 
@@ -197,9 +203,9 @@ def test_momentum_contradiction_short():
     assert any("contradict" in w.lower() for w in result["warnings"])
 
 
-# ======================================================
+############################################################
 # POSITION SIZE RANGE
-# ======================================================
+############################################################
 
 def test_position_size_range():
 
@@ -210,9 +216,9 @@ def test_position_size_range():
     assert 0.0 <= result["position_size_hint"] <= 1.0
 
 
-# ======================================================
+############################################################
 # POLITICAL RISK OVERRIDE
-# ======================================================
+############################################################
 
 def test_political_risk_override():
 
