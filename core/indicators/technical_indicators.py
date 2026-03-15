@@ -7,14 +7,13 @@ logger = logging.getLogger(__name__)
 
 class TechnicalIndicators:
     """
-    Institutional technical indicator engine.
+    Lightweight technical indicator engine for portfolio inference.
 
-    Guarantees:
-    ✔ No synthetic price creation
+    Guarantees
     ✔ Leak-safe rolling indicators
-    ✔ Corruption detection
-    ✔ Timestamp integrity
     ✔ Numeric safety
+    ✔ Timestamp normalization
+    ✔ Handles noisy Yahoo Finance data
     """
 
     REQUIRED_COLUMN = "close"
@@ -56,7 +55,7 @@ class TechnicalIndicators:
             )
 
         ####################################################
-        # DATE INTEGRITY
+        # DATE NORMALIZATION
         ####################################################
 
         if "date" in df.columns:
@@ -72,7 +71,7 @@ class TechnicalIndicators:
             df = df.sort_values("date")
 
         ####################################################
-        # PRICE SAFETY
+        # PRICE SANITIZATION
         ####################################################
 
         close = pd.to_numeric(
@@ -88,7 +87,7 @@ class TechnicalIndicators:
             raise RuntimeError("Invalid close prices detected.")
 
         ####################################################
-        # CORRUPTION GUARD (softened for Yahoo)
+        # YAHOO FINANCE SPIKE GUARD
         ####################################################
 
         returns = close.pct_change().abs()
@@ -149,13 +148,41 @@ class TechnicalIndicators:
     ####################################################
 
     @classmethod
-    def rsi(cls, df: pd.DataFrame, window: int = 14):
+    def rsi(
+        cls,
+        df: pd.DataFrame,
+        window: int = None,
+        period: int = None
+    ):
+        """
+        RSI indicator.
+
+        Supports both:
+        rsi(window=14)
+        rsi(period=14)
+
+        for compatibility with tests and project code.
+        """
+
+        if window is None and period is None:
+            window = 14
+
+        if window is None:
+            window = period
 
         cls._validate_window(window)
 
         df = cls._normalize_columns(df)
 
         close = df["close"].astype("float64")
+
+        # very short series protection
+        if len(close) < window:
+            return pd.Series(
+                np.full(len(close), 50.0),
+                index=close.index,
+                dtype="float32"
+            )
 
         delta = close.diff()
 
