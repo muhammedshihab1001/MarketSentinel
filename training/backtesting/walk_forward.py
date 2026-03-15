@@ -35,7 +35,7 @@ class WalkForwardValidator:
 
     SCORE_WINSOR_Q = 0.01
     EPSILON = 1e-9
-    TARGET_CLIP = 5.0  # match training
+    TARGET_CLIP = 5.0
 
     def __init__(
         self,
@@ -89,9 +89,16 @@ class WalkForwardValidator:
     # ----------------------------------------------------------
 
     def _winsorize(self, x):
-        lower = np.quantile(x, self.SCORE_WINSOR_Q)
-        upper = np.quantile(x, 1 - self.SCORE_WINSOR_Q)
-        return np.clip(x, lower, upper)
+
+        if len(x) < 5:
+            return x
+
+        try:
+            lower = np.quantile(x, self.SCORE_WINSOR_Q)
+            upper = np.quantile(x, 1 - self.SCORE_WINSOR_Q)
+            return np.clip(x, lower, upper)
+        except Exception:
+            return x
 
     def _softmax(self, x):
         x = x - np.max(x)
@@ -99,10 +106,14 @@ class WalkForwardValidator:
         return e / (np.sum(e) + self.EPSILON)
 
     def _compute_turnover(self, old_positions, new_positions):
+
         all_keys = set(old_positions.keys()) | set(new_positions.keys())
+
         turnover = 0.0
+
         for k in all_keys:
             turnover += abs(new_positions.get(k, 0.0) - old_positions.get(k, 0.0))
+
         return turnover
 
     # ----------------------------------------------------------
@@ -110,12 +121,14 @@ class WalkForwardValidator:
     def run(self, df: pd.DataFrame):
 
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
         df["date"] = pd.to_datetime(df["date"], utc=True)
 
         unique_dates = df["date"].drop_duplicates().sort_values()
 
         results = []
         equity_curve = []
+
         capital = 10_000.0
 
         start_idx = self.window_size
@@ -146,7 +159,6 @@ class WalkForwardValidator:
                 start_idx += self.step_size
                 continue
 
-            # Regime detection
             train_df = self.regime_detector.detect(train_df)
             test_df = self.regime_detector.detect(test_df)
 
@@ -172,7 +184,6 @@ class WalkForwardValidator:
                 signal_slice = test_df[test_df["date"] == signal_date].copy()
                 exit_slice = test_df[test_df["date"] == exit_date].copy()
 
-                # Clean NaN feature rows
                 signal_slice = signal_slice.replace([np.inf, -np.inf], np.nan)
                 signal_slice = signal_slice.dropna(subset=MODEL_FEATURES)
 
@@ -198,9 +209,16 @@ class WalkForwardValidator:
                     continue
 
                 scores = self._winsorize(scores)
-                scores = (scores - scores.mean()) / (scores.std() + self.EPSILON)
+
+                std = scores.std()
+
+                if std < self.EPSILON:
+                    continue
+
+                scores = (scores - scores.mean()) / (std + self.EPSILON)
 
                 signal_slice["score"] = scores
+
                 ranked = signal_slice.sort_values("score")
 
                 longs = ranked.tail(self.TOP_K)
@@ -212,11 +230,12 @@ class WalkForwardValidator:
                 long_w = self._softmax(longs["score"].values)
                 short_w = self._softmax(np.abs(shorts["score"].values))
 
-                # Regime multiplier (light integration)
-                regime_multiplier = signal_slice["regime_multiplier"].iloc[0] \
-                    if "regime_multiplier" in signal_slice.columns else 1.0
+                regime_multiplier = 1.0
 
-                gross = self.TARGET_GROSS_EXPOSURE * float(regime_multiplier)
+                if "regime_multiplier" in signal_slice.columns:
+                    regime_multiplier = float(signal_slice["regime_multiplier"].iloc[0])
+
+                gross = self.TARGET_GROSS_EXPOSURE * regime_multiplier
 
                 long_w *= gross / 2
                 short_w *= gross / 2
@@ -230,6 +249,7 @@ class WalkForwardValidator:
                     positions[t] = -min(float(w), self.MAX_POSITION_WEIGHT)
 
                 turnover = self._compute_turnover(prev_positions, positions)
+
                 turnover_sum += turnover
 
                 merged = pd.merge(
@@ -247,9 +267,13 @@ class WalkForwardValidator:
                 period_ret = 0.0
 
                 for row in merged.itertuples():
+
                     if row.ticker in positions:
+
                         weight = positions[row.ticker]
+
                         cost = abs(weight) * self.TRANSACTION_COST
+
                         period_ret += weight * row.ret - cost
 
                 period_ret = float(np.clip(
@@ -259,11 +283,18 @@ class WalkForwardValidator:
                 ))
 
                 capital *= np.exp(period_ret)
+
+                if not np.isfinite(capital):
+                    capital = 1.0
+
                 capital = max(capital, 1.0)
 
                 prev_positions = positions
+
                 window_returns.append(period_ret)
+
                 equity_curve.append(capital)
+
                 trade_count += 1
 
             if len(window_returns) < self.MIN_TRADES_PER_WINDOW:
@@ -273,6 +304,7 @@ class WalkForwardValidator:
             window_returns = np.array(window_returns)
 
             vol = np.std(window_returns)
+
             sharpe = 0.0 if vol < self.EPSILON else (
                 np.mean(window_returns) / vol
             ) * np.sqrt(252 / FORWARD_DAYS)
@@ -299,12 +331,15 @@ class WalkForwardValidator:
             raise RuntimeError("Walk-forward produced no valid windows.")
 
         df = pd.DataFrame(results)
+
         curve = np.array(equity_curve)
 
         peak = np.maximum.accumulate(curve)
+
         drawdowns = (curve - peak) / peak
 
         gains = df[df["strategy_return"] > 0]["strategy_return"].sum()
+
         losses = abs(df[df["strategy_return"] < 0]["strategy_return"].sum()) or 1e-6
 
         return {
