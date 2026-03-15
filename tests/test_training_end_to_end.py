@@ -13,9 +13,9 @@ from core.schema.feature_schema import (
 )
 
 
-# ---------------------------------------------------------
-# Synthetic Dataset Builder
-# ---------------------------------------------------------
+############################################################
+# SYNTHETIC DATASET BUILDER
+############################################################
 
 def build_training_dataset():
 
@@ -32,8 +32,12 @@ def build_training_dataset():
             row = {
                 "date": d,
                 "ticker": t,
-                "close": 100 + rng.normal(0, 1),
+
+                # slightly trending synthetic price
+                "close": 100 + rng.normal(0, 1) + (d.day * 0.02),
+
                 "volatility": abs(rng.normal()) + 0.2,
+
                 "regime": "SIDEWAYS",
                 "market_regime": "SIDEWAYS",
                 "regime_multiplier": 1.0
@@ -46,6 +50,7 @@ def build_training_dataset():
 
     df = pd.DataFrame(rows)
 
+    # enforce schema compliance
     feature_block = validate_feature_schema(
         df.loc[:, MODEL_FEATURES],
         mode="training"
@@ -56,9 +61,9 @@ def build_training_dataset():
     return df
 
 
-# ---------------------------------------------------------
-# Test Training Pipeline
-# ---------------------------------------------------------
+############################################################
+# TRAINING PIPELINE TEST
+############################################################
 
 def test_training_pipeline_runs():
 
@@ -70,9 +75,9 @@ def test_training_pipeline_runs():
     assert hasattr(model, "predict")
 
 
-# ---------------------------------------------------------
-# Test Walk-Forward With Real Trainer
-# ---------------------------------------------------------
+############################################################
+# WALK-FORWARD WITH REAL TRAINER
+############################################################
 
 def test_training_walkforward():
 
@@ -91,9 +96,9 @@ def test_training_walkforward():
     assert np.isfinite(metrics["avg_sharpe"])
 
 
-# ---------------------------------------------------------
-# Test Artifact Creation
-# ---------------------------------------------------------
+############################################################
+# ARTIFACT EXPORT TEST
+############################################################
 
 def test_model_artifact_export():
 
@@ -111,6 +116,9 @@ def test_model_artifact_export():
     dataset_hash = "dummy_hash"
 
     tmpdir = tempfile.mkdtemp()
+
+    # redirect artifact directory
+    os.environ["XGB_REGISTRY_DIR"] = tmpdir
 
     try:
 
@@ -133,9 +141,9 @@ def test_model_artifact_export():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ---------------------------------------------------------
-# Determinism Check
-# ---------------------------------------------------------
+############################################################
+# DETERMINISM CHECK
+############################################################
 
 def test_training_deterministic():
 
@@ -146,7 +154,10 @@ def test_training_deterministic():
 
     X = df.loc[:, MODEL_FEATURES]
 
-    X = validate_feature_schema(X, mode="inference")
+    X = validate_feature_schema(
+        X,
+        mode="inference"
+    ).astype(DTYPE)
 
     pred1 = model1.predict(X)
     pred2 = model2.predict(X)
