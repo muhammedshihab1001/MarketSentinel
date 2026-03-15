@@ -12,7 +12,6 @@ from pathlib import Path
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
-from core.features.feature_store import FeatureStore
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import (
     MODEL_FEATURES,
@@ -23,6 +22,7 @@ from core.time.market_time import MarketTime
 from core.monitoring.drift_detector import DriftDetector
 from app.inference.model_loader import ModelLoader
 from training.backtesting.walk_forward import WalkForwardValidator
+from training.train_xgboost import trainer as retrain_model
 
 
 # =========================================================
@@ -41,44 +41,58 @@ MAX_ALLOWED_DRIFT = 0.35
 # =========================================================
 
 def build_dataset():
+    """
+    Fetch price data for all universe tickers, concatenate,
+    then run the full feature pipeline ONCE on the combined
+    dataset so cross-sectional features compute correctly.
+    """
 
     market_data = MarketDataService()
-    store = FeatureStore()
     universe = MarketUniverse.get_universe()
 
     start_date, end_date = MarketTime.window_for("xgboost")
 
-    datasets = []
+    # ── Step 1: Fetch raw price data per ticker ──────────────────────────
+    price_frames = []
+    fetch_failures = []
 
     for ticker in universe:
         try:
             price_df = market_data.get_price_data(
                 ticker=ticker,
                 start_date=start_date,
-                end_date=end_date
+                end_date=end_date,
             )
-
-            # Build full feature pipeline (core + CS + finalize)
-            df = FeatureEngineer.build_feature_pipeline(
-                price_df=price_df,
-                sentiment_df=None,
-                training=False
-            )
-
-            if df is not None and not df.empty:
-                datasets.append(df)
-
-        except Exception:
+            if price_df is not None and not price_df.empty:
+                price_frames.append(price_df)
+        except Exception as exc:
+            fetch_failures.append(ticker)
             continue
 
-    if not datasets:
-        raise RuntimeError("No evaluation datasets built.")
+    if not price_frames:
+        raise RuntimeError("No evaluation price data fetched.")
 
-    df = pd.concat(datasets, ignore_index=True)
+    if fetch_failures:
+        print(f"Price fetch failed for {len(fetch_failures)} tickers: {fetch_failures}")
+
+    # ── Step 2: Concatenate and run feature pipeline once ────────────────
+    combined_prices = pd.concat(price_frames, ignore_index=True)
+
+    df = FeatureEngineer.build_feature_pipeline(
+        combined_prices, training=False
+    )
+
     df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
     if len(df) < 2000:
-        raise RuntimeError("Dataset too small for evaluation.")
+        raise RuntimeError(
+            f"Dataset too small for evaluation: {len(df)} rows, need 2000."
+        )
+
+    print(
+        f"Evaluation dataset built | rows={len(df)} "
+        f"tickers={df['ticker'].nunique()} dates={df['date'].nunique()}"
+    )
 
     return df
 
@@ -144,9 +158,10 @@ def main() -> int:
     if drift_score > MAX_ALLOWED_DRIFT:
         raise RuntimeError("Drift exceeded governance limit.")
 
-    # Walk-forward validation
+    # Walk-forward validation — retrain_model retrains per fold
+    # so each window gets a fresh model trained only on in-sample data
     validator = WalkForwardValidator(
-        model_trainer=lambda train_df: loader.xgb
+        model_trainer=retrain_model,
     )
 
     metrics = validator.run(df.copy())
