@@ -5,6 +5,9 @@ import threading
 from contextlib import nullcontext
 from typing import Dict, Any
 
+import pandas as pd
+import numpy as np
+
 from core.data.providers.market.yahoo_provider import YahooProvider
 
 try:
@@ -33,7 +36,9 @@ class MarketProviderRouter:
     }
 
     DEFAULT_MIN_ROWS = 50
+
     MAX_DAILY_MOVE = 0.90
+
     PROVIDER_TIMEOUT_WARN = 8.0
     FAILURE_COOLDOWN = 20
 
@@ -52,8 +57,11 @@ class MarketProviderRouter:
     def __init__(self):
 
         self.providers = []
+
         self._provider_failures = {}
+
         self._provider_stats: Dict[str, Dict[str, Any]] = {}
+
         self._lock = threading.Lock()
 
         self._yahoo_semaphore = threading.Semaphore(
@@ -83,29 +91,35 @@ class MarketProviderRouter:
         def register(name, builder, api_key_env=None):
 
             if api_key_env and not os.getenv(api_key_env):
+
                 logger.warning(
                     "Provider skipped → %s | missing %s",
                     name,
                     api_key_env
                 )
+
                 return
 
             if builder is None:
                 return
 
             try:
+
                 provider = builder()
+
                 self.providers.append((name, provider))
 
                 self._provider_stats[name] = {
                     "success": 0,
                     "failure": 0,
-                    "avg_latency": 0.0
+                    "avg_latency": 0.0,
+                    "last_failure": None
                 }
 
                 logger.info("Provider registered → %s", name)
 
             except Exception as e:
+
                 logger.warning(
                     "Provider disabled → %s | reason=%s",
                     name,
@@ -113,13 +127,16 @@ class MarketProviderRouter:
                 )
 
         register("yahoo", YahooProvider)
+
         register("twelvedata", TwelveDataProvider, "TWELVEDATA_API_KEY")
+
         register("alphavantage", AlphaVantageProvider, "ALPHAVANTAGE_API_KEY")
 
     ############################################################
 
     @classmethod
     def _validate_interval(cls, interval):
+
         if interval not in cls.ALLOWED_INTERVALS:
             raise ValueError(f"Unsupported interval: {interval}")
 
@@ -133,6 +150,7 @@ class MarketProviderRouter:
             return True
 
         with self._lock:
+
             last_fail = self._provider_failures.get(name)
 
             if not last_fail:
@@ -149,8 +167,12 @@ class MarketProviderRouter:
             return
 
         with self._lock:
+
             self._provider_failures[name] = time.time()
+
             self._provider_stats[name]["failure"] += 1
+
+            self._provider_stats[name]["last_failure"] = time.time()
 
     ############################################################
     # RESPONSE VALIDATION
@@ -167,6 +189,7 @@ class MarketProviderRouter:
         missing = self.REQUIRED_COLUMNS - set(df.columns)
 
         if missing:
+
             raise RuntimeError(
                 f"Provider schema violation for {ticker}. Missing={missing}"
             )
@@ -174,11 +197,42 @@ class MarketProviderRouter:
         if len(df) == 0:
             raise RuntimeError(f"Empty dataset returned for {ticker}")
 
-        # OHLC integrity check
+        ########################################################
+        # NUMERIC COERCION
+        ########################################################
+
+        for col in ["open", "high", "low", "close", "volume"]:
+
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df.dropna(subset=["open", "high", "low", "close"])
+
+        ########################################################
+        # OHLC INTEGRITY
+        ########################################################
+
         if not ((df["high"] >= df["low"]).all()):
             raise RuntimeError(f"OHLC integrity violation for {ticker}")
 
-        return df
+        ########################################################
+        # EXTREME MOVE GUARD (Yahoo safety)
+        ########################################################
+
+        returns = df["close"].pct_change().abs()
+
+        if returns.dropna().max() > self.MAX_DAILY_MOVE:
+
+            logger.warning(
+                "Extreme price move detected for %s — clipping.",
+                ticker
+            )
+
+            df["close"] = df["close"].clip(
+                lower=df["close"].quantile(0.001),
+                upper=df["close"].quantile(0.999)
+            )
+
+        return df.reset_index(drop=True)
 
     ############################################################
     # PROVIDER EXECUTION
@@ -204,6 +258,7 @@ class MarketProviderRouter:
         )
 
         with semaphore_context:
+
             df = provider.fetch(
                 ticker,
                 start,
@@ -215,6 +270,7 @@ class MarketProviderRouter:
         latency = time.time() - start_time
 
         if latency > self.PROVIDER_TIMEOUT_WARN:
+
             logger.warning(
                 "Slow provider detected → %s (%.2fs)",
                 name,
@@ -224,8 +280,11 @@ class MarketProviderRouter:
         df = self._validate_response(df, ticker)
 
         with self._lock:
+
             stats = self._provider_stats[name]
+
             stats["success"] += 1
+
             stats["avg_latency"] = (
                 (stats["avg_latency"] * (stats["success"] - 1) + latency)
                 / stats["success"]
@@ -272,6 +331,7 @@ class MarketProviderRouter:
                         raise RuntimeError(f"Provider {name} in cooldown.")
 
                     try:
+
                         return self._execute_provider(
                             name,
                             provider_obj,
@@ -283,7 +343,9 @@ class MarketProviderRouter:
                         )
 
                     except Exception:
+
                         self._record_failure(name)
+
                         raise
 
             raise RuntimeError(f"Requested provider not available: {provider}")
@@ -298,6 +360,7 @@ class MarketProviderRouter:
                 continue
 
             try:
+
                 return self._execute_provider(
                     name,
                     provider_obj,
@@ -322,17 +385,19 @@ class MarketProviderRouter:
         raise RuntimeError(f"All market providers failed for {ticker}")
 
     ############################################################
-    # PROVIDER HEALTH SNAPSHOT (NEW)
+    # PROVIDER HEALTH SNAPSHOT
     ############################################################
 
     def provider_health(self):
 
         with self._lock:
+
             snapshot = {}
 
             for name, stats in self._provider_stats.items():
 
                 total = stats["success"] + stats["failure"]
+
                 failure_rate = (
                     stats["failure"] / total if total > 0 else 0.0
                 )
@@ -341,7 +406,8 @@ class MarketProviderRouter:
                     "success": stats["success"],
                     "failure": stats["failure"],
                     "failure_rate": round(failure_rate, 4),
-                    "avg_latency": round(stats["avg_latency"], 4)
+                    "avg_latency": round(stats["avg_latency"], 4),
+                    "last_failure": stats["last_failure"]
                 }
 
             return snapshot
