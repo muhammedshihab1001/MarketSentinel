@@ -1,10 +1,12 @@
 import json
-import tempfile
-import os
 import pytest
 
 from core.artifacts.metadata_manager import MetadataManager
 
+
+############################################################
+# VALID METADATA BUILDER
+############################################################
 
 def _build_valid_metadata():
 
@@ -28,26 +30,27 @@ def _build_valid_metadata():
     )
 
 
-# ======================================================
-# BASIC INTEGRITY
-# ======================================================
+############################################################
+# BASIC INTEGRITY ROUNDTRIP
+############################################################
 
-def test_metadata_integrity_roundtrip():
+def test_metadata_integrity_roundtrip(tmp_path):
 
     metadata = _build_valid_metadata()
 
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        MetadataManager.save_metadata(metadata, tmp.name)
-        loaded = MetadataManager.load_metadata(tmp.name)
+    path = tmp_path / "metadata.json"
+
+    MetadataManager.save_metadata(metadata, path)
+
+    loaded = MetadataManager.load_metadata(path)
 
     assert loaded["metadata_integrity_hash"] == metadata["metadata_integrity_hash"]
+    assert loaded["dataset_hash"] == metadata["dataset_hash"]
 
-    os.remove(tmp.name)
 
-
-# ======================================================
+############################################################
 # REQUIRED FIELDS PRESENT
-# ======================================================
+############################################################
 
 def test_metadata_required_fields_present():
 
@@ -66,35 +69,46 @@ def test_metadata_required_fields_present():
     assert required_keys.issubset(metadata.keys())
 
 
-# ======================================================
-# TAMPER DETECTION
-# ======================================================
+############################################################
+# JSON SERIALIZATION SAFETY
+############################################################
 
-def test_metadata_tamper_detection():
+def test_metadata_is_json_serializable():
 
     metadata = _build_valid_metadata()
 
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        MetadataManager.save_metadata(metadata, tmp.name)
+    payload = json.dumps(metadata)
 
-        # Tamper with file
-        with open(tmp.name, "r") as f:
-            payload = json.load(f)
-
-        payload["dataset_hash"] = "tampered"
-
-        with open(tmp.name, "w") as f:
-            json.dump(payload, f)
-
-        with pytest.raises(Exception):
-            MetadataManager.load_metadata(tmp.name)
-
-    os.remove(tmp.name)
+    assert isinstance(payload, str)
 
 
-# ======================================================
+############################################################
+# TAMPER DETECTION
+############################################################
+
+def test_metadata_tamper_detection(tmp_path):
+
+    metadata = _build_valid_metadata()
+
+    path = tmp_path / "metadata.json"
+
+    MetadataManager.save_metadata(metadata, path)
+
+    with open(path, "r") as f:
+        payload = json.load(f)
+
+    payload["dataset_hash"] = "tampered"
+
+    with open(path, "w") as f:
+        json.dump(payload, f)
+
+    with pytest.raises(Exception):
+        MetadataManager.load_metadata(path)
+
+
+############################################################
 # DETERMINISTIC HASH
-# ======================================================
+############################################################
 
 def test_metadata_integrity_hash_deterministic():
 
@@ -102,3 +116,17 @@ def test_metadata_integrity_hash_deterministic():
     m2 = _build_valid_metadata()
 
     assert m1["metadata_integrity_hash"] == m2["metadata_integrity_hash"]
+
+
+############################################################
+# HASH EXISTS AND LOOKS VALID
+############################################################
+
+def test_metadata_hash_format():
+
+    metadata = _build_valid_metadata()
+
+    hash_value = metadata["metadata_integrity_hash"]
+
+    assert isinstance(hash_value, str)
+    assert len(hash_value) >= 32
