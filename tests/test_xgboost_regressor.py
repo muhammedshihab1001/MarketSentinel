@@ -42,7 +42,6 @@ def test_training_and_checksums():
     assert model.best_iteration is not None
     assert model.training_fingerprint is not None
 
-    # Ensure feature names stored correctly
     assert list(model.feature_names) == list(X.columns)
 
 
@@ -106,7 +105,11 @@ def test_predict_nan_guard():
 
 def test_target_variance_guard():
 
-    X = pd.DataFrame(np.random.randn(200, 10))
+    X = pd.DataFrame(
+        np.random.randn(200, 10),
+        columns=[f"f{i}" for i in range(10)]
+    )
+
     y = np.ones(200)  # zero variance target
 
     model = SafeXGBRegressor()
@@ -121,13 +124,16 @@ def test_target_variance_guard():
 
 def test_low_dispersion_warning():
 
-    X = pd.DataFrame(np.random.randn(300, 8))
+    X = pd.DataFrame(
+        np.random.randn(300, 8),
+        columns=[f"f{i}" for i in range(8)]
+    )
+
     y = np.random.randn(300)
 
     model = SafeXGBRegressor()
     model.fit(X, y)
 
-    # Force identical inference features
     X_same = X.copy()
     X_same.iloc[:] = 0.5
 
