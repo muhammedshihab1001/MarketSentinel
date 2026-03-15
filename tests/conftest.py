@@ -24,9 +24,16 @@ if PROJECT_ROOT not in sys.path:
 
 @pytest.fixture(autouse=True)
 def set_test_seeds():
+
     np.random.seed(42)
     random.seed(42)
+
     os.environ["PYTHONHASHSEED"] = "42"
+
+    # Prevent hidden nondeterminism
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 
 # ---------------------------------------------------
@@ -36,14 +43,34 @@ def set_test_seeds():
 @pytest.fixture(autouse=True)
 def test_environment(monkeypatch):
 
+    # Disable Redis
     monkeypatch.setenv("REDIS_HOST", "invalid-host")
+    monkeypatch.setenv("REDIS_PORT", "6379")
+
+    # Disable LLM
+    monkeypatch.setenv("LLM_ENABLED", "false")
+
+    # Disable strict drift failure
+    monkeypatch.setenv("DRIFT_HARD_FAIL", "false")
+
+    # Prevent heavy inference
     monkeypatch.setenv("MAX_CONCURRENT_INFERENCES", "2")
     monkeypatch.setenv("MAX_BATCH_SIZE", "3")
-    monkeypatch.setenv("MARKETSENTINEL_TEST_MODE", "1")
-    monkeypatch.setenv("LLM_ENABLED", "false")
-    monkeypatch.setenv("DRIFT_HARD_FAIL", "false")
+
+    # Reduce cache TTL
     monkeypatch.setenv("CACHE_TTL_SECONDS", "30")
-    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+
+    # Prevent GPU usage in CI
+    monkeypatch.setenv("XGB_USE_GPU", "false")
+
+    # Prevent model governance strict failures
+    monkeypatch.setenv("MODEL_STRICT_GOVERNANCE", "0")
+
+    # Ensure fallback allowed
+    monkeypatch.setenv("MODEL_ALLOW_POINTER_FALLBACK", "1")
+
+    # Mark test mode globally
+    monkeypatch.setenv("MARKETSENTINEL_TEST_MODE", "1")
 
 
 # ---------------------------------------------------
@@ -59,39 +86,63 @@ def isolated_artifacts(tmp_path, monkeypatch):
     artifacts_dir.mkdir()
     data_dir.mkdir()
 
+    # Redirect project artifact paths
     monkeypatch.setenv("ARTIFACTS_DIR", str(artifacts_dir))
     monkeypatch.setenv("DATA_DIR", str(data_dir))
+
+    # Prevent model loader from touching real registry
+    monkeypatch.setenv("XGB_REGISTRY_DIR", str(artifacts_dir / "xgboost"))
 
     return tmp_path
 
 
 # ---------------------------------------------------
-# SAFE NETWORK BLOCK (ALLOW LOCAL EVENT LOOP)
+# SAFE NETWORK BLOCK
 # ---------------------------------------------------
 
 @pytest.fixture(autouse=True)
 def disable_external_network(monkeypatch):
     """
-    Block external network access but allow:
+    Block external network access while allowing:
     - localhost
-    - internal socketpair (asyncio)
+    - internal event loops
     """
 
     original_socket = socket.socket
 
     def guarded_socket(*args, **kwargs):
 
-        # Allow internal event loop sockets
-        if args and args[0] in (socket.AF_INET, socket.AF_INET6):
-            return original_socket(*args, **kwargs)
+        sock = original_socket(*args, **kwargs)
 
-        # Allow socketpair internally
-        if hasattr(socket, "socketpair"):
-            try:
-                return original_socket(*args, **kwargs)
-            except Exception:
-                pass
+        original_connect = sock.connect
 
-        raise RuntimeError("External network access disabled in test mode")
+        def guarded_connect(address):
+
+            host = address[0]
+
+            # allow localhost
+            if host in ("127.0.0.1", "localhost"):
+                return original_connect(address)
+
+            raise RuntimeError(
+                "External network access disabled in test mode"
+            )
+
+        sock.connect = guarded_connect
+
+        return sock
 
     monkeypatch.setattr(socket, "socket", guarded_socket)
+
+
+# ---------------------------------------------------
+# PYTEST GLOBAL CONFIG
+# ---------------------------------------------------
+
+def pytest_configure(config):
+    """
+    Global pytest configuration for MarketSentinel tests.
+    Ensures test mode is always enabled.
+    """
+
+    os.environ["MARKETSENTINEL_TEST_MODE"] = "1"
