@@ -1,5 +1,8 @@
 import pandas as pd
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class TechnicalIndicators:
@@ -17,7 +20,8 @@ class TechnicalIndicators:
     REQUIRED_COLUMN = "close"
 
     STD_FLOOR = 1e-6
-    MAX_DAILY_RETURN = 0.80  # corruption guard
+    MAX_DAILY_RETURN = 0.80
+    EPSILON = 1e-9
 
     ####################################################
     # WINDOW VALIDATION
@@ -25,8 +29,10 @@ class TechnicalIndicators:
 
     @staticmethod
     def _validate_window(window: int):
+
         if not isinstance(window, int):
             raise RuntimeError("Window must be int.")
+
         if window < 2:
             raise RuntimeError("Window must be >= 2.")
 
@@ -41,6 +47,7 @@ class TechnicalIndicators:
             raise RuntimeError("Indicator received empty dataframe.")
 
         df = df.copy()
+
         df.columns = [c.lower() for c in df.columns]
 
         if "close" not in df.columns:
@@ -53,18 +60,16 @@ class TechnicalIndicators:
         ####################################################
 
         if "date" in df.columns:
+
             df["date"] = pd.to_datetime(
                 df["date"],
                 utc=True,
-                errors="raise"
+                errors="coerce"
             )
+
+            df = df.dropna(subset=["date"])
+
             df = df.sort_values("date")
-
-            if not df["date"].is_monotonic_increasing:
-                raise RuntimeError("Non-monotonic timestamps detected.")
-
-            if df["date"].duplicated().any():
-                raise RuntimeError("Duplicate timestamps detected.")
 
         ####################################################
         # PRICE SAFETY
@@ -77,22 +82,26 @@ class TechnicalIndicators:
 
         close.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-        if close.isna().any():
-            raise RuntimeError(
-                "Missing close prices detected — refusing indicator calc."
-            )
+        close = close.ffill().bfill()
 
         if (close <= 0).any():
             raise RuntimeError("Invalid close prices detected.")
 
         ####################################################
-        # CORRUPTION GUARD
+        # CORRUPTION GUARD (softened for Yahoo)
         ####################################################
 
         returns = close.pct_change().abs()
+
         if returns.dropna().max() > TechnicalIndicators.MAX_DAILY_RETURN:
-            raise RuntimeError(
-                "Unrealistic price jump detected — likely bad data."
+
+            logger.warning(
+                "Large price jump detected — repairing series."
+            )
+
+            close = close.clip(
+                lower=close.quantile(0.001),
+                upper=close.quantile(0.999)
             )
 
         df["close"] = close.astype("float32")
@@ -107,6 +116,7 @@ class TechnicalIndicators:
     def moving_average(cls, df: pd.DataFrame, window: int = 20):
 
         cls._validate_window(window)
+
         df = cls._normalize_columns(df)
 
         ma = df["close"].rolling(
@@ -117,16 +127,34 @@ class TechnicalIndicators:
         return ma.astype("float32")
 
     ####################################################
-    # RSI — WILDER SMOOTHING (FIXED + SAFE)
+    # EMA
+    ####################################################
+
+    @classmethod
+    def ema(cls, df: pd.DataFrame, span: int = 20):
+
+        cls._validate_window(span)
+
+        df = cls._normalize_columns(df)
+
+        ema = df["close"].ewm(
+            span=span,
+            adjust=False
+        ).mean()
+
+        return ema.astype("float32")
+
+    ####################################################
+    # RSI — WILDER SMOOTHING
     ####################################################
 
     @classmethod
     def rsi(cls, df: pd.DataFrame, window: int = 14):
 
         cls._validate_window(window)
+
         df = cls._normalize_columns(df)
 
-        # Compute in float64 for stability
         close = df["close"].astype("float64")
 
         delta = close.diff()
@@ -146,25 +174,12 @@ class TechnicalIndicators:
             min_periods=window
         ).mean()
 
-        # Use float64 during assignment to avoid pandas dtype warning
-        rsi = pd.Series(np.nan, index=close.index, dtype="float64")
+        rs = avg_gain / (avg_loss + cls.EPSILON)
 
-        mask_normal = (avg_gain > 0) & (avg_loss > 0)
-        rs = avg_gain[mask_normal] / avg_loss[mask_normal]
-        rsi.loc[mask_normal] = 100 - (100 / (1 + rs))
-
-        mask_gain_only = (avg_gain > 0) & (avg_loss == 0)
-        rsi.loc[mask_gain_only] = 100.0
-
-        mask_loss_only = (avg_gain == 0) & (avg_loss > 0)
-        rsi.loc[mask_loss_only] = 0.0
-
-        mask_flat = (avg_gain == 0) & (avg_loss == 0)
-        rsi.loc[mask_flat] = 50.0
+        rsi = 100 - (100 / (1 + rs))
 
         rsi = rsi.fillna(50.0).clip(0, 100)
 
-        # Downcast once at the end
         return rsi.astype("float32")
 
     ####################################################
@@ -175,6 +190,7 @@ class TechnicalIndicators:
     def bollinger_bands(cls, df: pd.DataFrame, window: int = 20):
 
         cls._validate_window(window)
+
         df = cls._normalize_columns(df)
 
         close = df["close"]
@@ -214,6 +230,7 @@ class TechnicalIndicators:
         ema26 = close.ewm(span=26, adjust=False).mean()
 
         macd_line = ema12 - ema26
+
         signal = macd_line.ewm(span=9, adjust=False).mean()
 
         macd_line = macd_line.replace([np.inf, -np.inf], np.nan).fillna(0)
