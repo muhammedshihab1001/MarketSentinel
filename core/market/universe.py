@@ -1,5 +1,5 @@
 # =========================================================
-# MARKET UNIVERSE CONTROLLER v2.0
+# MARKET UNIVERSE CONTROLLER v2.1
 # Hybrid Multi-Agent Compatible | CV-Optimized
 # =========================================================
 
@@ -35,6 +35,8 @@ class MarketUniverse:
     # CONFIG
     # -----------------------------------------------------
 
+    CONTROLLER_VERSION = "2.1"
+
     PRODUCTION_FILE = os.getenv(
         "UNIVERSE_PATH",
         "config/universe.json"
@@ -46,6 +48,8 @@ class MarketUniverse:
     )
 
     REQUIRED_SIZE = int(os.getenv("UNIVERSE_MIN_SIZE", "20"))
+    MAX_UNIVERSE_SIZE = int(os.getenv("UNIVERSE_MAX_SIZE", "200"))
+
     MIN_FILE_BYTES = 50
 
     ALLOW_RESEARCH_OVERRIDE = os.getenv(
@@ -57,6 +61,7 @@ class MarketUniverse:
 
     _CACHE: Optional[Dict] = None
     _LOCK = threading.RLock()
+
     _FILE_HASH: Optional[str] = None
     _LAST_VERSION: Optional[str] = None
     _LAST_LOADED_AT: Optional[str] = None
@@ -67,8 +72,10 @@ class MarketUniverse:
 
     @staticmethod
     def _parse_version(version: str):
+
         try:
             return tuple(int(x) for x in version.split("."))
+
         except Exception:
             return (0,)
 
@@ -78,8 +85,10 @@ class MarketUniverse:
 
     @classmethod
     def _active_file(cls) -> str:
+
         if cls.ALLOW_RESEARCH_OVERRIDE and Path(cls.RESEARCH_FILE).exists():
             return cls.RESEARCH_FILE
+
         return cls.PRODUCTION_FILE
 
     # -----------------------------------------------------
@@ -89,10 +98,12 @@ class MarketUniverse:
     @classmethod
     def _hash_file(cls):
 
-        path = cls._active_file()
+        path = Path(cls._active_file())
+
         h = hashlib.sha256()
 
         with open(path, "rb") as f:
+
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
 
@@ -114,6 +125,7 @@ class MarketUniverse:
         }
 
         missing = required - set(payload.keys())
+
         if missing:
             raise RuntimeError(f"Universe config missing fields: {missing}")
 
@@ -122,7 +134,6 @@ class MarketUniverse:
         tickers = payload["tickers"]
         min_history_days = payload["min_history_days"]
 
-        # Validate timestamp (soft)
         try:
             datetime.fromisoformat(created_utc.replace("Z", "+00:00"))
         except Exception:
@@ -134,16 +145,21 @@ class MarketUniverse:
         if not isinstance(tickers, list):
             raise RuntimeError("Universe tickers must be list.")
 
-        # Soft enforcement of minimum size
         if not cls.ALLOW_RESEARCH_OVERRIDE:
             if len(tickers) < cls.REQUIRED_SIZE:
                 raise RuntimeError(
                     f"Production universe must contain at least {cls.REQUIRED_SIZE} tickers."
                 )
 
+        if len(tickers) > cls.MAX_UNIVERSE_SIZE:
+            raise RuntimeError(
+                f"Universe exceeds max allowed size ({cls.MAX_UNIVERSE_SIZE})."
+            )
+
         parsed_version = cls._parse_version(version)
 
         if cls._LAST_VERSION:
+
             if parsed_version < cls._parse_version(cls._LAST_VERSION):
                 raise RuntimeError("Universe version downgrade detected.")
 
@@ -213,7 +229,9 @@ class MarketUniverse:
             with cls._LOCK:
 
                 if cls._CACHE is None or cls._FILE_HASH != current_hash:
+
                     cls._CACHE = cls._load_file()
+
                     cls._FILE_HASH = current_hash
 
         return cls._CACHE
@@ -232,7 +250,9 @@ class MarketUniverse:
 
     @classmethod
     def filter_valid(cls, tickers: List[str]) -> List[str]:
+
         universe_set = cls._get_cached()["ticker_set"]
+
         return sorted(set(
             t.upper().strip()
             for t in tickers
@@ -282,6 +302,7 @@ class MarketUniverse:
         cache = cls._get_cached()
 
         return {
+            "controller_version": cls.CONTROLLER_VERSION,
             "universe_version": cache["version"],
             "created_utc": cache["created_utc"],
             "description": cache["description"],
@@ -290,7 +311,7 @@ class MarketUniverse:
             "universe_size": len(cache["tickers"]),
             "file_path": cache["file_path"],
             "file_hash": cls._FILE_HASH,
-            "last_loaded_utc": cls._LAST_LOADED_AT,
+            "loaded_at": cls._LAST_LOADED_AT,
             "research_mode": cls.ALLOW_RESEARCH_OVERRIDE,
             "tickers": list(cache["tickers"])
         }
