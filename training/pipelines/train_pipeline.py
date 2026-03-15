@@ -1,5 +1,5 @@
 # ==========================================================
-# INSTITUTIONAL TRAINING PIPELINE WRAPPER
+# INSTITUTIONAL TRAINING PIPELINE WRAPPER v2.3
 # Governance Hardened + Hybrid Multi-Agent Compatible
 # ==========================================================
 
@@ -45,6 +45,7 @@ STRICT_GOVERNANCE = os.getenv("TRAINING_STRICT_GOVERNANCE", "1") == "1"
 # ==========================================================
 
 def enforce_determinism():
+
     os.environ["PYTHONHASHSEED"] = str(GLOBAL_SEED)
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
@@ -60,16 +61,26 @@ def enforce_determinism():
 # ==========================================================
 
 def _acquire_lock():
+
     os.makedirs(RUNS_DIR, exist_ok=True)
 
     if os.path.exists(LOCK_FILE):
+
+        try:
+            with open(LOCK_FILE) as f:
+                pid = int(f.read().strip())
+        except Exception:
+            pid = None
+
         age = time.time() - os.path.getmtime(LOCK_FILE)
+
         if age > 4 * 3600:
-            logger.warning("Stale lock detected — removing.")
+            logger.warning("Stale training lock detected — removing.")
             os.remove(LOCK_FILE)
+
         else:
             raise RuntimeError(
-                "Training lock detected — another training may be running."
+                f"Training lock detected (pid={pid}) — another training may be running."
             )
 
     with open(LOCK_FILE, "w") as f:
@@ -77,8 +88,12 @@ def _acquire_lock():
 
 
 def _release_lock():
+
     if os.path.exists(LOCK_FILE):
-        os.remove(LOCK_FILE)
+        try:
+            os.remove(LOCK_FILE)
+        except Exception:
+            logger.warning("Failed to remove training lock.")
 
 
 # ==========================================================
@@ -88,27 +103,31 @@ def _release_lock():
 def get_git_commit():
 
     if not os.path.exists(".git"):
-        logger.warning("No .git directory — container mode.")
+        logger.info("Git repository not present (container mode).")
         return "NO_GIT"
 
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain"],
-        capture_output=True,
-        text=True
-    ).stdout.strip()
-
-    if dirty and STRICT_GOVERNANCE:
-        raise RuntimeError(
-            "Repository is dirty — commit ALL changes before training."
-        )
-
     try:
+
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True
+        ).stdout.strip()
+
+        if dirty and STRICT_GOVERNANCE:
+            raise RuntimeError(
+                "Repository is dirty — commit ALL changes before training."
+            )
+
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             stderr=subprocess.DEVNULL
         ).decode().strip()
+
         return commit
+
     except Exception:
+        logger.warning("Git commit unavailable.")
         return "GIT_UNAVAILABLE"
 
 
@@ -129,6 +148,7 @@ def build_environment_fingerprint():
     }
 
     canonical = json.dumps(payload, sort_keys=True).encode()
+
     return hashlib.sha256(canonical).hexdigest()
 
 
@@ -171,6 +191,7 @@ def build_lineage(start_date, end_date):
 def save_manifest(run_id: str, manifest: dict):
 
     os.makedirs(RUNS_DIR, exist_ok=True)
+
     final_path = os.path.join(RUNS_DIR, f"{run_id}.json")
 
     manifest["manifest_hash"] = hashlib.sha256(
@@ -188,6 +209,7 @@ def save_manifest(run_id: str, manifest: dict):
         json.dump(manifest, tmp, indent=4, sort_keys=True)
         tmp.flush()
         os.fsync(tmp.fileno())
+
         temp_name = tmp.name
 
     os.replace(temp_name, final_path)
@@ -201,6 +223,7 @@ def main(create_baseline=False, promote_baseline=False):
 
     init_env()
     enforce_determinism()
+
     _acquire_lock()
 
     today = MarketTime.today().isoformat()
@@ -209,13 +232,13 @@ def main(create_baseline=False, promote_baseline=False):
     start_date, end_date = MarketTime.window_for("xgboost")
 
     logger.info(
-        "Pipeline training window | %s -> %s",
+        "Training window | %s -> %s",
         start_date,
         end_date
     )
 
-    # 🔒 Validate schema before training
     current_schema = get_schema_signature()
+
     if not current_schema:
         raise RuntimeError("Schema signature invalid.")
 
@@ -235,7 +258,7 @@ def main(create_baseline=False, promote_baseline=False):
             promote_baseline=promote_baseline
         )
 
-        runtime = time.time() - start
+        runtime = max(0.0, time.time() - start)
 
         if runtime > MAX_TRAINING_SECONDS:
             raise RuntimeError("Training exceeded allowed duration.")
@@ -251,7 +274,7 @@ def main(create_baseline=False, promote_baseline=False):
 
         save_manifest(run_id, manifest)
 
-        logger.info("Training completed successfully.")
+        logger.info("Training pipeline finished successfully.")
 
     except Exception as exc:
 
@@ -262,21 +285,24 @@ def main(create_baseline=False, promote_baseline=False):
             "status": "failed",
             "error": str(exc),
             "error_type": type(exc).__name__,
-            "runtime_sec": round(time.time() - start, 2),
+            "runtime_sec": round(max(0.0, time.time() - start), 2),
             "lineage": build_lineage(start_date, end_date),
             "created_utc": datetime.datetime.utcnow().isoformat()
         }
 
         save_manifest(run_id, manifest)
+
         raise
 
     finally:
+
         _release_lock()
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--create-baseline", action="store_true")
     parser.add_argument("--promote-baseline", action="store_true")
 
