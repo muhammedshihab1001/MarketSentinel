@@ -11,6 +11,8 @@ from core.schema.feature_schema import MODEL_FEATURES
 
 def sample_data(n_days=300):
 
+    np.random.seed(42)
+
     dates = pd.date_range("2022-01-01", periods=n_days, tz="UTC")
 
     df = pd.DataFrame({
@@ -37,6 +39,7 @@ def test_pipeline_produces_model_features():
         training=True
     )
 
+    # ensure all model features exist
     assert set(MODEL_FEATURES).issubset(df.columns)
 
 
@@ -54,13 +57,13 @@ def test_cross_sectional_features_present():
         training=True
     )
 
-    expected_cs = [
+    expected = [
         "market_dispersion",
         "breadth",
         "regime_feature"
     ]
 
-    for col in expected_cs:
+    for col in expected:
         assert col in df.columns
 
 
@@ -81,6 +84,25 @@ def test_zscore_features_exist():
     z_cols = [c for c in df.columns if c.endswith("_z")]
 
     assert len(z_cols) > 0
+
+
+############################################################
+# RANK FEATURES GENERATED
+############################################################
+
+def test_rank_features_exist():
+
+    price_df = sample_data()
+
+    df = FeatureEngineer.build_feature_pipeline(
+        price_df,
+        sentiment_df=None,
+        training=True
+    )
+
+    rank_cols = [c for c in df.columns if c.endswith("_rank")]
+
+    assert len(rank_cols) > 0
 
 
 ############################################################
@@ -115,6 +137,7 @@ def test_no_infinite_values():
     )
 
     numeric = df.select_dtypes(include=[np.number])
+
     assert np.isfinite(numeric.to_numpy()).all()
 
 
@@ -132,11 +155,11 @@ def test_datetime_normalization():
         training=True
     )
 
-    assert df["date"].dtype == "datetime64[ns]"
+    assert str(df["date"].dtype) == "datetime64[ns]"
 
 
 ############################################################
-# ORDER STABILITY FOR MODEL FEATURES
+# MODEL FEATURE ORDER STABILITY
 ############################################################
 
 def test_model_feature_order_stable():
@@ -152,3 +175,24 @@ def test_model_feature_order_stable():
     selected = list(df.loc[:, MODEL_FEATURES].columns)
 
     assert selected == list(MODEL_FEATURES)
+
+
+############################################################
+# BASIC DATA ROBUSTNESS (YFINANCE STYLE NOISY DATA)
+############################################################
+
+def test_pipeline_handles_noisy_data():
+
+    price_df = sample_data()
+
+    # introduce noise
+    price_df.loc[10:20, "close"] = np.nan
+    price_df.loc[30:40, "volume"] = 0
+
+    df = FeatureEngineer.build_feature_pipeline(
+        price_df,
+        sentiment_df=None,
+        training=True
+    )
+
+    assert len(df) > 0
