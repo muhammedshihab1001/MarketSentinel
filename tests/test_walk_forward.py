@@ -22,7 +22,7 @@ def dummy_trainer(train_df):
 
 def build_synthetic_dataset():
 
-    np.random.seed(42)
+    rng = np.random.default_rng(42)
 
     dates = pd.date_range("2026-01-01", periods=500)
     tickers = [f"T{i}" for i in range(15)]  # >= MIN_CS_WIDTH
@@ -35,19 +35,21 @@ def build_synthetic_dataset():
             row = {
                 "date": d,
                 "ticker": t,
-                # Simulated Yahoo-style noisy price
-                "close": 100 + np.random.randn() * 0.5 + (d.day * 0.01),
-                "volatility": abs(np.random.randn()) + 0.2
+                "close": 100 + rng.normal(0, 0.5) + (d.day * 0.01),
+                "volatility": abs(rng.normal()) + 0.2,
+                "regime": "SIDEWAYS",
+                "market_regime": "SIDEWAYS",
+                "regime_multiplier": 1.0
             }
 
             for col in MODEL_FEATURES:
-                row[col] = np.random.randn()
+                row[col] = rng.normal()
 
             rows.append(row)
 
     df = pd.DataFrame(rows)
 
-    # Ensure schema compliance + correct dtype
+    # Ensure schema compliance + dtype
     feature_block = validate_feature_schema(
         df.loc[:, MODEL_FEATURES],
         mode="training"
@@ -86,13 +88,29 @@ def test_walkforward_runs_end_to_end():
     assert np.isfinite(metrics["final_equity"])
     assert metrics["profit_factor"] >= 0
 
-    # Drawdown sanity (Yahoo-safe)
+    # Drawdown sanity
     assert metrics["max_drawdown"] <= 0
     assert metrics["max_drawdown"] >= -1.0
 
     # Turnover sanity
     assert metrics["avg_turnover"] >= 0
     assert metrics["avg_trades_per_window"] >= 1
+
+    # Ensure output keys exist
+    required = {
+        "avg_strategy_return",
+        "avg_sharpe",
+        "profit_factor",
+        "max_drawdown",
+        "return_volatility",
+        "final_equity",
+        "avg_turnover",
+        "avg_win_rate",
+        "avg_trades_per_window",
+        "num_windows",
+    }
+
+    assert required.issubset(metrics.keys())
 
 
 def test_walkforward_is_deterministic():
@@ -116,3 +134,4 @@ def test_walkforward_is_deterministic():
 
     assert metrics1["avg_sharpe"] == metrics2["avg_sharpe"]
     assert metrics1["final_equity"] == metrics2["final_equity"]
+    assert metrics1["profit_factor"] == metrics2["profit_factor"]
