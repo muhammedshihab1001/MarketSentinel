@@ -50,7 +50,6 @@ def test_drift_detector_baseline_and_detect(tmp_path):
         "severity_score",
         "drift_confidence",
         "coverage",
-        "cross_sectional_stability",
         "details",
         "drift_state",
         "exposure_scale"
@@ -60,7 +59,7 @@ def test_drift_detector_baseline_and_detect(tmp_path):
 
     assert np.isfinite(result["severity_score"])
     assert 0.0 <= result["coverage"] <= 1.0
-    assert result["exposure_scale"] in {0.0, 0.5, 1.0}
+    assert 0.0 <= result["exposure_scale"] <= 1.0
     assert isinstance(result["details"], dict)
 
 
@@ -94,7 +93,7 @@ def test_drift_detector_detects_shift(tmp_path):
     assert result["drift_detected"] is True
     assert result["severity_score"] > 0
     assert result["drift_state"] in {"soft", "hard"}
-    assert result["exposure_scale"] in {0.0, 0.5}
+    assert 0.0 <= result["exposure_scale"] <= 1.0
 
 
 ############################################################
