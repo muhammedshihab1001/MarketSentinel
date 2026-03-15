@@ -17,7 +17,6 @@ import inspect
 
 from core.config.env_loader import init_env
 from core.data.market_data_service import MarketDataService
-from core.features.feature_store import FeatureStore
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import (
     MODEL_FEATURES,
@@ -234,60 +233,84 @@ def export_artifacts(model,
 # ==========================================================
 
 def load_training_data(start_date, end_date):
+    """
+    Fetch price data for all universe tickers, concatenate,
+    then run the full feature pipeline ONCE on the combined
+    dataset so cross-sectional features compute correctly.
+
+    Previous bug: per-ticker FeatureStore.get_features() called
+    add_cross_sectional_features() with only 1 ticker per date,
+    which always fell below MIN_CS_WIDTH → empty DataFrames.
+    """
 
     market_data = MarketDataService()
-    store = FeatureStore()
     universe = MarketUniverse.get_universe()
 
-    datasets = []
+    # ── Step 1: Fetch raw price data per ticker ──────────────────────────
+    price_frames = []
+    fetch_failures = []
 
     for ticker in universe:
-
         try:
-
             price_df = market_data.get_price_data(
                 ticker=ticker,
                 start_date=start_date,
-                end_date=end_date
+                end_date=end_date,
+            )
+            if price_df is not None and not price_df.empty:
+                price_frames.append(price_df)
+        except Exception as exc:
+            fetch_failures.append(ticker)
+            logger.warning(
+                "Ticker failed during price fetch: %s | %s", ticker, exc
             )
 
-            if price_df is None or price_df.empty:
-                continue
+    if not price_frames:
+        raise RuntimeError(
+            f"All {len(universe)} tickers failed during price fetch."
+        )
 
-            dataset = store.get_features(
-                price_df,
-                sentiment_df=None,
-                ticker=ticker,
-                training=True
-            )
+    if fetch_failures:
+        logger.warning(
+            "Price fetch failed for %d/%d tickers: %s",
+            len(fetch_failures), len(universe), fetch_failures,
+        )
 
-            if dataset is not None and not dataset.empty:
-                datasets.append(dataset)
+    # ── Step 2: Concatenate all tickers ──────────────────────────────────
+    combined_prices = pd.concat(price_frames, ignore_index=True)
 
-        except Exception:
-            logger.warning("Ticker failed during training data load: %s", ticker)
+    if len(combined_prices) > MAX_DATASET_ROWS:
+        logger.warning("Dataset very large — trimming to %d rows", MAX_DATASET_ROWS)
+        combined_prices = combined_prices.sort_values(
+            ["date", "ticker"]
+        ).tail(MAX_DATASET_ROWS)
 
-    if not datasets:
-        raise RuntimeError("All tickers failed.")
+    # ── Step 3: Run full feature pipeline on combined data ───────────────
+    #    This correctly computes core features per-ticker AND
+    #    cross-sectional features across all tickers per date.
+    df = FeatureEngineer.build_feature_pipeline(
+        combined_prices, training=True
+    )
 
-    df = pd.concat(datasets, ignore_index=True)
-
-    if len(df) > MAX_DATASET_ROWS:
-        logger.warning("Dataset very large — trimming")
-        df = df.tail(MAX_DATASET_ROWS)
-
+    # ── Step 4: Validate ─────────────────────────────────────────────────
     if len(df) < MIN_TRAINING_ROWS:
-        raise RuntimeError("Dataset too small.")
+        raise RuntimeError(
+            f"Dataset too small after feature engineering: "
+            f"{len(df)} rows, need {MIN_TRAINING_ROWS}."
+        )
 
     if df["date"].nunique() < MIN_UNIQUE_DATES:
-        raise RuntimeError("Insufficient unique dates.")
-
-    df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
-    df = FeatureEngineer.add_cross_sectional_features(df)
-    df = FeatureEngineer.finalize(df)
+        raise RuntimeError(
+            f"Insufficient unique dates: "
+            f"{df['date'].nunique()}, need {MIN_UNIQUE_DATES}."
+        )
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="training")
+
+    logger.info(
+        "Training data loaded | rows=%d tickers=%d dates=%d",
+        len(df), df["ticker"].nunique(), df["date"].nunique(),
+    )
 
     return df
 
