@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from core.indicators.technical_indicators import TechnicalIndicators
-from core.schema.feature_schema import MODEL_FEATURES
+from core.schema.feature_schema import BASE_CS_COLS, MODEL_FEATURES
 
 logger = logging.getLogger(__name__)
 
@@ -42,23 +42,9 @@ class FeatureEngineer:
     VAR_FLOOR    = 1e-6
 
     # ── Columns to include in cross-sectional z-scoring ───────────────────────
-    # Explicit whitelist — avoids z-scoring internal/admin columns
-    CS_FEATURE_COLS = [
-        "return",
-        "return_lag1",
-        "return_lag5",
-        "momentum_20",
-        "momentum_60",
-        "momentum_composite",
-        "mom_vol_adj",
-        "volatility",
-        "volume_momentum",
-        "dollar_volume",
-        "rsi",
-        "ema_ratio",
-        "dist_from_52w_high",
-        "regime_feature",
-    ]
+    # Must match BASE_CS_COLS from feature_schema exactly so that all
+    # expected _z and _rank columns are produced.
+    CS_FEATURE_COLS = list(BASE_CS_COLS)
 
     # ────────────────────────────────────────────────────────────────────────
     # DATETIME NORMALISATION  (UTC-aware — no timezone stripping)
@@ -193,6 +179,20 @@ class FeatureEngineer:
             df["momentum_composite"] / (df["volatility"] + cls.EPSILON)
         ).clip(-5, 5)
 
+        # ── Volatility of Volatility ──────────────────────────────────────────
+        df["vol_of_vol"] = (
+            df.groupby("ticker")["volatility"]
+            .transform(lambda x: x.rolling(20, min_periods=10).std(ddof=0))
+            .shift(1)
+        ).fillna(0).clip(0, 1)
+
+        # ── Return Skewness ───────────────────────────────────────────────────
+        df["return_skew_20"] = (
+            df.groupby("ticker")["return"]
+            .transform(lambda x: x.rolling(20, min_periods=10).skew())
+            .shift(1)
+        ).fillna(0).clip(-3, 3)
+
         # ── Liquidity ─────────────────────────────────────────────────────────
         df["volume"] = df["volume"].clip(lower=cls.MIN_VOLUME)
         df["volume_mean_20"] = (
@@ -204,6 +204,19 @@ class FeatureEngineer:
             df["volume"] / (df["volume_mean_20"] + cls.EPSILON)
         ).clip(0, 5)
         df["dollar_volume"] = df["close"] * df["volume"]
+
+        # ── Amihud Illiquidity ────────────────────────────────────────────────
+        # Amihud = mean(|return| / dollar_volume) over rolling window
+        # Higher values = less liquid
+        abs_ret = df["return"].abs()
+        daily_illiq = abs_ret / (df["dollar_volume"] + cls.EPSILON)
+        df["amihud"] = (
+            daily_illiq.groupby(df["ticker"])
+            .transform(lambda x: x.rolling(20, min_periods=5).mean())
+            .shift(1)
+        ).fillna(0)
+        # Log-scale to compress extreme values (penny stocks)
+        df["amihud"] = np.log1p(df["amihud"] * 1e6).clip(0, 20)
 
         # ── RSI ───────────────────────────────────────────────────────────────
         df["rsi"] = 50.0   # safe default
@@ -277,8 +290,9 @@ class FeatureEngineer:
         """
         Compute cross-sectional z-scores and percentile ranks.
 
-        Only processes CS_FEATURE_COLS (explicit whitelist) to avoid
-        z-scoring internal columns like __dataset_hash or volume.
+        Only processes CS_FEATURE_COLS (derived from BASE_CS_COLS in
+        feature_schema) to ensure all expected _z and _rank columns
+        are produced.
         """
         df = df.sort_values(["date", "ticker"]).copy()
 
@@ -307,6 +321,13 @@ class FeatureEngineer:
         cols_to_process = [
             c for c in cls.CS_FEATURE_COLS if c in df.columns
         ]
+
+        missing_cs = [c for c in cls.CS_FEATURE_COLS if c not in df.columns]
+        if missing_cs:
+            logger.warning(
+                "CS columns missing from DataFrame (will not get _z/_rank): %s",
+                missing_cs,
+            )
 
         for col in cols_to_process:
             # Winsorise at 1st/99th percentile per date
@@ -358,7 +379,7 @@ class FeatureEngineer:
 
         # Ensure all expected model features exist
         missing_features = set(MODEL_FEATURES) - set(df.columns)
-        for col in missing_features:
+        for col in sorted(missing_features):
             logger.warning(
                 "MODEL_FEATURES column '%s' missing — filling with 0.0.", col
             )
