@@ -10,6 +10,7 @@ from core.indicators.technical_indicators import TechnicalIndicators
 ############################################################
 
 def build_df(prices):
+
     return pd.DataFrame({
         "date": pd.date_range("2022-01-01", periods=len(prices)),
         "close": prices
@@ -26,6 +27,7 @@ def test_rsi_runs_without_crashing():
 
     rsi = TechnicalIndicators.rsi(df, period=14)
 
+    assert isinstance(rsi, pd.Series)
     assert len(rsi) == len(df)
 
 
@@ -35,7 +37,9 @@ def test_rsi_runs_without_crashing():
 
 def test_rsi_bounds():
 
-    df = build_df(np.random.uniform(90, 110, 200))
+    rng = np.random.default_rng(42)
+
+    df = build_df(rng.uniform(90, 110, 200))
 
     rsi = TechnicalIndicators.rsi(df, period=14).dropna()
 
@@ -93,6 +97,19 @@ def test_rsi_no_all_nan():
     rsi = TechnicalIndicators.rsi(df, period=14)
 
     assert not rsi.isnull().all()
+
+
+############################################################
+# SHORT SERIES SAFETY
+############################################################
+
+def test_rsi_short_series():
+
+    df = build_df(np.linspace(100, 105, 10))
+
+    rsi = TechnicalIndicators.rsi(df, period=14)
+
+    assert len(rsi) == len(df)
 
 
 ############################################################
