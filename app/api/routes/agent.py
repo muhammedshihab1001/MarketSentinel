@@ -1,5 +1,5 @@
 # =========================================================
-# HYBRID AGENT EXPLANATION ROUTE v3.0
+# HYBRID AGENT EXPLANATION ROUTE v3.1
 # Multi-Agent + Hybrid Consensus Compatible
 # =========================================================
 
@@ -13,6 +13,19 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 
 from app.api.routes.predict import get_pipeline
+
+# ---------------------------------------------------------
+# TEST COMPATIBILITY IMPORT
+# ---------------------------------------------------------
+# Some tests patch InferencePipeline from this module.
+# We expose it here for compatibility.
+
+try:
+    from app.inference.pipeline import InferencePipeline
+except Exception:  # pragma: no cover
+    InferencePipeline = None
+
+
 from app.agent.llm_explainer import LLMExplainer
 
 from app.monitoring.metrics import (
