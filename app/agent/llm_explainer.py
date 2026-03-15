@@ -1,5 +1,5 @@
 # =========================================================
-# LLM EXPLAINER v3.0
+# LLM EXPLAINER v3.1
 # Hybrid Multi-Agent Compatible
 # CV-Ready | Deterministic | Governance-Aware
 # =========================================================
@@ -11,7 +11,7 @@ import threading
 import hashlib
 import json
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from datetime import datetime
 
 from openai import AsyncOpenAI
@@ -34,26 +34,35 @@ class LLMExplainer:
     def __init__(self):
 
         self.enabled = get_bool("LLM_ENABLED", False)
+
         self.model_name = get_env("OPENAI_MODEL", "gpt-4o-mini")
+
         self.timeout = get_int("OPENAI_TIMEOUT", 12)
 
         self.rate_limit_per_minute = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
 
         self.cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
+
         self.cache_ttl_seconds = get_int("LLM_CACHE_TTL_SEC", 180)
 
         self.audit_enabled = get_bool("LLM_AUDIT_ENABLED", True)
 
+        self.max_cache_items = get_int("LLM_CACHE_MAX_ITEMS", 500)
+
         self._request_times = []
+
         self._rate_lock = threading.Lock()
 
         self._cache = {}
+
         self._cache_lock = threading.Lock()
 
         api_key = get_env("OPENAI_API_KEY")
 
         if self.enabled and not api_key:
+
             logger.warning("LLM enabled but OPENAI_API_KEY missing.")
+
             self.enabled = False
 
         self.client = AsyncOpenAI(api_key=api_key) if self.enabled else None
@@ -80,7 +89,8 @@ class LLMExplainer:
                 return False
 
             self._request_times.append(now)
-            return True
+
+        return True
 
     ########################################################
     # CACHE
@@ -90,17 +100,18 @@ class LLMExplainer:
 
         payload = {
             "ticker": row.get("ticker"),
-            "hybrid_consensus_score": row.get("hybrid_consensus_score"),
+            "score": row.get("hybrid_consensus_score"),
             "confidence": signal_output.get("confidence_numeric"),
-            "risk_level": signal_output.get("risk_level"),
-            "volatility_regime": signal_output.get("volatility_regime"),
-            "technical_bias": technical_output.get("bias"),
-            "technical_score": technical_output.get("score"),
+            "risk": signal_output.get("risk_level"),
+            "vol_regime": signal_output.get("volatility_regime"),
+            "tech_bias": technical_output.get("bias"),
+            "tech_score": technical_output.get("score"),
             "drift_state": stats.get("drift_state"),
-            "severity_score": stats.get("severity_score"),
+            "severity": stats.get("severity_score"),
         }
 
         canonical = json.dumps(payload, sort_keys=True)
+
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     def _get_cached(self, key):
@@ -118,7 +129,9 @@ class LLMExplainer:
             data, ts = entry
 
             if time.time() - ts > self.cache_ttl_seconds:
+
                 del self._cache[key]
+
                 return None
 
             return data
@@ -129,6 +142,16 @@ class LLMExplainer:
             return
 
         with self._cache_lock:
+
+            if len(self._cache) > self.max_cache_items:
+
+                oldest = sorted(
+                    self._cache.items(),
+                    key=lambda x: x[1][1]
+                )[0][0]
+
+                del self._cache[oldest]
+
             self._cache[key] = (value, time.time())
 
     ########################################################
@@ -165,6 +188,7 @@ class LLMExplainer:
             logger.info("LLM_AUDIT | %s", json.dumps(audit_record))
 
         except Exception:
+
             logger.warning("Failed to write LLM audit log.")
 
     ########################################################
@@ -180,12 +204,14 @@ class LLMExplainer:
     ) -> Dict[str, Any]:
 
         if not self.enabled:
+
             return {
                 "llm_enabled": False,
                 "message": "LLM explanation disabled"
             }
 
         ticker = signal_row.get("ticker")
+
         signal = signal_output.get("signal")
 
         cache_key = self._cache_key(
@@ -196,16 +222,22 @@ class LLMExplainer:
         )
 
         cached = self._get_cached(cache_key)
+
         if cached:
+
             self._audit_log(ticker, signal, cached, cached=True)
+
             return {**cached, "cached": True}
 
         if not self._check_rate_limit():
+
             result = {
                 "llm_enabled": True,
                 "error": "rate_limit_exceeded"
             }
+
             self._audit_log(ticker, signal, result, cached=False)
+
             return result
 
         prompt = self._build_prompt(
@@ -214,6 +246,8 @@ class LLMExplainer:
             technical_output,
             drift_stats
         )
+
+        start = time.time()
 
         try:
 
@@ -239,31 +273,40 @@ class LLMExplainer:
                 timeout=self.timeout
             )
 
+            latency = time.time() - start
+
             raw_content = response.choices[0].message.content.strip()
+
             parsed = self._safe_parse_json(raw_content)
 
             result = {
                 "llm_enabled": True,
                 "model": self.model_name,
+                "latency": round(latency, 3),
+                "timestamp": datetime.utcnow().isoformat(),
                 "structured": parsed,
                 "cached": False
             }
 
             self._set_cache(cache_key, result)
+
             self._audit_log(ticker, signal, result, cached=False)
 
             return result
 
         except Exception:
+
             result = {
                 "llm_enabled": True,
                 "error": "llm_unavailable"
             }
+
             self._audit_log(ticker, signal, result, cached=False)
+
             return result
 
     ########################################################
-    # SNAPSHOT LEVEL EXPLANATION (NEW)
+    # SNAPSHOT LEVEL EXPLANATION
     ########################################################
 
     async def explain_portfolio(
@@ -283,7 +326,8 @@ Portfolio Findings:
 Executive Summary:
 {decision_report.get("executive_summary")}
 
-Provide a concise institutional commentary for an investment committee.
+Provide institutional investment committee commentary.
+
 Return JSON with keys:
 portfolio_summary, macro_risk_view, allocation_comment.
 """
@@ -302,10 +346,7 @@ portfolio_summary, macro_risk_view, allocation_comment.
 
             raw = response.choices[0].message.content.strip()
 
-            try:
-                parsed = json.loads(raw)
-            except Exception:
-                parsed = {"portfolio_summary": "Unavailable"}
+            parsed = self._safe_parse_json(raw)
 
             return {
                 "llm_enabled": True,
@@ -313,6 +354,7 @@ portfolio_summary, macro_risk_view, allocation_comment.
             }
 
         except Exception:
+
             return {
                 "llm_enabled": True,
                 "error": "portfolio_llm_unavailable"
@@ -325,6 +367,9 @@ portfolio_summary, macro_risk_view, allocation_comment.
     def _safe_parse_json(self, content: str):
 
         try:
+
+            content = content.replace("```json", "").replace("```", "").strip()
+
             data = json.loads(content)
 
             required = {
@@ -340,7 +385,9 @@ portfolio_summary, macro_risk_view, allocation_comment.
             return data
 
         except Exception:
+
             logger.warning("Malformed LLM JSON response.")
+
             return {
                 "summary": "Explanation unavailable.",
                 "rationale": "Model response could not be parsed.",
@@ -353,6 +400,10 @@ portfolio_summary, macro_risk_view, allocation_comment.
     ########################################################
 
     def _build_prompt(self, row, signal_output, technical_output, drift_stats):
+
+        warnings = signal_output.get("warnings", [])
+
+        warnings = warnings[:5]
 
         return f"""
 Ticker: {row.get("ticker")}
@@ -368,7 +419,7 @@ Technical Strength: {technical_output.get("score")}
 Drift State: {drift_stats.get("drift_state")}
 Drift Severity: {drift_stats.get("severity_score")}
 
-Warnings: {signal_output.get("warnings")}
+Warnings: {warnings}
 
 Provide professional institutional commentary.
 """
