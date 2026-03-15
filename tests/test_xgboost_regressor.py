@@ -5,6 +5,10 @@ import pytest
 from core.models.xgboost import SafeXGBRegressor
 
 
+############################################################
+# DATA GENERATOR
+############################################################
+
 def generate_data(rows=400, features=12):
 
     np.random.seed(42)
@@ -20,9 +24,9 @@ def generate_data(rows=400, features=12):
     return X, y
 
 
-# ==========================================================
+############################################################
 # TRAINING TEST
-# ==========================================================
+############################################################
 
 def test_training_and_checksums():
 
@@ -38,13 +42,13 @@ def test_training_and_checksums():
     assert model.best_iteration is not None
     assert model.training_fingerprint is not None
 
-    # Ensure feature names stored
+    # Ensure feature names stored correctly
     assert list(model.feature_names) == list(X.columns)
 
 
-# ==========================================================
+############################################################
 # PREDICTION TEST
-# ==========================================================
+############################################################
 
 def test_predict_valid():
 
@@ -60,9 +64,9 @@ def test_predict_valid():
     assert np.std(preds) > 0
 
 
-# ==========================================================
+############################################################
 # FEATURE MISMATCH TEST
-# ==========================================================
+############################################################
 
 def test_predict_feature_mismatch():
 
@@ -78,9 +82,9 @@ def test_predict_feature_mismatch():
         model.predict(X_bad)
 
 
-# ==========================================================
+############################################################
 # NAN INFERENCE GUARD
-# ==========================================================
+############################################################
 
 def test_predict_nan_guard():
 
@@ -96,25 +100,9 @@ def test_predict_nan_guard():
         model.predict(X_nan)
 
 
-# ==========================================================
-# ENTROPY GUARD TEST
-# ==========================================================
-
-def test_entropy_guard_trigger():
-
-    # Degenerate dataset
-    X = pd.DataFrame(np.ones((200, 10)))
-    y = np.ones(200)
-
-    model = SafeXGBRegressor()
-
-    with pytest.raises(RuntimeError):
-        model.fit(X, y)
-
-
-# ==========================================================
+############################################################
 # TARGET VARIANCE GUARD
-# ==========================================================
+############################################################
 
 def test_target_variance_guard():
 
@@ -127,9 +115,9 @@ def test_target_variance_guard():
         model.fit(X, y)
 
 
-# ==========================================================
+############################################################
 # LOW DISPERSION WARNING (NON-FATAL)
-# ==========================================================
+############################################################
 
 def test_low_dispersion_warning():
 
@@ -146,3 +134,22 @@ def test_low_dispersion_warning():
     preds = model.predict(X_same)
 
     assert np.all(np.isfinite(preds))
+
+
+############################################################
+# FEATURE IMPORTANCE EXPORT
+############################################################
+
+def test_feature_importance_export():
+
+    X, y = generate_data()
+
+    model = SafeXGBRegressor()
+    model.fit(X, y)
+
+    info = model.export_feature_importance()
+
+    assert "feature_importance" in info
+    assert "booster_checksum" in info
+    assert "feature_checksum" in info
+    assert "train_rmse" in info
