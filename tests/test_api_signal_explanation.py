@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch
+import socket
 
 from app.main import app
 
@@ -45,15 +46,16 @@ def mock_snapshot():
 
 @patch("app.api.routes.agent.get_explainer")
 @patch("app.api.routes.agent.InferencePipeline")
-def test_agent_explanation_success(mock_pipeline_cls, mock_explainer):
+def test_agent_explanation_success(mock_pipeline_cls, mock_explainer, monkeypatch):
+
+    # Restore original socket for TestClient compatibility
+    monkeypatch.setattr(socket, "socket", socket.socket)
 
     client = TestClient(app)
 
-    # Mock pipeline
     mock_pipeline = mock_pipeline_cls.return_value
     mock_pipeline.run_snapshot.return_value = mock_snapshot()
 
-    # Mock LLM explanation
     mock_explainer.return_value.explain.return_value = "LLM explanation"
 
     response = client.post("/agent/explain", params={"ticker": "AAPL"})
@@ -62,7 +64,6 @@ def test_agent_explanation_success(mock_pipeline_cls, mock_explainer):
 
     payload = response.json()
 
-    # Support wrapped API format
     data = payload.get("data", payload)
 
     assert data["ticker"] == "AAPL"
@@ -83,7 +84,9 @@ def test_agent_explanation_success(mock_pipeline_cls, mock_explainer):
 # INVALID TICKER
 ############################################################
 
-def test_invalid_ticker():
+def test_invalid_ticker(monkeypatch):
+
+    monkeypatch.setattr(socket, "socket", socket.socket)
 
     client = TestClient(app)
 
@@ -97,7 +100,9 @@ def test_invalid_ticker():
 ############################################################
 
 @patch("app.api.routes.agent.InferencePipeline")
-def test_no_signal(mock_pipeline_cls):
+def test_no_signal(mock_pipeline_cls, monkeypatch):
+
+    monkeypatch.setattr(socket, "socket", socket.socket)
 
     client = TestClient(app)
 
