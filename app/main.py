@@ -1,5 +1,5 @@
 # =====================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v2.3
+# MARKET SENTINEL APPLICATION ENTRYPOINT v2.4
 # Hybrid Multi-Agent | CV-Optimized Architecture
 # =====================================================
 
@@ -53,13 +53,17 @@ logger = logging.getLogger("marketsentinel")
 # =====================================================
 
 BOOT_ID = hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
+
 STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 120)
+
 APP_VERSION = get_env("APP_VERSION", "4.1.0")
 
 CORS_ORIGINS = get_env("CORS_ORIGINS", "*")
+
 CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS.split(",")]
 
 API_KEY = os.getenv("API_KEY")
+
 RATE_LIMIT = int(os.getenv("API_RATE_LIMIT_PER_MIN", "60"))
 
 WINDOW_SECONDS = 60
@@ -83,6 +87,7 @@ request_store = defaultdict(lambda: deque())
 class ReadinessState:
 
     def __init__(self):
+
         self.models_loaded = False
         self.redis_connected = False
         self.drift_baseline_loaded = False
@@ -100,11 +105,14 @@ class ReadinessState:
 
         self.boot_id = BOOT_ID
         self.start_time = int(time.time())
+
         self.boot_memory_mb = None
+
         self.config_fingerprint = None
 
     @property
     def ready(self):
+
         return self.models_loaded
 
 
@@ -116,6 +124,7 @@ readiness = ReadinessState()
 # =====================================================
 
 def api_success(data):
+
     return {
         "success": True,
         "data": data,
@@ -125,6 +134,7 @@ def api_success(data):
 
 
 def api_error(message):
+
     return {
         "success": False,
         "data": None,
@@ -140,6 +150,7 @@ def api_error(message):
 async def global_exception_handler(request: Request, exc: Exception):
 
     if isinstance(exc, HTTPException):
+
         return JSONResponse(
             status_code=exc.status_code,
             content=api_error(exc.detail)
@@ -163,16 +174,20 @@ async def lifespan(app: FastAPI):
     boot_start = time.time()
 
     try:
+
         logger.info("===================================")
         logger.info(" MarketSentinel Boot Sequence ")
         logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("===================================")
 
         loader = ModelLoader()
+
         _ = loader.xgb
+
         loader.warmup()
 
         readiness.models_loaded = True
+
         readiness.schema_signature = loader.schema_signature
         readiness.model_version = loader.xgb_version
         readiness.artifact_hash = loader.artifact_hash
@@ -180,21 +195,33 @@ async def lifespan(app: FastAPI):
         readiness.training_code_hash = loader.training_code_hash
 
         if readiness.schema_signature != get_schema_signature():
+
             logger.warning("Runtime schema mismatch detected.")
 
         try:
+
             cache = RedisCache()
+
             readiness.redis_connected = cache.enabled
+
         except Exception:
+
             readiness.redis_connected = False
+
             logger.warning("Redis unavailable — degraded mode.")
 
         try:
+
             detector = DriftDetector()
+
             detector._load_verified_baseline()
+
             readiness.drift_baseline_loaded = True
+
         except Exception:
+
             readiness.drift_baseline_loaded = False
+
             logger.warning("Drift baseline not loaded.")
 
         readiness.llm_enabled = get_bool("LLM_ENABLED", False)
@@ -216,18 +243,24 @@ async def lifespan(app: FastAPI):
 
         boot_time = round(time.time() - boot_start, 2)
 
-        if boot_time > STARTUP_TIMEOUT_SEC:
-            logger.warning("Startup slow.")
-
-        logger.info("System ready in %.2fs", boot_time)
+        logger.info(
+            "Startup complete | time=%ss | redis=%s | drift=%s | llm=%s",
+            boot_time,
+            readiness.redis_connected,
+            readiness.drift_baseline_loaded,
+            readiness.llm_enabled
+        )
 
         yield
 
         logger.info("Shutting down MarketSentinel")
+
         gc.collect()
 
     except Exception:
+
         logger.exception("CRITICAL STARTUP FAILURE")
+
         raise
 
 
@@ -258,7 +291,7 @@ app.add_middleware(
 
 
 # =====================================================
-# SECURITY + REQUEST MIDDLEWARE
+# REQUEST MIDDLEWARE
 # =====================================================
 
 @app.middleware("http")
@@ -271,20 +304,27 @@ async def request_context_middleware(request: Request, call_next):
         client_key = request.headers.get("X-API-KEY")
 
         if client_key != API_KEY:
+
             raise HTTPException(
                 status_code=401,
                 detail="Invalid API key"
             )
 
-    client_ip = request.client.host
+    client_ip = request.headers.get(
+        "X-Forwarded-For",
+        request.client.host
+    )
+
     now = time.time()
 
     queue = request_store[client_ip]
 
     while queue and queue[0] < now - WINDOW_SECONDS:
+
         queue.popleft()
 
     if len(queue) >= RATE_LIMIT:
+
         raise HTTPException(
             status_code=429,
             detail="Rate limit exceeded"
@@ -292,7 +332,13 @@ async def request_context_middleware(request: Request, call_next):
 
     queue.append(now)
 
+    # Cleanup empty IPs
+    if not queue:
+
+        request_store.pop(client_ip, None)
+
     request_id = str(uuid.uuid4())[:12]
+
     start = time.time()
 
     try:
@@ -302,12 +348,15 @@ async def request_context_middleware(request: Request, call_next):
         latency = time.time() - start
 
         response.headers["X-Request-ID"] = request_id
+
         response.headers["X-Process-Time"] = str(round(latency, 4))
 
         return response
 
     except Exception:
+
         logger.exception("Request failure | id=%s", request_id)
+
         raise
 
 
@@ -332,6 +381,7 @@ app.include_router(agent.router)
 
 @app.get("/")
 async def root():
+
     return api_success({
         "service": "MarketSentinel Hybrid Portfolio Engine",
         "architecture": "multi-agent-ml-governed",
@@ -351,6 +401,7 @@ async def root():
 
 @app.get("/metrics")
 def metrics():
+
     return Response(
         generate_latest(),
         media_type=CONTENT_TYPE_LATEST
