@@ -1,5 +1,5 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.7)
+# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.8)
 # ==========================================================
 
 import os
@@ -104,7 +104,7 @@ def compute_reproducibility_hash(dataset_hash):
 
 
 # ==========================================================
-# EXPORT ARTIFACTS  (NEW FUNCTION — FIXES YOUR TEST FAILURE)
+# EXPORT ARTIFACTS
 # ==========================================================
 
 def export_artifacts(
@@ -114,7 +114,7 @@ def export_artifacts(
     dataset_rows,
     start_date,
     end_date,
-    df,
+    training_df,
     promote_baseline=False,
     create_baseline=False,
 ):
@@ -155,10 +155,6 @@ def export_artifacts(
 
     logger.info("Metadata saved.")
 
-    # -----------------------------------------------------
-    # UPDATE PRODUCTION POINTER
-    # -----------------------------------------------------
-
     pointer = {
         "model_version": model_version,
         "model_path": model_path,
@@ -172,7 +168,7 @@ def export_artifacts(
     logger.info("Production pointer updated.")
 
     # -----------------------------------------------------
-    # CREATE DRIFT BASELINE
+    # DRIFT BASELINE CREATION
     # -----------------------------------------------------
 
     if create_baseline:
@@ -182,7 +178,7 @@ def export_artifacts(
         detector = DriftDetector()
 
         detector.create_baseline(
-            dataset=df,
+            dataset=training_df,
             dataset_hash=dataset_hash,
             training_code_hash=compute_training_code_hash(),
             feature_checksum=compute_feature_checksum(),
@@ -241,6 +237,10 @@ def load_training_data(start_date, end_date):
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="training")
 
+    if len(df) > MAX_DATASET_ROWS:
+        logger.warning("Dataset too large — sampling.")
+        df = df.sample(MAX_DATASET_ROWS, random_state=SEED)
+
     return df
 
 
@@ -284,7 +284,23 @@ def build_target(df):
 
 def trainer(train_df):
 
-    train_df = build_target(train_df)
+    train_df = train_df.copy()
+
+    # --------------------------------------------------
+    # FEATURE-ONLY DATASET SUPPORT
+    # --------------------------------------------------
+
+    if "target" not in train_df.columns:
+
+        logger.info("Building training target.")
+
+        train_df = build_target(train_df)
+
+    if len(train_df) < MIN_TRAINING_ROWS:
+
+        raise RuntimeError(
+            f"Training dataset too small ({len(train_df)} rows)"
+        )
 
     X = validate_feature_schema(
         train_df.loc[:, MODEL_FEATURES],
