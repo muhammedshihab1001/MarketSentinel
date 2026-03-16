@@ -33,7 +33,7 @@ REQUEST_TIMEOUT = 180
 MAX_CONCURRENT = 2
 
 performance_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-_pipeline: InferencePipeline | None = None
+_pipeline = None
 
 
 def get_pipeline():
@@ -126,17 +126,25 @@ def _compute_performance_sync(days: int):
     # FETCH PRICE DATA
     # =========================================================
 
-    price_history = market_data.get_price_data_batch(
+    # get_price_data_batch returns (results_dict, failures_dict)
+    price_results, price_failures = market_data.get_price_data_batch(
         tickers=universe,
         start_date=start_str,
         end_date=end_str,
         interval="1d",
-        min_history=MIN_HISTORY_ROWS
+        min_history=MIN_HISTORY_ROWS,
     )
 
+    if price_failures:
+        logger.warning(
+            "Performance: price fetch failed for %d tickers: %s",
+            len(price_failures), list(price_failures.keys()),
+        )
+
+    # Build forward returns lookup from raw price data
     cleaned_history = {}
 
-    for ticker, df in price_history.items():
+    for ticker, df in price_results.items():
 
         if df is None or len(df) < MIN_HISTORY_ROWS:
             continue
@@ -155,36 +163,21 @@ def _compute_performance_sync(days: int):
         raise RuntimeError("No valid price data available.")
 
     # =========================================================
-    # BUILD FEATURES
+    # BUILD FEATURES — concat all tickers, pipeline once
     # =========================================================
 
-    feature_frames = []
+    combined_prices = pd.concat(
+        list(price_results.values()), ignore_index=True
+    )
 
-    for ticker, df in cleaned_history.items():
+    full_df = FeatureEngineer.build_feature_pipeline(
+        combined_prices, training=False
+    )
 
-        try:
-            features = FeatureEngineer.build_feature_pipeline(
-                price_df=df,
-                sentiment_df=None,
-                training=False
-            )
+    if full_df.empty:
+        raise RuntimeError("Feature pipeline produced empty dataset.")
 
-            if features is None or features.empty:
-                continue
-
-            feature_frames.append(features)
-
-        except Exception:
-            logger.warning("Feature build failed for %s", ticker)
-
-    if not feature_frames:
-        raise RuntimeError("No feature datasets built.")
-
-    full_df = pd.concat(feature_frames, ignore_index=True)
     full_df = full_df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
-    full_df = FeatureEngineer.add_cross_sectional_features(full_df)
-    full_df = FeatureEngineer.finalize(full_df)
 
     portfolio_records = []
     eval_dates = sorted(full_df["date"].unique())[-days:]
@@ -215,7 +208,7 @@ def _compute_performance_sync(days: int):
         scores = (scores - scores.mean()) / (scores.std() + 1e-12)
         daily_slice["score"] = scores
 
-        # Drift scaling (kept from your original architecture)
+        # Drift scaling
         drift_result = pipeline._safe_drift(feature_df)
         exposure_scale = drift_result.get("exposure_scale", 1.0)
 
@@ -227,7 +220,6 @@ def _compute_performance_sync(days: int):
         if longs.empty or shorts.empty:
             continue
 
-        # 🔥 NEW: Local stable portfolio construction
         weights = construct_portfolio(longs, shorts)
 
         for _, row in daily_slice.iterrows():
@@ -263,15 +255,15 @@ def _compute_performance_sync(days: int):
     # BENCHMARK
     # =========================================================
 
-    benchmark_data = market_data.get_price_data_batch(
+    benchmark_results, _ = market_data.get_price_data_batch(
         tickers=[BENCHMARK_TICKER],
         start_date=start_str,
         end_date=end_str,
         interval="1d",
-        min_history=MIN_HISTORY_ROWS
+        min_history=MIN_HISTORY_ROWS,
     )
 
-    benchmark_df = benchmark_data.get(BENCHMARK_TICKER)
+    benchmark_df = benchmark_results.get(BENCHMARK_TICKER)
 
     benchmark_cumulative = 0.0
     alpha = 0.0
