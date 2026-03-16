@@ -55,9 +55,6 @@ class YahooProvider(MarketDataProvider):
     @staticmethod
     def _normalize_datetime(series: pd.Series) -> pd.Series:
 
-        if not isinstance(series, pd.Series):
-            raise RuntimeError("Date column must be a pandas Series.")
-
         dt = pd.to_datetime(series, errors="coerce", utc=True)
 
         if dt.isna().all():
@@ -138,6 +135,20 @@ class YahooProvider(MarketDataProvider):
 
         return clean
 
+    @staticmethod
+    def _repair_ohlc(clean: pd.DataFrame) -> pd.DataFrame:
+        """
+        Repair common Yahoo OHLC inconsistencies.
+        """
+
+        high_fix = clean[["high", "open", "close"]].max(axis=1)
+        low_fix = clean[["low", "open", "close"]].min(axis=1)
+
+        clean["high"] = high_fix
+        clean["low"] = low_fix
+
+        return clean
+
     def _normalize(self, df: pd.DataFrame, ticker: str, min_rows: int) -> pd.DataFrame:
 
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
@@ -190,10 +201,7 @@ class YahooProvider(MarketDataProvider):
             .reset_index(drop=True)
         )
 
-        clean = clean[clean["close"] > 0].reset_index(drop=True)
-
-        if clean.empty:
-            raise RuntimeError(f"All close prices are <= 0 for {ticker}.")
+        clean = self._repair_ohlc(clean)
 
         pct = clean["close"].pct_change().abs().fillna(0)
 
@@ -271,7 +279,6 @@ class YahooProvider(MarketDataProvider):
         min_rows = kwargs.get("min_rows", self.DEFAULT_MIN_ROWS)
 
         raw_df: Optional[pd.DataFrame] = None
-
         last_error: Optional[Exception] = None
 
         for attempt in range(1, self.MAX_RETRIES + 1):
@@ -287,13 +294,6 @@ class YahooProvider(MarketDataProvider):
 
                 if raw_df is not None and not raw_df.empty:
                     break
-
-                logger.warning(
-                    "Yahoo returned empty response for %s (attempt %d/%d).",
-                    ticker,
-                    attempt,
-                    self.MAX_RETRIES,
-                )
 
             except Exception as exc:
 
