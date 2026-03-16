@@ -351,6 +351,26 @@ class ModelLoader:
             return new_container.model
 
     ########################################################
+    # MODEL WARMUP
+    ########################################################
+
+    def warmup(self):
+
+        try:
+
+            model = self.xgb
+
+            dummy = np.zeros((1, len(MODEL_FEATURES)))
+
+            model.predict(dummy)
+
+            logger.info("Model warmup successful.")
+
+        except Exception as exc:
+
+            logger.warning("Model warmup skipped | %s", exc)
+
+    ########################################################
 
     @property
     def xgb(self):
