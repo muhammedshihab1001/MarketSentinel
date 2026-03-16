@@ -7,6 +7,10 @@ import numpy as np
 import pandas as pd
 
 
+EPSILON = 1e-12
+MIN_CS_SIZE = 5
+
+
 # =========================================================
 # MAIN EVALUATION FUNCTION (RANKING-ALIGNED)
 # =========================================================
@@ -44,9 +48,10 @@ def evaluate_xgboost(
     )
 
     # -----------------------------------------------------
-    # Drop NaNs early
+    # Drop NaNs / Infs early
     # -----------------------------------------------------
 
+    df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna()
 
     if df.empty:
@@ -74,6 +79,9 @@ def evaluate_xgboost(
 
     for date, group in grouped:
 
+        if len(group) < MIN_CS_SIZE:
+            continue
+
         if group["forward_return"].nunique() >= 2:
 
             corr = group["score"].corr(
@@ -81,7 +89,7 @@ def evaluate_xgboost(
                 method="spearman"
             )
 
-            if not np.isnan(corr):
+            if np.isfinite(corr):
                 ic_list.append(corr)
 
         if len(group) >= 10:
@@ -123,10 +131,12 @@ def evaluate_xgboost(
 
         long_short_spread = float(spread_series.mean())
 
-        if spread_series.std() > 0:
+        std = spread_series.std()
+
+        if std > EPSILON:
 
             sharpe = float(
-                (spread_series.mean() / spread_series.std())
+                (spread_series.mean() / std)
                 * np.sqrt(252 / 5)
             )
 
