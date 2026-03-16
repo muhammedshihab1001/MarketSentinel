@@ -149,16 +149,23 @@ class StockPriceFetcher:
 
     @staticmethod
     def _ensure_utc(series: pd.Series) -> pd.Series:
+        """
+        Convert any datetime series to UTC safely.
 
-        s = pd.to_datetime(series, errors="coerce")
+        FIX: Uses pd.to_datetime(utc=True) which handles BOTH cases:
+          - tz-naive timestamps → localized to UTC
+          - tz-aware timestamps → converted to UTC
+        This avoids the 'Cannot localize tz-aware Timestamp' error
+        that occurs when yfinance returns tz-aware DatetimeIndex and
+        the old code path incorrectly tried tz_localize on tz-aware data.
+        """
+
+        s = pd.to_datetime(series, utc=True, errors="coerce")
 
         if s.isna().all():
             raise RuntimeError("Date column contains no valid datetimes.")
 
-        if getattr(s.dt, "tz", None) is None:
-            return s.dt.tz_localize("UTC")
-
-        return s.dt.tz_convert("UTC")
+        return s
 
     @staticmethod
     def _validate_prices(df: pd.DataFrame) -> pd.DataFrame:
