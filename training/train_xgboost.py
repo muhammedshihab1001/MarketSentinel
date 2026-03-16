@@ -1,5 +1,5 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.9)
+# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.10)
 # ==========================================================
 
 import os
@@ -66,7 +66,6 @@ def enforce_determinism():
 
 def compute_dataset_hash(df: pd.DataFrame):
 
-    # Synthetic datasets used in tests may not contain date/ticker
     if {"date", "ticker"}.issubset(df.columns):
 
         df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
@@ -211,6 +210,21 @@ def load_training_data(start_date, end_date):
             if df is None or df.empty:
                 continue
 
+            # ----------------------------------------
+            # SAFE DATE NORMALIZATION (FIX TZ BUG)
+            # ----------------------------------------
+
+            if "date" in df.columns:
+
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+                df = df.dropna(subset=["date"])
+
+                if getattr(df["date"].dt, "tz", None) is None:
+                    df["date"] = df["date"].dt.tz_localize("UTC")
+                else:
+                    df["date"] = df["date"].dt.tz_convert("UTC")
+
             price_frames.append(df)
 
         except Exception as exc:
@@ -247,7 +261,6 @@ def load_training_data(start_date, end_date):
 
 def build_target(df):
 
-    # synthetic datasets don't contain these columns
     required = {"date", "ticker", "close"}
 
     if not required.issubset(df.columns):
@@ -290,10 +303,6 @@ def trainer(train_df):
 
     train_df = train_df.copy()
 
-    # --------------------------------------------------
-    # REAL MARKET DATA
-    # --------------------------------------------------
-
     if {"date", "ticker", "close"}.issubset(train_df.columns):
 
         logger.info("Market dataset detected — building target.")
@@ -306,10 +315,6 @@ def trainer(train_df):
         )
 
         y = train_df["target"].values
-
-    # --------------------------------------------------
-    # SYNTHETIC DATASET (TESTS)
-    # --------------------------------------------------
 
     else:
 
