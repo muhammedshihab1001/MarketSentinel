@@ -1,5 +1,5 @@
 """
-MarketSentinel v4.2.1
+MarketSentinel v4.3.0
 
 Feature Store — per-ticker feature cache for INFERENCE.
 """
@@ -158,19 +158,20 @@ class FeatureStore:
     def _cleanup_global_cache(self):
 
         files = [
-            f for f in os.listdir(self.FEATURE_DIR)
+            os.path.join(self.FEATURE_DIR, f)
+            for f in os.listdir(self.FEATURE_DIR)
             if f.endswith(".parquet")
         ]
 
         if len(files) > self.MAX_TOTAL_CACHE_FILES:
 
-            files.sort()
+            files.sort(key=lambda x: os.path.getmtime(x))
 
             excess = files[:-self.MAX_TOTAL_CACHE_FILES]
 
             for f in excess:
                 try:
-                    os.remove(os.path.join(self.FEATURE_DIR, f))
+                    os.remove(f)
                 except Exception:
                     pass
 
@@ -212,7 +213,7 @@ class FeatureStore:
 
                 self._memory_cache_ts.pop(old_key, None)
 
-        self._memory_cache[key] = df
+        self._memory_cache[key] = df.copy()
         self._memory_cache_ts[key] = time.time()
 
     def _get_memory_cache(self, key):
@@ -231,7 +232,7 @@ class FeatureStore:
 
         self._memory_cache.move_to_end(key)
 
-        return self._memory_cache[key]
+        return self._memory_cache[key].copy()
 
     ########################################################
     # MAIN ENTRY
@@ -314,14 +315,7 @@ class FeatureStore:
 
         logger.info("Feature cache miss — rebuilding for %s.", ticker)
 
-        df = self.engineer._validate_price_frame(price_df, ticker)
-
-        df = self.engineer.add_core_features(df)
-
-        # FIX: ensure cross-sectional features are generated
-        df = self.engineer.add_cross_sectional_features(df)
-
-        df = self.engineer.finalize(df)
+        df = self.engineer.build_feature_pipeline(price_df)
 
         df = df.sort_values(
             ["date", "ticker"]
