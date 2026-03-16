@@ -1,5 +1,5 @@
 # ==========================================================
-# INSTITUTIONAL TRAINING PIPELINE WRAPPER v2.4
+# INSTITUTIONAL TRAINING PIPELINE WRAPPER v2.5
 # Governance Hardened + Hybrid Multi-Agent Compatible
 # ==========================================================
 
@@ -53,6 +53,10 @@ def enforce_determinism():
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+    # optional deterministic flags (safe for portfolio project)
+    os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
     random.seed(GLOBAL_SEED)
     np.random.seed(GLOBAL_SEED)
@@ -213,7 +217,10 @@ def capture_provider_health():
 
         router = MarketProviderRouter()
 
-        return router.provider_health()
+        if hasattr(router, "provider_health"):
+            return router.provider_health()
+
+        return {"status": "provider_health_not_available"}
 
     except Exception as e:
 
