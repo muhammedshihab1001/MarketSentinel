@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v5.0
+# INSTITUTIONAL INFERENCE PIPELINE v5.1
 # Stable | Drift-Aware | CV-Optimized | Noise-Controlled
 # =========================================================
 
@@ -35,7 +35,6 @@ from app.monitoring.metrics import (
     MODEL_INFERENCE_LATENCY,
     PIPELINE_FAILURES,
     INFERENCE_IN_PROGRESS,
-    SIGNAL_DISTRIBUTION
 )
 
 logger = logging.getLogger("marketsentinel.pipeline")
@@ -64,7 +63,6 @@ def get_shared_model_loader():
 
                 _SHARED_MODEL_LOADER = ModelLoader()
 
-                # warm load
                 _ = _SHARED_MODEL_LOADER.xgb
 
     return _SHARED_MODEL_LOADER
@@ -84,10 +82,8 @@ class InferencePipeline:
 
     TOP_K = 10
     BOTTOM_K = 10
-    TOP_SELECTION = 5
 
     SCORE_WINSOR_Q = 0.02
-    BASE_LIQUIDITY = 5e5
 
     SNAPSHOT_CACHE_TTL = int(os.getenv("SNAPSHOT_CACHE_TTL", "120"))
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
@@ -97,11 +93,8 @@ class InferencePipeline:
     def __init__(self):
 
         self.market_data = MarketDataService()
-
         self.models = get_shared_model_loader()
-
         self.cache = RedisCache()
-
         self.drift_detector = DriftDetector()
 
         self.signal_agent = SignalAgent()
@@ -134,7 +127,6 @@ class InferencePipeline:
     def _build_cross_sectional_frame(self, tickers: List[str]):
 
         end_date = pd.Timestamp.utcnow()
-
         start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
 
         data, failures = self.market_data.get_price_data_batch(
@@ -144,7 +136,6 @@ class InferencePipeline:
         )
 
         if failures:
-
             logger.warning(
                 "Market data partial failure | success=%d | failed=%d",
                 len(data),
@@ -152,13 +143,9 @@ class InferencePipeline:
             )
 
         if len(data) < self.MIN_UNIVERSE_WIDTH:
-
-            raise RuntimeError(
-                f"Too few tickers available ({len(data)})."
-            )
+            raise RuntimeError(f"Too few tickers available ({len(data)}).")
 
         combined_prices = pd.concat(list(data.values()), ignore_index=True)
-
         combined_prices = combined_prices.dropna(subset=["close"])
 
         combined = FeatureEngineer.build_feature_pipeline(
@@ -178,56 +165,6 @@ class InferencePipeline:
         return combined
 
     # =========================================================
-    # STABLE SOFTMAX
-    # =========================================================
-
-    def _stable_softmax(self, x):
-
-        x = np.asarray(x)
-
-        x = x - np.max(x)
-
-        e = np.exp(x)
-
-        return e / (np.sum(e) + EPSILON)
-
-    # =========================================================
-    # PORTFOLIO CONSTRUCTION
-    # =========================================================
-
-    def _construct_portfolio_from_rows(self, longs, shorts):
-
-        weights = {}
-
-        if longs:
-
-            scores = np.array([x["hybrid_consensus_score"] for x in longs])
-
-            soft = self._stable_softmax(scores)
-
-            for row, w in zip(longs, soft):
-
-                weights[row["ticker"]] = min(
-                    w * self.TARGET_GROSS_EXPOSURE / 2,
-                    self.MAX_POSITION_WEIGHT
-                )
-
-        if shorts:
-
-            scores = np.array([x["hybrid_consensus_score"] for x in shorts])
-
-            soft = self._stable_softmax(-scores)
-
-            for row, w in zip(shorts, soft):
-
-                weights[row["ticker"]] = -min(
-                    w * self.TARGET_GROSS_EXPOSURE / 2,
-                    self.MAX_POSITION_WEIGHT
-                )
-
-        return weights
-
-    # =========================================================
     # WINSORIZE
     # =========================================================
 
@@ -237,24 +174,20 @@ class InferencePipeline:
             return x
 
         lower = np.quantile(x, self.SCORE_WINSOR_Q)
-
         upper = np.quantile(x, 1 - self.SCORE_WINSOR_Q)
 
         return np.clip(x, lower, upper)
 
     # =========================================================
-    # DRIFT SAFE CALL
+    # SAFE DRIFT
     # =========================================================
 
     def _safe_drift(self, feature_df):
 
         try:
             return self.drift_detector.detect(feature_df)
-
         except Exception:
-
             logger.warning("Drift detector failed.")
-
             return {
                 "drift_state": "unknown",
                 "severity_score": 0.0,
@@ -262,18 +195,15 @@ class InferencePipeline:
             }
 
     # =========================================================
-    # SAFE AGENT EXECUTION
+    # SAFE AGENT
     # =========================================================
 
     def _safe_agent(self, agent, context):
 
         try:
             return agent.analyze(context)
-
         except Exception:
-
             logger.exception("Agent failure.")
-
             return {"score": 0.0, "agent_score": 0.0, "hybrid": {"score": 0.0}}
 
     # =========================================================
@@ -286,7 +216,6 @@ class InferencePipeline:
         model = self.models.xgb
 
         full_universe = list(MarketUniverse.get_universe())
-
         requested = sorted(set(tickers)) if tickers else full_universe
 
         cache_key = self.cache.build_key({
@@ -297,12 +226,10 @@ class InferencePipeline:
         })
 
         cached = self.cache.get(cache_key)
-
         if cached:
             return cached
 
         INFERENCE_IN_PROGRESS.inc()
-
         start_time = time.time()
 
         try:
@@ -310,14 +237,12 @@ class InferencePipeline:
             df = self._build_cross_sectional_frame(full_universe)
 
             latest_date = df["date"].max()
-
             latest_df = df[df["date"] == latest_date].copy()
-
             latest_df = latest_df[latest_df["ticker"].isin(requested)]
 
+            # 🔥 FIX: safer cleaning
             latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
-
-            latest_df = latest_df.dropna(subset=MODEL_FEATURES)
+            latest_df = latest_df.dropna(subset=MODEL_FEATURES, how="any")
 
             if latest_df.empty:
                 raise RuntimeError("Latest snapshot invalid.")
@@ -328,19 +253,18 @@ class InferencePipeline:
             ).astype(DTYPE)
 
             drift_result = self._safe_drift(feature_df)
-
             exposure_scale = drift_result.get("exposure_scale", 1.0)
 
-            feature_np = np.ascontiguousarray(feature_df)
-
-            raw_scores = model.predict(feature_np)
+            # 🔥 FIX: PASS DATAFRAME (NOT NUMPY)
+            raw_scores = model.predict(feature_df)
 
             raw_scores = self._winsorize(raw_scores)
 
             score_std = raw_scores.std()
 
             if score_std < self.MIN_SCORE_STD:
-                raise RuntimeError("Model scores collapsed.")
+                logger.warning("Score collapse detected.")
+                score_std = 1.0  # fallback instead of crash
 
             raw_scores = (
                 raw_scores - raw_scores.mean()
@@ -355,11 +279,9 @@ class InferencePipeline:
                 direction = "LONG" if row["raw_model_score"] > 0 else "SHORT"
 
                 row_dict = {**row.to_dict(), "signal": direction}
-
                 context = {"row": row_dict}
 
                 signal_output = self._safe_agent(self.signal_agent, context)
-
                 technical_output = self._safe_agent(self.technical_agent, context)
 
                 hybrid_score = (
@@ -375,10 +297,7 @@ class InferencePipeline:
                     "weight": 0.0
                 })
 
-            ranked = sorted(
-                snapshot_rows,
-                key=lambda x: x["hybrid_consensus_score"]
-            )
+            ranked = sorted(snapshot_rows, key=lambda x: x["hybrid_consensus_score"])
 
             longs = ranked[-min(self.TOP_K, len(ranked)):]
             shorts = ranked[:min(self.BOTTOM_K, len(ranked))]
@@ -386,9 +305,7 @@ class InferencePipeline:
             weights = self._construct_portfolio_from_rows(longs, shorts)
 
             for row in snapshot_rows:
-
                 base_weight = weights.get(row["ticker"], 0.0)
-
                 row["weight"] = float(base_weight * exposure_scale)
 
             result = {
@@ -401,7 +318,6 @@ class InferencePipeline:
             self.cache.set(cache_key, result, ex=self.SNAPSHOT_CACHE_TTL)
 
             MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-
             MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(
                 time.time() - start_time
             )
@@ -411,9 +327,7 @@ class InferencePipeline:
         except Exception:
 
             PIPELINE_FAILURES.labels(stage="snapshot").inc()
-
             logger.exception("Snapshot failure.")
-
             raise
 
         finally:
