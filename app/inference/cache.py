@@ -1,6 +1,6 @@
 # =========================================================
-# REDIS CACHE v9
-# Stable | Drift-Safe | CV-Optimized
+# REDIS CACHE v10
+# Stable | Drift-Safe | CV-Optimized | Memory Fallback
 # =========================================================
 
 import redis
@@ -28,6 +28,9 @@ class RedisCache:
     _client = None
     _pool = None
 
+    # 🔥 NEW: in-memory fallback cache
+    _memory_cache = {}
+
     BASE_RETRY = 15
     MAX_RETRY = 120
 
@@ -35,7 +38,7 @@ class RedisCache:
     MIN_TTL = 30
 
     MAX_PAYLOAD_BYTES = 256_000
-    CACHE_NAMESPACE_VERSION = "v9"
+    CACHE_NAMESPACE_VERSION = "v10"
 
     ###################################################
 
@@ -50,7 +53,8 @@ class RedisCache:
 
         try:
             loader = ModelLoader()
-            self.model_fp = loader.xgb_version
+            container = loader._xgb_container
+            self.model_fp = container.version if container else "unknown"
         except Exception:
             self.model_fp = "unknown"
 
@@ -74,9 +78,7 @@ class RedisCache:
                     port=port,
                     socket_timeout=2,
                     socket_connect_timeout=2,
-                    socket_keepalive=True,
-                    health_check_interval=30,
-                    max_connections=16,
+                    max_connections=8,
                     retry_on_timeout=True,
                     decode_responses=False
                 )
@@ -156,7 +158,6 @@ class RedisCache:
 
         return (
             f"{self.CACHE_NAMESPACE_VERSION}:"
-            f"portfolio:"
             f"{self.model_fp}:"
             f"{self.schema_sig}:"
             f"{self.universe_fp}:"
@@ -164,53 +165,50 @@ class RedisCache:
         )
 
     ###################################################
-    # PAYLOAD VALIDATION
+    # MEMORY CACHE HELPERS
     ###################################################
 
-    def _validate_payload(self, payload):
+    def _memory_get(self, key):
 
-        if not isinstance(payload, list):
-            raise RuntimeError("Payload must be a list.")
+        entry = self._memory_cache.get(key)
 
-        if len(payload) == 0:
-            raise RuntimeError("Payload cannot be empty.")
+        if not entry:
+            return None
 
-        for row in payload:
+        value, expiry = entry
 
-            if not isinstance(row, dict):
-                raise RuntimeError("Invalid payload row.")
+        if time.time() > expiry:
+            self._memory_cache.pop(key, None)
+            return None
 
-            ticker = row.get("ticker")
-            weight = row.get("weight", 0)
+        return value
 
-            if not isinstance(ticker, str):
-                raise RuntimeError("Invalid ticker.")
+    def _memory_set(self, key, value, ttl):
 
-            if not isinstance(weight, (int, float)):
-                raise RuntimeError("Invalid weight.")
+        expiry = time.time() + ttl
 
-            if not np.isfinite(weight):
-                raise RuntimeError("Non-finite weight.")
+        # limit memory size (simple LRU-like cleanup)
+        if len(self._memory_cache) > 500:
+            self._memory_cache.pop(next(iter(self._memory_cache)))
 
-            if abs(weight) > 1:
-                raise RuntimeError("Unrealistic weight.")
+        self._memory_cache[key] = (value, expiry)
 
     ###################################################
-    # SNAPSHOT VALIDATION
+    # VALIDATION (RELAXED)
     ###################################################
 
     def _validate_snapshot(self, value):
 
         if not isinstance(value, dict):
-            raise RuntimeError("Cache payload must be dict.")
+            return False
 
         if "signals" not in value:
-            raise RuntimeError("Snapshot missing signals.")
+            return False
 
         if not isinstance(value["signals"], list):
-            raise RuntimeError("Signals must be list.")
+            return False
 
-        self._validate_payload(value["signals"])
+        return True
 
     ###################################################
     # GET
@@ -220,7 +218,15 @@ class RedisCache:
 
         self._maybe_reconnect()
 
+        # 🔥 1. Try memory cache first
+        mem = self._memory_get(key)
+        if mem:
+            CACHE_HITS.inc()
+            return mem
+
+        # 🔥 2. Try Redis
         if not self.enabled:
+            CACHE_MISSES.inc()
             return None
 
         try:
@@ -231,38 +237,18 @@ class RedisCache:
                 CACHE_MISSES.inc()
                 return None
 
-            if len(data) > self.MAX_PAYLOAD_BYTES:
-                logger.warning("Raw cache payload too large. Deleting.")
+            decompressed = zlib.decompress(data)
+            obj = json.loads(decompressed)
+
+            if not self._validate_snapshot(obj):
                 self.client.delete(key)
                 CACHE_MISSES.inc()
                 return None
 
-            try:
-                decompressed = zlib.decompress(data)
-            except Exception:
-                logger.warning("Corrupted compressed cache entry removed.")
-                self.client.delete(key)
-                CACHE_MISSES.inc()
-                return None
-
-            if len(decompressed) > self.MAX_PAYLOAD_BYTES:
-                logger.warning("Oversized decompressed cache entry removed.")
-                self.client.delete(key)
-                CACHE_MISSES.inc()
-                return None
-
-            try:
-                obj = json.loads(decompressed)
-            except Exception:
-                logger.warning("Invalid JSON cache entry removed.")
-                self.client.delete(key)
-                CACHE_MISSES.inc()
-                return None
-
-            self._validate_snapshot(obj)
+            # 🔥 store in memory cache
+            self._memory_set(key, obj, 60)
 
             CACHE_HITS.inc()
-
             return obj
 
         except Exception:
@@ -270,12 +256,6 @@ class RedisCache:
             logger.exception("Redis GET failure.")
 
             self.enabled = False
-
-            self._retry_delay = min(
-                self._retry_delay * 2,
-                self.MAX_RETRY
-            )
-
             self._disabled_until = time.time() + self._retry_delay
 
             return None
@@ -294,54 +274,33 @@ class RedisCache:
 
         self._maybe_reconnect()
 
+        ttl_value = ex if ex is not None else ttl
+
+        if ttl_value is None:
+            ttl_value = int(os.getenv("CACHE_TTL_SECONDS", "180"))
+
+        ttl_value = max(self.MIN_TTL, min(ttl_value, self.MAX_TTL))
+
+        # 🔥 Always store in memory
+        self._memory_set(key, value, ttl_value)
+
         if not self.enabled:
             return
 
         try:
 
-            self._validate_snapshot(value)
-
-            ttl_value = ex if ex is not None else ttl
-
-            if ttl_value is None:
-                ttl_value = int(
-                    os.getenv("CACHE_TTL_SECONDS", "180")
-                )
-
-            ttl_value = max(self.MIN_TTL, min(ttl_value, self.MAX_TTL))
-
-            jitter = int(ttl_value * 0.15)
-
-            final_ttl = ttl_value + random.randint(-jitter, jitter)
-
-            final_ttl = max(
-                self.MIN_TTL,
-                min(final_ttl, self.MAX_TTL)
-            )
-
             serialized = self._canonical_json(value).encode()
 
             if len(serialized) > self.MAX_PAYLOAD_BYTES:
-                logger.warning("Cache payload too large. Skipping cache.")
                 return
 
             payload = zlib.compress(serialized)
 
-            self.client.set(
-                key,
-                payload,
-                ex=final_ttl
-            )
+            self.client.set(key, payload, ex=ttl_value)
 
         except Exception:
 
             logger.exception("Redis SET failure.")
 
             self.enabled = False
-
-            self._retry_delay = min(
-                self._retry_delay * 2,
-                self.MAX_RETRY
-            )
-
             self._disabled_until = time.time() + self._retry_delay
