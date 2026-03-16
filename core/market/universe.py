@@ -1,5 +1,5 @@
 # =========================================================
-# MARKET UNIVERSE CONTROLLER v2.2
+# MARKET UNIVERSE CONTROLLER v2.3
 # Hybrid Multi-Agent Compatible | CV-Optimized
 # =========================================================
 
@@ -31,7 +31,7 @@ class MarketUniverse:
     - Non-critical production use
     """
 
-    CONTROLLER_VERSION = "2.2"
+    CONTROLLER_VERSION = "2.3"
 
     PRODUCTION_FILE = os.getenv(
         "UNIVERSE_PATH",
@@ -47,8 +47,10 @@ class MarketUniverse:
 
     MAX_UNIVERSE_SIZE = int(os.getenv("UNIVERSE_MAX_SIZE", "200"))
 
-    # NEW: soft cap for training safety
     TRAINING_SOFT_LIMIT = int(os.getenv("UNIVERSE_TRAINING_LIMIT", "120"))
+
+    # NEW: runtime safety cap
+    RUNTIME_FETCH_LIMIT = int(os.getenv("UNIVERSE_RUNTIME_LIMIT", "150"))
 
     MIN_FILE_BYTES = 50
 
@@ -190,7 +192,6 @@ class MarketUniverse:
         if len(normalized) != len(set(normalized)):
             raise RuntimeError("Duplicate tickers detected.")
 
-        # deterministic ordering
         normalized = sorted(normalized)
 
         cls._LAST_VERSION = version
@@ -258,9 +259,10 @@ class MarketUniverse:
 
         tickers = cls._get_cached()["tickers"]
 
-        # soft training cap
-        if len(tickers) > cls.TRAINING_SOFT_LIMIT:
+        if len(tickers) > cls.RUNTIME_FETCH_LIMIT:
+            tickers = tickers[: cls.RUNTIME_FETCH_LIMIT]
 
+        if len(tickers) > cls.TRAINING_SOFT_LIMIT:
             return tickers[: cls.TRAINING_SOFT_LIMIT]
 
         return tickers
@@ -347,4 +349,4 @@ class MarketUniverse:
             "loaded_at": cls._LAST_LOADED_AT,
             "research_mode": cls.ALLOW_RESEARCH_OVERRIDE,
             "tickers": list(cache["tickers"])
-        }
+        } 
