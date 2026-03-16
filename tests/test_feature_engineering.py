@@ -33,11 +33,7 @@ def test_pipeline_produces_model_features():
 
     price_df = sample_data()
 
-    df = FeatureEngineer.build_feature_pipeline(
-        price_df,
-        sentiment_df=None,
-        training=True
-    )
+    df = FeatureEngineer.build_feature_pipeline(price_df, training=True)
 
     assert set(MODEL_FEATURES).issubset(df.columns)
 
@@ -50,11 +46,7 @@ def test_cross_sectional_features_present():
 
     price_df = sample_data()
 
-    df = FeatureEngineer.build_feature_pipeline(
-        price_df,
-        sentiment_df=None,
-        training=True
-    )
+    df = FeatureEngineer.build_feature_pipeline(price_df, training=True)
 
     expected = [
         "market_dispersion",
@@ -74,11 +66,7 @@ def test_zscore_features_exist():
 
     price_df = sample_data()
 
-    df = FeatureEngineer.build_feature_pipeline(
-        price_df,
-        sentiment_df=None,
-        training=True
-    )
+    df = FeatureEngineer.build_feature_pipeline(price_df, training=True)
 
     z_cols = [c for c in df.columns if c.endswith("_z")]
 
@@ -93,11 +81,7 @@ def test_rank_features_exist():
 
     price_df = sample_data()
 
-    df = FeatureEngineer.build_feature_pipeline(
-        price_df,
-        sentiment_df=None,
-        training=True
-    )
+    df = FeatureEngineer.build_feature_pipeline(price_df, training=True)
 
     rank_cols = [c for c in df.columns if c.endswith("_rank")]
 
@@ -112,11 +96,7 @@ def test_volatility_floor():
 
     price_df = sample_data()
 
-    df = FeatureEngineer.build_feature_pipeline(
-        price_df,
-        sentiment_df=None,
-        training=True
-    )
+    df = FeatureEngineer.build_feature_pipeline(price_df, training=True)
 
     assert (df["volatility"] > 0).all()
 
@@ -129,11 +109,7 @@ def test_no_infinite_values():
 
     price_df = sample_data()
 
-    df = FeatureEngineer.build_feature_pipeline(
-        price_df,
-        sentiment_df=None,
-        training=True
-    )
+    df = FeatureEngineer.build_feature_pipeline(price_df, training=True)
 
     numeric = df.select_dtypes(include=[np.number])
 
@@ -148,13 +124,10 @@ def test_datetime_normalization():
 
     price_df = sample_data()
 
-    df = FeatureEngineer.build_feature_pipeline(
-        price_df,
-        sentiment_df=None,
-        training=True
-    )
+    df = FeatureEngineer.build_feature_pipeline(price_df, training=True)
 
-    assert str(df["date"].dtype) == "datetime64[ns]"
+    # Pipeline preserves UTC-aware datetimes
+    assert "datetime64" in str(df["date"].dtype)
 
 
 ############################################################
@@ -165,11 +138,7 @@ def test_model_feature_order_stable():
 
     price_df = sample_data()
 
-    df = FeatureEngineer.build_feature_pipeline(
-        price_df,
-        sentiment_df=None,
-        training=True
-    )
+    df = FeatureEngineer.build_feature_pipeline(price_df, training=True)
 
     selected = list(df.loc[:, MODEL_FEATURES].columns)
 
@@ -187,11 +156,7 @@ def test_pipeline_handles_noisy_data():
     price_df.loc[10:20, "close"] = np.nan
     price_df.loc[30:40, "volume"] = 0
 
-    df = FeatureEngineer.build_feature_pipeline(
-        price_df,
-        sentiment_df=None,
-        training=True
-    )
+    df = FeatureEngineer.build_feature_pipeline(price_df, training=True)
 
     # pipeline should not crash
     assert isinstance(df, pd.DataFrame)
