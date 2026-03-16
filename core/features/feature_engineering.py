@@ -1,7 +1,8 @@
 """
-MarketSentinel v4.3.1
+MarketSentinel v4.4.0
 
 Feature engineering pipeline for ML model training and inference.
+Robust to noisy yfinance data and missing values.
 """
 
 import logging
@@ -109,8 +110,12 @@ class FeatureEngineer:
         df = df.sort_values(["ticker", "date"]).copy()
 
         raw_returns = df.groupby("ticker")["close"].pct_change()
-        raw_returns = raw_returns.replace([np.inf, -np.inf], np.nan).fillna(0)
 
+        raw_returns = raw_returns.replace(
+            [np.inf, -np.inf], np.nan
+        ).fillna(0)
+
+        # Noise smoothing
         returns = raw_returns.groupby(df["ticker"]).transform(
             lambda x: x.rolling(3, min_periods=1).median()
         )
@@ -119,6 +124,7 @@ class FeatureEngineer:
 
         df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
         df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
+
         df["reversal_5"] = -df["return_lag5"]
 
         df["return_mean_20"] = (
@@ -180,6 +186,7 @@ class FeatureEngineer:
         df["dollar_volume"] = df["close"] * df["volume"]
 
         abs_ret = df["return"].abs()
+
         daily_illiq = abs_ret / (df["dollar_volume"] + cls.EPSILON)
 
         df["amihud"] = (
@@ -189,6 +196,8 @@ class FeatureEngineer:
         ).fillna(0)
 
         df["amihud"] = np.log1p(df["amihud"] * 1e6).clip(0, 20)
+
+        # RSI
 
         df["rsi"] = 50.0
 
@@ -202,7 +211,8 @@ class FeatureEngineer:
                     normalize=False
                 )
 
-                df.loc[group.index, "rsi"] = rsi_vals.values
+                if len(rsi_vals) == len(group):
+                    df.loc[group.index, "rsi"] = rsi_vals.values
 
             except Exception as exc:
 
@@ -290,11 +300,11 @@ class FeatureEngineer:
         for col in cols_to_process:
 
             lower = df.groupby("date")[col].transform(
-                "quantile", 0.01
+                lambda x: x.quantile(0.01)
             )
 
             upper = df.groupby("date")[col].transform(
-                "quantile", 0.99
+                lambda x: x.quantile(0.99)
             )
 
             clipped = df[col].clip(lower, upper)
@@ -352,8 +362,8 @@ class FeatureEngineer:
 
             df[col] = 0.0
 
-        # Preserve column order
         ordered_cols = list(df.columns)
+
         for col in MODEL_FEATURES:
             if col not in ordered_cols:
                 ordered_cols.append(col)
