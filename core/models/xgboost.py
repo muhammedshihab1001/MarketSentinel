@@ -1,5 +1,5 @@
 """
-MarketSentinel v4.3.0
+MarketSentinel v4.3.1
 
 XGBoost regression model wrapper with training safety guards,
 feature integrity checksums, and standardized inference scoring.
@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import random
+import time
 
 import numpy as np
 import xgboost as xgb
@@ -17,17 +18,17 @@ import xgboost as xgb
 logger = logging.getLogger("marketsentinel.xgboost")
 
 # ── Training constants ─────────────────────────────────────────────
+
 SEED = 42
 NUM_BOOST_ROUNDS = 1200
 EARLY_STOPPING_ROUNDS = 75
 VALIDATION_SPLIT = 0.15
 
 MIN_BOOST_ROUNDS = 25
-
-# NEW training safety
 MIN_TRAIN_ROWS = 120
 
 # ── Sanity thresholds ──────────────────────────────────────────────
+
 MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
 MIN_PRED_ENTROPY = 0.01
@@ -105,7 +106,12 @@ class SafeXGBRegressor:
             json.dumps(self.feature_names).encode()
         ).hexdigest()
 
+        # ── Safe validation split ─────────────────────────
+
         split_idx = int(len(X) * (1 - VALIDATION_SPLIT))
+
+        if len(X) - split_idx < MIN_VALIDATION_ROWS:
+            split_idx = len(X) - MIN_VALIDATION_ROWS
 
         X_train = X.iloc[:split_idx]
         y_train = y[:split_idx]
@@ -248,12 +254,9 @@ class SafeXGBRegressor:
         if missing:
             raise RuntimeError(f"Missing inference features: {missing}")
 
-        unexpected = set(X.columns) - set(self.feature_names)
+        X = X.reindex(columns=self.feature_names)
 
-        if unexpected:
-            logger.warning("Extra features ignored: %s", unexpected)
-
-        X = X.loc[:, self.feature_names].astype(np.float32)
+        X = X.astype(np.float32)
 
         if X.isnull().any().any():
             raise RuntimeError("NaN values in inference features.")
@@ -333,6 +336,25 @@ class SafeXGBRegressor:
             "training_fingerprint": self.training_fingerprint,
         }
 
+    # ==========================================================
+    # METADATA EXPORT
+    # ==========================================================
+
+    def export_model_metadata(self):
+
+        return {
+            "model_type": self.model_type,
+            "feature_count": len(self.feature_names),
+            "best_iteration": self.best_iteration,
+            "train_rmse": self.train_rmse,
+            "valid_rmse": self.valid_rmse,
+            "feature_checksum": self.feature_checksum,
+            "param_checksum": self.param_checksum,
+            "booster_checksum": self.booster_checksum,
+            "training_fingerprint": self.training_fingerprint,
+            "timestamp": int(time.time()),
+        }
+
 
 # ==========================================================
 # FACTORY
@@ -340,6 +362,6 @@ class SafeXGBRegressor:
 
 def build_xgboost_pipeline():
 
-    logger.info("Building XGBoost Regressor | MarketSentinel v4.3.0")
+    logger.info("Building XGBoost Regressor | MarketSentinel v4.3.1")
 
     return SafeXGBRegressor()
