@@ -1,5 +1,5 @@
 """
-MarketSentinel Institutional Evaluation Runner v4
+MarketSentinel Institutional Evaluation Runner v4.1
 Aligned with Walk-Forward Portfolio Validation
 Hybrid-Ready Governance Layer
 """
@@ -33,53 +33,55 @@ MIN_SHARPE = 0.10
 MAX_DRAWDOWN = -0.60
 MIN_WINDOWS = 5
 MAX_SHARPE_DEGRADATION = 0.10
-MAX_ALLOWED_DRIFT = 0.35
+
+# DriftDetector severity scale = 0–15
+MAX_ALLOWED_DRIFT = 8
 
 
 # =========================================================
-# DATASET BUILD (FULL FEATURE PIPELINE)
+# DATASET BUILD
 # =========================================================
 
 def build_dataset():
-    """
-    Fetch price data for all universe tickers, concatenate,
-    then run the full feature pipeline ONCE on the combined
-    dataset so cross-sectional features compute correctly.
-    """
 
     market_data = MarketDataService()
     universe = MarketUniverse.get_universe()
 
     start_date, end_date = MarketTime.window_for("xgboost")
 
-    # ── Step 1: Fetch raw price data per ticker ──────────────────────────
     price_frames = []
     fetch_failures = []
 
     for ticker in universe:
+
         try:
+
             price_df = market_data.get_price_data(
                 ticker=ticker,
                 start_date=start_date,
                 end_date=end_date,
             )
+
             if price_df is not None and not price_df.empty:
                 price_frames.append(price_df)
-        except Exception as exc:
+
+        except Exception:
             fetch_failures.append(ticker)
-            continue
 
     if not price_frames:
         raise RuntimeError("No evaluation price data fetched.")
 
     if fetch_failures:
-        print(f"Price fetch failed for {len(fetch_failures)} tickers: {fetch_failures}")
+        print(
+            f"WARNING: price fetch failed for "
+            f"{len(fetch_failures)} tickers: {fetch_failures}"
+        )
 
-    # ── Step 2: Concatenate and run feature pipeline once ────────────────
     combined_prices = pd.concat(price_frames, ignore_index=True)
 
     df = FeatureEngineer.build_feature_pipeline(
-        combined_prices, training=False
+        combined_prices,
+        training=False
     )
 
     df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
@@ -91,7 +93,8 @@ def build_dataset():
 
     print(
         f"Evaluation dataset built | rows={len(df)} "
-        f"tickers={df['ticker'].nunique()} dates={df['date'].nunique()}"
+        f"tickers={df['ticker'].nunique()} "
+        f"dates={df['date'].nunique()}"
     )
 
     return df
@@ -118,10 +121,11 @@ def compare_to_baseline(metrics):
     if baseline_sharpe is None:
         return
 
-    if metrics["avg_sharpe"] < baseline_sharpe - MAX_SHARPE_DEGRADATION:
+    if metrics.get("avg_sharpe", 0) < baseline_sharpe - MAX_SHARPE_DEGRADATION:
+
         raise RuntimeError(
             f"Sharpe degraded vs baseline. "
-            f"Current={metrics['avg_sharpe']:.4f} "
+            f"Current={metrics.get('avg_sharpe'):.4f} "
             f"Baseline={baseline_sharpe:.4f}"
         )
 
@@ -133,6 +137,7 @@ def compare_to_baseline(metrics):
 def main() -> int:
 
     print("Starting Institutional Walk-Forward CI Evaluation...")
+
     init_env()
 
     loader = ModelLoader()
@@ -140,47 +145,60 @@ def main() -> int:
     print(f"Evaluating model version: {loader.xgb_version}")
     print(f"Schema signature: {loader.schema_signature[:12]}")
 
-    # Build dataset
     df = build_dataset()
 
-    # Validate feature schema strictly
+    # Strict schema validation
     X = validate_feature_schema(
         df.loc[:, MODEL_FEATURES],
         mode="strict_contract"
     )
 
-    # Drift check
+    # =====================================================
+    # DRIFT CHECK
+    # =====================================================
+
     drift_detector = DriftDetector()
+
     drift_score = drift_detector.compute_drift(X)
 
-    print(f"Drift score: {drift_score:.4f}")
+    print(f"Drift severity score: {drift_score}")
 
     if drift_score > MAX_ALLOWED_DRIFT:
-        raise RuntimeError("Drift exceeded governance limit.")
 
-    # Walk-forward validation — retrain_model retrains per fold
-    # so each window gets a fresh model trained only on in-sample data
+        raise RuntimeError(
+            f"Drift exceeded governance limit "
+            f"(score={drift_score}, max={MAX_ALLOWED_DRIFT})"
+        )
+
+    # =====================================================
+    # WALK FORWARD VALIDATION
+    # =====================================================
+
     validator = WalkForwardValidator(
-        model_trainer=retrain_model,
+        model_trainer=retrain_model
     )
 
     metrics = validator.run(df.copy())
 
     print("Walk-forward metrics:", metrics)
 
-    # Governance enforcement
-    if metrics["avg_sharpe"] < MIN_SHARPE:
+    # =====================================================
+    # GOVERNANCE RULES
+    # =====================================================
+
+    if metrics.get("avg_sharpe", 0) < MIN_SHARPE:
         raise RuntimeError("Sharpe below governance threshold.")
 
-    if metrics["max_drawdown"] < MAX_DRAWDOWN:
+    if metrics.get("max_drawdown", 0) < MAX_DRAWDOWN:
         raise RuntimeError("Drawdown breach.")
 
-    if metrics["num_windows"] < MIN_WINDOWS:
+    if metrics.get("num_windows", 0) < MIN_WINDOWS:
         raise RuntimeError("Insufficient validation windows.")
 
     compare_to_baseline(metrics)
 
     print("CI Walk-forward evaluation PASSED.")
+
     return 0
 
 
