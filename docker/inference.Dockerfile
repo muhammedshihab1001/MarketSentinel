@@ -38,11 +38,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements/ ./requirements/
 
-RUN pip install --upgrade pip && \
-    pip install --prefer-binary --no-cache-dir -r requirements/inference.txt
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    pip install --prefer-binary -r requirements/inference.txt
 
 ############################################################
-# Remove build dependencies (smaller image)
+# Remove build dependencies
 ############################################################
 
 RUN apt-get purge -y build-essential && \
@@ -91,4 +91,13 @@ CMD curl -f http://127.0.0.1:8000/health/ready || exit 1
 # Server
 ############################################################
 
-CMD ["uvicorn", "app.main:app","--host", "0.0.0.0","--port", "8000","--workers", "1","--loop", "uvloop","--http", "httptools","--timeout-keep-alive", "30"]
+CMD [
+  "uvicorn",
+  "app.main:app",
+  "--host","0.0.0.0",
+  "--port","8000",
+  "--workers","1",
+  "--loop","uvloop",
+  "--http","httptools",
+  "--timeout-keep-alive","30"
+]
