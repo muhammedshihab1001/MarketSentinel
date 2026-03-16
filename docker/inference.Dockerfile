@@ -22,7 +22,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 ############################################################
-# System Dependencies (Minimal + XGBoost Safe)
+# System Dependencies
 ############################################################
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -39,7 +39,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements/ ./requirements/
 
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements/inference.txt
+    pip install --prefer-binary --no-cache-dir -r requirements/inference.txt
+
+############################################################
+# Remove build dependencies (smaller image)
+############################################################
+
+RUN apt-get purge -y build-essential && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
 
 ############################################################
 # Non-Root User
@@ -77,16 +85,16 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 ############################################################
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-CMD curl -f http://127.0.0.1:8000/docs || exit 1
+CMD curl -f http://127.0.0.1:8000/health/ready || exit 1
 
 ############################################################
 # Server
 ############################################################
 
-CMD ["uvicorn", "app.main:app", \
-     "--host", "0.0.0.0", \
-     "--port", "8000", \
-     "--workers", "1", \
-     "--loop", "uvloop", \
-     "--http", "httptools", \
+CMD ["uvicorn", "app.main:app",
+     "--host", "0.0.0.0",
+     "--port", "8000",
+     "--workers", "1",
+     "--loop", "uvloop",
+     "--http", "httptools",
      "--timeout-keep-alive", "30"]
