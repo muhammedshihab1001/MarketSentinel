@@ -19,10 +19,11 @@ _MAX_DAILY_GAP = 10
 
 class StockPriceFetcher:
     """
-    Wraps yfinance with retry logic, column normalisation, and
-    basic data-quality guards.
+    Safe wrapper around yfinance with retry logic,
+    rate limiting, schema normalization, and
+    basic OHLC data repairs.
 
-    Designed to be called only by YahooProvider.
+    Used internally by YahooProvider.
     """
 
     MAX_RETRIES = 5
@@ -35,7 +36,6 @@ class StockPriceFetcher:
     SOFT_FAIL_MODE = os.getenv("YFINANCE_SOFT_MODE", "1") == "1"
     SOFT_FAIL_RATIO = 0.70
 
-    # safer default interval between Yahoo requests
     MIN_REQUEST_INTERVAL = float(os.getenv("YFINANCE_MIN_INTERVAL", "2.0"))
 
     _last_request_time = 0.0
@@ -51,7 +51,6 @@ class StockPriceFetcher:
         with cls._rate_lock:
 
             now = time.time()
-
             elapsed = now - cls._last_request_time
 
             wait = cls.MIN_REQUEST_INTERVAL - elapsed
@@ -146,7 +145,7 @@ class StockPriceFetcher:
         return s.dt.tz_convert("UTC")
 
     # --------------------------------------------------
-    # VALIDATION
+    # PRICE VALIDATION
     # --------------------------------------------------
 
     @staticmethod
@@ -175,7 +174,22 @@ class StockPriceFetcher:
         return df
 
     # --------------------------------------------------
-    # DOWNLOAD (UPDATED)
+    # OHLC REPAIR (NEW)
+    # --------------------------------------------------
+
+    @staticmethod
+    def _repair_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Repair common Yahoo OHLC inconsistencies.
+        """
+
+        df["high"] = df[["high", "open", "close"]].max(axis=1)
+        df["low"] = df[["low", "open", "close"]].min(axis=1)
+
+        return df
+
+    # --------------------------------------------------
+    # DOWNLOAD
     # --------------------------------------------------
 
     def _download(
@@ -194,7 +208,6 @@ class StockPriceFetcher:
 
                 self._respect_rate_limit()
 
-                # safer endpoint than Ticker.history
                 df = yf.download(
                     tickers=ticker,
                     start=start,
@@ -315,6 +328,8 @@ class StockPriceFetcher:
             )
 
         df = self._validate_prices(df)
+
+        df = self._repair_ohlc(df)
 
         if df["date"].duplicated().any():
 
