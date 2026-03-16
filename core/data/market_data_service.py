@@ -112,13 +112,20 @@ class MarketDataService:
 
     @classmethod
     def _cap_to_safe_date(cls, date_input: str) -> pd.Timestamp:
+        """
+        Cap the requested end date to a safe cutoff (today minus lag).
 
-        # FIX: enforce UTC normalization
+        FIX: Replaced pd.Timestamp.utcnow().tz_localize("UTC") with
+        pd.Timestamp.now(tz="UTC"). The old code crashed with
+        'Cannot localize tz-aware Timestamp' because utcnow() can
+        return tz-aware in newer pandas versions, and tz_localize
+        fails on already-tz-aware timestamps.
+        """
+
         requested = pd.Timestamp(date_input, tz="UTC").normalize()
 
         safe_cutoff = (
-            pd.Timestamp.utcnow()
-            .tz_localize("UTC")
+            pd.Timestamp.now(tz="UTC")
             .normalize()
             - pd.Timedelta(days=cls.SAFE_LAG_DAYS)
         )
