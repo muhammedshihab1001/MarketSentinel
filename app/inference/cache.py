@@ -1,3 +1,8 @@
+# =========================================================
+# REDIS CACHE v9
+# Stable | Drift-Safe | CV-Optimized
+# =========================================================
+
 import redis
 import json
 import hashlib
@@ -30,7 +35,7 @@ class RedisCache:
     MIN_TTL = 30
 
     MAX_PAYLOAD_BYTES = 256_000
-    CACHE_NAMESPACE_VERSION = "v8"
+    CACHE_NAMESPACE_VERSION = "v9"
 
     ###################################################
 
@@ -90,7 +95,7 @@ class RedisCache:
 
             logger.info("Redis connected.")
 
-        except Exception:
+        except Exception as exc:
 
             self.enabled = False
 
@@ -108,7 +113,8 @@ class RedisCache:
             )
 
             logger.warning(
-                "Redis unavailable. Retry in %ss",
+                "Redis unavailable (%s). Retry in %ss",
+                exc,
                 self._retry_delay
             )
 
@@ -145,6 +151,7 @@ class RedisCache:
     def build_key(self, payload: dict) -> str:
 
         raw = self._canonical_json(payload)
+
         fingerprint = hashlib.sha256(raw.encode()).hexdigest()
 
         return (
@@ -157,17 +164,16 @@ class RedisCache:
         )
 
     ###################################################
-    # PAYLOAD VALIDATION (TEST COMPATIBILITY)
+    # PAYLOAD VALIDATION
     ###################################################
 
     def _validate_payload(self, payload):
-        """
-        Compatibility method for tests.
-        Accepts a list of signal rows.
-        """
 
         if not isinstance(payload, list):
             raise RuntimeError("Payload must be a list.")
+
+        if len(payload) == 0:
+            raise RuntimeError("Payload cannot be empty.")
 
         for row in payload:
 
@@ -231,7 +237,13 @@ class RedisCache:
                 CACHE_MISSES.inc()
                 return None
 
-            decompressed = zlib.decompress(data)
+            try:
+                decompressed = zlib.decompress(data)
+            except Exception:
+                logger.warning("Corrupted compressed cache entry removed.")
+                self.client.delete(key)
+                CACHE_MISSES.inc()
+                return None
 
             if len(decompressed) > self.MAX_PAYLOAD_BYTES:
                 logger.warning("Oversized decompressed cache entry removed.")
@@ -239,7 +251,13 @@ class RedisCache:
                 CACHE_MISSES.inc()
                 return None
 
-            obj = json.loads(decompressed)
+            try:
+                obj = json.loads(decompressed)
+            except Exception:
+                logger.warning("Invalid JSON cache entry removed.")
+                self.client.delete(key)
+                CACHE_MISSES.inc()
+                return None
 
             self._validate_snapshot(obj)
 
