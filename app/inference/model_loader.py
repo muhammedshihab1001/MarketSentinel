@@ -1,5 +1,5 @@
 # =========================================================
-# MODEL LOADER v2.4
+# MODEL LOADER v2.5
 # Hybrid Multi-Agent Compatible | CV-Optimized Governance
 # Pointer-Fallback Enabled | Baseline Verified
 # =========================================================
@@ -28,45 +28,24 @@ from app.monitoring.metrics import MODEL_VERSION
 logger = logging.getLogger("marketsentinel.loader")
 
 
-# =========================================================
-# LOADED MODEL CONTAINER
-# =========================================================
-
 @dataclass(frozen=True)
 class LoadedModel:
 
     model: object
-
     version: str
-
     schema_signature: str
-
     schema_version: str
-
     dataset_hash: str
-
     artifact_hash: str
-
     feature_checksum: str
-
     universe_hash: str
-
     training_code_hash: Optional[str]
-
     reproducibility_hash: Optional[str]
-
     pointer_hash: Optional[str]
-
     training_fingerprint: Optional[str]
-
     baseline_available: bool
-
     baseline_hash: Optional[str]
 
-
-# =========================================================
-# MODEL LOADER (Singleton)
-# =========================================================
 
 class ModelLoader:
 
@@ -84,8 +63,6 @@ class ModelLoader:
 
     ALLOW_POINTER_FALLBACK = os.getenv("MODEL_ALLOW_POINTER_FALLBACK", "1") == "1"
 
-    # -----------------------------------------------------
-
     def __new__(cls, *args, **kwargs):
 
         if cls._instance is None:
@@ -93,12 +70,9 @@ class ModelLoader:
             with cls._instance_lock:
 
                 if cls._instance is None:
-
                     cls._instance = super().__new__(cls)
 
         return cls._instance
-
-    # -----------------------------------------------------
 
     def __init__(self):
 
@@ -106,14 +80,10 @@ class ModelLoader:
             return
 
         self._reload_lock = threading.Lock()
-
         self._xgb_container: Optional[LoadedModel] = None
-
         self._initialized = True
 
-    # =====================================================
-    # HASH UTIL
-    # =====================================================
+    ########################################################
 
     def _sha256(self, path: str) -> str:
 
@@ -122,14 +92,11 @@ class ModelLoader:
         with open(path, "rb") as f:
 
             for chunk in iter(lambda: f.read(1 << 20), b""):
-
                 h.update(chunk)
 
         return h.hexdigest()
 
-    # =====================================================
-    # FEATURE CHECKSUM
-    # =====================================================
+    ########################################################
 
     def _compute_feature_checksum(self):
 
@@ -140,9 +107,7 @@ class ModelLoader:
 
         return hashlib.sha256(canonical).hexdigest()
 
-    # =====================================================
-    # BASELINE VERIFICATION
-    # =====================================================
+    ########################################################
 
     def _verify_baseline(self):
 
@@ -155,13 +120,11 @@ class ModelLoader:
         try:
 
             with open(self.BASELINE_PATH, encoding="utf-8") as f:
-
                 baseline = json.load(f)
 
             integrity = baseline.get("integrity_hash")
 
             clone = dict(baseline)
-
             clone.pop("integrity_hash", None)
 
             canonical = json.dumps(clone, sort_keys=True).encode()
@@ -182,9 +145,7 @@ class ModelLoader:
 
             return False, None
 
-    # =====================================================
-    # REGISTRY
-    # =====================================================
+    ########################################################
 
     def _get_registry_dir(self):
 
@@ -198,9 +159,7 @@ class ModelLoader:
 
         return base_dir
 
-    # =====================================================
-    # POINTER RESOLUTION
-    # =====================================================
+    ########################################################
 
     def _resolve_production_version(self, base_dir) -> Tuple[str, str, str, Optional[str]]:
 
@@ -220,8 +179,10 @@ class ModelLoader:
         pointer_hash = self._sha256(pointer_path)
 
         with open(pointer_path, encoding="utf-8") as f:
-
             pointer = json.load(f)
+
+        if not isinstance(pointer, dict):
+            raise RuntimeError("Invalid pointer structure.")
 
         version = pointer.get("model_version")
 
@@ -229,24 +190,20 @@ class ModelLoader:
             raise RuntimeError("Invalid production pointer format.")
 
         model_path = os.path.join(base_dir, f"model_{version}.pkl")
-
         metadata_path = os.path.join(base_dir, f"metadata_{version}.json")
 
         if not os.path.exists(model_path) or not os.path.exists(metadata_path):
-
             raise RuntimeError("Pointer references missing model artifacts.")
 
         return model_path, metadata_path, version, pointer_hash
 
-    # -----------------------------------------------------
+    ########################################################
 
     def _resolve_latest_version(self, base_dir):
 
-        files = os.listdir(base_dir)
-
         versions = []
 
-        for f in files:
+        for f in os.listdir(base_dir):
 
             if f.startswith("model_") and f.endswith(".pkl"):
 
@@ -257,23 +214,17 @@ class ModelLoader:
         if not versions:
             raise RuntimeError("No model artifacts found.")
 
-        # Versions are timestamp-based (e.g. "20240115_143022")
-        # which sort correctly as plain strings — newest is last
         latest_version = sorted(versions)[-1]
 
         model_path = os.path.join(base_dir, f"model_{latest_version}.pkl")
-
         metadata_path = os.path.join(base_dir, f"metadata_{latest_version}.json")
 
         if not os.path.exists(metadata_path):
-
             raise RuntimeError("Metadata missing for latest model.")
 
         return model_path, metadata_path, latest_version, None
 
-    # =====================================================
-    # SAFE MODEL LOAD
-    # =====================================================
+    ########################################################
 
     def _safe_load_model(self, model_path):
 
@@ -285,22 +236,9 @@ class ModelLoader:
         if not hasattr(model, "predict"):
             raise RuntimeError("Invalid model artifact.")
 
-        if hasattr(model, "feature_names"):
-
-            if list(model.feature_names) != list(MODEL_FEATURES):
-
-                msg = "Model feature order mismatch."
-
-                if self.STRICT_GOVERNANCE:
-                    raise RuntimeError(msg)
-
-                logger.warning(msg)
-
         return model
 
-    # =====================================================
-    # RELOAD LOGIC
-    # =====================================================
+    ########################################################
 
     def _reload_xgb_if_needed(self):
 
@@ -312,9 +250,9 @@ class ModelLoader:
                 self._resolve_production_version(base_dir)
 
             if (
-                self._xgb_container and
-                self._xgb_container.version == version and
-                self._xgb_container.pointer_hash == pointer_hash
+                self._xgb_container
+                and self._xgb_container.version == version
+                and self._xgb_container.pointer_hash == pointer_hash
             ):
                 return self._xgb_container.model
 
@@ -325,19 +263,31 @@ class ModelLoader:
 
             meta = MetadataManager.load_metadata(metadata_path)
 
-            actual_hash = self._sha256(model_path)
+            artifact_hash = self._sha256(model_path)
 
-            if meta.get("artifact_hash") != actual_hash:
+            if meta.get("artifact_hash") != artifact_hash:
                 raise RuntimeError("Artifact tampering detected.")
+
+            feature_checksum = self._compute_feature_checksum()
+
+            if meta.get("feature_checksum") != feature_checksum:
+
+                msg = "Feature schema mismatch."
+
+                if self.STRICT_GOVERNANCE:
+                    raise RuntimeError(msg)
+
+                logger.warning(msg)
 
             model = self._safe_load_model(model_path)
 
             baseline_available, baseline_hash = self._verify_baseline()
 
-            training_fingerprint = getattr(
-                model,
-                "training_fingerprint",
-                None
+            logger.info(
+                "Model loaded | version=%s | dataset=%s | schema=%s",
+                version,
+                meta.get("dataset_hash"),
+                meta.get("schema_version")
             )
 
             new_container = LoadedModel(
@@ -352,7 +302,7 @@ class ModelLoader:
                 training_code_hash=meta.get("training_code_hash"),
                 reproducibility_hash=meta.get("reproducibility_hash"),
                 pointer_hash=pointer_hash,
-                training_fingerprint=training_fingerprint,
+                training_fingerprint=getattr(model, "training_fingerprint", None),
                 baseline_available=baseline_available,
                 baseline_hash=baseline_hash
             )
@@ -364,89 +314,10 @@ class ModelLoader:
                 version=version
             ).set(1)
 
-            logger.info(
-                "Model loaded | version=%s | baseline=%s",
-                version,
-                "OK" if baseline_available else "MISSING"
-            )
-
             return new_container.model
 
-    # =====================================================
-    # PUBLIC ACCESSORS
-    # =====================================================
+    ########################################################
 
     @property
     def xgb(self):
         return self._reload_xgb_if_needed()
-
-    @property
-    def xgb_version(self):
-        self._reload_xgb_if_needed()
-        return getattr(self._xgb_container, "version", None)
-
-    @property
-    def schema_signature(self):
-        self._reload_xgb_if_needed()
-        return getattr(self._xgb_container, "schema_signature", None)
-
-    @property
-    def dataset_hash(self):
-        self._reload_xgb_if_needed()
-        return getattr(self._xgb_container, "dataset_hash", None)
-
-    @property
-    def artifact_hash(self):
-        self._reload_xgb_if_needed()
-        return getattr(self._xgb_container, "artifact_hash", None)
-
-    @property
-    def training_code_hash(self):
-        self._reload_xgb_if_needed()
-        return getattr(self._xgb_container, "training_code_hash", None)
-
-    @property
-    def feature_checksum(self):
-        self._reload_xgb_if_needed()
-        return getattr(self._xgb_container, "feature_checksum", None)
-
-    # =====================================================
-    # FEATURE IMPORTANCE
-    # =====================================================
-
-    def get_feature_importance(self):
-
-        model = self.xgb
-
-        if not hasattr(model, "export_feature_importance"):
-            raise RuntimeError(
-                "Model does not support feature importance export."
-            )
-
-        return model.export_feature_importance()
-
-    # =====================================================
-    # WARMUP
-    # =====================================================
-
-    def warmup(self):
-
-        logger.info("Model warmup triggered.")
-
-        model = self.xgb
-
-        try:
-            # SafeXGBRegressor.predict() expects a DataFrame with
-            # named columns matching MODEL_FEATURES, not a numpy array.
-            dummy = pd.DataFrame(
-                np.zeros((1, len(MODEL_FEATURES)), dtype=np.float32),
-                columns=MODEL_FEATURES,
-            )
-
-            model.predict(dummy)
-
-            logger.info("Model warmup inference OK.")
-
-        except Exception as exc:
-
-            logger.warning("Model warmup inference failed (non-critical): %s", exc)
