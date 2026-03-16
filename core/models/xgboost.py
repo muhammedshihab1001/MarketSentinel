@@ -1,5 +1,5 @@
 """
-MarketSentinel v4.3.1
+MarketSentinel v4.4.0
 
 XGBoost regression model wrapper with training safety guards,
 feature integrity checksums, and standardized inference scoring.
@@ -98,15 +98,17 @@ class SafeXGBRegressor:
         self.feature_names = list(X.columns)
         self.training_cols = X.shape[1]
 
+        # fingerprint
         self.training_fingerprint = hashlib.sha256(
             X.to_numpy().tobytes() + y.tobytes()
         ).hexdigest()
 
+        # feature checksum
         self.feature_checksum = hashlib.sha256(
-            json.dumps(self.feature_names).encode()
+            json.dumps(sorted(self.feature_names)).encode()
         ).hexdigest()
 
-        # ── Safe validation split ─────────────────────────
+        # ── time-series safe validation split ───────────────
 
         split_idx = int(len(X) * (1 - VALIDATION_SPLIT))
 
@@ -144,8 +146,11 @@ class SafeXGBRegressor:
                 len(X_valid),
             )
 
+        # GPU support
         use_gpu = os.getenv("XGB_USE_GPU", "false").lower() == "true"
         n_threads = int(os.getenv("XGB_NTHREAD", "-1"))
+
+        tree_method = "gpu_hist" if use_gpu else "hist"
 
         params = {
             "objective": "reg:squarederror",
@@ -158,7 +163,7 @@ class SafeXGBRegressor:
             "gamma": 0.05,
             "reg_alpha": 0.3,
             "reg_lambda": 1.2,
-            "tree_method": "gpu_hist" if use_gpu else "hist",
+            "tree_method": tree_method,
             "seed": SEED,
             "nthread": n_threads,
             "verbosity": 0,
@@ -170,15 +175,33 @@ class SafeXGBRegressor:
 
         evals_result = {}
 
-        self.model = xgb.train(
-            params,
-            dtrain,
-            num_boost_round=NUM_BOOST_ROUNDS,
-            evals=evals,
-            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-            verbose_eval=False,
-            evals_result=evals_result,
-        )
+        try:
+
+            self.model = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=NUM_BOOST_ROUNDS,
+                evals=evals,
+                early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+                verbose_eval=False,
+                evals_result=evals_result,
+            )
+
+        except xgb.core.XGBoostError:
+
+            logger.warning("GPU unavailable — falling back to CPU.")
+
+            params["tree_method"] = "hist"
+
+            self.model = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=NUM_BOOST_ROUNDS,
+                evals=evals,
+                early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+                verbose_eval=False,
+                evals_result=evals_result,
+            )
 
         self.best_iteration = (
             self.model.best_iteration
@@ -362,6 +385,6 @@ class SafeXGBRegressor:
 
 def build_xgboost_pipeline():
 
-    logger.info("Building XGBoost Regressor | MarketSentinel v4.3.1")
+    logger.info("Building XGBoost Regressor | MarketSentinel v4.4.0")
 
     return SafeXGBRegressor()
