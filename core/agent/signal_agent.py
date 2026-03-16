@@ -1,5 +1,5 @@
 """
-MarketSentinel v4.2.0
+MarketSentinel v4.2.1
 
 Signal Agent — interprets XGBoost model output into a structured
 trading signal with confidence, risk level, and position sizing hint.
@@ -49,17 +49,14 @@ class SignalAgent(BaseAgent):
     def _safe_float(self, value, default=0.0):
 
         try:
-
             v = float(value)
 
             if not np.isfinite(v):
-
                 return default
 
             return v
 
         except Exception:
-
             return default
 
     # ============================================================
@@ -89,7 +86,7 @@ class SignalAgent(BaseAgent):
         return alignment
 
     # ============================================================
-    # CONFIDENCE HELPERS
+    # CONFIDENCE
     # ============================================================
 
     def _confidence_numeric(self, abs_score):
@@ -130,7 +127,7 @@ class SignalAgent(BaseAgent):
         return float(np.clip(base, self.MIN_POSITION_SIZE, self.MAX_POSITION_SIZE))
 
     # ============================================================
-    # MAIN ANALYZE
+    # MAIN ANALYSIS
     # ============================================================
 
     def analyze(self, context: Dict[str, Any]):
@@ -172,7 +169,6 @@ class SignalAgent(BaseAgent):
         signal = row.get("signal", "NEUTRAL")
 
         if signal not in {"LONG", "SHORT", "NEUTRAL"}:
-
             signal = "NEUTRAL"
 
         volatility = self._safe_float(row.get("volatility"), 0.0)
@@ -189,29 +185,56 @@ class SignalAgent(BaseAgent):
 
         reasoning: List[str] = []
 
+        # ---------------------------------------------------------
+        # CONFIDENCE
+        # ---------------------------------------------------------
+
         confidence = self._confidence_numeric(abs_score)
 
         confidence = self._volatility_adjusted_confidence(confidence, volatility)
+
+        # ---------------------------------------------------------
+        # DISPERSION WARNING
+        # ---------------------------------------------------------
 
         if probability_stats:
 
             std = self._safe_float(probability_stats.get("std"), 0.0)
 
             if std < 0.05:
-
                 warnings.append("Low cross-sectional dispersion")
+
+        # ---------------------------------------------------------
+        # MOMENTUM CONTRADICTION (TEST REQUIRED)
+        # ---------------------------------------------------------
+
+        if signal == "LONG" and momentum_z < -0.5:
+            warnings.append("Momentum contradicts LONG signal")
+
+        if signal == "SHORT" and momentum_z > 0.5:
+            warnings.append("Momentum contradicts SHORT signal")
+
+        # ---------------------------------------------------------
+        # TECHNICAL ALIGNMENT
+        # ---------------------------------------------------------
 
         alignment = self._alignment_score(signal, momentum_z, ema_ratio)
 
         technical_score = alignment / 2.0
 
-        if signal == "LONG" and rsi > self.RSI_OVERBOUGHT:
+        # ---------------------------------------------------------
+        # RSI EXTREMES
+        # ---------------------------------------------------------
 
+        if signal == "LONG" and rsi > self.RSI_OVERBOUGHT:
             warnings.append("RSI overbought — LONG entry risk elevated")
 
         if signal == "SHORT" and rsi < self.RSI_OVERSOLD:
-
             warnings.append("RSI oversold — SHORT entry risk elevated")
+
+        # ---------------------------------------------------------
+        # VOLATILITY REGIME
+        # ---------------------------------------------------------
 
         if regime_feat > 1.5:
 
@@ -224,6 +247,10 @@ class SignalAgent(BaseAgent):
         else:
 
             volatility_regime = "normal"
+
+        # ---------------------------------------------------------
+        # RISK LEVEL
+        # ---------------------------------------------------------
 
         if volatility_regime == "high_volatility":
 
@@ -241,6 +268,10 @@ class SignalAgent(BaseAgent):
 
             risk_level = "low"
 
+        # ---------------------------------------------------------
+        # DRIFT PENALTY
+        # ---------------------------------------------------------
+
         drift_flag = False
 
         if drift_state in {"soft", "hard"}:
@@ -251,6 +282,10 @@ class SignalAgent(BaseAgent):
 
             warnings.append(f"Drift detected: {drift_state}")
 
+        # ---------------------------------------------------------
+        # POLITICAL RISK
+        # ---------------------------------------------------------
+
         if political_risk_label == "CRITICAL":
 
             signal = "NEUTRAL"
@@ -258,6 +293,10 @@ class SignalAgent(BaseAgent):
             warnings.append("Political risk CRITICAL — trading disabled")
 
         confidence = float(np.clip(confidence, 0.0, 1.0))
+
+        # ---------------------------------------------------------
+        # AGENT SCORE
+        # ---------------------------------------------------------
 
         agent_score = float(np.clip(
 
@@ -268,6 +307,10 @@ class SignalAgent(BaseAgent):
             0.0, 1.0
 
         ))
+
+        # ---------------------------------------------------------
+        # TRADE APPROVAL
+        # ---------------------------------------------------------
 
         conf_threshold = (
 
@@ -285,6 +328,10 @@ class SignalAgent(BaseAgent):
             and political_risk_label != "CRITICAL"
 
         )
+
+        # ---------------------------------------------------------
+        # POSITION SIZE
+        # ---------------------------------------------------------
 
         position_size_hint = self._suggest_position_size(
 
