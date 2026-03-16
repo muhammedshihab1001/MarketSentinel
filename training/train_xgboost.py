@@ -1,5 +1,5 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.5)
+# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.6)
 # CV-Ready | Walk-Forward Validated | Drift Governance
 # ==========================================================
 
@@ -48,10 +48,7 @@ TARGET_CLIP = 5.0
 LOW_VARIANCE_THRESHOLD = 1e-6
 MAX_DATASET_ROWS = 1_000_000
 
-# allow partial universe failure
 MIN_SUCCESSFUL_TICKERS = 8
-
-# safeguard for XGBoost early stop edge case
 MIN_BOOST_ROUNDS = 10
 
 
@@ -76,7 +73,9 @@ def sha256_file(path):
     h = hashlib.sha256()
 
     with open(path, "rb") as f:
+
         for chunk in iter(lambda: f.read(1 << 20), b""):
+
             h.update(chunk)
 
     return h.hexdigest()
@@ -132,6 +131,7 @@ def build_baseline_from_dataframe(df, model_version, dataset_hash):
     for col in MODEL_FEATURES:
 
         series = pd.to_numeric(feature_block[col], errors="coerce")
+
         series = series.replace([np.inf, -np.inf], np.nan).dropna()
 
         if len(series) < 50:
@@ -174,86 +174,10 @@ def build_baseline_from_dataframe(df, model_version, dataset_hash):
     baseline["integrity_hash"] = hashlib.sha256(canonical).hexdigest()
 
     with open(BASELINE_PATH, "w", encoding="utf-8") as f:
+
         json.dump(baseline, f, indent=2)
 
     logger.info("Baseline created/updated.")
-
-
-# ==========================================================
-# ARTIFACT EXPORT
-# ==========================================================
-
-def export_artifacts(
-    model,
-    metrics,
-    dataset_hash,
-    dataset_rows,
-    start_date,
-    end_date,
-    training_df,
-    promote_baseline=False,
-    create_baseline=False,
-):
-    """Export trained model, metadata, and optionally baseline + production pointer."""
-
-    os.makedirs(MODEL_DIR, exist_ok=True)
-
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    version = timestamp
-
-    model_path = os.path.join(MODEL_DIR, f"model_{version}.pkl")
-    metadata_path = os.path.join(MODEL_DIR, f"metadata_{version}.json")
-
-    # Save model artifact
-    joblib.dump(model, model_path)
-    artifact_hash = sha256_file(model_path)
-
-    # Build metadata
-    metadata = MetadataManager.create_metadata(
-        model_name="xgboost_regressor",
-        metrics=metrics,
-        features=MODEL_FEATURES,
-        training_start=str(start_date),
-        training_end=str(end_date),
-        dataset_hash=dataset_hash,
-        dataset_rows=dataset_rows,
-        metadata_type="xgboost_model",
-        artifact_hash=artifact_hash,
-        feature_checksum=compute_feature_checksum(),
-        extra_fields={
-            "model_version": version,
-            "reproducibility_hash": compute_reproducibility_hash(dataset_hash),
-        },
-    )
-
-    MetadataManager.save_metadata(metadata, metadata_path)
-
-    logger.info("Artifacts saved | version=%s", version)
-
-    # Baseline creation
-    if create_baseline or promote_baseline:
-        build_baseline_from_dataframe(
-            df=training_df,
-            model_version=version,
-            dataset_hash=dataset_hash,
-        )
-
-    # Production pointer
-    if promote_baseline:
-
-        pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
-
-        pointer_data = {
-            "model_version": version,
-            "promoted_at": timestamp,
-        }
-
-        with open(pointer_path, "w", encoding="utf-8") as f:
-            json.dump(pointer_data, f, indent=2)
-
-        logger.info("Model promoted to production.")
-
-    return version
 
 
 # ==========================================================
@@ -279,8 +203,13 @@ def load_training_data(start_date, end_date):
                 end_date=end_date,
             )
 
-            if df is not None and not df.empty:
-                price_frames.append(df)
+            if df is None or df.empty:
+                continue
+
+            if "close" not in df.columns:
+                continue
+
+            price_frames.append(df)
 
         except Exception as exc:
 
@@ -387,6 +316,10 @@ def trainer(train_df):
 
     train_df = train_df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
+    if not set(MODEL_FEATURES).issubset(train_df.columns):
+
+        raise RuntimeError("Missing expected feature columns before training.")
+
     X = validate_feature_schema(
         train_df.loc[:, MODEL_FEATURES],
         mode="training",
@@ -402,9 +335,12 @@ def trainer(train_df):
 
     pipeline = build_xgboost_pipeline()
 
+    start = time.time()
+
     pipeline.fit(X, y)
 
-    # safeguard for early stopping edge cases
+    logger.info("Training runtime %.2f sec", time.time() - start)
+
     if getattr(pipeline, "best_iteration", 0) < MIN_BOOST_ROUNDS:
 
         logger.warning(
