@@ -36,7 +36,6 @@ class MarketDataService:
     MEMORY_CACHE_TTL = 30
     MEMORY_CACHE_MAX = 200
 
-    # safer rate limit for Yahoo
     GLOBAL_RATE_LIMIT_PER_SEC = 2
 
     BATCH_SPACING_SECONDS = 0.20
@@ -117,8 +116,7 @@ class MarketDataService:
         requested = pd.Timestamp(date_input).normalize()
 
         safe_cutoff = (
-            pd.Timestamp.now(tz="UTC")
-            .tz_localize(None)
+            pd.Timestamp.utcnow()
             .normalize()
             - pd.Timedelta(days=cls.SAFE_LAG_DAYS)
         )
@@ -328,6 +326,9 @@ class MarketDataService:
                 min_rows=min_history,
             )
 
+            if df is None:
+                raise RuntimeError(f"Provider returned no data for {ticker}")
+
             df = self._validate_dataset(df, ticker, min_history)
 
             self._set_memory_cache(cache_key, df)
@@ -383,7 +384,6 @@ class MarketDataService:
                     )
                 ] = ticker
 
-                # jitter prevents synchronized bursts
                 time.sleep(self.BATCH_SPACING_SECONDS + np.random.uniform(0.05, 0.15))
 
             for future in as_completed(futures):
