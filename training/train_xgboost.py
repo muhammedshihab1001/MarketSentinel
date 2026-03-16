@@ -1,5 +1,5 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.3)
+# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.4)
 # CV-Ready | Walk-Forward Validated | Drift Governance
 # ==========================================================
 
@@ -39,6 +39,7 @@ BASELINE_PATH = os.path.join(DRIFT_DIR, "baseline.json")
 PRODUCTION_POINTER = "production_pointer.json"
 
 SEED = 42
+
 MIN_TRAINING_ROWS = 1200
 MIN_UNIQUE_DATES = 250
 MIN_CS_WIDTH = 8
@@ -47,13 +48,18 @@ TARGET_CLIP = 5.0
 LOW_VARIANCE_THRESHOLD = 1e-6
 MAX_DATASET_ROWS = 1_000_000
 
+# NEW: allow partial universe failure
+MIN_SUCCESSFUL_TICKERS = 8
+
 
 # ==========================================================
 # DETERMINISM
 # ==========================================================
 
 def enforce_determinism():
+
     os.environ["PYTHONHASHSEED"] = str(SEED)
+
     random.seed(SEED)
     np.random.seed(SEED)
 
@@ -63,28 +69,37 @@ def enforce_determinism():
 # ==========================================================
 
 def sha256_file(path):
+
     h = hashlib.sha256()
+
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
+
     return h.hexdigest()
 
 
-def compute_dataset_hash(df: pd.DataFrame) -> str:
+def compute_dataset_hash(df: pd.DataFrame):
+
     df_sorted = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
     return MetadataManager.fingerprint_dataset(df_sorted)
 
 
 def compute_feature_checksum():
+
     return MetadataManager.fingerprint_features(tuple(MODEL_FEATURES))
 
 
 def compute_training_code_hash():
+
     source = inspect.getsource(build_xgboost_pipeline)
+
     return hashlib.sha256(source.encode()).hexdigest()
 
 
 def compute_reproducibility_hash(dataset_hash):
+
     payload = {
         "dataset_hash": dataset_hash,
         "schema_signature": get_schema_signature(),
@@ -93,7 +108,9 @@ def compute_reproducibility_hash(dataset_hash):
         "universe_hash": MarketUniverse.fingerprint(),
         "training_code_hash": compute_training_code_hash()
     }
+
     canonical = json.dumps(payload, sort_keys=True).encode()
+
     return hashlib.sha256(canonical).hexdigest()
 
 
@@ -101,7 +118,7 @@ def compute_reproducibility_hash(dataset_hash):
 # BASELINE BUILDER
 # ==========================================================
 
-def build_baseline_from_dataframe(df: pd.DataFrame, model_version: str, dataset_hash: str):
+def build_baseline_from_dataframe(df, model_version, dataset_hash):
 
     os.makedirs(DRIFT_DIR, exist_ok=True)
 
@@ -119,19 +136,18 @@ def build_baseline_from_dataframe(df: pd.DataFrame, model_version: str, dataset_
 
         mean = float(series.mean())
         std = float(series.std())
-        variance = float(series.var())
 
         try:
-            counts, bin_edges = np.histogram(series, bins=10)
+            counts, bins = np.histogram(series, bins=10)
         except Exception:
             continue
 
         features_payload[col] = {
             "mean": mean,
             "std": std,
-            "variance": variance,
-            "bin_edges": bin_edges.tolist(),
-            "expected_counts": counts.tolist()
+            "variance": float(series.var()),
+            "bin_edges": bins.tolist(),
+            "expected_counts": counts.tolist(),
         }
 
     baseline = {
@@ -143,44 +159,49 @@ def build_baseline_from_dataframe(df: pd.DataFrame, model_version: str, dataset_
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "dataset_hash": dataset_hash,
             "model_version": model_version,
-            "universe_hash": MarketUniverse.fingerprint()
+            "universe_hash": MarketUniverse.fingerprint(),
         },
-        "features": features_payload
+        "features": features_payload,
     }
 
     clone = dict(baseline)
+
     canonical = json.dumps(clone, sort_keys=True).encode()
+
     baseline["integrity_hash"] = hashlib.sha256(canonical).hexdigest()
 
     with open(BASELINE_PATH, "w", encoding="utf-8") as f:
         json.dump(baseline, f, indent=2)
 
-    logger.info("Baseline created/updated at %s", BASELINE_PATH)
+    logger.info("Baseline created/updated.")
 
 
 # ==========================================================
 # ARTIFACT EXPORT
 # ==========================================================
 
-def export_artifacts(model,
-                     metrics,
-                     dataset_hash,
-                     dataset_rows,
-                     start_date,
-                     end_date,
-                     training_df,
-                     promote_baseline=False,
-                     create_baseline=False):
+def export_artifacts(
+    model,
+    metrics,
+    dataset_hash,
+    dataset_rows,
+    start_date,
+    end_date,
+    training_df,
+    promote_baseline=False,
+    create_baseline=False,
+):
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    version = timestamp
+    version = time.strftime("%Y%m%d_%H%M%S")
 
     model_path = os.path.join(MODEL_DIR, f"model_{version}.pkl")
+
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{version}.json")
 
     joblib.dump(model, model_path)
+
     artifact_hash = sha256_file(model_path)
 
     metadata = MetadataManager.create_metadata(
@@ -197,7 +218,7 @@ def export_artifacts(model,
         extra_fields={
             "model_version": version,
             "reproducibility_hash": compute_reproducibility_hash(dataset_hash),
-        }
+        },
     )
 
     MetadataManager.save_metadata(metadata, metadata_path)
@@ -205,23 +226,27 @@ def export_artifacts(model,
     logger.info("Artifacts saved | version=%s", version)
 
     if create_baseline or promote_baseline:
+
         build_baseline_from_dataframe(
-            df=training_df,
-            model_version=version,
-            dataset_hash=dataset_hash
+            training_df,
+            version,
+            dataset_hash,
         )
 
     if promote_baseline:
 
         pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
 
-        pointer_data = {
-            "model_version": version,
-            "promoted_at": timestamp
-        }
-
         with open(pointer_path, "w", encoding="utf-8") as f:
-            json.dump(pointer_data, f, indent=2)
+
+            json.dump(
+                {
+                    "model_version": version,
+                    "promoted_at": version,
+                },
+                f,
+                indent=2,
+            )
 
         logger.info("Model promoted to production.")
 
@@ -233,93 +258,81 @@ def export_artifacts(model,
 # ==========================================================
 
 def load_training_data(start_date, end_date):
-    """
-    Fetch price data for all universe tickers, concatenate,
-    then run the full feature pipeline ONCE on the combined
-    dataset so cross-sectional features compute correctly.
-
-    Previous bug: per-ticker FeatureStore.get_features() called
-    add_cross_sectional_features() with only 1 ticker per date,
-    which always fell below MIN_CS_WIDTH → empty DataFrames.
-    """
 
     market_data = MarketDataService()
+
     universe = MarketUniverse.get_universe()
 
-    # ── Step 1: Fetch raw price data per ticker ──────────────────────────
     price_frames = []
-    fetch_failures = []
+
+    failures = []
 
     for ticker in universe:
+
         try:
-            price_df = market_data.get_price_data(
+
+            df = market_data.get_price_data(
                 ticker=ticker,
                 start_date=start_date,
                 end_date=end_date,
             )
-            if price_df is not None and not price_df.empty:
-                price_frames.append(price_df)
+
+            if df is not None and not df.empty:
+
+                price_frames.append(df)
+
         except Exception as exc:
-            fetch_failures.append(ticker)
-            logger.warning(
-                "Ticker failed during price fetch: %s | %s", ticker, exc
-            )
 
-    if not price_frames:
+            failures.append(ticker)
+
+            logger.warning("Price fetch failed for %s | %s", ticker, exc)
+
+    if len(price_frames) < MIN_SUCCESSFUL_TICKERS:
+
         raise RuntimeError(
-            f"All {len(universe)} tickers failed during price fetch."
+            f"Too many tickers failed ({len(price_frames)} usable)"
         )
 
-    if fetch_failures:
-        logger.warning(
-            "Price fetch failed for %d/%d tickers: %s",
-            len(fetch_failures), len(universe), fetch_failures,
-        )
-
-    # ── Step 2: Concatenate all tickers ──────────────────────────────────
     combined_prices = pd.concat(price_frames, ignore_index=True)
 
     if len(combined_prices) > MAX_DATASET_ROWS:
-        logger.warning("Dataset very large — trimming to %d rows", MAX_DATASET_ROWS)
-        combined_prices = combined_prices.sort_values(
-            ["date", "ticker"]
-        ).tail(MAX_DATASET_ROWS)
 
-    # ── Step 3: Run full feature pipeline on combined data ───────────────
-    #    This correctly computes core features per-ticker AND
-    #    cross-sectional features across all tickers per date.
+        combined_prices = (
+            combined_prices
+            .sort_values(["date", "ticker"])
+            .tail(MAX_DATASET_ROWS)
+        )
+
     df = FeatureEngineer.build_feature_pipeline(
-        combined_prices, training=True
+        combined_prices,
+        training=True,
     )
 
-    # ── Step 4: Validate ─────────────────────────────────────────────────
     if len(df) < MIN_TRAINING_ROWS:
-        raise RuntimeError(
-            f"Dataset too small after feature engineering: "
-            f"{len(df)} rows, need {MIN_TRAINING_ROWS}."
-        )
+
+        raise RuntimeError("Dataset too small after feature engineering.")
 
     if df["date"].nunique() < MIN_UNIQUE_DATES:
-        raise RuntimeError(
-            f"Insufficient unique dates: "
-            f"{df['date'].nunique()}, need {MIN_UNIQUE_DATES}."
-        )
+
+        raise RuntimeError("Not enough unique trading dates.")
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="training")
 
     logger.info(
-        "Training data loaded | rows=%d tickers=%d dates=%d",
-        len(df), df["ticker"].nunique(), df["date"].nunique(),
+        "Training dataset ready | rows=%d tickers=%d dates=%d",
+        len(df),
+        df["ticker"].nunique(),
+        df["date"].nunique(),
     )
 
     return df
 
 
 # ==========================================================
-# TARGET BUILDING
+# TARGET
 # ==========================================================
 
-def build_target(df: pd.DataFrame):
+def build_target(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
 
@@ -331,20 +344,24 @@ def build_target(df: pd.DataFrame):
     df = df.dropna(subset=["raw_forward"])
 
     cs_mean = df.groupby("date")["raw_forward"].transform("mean")
-    cs_std = df.groupby("date")["raw_forward"].transform("std").replace(0, np.nan)
+
+    cs_std = (
+        df.groupby("date")["raw_forward"]
+        .transform("std")
+        .replace(0, np.nan)
+    )
 
     df["target"] = (df["raw_forward"] - cs_mean) / cs_std
+
     df["target"] = np.clip(df["target"], -TARGET_CLIP, TARGET_CLIP)
 
     df = df[np.isfinite(df["target"])]
 
     counts = df.groupby("date")["ticker"].transform("count")
+
     df = df[counts >= MIN_CS_WIDTH]
 
     df.drop(columns=["raw_forward"], inplace=True)
-
-    if df.empty:
-        raise RuntimeError("All dates removed after CS filtering.")
 
     return df
 
@@ -356,26 +373,28 @@ def build_target(df: pd.DataFrame):
 def trainer(train_df):
 
     train_df = build_target(train_df)
+
     train_df = train_df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
     X = validate_feature_schema(
         train_df.loc[:, MODEL_FEATURES],
-        mode="training"
+        mode="training",
     )
 
     y = train_df["target"].values
 
-    target_std = np.std(y)
+    if np.std(y) < LOW_VARIANCE_THRESHOLD:
 
-    if target_std < LOW_VARIANCE_THRESHOLD:
-        logger.warning("Target variance extremely low — injecting noise")
-        noise = np.random.normal(0, 1e-4, size=len(y))
-        y = y + noise
+        logger.warning("Low target variance — injecting small noise.")
+
+        y = y + np.random.normal(0, 1e-4, size=len(y))
 
     pipeline = build_xgboost_pipeline()
+
     pipeline.fit(X, y)
 
     dataset_hash = compute_dataset_hash(train_df)
+
     pipeline.training_fingerprint = compute_reproducibility_hash(dataset_hash)
 
     return pipeline
@@ -385,16 +404,20 @@ def trainer(train_df):
 # MAIN
 # ==========================================================
 
-def main(start_date=None,
-         end_date=None,
-         create_baseline=False,
-         promote_baseline=False,
-         allow_soft_fail=False):
+def main(
+    start_date=None,
+    end_date=None,
+    create_baseline=False,
+    promote_baseline=False,
+    allow_soft_fail=False,
+):
 
     init_env()
+
     enforce_determinism()
 
     if start_date is None or end_date is None:
+
         start_date, end_date = MarketTime.window_for("xgboost")
 
     try:
@@ -402,9 +425,11 @@ def main(start_date=None,
         raw_df = load_training_data(start_date, end_date)
 
         validator = WalkForwardValidator(trainer)
+
         metrics = validator.run(raw_df.copy())
 
         final_df = build_target(raw_df)
+
         dataset_hash = compute_dataset_hash(final_df)
 
         final_model = trainer(raw_df)
@@ -413,31 +438,37 @@ def main(start_date=None,
             final_model,
             metrics,
             dataset_hash,
-            dataset_rows=len(final_df),
-            start_date=start_date,
-            end_date=end_date,
-            training_df=final_df,
-            promote_baseline=promote_baseline,
-            create_baseline=create_baseline
+            len(final_df),
+            start_date,
+            end_date,
+            final_df,
+            promote_baseline,
+            create_baseline,
         )
 
         logger.info("Training completed successfully.")
+
         return metrics
 
-    except Exception as e:
+    except Exception as exc:
 
         if allow_soft_fail:
-            logger.warning("Training soft-failed: %s", str(e))
+
+            logger.warning("Training soft-failed: %s", exc)
+
             return {}
-        else:
-            raise
+
+        raise
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--create-baseline", action="store_true")
+
     parser.add_argument("--promote-baseline", action="store_true")
+
     parser.add_argument("--allow-soft-fail", action="store_true")
 
     args = parser.parse_args()
@@ -445,5 +476,5 @@ if __name__ == "__main__":
     main(
         create_baseline=args.create_baseline,
         promote_baseline=args.promote_baseline,
-        allow_soft_fail=args.allow_soft_fail
+        allow_soft_fail=args.allow_soft_fail,
     )
