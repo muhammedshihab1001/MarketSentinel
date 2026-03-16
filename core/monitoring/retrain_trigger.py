@@ -1,5 +1,5 @@
 # =========================================================
-# RETRAIN TRIGGER v1.0
+# RETRAIN TRIGGER v1.1
 # Simple governance layer for MarketSentinel
 # CV-optimized (no heavy orchestration)
 # =========================================================
@@ -30,6 +30,8 @@ class RetrainTrigger:
 
     MAX_EVENT_HISTORY = 100
 
+    MAX_SEVERITY = 100
+
     # =====================================================
     # INIT
     # =====================================================
@@ -51,6 +53,14 @@ class RetrainTrigger:
     def _load_events(self) -> List[Dict]:
 
         if not os.path.exists(self.EVENTS_FILE):
+
+            # create empty file for stability
+            try:
+                with open(self.EVENTS_FILE, "w", encoding="utf-8") as f:
+                    json.dump([], f)
+            except Exception:
+                pass
+
             return []
 
         try:
@@ -62,7 +72,16 @@ class RetrainTrigger:
                 return data
 
         except Exception as e:
+
             logger.warning("Failed to load retrain events: %s", str(e))
+
+            # backup corrupted file
+            try:
+                backup = self.EVENTS_FILE + ".corrupt"
+                os.rename(self.EVENTS_FILE, backup)
+                logger.warning("Corrupted retrain log backed up → %s", backup)
+            except Exception:
+                pass
 
         return []
 
@@ -87,6 +106,8 @@ class RetrainTrigger:
     # =====================================================
 
     def _log_event(self, severity: int, drift_state: str):
+
+        severity = max(0, min(severity, self.MAX_SEVERITY))
 
         event = {
             "timestamp": int(time.time()),
