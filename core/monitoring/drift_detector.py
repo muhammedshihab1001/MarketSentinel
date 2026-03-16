@@ -1,5 +1,5 @@
 # =========================================================
-# DRIFT DETECTOR v2.5
+# DRIFT DETECTOR v2.6
 # Hybrid Multi-Agent Compatible | CV-Optimized
 # Noise-Tolerant for yfinance data
 # =========================================================
@@ -31,7 +31,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "26.1"
+    BASELINE_VERSION = "26.2"
 
     MIN_SAMPLE_INFERENCE = 25
     MIN_FEATURE_EVAL_RATIO = 0.3
@@ -52,6 +52,8 @@ class DriftDetector:
 
     RECENT_WEIGHT_FACTOR = 1.5
     FEATURE_CLIP_SIGMA = 6.0
+
+    MIN_BASELINE_FEATURES = 10
 
     # =====================================================
     # INIT
@@ -108,6 +110,9 @@ class DriftDetector:
 
             counts, bin_edges = np.histogram(series, bins=20)
 
+            if counts.sum() == 0:
+                continue
+
             features[col] = {
                 "mean": float(series.mean()),
                 "std": float(series.std()),
@@ -115,6 +120,11 @@ class DriftDetector:
                 "bin_edges": bin_edges.tolist(),
                 "expected_counts": counts.tolist()
             }
+
+        if len(features) < self.MIN_BASELINE_FEATURES:
+            raise RuntimeError(
+                "Insufficient baseline features detected."
+            )
 
         payload = {
             "meta": {
@@ -202,6 +212,9 @@ class DriftDetector:
 
         if meta.get("schema_signature") != get_schema_signature():
             logger.warning("Schema mismatch detected.")
+
+        if len(baseline.get("features", {})) < self.MIN_BASELINE_FEATURES:
+            logger.warning("Baseline feature count suspiciously low.")
 
         return baseline
 
