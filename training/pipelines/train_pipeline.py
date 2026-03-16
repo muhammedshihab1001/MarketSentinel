@@ -1,5 +1,5 @@
 # ==========================================================
-# INSTITUTIONAL TRAINING PIPELINE WRAPPER v2.3
+# INSTITUTIONAL TRAINING PIPELINE WRAPPER v2.4
 # Governance Hardened + Hybrid Multi-Agent Compatible
 # ==========================================================
 
@@ -29,6 +29,7 @@ from core.artifacts.metadata_manager import MetadataManager
 from core.config.env_loader import init_env
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
+from core.data.providers.market.router import MarketProviderRouter
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ STRICT_GOVERNANCE = os.getenv("TRAINING_STRICT_GOVERNANCE", "1") == "1"
 def enforce_determinism():
 
     os.environ["PYTHONHASHSEED"] = str(GLOBAL_SEED)
+
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -153,6 +155,22 @@ def build_environment_fingerprint():
 
 
 # ==========================================================
+# DATA WINDOW HASH
+# ==========================================================
+
+def build_window_hash(start_date, end_date):
+
+    payload = {
+        "start": start_date,
+        "end": end_date
+    }
+
+    canonical = json.dumps(payload, sort_keys=True).encode()
+
+    return hashlib.sha256(canonical).hexdigest()
+
+
+# ==========================================================
 # LINEAGE
 # ==========================================================
 
@@ -173,6 +191,7 @@ def build_lineage(start_date, end_date):
             "start": start_date,
             "end": end_date
         },
+        "window_hash": build_window_hash(start_date, end_date),
         "training_universe": universe_snapshot,
         "universe_hash": universe_hash
     }
@@ -182,6 +201,25 @@ def build_lineage(start_date, end_date):
     lineage_payload["lineage_hash"] = hashlib.sha256(canonical).hexdigest()
 
     return lineage_payload
+
+
+# ==========================================================
+# PROVIDER HEALTH SNAPSHOT
+# ==========================================================
+
+def capture_provider_health():
+
+    try:
+
+        router = MarketProviderRouter()
+
+        return router.provider_health()
+
+    except Exception as e:
+
+        logger.warning("Failed to capture provider health: %s", e)
+
+        return {}
 
 
 # ==========================================================
@@ -207,6 +245,7 @@ def save_manifest(run_id: str, manifest: dict):
     ) as tmp:
 
         json.dump(manifest, tmp, indent=4, sort_keys=True)
+
         tmp.flush()
         os.fsync(tmp.fileno())
 
@@ -222,20 +261,18 @@ def save_manifest(run_id: str, manifest: dict):
 def main(create_baseline=False, promote_baseline=False):
 
     init_env()
+
     enforce_determinism()
 
     _acquire_lock()
 
     today = MarketTime.today().isoformat()
+
     MarketTime.freeze_today(today)
 
     start_date, end_date = MarketTime.window_for("xgboost")
 
-    logger.info(
-        "Training window | %s -> %s",
-        start_date,
-        end_date
-    )
+    logger.info("Training window | %s -> %s", start_date, end_date)
 
     current_schema = get_schema_signature()
 
@@ -246,6 +283,8 @@ def main(create_baseline=False, promote_baseline=False):
         datetime.datetime.utcnow().strftime("run_%Y_%m_%d_%H%M%S_%f")
         + "_" + uuid.uuid4().hex[:6]
     )
+
+    logger.info("Training run_id=%s", run_id)
 
     start = time.time()
 
@@ -268,6 +307,7 @@ def main(create_baseline=False, promote_baseline=False):
             "status": "success",
             "metrics": metrics,
             "runtime_sec": round(runtime, 2),
+            "provider_health": capture_provider_health(),
             "lineage": build_lineage(start_date, end_date),
             "created_utc": datetime.datetime.utcnow().isoformat()
         }
@@ -286,6 +326,7 @@ def main(create_baseline=False, promote_baseline=False):
             "error": str(exc),
             "error_type": type(exc).__name__,
             "runtime_sec": round(max(0.0, time.time() - start), 2),
+            "provider_health": capture_provider_health(),
             "lineage": build_lineage(start_date, end_date),
             "created_utc": datetime.datetime.utcnow().isoformat()
         }
