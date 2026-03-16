@@ -1,5 +1,5 @@
 # =========================================================
-# DRIFT DETECTOR v2.6
+# DRIFT DETECTOR v2.7
 # Hybrid Multi-Agent Compatible | CV-Optimized
 # Noise-Tolerant for yfinance data
 # =========================================================
@@ -31,7 +31,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "26.2"
+    BASELINE_VERSION = "26.3"
 
     MIN_SAMPLE_INFERENCE = 25
     MIN_FEATURE_EVAL_RATIO = 0.3
@@ -54,6 +54,8 @@ class DriftDetector:
     FEATURE_CLIP_SIGMA = 6.0
 
     MIN_BASELINE_FEATURES = 10
+
+    FEATURE_SET = set(MODEL_FEATURES)
 
     # =====================================================
     # INIT
@@ -102,6 +104,9 @@ class DriftDetector:
         features = {}
 
         for col in MODEL_FEATURES:
+
+            if col not in numeric.columns:
+                continue
 
             series = numeric[col].dropna()
 
@@ -153,7 +158,7 @@ class DriftDetector:
 
     def _safe_feature_block(self, dataset: pd.DataFrame):
 
-        missing = set(MODEL_FEATURES) - set(dataset.columns)
+        missing = self.FEATURE_SET - set(dataset.columns)
 
         if missing:
             raise RuntimeError(f"Missing features: {missing}")
@@ -169,7 +174,7 @@ class DriftDetector:
             mean = block[col].mean()
             std = block[col].std()
 
-            if std < self.EPSILON:
+            if not np.isfinite(mean) or not np.isfinite(std) or std < self.EPSILON:
                 continue
 
             block[col] = block[col].clip(
@@ -202,8 +207,13 @@ class DriftDetector:
         if not os.path.exists(self.BASELINE_PATH):
             raise FileNotFoundError("Baseline missing.")
 
-        with open(self.BASELINE_PATH, encoding="utf-8") as f:
-            baseline = json.load(f)
+        try:
+
+            with open(self.BASELINE_PATH, encoding="utf-8") as f:
+                baseline = json.load(f)
+
+        except Exception as exc:
+            raise RuntimeError("Baseline corrupted.") from exc
 
         if baseline.get("integrity_hash") != self._baseline_hash(baseline):
             raise RuntimeError("Baseline integrity failure.")
@@ -232,7 +242,10 @@ class DriftDetector:
         if len(actual) < 5:
             return 0.0
 
-        actual_counts = np.histogram(actual, bins=bin_edges)[0]
+        try:
+            actual_counts = np.histogram(actual, bins=bin_edges)[0]
+        except Exception:
+            return 0.0
 
         expected_perc = expected_counts / max(expected_counts.sum(), self.EPSILON)
         actual_perc = actual_counts / max(actual_counts.sum(), self.EPSILON)
@@ -304,6 +317,9 @@ class DriftDetector:
             evaluated_features = 0
 
             for col, stats in baseline.get("features", {}).items():
+
+                if col not in numeric.columns:
+                    continue
 
                 current = numeric[col].dropna()
 
