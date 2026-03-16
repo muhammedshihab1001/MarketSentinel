@@ -110,7 +110,13 @@ class MarketRegimeDetector:
 
         try:
 
+            # ------------------------------------------------
+            # Defensive cleaning for noisy yfinance data
+            # ------------------------------------------------
+
             close = pd.to_numeric(df["close"], errors="coerce")
+
+            close = close.replace([np.inf, -np.inf], np.nan)
 
             if close.isna().any():
                 return self._neutral_regime(df)
@@ -214,10 +220,12 @@ class MarketRegimeDetector:
             # MULTIPLIER FEATURE
             ########################################################
 
-            df["regime_multiplier"] = [
-                self.REGIME_MULTIPLIER.get(r, 1.0)
-                for r in regime
-            ]
+            df["regime_multiplier"] = (
+                pd.Series(regime)
+                .map(self.REGIME_MULTIPLIER)
+                .fillna(1.0)
+                .values
+            )
 
             return df
 
