@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 # ============================================================
 
-SCHEMA_VERSION = "45.1"
+SCHEMA_VERSION = "45.2"
 
 
 ############################################################
@@ -240,6 +240,11 @@ def validate_feature_schema(
 
             if col not in feature_df.columns:
 
+                logger.debug(
+                    "Inference auto-created missing feature: %s",
+                    col
+                )
+
                 if col.endswith("_rank"):
                     feature_df[col] = 0.5
                 else:
@@ -357,10 +362,8 @@ def validate_feature_schema(
 
     _check_dtype_stability(feature_df)
 
-    # enforce column order
     feature_df = feature_df.loc[:, MODEL_FEATURES]
 
-    # safety clip for extreme values
     feature_df = feature_df.clip(-1e9, 1e9)
 
     return feature_df.astype(DTYPE, copy=False)
