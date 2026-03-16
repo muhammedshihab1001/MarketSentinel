@@ -53,6 +53,10 @@ class YahooProvider(MarketDataProvider):
 
         logger.info("YahooProvider initialised (PRIMARY market data provider).")
 
+    ############################################################
+    # DATETIME NORMALIZATION (FIX FOR TZ ISSUES)
+    ############################################################
+
     @staticmethod
     def _normalize_datetime(series: pd.Series) -> pd.Series:
 
@@ -61,7 +65,14 @@ class YahooProvider(MarketDataProvider):
         if dt.isna().any():
             raise RuntimeError("Datetime parsing produced invalid timestamps.")
 
+        # Normalize to daily boundary to avoid tz comparison issues
+        dt = dt.dt.normalize()
+
         return dt
+
+    ############################################################
+    # COLUMN NORMALIZATION
+    ############################################################
 
     @staticmethod
     def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -84,6 +95,10 @@ class YahooProvider(MarketDataProvider):
         df = df.loc[:, ~df.columns.duplicated()]
 
         return df
+
+    ############################################################
+    # OHLCV EXTRACTION
+    ############################################################
 
     @staticmethod
     def _extract_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -136,6 +151,10 @@ class YahooProvider(MarketDataProvider):
 
         return clean
 
+    ############################################################
+    # OHLC REPAIR
+    ############################################################
+
     @staticmethod
     def _repair_ohlc(clean: pd.DataFrame) -> pd.DataFrame:
 
@@ -143,6 +162,10 @@ class YahooProvider(MarketDataProvider):
         clean["low"] = clean[["low", "open", "close"]].min(axis=1)
 
         return clean
+
+    ############################################################
+    # NORMALIZATION PIPELINE
+    ############################################################
 
     def _normalize(self, df: pd.DataFrame, ticker: str, min_rows: int) -> pd.DataFrame:
 
@@ -155,14 +178,18 @@ class YahooProvider(MarketDataProvider):
 
         df = self._flatten_columns(df)
 
+        ############################################################
+        # DATE EXTRACTION
+        ############################################################
+
         if "date" not in df.columns:
 
             if isinstance(df.index, pd.DatetimeIndex):
 
-                idx = df.index
-                idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+                idx = pd.to_datetime(df.index, utc=True, errors="coerce")
 
                 df = df.reset_index(drop=True)
+
                 df["date"] = idx
 
             else:
@@ -171,9 +198,17 @@ class YahooProvider(MarketDataProvider):
                     f"Yahoo DataFrame for {ticker} has no datetime index or 'date' column."
                 )
 
+        ############################################################
+        # EXTRACT OHLCV
+        ############################################################
+
         clean = self._extract_ohlcv(df)
 
-        clean["date"] = df["date"].values
+        clean["date"] = df["date"]
+
+        ############################################################
+        # NUMERIC SANITY
+        ############################################################
 
         for col in ("open", "high", "low", "close", "volume"):
             clean[col] = pd.to_numeric(clean[col], errors="coerce")
@@ -185,7 +220,15 @@ class YahooProvider(MarketDataProvider):
         if clean.empty:
             raise RuntimeError(f"Normalization produced empty dataset for {ticker}.")
 
+        ############################################################
+        # FIX: DATE NORMALIZATION
+        ############################################################
+
         clean["date"] = self._normalize_datetime(clean["date"])
+
+        ############################################################
+        # SORT + DEDUP
+        ############################################################
 
         clean = (
             clean
@@ -195,7 +238,15 @@ class YahooProvider(MarketDataProvider):
             .reset_index(drop=True)
         )
 
+        ############################################################
+        # OHLC CONSISTENCY
+        ############################################################
+
         clean = self._repair_ohlc(clean)
+
+        ############################################################
+        # OUTLIER PROTECTION (YFINANCE SPIKES)
+        ############################################################
 
         pct = clean["close"].pct_change().abs().fillna(0)
 
@@ -212,6 +263,10 @@ class YahooProvider(MarketDataProvider):
             clean.loc[extreme_mask, "close"] = np.nan
             clean["close"] = clean["close"].ffill().bfill()
 
+        ############################################################
+        # TRADING DENSITY CHECK
+        ############################################################
+
         span_days = (clean["date"].max() - clean["date"].min()).days + 1
 
         if span_days > 0:
@@ -226,9 +281,16 @@ class YahooProvider(MarketDataProvider):
                     density,
                 )
 
-        clean["close"] = clean["close"].ffill().bfill()
+        ############################################################
+        # FINAL CLEAN
+        ############################################################
 
+        clean["close"] = clean["close"].ffill().bfill()
         clean["volume"] = clean["volume"].fillna(0).clip(lower=0)
+
+        ############################################################
+        # HISTORY CHECK
+        ############################################################
 
         if len(clean) < min_rows:
 
@@ -257,6 +319,10 @@ class YahooProvider(MarketDataProvider):
         )
 
         return clean
+
+    ############################################################
+    # FETCH
+    ############################################################
 
     def fetch(self, ticker: str, start_date: str, end_date: str, interval: str, **kwargs) -> pd.DataFrame:
 
