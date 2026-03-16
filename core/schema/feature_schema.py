@@ -123,16 +123,18 @@ def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in cols:
 
-        series_or_df = df[col]
+        block = df[col]
 
-        if isinstance(series_or_df, pd.DataFrame):
+        if isinstance(block, pd.DataFrame):
 
-            for sub_col in series_or_df.columns:
-                df[sub_col] = pd.to_numeric(series_or_df[sub_col], errors="coerce")
+            for sub in block.columns:
+                series = pd.Series(block[sub].values, index=df.index)
+                df[sub] = pd.to_numeric(series, errors="coerce")
 
         else:
 
-            df[col] = pd.to_numeric(series_or_df, errors="coerce")
+            series = pd.Series(block.values, index=df.index)
+            df[col] = pd.to_numeric(series, errors="coerce")
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
