@@ -351,6 +351,9 @@ class FeatureEngineer:
     @classmethod
     def finalize(cls, df):
 
+        # FIX: Remove duplicate columns before processing
+        df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
         df = df.replace([np.inf, -np.inf], np.nan)
 
         numeric_cols = df.select_dtypes(include=[np.number]).columns

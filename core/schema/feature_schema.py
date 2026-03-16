@@ -127,9 +127,9 @@ def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
 
         if isinstance(block, pd.DataFrame):
 
-            for sub in block.columns:
-                series = pd.Series(block[sub].values, index=df.index)
-                df[sub] = pd.to_numeric(series, errors="coerce")
+            series = pd.Series(block.iloc[:, 0].values, index=df.index)
+            df = df.loc[:, ~df.columns.duplicated(keep="first")]
+            df[col] = pd.to_numeric(series, errors="coerce")
 
         else:
 

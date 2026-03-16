@@ -242,6 +242,9 @@ def load_training_data(start_date, end_date):
         training=True,
     )
 
+    # FIX: Remove duplicate columns produced by feature pipeline
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
     validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="training")
 
     if len(df) > MAX_DATASET_ROWS:
@@ -300,6 +303,9 @@ def build_target(df):
 def trainer(train_df):
 
     train_df = train_df.copy()
+
+    # FIX: Remove duplicate columns to prevent downstream dtype crash
+    train_df = train_df.loc[:, ~train_df.columns.duplicated(keep="first")]
 
     if {"date", "ticker", "close"}.issubset(train_df.columns):
 
