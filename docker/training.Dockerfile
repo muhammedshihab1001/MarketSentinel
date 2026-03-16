@@ -35,11 +35,10 @@ COPY requirements/ ./requirements/
 RUN pip install --upgrade pip setuptools wheel
 
 ############################################################
-# Install All Training Dependencies
+# Install Training Dependencies
 ############################################################
 
 RUN pip install --prefer-binary -r requirements/training.txt
-
 
 
 ############################################################
@@ -61,7 +60,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
-    APP_ENV=training
+    APP_ENV=training \
+    PYTHONPATH=/app \
+    LANG=C.UTF-8
 
 ############################################################
 # Runtime System Packages
@@ -92,6 +93,7 @@ COPY --from=builder /usr/local /usr/local
 COPY core ./core
 COPY training ./training
 COPY config ./config
+COPY requirements ./requirements
 
 ############################################################
 # Artifacts + Data Directories
