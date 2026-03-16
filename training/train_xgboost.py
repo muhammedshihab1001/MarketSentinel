@@ -48,10 +48,6 @@ MAX_DATASET_ROWS = 1_000_000
 MIN_SUCCESSFUL_TICKERS = 8
 
 
-# ==========================================================
-# DETERMINISM
-# ==========================================================
-
 def enforce_determinism():
 
     os.environ["PYTHONHASHSEED"] = str(SEED)
@@ -59,10 +55,6 @@ def enforce_determinism():
     random.seed(SEED)
     np.random.seed(SEED)
 
-
-# ==========================================================
-# HASH UTILITIES
-# ==========================================================
 
 def compute_dataset_hash(df: pd.DataFrame):
 
@@ -101,10 +93,6 @@ def compute_reproducibility_hash(dataset_hash):
     return hashlib.sha256(canonical).hexdigest()
 
 
-# ==========================================================
-# EXPORT ARTIFACTS
-# ==========================================================
-
 def export_artifacts(
     model,
     metrics,
@@ -124,8 +112,9 @@ def export_artifacts(
 
     model_version = f"xgb_{timestamp}"
 
-    model_path = os.path.join(MODEL_DIR, f"{model_version}.joblib")
-    metadata_path = os.path.join(MODEL_DIR, f"{model_version}_metadata.json")
+    # FIX: filenames aligned with ModelLoader expectations
+    model_path = os.path.join(MODEL_DIR, f"model_{model_version}.pkl")
+    metadata_path = os.path.join(MODEL_DIR, f"metadata_{model_version}.json")
 
     logger.info("Saving model → %s", model_path)
 
