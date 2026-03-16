@@ -38,20 +38,18 @@ class YahooProvider(MarketDataProvider):
     MAX_DAILY_MOVE = 0.85
     MIN_TRADING_DENSITY = 0.50
 
-    SOFT_FAIL_MODE = os.getenv("YAHOO_SOFT_FAIL", "1") == "1"
-    SOFT_FAIL_RATIO = 0.70
-
     MAX_RETRIES = 2
     RETRY_DELAY_SECONDS = 1.5
 
     RATE_LIMIT_WAIT = 4.0
-
-    # NEW: safety guard for hanging fetches
     FETCH_TIMEOUT_WARN = 10.0
 
     def __init__(self) -> None:
 
         self.fetcher = StockPriceFetcher()
+
+        self.soft_fail_mode = os.getenv("YAHOO_SOFT_FAIL", "1") == "1"
+        self.soft_fail_ratio = float(os.getenv("YAHOO_SOFT_FAIL_RATIO", "0.70"))
 
         logger.info("YahooProvider initialised (PRIMARY market data provider).")
 
@@ -60,8 +58,8 @@ class YahooProvider(MarketDataProvider):
 
         dt = pd.to_datetime(series, errors="coerce", utc=True)
 
-        if dt.isna().all():
-            raise RuntimeError("Datetime parsing failed — all values are NaT.")
+        if dt.isna().any():
+            raise RuntimeError("Datetime parsing produced invalid timestamps.")
 
         return dt
 
@@ -96,22 +94,22 @@ class YahooProvider(MarketDataProvider):
 
             lc = col.lower()
 
-            if lc.startswith("open") and "open" not in col_map:
+            if "open" in lc and "open" not in col_map:
                 col_map["open"] = col
 
-            elif lc.startswith("high") and "high" not in col_map:
+            elif "high" in lc and "high" not in col_map:
                 col_map["high"] = col
 
-            elif lc.startswith("low") and "low" not in col_map:
+            elif "low" in lc and "low" not in col_map:
                 col_map["low"] = col
 
-            elif lc.startswith("adj close") and "close" not in col_map:
+            elif "adj" in lc and "close" in lc and "close" not in col_map:
                 col_map["close"] = col
 
-            elif lc.startswith("close") and "close" not in col_map:
+            elif "close" in lc and "close" not in col_map:
                 col_map["close"] = col
 
-            elif lc.startswith("volume") and "volume" not in col_map:
+            elif "volume" in lc and "volume" not in col_map:
                 col_map["volume"] = col
 
         required = {"open", "high", "low", "close", "volume"}
@@ -141,15 +139,14 @@ class YahooProvider(MarketDataProvider):
     @staticmethod
     def _repair_ohlc(clean: pd.DataFrame) -> pd.DataFrame:
 
-        high_fix = clean[["high", "open", "close"]].max(axis=1)
-        low_fix = clean[["low", "open", "close"]].min(axis=1)
-
-        clean["high"] = high_fix
-        clean["low"] = low_fix
+        clean["high"] = clean[["high", "open", "close"]].max(axis=1)
+        clean["low"] = clean[["low", "open", "close"]].min(axis=1)
 
         return clean
 
     def _normalize(self, df: pd.DataFrame, ticker: str, min_rows: int) -> pd.DataFrame:
+
+        ticker = ticker.strip().upper()
 
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
             raise RuntimeError(f"Yahoo fetch returned empty DataFrame for {ticker}.")
@@ -179,7 +176,6 @@ class YahooProvider(MarketDataProvider):
         clean["date"] = df["date"].values
 
         for col in ("open", "high", "low", "close", "volume"):
-
             clean[col] = pd.to_numeric(clean[col], errors="coerce")
 
         clean.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -208,13 +204,12 @@ class YahooProvider(MarketDataProvider):
         if extreme_mask.any():
 
             logger.warning(
-                "Extreme price moves in Yahoo data for %s (%d bars)",
+                "Extreme price moves detected | provider=yahoo ticker=%s bars=%d",
                 ticker,
                 extreme_mask.sum(),
             )
 
             clean.loc[extreme_mask, "close"] = np.nan
-
             clean["close"] = clean["close"].ffill().bfill()
 
         span_days = (clean["date"].max() - clean["date"].min()).days + 1
@@ -226,7 +221,7 @@ class YahooProvider(MarketDataProvider):
             if density < self.MIN_TRADING_DENSITY:
 
                 logger.warning(
-                    "Low trading density for %s (%.2f)",
+                    "Low trading density | provider=yahoo ticker=%s density=%.2f",
                     ticker,
                     density,
                 )
@@ -237,12 +232,12 @@ class YahooProvider(MarketDataProvider):
 
         if len(clean) < min_rows:
 
-            soft_threshold = int(min_rows * self.SOFT_FAIL_RATIO)
+            soft_threshold = int(min_rows * self.soft_fail_ratio)
 
-            if self.SOFT_FAIL_MODE and len(clean) >= soft_threshold:
+            if self.soft_fail_mode and len(clean) >= soft_threshold:
 
                 logger.warning(
-                    "Short history accepted in soft-fail mode for %s (%d rows).",
+                    "Short history accepted | provider=yahoo ticker=%s rows=%d",
                     ticker,
                     len(clean),
                 )
@@ -296,7 +291,7 @@ class YahooProvider(MarketDataProvider):
 
                 if latency > self.FETCH_TIMEOUT_WARN:
                     logger.warning(
-                        "Slow Yahoo fetch detected | ticker=%s latency=%.2fs",
+                        "Slow Yahoo fetch | ticker=%s latency=%.2fs",
                         ticker,
                         latency,
                     )
