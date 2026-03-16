@@ -23,7 +23,7 @@ class MetadataManager:
     MIN_TRAINING_DAYS = 120
     MIN_METADATA_BYTES = 800
     MIN_FEATURE_COUNT = 10
-    MIN_DATASET_ROWS = 100  # relaxed for CV datasets
+    MIN_DATASET_ROWS = 100
     MIN_HASH_LENGTH = 64
 
     REQUIRED_METADATA_FIELDS = [
@@ -70,6 +70,29 @@ class MetadataManager:
             sort_keys=True,
             separators=(",", ":")
         ).encode()
+
+    # =====================================================
+    # HASHABLE METADATA SUBSET
+    # =====================================================
+
+    @staticmethod
+    def _metadata_hash_subset(metadata: dict) -> dict:
+        """
+        Return only deterministic fields used to compute
+        metadata_integrity_hash.
+        """
+
+        volatile_fields = {
+            "created_at",
+            "environment",
+            "metrics"
+        }
+
+        return {
+            k: v
+            for k, v in metadata.items()
+            if k not in volatile_fields and k != "metadata_integrity_hash"
+        }
 
     # =====================================================
     # FILE HASH
@@ -257,11 +280,10 @@ class MetadataManager:
         if not original_hash or len(original_hash) < MetadataManager.MIN_HASH_LENGTH:
             raise RuntimeError("Invalid metadata integrity hash.")
 
-        metadata_copy = dict(metadata)
-        metadata_copy.pop("metadata_integrity_hash", None)
+        metadata_subset = MetadataManager._metadata_hash_subset(metadata)
 
         recalculated = hashlib.sha256(
-            MetadataManager._canonical_json(metadata_copy)
+            MetadataManager._canonical_json(metadata_subset)
         ).hexdigest()
 
         if recalculated != original_hash:
@@ -351,8 +373,10 @@ class MetadataManager:
                 )
             metadata.update(dict(extra_fields))
 
+        metadata_subset = MetadataManager._metadata_hash_subset(metadata)
+
         metadata["metadata_integrity_hash"] = hashlib.sha256(
-            MetadataManager._canonical_json(metadata)
+            MetadataManager._canonical_json(metadata_subset)
         ).hexdigest()
 
         return metadata
