@@ -1,4 +1,3 @@
-
 import hashlib
 import logging
 import os
@@ -12,10 +11,7 @@ from dotenv import load_dotenv
 logger = logging.getLogger("marketsentinel.env")
 
 _ENV_INITIALIZED = False
-_ENV_LOCK        = threading.Lock()
-
-# Provider priority — must match MarketProviderRouter registration order
-_PROVIDER_PRIORITY = ["yahoo", "alphavantage", "twelvedata"]
+_ENV_LOCK = threading.Lock()
 
 # Valid OpenAI model strings accepted by this project
 _KNOWN_OPENAI_MODELS = {
@@ -38,7 +34,7 @@ def _configure_logging() -> None:
         return
 
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    level     = getattr(logging, log_level, logging.INFO)
+    level = getattr(logging, log_level, logging.INFO)
 
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -52,10 +48,11 @@ def _configure_logging() -> None:
     console.setFormatter(formatter)
     root.addHandler(console)
 
-    # Optional file logging — off by default, useful in production
+    # Optional file logging
     if os.getenv("ENABLE_FILE_LOGGING", "0") == "1":
         log_dir = os.getenv("LOG_DIR", "logs")
         os.makedirs(log_dir, exist_ok=True)
+
         fh = RotatingFileHandler(
             os.path.join(log_dir, "marketsentinel.log"),
             maxBytes=10_000_000,
@@ -65,7 +62,12 @@ def _configure_logging() -> None:
         fh.setFormatter(formatter)
         root.addHandler(fh)
 
-    logger.info("Logging initialised | level=%s", log_level)
+    logger.info(
+        "Logging initialised | level=%s | python=%s | pid=%s",
+        log_level,
+        sys.version.split()[0],
+        os.getpid(),
+    )
 
 
 # ============================================================
@@ -73,7 +75,7 @@ def _configure_logging() -> None:
 # ============================================================
 
 def _as_bool(value: Optional[str], default: bool = False) -> bool:
-    """Parse a string env value to bool. Returns default for None."""
+    """Parse a string env value to bool."""
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -82,10 +84,10 @@ def _as_bool(value: Optional[str], default: bool = False) -> bool:
 def _ensure_path(key: str, default: str) -> None:
     """
     Guarantee the directory referenced by env[key] exists.
-    Creates it if missing, raises RuntimeError if it cannot be created.
     """
     path = os.getenv(key, default)
     os.environ.setdefault(key, path)
+
     try:
         os.makedirs(path, exist_ok=True)
     except Exception as exc:
@@ -100,29 +102,20 @@ def _ensure_path(key: str, default: str) -> None:
 
 def _validate_market_providers() -> None:
     """
-    Check which fallback providers have API keys set.
-    Yahoo is always available (no key needed).
+    Validate available market data providers.
 
-    Priority order written to MARKET_PROVIDERS_ACTIVE:
-        yahoo → alphavantage → twelvedata
+    Yahoo Finance is always available.
+    TwelveData is optional.
     """
-    optional_providers = {
-        "alphavantage": "ALPHAVANTAGE_API_KEY",
-        "twelvedata":   "TWELVEDATA_API_KEY",
-    }
 
-    # Build in priority order — yahoo always first
     active: List[str] = ["yahoo"]
 
-    for provider in ["alphavantage", "twelvedata"]:
-        key = optional_providers[provider]
-        if os.getenv(key):
-            active.append(provider)
-        else:
-            logger.warning(
-                "Market provider unavailable → %s | missing env: %s",
-                provider, key,
-            )
+    if os.getenv("TWELVEDATA_API_KEY"):
+        active.append("twelvedata")
+    else:
+        logger.warning(
+            "TwelveData provider unavailable | missing env: TWELVEDATA_API_KEY"
+        )
 
     os.environ["MARKET_PROVIDERS_ACTIVE"] = ",".join(active)
 
@@ -130,12 +123,6 @@ def _validate_market_providers() -> None:
         "Market providers active | priority=%s",
         " → ".join(active),
     )
-
-    if len(active) == 1:
-        logger.warning(
-            "Only Yahoo Finance is available. "
-            "Set ALPHAVANTAGE_API_KEY or TWELVEDATA_API_KEY for fallback coverage."
-        )
 
 
 # ============================================================
@@ -145,8 +132,6 @@ def _validate_market_providers() -> None:
 def _validate_llm() -> None:
     """
     Validate OpenAI config when LLM_ENABLED=1.
-    Raises immediately on startup so misconfiguration is caught early
-    rather than at the first inference request.
     """
     llm_enabled = _as_bool(os.getenv("LLM_ENABLED"), default=False)
 
@@ -162,11 +147,12 @@ def _validate_llm() -> None:
         )
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
     if model not in _KNOWN_OPENAI_MODELS:
         logger.warning(
-            "OPENAI_MODEL='%s' is not a recognised model. "
-            "Known models: %s. Proceeding anyway.",
-            model, sorted(_KNOWN_OPENAI_MODELS),
+            "OPENAI_MODEL='%s' is not a recognised model. Known models: %s",
+            model,
+            sorted(_KNOWN_OPENAI_MODELS),
         )
 
     logger.info(
@@ -183,9 +169,9 @@ def _validate_llm() -> None:
 
 def _environment_fingerprint() -> None:
     """
-    Generate a short SHA-256 fingerprint of the active configuration.
-    Written to ENV_FINGERPRINT — useful for comparing deployments in logs.
+    Generate a short SHA256 fingerprint of active configuration.
     """
+
     payload = "".join([
         sys.version,
         os.getenv("MODEL_REGISTRY_PATH", ""),
@@ -198,8 +184,11 @@ def _environment_fingerprint() -> None:
         os.getenv("YAHOO_SOFT_FAIL", ""),
         os.getenv("YFINANCE_SOFT_MODE", ""),
     ])
+
     fp = hashlib.sha256(payload.encode()).hexdigest()[:12]
+
     os.environ["ENV_FINGERPRINT"] = fp
+
     logger.info("Environment fingerprint → %s", fp)
 
 
@@ -210,90 +199,90 @@ def _environment_fingerprint() -> None:
 def init_env() -> None:
     """
     Initialise the full application environment.
-
-    Thread-safe and idempotent — safe to call from multiple
-    entry points (API server, training scripts, tests).
+    Thread-safe and idempotent.
     """
+
     global _ENV_INITIALIZED
 
     if _ENV_INITIALIZED:
         return
 
     with _ENV_LOCK:
+
         if _ENV_INITIALIZED:
             return
 
-        # ── 1. Load .env file first so all subsequent getenv calls see it ────
         if os.getenv("DOTENV_ENABLED", "1") == "1":
             load_dotenv(override=False)
 
-        # ── 2. Configure logging before anything else logs ───────────────────
         _configure_logging()
 
-        # ── 3. Apply defaults (never overrides values already in environment) ─
         defaults = {
+
             # Artifact paths
-            "MODEL_REGISTRY_PATH":    "artifacts/registry",
-            "FEATURE_STORE_PATH":     "artifacts/feature_store",
-            "XGB_REGISTRY_DIR":       "artifacts/xgboost",
+            "MODEL_REGISTRY_PATH": "artifacts/registry",
+            "FEATURE_STORE_PATH": "artifacts/feature_store",
+            "XGB_REGISTRY_DIR": "artifacts/xgboost",
 
-            # LLM / OpenAI
-            "LLM_ENABLED":            "0",
-            "OPENAI_MODEL":           "gpt-4o-mini",
-            "OPENAI_TIMEOUT":         "12",
+            # LLM
+            "LLM_ENABLED": "0",
+            "OPENAI_MODEL": "gpt-4o-mini",
+            "OPENAI_TIMEOUT": "12",
             "LLM_RATE_LIMIT_PER_MIN": "30",
-            "LLM_CACHE_ENABLED":      "1",
-            "LLM_CACHE_TTL_SEC":      "120",
-            "LLM_AUDIT_ENABLED":      "1",
+            "LLM_CACHE_ENABLED": "1",
+            "LLM_CACHE_TTL_SEC": "120",
+            "LLM_AUDIT_ENABLED": "1",
 
-            # Data layer provider flags
-            "YAHOO_SOFT_FAIL":        "1",
-            "YFINANCE_SOFT_MODE":     "1",
-            "YAHOO_MAX_CONCURRENT":   "1",
+            # Data layer
+            "YAHOO_SOFT_FAIL": "1",
+            "YFINANCE_SOFT_MODE": "1",
+            "YAHOO_MAX_CONCURRENT": "1",
 
             # Logging
-            "LOG_LEVEL":              "INFO",
-            "ENABLE_FILE_LOGGING":    "0",
+            "LOG_LEVEL": "INFO",
+            "ENABLE_FILE_LOGGING": "0",
         }
+
         for key, value in defaults.items():
             os.environ.setdefault(key, value)
 
-        # ── 4. Ensure artifact directories exist ─────────────────────────────
         _ensure_path("MODEL_REGISTRY_PATH", "artifacts/registry")
-        _ensure_path("FEATURE_STORE_PATH",  "artifacts/feature_store")
-        _ensure_path("XGB_REGISTRY_DIR",    "artifacts/xgboost")
+        _ensure_path("FEATURE_STORE_PATH", "artifacts/feature_store")
+        _ensure_path("XGB_REGISTRY_DIR", "artifacts/xgboost")
 
-        # ── 5. Validation passes ──────────────────────────────────────────────
         _validate_market_providers()
         _validate_llm()
 
-        # ── 6. Fingerprint ────────────────────────────────────────────────────
         _environment_fingerprint()
 
         logger.info("Environment initialised successfully.")
+
         _ENV_INITIALIZED = True
 
 
 # ============================================================
-# PUBLIC ACCESSORS  (use these instead of os.getenv directly)
+# PUBLIC ACCESSORS
 # ============================================================
 
 def get_env(key: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
-    """
-    Read a string env value.
-    Raises RuntimeError if required=True and the key is missing.
-    """
+    """Read a string env value."""
+
     val = os.getenv(key, default)
-    if required and val is None:
+
+    if required and (val is None or val == ""):
         raise RuntimeError(f"Missing required environment variable: '{key}'")
+
     return val
 
 
 def get_int(key: str, default: int) -> int:
-    """Read an integer env value. Raises on invalid format."""
+    """Read integer env value."""
+
     val = os.getenv(key)
+
     if val is None:
         return default
+
     try:
         return int(val)
     except ValueError:
@@ -303,10 +292,13 @@ def get_int(key: str, default: int) -> int:
 
 
 def get_float(key: str, default: float) -> float:
-    """Read a float env value. Raises on invalid format."""
+    """Read float env value."""
+
     val = os.getenv(key)
+
     if val is None:
         return default
+
     try:
         return float(val)
     except ValueError:
@@ -316,16 +308,16 @@ def get_float(key: str, default: float) -> float:
 
 
 def get_bool(key: str, default: bool = False) -> bool:
-    """Read a boolean env value (1/true/yes/on → True)."""
+    """Read boolean env value."""
     return _as_bool(os.getenv(key), default)
 
 
 def get_list(key: str, default: Optional[List[str]] = None) -> List[str]:
-    """
-    Read a comma-separated env value as a Python list.
-    Example: MARKET_PROVIDERS_ACTIVE=yahoo,alphavantage → ['yahoo', 'alphavantage']
-    """
+    """Read comma-separated env value as list."""
+
     val = os.getenv(key)
+
     if not val:
         return default if default is not None else []
+
     return [item.strip() for item in val.split(",") if item.strip()]
