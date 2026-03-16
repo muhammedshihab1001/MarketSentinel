@@ -1,5 +1,5 @@
 """
-MarketSentinel v4.2.0
+MarketSentinel v4.2.1
 
 Feature Store — per-ticker feature cache for INFERENCE.
 """
@@ -30,7 +30,7 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v26"
+    CACHE_VERSION = "v27"
 
     MAX_CACHE_FILES_PER_TICKER = 6
     MAX_TOTAL_CACHE_FILES = 2000
@@ -75,7 +75,6 @@ class FeatureStore:
         if not np.isfinite(numeric.to_numpy(dtype=float)).all():
             raise RuntimeError("Non-finite feature values detected.")
 
-        # ensure model features exist
         missing = set(MODEL_FEATURES) - set(df.columns)
 
         if missing:
@@ -269,10 +268,6 @@ class FeatureStore:
             f"{self.env_hash}"
         )
 
-        ####################################################
-        # MEMORY CACHE
-        ####################################################
-
         cached = self._get_memory_cache(cache_key)
 
         if cached is not None:
@@ -322,6 +317,9 @@ class FeatureStore:
         df = self.engineer._validate_price_frame(price_df, ticker)
 
         df = self.engineer.add_core_features(df)
+
+        # FIX: ensure cross-sectional features are generated
+        df = self.engineer.add_cross_sectional_features(df)
 
         df = self.engineer.finalize(df)
 
