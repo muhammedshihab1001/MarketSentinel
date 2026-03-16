@@ -25,11 +25,18 @@ logger = logging.getLogger(__name__)
 
 class MarketProviderRouter:
     """
-    Routes market-data fetch requests across providers with
-    automatic sequential fallback, cooldown tracking, response
-    validation, and per-provider health statistics.
+    Market data router with sequential fallback and response validation.
 
-    Fallback chain: Yahoo → AlphaVantage → TwelveData
+    Provider priority:
+        Yahoo → AlphaVantage → TwelveData
+
+    Features
+    --------
+    - Provider cooldown after failure
+    - Yahoo concurrency + throttle
+    - Schema validation
+    - OHLC auto-repair for noisy providers (Yahoo etc.)
+    - Extreme move detection
     """
 
     REQUIRED_COLUMNS = {"date", "open", "high", "low", "close", "volume"}
@@ -41,11 +48,12 @@ class MarketProviderRouter:
     FAILURE_COOLDOWN = 60
 
     YAHOO_MAX_CONCURRENT = int(os.getenv("YAHOO_MAX_CONCURRENT", 1))
-
-    # NEW: Yahoo request throttle (seconds between requests)
     YAHOO_MIN_INTERVAL = float(os.getenv("YAHOO_MIN_INTERVAL", 1.0))
 
     ALLOWED_INTERVALS = {"1d", "D", "1h", "60m", "15m", "5m", "1m"}
+
+    # NEW: tolerance for OHLC violations
+    MAX_OHLC_VIOLATION_RATIO = float(os.getenv("OHLC_TOLERANCE", "0.20"))
 
     def __init__(self) -> None:
 
@@ -56,8 +64,6 @@ class MarketProviderRouter:
         self._lock = threading.Lock()
 
         self._yahoo_semaphore = threading.Semaphore(self.YAHOO_MAX_CONCURRENT)
-
-        # NEW: Yahoo throttle state
         self._last_yahoo_request = 0.0
 
         self._register_providers()
@@ -79,14 +85,18 @@ class MarketProviderRouter:
         def register(name: str, builder, api_key_env: Optional[str] = None):
 
             if builder is None:
-                logger.debug("Provider class unavailable → %s", name)
                 return
 
             if api_key_env and not os.getenv(api_key_env):
-                logger.warning("Provider skipped → %s | missing env var: %s", name, api_key_env)
+                logger.warning(
+                    "Provider skipped → %s | missing env var: %s",
+                    name,
+                    api_key_env,
+                )
                 return
 
             try:
+
                 provider = builder()
 
                 self.providers.append((name, provider))
@@ -101,7 +111,12 @@ class MarketProviderRouter:
                 logger.info("Provider registered → %s", name)
 
             except Exception as exc:
-                logger.warning("Provider disabled → %s | reason=%s", name, exc)
+
+                logger.warning(
+                    "Provider disabled → %s | reason=%s",
+                    name,
+                    exc,
+                )
 
         register("yahoo", YahooProvider)
         register("alphavantage", AlphaVantageProvider, "ALPHAVANTAGE_API_KEY")
@@ -111,6 +126,7 @@ class MarketProviderRouter:
     def _validate_interval(cls, interval: str):
 
         if interval not in cls.ALLOWED_INTERVALS:
+
             raise ValueError(
                 f"Unsupported interval: '{interval}'. Allowed: {sorted(cls.ALLOWED_INTERVALS)}"
             )
@@ -121,6 +137,7 @@ class MarketProviderRouter:
             return True
 
         with self._lock:
+
             last_fail = self._provider_failures.get(name)
 
             if not last_fail:
@@ -134,6 +151,7 @@ class MarketProviderRouter:
             return
 
         with self._lock:
+
             now = time.time()
 
             self._provider_failures[name] = now
@@ -141,13 +159,44 @@ class MarketProviderRouter:
             self._provider_stats[name]["failure"] += 1
             self._provider_stats[name]["last_failure"] = now
 
+    def _repair_ohlc(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Repair common OHLC inconsistencies from Yahoo Finance.
+        """
+
+        before = (
+            (df["high"] < df[["open", "close"]].max(axis=1))
+            | (df["low"] > df[["open", "close"]].min(axis=1))
+        )
+
+        violations = before.sum()
+
+        if violations == 0:
+            return df
+
+        ratio = violations / len(df)
+
+        if ratio > self.MAX_OHLC_VIOLATION_RATIO:
+
+            raise RuntimeError(
+                f"OHLC price invariant violated in {violations} bar(s)"
+            )
+
+        logger.warning(
+            "Repairing %d OHLC bars (%.1f%% of dataset)",
+            violations,
+            ratio * 100,
+        )
+
+        df["high"] = df[["high", "open", "close"]].max(axis=1)
+        df["low"] = df[["low", "open", "close"]].min(axis=1)
+
+        return df
+
     def _validate_response(self, df: pd.DataFrame, ticker: str, min_rows: int) -> pd.DataFrame:
 
         if df is None:
             raise RuntimeError(f"Provider returned None for {ticker}")
-
-        if not hasattr(df, "columns"):
-            raise RuntimeError(f"Invalid response type for {ticker}")
 
         missing = self.REQUIRED_COLUMNS - set(df.columns)
 
@@ -158,28 +207,26 @@ class MarketProviderRouter:
             raise RuntimeError(f"Empty dataset returned for {ticker}")
 
         for col in ("open", "high", "low", "close", "volume"):
+
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df = df.dropna(subset=["open", "high", "low", "close"])
 
         if len(df) < min_rows:
-            raise RuntimeError(f"Insufficient rows for {ticker}: got {len(df)}, need {min_rows}")
 
-        ohlc_ok = (
-            (df["high"] >= df["low"]).all()
-            and (df["high"] >= df["open"]).all()
-            and (df["high"] >= df["close"]).all()
-            and (df["low"] <= df["open"]).all()
-            and (df["low"] <= df["close"]).all()
-        )
+            raise RuntimeError(
+                f"Insufficient rows for {ticker}: got {len(df)}, need {min_rows}"
+            )
 
-        if not ohlc_ok:
-            raise RuntimeError(f"OHLC integrity violation for {ticker}")
+        df = self._repair_ohlc(df)
 
         max_move = df["close"].pct_change().abs().dropna().max()
 
         if max_move > self.MAX_DAILY_MOVE:
-            raise RuntimeError(f"Extreme price move ({max_move:.1%}) detected for {ticker}")
+
+            raise RuntimeError(
+                f"Extreme price move ({max_move:.1%}) detected for {ticker}"
+            )
 
         return df.reset_index(drop=True)
 
@@ -223,6 +270,7 @@ class MarketProviderRouter:
         latency = time.time() - start_time
 
         if latency > self.PROVIDER_TIMEOUT_WARN:
+
             logger.warning("Slow provider → %s (%.2fs)", name, latency)
 
         df = self._validate_response(df, ticker, min_rows)
@@ -264,43 +312,11 @@ class MarketProviderRouter:
         if min_rows is None:
             min_rows = self.DEFAULT_MIN_ROWS
 
-        if provider is not None:
-
-            requested = provider.lower()
-
-            for name, provider_obj in self.providers:
-
-                if name == requested:
-
-                    if not self._provider_allowed(name):
-                        raise RuntimeError(f"Provider '{name}' is in cooldown.")
-
-                    try:
-
-                        return self._execute_provider(
-                            name,
-                            provider_obj,
-                            ticker,
-                            start,
-                            end,
-                            interval,
-                            min_rows,
-                        )
-
-                    except Exception:
-
-                        self._record_failure(name)
-
-                        raise
-
-            raise RuntimeError(f"Requested provider not registered: '{requested}'")
-
         errors: Dict[str, str] = {}
 
         for name, provider_obj in self.providers:
 
             if not self._provider_allowed(name):
-                logger.debug("Provider in cooldown → %s", name)
                 continue
 
             try:
