@@ -8,62 +8,36 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# SCHEMA VERSION
-# ============================================================
-
 SCHEMA_VERSION = "45.4"
-
-
-############################################################
-# SIGNAL CONTRACT
-############################################################
 
 LONG_PERCENTILE = 0.70
 SHORT_PERCENTILE = 0.30
 
-
-############################################################
-# CORE FEATURES
-############################################################
-
 CORE_FEATURES: Tuple[str, ...] = (
-
     "return",
     "return_lag1",
     "return_lag5",
     "return_mean_20",
     "reversal_5",
-
     "momentum_20",
     "momentum_60",
     "momentum_composite",
     "mom_vol_adj",
     "momentum_regime_interaction",
-
     "volatility",
     "volatility_20",
     "vol_of_vol",
     "return_skew_20",
-
     "volume_momentum",
     "dollar_volume",
     "amihud",
-
     "rsi",
     "ema_ratio",
-
     "dist_from_52w_high",
     "regime_feature",
-
     "market_dispersion",
     "breadth",
 )
-
-
-############################################################
-# CROSS-SECTIONAL BASE COLUMNS
-############################################################
 
 BASE_CS_COLS: Tuple[str, ...] = (
     "momentum_20",
@@ -93,11 +67,6 @@ CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = tuple(
     [f"{col}_rank" for col in BASE_CS_COLS]
 )
 
-
-############################################################
-# MODEL FEATURE CONTRACT
-############################################################
-
 MODEL_FEATURES: Tuple[str, ...] = tuple(
     CORE_FEATURES + CROSS_SECTIONAL_FEATURES
 )
@@ -108,30 +77,16 @@ MIN_ROWS_TRAINING = 300
 MIN_VARIANCE = 1e-8
 MIN_CS_VARIANCE = 1e-6
 
-
-############################################################
-# FORBIDDEN COLUMN DETECTION
-############################################################
-
 FORBIDDEN_REGEX = re.compile(
     r"\b(future|next|forward|label|tomorrow|lead|horizon|lookahead|outcome|response)\b",
     re.IGNORECASE,
 )
-
-
-############################################################
-# LOG SUPPRESSION
-############################################################
 
 _logged_low_variance_core = set()
 _logged_low_variance_cs = set()
 _logged_constant_cs = set()
 _logged_missing_inference = set()
 
-
-############################################################
-# INTERNAL UTILITIES
-############################################################
 
 def _check_duplicate_features():
 
@@ -167,7 +122,17 @@ def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
     cols = [c for c in MODEL_FEATURES if c in df.columns]
 
     for col in cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        series_or_df = df[col]
+
+        if isinstance(series_or_df, pd.DataFrame):
+
+            for sub_col in series_or_df.columns:
+                df[sub_col] = pd.to_numeric(series_or_df[sub_col], errors="coerce")
+
+        else:
+
+            df[col] = pd.to_numeric(series_or_df, errors="coerce")
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
@@ -227,10 +192,6 @@ def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[:, MODEL_FEATURES]
 
 
-############################################################
-# VALIDATION
-############################################################
-
 def validate_feature_schema(
     df: pd.DataFrame,
     mode: str = "training",
@@ -262,10 +223,6 @@ def validate_feature_schema(
 
     feature_df = df.copy()
 
-    ########################################################
-    # STRICT CONTRACT
-    ########################################################
-
     if mode in {"training", "strict_contract"}:
 
         missing_all = set(MODEL_FEATURES) - set(feature_df.columns)
@@ -277,10 +234,6 @@ def validate_feature_schema(
             )
 
         feature_df = feature_df.loc[:, MODEL_FEATURES]
-
-    ########################################################
-    # INFERENCE MODE
-    ########################################################
 
     elif mode == "inference":
 
@@ -304,15 +257,7 @@ def validate_feature_schema(
 
         feature_df = _reorder_columns(feature_df)
 
-    ########################################################
-    # NUMERIC CLEANUP
-    ########################################################
-
     feature_df = _safe_numeric_block(feature_df)
-
-    ########################################################
-    # NAN HANDLING
-    ########################################################
 
     if mode == "inference":
 
@@ -325,10 +270,6 @@ def validate_feature_schema(
             raise RuntimeError(
                 "NaN detected after schema validation."
             )
-
-    ########################################################
-    # FINAL SANITY
-    ########################################################
 
     if not np.isfinite(feature_df.values).all():
 
@@ -346,10 +287,6 @@ def validate_feature_schema(
 
     return feature_df.astype(DTYPE, copy=False)
 
-
-############################################################
-# SCHEMA SIGNATURE
-############################################################
 
 def get_schema_signature() -> str:
 
@@ -373,10 +310,6 @@ def get_schema_signature() -> str:
         canonical.encode()
     ).hexdigest()
 
-
-############################################################
-# SCHEMA SNAPSHOT
-############################################################
 
 def schema_snapshot() -> Dict:
 
