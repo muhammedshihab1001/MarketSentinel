@@ -174,6 +174,13 @@ class MarketDataService:
         if not np.isfinite(df[numeric_cols].values).all():
             raise RuntimeError(f"Non-finite values detected for {ticker}")
 
+        # prevent corrupted prices
+        if (df[["open", "high", "low", "close"]] <= 0).any().any():
+            raise RuntimeError(f"Invalid price values detected for {ticker}")
+
+        # enforce OHLC sanity
+        df["high"] = np.maximum(df["high"], df["low"])
+
         if df["close"].nunique() < 5:
             raise RuntimeError(
                 f"Flat price series detected for {ticker}"
@@ -363,7 +370,7 @@ class MarketDataService:
         results = {}
         failures = {}
 
-        tickers = list(dict.fromkeys(tickers))
+        tickers = [self._sanitize_ticker(t) for t in list(dict.fromkeys(tickers))]
 
         worker_cap = min(self.MAX_WORKERS, max(2, min(len(tickers), 5)))
 
