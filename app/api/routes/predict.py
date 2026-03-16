@@ -1,5 +1,5 @@
 # =========================================================
-# PREDICTION & SNAPSHOT ROUTES v3.3
+# PREDICTION & SNAPSHOT ROUTES v3.4
 # Hybrid Multi-Agent Compatible
 # CV-Optimized | Decision-Aware | Governance-Aware
 # =========================================================
@@ -80,10 +80,6 @@ TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 # UTILS
 # =========================================================
 
-def safe_attr(obj, attr, default=None):
-    return getattr(obj, attr, default)
-
-
 def load_default_universe() -> List[str]:
 
     global _universe_cache
@@ -146,6 +142,7 @@ async def live_snapshot():
         pipeline = get_pipeline()
 
         loader = get_shared_model_loader()
+        container = loader._xgb_container
 
         async with inference_semaphore:
 
@@ -154,7 +151,7 @@ async def live_snapshot():
                 timeout=REQUEST_TIMEOUT
             )
 
-        if not snapshot or "signals" not in snapshot:
+        if not isinstance(snapshot, dict) or "signals" not in snapshot:
 
             raise RuntimeError("Invalid snapshot structure.")
 
@@ -164,7 +161,7 @@ async def live_snapshot():
         short_count = sum(1 for s in signals if s.get("weight", 0.0) < 0)
 
         hybrid_scores = [
-            s.get("hybrid_consensus_score", s.get("agent_score", 0.0)) * 100
+            s.get("hybrid_consensus_score", 0.0) * 100
             for s in signals
         ]
 
@@ -194,15 +191,15 @@ async def live_snapshot():
 
         meta = {
 
-            "model_version": safe_attr(loader, "xgb_version"),
+            "model_version": container.version if container else None,
 
-            "schema_signature": safe_attr(loader, "schema_signature"),
+            "schema_signature": container.schema_signature if container else None,
 
-            "dataset_hash": safe_attr(loader, "dataset_hash"),
+            "dataset_hash": container.dataset_hash if container else None,
 
-            "artifact_hash": safe_attr(loader, "artifact_hash"),
+            "artifact_hash": container.artifact_hash if container else None,
 
-            "feature_checksum": safe_attr(loader, "feature_checksum"),
+            "feature_checksum": container.feature_checksum if container else None,
 
             "universe_size": len(tickers),
 
