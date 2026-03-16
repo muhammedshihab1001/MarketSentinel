@@ -41,17 +41,19 @@ class YahooProvider(MarketDataProvider):
     SOFT_FAIL_MODE = os.getenv("YAHOO_SOFT_FAIL", "1") == "1"
     SOFT_FAIL_RATIO = 0.70
 
-    # Reduced retry count to avoid rate-limit storms
     MAX_RETRIES = 2
     RETRY_DELAY_SECONDS = 1.5
 
     RATE_LIMIT_WAIT = 4.0
 
+    # NEW: safety guard for hanging fetches
+    FETCH_TIMEOUT_WARN = 10.0
+
     def __init__(self) -> None:
 
         self.fetcher = StockPriceFetcher()
 
-        logger.debug("YahooProvider initialised.")
+        logger.info("YahooProvider initialised (PRIMARY market data provider).")
 
     @staticmethod
     def _normalize_datetime(series: pd.Series) -> pd.Series:
@@ -279,6 +281,8 @@ class YahooProvider(MarketDataProvider):
 
         for attempt in range(1, self.MAX_RETRIES + 1):
 
+            start_time = time.time()
+
             try:
 
                 raw_df = self.fetcher.fetch(
@@ -287,6 +291,15 @@ class YahooProvider(MarketDataProvider):
                     end_date,
                     yf_interval,
                 )
+
+                latency = time.time() - start_time
+
+                if latency > self.FETCH_TIMEOUT_WARN:
+                    logger.warning(
+                        "Slow Yahoo fetch detected | ticker=%s latency=%.2fs",
+                        ticker,
+                        latency,
+                    )
 
                 if raw_df is not None and not raw_df.empty:
                     break
