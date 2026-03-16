@@ -165,7 +165,7 @@ def export_artifacts(
 
     logger.info("Production pointer updated.")
 
-    if create_baseline:
+    if create_baseline or promote_baseline:
 
         logger.info("Creating drift baseline.")
 
@@ -213,17 +213,15 @@ def load_training_data(start_date, end_date):
             # ----------------------------------------
             # SAFE DATE NORMALIZATION (FIX TZ BUG)
             # ----------------------------------------
+            # FIX: Use utc=True to handle both tz-aware and tz-naive
+            # timestamps without the 'Cannot localize tz-aware
+            # Timestamp' crash.
 
             if "date" in df.columns:
 
-                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
 
                 df = df.dropna(subset=["date"])
-
-                if getattr(df["date"].dt, "tz", None) is None:
-                    df["date"] = df["date"].dt.tz_localize("UTC")
-                else:
-                    df["date"] = df["date"].dt.tz_convert("UTC")
 
             price_frames.append(df)
 
@@ -352,7 +350,7 @@ def trainer(train_df):
 # MAIN
 # ==========================================================
 
-def main():
+def main(create_baseline=False, promote_baseline=False):
 
     init_env()
 
@@ -380,6 +378,8 @@ def main():
         start_date,
         end_date,
         final_df,
+        promote_baseline=promote_baseline,
+        create_baseline=create_baseline,
     )
 
     logger.info("Training completed successfully.")
@@ -396,4 +396,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    main()
+    main(
+        create_baseline=args.create_baseline,
+        promote_baseline=args.promote_baseline,
+    )
