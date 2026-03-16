@@ -28,11 +28,13 @@ class StockPriceFetcher:
 
     REQUEST_TIMEOUT = 25
 
+    # FIX: must be class variable for classmethod access
+    MIN_REQUEST_INTERVAL = float(os.getenv("YFINANCE_MIN_INTERVAL", "2.5"))
+
     def __init__(self):
 
         self.soft_fail_mode = os.getenv("YFINANCE_SOFT_MODE", "1") == "1"
         self.soft_fail_ratio = float(os.getenv("YFINANCE_SOFT_FAIL_RATIO", "0.70"))
-        self.MIN_REQUEST_INTERVAL = float(os.getenv("YFINANCE_MIN_INTERVAL", "2.5"))
 
     _last_request_time = 0.0
     _rate_lock = threading.Lock()
