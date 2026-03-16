@@ -3,10 +3,11 @@ import logging
 import time
 import threading
 from contextlib import nullcontext
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 
 import pandas as pd
 
+from core.data.providers.market.base import MarketDataProvider
 from core.data.providers.market.yahoo_provider import YahooProvider
 
 try:
@@ -19,23 +20,6 @@ logger = logging.getLogger(__name__)
 
 
 class MarketProviderRouter:
-    """
-    Market data router with sequential fallback and response validation.
-
-    Provider priority (portfolio-friendly):
-
-        Yahoo (yfinance) → TwelveData
-
-    Rationale:
-        - Yahoo is free and widely used for ML experiments
-        - TwelveData acts as backup if Yahoo fails
-        - Good balance for portfolio projects
-
-    Designed for:
-        - Free data providers
-        - yfinance rate limits
-        - ML research / portfolio systems
-    """
 
     REQUIRED_COLUMNS = {"date", "open", "high", "low", "close", "volume"}
 
@@ -45,16 +29,16 @@ class MarketProviderRouter:
     PROVIDER_TIMEOUT_WARN = 8.0
     FAILURE_COOLDOWN = 60
 
-    YAHOO_MAX_CONCURRENT = int(os.getenv("YAHOO_MAX_CONCURRENT", 1))
-    YAHOO_MIN_INTERVAL = float(os.getenv("YAHOO_MIN_INTERVAL", 1.0))
-
     ALLOWED_INTERVALS = {"1d", "D", "1h", "60m", "15m", "5m", "1m"}
-
-    MAX_OHLC_VIOLATION_RATIO = float(os.getenv("OHLC_TOLERANCE", "0.20"))
 
     def __init__(self) -> None:
 
-        self.providers: list = []
+        self.YAHOO_MAX_CONCURRENT = int(os.getenv("YAHOO_MAX_CONCURRENT", 1))
+        self.YAHOO_MIN_INTERVAL = float(os.getenv("YAHOO_MIN_INTERVAL", 1.0))
+        self.MAX_OHLC_VIOLATION_RATIO = float(os.getenv("OHLC_TOLERANCE", "0.20"))
+
+        self.providers: List[Tuple[str, MarketDataProvider]] = []
+
         self._provider_failures: Dict[str, float] = {}
         self._provider_stats: Dict[str, Dict[str, Any]] = {}
 
@@ -71,9 +55,8 @@ class MarketProviderRouter:
         self._single_provider_mode = len(self.providers) == 1
 
         logger.info(
-            "Market router ready | priority=%s | single_provider=%s | yahoo_max_concurrent=%s",
+            "Market router ready | providers=%s | yahoo_max_concurrent=%s",
             [p[0] for p in self.providers],
-            self._single_provider_mode,
             self.YAHOO_MAX_CONCURRENT,
         )
 
@@ -85,6 +68,7 @@ class MarketProviderRouter:
                 return
 
             if api_key_env and not os.getenv(api_key_env):
+
                 logger.warning(
                     "Provider skipped → %s | missing env var: %s",
                     name,
@@ -115,13 +99,7 @@ class MarketProviderRouter:
                     exc,
                 )
 
-        # ---------------------------------------------------------
-        # Provider order (UPDATED)
-        # ---------------------------------------------------------
-        # Yahoo first (primary provider)
         register("yahoo", YahooProvider)
-
-        # TwelveData fallback
         register("twelvedata", TwelveDataProvider, "TWELVEDATA_API_KEY")
 
     @classmethod
@@ -178,7 +156,7 @@ class MarketProviderRouter:
         if ratio > self.MAX_OHLC_VIOLATION_RATIO:
 
             raise RuntimeError(
-                f"OHLC price invariant violated in {violations} bar(s)"
+                f"OHLC invariant violated in {violations} bars"
             )
 
         logger.warning(
@@ -200,15 +178,7 @@ class MarketProviderRouter:
         missing = self.REQUIRED_COLUMNS - set(df.columns)
 
         if missing:
-            raise RuntimeError(f"Schema violation for {ticker}. Missing columns: {missing}")
-
-        if len(df) == 0:
-            raise RuntimeError(f"Empty dataset returned for {ticker}")
-
-        for col in ("open", "high", "low", "close", "volume"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df = df.dropna(subset=["open", "high", "low", "close"])
+            raise RuntimeError(f"Schema violation for {ticker}. Missing {missing}")
 
         if len(df) < min_rows:
             raise RuntimeError(
@@ -220,6 +190,7 @@ class MarketProviderRouter:
         max_move = df["close"].pct_change().abs().dropna().max()
 
         if max_move > self.MAX_DAILY_MOVE:
+
             raise RuntimeError(
                 f"Extreme price move ({max_move:.1%}) detected for {ticker}"
             )
@@ -251,6 +222,8 @@ class MarketProviderRouter:
         interval: str,
         min_rows: int,
     ) -> pd.DataFrame:
+
+        ticker = ticker.strip().upper()
 
         start_time = time.time()
 
