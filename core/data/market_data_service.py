@@ -36,8 +36,10 @@ class MarketDataService:
     MEMORY_CACHE_TTL = 30
     MEMORY_CACHE_MAX = 200
 
-    GLOBAL_RATE_LIMIT_PER_SEC = 3
-    BATCH_SPACING_SECONDS = 0.15
+    # safer rate limit for Yahoo
+    GLOBAL_RATE_LIMIT_PER_SEC = 2
+
+    BATCH_SPACING_SECONDS = 0.20
     MAX_RETRY_BACKOFF = 2.5
 
     SOFT_FAIL_MODE = os.getenv("MARKET_SOFT_FAIL", "1") == "1"
@@ -50,11 +52,9 @@ class MarketDataService:
     _rate_lock: Lock = Lock()
     _recent_requests: deque = deque()
 
-    # NEW: prevent duplicate concurrent fetch
     _inflight_requests: Dict[str, bool] = {}
     _inflight_lock: Lock = Lock()
 
-    # NEW: cache stats (debugging)
     _cache_hits = 0
     _cache_misses = 0
 
@@ -383,7 +383,8 @@ class MarketDataService:
                     )
                 ] = ticker
 
-                time.sleep(self.BATCH_SPACING_SECONDS)
+                # jitter prevents synchronized bursts
+                time.sleep(self.BATCH_SPACING_SECONDS + np.random.uniform(0.05, 0.15))
 
             for future in as_completed(futures):
 
