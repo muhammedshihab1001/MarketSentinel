@@ -11,7 +11,6 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-
 _DAILY_INTERVALS = {"1d", "D", "1wk", "1mo"}
 _INTRADAY_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "60m", "90m"}
 
@@ -26,18 +25,18 @@ class StockPriceFetcher:
     Designed to be called only by YahooProvider.
     """
 
-    MAX_RETRIES = 4
+    MAX_RETRIES = 5
     BASE_RETRY_SLEEP = 1.0
-    MAX_BACKOFF = 8.0
+    MAX_BACKOFF = 10.0
 
     MIN_ROWS = 50
-    REQUEST_TIMEOUT = 20
+    REQUEST_TIMEOUT = 25
 
     SOFT_FAIL_MODE = os.getenv("YFINANCE_SOFT_MODE", "1") == "1"
     SOFT_FAIL_RATIO = 0.70
 
-    # NEW: throttle between Yahoo requests
-    MIN_REQUEST_INTERVAL = float(os.getenv("YFINANCE_MIN_INTERVAL", "1.0"))
+    # safer default interval between Yahoo requests
+    MIN_REQUEST_INTERVAL = float(os.getenv("YFINANCE_MIN_INTERVAL", "2.0"))
 
     _last_request_time = 0.0
     _rate_lock = threading.Lock()
@@ -176,7 +175,7 @@ class StockPriceFetcher:
         return df
 
     # --------------------------------------------------
-    # DOWNLOAD
+    # DOWNLOAD (UPDATED)
     # --------------------------------------------------
 
     def _download(
@@ -195,14 +194,15 @@ class StockPriceFetcher:
 
                 self._respect_rate_limit()
 
-                ticker_obj = yf.Ticker(ticker)
-
-                df = ticker_obj.history(
+                # safer endpoint than Ticker.history
+                df = yf.download(
+                    tickers=ticker,
                     start=start,
                     end=end,
                     interval=interval,
+                    progress=False,
                     auto_adjust=False,
-                    timeout=self.REQUEST_TIMEOUT,
+                    threads=False
                 )
 
                 if df is None or df.empty:
@@ -230,12 +230,12 @@ class StockPriceFetcher:
 
                 backoff = min(
                     (2 ** (attempt - 1)) * self.BASE_RETRY_SLEEP
-                    + random.uniform(0.3, 0.9),
+                    + random.uniform(0.5, 1.2),
                     self.MAX_BACKOFF,
                 )
 
                 if "too many requests" in msg or "rate" in msg:
-                    backoff = max(backoff, 4.0)
+                    backoff = max(backoff, 6.0)
 
                 logger.warning(
                     "yfinance attempt %d/%d failed | ticker=%s | backoff=%.2fs | error=%s",
@@ -303,7 +303,6 @@ class StockPriceFetcher:
         df.dropna(subset=["date"], inplace=True)
 
         if "adj_close" in df.columns:
-
             df["close"] = df["adj_close"]
 
         required = {"open", "high", "low", "close", "volume"}
