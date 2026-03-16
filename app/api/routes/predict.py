@@ -1,5 +1,5 @@
 # =========================================================
-# PREDICTION & SNAPSHOT ROUTES v3.1
+# PREDICTION & SNAPSHOT ROUTES v3.2
 # Hybrid Multi-Agent Compatible
 # CV-Optimized | Decision-Aware | Governance-Aware
 # =========================================================
@@ -17,6 +17,8 @@ from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline, get_shared_model_loader
+from core.data.market_data_service import MarketDataService
+
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
@@ -291,6 +293,70 @@ async def signal_explanation(ticker: str):
     except Exception as e:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
         logger.exception("Signal explanation failure")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
+
+
+# =========================================================
+# PRICE HISTORY (Frontend Chart Support)
+# =========================================================
+
+@router.get("/price-history/{ticker}")
+async def price_history(ticker: str, days: int = 365):
+
+    endpoint = "/predict/price-history"
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
+    start_time = time.time()
+
+    ticker = ticker.upper().strip()
+
+    if not TICKER_REGEX.match(ticker):
+        raise HTTPException(status_code=400, detail="Invalid ticker format.")
+
+    try:
+
+        service = MarketDataService()
+
+        end_date = pd.Timestamp.utcnow().normalize()
+        start_date = end_date - pd.Timedelta(days=days)
+
+        data, failures = await run_in_threadpool(
+            service.get_price_data_batch,
+            [ticker],
+            start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d")
+        )
+
+        df = data.get(ticker)
+
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail="Price history unavailable")
+
+        prices = [
+            {
+                "date": str(row["date"]),
+                "close": float(row["close"])
+            }
+            for _, row in df.iterrows()
+        ]
+
+        return {
+            "ticker": ticker,
+            "days": days,
+            "prices": prices,
+            "latency_ms": int((time.time() - start_time) * 1000),
+            "timestamp": int(time.time())
+        }
+
+    except HTTPException:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        raise
+
+    except Exception as e:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        logger.exception("Price history endpoint failed")
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
