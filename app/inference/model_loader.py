@@ -244,6 +244,9 @@ class ModelLoader:
 
     def _verify_universe(self, universe_hash):
 
+        if not universe_hash:
+            return
+
         try:
 
             runtime_hash = MarketUniverse().hash()
