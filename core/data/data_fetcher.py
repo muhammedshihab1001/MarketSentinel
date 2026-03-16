@@ -18,13 +18,6 @@ _MAX_DAILY_GAP = 10
 
 
 class StockPriceFetcher:
-    """
-    Safe wrapper around yfinance with retry logic,
-    rate limiting, schema normalization, and
-    basic OHLC data repairs.
-
-    Used internally by YahooProvider.
-    """
 
     MAX_RETRIES = 2
 
@@ -33,23 +26,20 @@ class StockPriceFetcher:
 
     MIN_ROWS = 50
 
-    # NEW: safety timeout guard
     REQUEST_TIMEOUT = 25
 
-    SOFT_FAIL_MODE = os.getenv("YFINANCE_SOFT_MODE", "1") == "1"
-    SOFT_FAIL_RATIO = 0.70
+    def __init__(self):
 
-    MIN_REQUEST_INTERVAL = float(os.getenv("YFINANCE_MIN_INTERVAL", "2.5"))
+        self.soft_fail_mode = os.getenv("YFINANCE_SOFT_MODE", "1") == "1"
+        self.soft_fail_ratio = float(os.getenv("YFINANCE_SOFT_FAIL_RATIO", "0.70"))
+        self.MIN_REQUEST_INTERVAL = float(os.getenv("YFINANCE_MIN_INTERVAL", "2.5"))
 
     _last_request_time = 0.0
     _rate_lock = threading.Lock()
 
     _ticker_cooldown = {}
+    _cooldown_lock = threading.Lock()
     _cooldown_seconds = 15
-
-    # --------------------------------------------------
-    # RATE LIMIT PROTECTION
-    # --------------------------------------------------
 
     @classmethod
     def _respect_rate_limit(cls):
@@ -69,27 +59,25 @@ class StockPriceFetcher:
     @classmethod
     def _respect_ticker_cooldown(cls, ticker: str):
 
-        cooldown_until = cls._ticker_cooldown.get(ticker)
+        with cls._cooldown_lock:
 
-        if cooldown_until:
+            cooldown_until = cls._ticker_cooldown.get(ticker)
 
-            now = time.time()
+            if cooldown_until:
 
-            if now < cooldown_until:
+                now = time.time()
 
-                sleep_time = cooldown_until - now
+                if now < cooldown_until:
 
-                logger.warning(
-                    "Cooldown active for %s (sleep %.2fs)",
-                    ticker,
-                    sleep_time,
-                )
+                    sleep_time = cooldown_until - now
 
-                time.sleep(sleep_time)
+                    logger.warning(
+                        "Cooldown active for %s (sleep %.2fs)",
+                        ticker,
+                        sleep_time,
+                    )
 
-    # --------------------------------------------------
-    # COLUMN HELPERS
-    # --------------------------------------------------
+                    time.sleep(sleep_time)
 
     @staticmethod
     def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -110,7 +98,9 @@ class StockPriceFetcher:
                         canonical = field.replace(" ", "_")
                         break
 
-                normalized.append(canonical if canonical else (parts[0] if parts else "unknown"))
+                normalized.append(
+                    canonical if canonical else (parts[0] if parts else "unknown")
+                )
 
             df.columns = normalized
 
@@ -152,8 +142,7 @@ class StockPriceFetcher:
                 return df
 
         raise RuntimeError(
-            "Could not locate a datetime column in Yahoo response. "
-            f"Available columns: {list(df.columns)}"
+            "Could not locate datetime column in Yahoo response."
         )
 
     @staticmethod
@@ -168,10 +157,6 @@ class StockPriceFetcher:
             return s.dt.tz_localize("UTC")
 
         return s.dt.tz_convert("UTC")
-
-    # --------------------------------------------------
-    # PRICE VALIDATION
-    # --------------------------------------------------
 
     @staticmethod
     def _validate_prices(df: pd.DataFrame) -> pd.DataFrame:
@@ -188,19 +173,15 @@ class StockPriceFetcher:
         df.dropna(subset=["open", "high", "low", "close"], inplace=True)
 
         if df.empty:
-            raise RuntimeError("All price rows are invalid after coercion.")
+            raise RuntimeError("All price rows invalid after coercion.")
 
         if (df[["open", "high", "low", "close"]] <= 0).any().any():
-            raise RuntimeError("Non-positive prices detected in Yahoo data.")
+            raise RuntimeError("Non-positive prices detected.")
 
         if (df["volume"] < 0).any():
-            raise RuntimeError("Negative volume values detected.")
+            raise RuntimeError("Negative volume detected.")
 
         return df
-
-    # --------------------------------------------------
-    # OHLC REPAIR
-    # --------------------------------------------------
 
     @staticmethod
     def _repair_ohlc(df: pd.DataFrame) -> pd.DataFrame:
@@ -210,17 +191,9 @@ class StockPriceFetcher:
 
         return df
 
-    # --------------------------------------------------
-    # DOWNLOAD
-    # --------------------------------------------------
+    def _download(self, ticker: str, start: str, end: str, interval: str) -> pd.DataFrame:
 
-    def _download(
-        self,
-        ticker: str,
-        start: str,
-        end: str,
-        interval: str,
-    ) -> pd.DataFrame:
+        ticker = ticker.strip().upper()
 
         last_exc: Optional[Exception] = None
 
@@ -257,38 +230,17 @@ class StockPriceFetcher:
                 if df is None or df.empty:
                     raise RuntimeError("yfinance returned empty DataFrame.")
 
-                if len(df.columns) <= 1:
-                    raise RuntimeError(
-                        f"Suspicious yfinance response for {ticker}"
-                    )
-
-                logger.debug(
-                    "yfinance download OK | ticker=%s attempt=%d rows=%d",
-                    ticker,
-                    attempt,
-                    len(df),
-                )
-
                 return df
 
             except Exception as exc:
 
                 last_exc = exc
-                msg = str(exc).lower()
 
                 backoff = min(
                     (2 ** (attempt - 1)) * self.BASE_RETRY_SLEEP
                     + random.uniform(0.5, 1.2),
                     self.MAX_BACKOFF,
                 )
-
-                if "too many requests" in msg or "rate" in msg:
-
-                    backoff = max(backoff, 6.0)
-
-                    self._ticker_cooldown[ticker] = (
-                        time.time() + self._cooldown_seconds
-                    )
 
                 logger.warning(
                     "yfinance attempt %d/%d failed | ticker=%s | backoff=%.2fs | error=%s",
@@ -303,46 +255,13 @@ class StockPriceFetcher:
                     time.sleep(backoff)
 
         raise RuntimeError(
-            f"yfinance fetch failed after {self.MAX_RETRIES} attempts "
-            f"for '{ticker}'. Last error: {last_exc}"
+            f"yfinance fetch failed after {self.MAX_RETRIES} attempts for '{ticker}'. "
+            f"Last error: {last_exc}"
         )
 
-    # --------------------------------------------------
-    # GAP CHECK
-    # --------------------------------------------------
+    def fetch(self, ticker: str, start_date: str, end_date: str, interval: str = "1d") -> pd.DataFrame:
 
-    @staticmethod
-    def _check_calendar_gaps(df: pd.DataFrame, ticker: str, interval: str):
-
-        if interval not in _DAILY_INTERVALS:
-            return
-
-        if len(df) < 2:
-            return
-
-        gap_days = df["date"].diff().dt.days
-        max_gap = gap_days.max()
-
-        if pd.notna(max_gap) and max_gap > _MAX_DAILY_GAP:
-
-            logger.warning(
-                "Large calendar gap for %s: %d days (interval=%s)",
-                ticker,
-                int(max_gap),
-                interval,
-            )
-
-    # --------------------------------------------------
-    # PUBLIC FETCH
-    # --------------------------------------------------
-
-    def fetch(
-        self,
-        ticker: str,
-        start_date: str,
-        end_date: str,
-        interval: str = "1d",
-    ) -> pd.DataFrame:
+        ticker = ticker.strip().upper()
 
         df = self._download(ticker, start_date, end_date, interval)
 
@@ -370,32 +289,20 @@ class StockPriceFetcher:
 
         df = self._repair_ohlc(df)
 
-        if df["date"].duplicated().any():
-
-            n_dupes = df["date"].duplicated().sum()
-
-            logger.warning(
-                "Duplicate timestamps in Yahoo data for %s (%d rows)",
-                ticker,
-                n_dupes,
-            )
-
-            df = df.drop_duplicates(subset=["date"], keep="last")
+        df = df.drop_duplicates("date")
 
         df = df.sort_values("date").reset_index(drop=True)
 
         now_utc = pd.Timestamp.now(tz="UTC")
 
         if df["date"].max() > now_utc:
-            df = df[df["date"] <= now_utc].reset_index(drop=True)
-
-        self._check_calendar_gaps(df, ticker, interval)
+            df = df[df["date"] <= now_utc]
 
         if len(df) < self.MIN_ROWS:
 
-            soft_threshold = int(self.MIN_ROWS * self.SOFT_FAIL_RATIO)
+            soft_threshold = int(self.MIN_ROWS * self.soft_fail_ratio)
 
-            if self.SOFT_FAIL_MODE and len(df) >= soft_threshold:
+            if self.soft_fail_mode and len(df) >= soft_threshold:
 
                 logger.warning(
                     "Short history accepted in soft-fail mode for %s (%d rows).",
