@@ -93,6 +93,10 @@ def compute_reproducibility_hash(dataset_hash):
     return hashlib.sha256(canonical).hexdigest()
 
 
+# ==========================================================
+# EXPORT ARTIFACTS
+# ==========================================================
+
 def export_artifacts(
     model,
     metrics,
@@ -109,10 +113,8 @@ def export_artifacts(
     os.makedirs(DRIFT_DIR, exist_ok=True)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-
     model_version = f"xgb_{timestamp}"
 
-    # FIX: filenames aligned with ModelLoader expectations
     model_path = os.path.join(MODEL_DIR, f"model_{model_version}.pkl")
     metadata_path = os.path.join(MODEL_DIR, f"metadata_{model_version}.json")
 
@@ -120,25 +122,24 @@ def export_artifacts(
 
     joblib.dump(model, model_path)
 
-    metadata = {
-        "model_version": model_version,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "dataset_hash": dataset_hash,
-        "dataset_rows": dataset_rows,
-        "schema_signature": get_schema_signature(),
-        "schema_version": SCHEMA_VERSION,
-        "feature_checksum": compute_feature_checksum(),
-        "training_code_hash": compute_training_code_hash(),
-        "universe_hash": MarketUniverse.fingerprint(),
-        "training_window": {
-            "start": start_date,
-            "end": end_date,
-        },
-        "metrics": metrics,
-    }
+    # compute artifact hash
+    artifact_hash = MetadataManager.hash_file(model_path)
 
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+    # FIX: use official metadata creator
+    metadata = MetadataManager.create_metadata(
+        model_name="xgboost",
+        metrics=metrics,
+        features=MODEL_FEATURES,
+        training_start=start_date,
+        training_end=end_date,
+        dataset_hash=dataset_hash,
+        dataset_rows=dataset_rows,
+        metadata_type="model_training",
+        artifact_hash=artifact_hash,
+        feature_checksum=compute_feature_checksum(),
+    )
+
+    MetadataManager.save_metadata(metadata, metadata_path)
 
     logger.info("Metadata saved.")
 
@@ -199,17 +200,9 @@ def load_training_data(start_date, end_date):
             if df is None or df.empty:
                 continue
 
-            # ----------------------------------------
-            # SAFE DATE NORMALIZATION (FIX TZ BUG)
-            # ----------------------------------------
-            # FIX: Use utc=True to handle both tz-aware and tz-naive
-            # timestamps without the 'Cannot localize tz-aware
-            # Timestamp' crash.
-
             if "date" in df.columns:
 
                 df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
-
                 df = df.dropna(subset=["date"])
 
             price_frames.append(df)
@@ -231,7 +224,6 @@ def load_training_data(start_date, end_date):
         training=True,
     )
 
-    # FIX: Remove duplicate columns produced by feature pipeline
     df = df.loc[:, ~df.columns.duplicated(keep="first")]
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="training")
@@ -293,7 +285,6 @@ def trainer(train_df):
 
     train_df = train_df.copy()
 
-    # FIX: Remove duplicate columns to prevent downstream dtype crash
     train_df = train_df.loc[:, ~train_df.columns.duplicated(keep="first")]
 
     if {"date", "ticker", "close"}.issubset(train_df.columns):
