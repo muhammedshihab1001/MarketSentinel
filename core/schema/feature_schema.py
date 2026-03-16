@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 # ============================================================
 
-SCHEMA_VERSION = "45.3"
+SCHEMA_VERSION = "45.4"
 
 
 ############################################################
@@ -98,7 +98,7 @@ CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = tuple(
 # MODEL FEATURE CONTRACT
 ############################################################
 
-MODEL_FEATURES: List[str] = list(
+MODEL_FEATURES: Tuple[str, ...] = tuple(
     CORE_FEATURES + CROSS_SECTIONAL_FEATURES
 )
 
@@ -126,23 +126,38 @@ FORBIDDEN_REGEX = re.compile(
 _logged_low_variance_core = set()
 _logged_low_variance_cs = set()
 _logged_constant_cs = set()
+_logged_missing_inference = set()
 
 
 ############################################################
 # INTERNAL UTILITIES
 ############################################################
 
+def _check_duplicate_features():
+
+    duplicates = [
+        x for x in MODEL_FEATURES
+        if MODEL_FEATURES.count(x) > 1
+    ]
+
+    if duplicates:
+        raise RuntimeError(
+            f"Duplicate features detected in schema: {set(duplicates)}"
+        )
+
+
 def _check_forbidden_columns(df: pd.DataFrame, mode: str) -> None:
 
     for col in df.columns:
 
-        # Allow "target" ONLY during training
         if mode == "training" and col.lower() == "target":
             continue
 
         if FORBIDDEN_REGEX.search(col):
 
-            raise RuntimeError(f"Lookahead column detected: {col}")
+            raise RuntimeError(
+                f"Lookahead column detected: {col}"
+            )
 
 
 def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
@@ -176,6 +191,23 @@ def _check_dtype_stability(df: pd.DataFrame) -> None:
         )
 
 
+def _check_variance(df: pd.DataFrame):
+
+    for col in df.columns:
+
+        var = df[col].var()
+
+        if var < MIN_VARIANCE and col not in _logged_low_variance_core:
+
+            logger.debug(
+                "Low variance feature detected: %s (var=%s)",
+                col,
+                var
+            )
+
+            _logged_low_variance_core.add(col)
+
+
 def _fill_nan_defaults(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in df.columns:
@@ -204,21 +236,29 @@ def validate_feature_schema(
     mode: str = "training",
 ) -> pd.DataFrame:
 
+    _check_duplicate_features()
+
     if df is None or df.empty:
         raise RuntimeError("Empty feature dataset.")
 
     if mode not in {"training", "inference", "strict_contract"}:
-        raise RuntimeError(f"Unknown validation mode: {mode}")
+        raise RuntimeError(
+            f"Unknown validation mode: {mode}"
+        )
 
     if mode == "training" and len(df) < MIN_ROWS_TRAINING:
-        raise RuntimeError("Dataset below minimum rows for training.")
+        raise RuntimeError(
+            "Dataset below minimum rows for training."
+        )
 
     _check_forbidden_columns(df, mode)
 
     missing_core = set(CORE_FEATURES) - set(df.columns)
 
     if missing_core:
-        raise RuntimeError(f"Missing core features: {missing_core}")
+        raise RuntimeError(
+            f"Missing core features: {missing_core}"
+        )
 
     feature_df = df.copy()
 
@@ -248,6 +288,15 @@ def validate_feature_schema(
 
             if col not in feature_df.columns:
 
+                if col not in _logged_missing_inference:
+
+                    logger.warning(
+                        "Missing inference feature: %s (default inserted)",
+                        col
+                    )
+
+                    _logged_missing_inference.add(col)
+
                 if col.endswith("_rank"):
                     feature_df[col] = 0.5
                 else:
@@ -262,7 +311,7 @@ def validate_feature_schema(
     feature_df = _safe_numeric_block(feature_df)
 
     ########################################################
-    # FINAL SANITY
+    # NAN HANDLING
     ########################################################
 
     if mode == "inference":
@@ -277,6 +326,10 @@ def validate_feature_schema(
                 "NaN detected after schema validation."
             )
 
+    ########################################################
+    # FINAL SANITY
+    ########################################################
+
     if not np.isfinite(feature_df.values).all():
 
         raise RuntimeError(
@@ -284,6 +337,8 @@ def validate_feature_schema(
         )
 
     _check_dtype_stability(feature_df)
+
+    _check_variance(feature_df)
 
     feature_df = feature_df.loc[:, MODEL_FEATURES]
 
@@ -309,7 +364,10 @@ def get_schema_signature() -> str:
         "feature_count": len(MODEL_FEATURES),
     }
 
-    canonical = json.dumps(contract, sort_keys=True)
+    canonical = json.dumps(
+        contract,
+        sort_keys=True
+    )
 
     return hashlib.sha256(
         canonical.encode()
