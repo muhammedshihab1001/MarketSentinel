@@ -115,6 +115,16 @@ FORBIDDEN_REGEX = re.compile(
 
 
 ############################################################
+# LOG SUPPRESSION (NEW)
+############################################################
+
+# Prevent repeated warning spam
+_logged_low_variance_core = set()
+_logged_low_variance_cs = set()
+_logged_constant_cs = set()
+
+
+############################################################
 # INTERNAL UTILITIES
 ############################################################
 
@@ -138,9 +148,6 @@ def _check_dtype_stability(df: pd.DataFrame) -> None:
 
 
 def _fill_nan_defaults(df: pd.DataFrame) -> pd.DataFrame:
-    """Fill NaN with sensible defaults for inference mode.
-    _rank columns get 0.5 (midpoint), everything else gets 0.0.
-    """
     for col in df.columns:
         if df[col].isna().any():
             if col.endswith("_rank"):
@@ -191,7 +198,7 @@ def validate_feature_schema(
         feature_df = feature_df.loc[:, MODEL_FEATURES]
 
     ########################################################
-    # INFERENCE MODE (SAFE FALLBACK)
+    # INFERENCE MODE
     ########################################################
 
     elif mode == "inference":
@@ -228,7 +235,9 @@ def validate_feature_schema(
                 raise RuntimeError(f"Constant CORE feature detected: {col}")
 
         if finite_vals.var(ddof=0) < MIN_VARIANCE:
-            logger.warning("Low variance core feature: %s", col)
+            if col not in _logged_low_variance_core:
+                logger.warning("Low variance core feature: %s", col)
+                _logged_low_variance_core.add(col)
 
     ########################################################
     # CROSS SECTIONAL VALIDATION
@@ -245,7 +254,9 @@ def validate_feature_schema(
         if finite_vals.nunique() <= 1:
 
             if mode == "training":
-                logger.warning("Constant CS feature in training: %s", col)
+                if col not in _logged_constant_cs:
+                    logger.warning("Constant CS feature in training: %s", col)
+                    _logged_constant_cs.add(col)
                 continue
 
             if col.endswith("_z"):
@@ -257,17 +268,14 @@ def validate_feature_schema(
                 continue
 
         if finite_vals.var(ddof=0) < MIN_CS_VARIANCE:
-            logger.warning("Low variance CS feature: %s", col)
+            if col not in _logged_low_variance_cs:
+                logger.warning("Low variance CS feature: %s", col)
+                _logged_low_variance_cs.add(col)
 
     ########################################################
     # FINAL SANITY
     ########################################################
 
-    # FIX: In inference mode, fill NaN with safe defaults BEFORE
-    # the isfinite check. Previously inference would crash here
-    # because _safe_numeric_block coerces bad values to NaN,
-    # the NaN check was skipped for inference, but isfinite()
-    # still caught NaN (NaN is not finite).
     if mode == "inference":
         feature_df = _fill_nan_defaults(feature_df)
     else:
