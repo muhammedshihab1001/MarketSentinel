@@ -59,17 +59,22 @@ class YahooProvider(MarketDataProvider):
 
     @staticmethod
     def _normalize_datetime(series: pd.Series) -> pd.Series:
+        """
+        Convert any datetime series to normalised UTC dates safely.
 
-        dt = pd.to_datetime(series, errors="coerce")
+        FIX 1: Uses pd.to_datetime(utc=True) to handle both tz-aware
+        and tz-naive timestamps without the 'Cannot localize tz-aware
+        Timestamp' crash.
 
-        if dt.isna().any():
-            raise RuntimeError("Datetime parsing produced invalid timestamps.")
+        FIX 2: Changed isna().any() → isna().all(). A few NaT values
+        from coercion are acceptable (dropped later). Only raise if
+        ALL values are invalid.
+        """
 
-        # Handle tz-aware and tz-naive safely
-        if getattr(dt.dt, "tz", None) is None:
-            dt = dt.dt.tz_localize("UTC")
-        else:
-            dt = dt.dt.tz_convert("UTC")
+        dt = pd.to_datetime(series, utc=True, errors="coerce")
+
+        if dt.isna().all():
+            raise RuntimeError("Datetime parsing produced no valid timestamps.")
 
         dt = dt.dt.normalize()
 
