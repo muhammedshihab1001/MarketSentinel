@@ -1,5 +1,5 @@
 # =========================================================
-# DRIFT DETECTOR v2.3
+# DRIFT DETECTOR v2.4
 # Hybrid Multi-Agent Compatible | CV-Optimized
 # Noise-Tolerant for yfinance data
 # =========================================================
@@ -16,8 +16,6 @@ from core.schema.feature_schema import (
     MODEL_FEATURES,
     DTYPE
 )
-
-from core.artifacts.metadata_manager import MetadataManager
 
 logger = logging.getLogger("marketsentinel.drift")
 
@@ -76,7 +74,7 @@ class DriftDetector:
         ).lower() == "true"
 
     # =====================================================
-    # CREATE BASELINE
+    # BASELINE CREATION
     # =====================================================
 
     def create_baseline(
@@ -159,11 +157,13 @@ class DriftDetector:
             mean = block[col].mean()
             std = block[col].std()
 
-            if std > 0:
-                block[col] = block[col].clip(
-                    mean - self.FEATURE_CLIP_SIGMA * std,
-                    mean + self.FEATURE_CLIP_SIGMA * std
-                )
+            if std < self.EPSILON:
+                continue
+
+            block[col] = block[col].clip(
+                mean - self.FEATURE_CLIP_SIGMA * std,
+                mean + self.FEATURE_CLIP_SIGMA * std
+            )
 
         return block
 
@@ -182,7 +182,7 @@ class DriftDetector:
         return hashlib.sha256(canonical).hexdigest()
 
     # =====================================================
-    # LOAD VERIFIED BASELINE
+    # LOAD BASELINE
     # =====================================================
 
     def _load_verified_baseline(self):
@@ -190,18 +190,23 @@ class DriftDetector:
         if not os.path.exists(self.BASELINE_PATH):
             raise FileNotFoundError("Baseline missing.")
 
-        with open(self.BASELINE_PATH, encoding="utf-8") as f:
-            baseline = json.load(f)
+        try:
 
-        if baseline.get("integrity_hash") != self._baseline_hash(baseline):
-            raise RuntimeError("Baseline integrity failure.")
+            with open(self.BASELINE_PATH, encoding="utf-8") as f:
+                baseline = json.load(f)
 
-        meta = baseline.get("meta", {})
+            if baseline.get("integrity_hash") != self._baseline_hash(baseline):
+                raise RuntimeError("Baseline integrity failure.")
 
-        if meta.get("schema_signature") != get_schema_signature():
-            logger.warning("Schema mismatch detected.")
+            meta = baseline.get("meta", {})
 
-        return baseline
+            if meta.get("schema_signature") != get_schema_signature():
+                logger.warning("Schema mismatch detected.")
+
+            return baseline
+
+        except json.JSONDecodeError:
+            raise RuntimeError("Baseline JSON corrupted.")
 
     # =====================================================
     # PSI
@@ -331,23 +336,14 @@ class DriftDetector:
                 else "none"
             )
 
-            if drift_state == "hard":
-                exposure_scale = 0.2
-            elif drift_state == "soft":
-                exposure_scale = max(0.4, 1 - severity_score * 0.04)
-            else:
-                exposure_scale = 1.0
-
             DRIFT_DETECTED.set(severity_score)
 
             return {
                 "drift_detected": drift_count > 0,
                 "severity_score": severity_score,
-                "drift_confidence": float(min(drift_count / max(total_features, 1), 1.0)),
-                "coverage": coverage,
-                "details": report,
                 "drift_state": drift_state,
-                "exposure_scale": float(exposure_scale)
+                "coverage": coverage,
+                "details": report
             }
 
         except FileNotFoundError:
@@ -357,11 +353,9 @@ class DriftDetector:
             return {
                 "drift_detected": False,
                 "severity_score": 0,
-                "drift_confidence": 0.0,
-                "coverage": 0.0,
-                "details": {},
                 "drift_state": "baseline_missing",
-                "exposure_scale": 1.0
+                "coverage": 0,
+                "details": {}
             }
 
         except Exception as exc:
@@ -376,9 +370,31 @@ class DriftDetector:
             return {
                 "drift_detected": True,
                 "severity_score": 6,
-                "drift_confidence": 0.5,
-                "coverage": 0.0,
-                "details": {},
                 "drift_state": "detector_failure",
-                "exposure_scale": 0.4
+                "coverage": 0,
+                "details": {}
             }
+
+    # =====================================================
+    # BACKWARD COMPATIBILITY
+    # =====================================================
+
+    def compute_drift(self, dataset: pd.DataFrame):
+
+        result = self.detect(dataset)
+
+        if isinstance(result, dict):
+            return result.get("severity_score", 0)
+
+        return 0
+
+    # =====================================================
+    # HEALTH CHECK
+    # =====================================================
+
+    def health(self):
+
+        return {
+            "baseline_exists": os.path.exists(self.BASELINE_PATH),
+            "baseline_path": self.BASELINE_PATH
+        }
