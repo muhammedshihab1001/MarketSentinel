@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v4.9
+# INSTITUTIONAL INFERENCE PIPELINE v5.0
 # Stable | Drift-Aware | CV-Optimized | Noise-Controlled
 # =========================================================
 
@@ -64,7 +64,7 @@ def get_shared_model_loader():
 
                 _SHARED_MODEL_LOADER = ModelLoader()
 
-                # warm model
+                # warm load
                 _ = _SHARED_MODEL_LOADER.xgb
 
     return _SHARED_MODEL_LOADER
@@ -105,11 +105,8 @@ class InferencePipeline:
         self.drift_detector = DriftDetector()
 
         self.signal_agent = SignalAgent()
-
         self.technical_agent = TechnicalRiskAgent()
-
         self.portfolio_agent = PortfolioDecisionAgent()
-
         self.political_agent = PoliticalRiskAgent()
 
         self._validate_models_loaded()
@@ -120,10 +117,15 @@ class InferencePipeline:
 
     def _validate_models_loaded(self):
 
-        if self.models.schema_signature != get_schema_signature():
+        container = self.models._xgb_container
+
+        if container is None:
+            raise RuntimeError("Model container not initialized.")
+
+        if container.schema_signature != get_schema_signature():
             raise RuntimeError("Schema signature mismatch.")
 
-        logger.info("Model verified | version=%s", self.models.xgb_version)
+        logger.info("Model verified | version=%s", container.version)
 
     # =========================================================
     # FEATURE FRAME BUILDER
@@ -157,7 +159,6 @@ class InferencePipeline:
 
         combined_prices = pd.concat(list(data.values()), ignore_index=True)
 
-        # protect against yfinance weird rows
         combined_prices = combined_prices.dropna(subset=["close"])
 
         combined = FeatureEngineer.build_feature_pipeline(
@@ -261,23 +262,38 @@ class InferencePipeline:
             }
 
     # =========================================================
+    # SAFE AGENT EXECUTION
+    # =========================================================
+
+    def _safe_agent(self, agent, context):
+
+        try:
+            return agent.analyze(context)
+
+        except Exception:
+
+            logger.exception("Agent failure.")
+
+            return {"score": 0.0, "agent_score": 0.0, "hybrid": {"score": 0.0}}
+
+    # =========================================================
     # MAIN SNAPSHOT
     # =========================================================
 
     def run_snapshot(self, tickers: List[str]):
 
-        full_universe = list(MarketUniverse.get_universe())
+        container = self.models._xgb_container
+        model = self.models.xgb
 
-        if not full_universe:
-            raise RuntimeError("Universe empty.")
+        full_universe = list(MarketUniverse.get_universe())
 
         requested = sorted(set(tickers)) if tickers else full_universe
 
         cache_key = self.cache.build_key({
             "type": "snapshot",
             "requested": requested,
-            "model_version": self.models.xgb_version,
-            "schema": self.models.schema_signature
+            "model_version": container.version,
+            "schema": container.schema_signature
         })
 
         cached = self.cache.get(cache_key)
@@ -311,13 +327,13 @@ class InferencePipeline:
                 mode="inference"
             ).astype(DTYPE)
 
-            feature_df = np.ascontiguousarray(feature_df)
-
             drift_result = self._safe_drift(feature_df)
 
             exposure_scale = drift_result.get("exposure_scale", 1.0)
 
-            raw_scores = self.models.xgb.predict(feature_df)
+            feature_np = np.ascontiguousarray(feature_df)
+
+            raw_scores = model.predict(feature_np)
 
             raw_scores = self._winsorize(raw_scores)
 
@@ -332,18 +348,6 @@ class InferencePipeline:
 
             latest_df["raw_model_score"] = raw_scores
 
-            probability_stats = {
-                "mean": float(np.mean(raw_scores)),
-                "std": float(np.std(raw_scores))
-            }
-
-            # aggregate signal metrics
-            long_count = np.sum(raw_scores > 0)
-            short_count = np.sum(raw_scores <= 0)
-
-            SIGNAL_DISTRIBUTION.labels(signal="LONG").inc(long_count)
-            SIGNAL_DISTRIBUTION.labels(signal="SHORT").inc(short_count)
-
             snapshot_rows = []
 
             for _, row in latest_df.iterrows():
@@ -352,38 +356,23 @@ class InferencePipeline:
 
                 row_dict = {**row.to_dict(), "signal": direction}
 
-                context = {
-                    "row": row_dict,
-                    "probability_stats": probability_stats,
-                    "drift_state": drift_result.get("drift_state")
-                }
+                context = {"row": row_dict}
 
-                signal_output = self.signal_agent.analyze(context)
+                signal_output = self._safe_agent(self.signal_agent, context)
 
-                technical_output = self.technical_agent.analyze(context)
-
-                total_weight = (
-                    self.signal_agent.weight +
-                    self.technical_agent.weight
-                )
+                technical_output = self._safe_agent(self.technical_agent, context)
 
                 hybrid_score = (
-                    signal_output["hybrid"]["score"] * self.signal_agent.weight +
-                    technical_output["score"] * self.technical_agent.weight
-                ) / total_weight
+                    signal_output.get("hybrid", {}).get("score", 0) +
+                    technical_output.get("score", 0)
+                ) / 2
 
                 snapshot_rows.append({
                     "date": str(row["date"]),
                     "ticker": row["ticker"],
                     "raw_model_score": float(row["raw_model_score"]),
-                    "agent_score": float(signal_output["agent_score"]),
-                    "technical_score": float(technical_output["score"]),
                     "hybrid_consensus_score": float(hybrid_score),
-                    "weight": 0.0,
-                    "agents": {
-                        "signal_agent": signal_output,
-                        "technical_agent": technical_output
-                    }
+                    "weight": 0.0
                 })
 
             ranked = sorted(
@@ -402,25 +391,11 @@ class InferencePipeline:
 
                 row["weight"] = float(base_weight * exposure_scale)
 
-            snapshot_core = {
+            result = {
                 "snapshot_date": str(latest_date),
-                "model_version": self.models.xgb_version,
-                "gross_exposure": float(sum(abs(x["weight"]) for x in snapshot_rows)),
-                "net_exposure": float(sum(x["weight"] for x in snapshot_rows)),
+                "model_version": container.version,
                 "drift": drift_result,
                 "signals": snapshot_rows
-            }
-
-            decision_report = self.portfolio_agent.analyze_snapshot(snapshot_core)
-
-            result = {
-                **snapshot_core,
-                "top_5": sorted(
-                    snapshot_rows,
-                    key=lambda x: x["hybrid_consensus_score"],
-                    reverse=True
-                )[:self.TOP_SELECTION],
-                "decision_report": decision_report
             }
 
             self.cache.set(cache_key, result, ex=self.SNAPSHOT_CACHE_TTL)
