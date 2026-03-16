@@ -22,13 +22,19 @@ class MarketProviderRouter:
     """
     Market data router with sequential fallback and response validation.
 
-    Provider priority:
-        TwelveData → Yahoo
+    Provider priority (portfolio-friendly):
+
+        Yahoo (yfinance) → TwelveData
+
+    Rationale:
+        - Yahoo is free and widely used for ML experiments
+        - TwelveData acts as backup if Yahoo fails
+        - Good balance for portfolio projects
 
     Designed for:
         - Free data providers
         - yfinance rate limits
-        - Portfolio ML projects
+        - ML research / portfolio systems
     """
 
     REQUIRED_COLUMNS = {"date", "open", "high", "low", "close", "volume"}
@@ -109,9 +115,14 @@ class MarketProviderRouter:
                     exc,
                 )
 
-        # Provider order optimized for free APIs
-        register("twelvedata", TwelveDataProvider, "TWELVEDATA_API_KEY")
+        # ---------------------------------------------------------
+        # Provider order (UPDATED)
+        # ---------------------------------------------------------
+        # Yahoo first (primary provider)
         register("yahoo", YahooProvider)
+
+        # TwelveData fallback
+        register("twelvedata", TwelveDataProvider, "TWELVEDATA_API_KEY")
 
     @classmethod
     def _validate_interval(cls, interval: str):
