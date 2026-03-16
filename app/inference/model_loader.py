@@ -1,5 +1,5 @@
 # =========================================================
-# MODEL LOADER v2.5
+# MODEL LOADER v2.6
 # Hybrid Multi-Agent Compatible | CV-Optimized Governance
 # Pointer-Fallback Enabled | Baseline Verified
 # =========================================================
@@ -62,6 +62,8 @@ class ModelLoader:
     STRICT_GOVERNANCE = os.getenv("MODEL_STRICT_GOVERNANCE", "0") == "1"
 
     ALLOW_POINTER_FALLBACK = os.getenv("MODEL_ALLOW_POINTER_FALLBACK", "1") == "1"
+
+    RUNTIME_SCHEMA_SIGNATURE = get_schema_signature()
 
     def __new__(cls, *args, **kwargs):
 
@@ -240,6 +242,24 @@ class ModelLoader:
 
     ########################################################
 
+    def _verify_universe(self, universe_hash):
+
+        try:
+
+            runtime_hash = MarketUniverse().hash()
+
+            if runtime_hash != universe_hash:
+
+                logger.warning(
+                    "Universe mismatch detected between training and runtime."
+                )
+
+        except Exception:
+
+            logger.warning("Unable to verify universe integrity.")
+
+    ########################################################
+
     def _reload_xgb_if_needed(self):
 
         with self._reload_lock:
@@ -268,6 +288,15 @@ class ModelLoader:
             if meta.get("artifact_hash") != artifact_hash:
                 raise RuntimeError("Artifact tampering detected.")
 
+            if meta.get("schema_signature") != self.RUNTIME_SCHEMA_SIGNATURE:
+
+                msg = "Runtime schema mismatch."
+
+                if self.STRICT_GOVERNANCE:
+                    raise RuntimeError(msg)
+
+                logger.warning(msg)
+
             feature_checksum = self._compute_feature_checksum()
 
             if meta.get("feature_checksum") != feature_checksum:
@@ -278,6 +307,8 @@ class ModelLoader:
                     raise RuntimeError(msg)
 
                 logger.warning(msg)
+
+            self._verify_universe(meta.get("universe_hash"))
 
             model = self._safe_load_model(model_path)
 
