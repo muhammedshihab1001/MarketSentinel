@@ -1,5 +1,5 @@
 """
-MarketSentinel v4.4.0
+MarketSentinel v4.5.0
 
 Feature engineering pipeline for ML model training and inference.
 Robust to noisy yfinance data and missing values.
@@ -31,12 +31,12 @@ class FeatureEngineer:
 
     CS_FEATURE_COLS = list(BASE_CS_COLS)
 
-    # -----------------------------------------------------
+    ############################################################
     # DATETIME NORMALIZATION
-    # -----------------------------------------------------
+    ############################################################
 
     @staticmethod
-    def _normalize_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    def _normalize_datetime(df: pd.DataFrame):
 
         df = df.copy()
 
@@ -53,12 +53,12 @@ class FeatureEngineer:
 
         return df.reset_index(drop=True)
 
-    # -----------------------------------------------------
+    ############################################################
     # PRICE VALIDATION
-    # -----------------------------------------------------
+    ############################################################
 
     @classmethod
-    def _validate_price_frame(cls, df: pd.DataFrame, ticker: str = None):
+    def _validate_price_frame(cls, df: pd.DataFrame, ticker=None):
 
         if df is None or df.empty:
             raise RuntimeError("Price DataFrame is empty.")
@@ -91,6 +91,7 @@ class FeatureEngineer:
         extreme = returns > cls.SPLIT_THRESHOLD
 
         if extreme.any():
+
             logger.warning(
                 "Split-like price move detected in %d bar(s)",
                 extreme.sum(),
@@ -100,81 +101,84 @@ class FeatureEngineer:
 
         return df.reset_index(drop=True)
 
-    # -----------------------------------------------------
+    ############################################################
     # CORE FEATURES
-    # -----------------------------------------------------
+    ############################################################
 
     @classmethod
     def add_core_features(cls, df):
 
         df = df.sort_values(["ticker", "date"]).copy()
 
-        raw_returns = df.groupby("ticker")["close"].pct_change()
+        grouped = df.groupby("ticker")
+
+        raw_returns = grouped["close"].pct_change()
 
         raw_returns = raw_returns.replace(
             [np.inf, -np.inf], np.nan
         ).fillna(0)
 
-        # Noise smoothing
         returns = raw_returns.groupby(df["ticker"]).transform(
             lambda x: x.rolling(3, min_periods=1).median()
         )
 
         df["return"] = returns.clip(*cls.RETURN_CLAMP)
 
-        df["return_lag1"] = df.groupby("ticker")["return"].shift(1)
-        df["return_lag5"] = df.groupby("ticker")["return"].shift(5)
+        df["return_lag1"] = grouped["return"].shift(1)
+        df["return_lag5"] = grouped["return"].shift(5)
 
         df["reversal_5"] = -df["return_lag5"]
 
         df["return_mean_20"] = (
-            df.groupby("ticker")["return"]
+            grouped["return"]
             .transform(lambda x: x.rolling(20, min_periods=5).mean())
             .shift(1)
         ).clip(-0.2, 0.2)
 
-        df["momentum_20"] = (
-            df.groupby("ticker")["close"].pct_change(20).shift(1)
-        )
-
-        df["momentum_60"] = (
-            df.groupby("ticker")["close"].pct_change(60).shift(1)
-        )
+        df["momentum_20"] = grouped["close"].pct_change(20).shift(1)
+        df["momentum_60"] = grouped["close"].pct_change(60).shift(1)
 
         df["momentum_composite"] = (
             0.6 * df["momentum_20"] + 0.4 * df["momentum_60"]
         ).clip(-2, 2)
 
         df["volatility_20"] = (
-            df.groupby("ticker")["return"]
+            grouped["return"]
             .transform(lambda x: x.rolling(20, min_periods=20).std(ddof=0))
             .shift(1)
         )
 
         df["volatility"] = (
-            df["volatility_20"].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
+            df["volatility_20"]
+            .fillna(cls.VOL_FLOOR)
+            .clip(lower=cls.VOL_FLOOR)
         )
 
         df["mom_vol_adj"] = (
-            df["momentum_composite"] / (df["volatility"] + cls.EPSILON)
+            df["momentum_composite"]
+            / (df["volatility"] + cls.EPSILON)
         ).clip(-5, 5)
 
         df["vol_of_vol"] = (
-            df.groupby("ticker")["volatility"]
+            grouped["volatility"]
             .transform(lambda x: x.rolling(20, min_periods=10).std(ddof=0))
             .shift(1)
         ).fillna(0).clip(0, 1)
 
         df["return_skew_20"] = (
-            df.groupby("ticker")["return"]
+            grouped["return"]
             .transform(lambda x: x.rolling(20, min_periods=10).skew())
             .shift(1)
         ).fillna(0).clip(-3, 3)
 
+        ########################################################
+        # LIQUIDITY FEATURES
+        ########################################################
+
         df["volume"] = df["volume"].clip(lower=cls.MIN_VOLUME)
 
         df["volume_mean_20"] = (
-            df.groupby("ticker")["volume"]
+            grouped["volume"]
             .transform(lambda x: x.rolling(20, min_periods=5).mean())
             .shift(1)
         )
@@ -197,38 +201,37 @@ class FeatureEngineer:
 
         df["amihud"] = np.log1p(df["amihud"] * 1e6).clip(0, 20)
 
+        ########################################################
         # RSI
+        ########################################################
 
-        df["rsi"] = 50.0
+        try:
 
-        for ticker, group in df.groupby("ticker"):
+            df["rsi"] = (
+                grouped["close"]
+                .apply(lambda x: TechnicalIndicators.rsi(
+                    pd.DataFrame({"close": x}), 14, normalize=False
+                ))
+                .reset_index(level=0, drop=True)
+            )
 
-            try:
+        except Exception:
 
-                rsi_vals = TechnicalIndicators.rsi(
-                    group[["date", "close"]],
-                    14,
-                    normalize=False
-                )
+            logger.warning("RSI fallback triggered.")
 
-                if len(rsi_vals) == len(group):
-                    df.loc[group.index, "rsi"] = rsi_vals.values
-
-            except Exception as exc:
-
-                logger.warning(
-                    "RSI failed for %s: %s",
-                    ticker,
-                    exc,
-                )
+            df["rsi"] = 50.0
 
         df["rsi"] = df["rsi"].clip(0, 100)
 
-        df["ema_10"] = df.groupby("ticker")["close"].transform(
+        ########################################################
+        # EMA FEATURES
+        ########################################################
+
+        df["ema_10"] = grouped["close"].transform(
             lambda x: x.ewm(span=10, adjust=False).mean()
         )
 
-        df["ema_50"] = df.groupby("ticker")["close"].transform(
+        df["ema_50"] = grouped["close"].transform(
             lambda x: x.ewm(span=50, adjust=False).mean()
         )
 
@@ -236,8 +239,12 @@ class FeatureEngineer:
             df["ema_10"] / (df["ema_50"] + cls.EPSILON)
         ).clip(0.5, 1.5)
 
+        ########################################################
+        # LONG TERM TREND
+        ########################################################
+
         rolling_high = (
-            df.groupby("ticker")["close"]
+            grouped["close"]
             .transform(lambda x: x.rolling(252, min_periods=60).max())
             .shift(1)
         )
@@ -246,11 +253,15 @@ class FeatureEngineer:
             (df["close"] / (rolling_high + cls.EPSILON)) - 1
         ).clip(-1, 0)
 
-        vol_mean = df.groupby("ticker")["volatility"].transform(
+        ########################################################
+        # VOL REGIME
+        ########################################################
+
+        vol_mean = grouped["volatility"].transform(
             lambda x: x.rolling(60, min_periods=20).mean()
         )
 
-        vol_std = df.groupby("ticker")["volatility"].transform(
+        vol_std = grouped["volatility"].transform(
             lambda x: x.rolling(60, min_periods=20).std()
         )
 
@@ -264,9 +275,9 @@ class FeatureEngineer:
 
         return df
 
-    # -----------------------------------------------------
+    ############################################################
     # CROSS SECTIONAL FEATURES
-    # -----------------------------------------------------
+    ############################################################
 
     @classmethod
     def add_cross_sectional_features(cls, df):
@@ -278,7 +289,9 @@ class FeatureEngineer:
         df = df[counts >= cls.MIN_CS_WIDTH].copy()
 
         if df.empty:
+
             logger.warning("Cross-sectional width insufficient.")
+
             return df
 
         df["market_dispersion"] = (
@@ -331,9 +344,9 @@ class FeatureEngineer:
 
         return df
 
-    # -----------------------------------------------------
+    ############################################################
     # FINALIZE
-    # -----------------------------------------------------
+    ############################################################
 
     @classmethod
     def finalize(cls, df):
@@ -372,9 +385,9 @@ class FeatureEngineer:
 
         return df.reset_index(drop=True)
 
-    # -----------------------------------------------------
+    ############################################################
     # PIPELINE
-    # -----------------------------------------------------
+    ############################################################
 
     @classmethod
     def build_feature_pipeline(cls, price_df, training=True):
