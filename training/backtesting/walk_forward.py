@@ -63,11 +63,16 @@ class WalkForwardValidator:
         missing = required - set(df.columns)
 
         if missing:
-            raise RuntimeError(f"Dataset missing columns: {missing}")
+
+            raise RuntimeError(
+                f"Dataset missing columns: {missing}. "
+                f"Walk-forward validation requires real market data."
+            )
 
         missing_features = set(MODEL_FEATURES) - set(df.columns)
 
         if missing_features:
+
             raise RuntimeError(
                 f"Missing model features: {missing_features}"
             )
@@ -89,6 +94,12 @@ class WalkForwardValidator:
 
         df = df.sort_values(["date", "ticker"]).copy()
 
+        # defensive cleaning for yfinance noise
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.dropna(subset=["close"])
+
+        df = df[df["close"] > 0]
+
         df["raw_forward"] = (
             df.groupby("ticker")["close"]
             .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
@@ -97,7 +108,12 @@ class WalkForwardValidator:
         df = df.dropna(subset=["raw_forward"])
 
         cs_mean = df.groupby("date")["raw_forward"].transform("mean")
-        cs_std = df.groupby("date")["raw_forward"].transform("std").replace(0, np.nan)
+
+        cs_std = (
+            df.groupby("date")["raw_forward"]
+            .transform("std")
+            .replace(0, np.nan)
+        )
 
         df["target"] = (df["raw_forward"] - cs_mean) / cs_std
 
@@ -124,6 +140,7 @@ class WalkForwardValidator:
             return x
 
         try:
+
             lower = np.quantile(x, self.SCORE_WINSOR_Q)
             upper = np.quantile(x, 1 - self.SCORE_WINSOR_Q)
 
@@ -132,6 +149,8 @@ class WalkForwardValidator:
         except Exception:
             return x
 
+    # ----------------------------------------------------------
+
     def _softmax(self, x):
 
         x = x - np.max(x)
@@ -139,6 +158,8 @@ class WalkForwardValidator:
         e = np.exp(x)
 
         return e / (np.sum(e) + self.EPSILON)
+
+    # ----------------------------------------------------------
 
     def _compute_turnover(self, old_positions, new_positions):
 
@@ -348,11 +369,13 @@ class WalkForwardValidator:
                 capital *= np.exp(period_ret)
 
                 if not np.isfinite(capital):
+
                     capital = 1.0
 
                 capital = max(capital, 1.0)
 
                 if capital > self.MAX_CAPITAL:
+
                     capital = self.MAX_CAPITAL
 
                 prev_positions = positions
@@ -401,6 +424,7 @@ class WalkForwardValidator:
     def aggregate_results(self, results, equity_curve):
 
         if not results or not equity_curve:
+
             raise RuntimeError(
                 "Walk-forward produced no valid windows."
             )
