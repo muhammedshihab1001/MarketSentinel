@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 # ============================================================
 
-SCHEMA_VERSION = "45.0"
+SCHEMA_VERSION = "45.1"
 
 
 ############################################################
@@ -128,8 +128,11 @@ _logged_constant_cs = set()
 ############################################################
 
 def _check_forbidden_columns(df: pd.DataFrame) -> None:
+
     for col in df.columns:
+
         if FORBIDDEN_REGEX.search(col):
+
             raise RuntimeError(f"Lookahead column detected: {col}")
 
 
@@ -137,7 +140,10 @@ def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
 
-    for col in df.columns:
+    cols = [c for c in MODEL_FEATURES if c in df.columns]
+
+    for col in cols:
+
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -146,8 +152,20 @@ def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _check_dtype_stability(df: pd.DataFrame) -> None:
-    if df.dtypes.nunique() > 1:
-        logger.debug("Mixed dtypes detected before cast.")
+
+    numeric_cols = df.select_dtypes(include=["number"]).columns
+
+    bad = [
+        c for c in numeric_cols
+        if not np.issubdtype(df[c].dtype, np.number)
+    ]
+
+    if bad:
+
+        logger.debug(
+            "Unexpected dtype detected: %s",
+            bad
+        )
 
 
 def _fill_nan_defaults(df: pd.DataFrame) -> pd.DataFrame:
@@ -158,7 +176,6 @@ def _fill_nan_defaults(df: pd.DataFrame) -> pd.DataFrame:
 
             if col.endswith("_rank"):
                 df[col] = df[col].fillna(0.5)
-
             else:
                 df[col] = df[col].fillna(0.0)
 
@@ -166,7 +183,7 @@ def _fill_nan_defaults(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure feature order is stable."""
+
     return df.loc[:, MODEL_FEATURES]
 
 
@@ -191,6 +208,7 @@ def validate_feature_schema(
     _check_forbidden_columns(df)
 
     missing_core = set(CORE_FEATURES) - set(df.columns)
+
     if missing_core:
         raise RuntimeError(f"Missing core features: {missing_core}")
 
@@ -205,6 +223,7 @@ def validate_feature_schema(
         missing_all = set(MODEL_FEATURES) - set(feature_df.columns)
 
         if missing_all:
+
             raise RuntimeError(
                 f"Missing required features under strict contract: {missing_all}"
             )
@@ -241,20 +260,30 @@ def validate_feature_schema(
     for col in CORE_FEATURES:
 
         series = feature_df[col]
+
         finite_vals = series[np.isfinite(series)]
 
         if finite_vals.empty:
+
             raise RuntimeError(f"Core feature fully invalid: {col}")
 
         if mode in {"training", "strict_contract"}:
 
             if finite_vals.nunique() <= 1:
-                raise RuntimeError(f"Constant CORE feature detected: {col}")
+
+                raise RuntimeError(
+                    f"Constant CORE feature detected: {col}"
+                )
 
         if finite_vals.var(ddof=0) < MIN_VARIANCE:
 
             if col not in _logged_low_variance_core:
-                logger.warning("Low variance core feature: %s", col)
+
+                logger.warning(
+                    "Low variance core feature: %s",
+                    col
+                )
+
                 _logged_low_variance_core.add(col)
 
     ########################################################
@@ -264,6 +293,7 @@ def validate_feature_schema(
     for col in CROSS_SECTIONAL_FEATURES:
 
         series = feature_df[col]
+
         finite_vals = series[np.isfinite(series)]
 
         if len(finite_vals) == 0:
@@ -274,7 +304,12 @@ def validate_feature_schema(
             if mode == "training":
 
                 if col not in _logged_constant_cs:
-                    logger.warning("Constant CS feature in training: %s", col)
+
+                    logger.warning(
+                        "Constant CS feature in training: %s",
+                        col
+                    )
+
                     _logged_constant_cs.add(col)
 
                 continue
@@ -290,7 +325,12 @@ def validate_feature_schema(
         if finite_vals.var(ddof=0) < MIN_CS_VARIANCE:
 
             if col not in _logged_low_variance_cs:
-                logger.warning("Low variance CS feature: %s", col)
+
+                logger.warning(
+                    "Low variance CS feature: %s",
+                    col
+                )
+
                 _logged_low_variance_cs.add(col)
 
     ########################################################
@@ -298,16 +338,30 @@ def validate_feature_schema(
     ########################################################
 
     if mode == "inference":
+
         feature_df = _fill_nan_defaults(feature_df)
 
     else:
+
         if feature_df.isnull().any().any():
-            raise RuntimeError("NaN detected after schema validation.")
+
+            raise RuntimeError(
+                "NaN detected after schema validation."
+            )
 
     if not np.isfinite(feature_df.values).all():
-        raise RuntimeError("Non-finite values detected.")
+
+        raise RuntimeError(
+            "Non-finite values detected."
+        )
 
     _check_dtype_stability(feature_df)
+
+    # enforce column order
+    feature_df = feature_df.loc[:, MODEL_FEATURES]
+
+    # safety clip for extreme values
+    feature_df = feature_df.clip(-1e9, 1e9)
 
     return feature_df.astype(DTYPE, copy=False)
 
