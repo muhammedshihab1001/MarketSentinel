@@ -95,7 +95,8 @@ class TechnicalIndicators:
         if returns.dropna().max() > TechnicalIndicators.MAX_DAILY_RETURN:
 
             logger.warning(
-                "Large price jump detected — repairing series."
+                "Extreme price jump detected (>80%%). "
+                "Possible Yahoo anomaly. Applying spike guard."
             )
 
             close = close.clip(
@@ -112,11 +113,17 @@ class TechnicalIndicators:
     ####################################################
 
     @classmethod
-    def moving_average(cls, df: pd.DataFrame, window: int = 20):
+    def moving_average(
+        cls,
+        df: pd.DataFrame,
+        window: int = 20,
+        normalize: bool = True
+    ):
 
         cls._validate_window(window)
 
-        df = cls._normalize_columns(df)
+        if normalize:
+            df = cls._normalize_columns(df)
 
         ma = df["close"].rolling(
             window=window,
@@ -130,11 +137,17 @@ class TechnicalIndicators:
     ####################################################
 
     @classmethod
-    def ema(cls, df: pd.DataFrame, span: int = 20):
+    def ema(
+        cls,
+        df: pd.DataFrame,
+        span: int = 20,
+        normalize: bool = True
+    ):
 
         cls._validate_window(span)
 
-        df = cls._normalize_columns(df)
+        if normalize:
+            df = cls._normalize_columns(df)
 
         ema = df["close"].ewm(
             span=span,
@@ -152,7 +165,8 @@ class TechnicalIndicators:
         cls,
         df: pd.DataFrame,
         window: int = None,
-        period: int = None
+        period: int = None,
+        normalize: bool = True
     ):
         """
         RSI indicator.
@@ -160,8 +174,6 @@ class TechnicalIndicators:
         Supports both:
         rsi(window=14)
         rsi(period=14)
-
-        for compatibility with tests and project code.
         """
 
         if window is None and period is None:
@@ -172,11 +184,11 @@ class TechnicalIndicators:
 
         cls._validate_window(window)
 
-        df = cls._normalize_columns(df)
+        if normalize:
+            df = cls._normalize_columns(df)
 
         close = df["close"].astype("float64")
 
-        # very short series protection
         if len(close) < window:
             return pd.Series(
                 np.full(len(close), 50.0),
@@ -214,11 +226,17 @@ class TechnicalIndicators:
     ####################################################
 
     @classmethod
-    def bollinger_bands(cls, df: pd.DataFrame, window: int = 20):
+    def bollinger_bands(
+        cls,
+        df: pd.DataFrame,
+        window: int = 20,
+        normalize: bool = True
+    ):
 
         cls._validate_window(window)
 
-        df = cls._normalize_columns(df)
+        if normalize:
+            df = cls._normalize_columns(df)
 
         close = df["close"]
 
@@ -247,9 +265,14 @@ class TechnicalIndicators:
     ####################################################
 
     @classmethod
-    def macd(cls, df: pd.DataFrame):
+    def macd(
+        cls,
+        df: pd.DataFrame,
+        normalize: bool = True
+    ):
 
-        df = cls._normalize_columns(df)
+        if normalize:
+            df = cls._normalize_columns(df)
 
         close = df["close"]
 
