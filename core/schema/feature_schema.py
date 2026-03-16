@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 # ============================================================
 
-SCHEMA_VERSION = "44.0"
+SCHEMA_VERSION = "45.0"
 
 
 ############################################################
@@ -115,10 +115,9 @@ FORBIDDEN_REGEX = re.compile(
 
 
 ############################################################
-# LOG SUPPRESSION (NEW)
+# LOG SUPPRESSION
 ############################################################
 
-# Prevent repeated warning spam
 _logged_low_variance_core = set()
 _logged_low_variance_cs = set()
 _logged_constant_cs = set()
@@ -135,10 +134,14 @@ def _check_forbidden_columns(df: pd.DataFrame) -> None:
 
 
 def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
+
     df = df.copy()
+
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
     return df
 
 
@@ -148,13 +151,23 @@ def _check_dtype_stability(df: pd.DataFrame) -> None:
 
 
 def _fill_nan_defaults(df: pd.DataFrame) -> pd.DataFrame:
+
     for col in df.columns:
+
         if df[col].isna().any():
+
             if col.endswith("_rank"):
                 df[col] = df[col].fillna(0.5)
+
             else:
                 df[col] = df[col].fillna(0.0)
+
     return df
+
+
+def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure feature order is stable."""
+    return df.loc[:, MODEL_FEATURES]
 
 
 ############################################################
@@ -190,6 +203,7 @@ def validate_feature_schema(
     if mode in {"training", "strict_contract"}:
 
         missing_all = set(MODEL_FEATURES) - set(feature_df.columns)
+
         if missing_all:
             raise RuntimeError(
                 f"Missing required features under strict contract: {missing_all}"
@@ -204,13 +218,15 @@ def validate_feature_schema(
     elif mode == "inference":
 
         for col in MODEL_FEATURES:
+
             if col not in feature_df.columns:
+
                 if col.endswith("_rank"):
                     feature_df[col] = 0.5
                 else:
                     feature_df[col] = 0.0
 
-        feature_df = feature_df.loc[:, MODEL_FEATURES]
+        feature_df = _reorder_columns(feature_df)
 
     ########################################################
     # NUMERIC CLEANUP
@@ -231,10 +247,12 @@ def validate_feature_schema(
             raise RuntimeError(f"Core feature fully invalid: {col}")
 
         if mode in {"training", "strict_contract"}:
+
             if finite_vals.nunique() <= 1:
                 raise RuntimeError(f"Constant CORE feature detected: {col}")
 
         if finite_vals.var(ddof=0) < MIN_VARIANCE:
+
             if col not in _logged_low_variance_core:
                 logger.warning("Low variance core feature: %s", col)
                 _logged_low_variance_core.add(col)
@@ -254,9 +272,11 @@ def validate_feature_schema(
         if finite_vals.nunique() <= 1:
 
             if mode == "training":
+
                 if col not in _logged_constant_cs:
                     logger.warning("Constant CS feature in training: %s", col)
                     _logged_constant_cs.add(col)
+
                 continue
 
             if col.endswith("_z"):
@@ -268,6 +288,7 @@ def validate_feature_schema(
                 continue
 
         if finite_vals.var(ddof=0) < MIN_CS_VARIANCE:
+
             if col not in _logged_low_variance_cs:
                 logger.warning("Low variance CS feature: %s", col)
                 _logged_low_variance_cs.add(col)
@@ -278,6 +299,7 @@ def validate_feature_schema(
 
     if mode == "inference":
         feature_df = _fill_nan_defaults(feature_df)
+
     else:
         if feature_df.isnull().any().any():
             raise RuntimeError("NaN detected after schema validation.")
