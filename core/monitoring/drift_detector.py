@@ -1,5 +1,5 @@
 # =========================================================
-# DRIFT DETECTOR v2.4
+# DRIFT DETECTOR v2.5
 # Hybrid Multi-Agent Compatible | CV-Optimized
 # Noise-Tolerant for yfinance data
 # =========================================================
@@ -31,7 +31,7 @@ except Exception:
 class DriftDetector:
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "26.0"
+    BASELINE_VERSION = "26.1"
 
     MIN_SAMPLE_INFERENCE = 25
     MIN_FEATURE_EVAL_RATIO = 0.3
@@ -53,7 +53,9 @@ class DriftDetector:
     RECENT_WEIGHT_FACTOR = 1.5
     FEATURE_CLIP_SIGMA = 6.0
 
-    # -----------------------------------------------------
+    # =====================================================
+    # INIT
+    # =====================================================
 
     def __init__(self, z_threshold: float = 4.0, baseline_dir: str = "artifacts/drift"):
 
@@ -190,23 +192,18 @@ class DriftDetector:
         if not os.path.exists(self.BASELINE_PATH):
             raise FileNotFoundError("Baseline missing.")
 
-        try:
+        with open(self.BASELINE_PATH, encoding="utf-8") as f:
+            baseline = json.load(f)
 
-            with open(self.BASELINE_PATH, encoding="utf-8") as f:
-                baseline = json.load(f)
+        if baseline.get("integrity_hash") != self._baseline_hash(baseline):
+            raise RuntimeError("Baseline integrity failure.")
 
-            if baseline.get("integrity_hash") != self._baseline_hash(baseline):
-                raise RuntimeError("Baseline integrity failure.")
+        meta = baseline.get("meta", {})
 
-            meta = baseline.get("meta", {})
+        if meta.get("schema_signature") != get_schema_signature():
+            logger.warning("Schema mismatch detected.")
 
-            if meta.get("schema_signature") != get_schema_signature():
-                logger.warning("Schema mismatch detected.")
-
-            return baseline
-
-        except json.JSONDecodeError:
-            raise RuntimeError("Baseline JSON corrupted.")
+        return baseline
 
     # =====================================================
     # PSI
@@ -251,6 +248,26 @@ class DriftDetector:
         weights /= weights.sum()
 
         return float(np.sum(series.values * weights))
+
+    # =====================================================
+    # EXPOSURE SCALE
+    # =====================================================
+
+    def _exposure_scale(self, drift_state):
+
+        if drift_state == "none":
+            return 1.0
+
+        if drift_state == "soft":
+            return 0.6
+
+        if drift_state == "hard":
+            return 0.25
+
+        if drift_state == "detector_failure":
+            return 0.4
+
+        return 0.5
 
     # =====================================================
     # DETECT
@@ -336,14 +353,20 @@ class DriftDetector:
                 else "none"
             )
 
+            drift_confidence = min(1.0, severity_score / self.MAX_SEVERITY_CAP)
+
+            exposure_scale = self._exposure_scale(drift_state)
+
             DRIFT_DETECTED.set(severity_score)
 
             return {
                 "drift_detected": drift_count > 0,
                 "severity_score": severity_score,
+                "drift_confidence": float(drift_confidence),
                 "drift_state": drift_state,
                 "coverage": coverage,
-                "details": report
+                "details": report,
+                "exposure_scale": exposure_scale
             }
 
         except FileNotFoundError:
@@ -353,9 +376,11 @@ class DriftDetector:
             return {
                 "drift_detected": False,
                 "severity_score": 0,
+                "drift_confidence": 0.0,
                 "drift_state": "baseline_missing",
                 "coverage": 0,
-                "details": {}
+                "details": {},
+                "exposure_scale": 1.0
             }
 
         except Exception as exc:
@@ -370,9 +395,11 @@ class DriftDetector:
             return {
                 "drift_detected": True,
                 "severity_score": 6,
+                "drift_confidence": 0.5,
                 "drift_state": "detector_failure",
                 "coverage": 0,
-                "details": {}
+                "details": {},
+                "exposure_scale": 0.4
             }
 
     # =====================================================
