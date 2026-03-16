@@ -76,7 +76,6 @@ class MarketRegimeDetector:
         confirmed = regimes.copy()
 
         current = regimes[0]
-
         streak = 0
 
         for i in range(1, len(regimes)):
@@ -97,7 +96,7 @@ class MarketRegimeDetector:
         return confirmed
 
     ########################################################
-    # SINGLE ASSET (STRICTLY CAUSAL)
+    # SINGLE ASSET DETECTION
     ########################################################
 
     def _detect_single_asset(self, df: pd.DataFrame):
@@ -114,6 +113,9 @@ class MarketRegimeDetector:
             close = pd.to_numeric(df["close"], errors="coerce")
 
             if close.isna().any():
+                return self._neutral_regime(df)
+
+            if (close <= 0).any():
                 return self._neutral_regime(df)
 
             raw_returns = close.pct_change()
@@ -175,7 +177,10 @@ class MarketRegimeDetector:
             ready = ma_long.notna() & volatility.notna()
 
             crisis = ready & (
-                volatility > (cfg.crash_vol_threshold + cfg.HYSTERESIS_BUFFER)
+                volatility > (
+                    cfg.crash_vol_threshold
+                    + cfg.HYSTERESIS_BUFFER
+                )
             )
 
             bull = (
@@ -210,7 +215,8 @@ class MarketRegimeDetector:
             ########################################################
 
             df["regime_multiplier"] = [
-                self.REGIME_MULTIPLIER.get(r, 1.0) for r in regime
+                self.REGIME_MULTIPLIER.get(r, 1.0)
+                for r in regime
             ]
 
             return df
@@ -222,13 +228,16 @@ class MarketRegimeDetector:
             return self._neutral_regime(df)
 
     ########################################################
-    # MULTI ASSET
+    # MULTI ASSET DETECTION
     ########################################################
 
     def detect(self, df: pd.DataFrame):
 
         if df.empty:
             return df
+
+        if "ticker" not in df.columns:
+            raise RuntimeError("Dataset missing 'ticker' column.")
 
         grouped = []
 
