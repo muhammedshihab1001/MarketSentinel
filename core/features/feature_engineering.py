@@ -1,5 +1,5 @@
 """
-MarketSentinel v4.3.0
+MarketSentinel v4.3.1
 
 Feature engineering pipeline for ML model training and inference.
 """
@@ -90,7 +90,6 @@ class FeatureEngineer:
         extreme = returns > cls.SPLIT_THRESHOLD
 
         if extreme.any():
-
             logger.warning(
                 "Split-like price move detected in %d bar(s)",
                 extreme.sum(),
@@ -198,7 +197,9 @@ class FeatureEngineer:
             try:
 
                 rsi_vals = TechnicalIndicators.rsi(
-                    group[["date", "close"]], 14
+                    group[["date", "close"]],
+                    14,
+                    normalize=False
                 )
 
                 df.loc[group.index, "rsi"] = rsi_vals.values
@@ -289,11 +290,11 @@ class FeatureEngineer:
         for col in cols_to_process:
 
             lower = df.groupby("date")[col].transform(
-                lambda x: x.quantile(0.01)
+                "quantile", 0.01
             )
 
             upper = df.groupby("date")[col].transform(
-                lambda x: x.quantile(0.99)
+                "quantile", 0.99
             )
 
             clipped = df[col].clip(lower, upper)
@@ -351,7 +352,13 @@ class FeatureEngineer:
 
             df[col] = 0.0
 
-        df = df.loc[:, list(set(df.columns) | set(MODEL_FEATURES))]
+        # Preserve column order
+        ordered_cols = list(df.columns)
+        for col in MODEL_FEATURES:
+            if col not in ordered_cols:
+                ordered_cols.append(col)
+
+        df = df.loc[:, ordered_cols]
 
         return df.reset_index(drop=True)
 
