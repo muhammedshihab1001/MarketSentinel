@@ -1,5 +1,5 @@
 """
-MarketSentinel v4.3.0
+MarketSentinel v4.4
 
 Feature Store — per-ticker feature cache for INFERENCE.
 """
@@ -30,7 +30,7 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v27"
+    CACHE_VERSION = "v28"
 
     MAX_CACHE_FILES_PER_TICKER = 6
     MAX_TOTAL_CACHE_FILES = 2000
@@ -39,6 +39,8 @@ class FeatureStore:
 
     MEMORY_CACHE_LIMIT = 100
     MEMORY_CACHE_TTL = 120
+
+    MAX_MEMORY_ROWS = 20000
 
     _memory_cache = OrderedDict()
     _memory_cache_ts = {}
@@ -149,7 +151,27 @@ class FeatureStore:
 
         h.update(self._stable_hash_df(price_core).encode())
 
+        # Optional sentiment fingerprint
+        if sentiment_df is not None and not sentiment_df.empty:
+
+            try:
+                sentiment_sample = sentiment_df.tail(50)
+                h.update(sentiment_sample.to_csv(index=False).encode())
+            except Exception:
+                pass
+
         return h.hexdigest()[:20]
+
+    ########################################################
+    # SAFE FILE LISTING
+    ########################################################
+
+    def _safe_listdir(self):
+
+        try:
+            return os.listdir(self.FEATURE_DIR)
+        except Exception:
+            return []
 
     ########################################################
     # CACHE CLEANUP
@@ -159,7 +181,7 @@ class FeatureStore:
 
         files = [
             os.path.join(self.FEATURE_DIR, f)
-            for f in os.listdir(self.FEATURE_DIR)
+            for f in self._safe_listdir()
             if f.endswith(".parquet")
         ]
 
@@ -180,7 +202,7 @@ class FeatureStore:
         ticker = re.sub(r"[^A-Za-z0-9_]", "_", ticker)
 
         files = [
-            f for f in os.listdir(self.FEATURE_DIR)
+            f for f in self._safe_listdir()
             if f.startswith(self.CACHE_VERSION + "_" + ticker)
         ]
 
@@ -202,6 +224,9 @@ class FeatureStore:
     ########################################################
 
     def _set_memory_cache(self, key, df):
+
+        if len(df) > self.MAX_MEMORY_ROWS:
+            return
 
         if key in self._memory_cache:
             self._memory_cache.move_to_end(key)
