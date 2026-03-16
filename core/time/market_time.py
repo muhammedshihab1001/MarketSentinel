@@ -2,11 +2,15 @@ import datetime
 import json
 import os
 import hashlib
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class MarketTime:
     """
-    Institutional Time Governor (Production Grade v4.0)
+    Institutional Time Governor (Production Grade v4.1)
 
     Guarantees:
     ✔ deterministic training windows
@@ -19,19 +23,17 @@ class MarketTime:
     ✔ research vs production mode separation
     """
 
-    TIME_GOVERNANCE_VERSION = "4.0"
+    TIME_GOVERNANCE_VERSION = "4.1"
 
     ########################################################
     # CONFIGURABLE TRAINING WINDOWS
     ########################################################
 
     DEFAULT_WINDOWS = {
-        "xgboost": 5,   # 5-year rolling window (recommended)
+        "xgboost": 5,
     }
 
-    # Approx trading days per year
     TRADING_DAYS_PER_YEAR = 252
-
     WALK_FORWARD_MONTHS = 3
 
     MIN_YEARS = 1
@@ -97,6 +99,7 @@ class MarketTime:
                 os.close(fd)
 
         finally:
+
             if os.path.exists(tmp):
                 try:
                     os.remove(tmp)
@@ -154,10 +157,7 @@ class MarketTime:
                 "governance_version": cls.TIME_GOVERNANCE_VERSION
             }
 
-            cls._atomic_write(
-                cls.FREEZE_FILE,
-                payload
-            )
+            cls._atomic_write(cls.FREEZE_FILE, payload)
 
         finally:
             cls._release_lock()
@@ -173,6 +173,7 @@ class MarketTime:
             return None
 
         try:
+
             with open(cls.FREEZE_FILE) as f:
                 payload = json.load(f)
 
@@ -183,18 +184,17 @@ class MarketTime:
                     "Freeze file integrity failure — possible tampering."
                 )
 
-            frozen = datetime.date.fromisoformat(
-                payload["frozen_today"]
-            )
+            frozen = datetime.date.fromisoformat(payload["frozen_today"])
 
             if frozen > cls._utc_today():
                 raise RuntimeError("Freeze file contains future date.")
 
             return frozen
 
-        except Exception:
+        except Exception as e:
+
             raise RuntimeError(
-                "Time freeze file corrupted — refusing to run."
+                f"Time freeze file corrupted — refusing to run. ({e})"
             )
 
     ########################################################
@@ -241,8 +241,16 @@ class MarketTime:
         env_key = f"{model_name.upper()}_TRAIN_YEARS"
 
         if env_key in os.environ:
-            years = int(os.environ[env_key])
+
+            try:
+                years = int(os.environ[env_key])
+            except ValueError:
+                raise RuntimeError(
+                    f"Invalid env override for {env_key}"
+                )
+
         else:
+
             years = cls.DEFAULT_WINDOWS.get(model_name)
 
         if years is None:
@@ -265,7 +273,6 @@ class MarketTime:
 
         end = cls.today()
 
-        # Use trading-day approximation instead of calendar years
         days = int(cls.TRADING_DAYS_PER_YEAR * years * 1.05)
 
         start = end - datetime.timedelta(days=days)
@@ -331,9 +338,7 @@ class MarketTime:
             separators=(",", ":")
         ).encode()
 
-        contract["time_hash"] = hashlib.sha256(
-            canonical
-        ).hexdigest()
+        contract["time_hash"] = hashlib.sha256(canonical).hexdigest()
 
         contract["training_id"] = hashlib.sha256(
             (contract["time_hash"] + model_name).encode()
