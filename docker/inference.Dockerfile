@@ -91,5 +91,4 @@ CMD curl -f http://127.0.0.1:8000/health/ready || exit 1
 # Server
 ############################################################
 
-CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--workers","1","--loop","uvloop","--http","httptools","--timeout-keep-alive","30"
-]
+CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--workers","1","--loop","uvloop","--http","httptools","--timeout-keep-alive","30"]
