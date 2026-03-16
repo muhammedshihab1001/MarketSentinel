@@ -1,42 +1,27 @@
-########################################
-# CORE NUMERICS — ABI LOCKED
-########################################
-
 numpy==1.26.4
 pandas==2.2.2
+scikit-learn==1.5.1
 scipy==1.15.3
-joblib==1.4.2
-pyarrow==15.0.2
+xgboost==2.1.1
 
-########################################
-# DATETIME / TYPING
-########################################
+fastapi==0.112.2
+starlette==0.38.6
+uvicorn==0.30.6
+httptools==0.6.1
 
-python-dateutil==2.9.0.post0
-pytz==2025.2
-typing_extensions==4.12.2
-
-########################################
-# UTILITIES
-########################################
-
-python-dotenv==1.0.1
-packaging==24.1
-
-########################################
-# SYSTEM UTILITIES
-########################################
-
-psutil==6.0.0
-
-########################################
-# JSON PERFORMANCE
-########################################
-
+pydantic==2.8.2
 orjson==3.10.6
 
-########################################
-# MONITORING
-########################################
+redis==5.0.7
+prometheus_client==0.20.0
 
-prometheus-client==0.20.0
+pyarrow==15.0.2
+joblib==1.4.2
+
+python-dotenv==1.0.1
+requests==2.32.5
+yfinance==1.2.0
+
+matplotlib==3.9.2
+seaborn==0.13.2
+plotly==5.24.1
