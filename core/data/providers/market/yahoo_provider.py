@@ -41,7 +41,8 @@ class YahooProvider(MarketDataProvider):
     SOFT_FAIL_MODE = os.getenv("YAHOO_SOFT_FAIL", "1") == "1"
     SOFT_FAIL_RATIO = 0.70
 
-    MAX_RETRIES = 3
+    # Reduced retry count to avoid rate-limit storms
+    MAX_RETRIES = 2
     RETRY_DELAY_SECONDS = 1.5
 
     RATE_LIMIT_WAIT = 4.0
@@ -137,9 +138,6 @@ class YahooProvider(MarketDataProvider):
 
     @staticmethod
     def _repair_ohlc(clean: pd.DataFrame) -> pd.DataFrame:
-        """
-        Repair common Yahoo OHLC inconsistencies.
-        """
 
         high_fix = clean[["high", "open", "close"]].max(axis=1)
         low_fix = clean[["low", "open", "close"]].min(axis=1)
@@ -163,11 +161,9 @@ class YahooProvider(MarketDataProvider):
             if isinstance(df.index, pd.DatetimeIndex):
 
                 idx = df.index
-
                 idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
 
                 df = df.reset_index(drop=True)
-
                 df["date"] = idx
 
             else:
@@ -301,14 +297,14 @@ class YahooProvider(MarketDataProvider):
 
                 msg = str(exc).lower()
 
-                if "too many requests" in msg or "rate limited" in msg or "429" in msg:
+                if any(x in msg for x in ["too many requests", "rate limit", "429"]):
 
                     logger.warning(
                         "Yahoo rate limit detected for %s — cooling down.",
                         ticker,
                     )
 
-                    time.sleep(self.RATE_LIMIT_WAIT)
+                    time.sleep(self.RATE_LIMIT_WAIT + random.uniform(0.5, 1.5))
 
                 else:
 
