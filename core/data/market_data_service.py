@@ -113,10 +113,12 @@ class MarketDataService:
     @classmethod
     def _cap_to_safe_date(cls, date_input: str) -> pd.Timestamp:
 
-        requested = pd.Timestamp(date_input).normalize()
+        # FIX: enforce UTC normalization
+        requested = pd.Timestamp(date_input, tz="UTC").normalize()
 
         safe_cutoff = (
             pd.Timestamp.utcnow()
+            .tz_localize("UTC")
             .normalize()
             - pd.Timedelta(days=cls.SAFE_LAG_DAYS)
         )
@@ -158,7 +160,9 @@ class MarketDataService:
 
         df["ticker"] = ticker
 
+        # FIX: enforce UTC + normalize
         df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
+        df["date"] = df["date"].dt.normalize()
 
         df = df.dropna(subset=["date"])
 
@@ -178,8 +182,9 @@ class MarketDataService:
         if (df[["open", "high", "low", "close"]] <= 0).any().any():
             raise RuntimeError(f"Invalid price values detected for {ticker}")
 
-        # enforce OHLC sanity
-        df["high"] = np.maximum(df["high"], df["low"])
+        # OHLC sanity repair
+        df["high"] = np.maximum.reduce([df["high"], df["open"], df["close"]])
+        df["low"] = np.minimum.reduce([df["low"], df["open"], df["close"]])
 
         if df["close"].nunique() < 5:
             raise RuntimeError(
