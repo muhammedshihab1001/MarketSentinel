@@ -55,6 +55,8 @@ class PerformanceEngine:
     TRADING_DAYS = 252
     ROLLING_WINDOW = 63
 
+    MAX_DAILY_RETURN = 0.8  # guard against bad data spikes
+
     ########################################################
     # CORE ENTRY
     ########################################################
@@ -88,7 +90,18 @@ class PerformanceEngine:
         if merged.empty:
             raise RuntimeError("No overlapping data for evaluation.")
 
+        ########################################################
+        # CLEAN DATA
+        ########################################################
+
+        merged = merged.replace([np.inf, -np.inf], np.nan)
+
         merged = merged.dropna(subset=["forward_return", "weight"])
+
+        merged["forward_return"] = merged["forward_return"].clip(
+            -self.MAX_DAILY_RETURN,
+            self.MAX_DAILY_RETURN
+        )
 
         ########################################################
         # DAILY RETURNS
@@ -143,8 +156,11 @@ class PerformanceEngine:
         calmar = self._calmar_ratio(ann_ret, max_dd)
         hit = self._hit_rate(daily)
         turnover = self._turnover(portfolio_df)
-        skewness = float(daily.skew())
+
+        skewness = float(daily.skew()) if len(daily) > 2 else 0.0
+
         downside_dev = self._downside_deviation(daily)
+
         tracking_error = self._tracking_error(daily, benchmark_returns)
         beta = self._beta(daily, benchmark_returns)
         info_ratio = self._information_ratio(daily, benchmark_returns)
