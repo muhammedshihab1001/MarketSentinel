@@ -180,6 +180,83 @@ def build_baseline_from_dataframe(df, model_version, dataset_hash):
 
 
 # ==========================================================
+# ARTIFACT EXPORT
+# ==========================================================
+
+def export_artifacts(
+    model,
+    metrics,
+    dataset_hash,
+    dataset_rows,
+    start_date,
+    end_date,
+    training_df,
+    promote_baseline=False,
+    create_baseline=False,
+):
+    """Export trained model, metadata, and optionally baseline + production pointer."""
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    version = timestamp
+
+    model_path = os.path.join(MODEL_DIR, f"model_{version}.pkl")
+    metadata_path = os.path.join(MODEL_DIR, f"metadata_{version}.json")
+
+    # Save model artifact
+    joblib.dump(model, model_path)
+    artifact_hash = sha256_file(model_path)
+
+    # Build metadata
+    metadata = MetadataManager.create_metadata(
+        model_name="xgboost_regressor",
+        metrics=metrics,
+        features=MODEL_FEATURES,
+        training_start=str(start_date),
+        training_end=str(end_date),
+        dataset_hash=dataset_hash,
+        dataset_rows=dataset_rows,
+        metadata_type="xgboost_model",
+        artifact_hash=artifact_hash,
+        feature_checksum=compute_feature_checksum(),
+        extra_fields={
+            "model_version": version,
+            "reproducibility_hash": compute_reproducibility_hash(dataset_hash),
+        },
+    )
+
+    MetadataManager.save_metadata(metadata, metadata_path)
+
+    logger.info("Artifacts saved | version=%s", version)
+
+    # Baseline creation
+    if create_baseline or promote_baseline:
+        build_baseline_from_dataframe(
+            df=training_df,
+            model_version=version,
+            dataset_hash=dataset_hash,
+        )
+
+    # Production pointer
+    if promote_baseline:
+
+        pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
+
+        pointer_data = {
+            "model_version": version,
+            "promoted_at": timestamp,
+        }
+
+        with open(pointer_path, "w", encoding="utf-8") as f:
+            json.dump(pointer_data, f, indent=2)
+
+        logger.info("Model promoted to production.")
+
+    return version
+
+
+# ==========================================================
 # DATA LOADING
 # ==========================================================
 
@@ -293,6 +370,9 @@ def build_target(df):
     df = df[counts >= MIN_CS_WIDTH]
 
     df.drop(columns=["raw_forward"], inplace=True)
+
+    if df.empty:
+        raise RuntimeError("All dates removed after target construction.")
 
     return df
 
