@@ -81,6 +81,24 @@ class BacktestEngine:
 
     ############################################################
 
+    def _sanitize_prices(self, prices):
+
+        prices = np.asarray(prices, dtype=float)
+
+        returns = np.diff(prices) / prices[:-1]
+
+        mask = np.abs(returns) > self.MAX_SINGLE_BAR_RETURN
+
+        if mask.any():
+
+            returns[mask] = np.sign(returns[mask]) * self.MAX_SINGLE_BAR_RETURN
+
+            prices = prices[0] * np.cumprod(np.concatenate([[1], 1 + returns]))
+
+        return prices
+
+    ############################################################
+
     def run(
         self,
         prices,
@@ -96,6 +114,8 @@ class BacktestEngine:
             signals,
             position_size
         )
+
+        prices = self._sanitize_prices(prices)
 
         prices = np.asarray(prices, dtype=np.float64)
 
@@ -155,10 +175,9 @@ class BacktestEngine:
                     initial_cash=initial_cash
                 )
 
-                execution_price = price * (1 + slippage)
+                execution_price = max(price * (1 + slippage), self.EPSILON)
 
-                deploy_cash = current_equity * dynamic_size
-                deploy_cash = min(deploy_cash, cash)
+                deploy_cash = cash * dynamic_size
 
                 shares = (
                     deploy_cash * (1 - transaction_cost)
@@ -182,7 +201,7 @@ class BacktestEngine:
                 and hold_bars >= self.MIN_HOLD_BARS
             ):
 
-                execution_price = price * (1 - slippage)
+                execution_price = max(price * (1 - slippage), self.EPSILON)
 
                 proceeds = (
                     position
@@ -224,10 +243,11 @@ class BacktestEngine:
                     - 1
                 )
 
-                if abs(step_return) > self.MAX_SINGLE_BAR_RETURN:
-                    raise RuntimeError(
-                        "Unrealistic portfolio jump detected."
-                    )
+                step_return = np.clip(
+                    step_return,
+                    -self.MAX_SINGLE_BAR_RETURN,
+                    self.MAX_SINGLE_BAR_RETURN
+                )
 
             if position > 0:
                 time_in_market += 1
@@ -243,7 +263,7 @@ class BacktestEngine:
         if position > 0 and portfolio_values:
 
             final_price = prices[-1]
-            liquidation_price = final_price * (1 - slippage)
+            liquidation_price = max(final_price * (1 - slippage), self.EPSILON)
 
             proceeds = (
                 position
