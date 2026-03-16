@@ -1,5 +1,5 @@
 """
-MarketSentinel v4.1.1
+MarketSentinel v4.2.0
 
 Portfolio Decision Agent — aggregates per-ticker agent outputs into a
 ranked portfolio selection with portfolio-level risk analysis.
@@ -66,7 +66,7 @@ class PortfolioDecisionAgent(BaseAgent):
 
         signals = snapshot.get("signals", [])
 
-        drift_info = snapshot.get("drift", {})
+        drift_info = snapshot.get("drift", {}) or {}
 
         generated_at = datetime.now(timezone.utc).isoformat()
 
@@ -126,9 +126,11 @@ class PortfolioDecisionAgent(BaseAgent):
 
         for stock in top_k:
 
-            signal_agent = stock.get("agents", {}).get("signal_agent", {})
+            agents = stock.get("agents", {}) or {}
 
-            tech_agent = stock.get("agents", {}).get("technical_agent", {})
+            signal_agent = agents.get("signal_agent", {}) or {}
+
+            tech_agent = agents.get("technical_agent", {}) or {}
 
             confidence = self._safe_float(
                 signal_agent.get("confidence_numeric"), 0.0
@@ -152,11 +154,9 @@ class PortfolioDecisionAgent(BaseAgent):
                 risk_distribution.get(risk_level, 0) + 1
             )
 
-            # -----------------------------------------------------
+            sa_warnings = signal_agent.get("warnings", []) or []
 
-            sa_warnings = signal_agent.get("warnings", [])
-
-            tech_warnings = tech_agent.get("warnings", [])
+            tech_warnings = tech_agent.get("warnings", []) or []
 
             combined_warnings = list(
                 dict.fromkeys(sa_warnings + tech_warnings)
@@ -274,11 +274,11 @@ class PortfolioDecisionAgent(BaseAgent):
 
         severity = self._safe_float(drift_info.get("severity_score"), 0)
 
-        if severity > 0.7:
+        if severity > 7:
 
             drift_risk = "high"
 
-        elif severity > 0.3:
+        elif severity > 3:
 
             drift_risk = "moderate"
 
