@@ -10,11 +10,6 @@ import pandas as pd
 from core.data.providers.market.yahoo_provider import YahooProvider
 
 try:
-    from core.data.providers.market.alphavantage_provider import AlphaVantageProvider
-except Exception:
-    AlphaVantageProvider = None
-
-try:
     from core.data.providers.market.twelvedata_provider import TwelveDataProvider
 except Exception:
     TwelveDataProvider = None
@@ -28,15 +23,12 @@ class MarketProviderRouter:
     Market data router with sequential fallback and response validation.
 
     Provider priority:
-        Yahoo → AlphaVantage → TwelveData
+        TwelveData → Yahoo
 
-    Features
-    --------
-    - Provider cooldown after failure
-    - Yahoo concurrency + throttle
-    - Schema validation
-    - OHLC auto-repair for noisy providers (Yahoo etc.)
-    - Extreme move detection
+    Designed for:
+        - Free data providers
+        - yfinance rate limits
+        - Portfolio ML projects
     """
 
     REQUIRED_COLUMNS = {"date", "open", "high", "low", "close", "volume"}
@@ -52,7 +44,6 @@ class MarketProviderRouter:
 
     ALLOWED_INTERVALS = {"1d", "D", "1h", "60m", "15m", "5m", "1m"}
 
-    # NEW: tolerance for OHLC violations
     MAX_OHLC_VIOLATION_RATIO = float(os.getenv("OHLC_TOLERANCE", "0.20"))
 
     def __init__(self) -> None:
@@ -118,9 +109,9 @@ class MarketProviderRouter:
                     exc,
                 )
 
-        register("yahoo", YahooProvider)
-        register("alphavantage", AlphaVantageProvider, "ALPHAVANTAGE_API_KEY")
+        # Provider order optimized for free APIs
         register("twelvedata", TwelveDataProvider, "TWELVEDATA_API_KEY")
+        register("yahoo", YahooProvider)
 
     @classmethod
     def _validate_interval(cls, interval: str):
@@ -160,9 +151,6 @@ class MarketProviderRouter:
             self._provider_stats[name]["last_failure"] = now
 
     def _repair_ohlc(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Repair common OHLC inconsistencies from Yahoo Finance.
-        """
 
         before = (
             (df["high"] < df[["open", "close"]].max(axis=1))
@@ -207,13 +195,11 @@ class MarketProviderRouter:
             raise RuntimeError(f"Empty dataset returned for {ticker}")
 
         for col in ("open", "high", "low", "close", "volume"):
-
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df = df.dropna(subset=["open", "high", "low", "close"])
 
         if len(df) < min_rows:
-
             raise RuntimeError(
                 f"Insufficient rows for {ticker}: got {len(df)}, need {min_rows}"
             )
@@ -223,7 +209,6 @@ class MarketProviderRouter:
         max_move = df["close"].pct_change().abs().dropna().max()
 
         if max_move > self.MAX_DAILY_MOVE:
-
             raise RuntimeError(
                 f"Extreme price move ({max_move:.1%}) detected for {ticker}"
             )
@@ -270,7 +255,6 @@ class MarketProviderRouter:
         latency = time.time() - start_time
 
         if latency > self.PROVIDER_TIMEOUT_WARN:
-
             logger.warning("Slow provider → %s (%.2fs)", name, latency)
 
         df = self._validate_response(df, ticker, min_rows)
@@ -304,7 +288,6 @@ class MarketProviderRouter:
         end: str,
         interval: str,
         min_rows: Optional[int] = None,
-        provider: Optional[str] = None,
     ) -> pd.DataFrame:
 
         self._validate_interval(interval)
