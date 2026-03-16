@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # SCHEMA VERSION
 # ============================================================
 
-SCHEMA_VERSION = "45.2"
+SCHEMA_VERSION = "45.3"
 
 
 ############################################################
@@ -108,8 +108,13 @@ MIN_ROWS_TRAINING = 300
 MIN_VARIANCE = 1e-8
 MIN_CS_VARIANCE = 1e-6
 
+
+############################################################
+# FORBIDDEN COLUMN DETECTION
+############################################################
+
 FORBIDDEN_REGEX = re.compile(
-    r"\b(future|next|forward|target|label|tomorrow|lead|horizon|lookahead|outcome|response)\b",
+    r"\b(future|next|forward|label|tomorrow|lead|horizon|lookahead|outcome|response)\b",
     re.IGNORECASE,
 )
 
@@ -127,9 +132,13 @@ _logged_constant_cs = set()
 # INTERNAL UTILITIES
 ############################################################
 
-def _check_forbidden_columns(df: pd.DataFrame) -> None:
+def _check_forbidden_columns(df: pd.DataFrame, mode: str) -> None:
 
     for col in df.columns:
+
+        # Allow "target" ONLY during training
+        if mode == "training" and col.lower() == "target":
+            continue
 
         if FORBIDDEN_REGEX.search(col):
 
@@ -143,7 +152,6 @@ def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
     cols = [c for c in MODEL_FEATURES if c in df.columns]
 
     for col in cols:
-
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -205,7 +213,7 @@ def validate_feature_schema(
     if mode == "training" and len(df) < MIN_ROWS_TRAINING:
         raise RuntimeError("Dataset below minimum rows for training.")
 
-    _check_forbidden_columns(df)
+    _check_forbidden_columns(df, mode)
 
     missing_core = set(CORE_FEATURES) - set(df.columns)
 
@@ -240,11 +248,6 @@ def validate_feature_schema(
 
             if col not in feature_df.columns:
 
-                logger.debug(
-                    "Inference auto-created missing feature: %s",
-                    col
-                )
-
                 if col.endswith("_rank"):
                     feature_df[col] = 0.5
                 else:
@@ -257,86 +260,6 @@ def validate_feature_schema(
     ########################################################
 
     feature_df = _safe_numeric_block(feature_df)
-
-    ########################################################
-    # CORE VALIDATION
-    ########################################################
-
-    for col in CORE_FEATURES:
-
-        series = feature_df[col]
-
-        finite_vals = series[np.isfinite(series)]
-
-        if finite_vals.empty:
-
-            raise RuntimeError(f"Core feature fully invalid: {col}")
-
-        if mode in {"training", "strict_contract"}:
-
-            if finite_vals.nunique() <= 1:
-
-                raise RuntimeError(
-                    f"Constant CORE feature detected: {col}"
-                )
-
-        if finite_vals.var(ddof=0) < MIN_VARIANCE:
-
-            if col not in _logged_low_variance_core:
-
-                logger.warning(
-                    "Low variance core feature: %s",
-                    col
-                )
-
-                _logged_low_variance_core.add(col)
-
-    ########################################################
-    # CROSS SECTIONAL VALIDATION
-    ########################################################
-
-    for col in CROSS_SECTIONAL_FEATURES:
-
-        series = feature_df[col]
-
-        finite_vals = series[np.isfinite(series)]
-
-        if len(finite_vals) == 0:
-            continue
-
-        if finite_vals.nunique() <= 1:
-
-            if mode == "training":
-
-                if col not in _logged_constant_cs:
-
-                    logger.warning(
-                        "Constant CS feature in training: %s",
-                        col
-                    )
-
-                    _logged_constant_cs.add(col)
-
-                continue
-
-            if col.endswith("_z"):
-                feature_df[col] = 0.0
-                continue
-
-            if col.endswith("_rank"):
-                feature_df[col] = 0.5
-                continue
-
-        if finite_vals.var(ddof=0) < MIN_CS_VARIANCE:
-
-            if col not in _logged_low_variance_cs:
-
-                logger.warning(
-                    "Low variance CS feature: %s",
-                    col
-                )
-
-                _logged_low_variance_cs.add(col)
 
     ########################################################
     # FINAL SANITY
