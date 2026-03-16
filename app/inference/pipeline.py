@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import logging
 import os
-from typing import List, Dict, Any
+from typing import List
 
 from core.data.market_data_service import MarketDataService
 from core.features.feature_engineering import FeatureEngineer
@@ -118,15 +118,6 @@ class InferencePipeline:
     # =========================================================
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
-        """
-        Fetch price data for all tickers, concatenate, then run the
-        full feature pipeline ONCE so cross-sectional features compute
-        correctly across the universe.
-
-        Previous bug: called build_feature_pipeline() per single ticker
-        inside a loop, so CS features (needing 5+ tickers/date) always
-        failed or produced zero-filled defaults.
-        """
 
         end_date = pd.Timestamp.utcnow()
 
@@ -139,22 +130,24 @@ class InferencePipeline:
         )
 
         if failures:
+
             logger.warning(
-                "Market data partial failure | success=%d | failed=%d | tickers=%s",
+                "Market data partial failure | success=%d | failed=%d",
                 len(data),
                 len(failures),
-                list(failures.keys()),
             )
 
-        if not data:
-            raise RuntimeError("Market data fetch failed for all tickers.")
+        if len(data) < self.MIN_UNIVERSE_WIDTH:
 
-        # Concatenate all tickers' price data first
+            raise RuntimeError(
+                f"Too few tickers available for inference ({len(data)}). "
+                f"Minimum required: {self.MIN_UNIVERSE_WIDTH}"
+            )
+
         combined_prices = pd.concat(
             list(data.values()), ignore_index=True
         )
 
-        # Run full feature pipeline once on combined data
         combined = FeatureEngineer.build_feature_pipeline(
             combined_prices, training=False
         )
@@ -164,7 +157,8 @@ class InferencePipeline:
 
         logger.info(
             "Cross-sectional frame built | rows=%d tickers=%d",
-            len(combined), combined["ticker"].nunique(),
+            len(combined),
+            combined["ticker"].nunique(),
         )
 
         return combined
@@ -289,9 +283,14 @@ class InferencePipeline:
 
             raw_scores = self._winsorize(raw_scores)
 
+            score_std = raw_scores.std()
+
+            if score_std < self.MIN_SCORE_STD:
+                raise RuntimeError("Model scores collapsed (std too small).")
+
             raw_scores = (
                 raw_scores - raw_scores.mean()
-            ) / (raw_scores.std() + EPSILON)
+            ) / (score_std + EPSILON)
 
             latest_df["raw_model_score"] = raw_scores
 
@@ -350,7 +349,6 @@ class InferencePipeline:
             )
 
             longs = ranked[-min(self.TOP_K, len(ranked)):]
-
             shorts = ranked[:min(self.BOTTOM_K, len(ranked))]
 
             weights = self._construct_portfolio_from_rows(longs, shorts)
