@@ -1,5 +1,5 @@
 # =====================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v2.4
+# MARKET SENTINEL APPLICATION ENTRYPOINT v2.5
 # Hybrid Multi-Agent | CV-Optimized Architecture
 # =====================================================
 
@@ -59,13 +59,11 @@ STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 120)
 APP_VERSION = get_env("APP_VERSION", "4.1.0")
 
 CORS_ORIGINS = get_env("CORS_ORIGINS", "*")
-
 CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS.split(",")]
 
 API_KEY = os.getenv("API_KEY")
 
 RATE_LIMIT = int(os.getenv("API_RATE_LIMIT_PER_MIN", "60"))
-
 WINDOW_SECONDS = 60
 
 PUBLIC_PATHS = {
@@ -78,6 +76,7 @@ PUBLIC_PATHS = {
 }
 
 request_store = defaultdict(lambda: deque())
+MAX_TRACKED_IPS = 5000
 
 
 # =====================================================
@@ -243,12 +242,14 @@ async def lifespan(app: FastAPI):
 
         boot_time = round(time.time() - boot_start, 2)
 
+        if boot_time > STARTUP_TIMEOUT_SEC:
+            logger.warning("Startup exceeded expected time.")
+
         logger.info(
-            "Startup complete | time=%ss | redis=%s | drift=%s | llm=%s",
+            "Startup complete | time=%ss | redis=%s | drift=%s",
             boot_time,
             readiness.redis_connected,
             readiness.drift_baseline_loaded,
-            readiness.llm_enabled
         )
 
         yield
@@ -310,17 +311,18 @@ async def request_context_middleware(request: Request, call_next):
                 detail="Invalid API key"
             )
 
-    client_ip = request.headers.get(
-        "X-Forwarded-For",
-        request.client.host
-    )
+    forwarded = request.headers.get("X-Forwarded-For")
+
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+    else:
+        client_ip = request.client.host
 
     now = time.time()
 
     queue = request_store[client_ip]
 
     while queue and queue[0] < now - WINDOW_SECONDS:
-
         queue.popleft()
 
     if len(queue) >= RATE_LIMIT:
@@ -332,10 +334,9 @@ async def request_context_middleware(request: Request, call_next):
 
     queue.append(now)
 
-    # Cleanup empty IPs
-    if not queue:
-
-        request_store.pop(client_ip, None)
+    # prevent memory explosion
+    if len(request_store) > MAX_TRACKED_IPS:
+        request_store.clear()
 
     request_id = str(uuid.uuid4())[:12]
 
@@ -348,7 +349,6 @@ async def request_context_middleware(request: Request, call_next):
         latency = time.time() - start
 
         response.headers["X-Request-ID"] = request_id
-
         response.headers["X-Process-Time"] = str(round(latency, 4))
 
         return response
@@ -382,6 +382,8 @@ app.include_router(agent.router)
 @app.get("/")
 async def root():
 
+    uptime = int(time.time()) - readiness.start_time
+
     return api_success({
         "service": "MarketSentinel Hybrid Portfolio Engine",
         "architecture": "multi-agent-ml-governed",
@@ -389,6 +391,9 @@ async def root():
         "boot_id": readiness.boot_id,
         "model_version": readiness.model_version,
         "artifact_hash": readiness.artifact_hash,
+        "redis": readiness.redis_connected,
+        "drift_baseline": readiness.drift_baseline_loaded,
+        "uptime_seconds": uptime,
         "version": APP_VERSION,
         "docs": "/docs",
         "metrics": "/metrics"
