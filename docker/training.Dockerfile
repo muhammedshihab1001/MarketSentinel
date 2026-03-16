@@ -32,13 +32,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements/ ./requirements/
 
-RUN pip install --upgrade pip setuptools wheel
-
 ############################################################
-# Install Training Dependencies
+# Install Python Dependencies
 ############################################################
 
-RUN pip install --prefer-binary -r requirements/training.txt
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    pip install --prefer-binary -r requirements/training.txt
 
 
 ############################################################
