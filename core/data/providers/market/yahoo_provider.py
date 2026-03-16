@@ -54,18 +54,23 @@ class YahooProvider(MarketDataProvider):
         logger.info("YahooProvider initialised (PRIMARY market data provider).")
 
     ############################################################
-    # DATETIME NORMALIZATION (FIX FOR TZ ISSUES)
+    # SAFE DATETIME NORMALIZATION (FIX TZ BUG)
     ############################################################
 
     @staticmethod
     def _normalize_datetime(series: pd.Series) -> pd.Series:
 
-        dt = pd.to_datetime(series, errors="coerce", utc=True)
+        dt = pd.to_datetime(series, errors="coerce")
 
         if dt.isna().any():
             raise RuntimeError("Datetime parsing produced invalid timestamps.")
 
-        # Normalize to daily boundary to avoid tz comparison issues
+        # Handle tz-aware and tz-naive safely
+        if getattr(dt.dt, "tz", None) is None:
+            dt = dt.dt.tz_localize("UTC")
+        else:
+            dt = dt.dt.tz_convert("UTC")
+
         dt = dt.dt.normalize()
 
         return dt
@@ -186,7 +191,7 @@ class YahooProvider(MarketDataProvider):
 
             if isinstance(df.index, pd.DatetimeIndex):
 
-                idx = pd.to_datetime(df.index, utc=True, errors="coerce")
+                idx = pd.to_datetime(df.index, errors="coerce")
 
                 df = df.reset_index(drop=True)
 
