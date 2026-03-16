@@ -1,5 +1,5 @@
 # =========================================================
-# MARKET UNIVERSE CONTROLLER v2.1
+# MARKET UNIVERSE CONTROLLER v2.2
 # Hybrid Multi-Agent Compatible | CV-Optimized
 # =========================================================
 
@@ -31,11 +31,7 @@ class MarketUniverse:
     - Non-critical production use
     """
 
-    # -----------------------------------------------------
-    # CONFIG
-    # -----------------------------------------------------
-
-    CONTROLLER_VERSION = "2.1"
+    CONTROLLER_VERSION = "2.2"
 
     PRODUCTION_FILE = os.getenv(
         "UNIVERSE_PATH",
@@ -48,7 +44,11 @@ class MarketUniverse:
     )
 
     REQUIRED_SIZE = int(os.getenv("UNIVERSE_MIN_SIZE", "20"))
+
     MAX_UNIVERSE_SIZE = int(os.getenv("UNIVERSE_MAX_SIZE", "200"))
+
+    # NEW: soft cap for training safety
+    TRAINING_SOFT_LIMIT = int(os.getenv("UNIVERSE_TRAINING_LIMIT", "120"))
 
     MIN_FILE_BYTES = 50
 
@@ -60,10 +60,13 @@ class MarketUniverse:
     TICKER_REGEX = re.compile(r"^[A-Z0-9.\-]{1,12}$")
 
     _CACHE: Optional[Dict] = None
+
     _LOCK = threading.RLock()
 
     _FILE_HASH: Optional[str] = None
+
     _LAST_VERSION: Optional[str] = None
+
     _LAST_LOADED_AT: Optional[str] = None
 
     # -----------------------------------------------------
@@ -84,7 +87,7 @@ class MarketUniverse:
     # -----------------------------------------------------
 
     @classmethod
-    def _active_file(cls) -> str:
+    def _active_file(cls):
 
         if cls.ALLOW_RESEARCH_OVERRIDE and Path(cls.RESEARCH_FILE).exists():
             return cls.RESEARCH_FILE
@@ -130,8 +133,11 @@ class MarketUniverse:
             raise RuntimeError(f"Universe config missing fields: {missing}")
 
         version = str(payload["version"])
+
         created_utc = payload["created_utc"]
+
         tickers = payload["tickers"]
+
         min_history_days = payload["min_history_days"]
 
         try:
@@ -146,12 +152,15 @@ class MarketUniverse:
             raise RuntimeError("Universe tickers must be list.")
 
         if not cls.ALLOW_RESEARCH_OVERRIDE:
+
             if len(tickers) < cls.REQUIRED_SIZE:
+
                 raise RuntimeError(
                     f"Production universe must contain at least {cls.REQUIRED_SIZE} tickers."
                 )
 
         if len(tickers) > cls.MAX_UNIVERSE_SIZE:
+
             raise RuntimeError(
                 f"Universe exceeds max allowed size ({cls.MAX_UNIVERSE_SIZE})."
             )
@@ -161,6 +170,7 @@ class MarketUniverse:
         if cls._LAST_VERSION:
 
             if parsed_version < cls._parse_version(cls._LAST_VERSION):
+
                 raise RuntimeError("Universe version downgrade detected.")
 
         normalized = []
@@ -180,6 +190,9 @@ class MarketUniverse:
         if len(normalized) != len(set(normalized)):
             raise RuntimeError("Duplicate tickers detected.")
 
+        # deterministic ordering
+        normalized = sorted(normalized)
+
         cls._LAST_VERSION = version
 
         return {
@@ -187,7 +200,7 @@ class MarketUniverse:
             "created_utc": created_utc,
             "description": payload["description"],
             "min_history_days": min_history_days,
-            "tickers": tuple(sorted(normalized)),
+            "tickers": tuple(normalized),
             "ticker_set": set(normalized),
             "file_path": cls._active_file()
         }
@@ -242,10 +255,19 @@ class MarketUniverse:
 
     @classmethod
     def get_universe(cls) -> Tuple[str, ...]:
-        return cls._get_cached()["tickers"]
+
+        tickers = cls._get_cached()["tickers"]
+
+        # soft training cap
+        if len(tickers) > cls.TRAINING_SOFT_LIMIT:
+
+            return tickers[: cls.TRAINING_SOFT_LIMIT]
+
+        return tickers
 
     @classmethod
-    def contains(cls, ticker: str) -> bool:
+    def contains(cls, ticker: str):
+
         return ticker.upper() in cls._get_cached()["ticker_set"]
 
     @classmethod
@@ -253,22 +275,33 @@ class MarketUniverse:
 
         universe_set = cls._get_cached()["ticker_set"]
 
-        return sorted(set(
-            t.upper().strip()
-            for t in tickers
-            if isinstance(t, str) and t.upper().strip() in universe_set
-        ))
+        valid = []
+
+        for t in tickers:
+
+            if not isinstance(t, str):
+                continue
+
+            t = t.upper().strip()
+
+            if t in universe_set:
+                valid.append(t)
+
+        return sorted(set(valid))
 
     @classmethod
     def get_min_history_days(cls):
+
         return cls._get_cached()["min_history_days"]
 
     @classmethod
-    def get_version(cls) -> str:
+    def get_version(cls):
+
         return cls._get_cached()["version"]
 
     @classmethod
-    def size(cls) -> int:
+    def size(cls):
+
         return len(cls.get_universe())
 
     # -----------------------------------------------------
@@ -276,7 +309,7 @@ class MarketUniverse:
     # -----------------------------------------------------
 
     @classmethod
-    def fingerprint(cls) -> str:
+    def fingerprint(cls):
 
         contract = {
             "tickers": list(cls.get_universe()),
@@ -297,7 +330,7 @@ class MarketUniverse:
     # -----------------------------------------------------
 
     @classmethod
-    def snapshot(cls) -> Dict:
+    def snapshot(cls):
 
         cache = cls._get_cached()
 
