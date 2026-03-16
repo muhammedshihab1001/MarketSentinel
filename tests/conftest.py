@@ -105,34 +105,31 @@ def disable_external_network(monkeypatch):
     """
     Block external network access while allowing:
     - localhost
-    - internal event loops
+    - internal FastAPI TestClient sockets
     """
 
     original_socket = socket.socket
 
-    def guarded_socket(*args, **kwargs):
+    class GuardedSocket(socket.socket):
 
-        sock = original_socket(*args, **kwargs)
-
-        original_connect = sock.connect
-
-        def guarded_connect(address):
+        def connect(self, address):
 
             host = address[0]
 
             # allow localhost
             if host in ("127.0.0.1", "localhost"):
-                return original_connect(address)
+                return super().connect(address)
 
             raise RuntimeError(
                 "External network access disabled in test mode"
             )
 
-        sock.connect = guarded_connect
+    monkeypatch.setattr(socket, "socket", GuardedSocket)
 
-        return sock
+    yield
 
-    monkeypatch.setattr(socket, "socket", guarded_socket)
+    # restore original socket after test
+    monkeypatch.setattr(socket, "socket", original_socket)
 
 
 # ---------------------------------------------------
