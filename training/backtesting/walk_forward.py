@@ -94,28 +94,23 @@ class WalkForwardValidator:
 
         df = df.sort_values(["date", "ticker"]).copy()
 
-        # defensive cleaning for yfinance noise
         df = df.replace([np.inf, -np.inf], np.nan)
         df = df.dropna(subset=["close"])
-
         df = df[df["close"] > 0]
 
-        df["raw_forward"] = (
-            df.groupby("ticker")["close"]
-            .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
-        )
+        forward_prices = df.groupby("ticker")["close"].shift(-FORWARD_DAYS)
+
+        df["raw_forward"] = np.log(forward_prices) - np.log(df["close"])
 
         df = df.dropna(subset=["raw_forward"])
 
         cs_mean = df.groupby("date")["raw_forward"].transform("mean")
+        cs_std = df.groupby("date")["raw_forward"].transform("std")
 
-        cs_std = (
-            df.groupby("date")["raw_forward"]
-            .transform("std")
-            .replace(0, np.nan)
+        df["target"] = (
+            (df["raw_forward"] - cs_mean) /
+            (cs_std + self.EPSILON)
         )
-
-        df["target"] = (df["raw_forward"] - cs_mean) / cs_std
 
         df["target"] = np.clip(
             df["target"],
@@ -200,7 +195,6 @@ class WalkForwardValidator:
             prev_positions = {}
 
             train_dates = unique_dates.iloc[start_idx - self.window_size:start_idx]
-
             test_dates = unique_dates.iloc[start_idx:start_idx + self.step_size]
 
             if len(test_dates) < self.MIN_TEST_DAYS:
@@ -233,10 +227,13 @@ class WalkForwardValidator:
                 start_idx += self.step_size
                 continue
 
-            train_df = validate_feature_schema(
-                train_df,
+            # SAFE FEATURE VALIDATION
+            X_train = validate_feature_schema(
+                train_df.loc[:, MODEL_FEATURES],
                 mode="training"
             )
+
+            train_df = pd.concat([train_df.reset_index(drop=True), X_train], axis=1)
 
             model = self.model_trainer(train_df)
 
@@ -255,7 +252,6 @@ class WalkForwardValidator:
                 exit_slice = test_df[test_df["date"] == exit_date].copy()
 
                 signal_slice = signal_slice.replace([np.inf, -np.inf], np.nan)
-
                 signal_slice = signal_slice.dropna(subset=MODEL_FEATURES)
 
                 common = set(signal_slice["ticker"]) & set(exit_slice["ticker"])
@@ -301,34 +297,13 @@ class WalkForwardValidator:
                 long_w = self._softmax(longs["score"].values)
                 short_w = self._softmax(np.abs(shorts["score"].values))
 
-                regime_multiplier = 1.0
-
-                if "regime_multiplier" in signal_slice.columns:
-
-                    regime_multiplier = float(
-                        signal_slice["regime_multiplier"].iloc[0]
-                    )
-
-                gross = self.TARGET_GROSS_EXPOSURE * regime_multiplier
-
-                long_w *= gross / 2
-                short_w *= gross / 2
-
                 positions = {}
 
                 for t, w in zip(longs["ticker"], long_w):
-
-                    positions[t] = min(
-                        float(w),
-                        self.MAX_POSITION_WEIGHT
-                    )
+                    positions[t] = min(float(w), self.MAX_POSITION_WEIGHT)
 
                 for t, w in zip(shorts["ticker"], short_w):
-
-                    positions[t] = -min(
-                        float(w),
-                        self.MAX_POSITION_WEIGHT
-                    )
+                    positions[t] = -min(float(w), self.MAX_POSITION_WEIGHT)
 
                 turnover = self._compute_turnover(prev_positions, positions)
 
@@ -366,16 +341,14 @@ class WalkForwardValidator:
                     )
                 )
 
-                capital *= np.exp(period_ret)
-
                 if not np.isfinite(capital):
-
                     capital = 1.0
+
+                capital *= np.exp(period_ret)
 
                 capital = max(capital, 1.0)
 
                 if capital > self.MAX_CAPITAL:
-
                     capital = self.MAX_CAPITAL
 
                 prev_positions = positions
