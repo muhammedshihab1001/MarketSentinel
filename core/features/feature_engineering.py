@@ -1,5 +1,5 @@
 """
-MarketSentinel v4.2.0
+MarketSentinel v4.3.0
 
 Feature engineering pipeline for ML model training and inference.
 """
@@ -26,6 +26,7 @@ class FeatureEngineer:
     Z_CLIP = 5.0
     MIN_VOLUME = 1.0
     VAR_FLOOR = 1e-6
+    DISPERSION_FLOOR = 1e-6
 
     CS_FEATURE_COLS = list(BASE_CS_COLS)
 
@@ -47,7 +48,6 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"])
 
-        # Duplicate protection
         df = df.drop_duplicates(["ticker", "date"])
 
         return df.reset_index(drop=True)
@@ -109,7 +109,6 @@ class FeatureEngineer:
 
         df = df.sort_values(["ticker", "date"]).copy()
 
-        # ── Returns ──────────────────────────────────────
         raw_returns = df.groupby("ticker")["close"].pct_change()
         raw_returns = raw_returns.replace([np.inf, -np.inf], np.nan).fillna(0)
 
@@ -129,7 +128,6 @@ class FeatureEngineer:
             .shift(1)
         ).clip(-0.2, 0.2)
 
-        # ── Momentum ─────────────────────────────────────
         df["momentum_20"] = (
             df.groupby("ticker")["close"].pct_change(20).shift(1)
         )
@@ -142,7 +140,6 @@ class FeatureEngineer:
             0.6 * df["momentum_20"] + 0.4 * df["momentum_60"]
         ).clip(-2, 2)
 
-        # ── Volatility ───────────────────────────────────
         df["volatility_20"] = (
             df.groupby("ticker")["return"]
             .transform(lambda x: x.rolling(20, min_periods=20).std(ddof=0))
@@ -157,21 +154,18 @@ class FeatureEngineer:
             df["momentum_composite"] / (df["volatility"] + cls.EPSILON)
         ).clip(-5, 5)
 
-        # ── Volatility of Volatility ─────────────────────
         df["vol_of_vol"] = (
             df.groupby("ticker")["volatility"]
             .transform(lambda x: x.rolling(20, min_periods=10).std(ddof=0))
             .shift(1)
         ).fillna(0).clip(0, 1)
 
-        # ── Return Skewness ──────────────────────────────
         df["return_skew_20"] = (
             df.groupby("ticker")["return"]
             .transform(lambda x: x.rolling(20, min_periods=10).skew())
             .shift(1)
         ).fillna(0).clip(-3, 3)
 
-        # ── Liquidity ────────────────────────────────────
         df["volume"] = df["volume"].clip(lower=cls.MIN_VOLUME)
 
         df["volume_mean_20"] = (
@@ -186,17 +180,17 @@ class FeatureEngineer:
 
         df["dollar_volume"] = df["close"] * df["volume"]
 
-        # ── Amihud Illiquidity ───────────────────────────
         abs_ret = df["return"].abs()
         daily_illiq = abs_ret / (df["dollar_volume"] + cls.EPSILON)
+
         df["amihud"] = (
             daily_illiq.groupby(df["ticker"])
             .transform(lambda x: x.rolling(20, min_periods=5).mean())
             .shift(1)
         ).fillna(0)
+
         df["amihud"] = np.log1p(df["amihud"] * 1e6).clip(0, 20)
 
-        # ── RSI ──────────────────────────────────────────
         df["rsi"] = 50.0
 
         for ticker, group in df.groupby("ticker"):
@@ -219,7 +213,6 @@ class FeatureEngineer:
 
         df["rsi"] = df["rsi"].clip(0, 100)
 
-        # ── EMA structure ────────────────────────────────
         df["ema_10"] = df.groupby("ticker")["close"].transform(
             lambda x: x.ewm(span=10, adjust=False).mean()
         )
@@ -232,28 +225,28 @@ class FeatureEngineer:
             df["ema_10"] / (df["ema_50"] + cls.EPSILON)
         ).clip(0.5, 1.5)
 
-        # ── 52-week high distance ────────────────────────
         rolling_high = (
             df.groupby("ticker")["close"]
             .transform(lambda x: x.rolling(252, min_periods=60).max())
             .shift(1)
         )
+
         df["dist_from_52w_high"] = (
             (df["close"] / (rolling_high + cls.EPSILON)) - 1
         ).clip(-1, 0)
 
-        # ── Volatility regime ────────────────────────────
         vol_mean = df.groupby("ticker")["volatility"].transform(
             lambda x: x.rolling(60, min_periods=20).mean()
         )
+
         vol_std = df.groupby("ticker")["volatility"].transform(
             lambda x: x.rolling(60, min_periods=20).std()
         )
+
         df["regime_feature"] = (
             (df["volatility"] - vol_mean) / (vol_std + cls.EPSILON)
         ).clip(-3, 3).fillna(0)
 
-        # ── Momentum × Regime interaction ────────────────
         df["momentum_regime_interaction"] = (
             df["momentum_composite"] * df["regime_feature"]
         ).clip(-5, 5)
@@ -277,9 +270,10 @@ class FeatureEngineer:
             logger.warning("Cross-sectional width insufficient.")
             return df
 
-        # ── Market-level context ─────────────────────────
         df["market_dispersion"] = (
-            df.groupby("date")["return"].transform("std").fillna(0)
+            df.groupby("date")["return"].transform("std")
+            .clip(lower=cls.DISPERSION_FLOOR)
+            .fillna(0)
         )
 
         df["breadth"] = (
@@ -288,16 +282,9 @@ class FeatureEngineer:
             .fillna(0.5)
         )
 
-        # ── Z-scores + ranks ────────────────────────────
         cols_to_process = [
             c for c in cls.CS_FEATURE_COLS if c in df.columns
         ]
-
-        missing_cs = [c for c in cls.CS_FEATURE_COLS if c not in df.columns]
-        if missing_cs:
-            logger.warning(
-                "CS columns missing from DataFrame: %s", missing_cs
-            )
 
         for col in cols_to_process:
 
@@ -363,6 +350,8 @@ class FeatureEngineer:
             logger.warning("Missing feature %s — filling with 0.", col)
 
             df[col] = 0.0
+
+        df = df.loc[:, list(set(df.columns) | set(MODEL_FEATURES))]
 
         return df.reset_index(drop=True)
 
