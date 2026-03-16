@@ -26,13 +26,14 @@ class StockPriceFetcher:
     Used internally by YahooProvider.
     """
 
-    # Reduced retries to prevent Yahoo rate-limit storms
     MAX_RETRIES = 2
 
     BASE_RETRY_SLEEP = 1.0
     MAX_BACKOFF = 8.0
 
     MIN_ROWS = 50
+
+    # NEW: safety timeout guard
     REQUEST_TIMEOUT = 25
 
     SOFT_FAIL_MODE = os.getenv("YFINANCE_SOFT_MODE", "1") == "1"
@@ -43,7 +44,6 @@ class StockPriceFetcher:
     _last_request_time = 0.0
     _rate_lock = threading.Lock()
 
-    # simple cooldown memory for rate-limited tickers
     _ticker_cooldown = {}
     _cooldown_seconds = 15
 
@@ -110,7 +110,7 @@ class StockPriceFetcher:
                         canonical = field.replace(" ", "_")
                         break
 
-                normalized.append(canonical or parts[0] if parts else "unknown")
+                normalized.append(canonical if canonical else (parts[0] if parts else "unknown"))
 
             df.columns = normalized
 
@@ -228,6 +228,8 @@ class StockPriceFetcher:
 
         for attempt in range(1, self.MAX_RETRIES + 1):
 
+            start_time = time.time()
+
             try:
 
                 self._respect_rate_limit()
@@ -239,8 +241,18 @@ class StockPriceFetcher:
                     interval=interval,
                     progress=False,
                     auto_adjust=False,
-                    threads=False
+                    threads=False,
+                    timeout=self.REQUEST_TIMEOUT,
                 )
+
+                latency = time.time() - start_time
+
+                if latency > 10:
+                    logger.warning(
+                        "Slow yfinance response | ticker=%s latency=%.2fs",
+                        ticker,
+                        latency,
+                    )
 
                 if df is None or df.empty:
                     raise RuntimeError("yfinance returned empty DataFrame.")
