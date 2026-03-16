@@ -1,5 +1,5 @@
 # ==========================================================
-# INSTITUTIONAL TRAINING PIPELINE WRAPPER v2.6
+# INSTITUTIONAL TRAINING PIPELINE WRAPPER v2.7
 # Governance Hardened + Hybrid Multi-Agent Compatible
 # ==========================================================
 
@@ -16,6 +16,7 @@ import tempfile
 import uuid
 import argparse
 import hashlib
+import sys
 
 import numpy as np
 import pandas as pd
@@ -39,6 +40,8 @@ LOCK_FILE = os.path.join(RUNS_DIR, ".training.lock")
 MAX_TRAINING_SECONDS = 7200
 GLOBAL_SEED = 42
 STRICT_GOVERNANCE = os.getenv("TRAINING_STRICT_GOVERNANCE", "1") == "1"
+
+os.makedirs(RUNS_DIR, exist_ok=True)
 
 
 # ==========================================================
@@ -64,8 +67,6 @@ def enforce_determinism():
 
 def _acquire_lock():
 
-    os.makedirs(RUNS_DIR, exist_ok=True)
-
     if os.path.exists(LOCK_FILE):
 
         try:
@@ -81,7 +82,10 @@ def _acquire_lock():
 
         if age > 4 * 3600:
             logger.warning("Stale training lock detected — removing.")
-            os.remove(LOCK_FILE)
+            try:
+                os.remove(LOCK_FILE)
+            except FileNotFoundError:
+                pass
         else:
             raise RuntimeError(
                 f"Training lock detected (pid={pid}) — another training may be running."
@@ -121,7 +125,8 @@ def get_git_commit():
         dirty = subprocess.run(
             ["git", "status", "--porcelain"],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=5
         ).stdout.strip()
 
         if dirty and STRICT_GOVERNANCE:
@@ -131,7 +136,8 @@ def get_git_commit():
 
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
+            timeout=5
         ).decode().strip()
 
         return commit
@@ -149,12 +155,14 @@ def build_environment_fingerprint():
 
     payload = {
         "python": platform.python_version(),
+        "python_executable": sys.executable,
         "numpy": np.__version__,
         "pandas": pd.__version__,
         "platform": platform.platform(),
         "hostname": socket.gethostname(),
         "cpu_count": os.cpu_count(),
-        "env_hash": os.getenv("ENV_FINGERPRINT"),
+        "env_hash": os.getenv("ENV_FINGERPRINT", "none"),
+        "process_id": os.getpid()
     }
 
     canonical = json.dumps(payload, sort_keys=True).encode()
@@ -238,8 +246,6 @@ def capture_provider_health():
 # ==========================================================
 
 def save_manifest(run_id: str, manifest: dict):
-
-    os.makedirs(RUNS_DIR, exist_ok=True)
 
     final_path = os.path.join(RUNS_DIR, f"{run_id}.json")
 
