@@ -1,16 +1,8 @@
 """
-MarketSentinel v4.1.0
+MarketSentinel v4.2.0
 
 XGBoost regression model wrapper with training safety guards,
-feature integrity checksums, and standardised inference scoring.
-
-Features:
-    - Time-ordered train/validation split (no shuffling — financial data)
-    - Early stopping with configurable rounds
-    - Feature + parameter + booster checksums for artifact integrity
-    - Prediction entropy and dispersion guards
-    - Optional GPU support via XGB_USE_GPU env var
-    - Configurable thread count via XGB_NTHREAD env var
+feature integrity checksums, and standardized inference scoring.
 """
 
 import hashlib
@@ -24,88 +16,62 @@ import xgboost as xgb
 
 logger = logging.getLogger("marketsentinel.xgboost")
 
-# ── Training constants ────────────────────────────────────────────────────────
-SEED                  = 42
-NUM_BOOST_ROUNDS      = 1200
+# ── Training constants ─────────────────────────────────────────────
+SEED = 42
+NUM_BOOST_ROUNDS = 1200
 EARLY_STOPPING_ROUNDS = 75
-VALIDATION_SPLIT      = 0.15
+VALIDATION_SPLIT = 0.15
 
-# ── Sanity thresholds ─────────────────────────────────────────────────────────
-MIN_SCORE_STD    = 1e-6
-MIN_TARGET_STD   = 1e-6
+# ── Sanity thresholds ──────────────────────────────────────────────
+MIN_SCORE_STD = 1e-6
+MIN_TARGET_STD = 1e-6
 MIN_PRED_ENTROPY = 0.01
 MAX_MODEL_SIZE_MB = 150
-MAX_ABS_SCORE    = 50
-EPSILON          = 1e-12
+MAX_ABS_SCORE = 50
+EPSILON = 1e-12
+
+# NEW: safety guards
+MIN_VALIDATION_ROWS = 50
+MAX_TARGET_ABS = 50
 
 
 class SafeXGBRegressor:
-    """
-    Production-hardened XGBoost regressor with integrity checks,
-    feature validation, and standardised inference output.
 
-    Training flow:
-        fit(X, y) → time-ordered split → xgb.train() → sanity checks
-    Inference flow:
-        predict(X) → feature alignment → clip → optional standardise
-    """
-
-    # ── Inference standardisation (class-level — can be overridden per instance)
     STANDARDIZE_INFERENCE = True
 
-    # ────────────────────────────────────────────────────────────────────────
-    # INIT
-    # ────────────────────────────────────────────────────────────────────────
+    def __init__(self):
 
-    def __init__(self) -> None:
-        self.model              = None
-        self.feature_names      = None
-        self.training_cols      = None
+        self.model = None
+        self.feature_names = None
+        self.training_cols = None
 
-        # Integrity checksums
-        self.feature_checksum   = None
-        self.param_checksum     = None
+        self.feature_checksum = None
+        self.param_checksum = None
         self.importance_checksum = None
         self.training_fingerprint = None
-        self.booster_checksum   = None
+        self.booster_checksum = None
 
-        # Training metrics
-        self.best_iteration     = None
-        self.train_rmse         = None
-        self.valid_rmse         = None
+        self.best_iteration = None
+        self.train_rmse = None
+        self.valid_rmse = None
 
         self.model_type = "xgboost_regressor"
 
-        # Seed numpy + random for reproducible training
-        # NOTE: PYTHONHASHSEED only works if set before interpreter startup
-        # — setting os.environ here at runtime has no effect on hash randomisation.
-        # These two seeds are sufficient for XGBoost + numpy reproducibility.
         random.seed(SEED)
         np.random.seed(SEED)
 
-    # ────────────────────────────────────────────────────────────────────────
+    # ==========================================================
     # FIT
-    # ────────────────────────────────────────────────────────────────────────
+    # ==========================================================
 
-    def fit(self, X, y) -> "SafeXGBRegressor":
-        """
-        Train XGBoost regressor on (X, y).
+    def fit(self, X, y):
 
-        Parameters
-        ----------
-        X : pd.DataFrame — feature matrix (MODEL_FEATURES columns)
-        y : array-like   — continuous regression target
-
-        Uses a time-ordered train/validation split (no shuffling).
-        """
-
-        # ── Input guards ──────────────────────────────────────────────────────
         if X is None or X.empty:
             raise RuntimeError("Training feature matrix is empty.")
+
         if len(X) != len(y):
-            raise RuntimeError(
-                f"Feature/label length mismatch: X={len(X)}, y={len(y)}."
-            )
+            raise RuntimeError("Feature/label length mismatch.")
+
         if X.isnull().any().any():
             raise RuntimeError("NaN values detected in training features.")
 
@@ -114,14 +80,15 @@ class SafeXGBRegressor:
 
         if np.std(y) < MIN_TARGET_STD:
             raise RuntimeError(
-                f"Target variance too small ({np.std(y):.2e}). "
-                "Check label construction."
+                f"Target variance too small ({np.std(y):.2e})."
             )
 
-        self.feature_names  = list(X.columns)
-        self.training_cols  = X.shape[1]
+        # Clip extreme label spikes (yfinance safety)
+        y = np.clip(y, -MAX_TARGET_ABS, MAX_TARGET_ABS)
 
-        # ── Integrity checksums ───────────────────────────────────────────────
+        self.feature_names = list(X.columns)
+        self.training_cols = X.shape[1]
+
         self.training_fingerprint = hashlib.sha256(
             X.to_numpy().tobytes() + y.tobytes()
         ).hexdigest()
@@ -130,49 +97,71 @@ class SafeXGBRegressor:
             json.dumps(self.feature_names).encode()
         ).hexdigest()
 
-        # ── Time-ordered split ────────────────────────────────────────────────
+        # ── Time ordered split ───────────────────────────────
+
         split_idx = int(len(X) * (1 - VALIDATION_SPLIT))
-        X_train, y_train = X.iloc[:split_idx], y[:split_idx]
-        X_valid, y_valid = X.iloc[split_idx:], y[split_idx:]
+
+        X_train = X.iloc[:split_idx]
+        y_train = y[:split_idx]
+
+        X_valid = X.iloc[split_idx:]
+        y_valid = y[split_idx:]
 
         dtrain = xgb.DMatrix(
-            X_train, label=y_train, feature_names=self.feature_names
+            X_train,
+            label=y_train,
+            feature_names=self.feature_names,
         )
+
         evals = [(dtrain, "train")]
 
-        if len(X_valid) >= 10:
+        if len(X_valid) >= MIN_VALIDATION_ROWS:
+
             dvalid = xgb.DMatrix(
-                X_valid, label=y_valid, feature_names=self.feature_names
+                X_valid,
+                label=y_valid,
+                feature_names=self.feature_names,
             )
+
             evals.append((dvalid, "valid"))
 
-        # ── Parameters ───────────────────────────────────────────────────────
-        use_gpu   = os.getenv("XGB_USE_GPU", "false").lower() == "true"
-        n_threads = int(os.getenv("XGB_NTHREAD", "-1"))   # -1 = all available cores
+        else:
+
+            logger.warning(
+                "Validation set too small (%d rows) — skipping validation.",
+                len(X_valid),
+            )
+
+        # ── Parameters ───────────────────────────────────────
+
+        use_gpu = os.getenv("XGB_USE_GPU", "false").lower() == "true"
+        n_threads = int(os.getenv("XGB_NTHREAD", "-1"))
 
         params = {
-            "objective":        "reg:squarederror",
-            "eval_metric":      "rmse",
-            "max_depth":        6,
-            "eta":              0.03,
-            "subsample":        0.85,
+            "objective": "reg:squarederror",
+            "eval_metric": "rmse",
+            "max_depth": 6,
+            "eta": 0.03,
+            "subsample": 0.85,
             "colsample_bytree": 0.85,
             "min_child_weight": 2,
-            "gamma":            0.05,
-            "reg_alpha":        0.3,
-            "reg_lambda":       1.2,
-            "tree_method":      "gpu_hist" if use_gpu else "hist",
-            "seed":             SEED,
-            "nthread":          n_threads,
-            "verbosity":        0,
+            "gamma": 0.05,
+            "reg_alpha": 0.3,
+            "reg_lambda": 1.2,
+            "tree_method": "gpu_hist" if use_gpu else "hist",
+            "seed": SEED,
+            "nthread": n_threads,
+            "verbosity": 0,
         }
 
         self.param_checksum = hashlib.sha256(
             json.dumps(params, sort_keys=True).encode()
         ).hexdigest()
 
-        # ── Train ─────────────────────────────────────────────────────────────
+        # ── Train ────────────────────────────────────────────
+
         evals_result = {}
+
         self.model = xgb.train(
             params,
             dtrain,
@@ -185,40 +174,43 @@ class SafeXGBRegressor:
 
         self.best_iteration = (
             self.model.best_iteration
-            if hasattr(self.model, "best_iteration") and self.model.best_iteration is not None
+            if getattr(self.model, "best_iteration", None) is not None
             else NUM_BOOST_ROUNDS
         )
 
         self.train_rmse = float(evals_result["train"]["rmse"][-1])
-        self.valid_rmse = (
-            float(evals_result["valid"]["rmse"][-1])
-            if "valid" in evals_result
-            else self.train_rmse
-        )
 
-        # ── Overfit check ─────────────────────────────────────────────────────
+        if "valid" in evals_result:
+            self.valid_rmse = float(evals_result["valid"]["rmse"][-1])
+        else:
+            self.valid_rmse = self.train_rmse
+
+        # ── Overfit warning ─────────────────────────────────
+
         if self.valid_rmse > self.train_rmse * 1.5:
+
             logger.warning(
-                "Potential overfitting detected | "
-                "train_rmse=%.5f | valid_rmse=%.5f | ratio=%.2f",
-                self.train_rmse, self.valid_rmse,
-                self.valid_rmse / (self.train_rmse + EPSILON),
+                "Potential overfitting | train_rmse=%.5f valid_rmse=%.5f",
+                self.train_rmse,
+                self.valid_rmse,
             )
 
-        # ── Model size check ──────────────────────────────────────────────────
-        # Use "ubj" (universal binary JSON) format — consistent across XGBoost versions
-        raw_model      = self.model.save_raw("ubj")
-        model_size_mb  = len(raw_model) / (1024 * 1024)
+        # ── Model size guard ────────────────────────────────
+
+        raw_model = self.model.save_raw("ubj")
+
+        model_size_mb = len(raw_model) / (1024 * 1024)
 
         if model_size_mb > MAX_MODEL_SIZE_MB:
+
             raise RuntimeError(
-                f"Model artifact too large: {model_size_mb:.1f} MB "
-                f"(limit={MAX_MODEL_SIZE_MB} MB)."
+                f"Model artifact too large: {model_size_mb:.1f} MB"
             )
 
         self.booster_checksum = hashlib.sha256(raw_model).hexdigest()
 
-        # ── Training sanity check ─────────────────────────────────────────────
+        # ── Prediction sanity ───────────────────────────────
+
         preds = self.model.predict(
             dtrain,
             iteration_range=(0, self.best_iteration),
@@ -228,71 +220,63 @@ class SafeXGBRegressor:
             raise RuntimeError("Non-finite values in training predictions.")
 
         pred_std = float(np.std(preds))
+
         if pred_std < MIN_SCORE_STD:
             raise RuntimeError(
-                f"Score collapse: prediction std={pred_std:.2e} < {MIN_SCORE_STD}."
+                f"Score collapse detected (std={pred_std:.2e})."
             )
 
-        hist, _  = np.histogram(preds, bins=30)
-        probs    = hist / (hist.sum() + EPSILON)
-        entropy  = float(-np.sum(probs * np.log(probs + EPSILON)))
+        # entropy
+        hist, _ = np.histogram(preds, bins=30)
+
+        probs = hist / (hist.sum() + EPSILON)
+
+        entropy = float(
+            -np.sum(probs * np.log(probs + EPSILON))
+        )
 
         if entropy < MIN_PRED_ENTROPY:
             raise RuntimeError(
-                f"Prediction entropy too low: {entropy:.4f} < {MIN_PRED_ENTROPY}."
+                f"Prediction entropy too low ({entropy:.4f})."
             )
 
         logger.info(
-            "XGBoost trained | best_iter=%d | pred_std=%.6f | entropy=%.4f "
-            "| train_rmse=%.5f | valid_rmse=%.5f | size_mb=%.2f",
-            self.best_iteration, pred_std, entropy,
-            self.train_rmse, self.valid_rmse, model_size_mb,
+            "XGBoost trained | iter=%d | train_rmse=%.5f | valid_rmse=%.5f | entropy=%.4f",
+            self.best_iteration,
+            self.train_rmse,
+            self.valid_rmse,
+            entropy,
         )
 
         return self
 
-    # ────────────────────────────────────────────────────────────────────────
+    # ==========================================================
     # PREDICT
-    # ────────────────────────────────────────────────────────────────────────
+    # ==========================================================
 
-    def predict(self, X) -> np.ndarray:
-        """
-        Run inference and return standardised scores.
+    def predict(self, X):
 
-        Parameters
-        ----------
-        X : pd.DataFrame — must contain all training feature columns
-
-        Returns
-        -------
-        np.ndarray of float32 scores, optionally standardised to zero-mean unit-std.
-        """
         if self.model is None:
-            raise RuntimeError("Model has not been trained yet.")
+            raise RuntimeError("Model not trained.")
+
         if X is None or X.empty:
-            raise RuntimeError("Inference feature matrix is empty.")
+            raise RuntimeError("Inference features empty.")
 
-        # ── Missing features check FIRST (more informative than col count) ────
         missing = set(self.feature_names) - set(X.columns)
+
         if missing:
-            raise RuntimeError(
-                f"Missing inference features: {missing}. "
-                f"Expected {self.training_cols} features."
-            )
+            raise RuntimeError(f"Missing inference features: {missing}")
 
-        # ── Dimension check ───────────────────────────────────────────────────
-        if len(X.columns) != self.training_cols:
-            raise RuntimeError(
-                f"Feature dimension mismatch: got {len(X.columns)}, "
-                f"expected {self.training_cols}."
-            )
-
+        # enforce order
         X = X.loc[:, self.feature_names].astype(np.float32)
 
         if X.isnull().any().any():
-            raise RuntimeError("NaN values detected in inference features.")
+            raise RuntimeError("NaN values in inference features.")
 
-        dmatrix = xgb.DMatrix(X, feature_names=self.feature_names)
+        dmatrix = xgb.DMatrix(
+            X,
+            feature_names=self.feature_names,
+        )
 
         scores = self.model.predict(
             dmatrix,
@@ -300,46 +284,54 @@ class SafeXGBRegressor:
         )
 
         if not np.all(np.isfinite(scores)):
-            raise RuntimeError("Non-finite values in inference scores.")
+            raise RuntimeError("Non-finite inference scores.")
 
         scores = np.clip(scores, -MAX_ABS_SCORE, MAX_ABS_SCORE)
 
         score_std = float(np.std(scores))
+
         if score_std < MIN_SCORE_STD:
+
             logger.warning(
-                "Low inference score dispersion (std=%.2e) — "
-                "model may be producing flat predictions.",
+                "Low score dispersion (std=%.2e).",
                 score_std,
             )
 
         if self.STANDARDIZE_INFERENCE and score_std > MIN_SCORE_STD:
-            scores = (scores - np.mean(scores)) / (score_std + EPSILON)
 
-        return scores
+            scores = (
+                scores - np.mean(scores)
+            ) / (score_std + EPSILON)
 
-    # ────────────────────────────────────────────────────────────────────────
+        return scores.astype(np.float32)
+
+    # ==========================================================
     # FEATURE IMPORTANCE
-    # ────────────────────────────────────────────────────────────────────────
+    # ==========================================================
 
-    def export_feature_importance(self) -> dict:
-        """
-        Export normalised feature importance by gain.
-        Returns a dict with importance ranking and all integrity checksums.
-        """
+    def export_feature_importance(self):
+
         if self.model is None:
-            raise RuntimeError("Model has not been trained.")
+            raise RuntimeError("Model not trained.")
 
-        raw_gain   = self.model.get_score(importance_type="gain") or {}
+        raw_gain = self.model.get_score(importance_type="gain") or {}
+
         importance = {
             name: float(raw_gain.get(name, 0.0))
             for name in self.feature_names
         }
 
         total_gain = sum(importance.values()) + EPSILON
-        normalised = {k: v / total_gain for k, v in importance.items()}
+
+        normalized = {
+            k: v / total_gain
+            for k, v in importance.items()
+        }
 
         sorted_imp = sorted(
-            normalised.items(), key=lambda x: x[1], reverse=True
+            normalized.items(),
+            key=lambda x: x[1],
+            reverse=True,
         )
 
         self.importance_checksum = hashlib.sha256(
@@ -347,23 +339,24 @@ class SafeXGBRegressor:
         ).hexdigest()
 
         return {
-            "feature_importance":    sorted_imp,
-            "importance_checksum":   self.importance_checksum,
-            "booster_checksum":      self.booster_checksum,
-            "best_iteration":        self.best_iteration,
-            "param_checksum":        self.param_checksum,
-            "feature_checksum":      self.feature_checksum,
-            "train_rmse":            self.train_rmse,
-            "valid_rmse":            self.valid_rmse,
-            "training_fingerprint":  self.training_fingerprint,
+            "feature_importance": sorted_imp,
+            "importance_checksum": self.importance_checksum,
+            "booster_checksum": self.booster_checksum,
+            "best_iteration": self.best_iteration,
+            "param_checksum": self.param_checksum,
+            "feature_checksum": self.feature_checksum,
+            "train_rmse": self.train_rmse,
+            "valid_rmse": self.valid_rmse,
+            "training_fingerprint": self.training_fingerprint,
         }
 
 
-# ────────────────────────────────────────────────────────────────────────────
+# ==========================================================
 # FACTORY
-# ────────────────────────────────────────────────────────────────────────────
+# ==========================================================
 
-def build_xgboost_pipeline() -> SafeXGBRegressor:
-    """Factory function — returns a fresh untrained SafeXGBRegressor."""
-    logger.info("Building XGBoost Regressor | MarketSentinel v4.1.0")
+def build_xgboost_pipeline():
+
+    logger.info("Building XGBoost Regressor | MarketSentinel v4.2.0")
+
     return SafeXGBRegressor()
