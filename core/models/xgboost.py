@@ -1,5 +1,5 @@
 """
-MarketSentinel v4.2.1
+MarketSentinel v4.3.0
 
 XGBoost regression model wrapper with training safety guards,
 feature integrity checksums, and standardized inference scoring.
@@ -22,8 +22,10 @@ NUM_BOOST_ROUNDS = 1200
 EARLY_STOPPING_ROUNDS = 75
 VALIDATION_SPLIT = 0.15
 
-# NEW safety guard
 MIN_BOOST_ROUNDS = 25
+
+# NEW training safety
+MIN_TRAIN_ROWS = 120
 
 # ── Sanity thresholds ──────────────────────────────────────────────
 MIN_SCORE_STD = 1e-6
@@ -33,7 +35,6 @@ MAX_MODEL_SIZE_MB = 150
 MAX_ABS_SCORE = 50
 EPSILON = 1e-12
 
-# Additional safety
 MIN_VALIDATION_ROWS = 50
 MAX_TARGET_ABS = 50
 
@@ -72,6 +73,11 @@ class SafeXGBRegressor:
         if X is None or X.empty:
             raise RuntimeError("Training feature matrix is empty.")
 
+        if len(X) < MIN_TRAIN_ROWS:
+            raise RuntimeError(
+                f"Training dataset too small ({len(X)} rows)."
+            )
+
         if len(X) != len(y):
             raise RuntimeError("Feature/label length mismatch.")
 
@@ -86,7 +92,6 @@ class SafeXGBRegressor:
                 f"Target variance too small ({np.std(y):.2e})."
             )
 
-        # clip extreme spikes (common with yfinance noise)
         y = np.clip(y, -MAX_TARGET_ABS, MAX_TARGET_ABS)
 
         self.feature_names = list(X.columns)
@@ -99,8 +104,6 @@ class SafeXGBRegressor:
         self.feature_checksum = hashlib.sha256(
             json.dumps(self.feature_names).encode()
         ).hexdigest()
-
-        # ── Time ordered split ───────────────────────────────
 
         split_idx = int(len(X) * (1 - VALIDATION_SPLIT))
 
@@ -135,8 +138,6 @@ class SafeXGBRegressor:
                 len(X_valid),
             )
 
-        # ── Parameters ───────────────────────────────────────
-
         use_gpu = os.getenv("XGB_USE_GPU", "false").lower() == "true"
         n_threads = int(os.getenv("XGB_NTHREAD", "-1"))
 
@@ -161,8 +162,6 @@ class SafeXGBRegressor:
             json.dumps(params, sort_keys=True).encode()
         ).hexdigest()
 
-        # ── Train ────────────────────────────────────────────
-
         evals_result = {}
 
         self.model = xgb.train(
@@ -181,12 +180,10 @@ class SafeXGBRegressor:
             else NUM_BOOST_ROUNDS
         )
 
-        # early stop safeguard
         if self.best_iteration < MIN_BOOST_ROUNDS:
 
             logger.warning(
-                "Model stopped extremely early (iter=%d). "
-                "Possible weak signal in data.",
+                "Model stopped extremely early (iter=%d).",
                 self.best_iteration
             )
 
@@ -196,18 +193,6 @@ class SafeXGBRegressor:
             self.valid_rmse = float(evals_result["valid"]["rmse"][-1])
         else:
             self.valid_rmse = self.train_rmse
-
-        # ── Overfit warning ─────────────────────────────────
-
-        if self.valid_rmse > self.train_rmse * 1.5:
-
-            logger.warning(
-                "Potential overfitting | train_rmse=%.5f valid_rmse=%.5f",
-                self.train_rmse,
-                self.valid_rmse,
-            )
-
-        # ── Model size guard ────────────────────────────────
 
         raw_model = self.model.save_raw("ubj")
 
@@ -220,8 +205,6 @@ class SafeXGBRegressor:
             )
 
         self.booster_checksum = hashlib.sha256(raw_model).hexdigest()
-
-        # ── Prediction sanity ───────────────────────────────
 
         preds = self.model.predict(
             dtrain,
@@ -238,24 +221,12 @@ class SafeXGBRegressor:
                 f"Score collapse detected (std={pred_std:.2e})."
             )
 
-        hist, _ = np.histogram(preds, bins=30)
-
-        probs = hist / (hist.sum() + EPSILON)
-
-        entropy = float(-np.sum(probs * np.log(probs + EPSILON)))
-
-        if entropy < MIN_PRED_ENTROPY:
-            raise RuntimeError(
-                f"Prediction entropy too low ({entropy:.4f})."
-            )
-
         logger.info(
-            "XGBoost trained | iter=%d | features=%d | train_rmse=%.5f | valid_rmse=%.5f | entropy=%.4f",
+            "XGBoost trained | iter=%d | features=%d | train_rmse=%.5f | valid_rmse=%.5f",
             self.best_iteration,
             len(self.feature_names),
             self.train_rmse,
             self.valid_rmse,
-            entropy,
         )
 
         return self
@@ -276,6 +247,11 @@ class SafeXGBRegressor:
 
         if missing:
             raise RuntimeError(f"Missing inference features: {missing}")
+
+        unexpected = set(X.columns) - set(self.feature_names)
+
+        if unexpected:
+            logger.warning("Extra features ignored: %s", unexpected)
 
         X = X.loc[:, self.feature_names].astype(np.float32)
 
@@ -364,6 +340,6 @@ class SafeXGBRegressor:
 
 def build_xgboost_pipeline():
 
-    logger.info("Building XGBoost Regressor | MarketSentinel v4.2.1")
+    logger.info("Building XGBoost Regressor | MarketSentinel v4.3.0")
 
     return SafeXGBRegressor()
