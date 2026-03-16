@@ -26,9 +26,11 @@ class StockPriceFetcher:
     Used internally by YahooProvider.
     """
 
-    MAX_RETRIES = 5
+    # Reduced retries to prevent Yahoo rate-limit storms
+    MAX_RETRIES = 2
+
     BASE_RETRY_SLEEP = 1.0
-    MAX_BACKOFF = 10.0
+    MAX_BACKOFF = 8.0
 
     MIN_ROWS = 50
     REQUEST_TIMEOUT = 25
@@ -36,10 +38,14 @@ class StockPriceFetcher:
     SOFT_FAIL_MODE = os.getenv("YFINANCE_SOFT_MODE", "1") == "1"
     SOFT_FAIL_RATIO = 0.70
 
-    MIN_REQUEST_INTERVAL = float(os.getenv("YFINANCE_MIN_INTERVAL", "2.0"))
+    MIN_REQUEST_INTERVAL = float(os.getenv("YFINANCE_MIN_INTERVAL", "2.5"))
 
     _last_request_time = 0.0
     _rate_lock = threading.Lock()
+
+    # simple cooldown memory for rate-limited tickers
+    _ticker_cooldown = {}
+    _cooldown_seconds = 15
 
     # --------------------------------------------------
     # RATE LIMIT PROTECTION
@@ -59,6 +65,27 @@ class StockPriceFetcher:
                 time.sleep(wait)
 
             cls._last_request_time = time.time()
+
+    @classmethod
+    def _respect_ticker_cooldown(cls, ticker: str):
+
+        cooldown_until = cls._ticker_cooldown.get(ticker)
+
+        if cooldown_until:
+
+            now = time.time()
+
+            if now < cooldown_until:
+
+                sleep_time = cooldown_until - now
+
+                logger.warning(
+                    "Cooldown active for %s (sleep %.2fs)",
+                    ticker,
+                    sleep_time,
+                )
+
+                time.sleep(sleep_time)
 
     # --------------------------------------------------
     # COLUMN HELPERS
@@ -108,9 +135,7 @@ class StockPriceFetcher:
         if isinstance(df.index, pd.DatetimeIndex):
 
             date_values = df.index
-
             df = df.reset_index(drop=True)
-
             df["date"] = date_values
 
             return df
@@ -174,14 +199,11 @@ class StockPriceFetcher:
         return df
 
     # --------------------------------------------------
-    # OHLC REPAIR (NEW)
+    # OHLC REPAIR
     # --------------------------------------------------
 
     @staticmethod
     def _repair_ohlc(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Repair common Yahoo OHLC inconsistencies.
-        """
 
         df["high"] = df[["high", "open", "close"]].max(axis=1)
         df["low"] = df[["low", "open", "close"]].min(axis=1)
@@ -201,6 +223,8 @@ class StockPriceFetcher:
     ) -> pd.DataFrame:
 
         last_exc: Optional[Exception] = None
+
+        self._respect_ticker_cooldown(ticker)
 
         for attempt in range(1, self.MAX_RETRIES + 1):
 
@@ -238,7 +262,6 @@ class StockPriceFetcher:
             except Exception as exc:
 
                 last_exc = exc
-
                 msg = str(exc).lower()
 
                 backoff = min(
@@ -248,7 +271,12 @@ class StockPriceFetcher:
                 )
 
                 if "too many requests" in msg or "rate" in msg:
+
                     backoff = max(backoff, 6.0)
+
+                    self._ticker_cooldown[ticker] = (
+                        time.time() + self._cooldown_seconds
+                    )
 
                 logger.warning(
                     "yfinance attempt %d/%d failed | ticker=%s | backoff=%.2fs | error=%s",
@@ -281,7 +309,6 @@ class StockPriceFetcher:
             return
 
         gap_days = df["date"].diff().dt.days
-
         max_gap = gap_days.max()
 
         if pd.notna(max_gap) and max_gap > _MAX_DAILY_GAP:
@@ -348,7 +375,6 @@ class StockPriceFetcher:
         now_utc = pd.Timestamp.now(tz="UTC")
 
         if df["date"].max() > now_utc:
-
             df = df[df["date"] <= now_utc].reset_index(drop=True)
 
         self._check_calendar_gaps(df, ticker, interval)
