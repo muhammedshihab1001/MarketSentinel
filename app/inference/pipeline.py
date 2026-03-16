@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v4.8
+# INSTITUTIONAL INFERENCE PIPELINE v4.9
 # Stable | Drift-Aware | CV-Optimized | Noise-Controlled
 # =========================================================
 
@@ -41,9 +41,14 @@ from app.monitoring.metrics import (
 logger = logging.getLogger("marketsentinel.pipeline")
 
 EPSILON = 1e-12
+
 _SHARED_MODEL_LOADER = None
 _MODEL_LOCK = threading.Lock()
 
+
+# =========================================================
+# SHARED MODEL LOADER
+# =========================================================
 
 def get_shared_model_loader():
 
@@ -59,10 +64,15 @@ def get_shared_model_loader():
 
                 _SHARED_MODEL_LOADER = ModelLoader()
 
+                # warm model
                 _ = _SHARED_MODEL_LOADER.xgb
 
     return _SHARED_MODEL_LOADER
 
+
+# =========================================================
+# INFERENCE PIPELINE
+# =========================================================
 
 class InferencePipeline:
 
@@ -81,6 +91,8 @@ class InferencePipeline:
 
     SNAPSHOT_CACHE_TTL = int(os.getenv("SNAPSHOT_CACHE_TTL", "120"))
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
+
+    # -----------------------------------------------------
 
     def __init__(self):
 
@@ -140,16 +152,17 @@ class InferencePipeline:
         if len(data) < self.MIN_UNIVERSE_WIDTH:
 
             raise RuntimeError(
-                f"Too few tickers available for inference ({len(data)}). "
-                f"Minimum required: {self.MIN_UNIVERSE_WIDTH}"
+                f"Too few tickers available ({len(data)})."
             )
 
-        combined_prices = pd.concat(
-            list(data.values()), ignore_index=True
-        )
+        combined_prices = pd.concat(list(data.values()), ignore_index=True)
+
+        # protect against yfinance weird rows
+        combined_prices = combined_prices.dropna(subset=["close"])
 
         combined = FeatureEngineer.build_feature_pipeline(
-            combined_prices, training=False
+            combined_prices,
+            training=False
         )
 
         if combined.empty:
@@ -164,6 +177,20 @@ class InferencePipeline:
         return combined
 
     # =========================================================
+    # STABLE SOFTMAX
+    # =========================================================
+
+    def _stable_softmax(self, x):
+
+        x = np.asarray(x)
+
+        x = x - np.max(x)
+
+        e = np.exp(x)
+
+        return e / (np.sum(e) + EPSILON)
+
+    # =========================================================
     # PORTFOLIO CONSTRUCTION
     # =========================================================
 
@@ -175,7 +202,7 @@ class InferencePipeline:
 
             scores = np.array([x["hybrid_consensus_score"] for x in longs])
 
-            soft = np.exp(scores) / (np.sum(np.exp(scores)) + EPSILON)
+            soft = self._stable_softmax(scores)
 
             for row, w in zip(longs, soft):
 
@@ -188,7 +215,7 @@ class InferencePipeline:
 
             scores = np.array([x["hybrid_consensus_score"] for x in shorts])
 
-            soft = np.exp(-scores) / (np.sum(np.exp(-scores)) + EPSILON)
+            soft = self._stable_softmax(-scores)
 
             for row, w in zip(shorts, soft):
 
@@ -215,16 +242,23 @@ class InferencePipeline:
         return np.clip(x, lower, upper)
 
     # =========================================================
-    # DRIFT
+    # DRIFT SAFE CALL
     # =========================================================
 
     def _safe_drift(self, feature_df):
 
         try:
             return self.drift_detector.detect(feature_df)
+
         except Exception:
+
             logger.warning("Drift detector failed.")
-            return {"drift_state": "unknown", "severity_score": 0.0, "exposure_scale": 1.0}
+
+            return {
+                "drift_state": "unknown",
+                "severity_score": 0.0,
+                "exposure_scale": 1.0
+            }
 
     # =========================================================
     # MAIN SNAPSHOT
@@ -241,7 +275,9 @@ class InferencePipeline:
 
         cache_key = self.cache.build_key({
             "type": "snapshot",
-            "requested": requested
+            "requested": requested,
+            "model_version": self.models.xgb_version,
+            "schema": self.models.schema_signature
         })
 
         cached = self.cache.get(cache_key)
@@ -275,6 +311,8 @@ class InferencePipeline:
                 mode="inference"
             ).astype(DTYPE)
 
+            feature_df = np.ascontiguousarray(feature_df)
+
             drift_result = self._safe_drift(feature_df)
 
             exposure_scale = drift_result.get("exposure_scale", 1.0)
@@ -286,7 +324,7 @@ class InferencePipeline:
             score_std = raw_scores.std()
 
             if score_std < self.MIN_SCORE_STD:
-                raise RuntimeError("Model scores collapsed (std too small).")
+                raise RuntimeError("Model scores collapsed.")
 
             raw_scores = (
                 raw_scores - raw_scores.mean()
@@ -299,13 +337,18 @@ class InferencePipeline:
                 "std": float(np.std(raw_scores))
             }
 
+            # aggregate signal metrics
+            long_count = np.sum(raw_scores > 0)
+            short_count = np.sum(raw_scores <= 0)
+
+            SIGNAL_DISTRIBUTION.labels(signal="LONG").inc(long_count)
+            SIGNAL_DISTRIBUTION.labels(signal="SHORT").inc(short_count)
+
             snapshot_rows = []
 
             for _, row in latest_df.iterrows():
 
                 direction = "LONG" if row["raw_model_score"] > 0 else "SHORT"
-
-                SIGNAL_DISTRIBUTION.labels(signal=direction).inc()
 
                 row_dict = {**row.to_dict(), "signal": direction}
 
