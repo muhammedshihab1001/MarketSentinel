@@ -1,5 +1,5 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.4)
+# TRAIN XGBOOST REGRESSION (Hybrid + Baseline Enabled v2.5)
 # CV-Ready | Walk-Forward Validated | Drift Governance
 # ==========================================================
 
@@ -48,8 +48,11 @@ TARGET_CLIP = 5.0
 LOW_VARIANCE_THRESHOLD = 1e-6
 MAX_DATASET_ROWS = 1_000_000
 
-# NEW: allow partial universe failure
+# allow partial universe failure
 MIN_SUCCESSFUL_TICKERS = 8
+
+# safeguard for XGBoost early stop edge case
+MIN_BOOST_ROUNDS = 10
 
 
 # ==========================================================
@@ -177,83 +180,6 @@ def build_baseline_from_dataframe(df, model_version, dataset_hash):
 
 
 # ==========================================================
-# ARTIFACT EXPORT
-# ==========================================================
-
-def export_artifacts(
-    model,
-    metrics,
-    dataset_hash,
-    dataset_rows,
-    start_date,
-    end_date,
-    training_df,
-    promote_baseline=False,
-    create_baseline=False,
-):
-
-    os.makedirs(MODEL_DIR, exist_ok=True)
-
-    version = time.strftime("%Y%m%d_%H%M%S")
-
-    model_path = os.path.join(MODEL_DIR, f"model_{version}.pkl")
-
-    metadata_path = os.path.join(MODEL_DIR, f"metadata_{version}.json")
-
-    joblib.dump(model, model_path)
-
-    artifact_hash = sha256_file(model_path)
-
-    metadata = MetadataManager.create_metadata(
-        model_name="xgboost_regressor",
-        metrics=metrics,
-        features=MODEL_FEATURES,
-        training_start=str(start_date),
-        training_end=str(end_date),
-        dataset_hash=dataset_hash,
-        dataset_rows=dataset_rows,
-        metadata_type="xgboost_model",
-        artifact_hash=artifact_hash,
-        feature_checksum=compute_feature_checksum(),
-        extra_fields={
-            "model_version": version,
-            "reproducibility_hash": compute_reproducibility_hash(dataset_hash),
-        },
-    )
-
-    MetadataManager.save_metadata(metadata, metadata_path)
-
-    logger.info("Artifacts saved | version=%s", version)
-
-    if create_baseline or promote_baseline:
-
-        build_baseline_from_dataframe(
-            training_df,
-            version,
-            dataset_hash,
-        )
-
-    if promote_baseline:
-
-        pointer_path = os.path.join(MODEL_DIR, PRODUCTION_POINTER)
-
-        with open(pointer_path, "w", encoding="utf-8") as f:
-
-            json.dump(
-                {
-                    "model_version": version,
-                    "promoted_at": version,
-                },
-                f,
-                indent=2,
-            )
-
-        logger.info("Model promoted to production.")
-
-    return version
-
-
-# ==========================================================
 # DATA LOADING
 # ==========================================================
 
@@ -264,7 +190,6 @@ def load_training_data(start_date, end_date):
     universe = MarketUniverse.get_universe()
 
     price_frames = []
-
     failures = []
 
     for ticker in universe:
@@ -278,7 +203,6 @@ def load_training_data(start_date, end_date):
             )
 
             if df is not None and not df.empty:
-
                 price_frames.append(df)
 
         except Exception as exc:
@@ -286,6 +210,14 @@ def load_training_data(start_date, end_date):
             failures.append(ticker)
 
             logger.warning("Price fetch failed for %s | %s", ticker, exc)
+
+    if failures:
+
+        logger.warning(
+            "Universe failures | failed=%d success=%d",
+            len(failures),
+            len(price_frames),
+        )
 
     if len(price_frames) < MIN_SUCCESSFUL_TICKERS:
 
@@ -309,20 +241,19 @@ def load_training_data(start_date, end_date):
     )
 
     if len(df) < MIN_TRAINING_ROWS:
-
         raise RuntimeError("Dataset too small after feature engineering.")
 
     if df["date"].nunique() < MIN_UNIQUE_DATES:
-
         raise RuntimeError("Not enough unique trading dates.")
 
     validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="training")
 
     logger.info(
-        "Training dataset ready | rows=%d tickers=%d dates=%d",
+        "Training dataset ready | rows=%d tickers=%d dates=%d features=%d",
         len(df),
         df["ticker"].nunique(),
         df["date"].nunique(),
+        len(MODEL_FEATURES),
     )
 
     return df
@@ -392,6 +323,14 @@ def trainer(train_df):
     pipeline = build_xgboost_pipeline()
 
     pipeline.fit(X, y)
+
+    # safeguard for early stopping edge cases
+    if getattr(pipeline, "best_iteration", 0) < MIN_BOOST_ROUNDS:
+
+        logger.warning(
+            "Model stopped too early (iter=%s) — possible weak signal.",
+            pipeline.best_iteration
+        )
 
     dataset_hash = compute_dataset_hash(train_df)
 
@@ -466,9 +405,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--create-baseline", action="store_true")
-
     parser.add_argument("--promote-baseline", action="store_true")
-
     parser.add_argument("--allow-soft-fail", action="store_true")
 
     args = parser.parse_args()
