@@ -1,15 +1,7 @@
 """
-MarketSentinel v4.1.0
+MarketSentinel v4.2.0
 
 Feature Store — per-ticker feature cache for INFERENCE.
-
-For training, use FeatureEngineer.build_feature_pipeline() directly
-on the full multi-ticker dataset so cross-sectional features compute
-correctly across the universe.
-
-For inference (single-ticker), this store computes core features and
-calls finalize() to fill missing CS columns with safe defaults
-(0.0 for _z, 0.5 for _rank).
 """
 
 import os
@@ -18,6 +10,7 @@ import hashlib
 import re
 import sys
 import uuid
+import time
 from typing import Optional
 from collections import OrderedDict
 
@@ -26,7 +19,7 @@ import numpy as np
 
 from core.features.feature_engineering import FeatureEngineer
 from core.indicators.technical_indicators import TechnicalIndicators
-from core.schema.feature_schema import get_schema_signature
+from core.schema.feature_schema import get_schema_signature, MODEL_FEATURES
 
 logger = logging.getLogger(__name__)
 
@@ -37,17 +30,26 @@ class FeatureStore:
 
     REQUIRED_COLUMNS = {"date", "close", "ticker"}
 
-    CACHE_VERSION = "v25"  # bumped: now calls finalize() for MODEL_FEATURES alignment
+    CACHE_VERSION = "v26"
+
     MAX_CACHE_FILES_PER_TICKER = 6
     MAX_TOTAL_CACHE_FILES = 2000
+
     MIN_FILE_BYTES = 5_000
 
+    MEMORY_CACHE_LIMIT = 100
+    MEMORY_CACHE_TTL = 120
+
     _memory_cache = OrderedDict()
-    _memory_cache_limit = 100
+    _memory_cache_ts = {}
+
+    _cache_hits = 0
+    _cache_misses = 0
 
     ########################################################
 
     def __init__(self):
+
         os.makedirs(self.FEATURE_DIR, exist_ok=True)
 
         self.engineer = FeatureEngineer()
@@ -73,6 +75,14 @@ class FeatureStore:
         if not np.isfinite(numeric.to_numpy(dtype=float)).all():
             raise RuntimeError("Non-finite feature values detected.")
 
+        # ensure model features exist
+        missing = set(MODEL_FEATURES) - set(df.columns)
+
+        if missing:
+            raise RuntimeError(
+                f"FeatureStore output missing MODEL_FEATURES: {missing}"
+            )
+
     ########################################################
     # HASHING
     ########################################################
@@ -80,16 +90,21 @@ class FeatureStore:
     def _stable_hash_df(self, df: pd.DataFrame) -> str:
 
         df = df.copy()
+
         df["date"] = pd.to_datetime(df["date"], utc=True)
+
         df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
         payload = df.to_csv(index=False).encode()
+
         return hashlib.sha256(payload).hexdigest()
 
     def _fingerprint_engineer(self) -> str:
 
         def module_hash(module):
+
             path = sys.modules[module.__module__].__file__
+
             with open(path, "rb") as f:
                 return hashlib.sha256(f.read()).hexdigest()
 
@@ -103,9 +118,9 @@ class FeatureStore:
     def _environment_fingerprint(self) -> str:
 
         payload = (
-            sys.version +
-            pd.__version__ +
-            np.__version__
+            sys.version
+            + pd.__version__
+            + np.__version__
         )
 
         return hashlib.sha256(payload.encode()).hexdigest()
@@ -121,7 +136,9 @@ class FeatureStore:
     ) -> str:
 
         price_core = price_df[["ticker", "date", "close"]].copy()
+
         price_core["date"] = pd.to_datetime(price_core["date"], utc=True)
+
         price_core = price_core.sort_values(
             ["ticker", "date"]
         ).reset_index(drop=True)
@@ -130,6 +147,7 @@ class FeatureStore:
             price_core = price_core.tail(300)
 
         h = hashlib.sha256()
+
         h.update(self._stable_hash_df(price_core).encode())
 
         return h.hexdigest()[:20]
@@ -146,7 +164,9 @@ class FeatureStore:
         ]
 
         if len(files) > self.MAX_TOTAL_CACHE_FILES:
+
             files.sort()
+
             excess = files[:-self.MAX_TOTAL_CACHE_FILES]
 
             for f in excess:
@@ -165,8 +185,11 @@ class FeatureStore:
         ]
 
         if len(files) > self.MAX_CACHE_FILES_PER_TICKER:
+
             files.sort()
+
             for f in files[:-self.MAX_CACHE_FILES_PER_TICKER]:
+
                 try:
                     os.remove(os.path.join(self.FEATURE_DIR, f))
                 except Exception:
@@ -175,7 +198,7 @@ class FeatureStore:
         self._cleanup_global_cache()
 
     ########################################################
-    # MEMORY CACHE (True LRU)
+    # MEMORY CACHE
     ########################################################
 
     def _set_memory_cache(self, key, df):
@@ -183,10 +206,33 @@ class FeatureStore:
         if key in self._memory_cache:
             self._memory_cache.move_to_end(key)
         else:
-            if len(self._memory_cache) >= self._memory_cache_limit:
-                self._memory_cache.popitem(last=False)
+
+            if len(self._memory_cache) >= self.MEMORY_CACHE_LIMIT:
+
+                old_key, _ = self._memory_cache.popitem(last=False)
+
+                self._memory_cache_ts.pop(old_key, None)
 
         self._memory_cache[key] = df
+        self._memory_cache_ts[key] = time.time()
+
+    def _get_memory_cache(self, key):
+
+        if key not in self._memory_cache:
+            return None
+
+        ts = self._memory_cache_ts.get(key)
+
+        if ts and time.time() - ts > self.MEMORY_CACHE_TTL:
+
+            self._memory_cache.pop(key, None)
+            self._memory_cache_ts.pop(key, None)
+
+            return None
+
+        self._memory_cache.move_to_end(key)
+
+        return self._memory_cache[key]
 
     ########################################################
     # MAIN ENTRY
@@ -199,16 +245,6 @@ class FeatureStore:
         ticker: str = "unknown",
         training: bool = False
     ):
-        """
-        Compute features for a single ticker (inference use case).
-
-        For training, use FeatureEngineer.build_feature_pipeline()
-        directly on the full multi-ticker dataset instead.
-
-        Returns a DataFrame with all MODEL_FEATURES columns present.
-        Missing cross-sectional columns are filled with safe defaults
-        by finalize() (0.0 for _z, 0.5 for _rank via schema fallback).
-        """
 
         if not self.REQUIRED_COLUMNS.issubset(price_df.columns):
             raise RuntimeError("Price dataframe missing required columns.")
@@ -237,9 +273,15 @@ class FeatureStore:
         # MEMORY CACHE
         ####################################################
 
-        if cache_key in self._memory_cache:
-            self._memory_cache.move_to_end(cache_key)
-            return self._memory_cache[cache_key]
+        cached = self._get_memory_cache(cache_key)
+
+        if cached is not None:
+
+            FeatureStore._cache_hits += 1
+
+            return cached
+
+        FeatureStore._cache_misses += 1
 
         path = os.path.join(
             self.FEATURE_DIR,
@@ -251,13 +293,21 @@ class FeatureStore:
         ####################################################
 
         if os.path.exists(path) and os.path.getsize(path) >= self.MIN_FILE_BYTES:
+
             try:
+
                 df = pd.read_parquet(path)
+
                 self._validate_basic_integrity(df)
+
                 self._set_memory_cache(cache_key, df)
+
                 return df
+
             except Exception:
+
                 logger.warning("Corrupted feature cache removed.")
+
                 try:
                     os.remove(path)
                 except Exception:
@@ -270,11 +320,9 @@ class FeatureStore:
         logger.info("Feature cache miss — rebuilding for %s.", ticker)
 
         df = self.engineer._validate_price_frame(price_df, ticker)
+
         df = self.engineer.add_core_features(df)
 
-        # For single-ticker inference, CS features cannot be computed
-        # (need multiple tickers per date). finalize() will fill all
-        # missing MODEL_FEATURES columns with safe defaults.
         df = self.engineer.finalize(df)
 
         df = df.sort_values(
@@ -284,19 +332,24 @@ class FeatureStore:
         self._validate_basic_integrity(df)
 
         ####################################################
-        # ATOMIC WRITE (Safe Parquet Fallback)
+        # SAFE WRITE
         ####################################################
 
         tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
 
         try:
+
             df.to_parquet(
                 tmp_path,
                 index=False,
                 engine="pyarrow",
                 compression="zstd"
             )
+
         except Exception:
+
+            logger.warning("pyarrow unavailable — using fallback parquet.")
+
             df.to_parquet(tmp_path, index=False)
 
         os.replace(tmp_path, path)
