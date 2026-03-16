@@ -15,8 +15,8 @@ def test_key_build():
 
     assert isinstance(key, str)
 
-    # Your pipeline keys normally include portfolio/snapshot namespace
-    assert "portfolio" in key or "snapshot" in key
+    # Pipeline keys include portfolio namespace
+    assert "portfolio" in key
 
 
 ############################################################
@@ -65,10 +65,11 @@ def test_payload_validation_failure():
 
     cache = RedisCache()
 
+    # Weight > 1 triggers "Unrealistic weight" check
     invalid_payload = [
         {
             "ticker": "AAPL",
-            "score": 1.2
+            "weight": 5.0
         }
     ]
 
