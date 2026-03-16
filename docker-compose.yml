@@ -19,6 +19,8 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
 
+    command: redis-server --appendonly yes
+
     networks:
       - marketsentinel-net
 
@@ -46,6 +48,8 @@ services:
       dockerfile: docker/inference.Dockerfile
 
     restart: unless-stopped
+
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
 
     networks:
       - marketsentinel-net
@@ -128,9 +132,6 @@ services:
     ports:
       - "9090:9090"
 
-    depends_on:
-      - api
-
     mem_limit: 256m
     cpus: 0.5
 
@@ -153,8 +154,9 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
 
-    env_file:
-      - .env
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
 
     depends_on:
       - prometheus
