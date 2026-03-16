@@ -1,5 +1,5 @@
 # ==========================================================
-# INSTITUTIONAL TRAINING PIPELINE WRAPPER v2.5
+# INSTITUTIONAL TRAINING PIPELINE WRAPPER v2.6
 # Governance Hardened + Hybrid Multi-Agent Compatible
 # ==========================================================
 
@@ -54,10 +54,6 @@ def enforce_determinism():
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-    # optional deterministic flags (safe for portfolio project)
-    os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-
     random.seed(GLOBAL_SEED)
     np.random.seed(GLOBAL_SEED)
 
@@ -74,23 +70,31 @@ def _acquire_lock():
 
         try:
             with open(LOCK_FILE) as f:
-                pid = int(f.read().strip())
+                data = json.load(f)
+                pid = data.get("pid")
+                created = data.get("created")
         except Exception:
             pid = None
+            created = None
 
         age = time.time() - os.path.getmtime(LOCK_FILE)
 
         if age > 4 * 3600:
             logger.warning("Stale training lock detected — removing.")
             os.remove(LOCK_FILE)
-
         else:
             raise RuntimeError(
                 f"Training lock detected (pid={pid}) — another training may be running."
             )
 
     with open(LOCK_FILE, "w") as f:
-        f.write(str(os.getpid()))
+        json.dump(
+            {
+                "pid": os.getpid(),
+                "created": datetime.datetime.utcnow().isoformat()
+            },
+            f
+        )
 
 
 def _release_lock():
@@ -281,9 +285,9 @@ def main(create_baseline=False, promote_baseline=False):
 
     logger.info("Training window | %s -> %s", start_date, end_date)
 
-    current_schema = get_schema_signature()
+    schema_signature = get_schema_signature()
 
-    if not current_schema:
+    if not schema_signature:
         raise RuntimeError("Schema signature invalid.")
 
     run_id = (
@@ -304,6 +308,9 @@ def main(create_baseline=False, promote_baseline=False):
             promote_baseline=promote_baseline
         )
 
+        if not isinstance(metrics, dict):
+            raise RuntimeError("Training did not return metrics dictionary.")
+
         runtime = max(0.0, time.time() - start)
 
         if runtime > MAX_TRAINING_SECONDS:
@@ -312,6 +319,11 @@ def main(create_baseline=False, promote_baseline=False):
         manifest = {
             "run_id": run_id,
             "status": "success",
+            "schema_signature": schema_signature,
+            "training_window": {
+                "start": start_date,
+                "end": end_date
+            },
             "metrics": metrics,
             "runtime_sec": round(runtime, 2),
             "provider_health": capture_provider_health(),
