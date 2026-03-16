@@ -14,6 +14,8 @@ from core.schema.feature_schema import (
     DTYPE,
 )
 from core.monitoring.drift_detector import DriftDetector
+from core.monitoring.retrain_trigger import RetrainTrigger
+
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
@@ -156,6 +158,13 @@ def _drift_status_sync():
             "exposure_scale": 1.0
         }
 
+    # -----------------------------------------------------
+    # Retrain Trigger Evaluation
+    # -----------------------------------------------------
+
+    retrain_trigger = RetrainTrigger()
+    retrain_info = retrain_trigger.evaluate(drift_result)
+
     baseline_meta = _get_baseline_meta()
 
     return {
@@ -164,6 +173,10 @@ def _drift_status_sync():
         "severity_score": drift_result.get("severity_score", 0),
         "drift_state": drift_result.get("drift_state", "unknown"),
         "exposure_scale": drift_result.get("exposure_scale", 1.0),
+
+        # Retrain trigger
+        "retrain_required": retrain_info["retrain_required"],
+        "retrain_events": retrain_info["events"],
 
         # Baseline governance
         **baseline_meta,
