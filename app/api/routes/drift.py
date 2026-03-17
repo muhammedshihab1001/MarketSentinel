@@ -1,5 +1,6 @@
 # =========================================================
-# DRIFT STATUS ROUTE v2.1 — uses shared pipeline singleton
+# DRIFT STATUS ROUTE v2.2
+# FIX: Added GET /drift alias (frontend calls /drift)
 # =========================================================
 
 import asyncio
@@ -35,41 +36,6 @@ MAX_CONCURRENT = 2
 MIN_UNIVERSE_WIDTH = 10
 
 drift_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
-
-# =========================================================
-# DRIFT STATUS
-# =========================================================
-
-@router.get("/drift-status")
-async def drift_status():
-
-    endpoint = "/drift-status"
-    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
-    start_time = time.time()
-
-    try:
-
-        async with drift_semaphore:
-
-            result = await asyncio.wait_for(
-                run_in_threadpool(_drift_status_sync),
-                timeout=REQUEST_TIMEOUT,
-            )
-
-        return result
-
-    except asyncio.TimeoutError:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        raise HTTPException(status_code=504, detail="Drift check timeout")
-
-    except Exception as e:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.exception("Drift status check failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
 
 
 # =========================================================
@@ -112,7 +78,7 @@ def _get_baseline_meta():
 
 
 # =========================================================
-# SYNC DRIFT LOGIC
+# SHARED SYNC LOGIC
 # =========================================================
 
 def _drift_status_sync():
@@ -154,31 +120,89 @@ def _drift_status_sync():
             "exposure_scale": 1.0,
         }
 
-    # Retrain Trigger Evaluation
     retrain_trigger = RetrainTrigger()
     retrain_info = retrain_trigger.evaluate(drift_result)
 
     baseline_meta = _get_baseline_meta()
 
     return {
-        # Core drift
         "drift_detected": drift_result.get("drift_detected", False),
         "severity_score": drift_result.get("severity_score", 0),
         "drift_state": drift_result.get("drift_state", "unknown"),
         "exposure_scale": drift_result.get("exposure_scale", 1.0),
-        # Retrain trigger
         "retrain_required": retrain_info["retrain_required"],
         "retrain_events": retrain_info["events"],
-        # Baseline governance
         **baseline_meta,
-        # Model governance
         "model_version": loader.xgb_version,
         "schema_signature": loader.schema_signature,
         "artifact_hash": loader.artifact_hash,
         "dataset_hash": loader.dataset_hash,
-        # Context
         "universe_size": len(latest_df),
         "snapshot_date": str(latest_date),
         "latency_ms": int((time.time() - start_time) * 1000),
         "timestamp": int(time.time()),
     }
+
+
+# =========================================================
+# GET /drift  (frontend calls this)
+# =========================================================
+
+@router.get("/drift")
+async def drift():
+
+    endpoint = "/drift"
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
+    start_time = time.time()
+
+    try:
+        async with drift_semaphore:
+            result = await asyncio.wait_for(
+                run_in_threadpool(_drift_status_sync),
+                timeout=REQUEST_TIMEOUT,
+            )
+        return result
+
+    except asyncio.TimeoutError:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        raise HTTPException(status_code=504, detail="Drift check timeout")
+
+    except Exception as e:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        logger.exception("Drift status check failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
+
+
+# =========================================================
+# GET /drift-status  (kept for backward compatibility)
+# =========================================================
+
+@router.get("/drift-status")
+async def drift_status():
+
+    endpoint = "/drift-status"
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
+    start_time = time.time()
+
+    try:
+        async with drift_semaphore:
+            result = await asyncio.wait_for(
+                run_in_threadpool(_drift_status_sync),
+                timeout=REQUEST_TIMEOUT,
+            )
+        return result
+
+    except asyncio.TimeoutError:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        raise HTTPException(status_code=504, detail="Drift check timeout")
+
+    except Exception as e:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        logger.exception("Drift status check failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)

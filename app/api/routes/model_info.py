@@ -1,6 +1,14 @@
-import logging
+# =========================================================
+# MODEL INFO ROUTE v2.2
+# FIX: Routes renamed to work with prefix="/model" in main.py
+# /model-info      → /model/info
+# /feature-importance → /model/feature-importance
+# /model-diagnostics  → /model/diagnostics
+# =========================================================
+
 import asyncio
 import time
+import logging
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from typing import Dict, Any
@@ -10,7 +18,7 @@ from core.schema.feature_schema import MODEL_FEATURES
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
-    API_ERROR_COUNT
+    API_ERROR_COUNT,
 )
 
 router = APIRouter()
@@ -23,13 +31,13 @@ model_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 
 # =========================================================
-# MODEL INFO
+# MODEL INFO  →  GET /model/info
 # =========================================================
 
-@router.get("/model-info")
+@router.get("/info")
 async def model_info():
 
-    endpoint = "/model-info"
+    endpoint = "/model/info"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
 
@@ -37,7 +45,7 @@ async def model_info():
         async with model_semaphore:
             result = await asyncio.wait_for(
                 run_in_threadpool(_model_info_sync),
-                timeout=REQUEST_TIMEOUT
+                timeout=REQUEST_TIMEOUT,
             )
         return result
 
@@ -68,18 +76,18 @@ def _model_info_sync():
         "feature_checksum": loader.feature_checksum,
         "feature_count": len(MODEL_FEATURES),
         "latency_ms": int((time.time() - start_time) * 1000),
-        "timestamp": int(time.time())
+        "timestamp": int(time.time()),
     }
 
 
 # =========================================================
-# FEATURE IMPORTANCE (FIXED CONTRACT)
+# FEATURE IMPORTANCE  →  GET /model/feature-importance
 # =========================================================
 
 @router.get("/feature-importance")
 async def feature_importance():
 
-    endpoint = "/feature-importance"
+    endpoint = "/model/feature-importance"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
 
@@ -87,7 +95,7 @@ async def feature_importance():
         async with model_semaphore:
             result = await asyncio.wait_for(
                 run_in_threadpool(_feature_importance_sync),
-                timeout=REQUEST_TIMEOUT
+                timeout=REQUEST_TIMEOUT,
             )
         return result
 
@@ -110,7 +118,6 @@ def _feature_importance_sync():
     loader = get_shared_model_loader()
     model = loader.xgb
 
-    # FIX: get_feature_importance returns a list of dicts, not a rich dict
     importance_list = loader.get_feature_importance()
 
     importance = [
@@ -125,18 +132,18 @@ def _feature_importance_sync():
         "training_fingerprint": getattr(model, "training_fingerprint", None),
         "importance": importance,
         "latency_ms": int((time.time() - start_time) * 1000),
-        "timestamp": int(time.time())
+        "timestamp": int(time.time()),
     }
 
 
 # =========================================================
-# MODEL DIAGNOSTICS
+# MODEL DIAGNOSTICS  →  GET /model/diagnostics
 # =========================================================
 
-@router.get("/model-diagnostics")
+@router.get("/diagnostics")
 async def model_diagnostics() -> Dict[str, Any]:
 
-    endpoint = "/model-diagnostics"
+    endpoint = "/model/diagnostics"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
 
@@ -144,7 +151,7 @@ async def model_diagnostics() -> Dict[str, Any]:
         async with model_semaphore:
             result = await asyncio.wait_for(
                 run_in_threadpool(_model_diagnostics_sync),
-                timeout=REQUEST_TIMEOUT
+                timeout=REQUEST_TIMEOUT,
             )
         return result
 
@@ -175,14 +182,11 @@ def _model_diagnostics_sync():
         "training_code_hash": loader.training_code_hash,
         "feature_checksum": loader.feature_checksum,
         "feature_count": len(MODEL_FEATURES),
-
-        # Model internals
         "training_fingerprint": getattr(model, "training_fingerprint", None),
         "training_cols": getattr(model, "training_cols", None),
         "param_checksum": getattr(model, "param_checksum", None),
         "booster_checksum": getattr(model, "booster_checksum", None),
         "best_iteration": getattr(model, "best_iteration", None),
-
         "latency_ms": int((time.time() - start_time) * 1000),
-        "timestamp": int(time.time())
+        "timestamp": int(time.time()),
     }

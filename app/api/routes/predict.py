@@ -1,6 +1,6 @@
 # =========================================================
-# PREDICTION & SNAPSHOT ROUTES v3.5
-# Hybrid Multi-Agent Compatible | DB-Backed
+# PREDICTION & SNAPSHOT ROUTES v3.6
+# FIX: price_history now uses get_price_data (no start/end args)
 # =========================================================
 
 import time
@@ -58,15 +58,12 @@ def get_pipeline() -> InferencePipeline:
 # =========================================================
 
 MAX_CONCURRENT_INFERENCES = int(os.getenv("MAX_CONCURRENT_INFERENCES", "4"))
-
 REQUEST_TIMEOUT = int(os.getenv("INFERENCE_TIMEOUT_SEC", "180"))
-
 MIN_BATCH_SIZE = 4
 
 PRIMARY_UNIVERSE_PATH = Path(
     os.getenv("PRODUCTION_UNIVERSE_PATH", "config/universe.json")
 )
-
 FALLBACK_UNIVERSE_PATH = Path("config/universe.json")
 
 inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
@@ -116,7 +113,6 @@ def load_default_universe() -> List[str]:
         raise RuntimeError("Universe size below minimum batch size.")
 
     _universe_cache = unique
-
     return unique
 
 
@@ -134,14 +130,11 @@ async def live_snapshot():
     try:
 
         tickers = load_default_universe()
-
         pipeline = get_pipeline()
-
         loader = get_shared_model_loader()
         container = loader._xgb_container
 
         async with inference_semaphore:
-
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(pipeline.run_snapshot, tickers),
                 timeout=REQUEST_TIMEOUT,
@@ -155,15 +148,11 @@ async def live_snapshot():
         long_count = sum(1 for s in signals if s.get("weight", 0.0) > 0)
         short_count = sum(1 for s in signals if s.get("weight", 0.0) < 0)
 
-        hybrid_scores = [
-            s.get("hybrid_consensus_score", 0.0) * 100
-            for s in signals
-        ]
+        hybrid_scores = [s.get("hybrid_consensus_score", 0.0) * 100 for s in signals]
 
         avg_strength = (
             round(sum(hybrid_scores) / len(hybrid_scores), 2)
-            if hybrid_scores
-            else 0.0
+            if hybrid_scores else 0.0
         )
 
         top_5 = snapshot.get("top_5", [])
@@ -235,7 +224,6 @@ async def signal_explanation(ticker: str):
 
         pipeline = get_pipeline()
         loader = get_shared_model_loader()
-
         universe_tickers = load_default_universe()
 
         if ticker not in universe_tickers:
@@ -245,14 +233,12 @@ async def signal_explanation(ticker: str):
             )
 
         async with inference_semaphore:
-
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(pipeline.run_snapshot, universe_tickers),
                 timeout=REQUEST_TIMEOUT,
             )
 
         signals = snapshot.get("signals", [])
-
         row = next((s for s in signals if s["ticker"] == ticker), None)
 
         if row is None:
@@ -265,10 +251,7 @@ async def signal_explanation(ticker: str):
             ticker=row["ticker"],
             score=row.get("raw_model_score", 0.0),
             signal=signal_agent.get("signal", "NEUTRAL"),
-            agent_score=row.get(
-                "hybrid_consensus_score",
-                row.get("agent_score", 0.0),
-            ),
+            agent_score=row.get("hybrid_consensus_score", row.get("agent_score", 0.0)),
             alpha_strength=signal_agent.get("alpha_strength", 0.0),
             confidence_numeric=signal_agent.get("confidence_numeric", 0.0),
             governance_score=signal_agent.get("governance_score", 0),
@@ -288,10 +271,7 @@ async def signal_explanation(ticker: str):
             timestamp=int(time.time()),
         )
 
-        return SignalExplanationEnvelope(
-            meta=meta,
-            explanation=explanation,
-        )
+        return SignalExplanationEnvelope(meta=meta, explanation=explanation)
 
     except asyncio.TimeoutError:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
@@ -311,7 +291,9 @@ async def signal_explanation(ticker: str):
 
 
 # =========================================================
-# PRICE HISTORY (now reads from PostgreSQL via MarketDataService)
+# PRICE HISTORY
+# FIX: Uses get_price_data() — no start_date/end_date args
+# (MarketDataService is DB-backed, reads directly from PostgreSQL)
 # =========================================================
 
 @router.get("/price-history/{ticker}")
@@ -326,40 +308,41 @@ async def price_history(ticker: str, days: int = 365):
     if not TICKER_REGEX.match(ticker):
         raise HTTPException(status_code=400, detail="Invalid ticker format.")
 
-    if days > 2000:
-        days = 2000
+    days = min(days, 2000)
 
     try:
 
         service = MarketDataService()
 
-        # FIX: pd.Timestamp.utcnow() is deprecated
-        end_date = pd.Timestamp.now(tz="UTC").normalize()
-        start_date = end_date - pd.Timedelta(days=days)
-
-        data, failures = await run_in_threadpool(
-            service.get_price_data_batch,
-            [ticker],
-            start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d"),
+        df = await run_in_threadpool(
+            service.get_price_data,
+            ticker,
+            interval="1d",
+            min_history=days,
         )
-
-        df = data.get(ticker)
 
         if df is None or df.empty:
             raise HTTPException(status_code=404, detail="Price history unavailable")
 
-        prices = [
-            {
-                "date": str(row["date"]),
-                "close": float(row["close"]),
-            }
-            for _, row in df.iterrows()
-        ]
+        df = df.tail(days)
+
+        prices = []
+        for idx, row in df.iterrows():
+            date_val = str(idx.date()) if hasattr(idx, "date") else str(idx)
+            prices.append({
+                "date": date_val,
+                "open": round(float(row.get("Open", row.get("open", 0))), 4),
+                "high": round(float(row.get("High", row.get("high", 0))), 4),
+                "low": round(float(row.get("Low", row.get("low", 0))), 4),
+                "close": round(float(row.get("Close", row.get("close", 0))), 4),
+                "volume": int(row.get("Volume", row.get("volume", 0))),
+            })
 
         return {
             "ticker": ticker,
             "days": days,
+            "rows": len(prices),
+            "data_source": "postgresql",
             "prices": prices,
             "latency_ms": int((time.time() - start_time) * 1000),
             "timestamp": int(time.time()),
