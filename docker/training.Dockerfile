@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     git \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ############################################################
@@ -33,7 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements/ ./requirements/
 
 ############################################################
-# Install Python Dependencies
+# Install Python Packages
 ############################################################
 
 RUN python -m pip install --upgrade pip setuptools wheel && \
@@ -69,6 +70,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
+    libpq5 \
     tini \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -80,7 +82,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -u 10001 appuser
 
 ############################################################
-# Copy Installed Python Packages
+# Copy Installed Python Packages from Builder
 ############################################################
 
 COPY --from=builder /usr/local /usr/local
@@ -95,10 +97,10 @@ COPY config ./config
 COPY requirements ./requirements
 
 ############################################################
-# Artifacts + Data Directories
+# Artifacts + Data + Logs Directories
 ############################################################
 
-RUN mkdir -p /app/artifacts /app/data && \
+RUN mkdir -p /app/artifacts /app/data /app/logs && \
     chown -R appuser:appuser /app
 
 ############################################################
@@ -117,4 +119,4 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 # Default Training Command
 ############################################################
 
-CMD ["python", "-m", "training.train_xgboost"]
+CMD ["python", "-m", "training.pipelines.train_pipeline"]

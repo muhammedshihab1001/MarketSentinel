@@ -22,12 +22,43 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: marketsentinel
+          POSTGRES_PASSWORD: marketsentinel
+          POSTGRES_DB: marketsentinel
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     env:
       PYTHONHASHSEED: 42
       OMP_NUM_THREADS: 1
       MKL_NUM_THREADS: 1
       TOKENIZERS_PARALLELISM: false
       PYTHONUNBUFFERED: 1
+      # Database — points at the service above
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: marketsentinel
+      POSTGRES_PASSWORD: marketsentinel
+      POSTGRES_DB: marketsentinel
+      DATABASE_URL: postgresql+psycopg2://marketsentinel:marketsentinel@localhost:5432/marketsentinel
+      # Skip Yahoo sync in CI — no live data needed for unit tests
+      SKIP_DATA_SYNC: "1"
+      STORE_PREDICTIONS: "0"
+      # Disable Redis / LLM / strict governance in CI
+      REDIS_HOST: invalid-host
+      LLM_ENABLED: "false"
+      DRIFT_HARD_FAIL: "false"
+      MODEL_STRICT_GOVERNANCE: "0"
+      MODEL_ALLOW_POINTER_FALLBACK: "1"
 
     steps:
 
@@ -66,12 +97,39 @@ jobs:
     needs: fast-ci
     timeout-minutes: 30
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: marketsentinel
+          POSTGRES_PASSWORD: marketsentinel
+          POSTGRES_DB: marketsentinel
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     env:
       CI_SMOKE_TEST: "true"
       PYTHONHASHSEED: 42
       OMP_NUM_THREADS: 1
       MKL_NUM_THREADS: 1
       PYTHONUNBUFFERED: 1
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: marketsentinel
+      POSTGRES_PASSWORD: marketsentinel
+      POSTGRES_DB: marketsentinel
+      DATABASE_URL: postgresql+psycopg2://marketsentinel:marketsentinel@localhost:5432/marketsentinel
+      SKIP_DATA_SYNC: "1"
+      STORE_PREDICTIONS: "0"
+      REDIS_HOST: invalid-host
+      LLM_ENABLED: "false"
+      DRIFT_HARD_FAIL: "false"
+      MODEL_STRICT_GOVERNANCE: "0"
 
     steps:
 
@@ -112,11 +170,11 @@ jobs:
       - name: Build inference image
         run: |
           docker build --pull \
-          -f docker/inference.Dockerfile \
-          -t marketsentinel-inference .
+            -f docker/inference.Dockerfile \
+            -t marketsentinel-inference .
 
       - name: Build training image
         run: |
           docker build --pull \
-          -f docker/training.Dockerfile \
-          -t marketsentinel-training .
+            -f docker/training.Dockerfile \
+            -t marketsentinel-training .

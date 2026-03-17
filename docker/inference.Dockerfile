@@ -27,6 +27,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
+    libpq-dev \
     tini \
     curl \
     build-essential \
@@ -63,7 +64,11 @@ COPY app ./app
 COPY core ./core
 COPY config ./config
 
-RUN mkdir -p /app/artifacts && \
+############################################################
+# Directories
+############################################################
+
+RUN mkdir -p /app/artifacts /app/logs && \
     chown -R appuser:appuser /app
 
 USER appuser
@@ -84,11 +89,17 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 # Healthcheck
 ############################################################
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-CMD curl -f http://127.0.0.1:8000/health/ready || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -f http://127.0.0.1:8000/health/ready || exit 1
 
 ############################################################
 # Server
 ############################################################
 
-CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--workers","1","--loop","uvloop","--http","httptools","--timeout-keep-alive","30"]
+CMD ["uvicorn", "app.main:app", \
+    "--host", "0.0.0.0", \
+    "--port", "8000", \
+    "--workers", "1", \
+    "--loop", "uvloop", \
+    "--http", "httptools", \
+    "--timeout-keep-alive", "30"]
