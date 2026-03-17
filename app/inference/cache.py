@@ -32,7 +32,7 @@ class RedisCache:
     _memory_cache = {}
 
     BASE_RETRY = 15
-    MAX_RETRY = 120
+    MAX_RETRY = 180
 
     MAX_TTL = 900
     MIN_TTL = 30

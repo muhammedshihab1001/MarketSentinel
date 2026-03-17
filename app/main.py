@@ -54,7 +54,7 @@ logger = logging.getLogger("marketsentinel")
 
 BOOT_ID = hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
 
-STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 120)
+STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 180)
 
 APP_VERSION = get_env("APP_VERSION", "4.1.0")
 
@@ -63,8 +63,8 @@ CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS.split(",")]
 
 API_KEY = os.getenv("API_KEY")
 
-RATE_LIMIT = int(os.getenv("API_RATE_LIMIT_PER_MIN", "60"))
-WINDOW_SECONDS = 60
+RATE_LIMIT = int(os.getenv("API_RATE_LIMIT_PER_MIN", "180"))
+WINDOW_SECONDS = 180
 
 PUBLIC_PATHS = {
     "/",

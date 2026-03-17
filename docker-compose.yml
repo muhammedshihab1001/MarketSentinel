@@ -6,10 +6,44 @@ networks:
 
 volumes:
   redis-data:
+  postgres-data:
   grafana-data:
   prometheus-data:
 
 services:
+
+  ####################################################
+  # POSTGRESQL (Persistent Data Store)
+  ####################################################
+  postgres:
+    container_name: marketsentinel-postgres
+    image: postgres:16-alpine
+    restart: unless-stopped
+
+    networks:
+      - marketsentinel-net
+
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: marketsentinel
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    ports:
+      - "5432:5432"
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d marketsentinel"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+    mem_limit: 512m
+    cpus: 1.0
+
 
   ####################################################
   # REDIS (Optional Cache)
@@ -64,13 +98,22 @@ services:
       - MARKET_MAX_WORKERS=2
       - YAHOO_MAX_CONCURRENT=1
       - DRIFT_HARD_FAIL=false
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=sentinel
+      - POSTGRES_PASSWORD=sentinel
+      - POSTGRES_DB=marketsentinel
+      - REDIS_HOST=redis
 
     volumes:
       - ./artifacts:/app/artifacts
       - ./data:/app/data
+      - ./logs:/app/logs
 
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
     healthcheck:
@@ -99,9 +142,21 @@ services:
     env_file:
       - .env
 
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=sentinel
+      - POSTGRES_PASSWORD=sentinel
+      - POSTGRES_DB=marketsentinel
+
     volumes:
       - ./artifacts:/app/artifacts
       - ./data:/app/data
+      - ./logs:/app/logs
+
+    depends_on:
+      postgres:
+        condition: service_healthy
 
     profiles:
       - training
