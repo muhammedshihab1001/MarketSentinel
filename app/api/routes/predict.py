@@ -330,15 +330,16 @@ async def signal_explanation(ticker: str):
             explanation=signal_agent.get("explanation", "")
         )
 
+        # FIX: Replace undefined safe_attr with getattr
         meta = SignalExplanationMeta(
 
-            model_version=safe_attr(loader, "xgb_version"),
+            model_version=getattr(loader, "xgb_version", None),
 
-            schema_signature=safe_attr(loader, "schema_signature"),
+            schema_signature=getattr(loader, "schema_signature", None),
 
-            dataset_hash=safe_attr(loader, "dataset_hash"),
+            dataset_hash=getattr(loader, "dataset_hash", None),
 
-            artifact_hash=safe_attr(loader, "artifact_hash"),
+            artifact_hash=getattr(loader, "artifact_hash", None),
 
             latency_ms=int((time.time() - start_time) * 1000),
 
