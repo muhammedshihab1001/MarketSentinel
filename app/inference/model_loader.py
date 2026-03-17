@@ -156,8 +156,15 @@ class ModelLoader:
 
         version = pointer.get("model_version")
 
-        model_path = os.path.join(base_dir, f"model_{version}.pkl")
-        metadata_path = os.path.join(base_dir, f"metadata_{version}.json")
+        # FIX: Use pointer paths first, fall back to both naming conventions
+        model_path = pointer.get("model_path")
+        metadata_path = pointer.get("metadata_path")
+
+        if not model_path or not os.path.exists(model_path):
+            model_path = os.path.join(base_dir, f"{version}.joblib")
+
+        if not metadata_path or not os.path.exists(metadata_path):
+            metadata_path = os.path.join(base_dir, f"{version}_metadata.json")
 
         if not os.path.exists(model_path) or not os.path.exists(metadata_path):
             raise RuntimeError("Pointer references missing model artifacts.")
@@ -168,10 +175,11 @@ class ModelLoader:
 
     def _resolve_latest_version(self, base_dir):
 
+        # FIX: Look for .joblib files matching trainer naming convention
         versions = [
-            f.replace("model_", "").replace(".pkl", "")
+            f.replace(".joblib", "")
             for f in os.listdir(base_dir)
-            if f.startswith("model_")
+            if f.endswith(".joblib")
         ]
 
         if not versions:
@@ -180,8 +188,8 @@ class ModelLoader:
         version = sorted(versions)[-1]
 
         return (
-            os.path.join(base_dir, f"model_{version}.pkl"),
-            os.path.join(base_dir, f"metadata_{version}.json"),
+            os.path.join(base_dir, f"{version}.joblib"),
+            os.path.join(base_dir, f"{version}_metadata.json"),
             version,
             None,
         )
@@ -272,7 +280,7 @@ class ModelLoader:
             logger.warning("Model warmup skipped | %s", exc)
 
     ########################################################
-    # PROPERTIES (FIXES YOUR CRASH)
+    # PROPERTIES
     ########################################################
 
     @property
@@ -298,3 +306,37 @@ class ModelLoader:
     @property
     def training_code_hash(self):
         return self._xgb_container.training_code_hash if self._xgb_container else None
+
+    # FIX: Add missing feature_checksum property
+    @property
+    def feature_checksum(self):
+        return self._xgb_container.feature_checksum if self._xgb_container else None
+
+    ########################################################
+    # FIX: Add missing get_feature_importance method
+    ########################################################
+
+    def get_feature_importance(self):
+
+        model = self.xgb
+
+        booster = getattr(model, "get_booster", None)
+
+        if booster is not None:
+            score_map = booster().get_score(importance_type="gain")
+        elif hasattr(model, "feature_importances_"):
+            score_map = dict(zip(MODEL_FEATURES, model.feature_importances_))
+        else:
+            score_map = {f: 0.0 for f in MODEL_FEATURES}
+
+        result = []
+
+        for feat in MODEL_FEATURES:
+            result.append({
+                "feature": feat,
+                "importance": float(score_map.get(feat, score_map.get(f"f{list(MODEL_FEATURES).index(feat)}", 0.0))),
+            })
+
+        result.sort(key=lambda x: x["importance"], reverse=True)
+
+        return result
