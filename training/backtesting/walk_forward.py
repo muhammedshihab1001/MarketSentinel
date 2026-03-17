@@ -233,7 +233,12 @@ class WalkForwardValidator:
                 mode="training"
             )
 
-            train_df = pd.concat([train_df.reset_index(drop=True), X_train], axis=1)
+            # FIX: Drop original MODEL_FEATURES before concat to prevent duplicate columns
+            non_feature_cols = [c for c in train_df.columns if c not in set(MODEL_FEATURES)]
+            train_df = pd.concat(
+                [train_df[non_feature_cols].reset_index(drop=True), X_train],
+                axis=1
+            )
 
             model = self.model_trainer(train_df)
 
