@@ -155,8 +155,19 @@ class SafeXGBRegressor:
 
         self.best_iteration = getattr(self.model, "best_iteration", NUM_BOOST_ROUNDS)
 
+        # FIX: Ensure at least 1 boosting round is used for prediction
+        if self.best_iteration < 1:
+            logger.warning("Model stopped extremely early (iter=%d).", self.best_iteration)
+            self.best_iteration = 1
+        elif self.best_iteration < MIN_BOOST_ROUNDS:
+            logger.warning("Model stopped extremely early (iter=%d).", self.best_iteration)
+
         self.train_rmse = float(evals_result["train"]["rmse"][-1])
         self.valid_rmse = float(evals_result.get("valid", {}).get("rmse", [self.train_rmse])[-1])
+
+        self.booster_checksum = hashlib.sha256(
+            self.model.save_raw().tobytes() if hasattr(self.model.save_raw(), 'tobytes') else self.model.save_raw()
+        ).hexdigest()
 
         logger.info(
             "XGBoost trained | iter=%d | features=%d | train_rmse=%.5f | valid_rmse=%.5f",
