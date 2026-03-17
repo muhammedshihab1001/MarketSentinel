@@ -1,4 +1,10 @@
+# =========================================================
+# MarketSentinel — Inference Requirements
+# Production API container only
+# =========================================================
+
 -r base.txt
 
-uvloop
-httptools
+# ── High-performance async event loop ────────────────────
+# Used by uvicorn in inference.Dockerfile CMD
+uvloop==0.19.0

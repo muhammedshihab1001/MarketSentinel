@@ -1,7 +1,16 @@
+# =========================================================
+# MarketSentinel — Training Requirements
+# Offline training container only
+# =========================================================
+
 -r base.txt
 
-pytest==8.3.2
-pytest-asyncio==0.23.8
-pytest-cov==5.0.0
-pytest-mock==3.14.0
-pytest-timeout==2.3.1
+# ── Statistical computation ───────────────────────────────
+# Used by backtesting/performance_engine for regime detection,
+# Sharpe, Sortino, drawdown calculations
+scipy==1.15.3
+
+# ── Columnar data / parquet ───────────────────────────────
+# Used by feature store and data pipeline for efficient
+# serialisation of large DataFrames
+pyarrow==15.0.2
