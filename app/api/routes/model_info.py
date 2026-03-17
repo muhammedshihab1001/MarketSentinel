@@ -108,26 +108,21 @@ def _feature_importance_sync():
 
     start_time = time.time()
     loader = get_shared_model_loader()
+    model = loader.xgb
 
-    model_output = loader.get_feature_importance()
-
-    # Adapt model output to stable API contract
-    importance_pairs = model_output.get("feature_importance", [])
+    # FIX: get_feature_importance returns a list of dicts, not a rich dict
+    importance_list = loader.get_feature_importance()
 
     importance = [
-        {"feature": name, "importance": float(score)}
-        for name, score in importance_pairs
+        {"feature": item["feature"], "importance": float(item["importance"])}
+        for item in importance_list
     ]
 
     return {
         "model_version": loader.xgb_version,
-        "feature_checksum": model_output.get("feature_checksum"),
-        "importance_checksum": model_output.get("importance_checksum"),
-        "booster_checksum": model_output.get("booster_checksum"),
-        "best_iteration": model_output.get("best_iteration"),
-        "train_rmse": model_output.get("train_rmse"),
-        "valid_rmse": model_output.get("valid_rmse"),
-        "training_fingerprint": model_output.get("training_fingerprint"),
+        "feature_checksum": loader.feature_checksum,
+        "best_iteration": getattr(model, "best_iteration", None),
+        "training_fingerprint": getattr(model, "training_fingerprint", None),
         "importance": importance,
         "latency_ms": int((time.time() - start_time) * 1000),
         "timestamp": int(time.time())
