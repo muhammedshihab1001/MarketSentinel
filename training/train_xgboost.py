@@ -5,7 +5,6 @@
 import os
 import time
 import joblib
-import logging
 import random
 import numpy as np
 import pandas as pd
@@ -29,8 +28,9 @@ from core.artifacts.metadata_manager import MetadataManager
 from training.backtesting.walk_forward import WalkForwardValidator, FORWARD_DAYS
 from core.models.xgboost import build_xgboost_pipeline
 from core.monitoring.drift_detector import DriftDetector
+from core.logging.logger import get_logger
 
-logger = logging.getLogger("marketsentinel.train_xgb")
+logger = get_logger("marketsentinel.train_xgb")
 
 MODEL_DIR = os.path.abspath("artifacts/xgboost")
 DRIFT_DIR = os.path.abspath("artifacts/drift")
@@ -122,10 +122,8 @@ def export_artifacts(
 
     joblib.dump(model, model_path)
 
-    # compute artifact hash
     artifact_hash = MetadataManager.hash_file(model_path)
 
-    # FIX: use official metadata creator
     metadata = MetadataManager.create_metadata(
         model_name="xgboost",
         metrics=metrics,
@@ -198,6 +196,10 @@ def load_training_data(start_date, end_date):
             )
 
             if df is None or df.empty:
+                logger.warning(
+                    "Empty price data | ticker=%s | function=load_training_data",
+                    ticker,
+                )
                 continue
 
             if "date" in df.columns:
@@ -209,7 +211,11 @@ def load_training_data(start_date, end_date):
 
         except Exception as exc:
 
-            logger.warning("Price fetch failed for %s | %s", ticker, exc)
+            logger.warning(
+                "Price fetch failed | ticker=%s | error=%s | function=load_training_data",
+                ticker,
+                exc,
+            )
 
     if len(price_frames) < MIN_SUCCESSFUL_TICKERS:
 
@@ -230,7 +236,10 @@ def load_training_data(start_date, end_date):
 
     if len(df) > MAX_DATASET_ROWS:
 
-        logger.warning("Dataset too large — sampling.")
+        logger.warning(
+            "Dataset too large — sampling | rows=%d | function=load_training_data",
+            len(df),
+        )
 
         df = df.sample(MAX_DATASET_ROWS, random_state=SEED)
 
@@ -313,7 +322,10 @@ def trainer(train_df):
 
     if len(X) < MIN_TRAINING_ROWS:
 
-        logger.warning("Small training dataset (%s rows)", len(X))
+        logger.warning(
+            "Small training dataset | rows=%d | function=trainer",
+            len(X),
+        )
 
     if np.std(y) < LOW_VARIANCE_THRESHOLD:
 
@@ -336,13 +348,19 @@ def trainer(train_df):
 # MAIN
 # ==========================================================
 
-def main(create_baseline=False, promote_baseline=False):
+def main(
+    start_date=None,
+    end_date=None,
+    create_baseline=False,
+    promote_baseline=False,
+):
 
     init_env()
 
     enforce_determinism()
 
-    start_date, end_date = MarketTime.window_for("xgboost")
+    if start_date is None or end_date is None:
+        start_date, end_date = MarketTime.window_for("xgboost")
 
     raw_df = load_training_data(start_date, end_date)
 

@@ -1,5 +1,5 @@
 # ==========================================================
-# INSTITUTIONAL TRAINING PIPELINE WRAPPER v2.7
+# INSTITUTIONAL TRAINING PIPELINE WRAPPER v2.8
 # Governance Hardened + Hybrid Multi-Agent Compatible
 # ==========================================================
 
@@ -7,7 +7,6 @@ import time
 import datetime
 import os
 import json
-import logging
 import socket
 import platform
 import random
@@ -30,9 +29,10 @@ from core.artifacts.metadata_manager import MetadataManager
 from core.config.env_loader import init_env
 from core.time.market_time import MarketTime
 from core.market.universe import MarketUniverse
-from core.data.providers.market.router import MarketProviderRouter
+from core.db.engine import init_db
+from core.logging.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger("marketsentinel.train_pipeline")
 
 RUNS_DIR = os.path.abspath("artifacts/training_runs")
 LOCK_FILE = os.path.join(RUNS_DIR, ".training.lock")
@@ -73,15 +73,15 @@ def _acquire_lock():
             with open(LOCK_FILE) as f:
                 data = json.load(f)
                 pid = data.get("pid")
-                created = data.get("created")
         except Exception:
             pid = None
-            created = None
 
         age = time.time() - os.path.getmtime(LOCK_FILE)
 
         if age > 4 * 3600:
-            logger.warning("Stale training lock detected — removing.")
+            logger.warning(
+                "Stale training lock detected — removing | function=_acquire_lock"
+            )
             try:
                 os.remove(LOCK_FILE)
             except FileNotFoundError:
@@ -107,7 +107,9 @@ def _release_lock():
         try:
             os.remove(LOCK_FILE)
         except Exception:
-            logger.warning("Failed to remove training lock.")
+            logger.warning(
+                "Failed to remove training lock | function=_release_lock"
+            )
 
 
 # ==========================================================
@@ -221,24 +223,31 @@ def build_lineage(start_date, end_date):
 
 # ==========================================================
 # PROVIDER HEALTH SNAPSHOT
+# Previously used MarketProviderRouter directly.
+# Now uses MarketDataService which reads from PostgreSQL.
+# Health snapshot reflects DB connectivity instead.
 # ==========================================================
 
 def capture_provider_health():
 
     try:
 
-        router = MarketProviderRouter()
+        from core.db.engine import get_session
+        from sqlalchemy import text
 
-        if hasattr(router, "provider_health"):
-            return router.provider_health()
+        with get_session() as session:
+            session.execute(text("SELECT 1"))
 
-        return {"status": "provider_health_not_available"}
+        return {"status": "db_healthy", "source": "postgresql"}
 
     except Exception as e:
 
-        logger.warning("Failed to capture provider health: %s", e)
+        logger.warning(
+            "DB health check failed | error=%s | function=capture_provider_health",
+            e,
+        )
 
-        return {}
+        return {"status": "db_unavailable", "error": str(e)}
 
 
 # ==========================================================
@@ -281,6 +290,18 @@ def main(create_baseline=False, promote_baseline=False):
 
     enforce_determinism()
 
+    # ── Init DB before any data access ──────────────────
+    logger.info("Initialising database connection | function=main")
+
+    try:
+        init_db()
+        logger.info("Database ready | function=main")
+    except Exception as e:
+        logger.warning(
+            "DB init failed — training will use whatever data is available | error=%s",
+            e,
+        )
+
     _acquire_lock()
 
     today = MarketTime.today().isoformat()
@@ -289,7 +310,11 @@ def main(create_baseline=False, promote_baseline=False):
 
     start_date, end_date = MarketTime.window_for("xgboost")
 
-    logger.info("Training window | %s -> %s", start_date, end_date)
+    logger.info(
+        "Training window | start=%s | end=%s | function=main",
+        start_date,
+        end_date,
+    )
 
     schema_signature = get_schema_signature()
 
@@ -301,7 +326,7 @@ def main(create_baseline=False, promote_baseline=False):
         + "_" + uuid.uuid4().hex[:6]
     )
 
-    logger.info("Training run_id=%s", run_id)
+    logger.info("Training run | run_id=%s | function=main", run_id)
 
     start = time.time()
 
@@ -339,11 +364,17 @@ def main(create_baseline=False, promote_baseline=False):
 
         save_manifest(run_id, manifest)
 
-        logger.info("Training pipeline finished successfully.")
+        logger.info(
+            "Training pipeline finished successfully | run_id=%s | function=main",
+            run_id,
+        )
 
     except Exception as exc:
 
-        logger.exception("Training failed.")
+        logger.exception(
+            "Training failed | run_id=%s | function=main",
+            run_id,
+        )
 
         manifest = {
             "run_id": run_id,

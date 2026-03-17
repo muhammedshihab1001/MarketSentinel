@@ -1,5 +1,5 @@
 """
-MarketSentinel Institutional Evaluation Runner v4.1
+MarketSentinel Institutional Evaluation Runner v4.2
 Aligned with Walk-Forward Portfolio Validation
 Hybrid-Ready Governance Layer
 """
@@ -23,6 +23,10 @@ from core.monitoring.drift_detector import DriftDetector
 from app.inference.model_loader import ModelLoader
 from training.backtesting.walk_forward import WalkForwardValidator
 from training.train_xgboost import trainer as retrain_model
+from core.db.engine import init_db
+from core.logging.logger import get_logger
+
+logger = get_logger("marketsentinel.run_evaluation")
 
 
 # =========================================================
@@ -34,7 +38,6 @@ MAX_DRAWDOWN = -0.60
 MIN_WINDOWS = 5
 MAX_SHARPE_DEGRADATION = 0.10
 
-# DriftDetector severity scale = 0–15
 MAX_ALLOWED_DRIFT = 8
 
 
@@ -72,9 +75,10 @@ def build_dataset():
         raise RuntimeError("No evaluation price data fetched.")
 
     if fetch_failures:
-        print(
-            f"WARNING: price fetch failed for "
-            f"{len(fetch_failures)} tickers: {fetch_failures}"
+        logger.warning(
+            "Price fetch failed | tickers=%s | count=%d | function=build_dataset",
+            fetch_failures,
+            len(fetch_failures),
         )
 
     combined_prices = pd.concat(price_frames, ignore_index=True)
@@ -91,10 +95,11 @@ def build_dataset():
             f"Dataset too small for evaluation: {len(df)} rows, need 2000."
         )
 
-    print(
-        f"Evaluation dataset built | rows={len(df)} "
-        f"tickers={df['ticker'].nunique()} "
-        f"dates={df['date'].nunique()}"
+    logger.info(
+        "Evaluation dataset built | rows=%d | tickers=%d | dates=%d | function=build_dataset",
+        len(df),
+        df["ticker"].nunique(),
+        df["date"].nunique(),
     )
 
     return df
@@ -109,7 +114,7 @@ def compare_to_baseline(metrics):
     baseline_path = Path("artifacts/xgboost/baseline_contract.json")
 
     if not baseline_path.exists():
-        print("No baseline contract found.")
+        logger.info("No baseline contract found — skipping comparison.")
         return
 
     with open(baseline_path, "r", encoding="utf-8") as f:
@@ -121,13 +126,21 @@ def compare_to_baseline(metrics):
     if baseline_sharpe is None:
         return
 
-    if metrics.get("avg_sharpe", 0) < baseline_sharpe - MAX_SHARPE_DEGRADATION:
+    current_sharpe = metrics.get("avg_sharpe", 0)
+
+    if current_sharpe < baseline_sharpe - MAX_SHARPE_DEGRADATION:
 
         raise RuntimeError(
             f"Sharpe degraded vs baseline. "
-            f"Current={metrics.get('avg_sharpe'):.4f} "
+            f"Current={current_sharpe:.4f} "
             f"Baseline={baseline_sharpe:.4f}"
         )
+
+    logger.info(
+        "Baseline comparison passed | current_sharpe=%.4f | baseline_sharpe=%.4f | function=compare_to_baseline",
+        current_sharpe,
+        baseline_sharpe,
+    )
 
 
 # =========================================================
@@ -136,18 +149,32 @@ def compare_to_baseline(metrics):
 
 def main() -> int:
 
-    print("Starting Institutional Walk-Forward CI Evaluation...")
+    logger.info("Starting Institutional Walk-Forward CI Evaluation | function=main")
 
     init_env()
 
+    # ── Init DB before any data access ──────────────────
+    logger.info("Initialising database connection | function=main")
+
+    try:
+        init_db()
+        logger.info("Database ready | function=main")
+    except Exception as e:
+        logger.warning(
+            "DB init failed — evaluation will use cached data if available | error=%s | function=main",
+            e,
+        )
+
     loader = ModelLoader()
 
-    print(f"Evaluating model version: {loader.xgb_version}")
-    print(f"Schema signature: {loader.schema_signature[:12]}")
+    logger.info(
+        "Evaluating model | version=%s | schema_signature=%.12s | function=main",
+        loader.xgb_version,
+        loader.schema_signature,
+    )
 
     df = build_dataset()
 
-    # Strict schema validation
     X = validate_feature_schema(
         df.loc[:, MODEL_FEATURES],
         mode="strict_contract"
@@ -161,7 +188,10 @@ def main() -> int:
 
     drift_score = drift_detector.compute_drift(X)
 
-    print(f"Drift severity score: {drift_score}")
+    logger.info(
+        "Drift severity score | score=%s | function=main",
+        drift_score,
+    )
 
     if drift_score > MAX_ALLOWED_DRIFT:
 
@@ -180,7 +210,7 @@ def main() -> int:
 
     metrics = validator.run(df.copy())
 
-    print("Walk-forward metrics:", metrics)
+    logger.info("Walk-forward metrics | metrics=%s | function=main", metrics)
 
     # =====================================================
     # GOVERNANCE RULES
@@ -197,7 +227,7 @@ def main() -> int:
 
     compare_to_baseline(metrics)
 
-    print("CI Walk-forward evaluation PASSED.")
+    logger.info("CI Walk-forward evaluation PASSED | function=main")
 
     return 0
 
