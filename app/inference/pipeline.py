@@ -207,6 +207,41 @@ class InferencePipeline:
             return {"score": 0.0, "agent_score": 0.0, "hybrid": {"score": 0.0}}
 
     # =========================================================
+    # PORTFOLIO CONSTRUCTION
+    # =========================================================
+
+    def _construct_portfolio_from_rows(self, longs, shorts):
+
+        weights = {}
+
+        n_longs = len(longs)
+        n_shorts = len(shorts)
+
+        half_exposure = self.TARGET_GROSS_EXPOSURE / 2.0
+
+        if n_longs > 0:
+
+            long_weight = min(
+                half_exposure / n_longs,
+                self.MAX_POSITION_WEIGHT,
+            )
+
+            for row in longs:
+                weights[row["ticker"]] = round(long_weight, 6)
+
+        if n_shorts > 0:
+
+            short_weight = min(
+                half_exposure / n_shorts,
+                self.MAX_POSITION_WEIGHT,
+            )
+
+            for row in shorts:
+                weights[row["ticker"]] = round(-short_weight, 6)
+
+        return weights
+
+    # =========================================================
     # MAIN SNAPSHOT
     # =========================================================
 
