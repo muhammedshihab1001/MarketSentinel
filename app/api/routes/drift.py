@@ -1,4 +1,7 @@
-import logging
+# =========================================================
+# DRIFT STATUS ROUTE v2.1 — uses shared pipeline singleton
+# =========================================================
+
 import asyncio
 import time
 import os
@@ -6,7 +9,8 @@ import json
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from app.inference.pipeline import InferencePipeline, get_shared_model_loader
+from app.api.routes.predict import get_pipeline
+from app.inference.pipeline import get_shared_model_loader
 from core.market.universe import MarketUniverse
 from core.schema.feature_schema import (
     MODEL_FEATURES,
@@ -15,30 +19,22 @@ from core.schema.feature_schema import (
 )
 from core.monitoring.drift_detector import DriftDetector
 from core.monitoring.retrain_trigger import RetrainTrigger
+from core.logging.logger import get_logger
 
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
-    API_ERROR_COUNT
+    API_ERROR_COUNT,
 )
 
 router = APIRouter()
-logger = logging.getLogger("marketsentinel.drift")
+logger = get_logger("marketsentinel.drift")
 
 REQUEST_TIMEOUT = 180
 MAX_CONCURRENT = 2
 MIN_UNIVERSE_WIDTH = 10
 
 drift_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
-_pipeline: InferencePipeline | None = None
-
-
-def get_pipeline():
-    global _pipeline
-    if _pipeline is None:
-        _pipeline = InferencePipeline()
-    return _pipeline
 
 
 # =========================================================
@@ -58,7 +54,7 @@ async def drift_status():
 
             result = await asyncio.wait_for(
                 run_in_threadpool(_drift_status_sync),
-                timeout=REQUEST_TIMEOUT
+                timeout=REQUEST_TIMEOUT,
             )
 
         return result
@@ -90,7 +86,7 @@ def _get_baseline_meta():
             "baseline_exists": False,
             "baseline_version": None,
             "baseline_model_version": None,
-            "baseline_dataset_hash": None
+            "baseline_dataset_hash": None,
         }
 
     try:
@@ -103,7 +99,7 @@ def _get_baseline_meta():
             "baseline_exists": True,
             "baseline_version": meta.get("baseline_version"),
             "baseline_model_version": meta.get("model_version"),
-            "baseline_dataset_hash": meta.get("dataset_hash")
+            "baseline_dataset_hash": meta.get("dataset_hash"),
         }
 
     except Exception:
@@ -111,7 +107,7 @@ def _get_baseline_meta():
             "baseline_exists": False,
             "baseline_version": None,
             "baseline_model_version": None,
-            "baseline_dataset_hash": None
+            "baseline_dataset_hash": None,
         }
 
 
@@ -144,7 +140,7 @@ def _drift_status_sync():
 
     feature_df = validate_feature_schema(
         latest_df.loc[:, MODEL_FEATURES],
-        mode="inference"
+        mode="inference",
     ).astype(DTYPE)
 
     try:
@@ -155,13 +151,10 @@ def _drift_status_sync():
             "drift_detected": False,
             "severity_score": 0.0,
             "drift_state": "baseline_missing",
-            "exposure_scale": 1.0
+            "exposure_scale": 1.0,
         }
 
-    # -----------------------------------------------------
     # Retrain Trigger Evaluation
-    # -----------------------------------------------------
-
     retrain_trigger = RetrainTrigger()
     retrain_info = retrain_trigger.evaluate(drift_result)
 
@@ -173,23 +166,19 @@ def _drift_status_sync():
         "severity_score": drift_result.get("severity_score", 0),
         "drift_state": drift_result.get("drift_state", "unknown"),
         "exposure_scale": drift_result.get("exposure_scale", 1.0),
-
         # Retrain trigger
         "retrain_required": retrain_info["retrain_required"],
         "retrain_events": retrain_info["events"],
-
         # Baseline governance
         **baseline_meta,
-
         # Model governance
         "model_version": loader.xgb_version,
         "schema_signature": loader.schema_signature,
         "artifact_hash": loader.artifact_hash,
         "dataset_hash": loader.dataset_hash,
-
         # Context
         "universe_size": len(latest_df),
         "snapshot_date": str(latest_date),
         "latency_ms": int((time.time() - start_time) * 1000),
-        "timestamp": int(time.time())
+        "timestamp": int(time.time()),
     }

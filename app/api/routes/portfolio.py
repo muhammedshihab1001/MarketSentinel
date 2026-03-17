@@ -1,36 +1,30 @@
-import logging
+# =========================================================
+# PORTFOLIO SUMMARY ROUTE v2.1 — uses shared pipeline singleton
+# =========================================================
+
 import asyncio
 import time
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from app.inference.pipeline import (
-    InferencePipeline,
-    get_shared_model_loader,
-)
+from app.api.routes.predict import get_pipeline
+from app.inference.pipeline import get_shared_model_loader
 from core.market.universe import MarketUniverse
+from core.logging.logger import get_logger
+
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
-    API_ERROR_COUNT
+    API_ERROR_COUNT,
 )
 
 router = APIRouter()
-logger = logging.getLogger("marketsentinel.portfolio")
+logger = get_logger("marketsentinel.portfolio")
 
 REQUEST_TIMEOUT = 180
 MAX_CONCURRENT = 3
 
 portfolio_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
-_pipeline = None
-
-
-def get_pipeline():
-    global _pipeline
-    if _pipeline is None:
-        _pipeline = InferencePipeline()
-    return _pipeline
 
 
 @router.get("/portfolio-summary")
@@ -44,7 +38,7 @@ async def portfolio_summary():
         async with portfolio_semaphore:
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(_portfolio_summary_sync),
-                timeout=REQUEST_TIMEOUT
+                timeout=REQUEST_TIMEOUT,
             )
 
         return snapshot
@@ -102,7 +96,6 @@ def _portfolio_summary_sync():
     # ===============================
     # AGENT METRICS
     # ===============================
-    # Signal rows use "agents" → "signal_agent" structure (set in pipeline.py)
 
     def _get_signal_agent(r):
         return r.get("agents", {}).get("signal_agent", {})
@@ -177,27 +170,23 @@ def _portfolio_summary_sync():
         for r in sorted(
             results,
             key=lambda x: x.get("raw_model_score", 0.0),
-            reverse=True
+            reverse=True,
         )[:5]
     ]
 
     return {
         "snapshot_date": snapshot.get("snapshot_date"),
         "universe_size": len(universe),
-
         # Governance
         "model_version": loader.xgb_version,
         "schema_signature": loader.schema_signature,
-
         # Exposure
         "gross_exposure": round(gross_exposure, 6),
         "net_exposure": round(net_exposure, 6),
-
         # Signal breakdown
         "long_count": long_count,
         "short_count": short_count,
         "neutral_count": neutral_count,
-
         # Agent metrics
         "approved_trades": approved_trades,
         "rejected_trades": rejected_trades,
@@ -205,18 +194,14 @@ def _portfolio_summary_sync():
         "avg_confidence": round(avg_confidence, 3),
         "high_conviction_count": high_conviction_count,
         "elevated_risk_count": elevated_risk_count,
-
         # Drift
         "drift_detected": drift_detected,
         "drift_state": drift_state,
-
         # Health
         "portfolio_health_score": health_score,
-
         # Preview
         "top_5_preview": top_5_preview,
-
         # Observability
         "latency_ms": int((time.time() - start_time) * 1000),
-        "timestamp": int(time.time())
+        "timestamp": int(time.time()),
     }

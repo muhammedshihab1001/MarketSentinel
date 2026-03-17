@@ -1,14 +1,12 @@
 # =========================================================
-# PREDICTION & SNAPSHOT ROUTES v3.4
-# Hybrid Multi-Agent Compatible
-# CV-Optimized | Decision-Aware | Governance-Aware
+# PREDICTION & SNAPSHOT ROUTES v3.5
+# Hybrid Multi-Agent Compatible | DB-Backed
 # =========================================================
 
 import time
 import asyncio
 import os
 import re
-import logging
 import json
 import pandas as pd
 from pathlib import Path
@@ -19,11 +17,12 @@ from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline, get_shared_model_loader
 from core.data.market_data_service import MarketDataService
+from core.logging.logger import get_logger
 
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
-    API_ERROR_COUNT
+    API_ERROR_COUNT,
 )
 
 from app.api.schemas import (
@@ -33,7 +32,7 @@ from app.api.schemas import (
 )
 
 router = APIRouter(prefix="/predict", tags=["prediction"])
-logger = logging.getLogger("marketsentinel.api")
+logger = get_logger("marketsentinel.api")
 
 _pipeline: Optional[InferencePipeline] = None
 _universe_cache: Optional[List[str]] = None
@@ -48,7 +47,6 @@ def get_pipeline() -> InferencePipeline:
     global _pipeline
 
     if _pipeline is None:
-
         logger.info("Initializing InferencePipeline (singleton)")
         _pipeline = InferencePipeline()
 
@@ -130,9 +128,7 @@ def load_default_universe() -> List[str]:
 async def live_snapshot():
 
     endpoint = "/predict/live-snapshot"
-
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
-
     start_time = time.time()
 
     try:
@@ -148,11 +144,10 @@ async def live_snapshot():
 
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(pipeline.run_snapshot, tickers),
-                timeout=REQUEST_TIMEOUT
+                timeout=REQUEST_TIMEOUT,
             )
 
         if not isinstance(snapshot, dict) or "signals" not in snapshot:
-
             raise RuntimeError("Invalid snapshot structure.")
 
         signals = snapshot["signals"]
@@ -167,80 +162,53 @@ async def live_snapshot():
 
         avg_strength = (
             round(sum(hybrid_scores) / len(hybrid_scores), 2)
-            if hybrid_scores else 0.0
+            if hybrid_scores
+            else 0.0
         )
 
         top_5 = snapshot.get("top_5", [])
-
         decision_report = snapshot.get("decision_report", {})
-
         drift = snapshot.get("drift", {})
 
         executive_summary = {
-
             "top_5_tickers": [t["ticker"] for t in top_5],
-
             "portfolio_bias": decision_report.get("portfolio_bias"),
-
             "risk_regime": drift.get("drift_state"),
-
             "gross_exposure": snapshot.get("gross_exposure"),
-
-            "net_exposure": snapshot.get("net_exposure")
+            "net_exposure": snapshot.get("net_exposure"),
         }
 
         meta = {
-
             "model_version": container.version if container else None,
-
             "schema_signature": container.schema_signature if container else None,
-
             "dataset_hash": container.dataset_hash if container else None,
-
             "artifact_hash": container.artifact_hash if container else None,
-
             "feature_checksum": container.feature_checksum if container else None,
-
             "universe_size": len(tickers),
-
             "long_signals": long_count,
-
             "short_signals": short_count,
-
             "avg_hybrid_score": avg_strength,
-
             "drift_state": drift.get("drift_state"),
-
             "latency_ms": int((time.time() - start_time) * 1000),
-
-            "timestamp": int(time.time())
+            "timestamp": int(time.time()),
         }
 
         return {
-
             "meta": meta,
-
             "executive_summary": executive_summary,
-
-            "snapshot": snapshot
+            "snapshot": snapshot,
         }
 
     except asyncio.TimeoutError:
-
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-
         raise HTTPException(status_code=504, detail="Snapshot inference timeout")
 
     except Exception as e:
-
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-
         logger.exception("Live snapshot failure")
-
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-
         API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
 
 
@@ -250,42 +218,37 @@ async def live_snapshot():
 
 @router.get(
     "/signal-explanation/{ticker}",
-    response_model=SignalExplanationEnvelope
+    response_model=SignalExplanationEnvelope,
 )
 async def signal_explanation(ticker: str):
 
     endpoint = "/predict/signal-explanation"
-
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
-
     start_time = time.time()
 
     ticker = ticker.upper().strip()
 
     if not TICKER_REGEX.match(ticker):
-
         raise HTTPException(status_code=400, detail="Invalid ticker format.")
 
     try:
 
         pipeline = get_pipeline()
-
         loader = get_shared_model_loader()
 
         universe_tickers = load_default_universe()
 
         if ticker not in universe_tickers:
-
             raise HTTPException(
                 status_code=404,
-                detail="Ticker not in production universe."
+                detail="Ticker not in production universe.",
             )
 
         async with inference_semaphore:
 
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(pipeline.run_snapshot, universe_tickers),
-                timeout=REQUEST_TIMEOUT
+                timeout=REQUEST_TIMEOUT,
             )
 
         signals = snapshot.get("signals", [])
@@ -293,106 +256,74 @@ async def signal_explanation(ticker: str):
         row = next((s for s in signals if s["ticker"] == ticker), None)
 
         if row is None:
-
             raise HTTPException(status_code=404, detail="Signal not found.")
 
         agents = row.get("agents", {})
-
         signal_agent = agents.get("signal_agent", {})
 
         explanation = SignalExplanationResponse(
-
             ticker=row["ticker"],
-
             score=row.get("raw_model_score", 0.0),
-
             signal=signal_agent.get("signal", "NEUTRAL"),
-
             agent_score=row.get(
                 "hybrid_consensus_score",
-                row.get("agent_score", 0.0)
+                row.get("agent_score", 0.0),
             ),
-
             alpha_strength=signal_agent.get("alpha_strength", 0.0),
-
             confidence_numeric=signal_agent.get("confidence_numeric", 0.0),
-
             governance_score=signal_agent.get("governance_score", 0),
-
             risk_level=signal_agent.get("risk_level", "unknown"),
-
             volatility_regime=signal_agent.get("volatility_regime", "unknown"),
-
             drift_flag=signal_agent.get("drift_flag", False),
-
             warnings=signal_agent.get("warnings", []),
-
-            explanation=signal_agent.get("explanation", "")
+            explanation=signal_agent.get("explanation", ""),
         )
 
-        # FIX: Replace undefined safe_attr with getattr
         meta = SignalExplanationMeta(
-
             model_version=getattr(loader, "xgb_version", None),
-
             schema_signature=getattr(loader, "schema_signature", None),
-
             dataset_hash=getattr(loader, "dataset_hash", None),
-
             artifact_hash=getattr(loader, "artifact_hash", None),
-
             latency_ms=int((time.time() - start_time) * 1000),
-
-            timestamp=int(time.time())
+            timestamp=int(time.time()),
         )
 
         return SignalExplanationEnvelope(
             meta=meta,
-            explanation=explanation
+            explanation=explanation,
         )
 
     except asyncio.TimeoutError:
-
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-
         raise HTTPException(status_code=504, detail="Signal explanation timeout")
 
     except HTTPException:
-
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-
         raise
 
     except Exception as e:
-
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-
         logger.exception("Signal explanation failure")
-
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-
         API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
 
 
 # =========================================================
-# PRICE HISTORY
+# PRICE HISTORY (now reads from PostgreSQL via MarketDataService)
 # =========================================================
 
 @router.get("/price-history/{ticker}")
 async def price_history(ticker: str, days: int = 365):
 
     endpoint = "/predict/price-history"
-
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
-
     start_time = time.time()
 
     ticker = ticker.upper().strip()
 
     if not TICKER_REGEX.match(ticker):
-
         raise HTTPException(status_code=400, detail="Invalid ticker format.")
 
     if days > 2000:
@@ -402,60 +333,46 @@ async def price_history(ticker: str, days: int = 365):
 
         service = MarketDataService()
 
-        end_date = pd.Timestamp.utcnow().normalize()
-
+        # FIX: pd.Timestamp.utcnow() is deprecated
+        end_date = pd.Timestamp.now(tz="UTC").normalize()
         start_date = end_date - pd.Timedelta(days=days)
 
         data, failures = await run_in_threadpool(
             service.get_price_data_batch,
             [ticker],
             start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d")
+            end_date.strftime("%Y-%m-%d"),
         )
 
         df = data.get(ticker)
 
         if df is None or df.empty:
-
             raise HTTPException(status_code=404, detail="Price history unavailable")
 
         prices = [
-
             {
                 "date": str(row["date"]),
-                "close": float(row["close"])
+                "close": float(row["close"]),
             }
-
             for _, row in df.iterrows()
         ]
 
         return {
-
             "ticker": ticker,
-
             "days": days,
-
             "prices": prices,
-
             "latency_ms": int((time.time() - start_time) * 1000),
-
-            "timestamp": int(time.time())
+            "timestamp": int(time.time()),
         }
 
     except HTTPException:
-
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-
         raise
 
     except Exception as e:
-
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-
         logger.exception("Price history endpoint failed")
-
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-
         API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)

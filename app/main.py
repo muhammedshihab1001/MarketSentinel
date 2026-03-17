@@ -1,9 +1,8 @@
 # =====================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v2.5
-# Hybrid Multi-Agent | CV-Optimized Architecture
+# MARKET SENTINEL APPLICATION ENTRYPOINT v3.0
+# Hybrid Multi-Agent | DB-Backed | CV-Optimized
 # =====================================================
 
-import logging
 import time
 import gc
 import hashlib
@@ -21,6 +20,7 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from core.config.env_loader import init_env, get_int, get_env, get_bool
 from core.schema.feature_schema import get_schema_signature
+from core.logging.logger import get_logger
 
 from app.api.routes import (
     drift,
@@ -31,12 +31,14 @@ from app.api.routes import (
     predict,
     performance,
     equity,
-    agent
+    agent,
 )
 
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
 from core.monitoring.drift_detector import DriftDetector
+from core.db.engine import init_db, check_db_health, dispose_engine
+from core.data.data_sync import DataSyncService
 
 
 # =====================================================
@@ -45,7 +47,7 @@ from core.monitoring.drift_detector import DriftDetector
 
 init_env()
 
-logger = logging.getLogger("marketsentinel")
+logger = get_logger("marketsentinel")
 
 
 # =====================================================
@@ -56,7 +58,7 @@ BOOT_ID = hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
 
 STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 180)
 
-APP_VERSION = get_env("APP_VERSION", "4.1.0")
+APP_VERSION = get_env("APP_VERSION", "5.0.0")
 
 CORS_ORIGINS = get_env("CORS_ORIGINS", "*")
 CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS.split(",")]
@@ -66,13 +68,16 @@ API_KEY = os.getenv("API_KEY")
 RATE_LIMIT = int(os.getenv("API_RATE_LIMIT_PER_MIN", "180"))
 WINDOW_SECONDS = 180
 
+# Skip data sync on startup (useful for tests or quick restarts)
+SKIP_DATA_SYNC = os.getenv("SKIP_DATA_SYNC", "0") == "1"
+
 PUBLIC_PATHS = {
     "/",
     "/docs",
     "/openapi.json",
     "/metrics",
     "/health/live",
-    "/health/ready"
+    "/health/ready",
 }
 
 request_store = defaultdict(lambda: deque())
@@ -89,6 +94,8 @@ class ReadinessState:
 
         self.models_loaded = False
         self.redis_connected = False
+        self.db_connected = False
+        self.data_synced = False
         self.drift_baseline_loaded = False
 
         self.schema_signature = None
@@ -106,13 +113,13 @@ class ReadinessState:
         self.start_time = int(time.time())
 
         self.boot_memory_mb = None
-
         self.config_fingerprint = None
+
+        self.sync_report = None
 
     @property
     def ready(self):
-
-        return self.models_loaded
+        return self.models_loaded and self.db_connected
 
 
 readiness = ReadinessState()
@@ -128,7 +135,7 @@ def api_success(data):
         "success": True,
         "data": data,
         "error": None,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -138,7 +145,7 @@ def api_error(message):
         "success": False,
         "data": None,
         "error": message,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -149,17 +156,16 @@ def api_error(message):
 async def global_exception_handler(request: Request, exc: Exception):
 
     if isinstance(exc, HTTPException):
-
         return JSONResponse(
             status_code=exc.status_code,
-            content=api_error(exc.detail)
+            content=api_error(exc.detail),
         )
 
     logger.exception("Unhandled API error")
 
     return JSONResponse(
         status_code=500,
-        content=api_error("internal_server_error")
+        content=api_error("internal_server_error"),
     )
 
 
@@ -175,18 +181,57 @@ async def lifespan(app: FastAPI):
     try:
 
         logger.info("===================================")
-        logger.info(" MarketSentinel Boot Sequence ")
+        logger.info(" MarketSentinel Boot Sequence v3.0 ")
         logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("===================================")
 
+        # ── Step 1: Initialize PostgreSQL ────────────────
+
+        try:
+            init_db()
+            db_health = check_db_health()
+            readiness.db_connected = db_health["status"] == "healthy"
+
+            logger.info(
+                "Database ready | status=%s latency=%.1fms",
+                db_health["status"],
+                db_health.get("latency_ms", 0),
+            )
+
+        except Exception:
+            readiness.db_connected = False
+            logger.exception("Database initialization failed")
+
+        # ── Step 2: Sync market data (Yahoo → PostgreSQL) ──
+
+        if readiness.db_connected and not SKIP_DATA_SYNC:
+
+            try:
+                sync_service = DataSyncService()
+                readiness.sync_report = sync_service.sync_universe()
+                readiness.data_synced = True
+
+                logger.info(
+                    "Data sync complete | synced=%d skipped=%d errors=%d",
+                    readiness.sync_report.get("synced", 0),
+                    readiness.sync_report.get("skipped", 0),
+                    readiness.sync_report.get("errors", 0),
+                )
+
+            except Exception:
+                readiness.data_synced = False
+                logger.exception("Data sync failed — DB may have stale data")
+
+        elif SKIP_DATA_SYNC:
+            logger.info("Data sync skipped (SKIP_DATA_SYNC=1)")
+
+        # ── Step 3: Load model ───────────────────────────
+
         loader = ModelLoader()
-
         _ = loader.xgb
-
         loader.warmup()
 
         readiness.models_loaded = True
-
         readiness.schema_signature = loader.schema_signature
         readiness.model_version = loader.xgb_version
         readiness.artifact_hash = loader.artifact_hash
@@ -194,42 +239,37 @@ async def lifespan(app: FastAPI):
         readiness.training_code_hash = loader.training_code_hash
 
         if readiness.schema_signature != get_schema_signature():
-
             logger.warning("Runtime schema mismatch detected.")
 
+        # ── Step 4: Redis ────────────────────────────────
+
         try:
-
             cache = RedisCache()
-
             readiness.redis_connected = cache.enabled
-
         except Exception:
-
             readiness.redis_connected = False
-
             logger.warning("Redis unavailable — degraded mode.")
 
+        # ── Step 5: Drift baseline ───────────────────────
+
         try:
-
             detector = DriftDetector()
-
             detector._load_verified_baseline()
-
             readiness.drift_baseline_loaded = True
-
         except Exception:
-
             readiness.drift_baseline_loaded = False
-
             logger.warning("Drift baseline not loaded.")
+
+        # ── Step 6: LLM config ───────────────────────────
 
         readiness.llm_enabled = get_bool("LLM_ENABLED", False)
         readiness.llm_model = get_env("OPENAI_MODEL", None)
         readiness.llm_rate_limit = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
         readiness.llm_cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
 
-        process = psutil.Process(os.getpid())
+        # ── Step 7: Memory + fingerprint ─────────────────
 
+        process = psutil.Process(os.getpid())
         readiness.boot_memory_mb = round(
             process.memory_info().rss / (1024 * 1024), 2
         )
@@ -246,22 +286,24 @@ async def lifespan(app: FastAPI):
             logger.warning("Startup exceeded expected time.")
 
         logger.info(
-            "Startup complete | time=%ss | redis=%s | drift=%s",
+            "Startup complete | time=%ss | db=%s | redis=%s | drift=%s | synced=%s",
             boot_time,
+            readiness.db_connected,
             readiness.redis_connected,
             readiness.drift_baseline_loaded,
+            readiness.data_synced,
         )
 
         yield
 
-        logger.info("Shutting down MarketSentinel")
+        # ── Shutdown ─────────────────────────────────────
 
+        logger.info("Shutting down MarketSentinel")
+        dispose_engine()
         gc.collect()
 
     except Exception:
-
         logger.exception("CRITICAL STARTUP FAILURE")
-
         raise
 
 
@@ -272,7 +314,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="MarketSentinel Portfolio API",
     version=APP_VERSION,
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 app.add_exception_handler(Exception, global_exception_handler)
@@ -305,10 +347,9 @@ async def request_context_middleware(request: Request, call_next):
         client_key = request.headers.get("X-API-KEY")
 
         if client_key != API_KEY:
-
             raise HTTPException(
                 status_code=401,
-                detail="Invalid API key"
+                detail="Invalid API key",
             )
 
     forwarded = request.headers.get("X-Forwarded-For")
@@ -326,26 +367,22 @@ async def request_context_middleware(request: Request, call_next):
         queue.popleft()
 
     if len(queue) >= RATE_LIMIT:
-
         raise HTTPException(
             status_code=429,
-            detail="Rate limit exceeded"
+            detail="Rate limit exceeded",
         )
 
     queue.append(now)
 
-    # prevent memory explosion
+    # Prevent memory explosion
     if len(request_store) > MAX_TRACKED_IPS:
         request_store.clear()
 
     request_id = str(uuid.uuid4())[:12]
-
     start = time.time()
 
     try:
-
         response = await call_next(request)
-
         latency = time.time() - start
 
         response.headers["X-Request-ID"] = request_id
@@ -354,9 +391,7 @@ async def request_context_middleware(request: Request, call_next):
         return response
 
     except Exception:
-
         logger.exception("Request failure | id=%s", request_id)
-
         raise
 
 
@@ -391,12 +426,14 @@ async def root():
         "boot_id": readiness.boot_id,
         "model_version": readiness.model_version,
         "artifact_hash": readiness.artifact_hash,
+        "db": readiness.db_connected,
         "redis": readiness.redis_connected,
+        "data_synced": readiness.data_synced,
         "drift_baseline": readiness.drift_baseline_loaded,
         "uptime_seconds": uptime,
         "version": APP_VERSION,
         "docs": "/docs",
-        "metrics": "/metrics"
+        "metrics": "/metrics",
     })
 
 
@@ -409,5 +446,5 @@ def metrics():
 
     return Response(
         generate_latest(),
-        media_type=CONTENT_TYPE_LATEST
+        media_type=CONTENT_TYPE_LATEST,
     )

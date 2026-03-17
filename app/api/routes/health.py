@@ -1,20 +1,25 @@
+# =========================================================
+# HEALTH ROUTES v2.0 — with DB health check
+# =========================================================
+
 import time
-import logging
+
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
-    API_ERROR_COUNT
+    API_ERROR_COUNT,
 )
 
 from app.inference.pipeline import get_shared_model_loader
 from core.schema.feature_schema import get_schema_signature
-
+from core.db.engine import check_db_health
+from core.logging.logger import get_logger
 
 router = APIRouter(prefix="/health", tags=["health"])
-logger = logging.getLogger("marketsentinel.health")
+logger = get_logger("marketsentinel.health")
 
 
 # =========================================================
@@ -37,7 +42,7 @@ def liveness():
         return {
             "status": "alive",
             "service": "MarketSentinel",
-            "timestamp": int(time.time())
+            "timestamp": int(time.time()),
         }
 
     except Exception as e:
@@ -49,8 +54,8 @@ def liveness():
             status_code=503,
             content={
                 "status": "error",
-                "error": str(e)
-            }
+                "error": str(e),
+            },
         )
 
     finally:
@@ -60,14 +65,14 @@ def liveness():
 
 
 # =========================================================
-# READINESS
+# READINESS (now includes DB health)
 # =========================================================
 
 @router.get("/ready")
 def readiness():
     """
     Readiness probe.
-    Ensures model and critical dependencies are loaded.
+    Ensures model, database, and critical dependencies are loaded.
     """
 
     endpoint = "/health/ready"
@@ -84,12 +89,16 @@ def readiness():
         if loader.schema_signature != get_schema_signature():
             raise RuntimeError("Schema signature mismatch")
 
+        # DB health check
+        db_status = check_db_health()
+
         return {
             "status": "ready",
             "model_version": loader.xgb_version,
             "schema_signature": loader.schema_signature,
             "artifact_hash": loader.artifact_hash,
-            "timestamp": int(time.time())
+            "database": db_status,
+            "timestamp": int(time.time()),
         }
 
     except Exception as e:
@@ -101,8 +110,8 @@ def readiness():
             status_code=503,
             content={
                 "status": "not_ready",
-                "error": str(e)
-            }
+                "error": str(e),
+            },
         )
 
     finally:
@@ -144,7 +153,7 @@ def model_health():
             "booster_checksum": getattr(model, "booster_checksum", None),
             "best_iteration": getattr(model, "best_iteration", None),
             "feature_count": getattr(model, "training_cols", None),
-            "timestamp": int(time.time())
+            "timestamp": int(time.time()),
         }
 
     except Exception as e:
@@ -156,8 +165,53 @@ def model_health():
             status_code=503,
             content={
                 "status": "error",
-                "error": str(e)
-            }
+                "error": str(e),
+            },
+        )
+
+    finally:
+        API_LATENCY.labels(endpoint=endpoint).observe(
+            time.time() - start_time
+        )
+
+
+# =========================================================
+# DATABASE HEALTH (new endpoint)
+# =========================================================
+
+@router.get("/db")
+def database_health():
+    """
+    Database health check endpoint.
+    Returns PostgreSQL connection status and latency.
+    """
+
+    endpoint = "/health/db"
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
+    start_time = time.time()
+
+    try:
+
+        db_status = check_db_health()
+
+        return {
+            "status": db_status["status"],
+            "latency_ms": db_status.get("latency_ms"),
+            "error": db_status.get("error"),
+            "timestamp": int(time.time()),
+        }
+
+    except Exception as e:
+
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        logger.exception("Database health check failed")
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error": str(e),
+            },
         )
 
     finally:
