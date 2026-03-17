@@ -1,21 +1,25 @@
 # =====================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v3.0
+# MARKET SENTINEL APPLICATION ENTRYPOINT v3.1
 # Hybrid Multi-Agent | DB-Backed | CV-Optimized
 # =====================================================
 
+import asyncio
 import time
 import gc
 import hashlib
 import os
 import psutil
 import uuid
+import datetime
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import timezone
+from datetime import datetime as dt
 from collections import defaultdict, deque
 
 from fastapi import FastAPI, Response, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from core.config.env_loader import init_env, get_int, get_env, get_bool
@@ -68,8 +72,10 @@ API_KEY = os.getenv("API_KEY")
 RATE_LIMIT = int(os.getenv("API_RATE_LIMIT_PER_MIN", "180"))
 WINDOW_SECONDS = 180
 
-# Skip data sync on startup (useful for tests or quick restarts)
 SKIP_DATA_SYNC = os.getenv("SKIP_DATA_SYNC", "0") == "1"
+
+# Background snapshot pre-computation interval (seconds)
+SNAPSHOT_PRECOMPUTE_INTERVAL = int(os.getenv("SNAPSHOT_PRECOMPUTE_INTERVAL", "120"))
 
 PUBLIC_PATHS = {
     "/",
@@ -135,7 +141,7 @@ def api_success(data):
         "success": True,
         "data": data,
         "error": None,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": dt.now(timezone.utc).isoformat(),
     }
 
 
@@ -145,7 +151,7 @@ def api_error(message):
         "success": False,
         "data": None,
         "error": message,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": dt.now(timezone.utc).isoformat(),
     }
 
 
@@ -170,6 +176,71 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # =====================================================
+# BACKGROUND TASKS
+# =====================================================
+
+async def _daily_sync_loop():
+    """
+    Runs delta data sync every weekday at 6:30pm.
+    Only fetches new rows since last stored date — fast after first run.
+    """
+    while True:
+        now = datetime.datetime.now()
+        target = now.replace(hour=18, minute=30, second=0, microsecond=0)
+        if now >= target:
+            target += datetime.timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+
+        if datetime.datetime.now().weekday() < 5:
+            try:
+                logger.info("Running scheduled daily data sync")
+                svc = DataSyncService()
+                report = await asyncio.to_thread(svc.sync_universe)
+                logger.info(
+                    "Daily sync complete | synced=%d skipped=%d errors=%d",
+                    report.get("synced", 0),
+                    report.get("skipped", 0),
+                    report.get("errors", 0),
+                )
+            except Exception as e:
+                logger.warning("Daily sync failed | error=%s", e)
+
+
+async def _background_snapshot_loop():
+    """
+    Pre-computes the full snapshot every SNAPSHOT_PRECOMPUTE_INTERVAL seconds
+    and stores the result in Redis. This means POST /snapshot returns instantly
+    from cache instead of waiting 10-30s for inference.
+    """
+    # Wait for initial startup to complete before starting
+    await asyncio.sleep(30)
+
+    while True:
+        try:
+            from app.api.routes.predict import get_pipeline, load_default_universe
+
+            pipeline = get_pipeline()
+            tickers = load_default_universe()
+
+            result = await asyncio.to_thread(pipeline.run_snapshot, tickers)
+
+            cache = RedisCache()
+            if cache.enabled:
+                key = cache.build_key({"type": "background_snapshot"})
+                cache.set(key, result)
+                logger.info(
+                    "Background snapshot cached | signals=%d | model=%s",
+                    len(result.get("signals", [])),
+                    result.get("model_version", "unknown"),
+                )
+
+        except Exception as e:
+            logger.warning("Background snapshot failed | error=%s", e)
+
+        await asyncio.sleep(SNAPSHOT_PRECOMPUTE_INTERVAL)
+
+
+# =====================================================
 # LIFESPAN MANAGEMENT
 # =====================================================
 
@@ -181,7 +252,7 @@ async def lifespan(app: FastAPI):
     try:
 
         logger.info("===================================")
-        logger.info(" MarketSentinel Boot Sequence v3.0 ")
+        logger.info(" MarketSentinel Boot Sequence v3.1 ")
         logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("===================================")
 
@@ -294,6 +365,18 @@ async def lifespan(app: FastAPI):
             readiness.data_synced,
         )
 
+        # ── Step 8: Start background tasks ───────────────
+
+        asyncio.create_task(_daily_sync_loop())
+        logger.info("Daily sync scheduler started (runs weekdays at 18:30)")
+
+        if readiness.models_loaded and readiness.db_connected:
+            asyncio.create_task(_background_snapshot_loop())
+            logger.info(
+                "Background snapshot pre-computation started (interval=%ds)",
+                SNAPSHOT_PRECOMPUTE_INTERVAL,
+            )
+
         yield
 
         # ── Shutdown ─────────────────────────────────────
@@ -321,8 +404,11 @@ app.add_exception_handler(Exception, global_exception_handler)
 
 
 # =====================================================
-# CORS
+# MIDDLEWARE (order matters — outermost first)
 # =====================================================
+
+# GZip — compresses responses > 1KB (cuts JSON payload 60-80%)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 app.add_middleware(
     CORSMiddleware,
@@ -374,7 +460,6 @@ async def request_context_middleware(request: Request, call_next):
 
     queue.append(now)
 
-    # Prevent memory explosion
     if len(request_store) > MAX_TRACKED_IPS:
         request_store.clear()
 
@@ -402,12 +487,28 @@ async def request_context_middleware(request: Request, call_next):
 app.include_router(predict.router)
 app.include_router(health.router)
 app.include_router(universe.router)
-app.include_router(model_info.router)
+app.include_router(model_info.router, prefix="/model")   # FIX: /model/info, /model/model-info → /model/info
 app.include_router(drift.router)
 app.include_router(portfolio.router)
 app.include_router(performance.router)
 app.include_router(equity.router)
 app.include_router(agent.router)
+
+
+# =====================================================
+# ROOT-LEVEL SNAPSHOT ALIAS
+# FIX: predict.router uses prefix=/predict so POST /snapshot
+# was returning 404. This aliases it at the root level.
+# =====================================================
+
+@app.post("/snapshot")
+async def snapshot():
+    """
+    Full inference run — all tickers, multi-agent pipeline, portfolio construction.
+    Alias for POST /predict/live-snapshot at the root level.
+    """
+    from app.api.routes.predict import live_snapshot
+    return await live_snapshot()
 
 
 # =====================================================
