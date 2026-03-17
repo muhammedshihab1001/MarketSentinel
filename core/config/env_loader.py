@@ -1,14 +1,28 @@
+"""
+MarketSentinel — Environment Loader v3.0
+
+Initialises all environment variables, validates providers,
+and sets up the application runtime context.
+
+Changes from v2.x:
+  - Removed _configure_logging() — now handled by core.logging.logger
+  - Added PostgreSQL default env vars for DB layer
+  - Added _validate_database() check
+  - Added DB connection string to environment fingerprint
+"""
+
 import hashlib
 import logging
 import os
 import sys
 import threading
-from logging.handlers import RotatingFileHandler
 from typing import List, Optional
 
 from dotenv import load_dotenv
 
-logger = logging.getLogger("marketsentinel.env")
+from core.logging.logger import setup_logging, get_logger
+
+logger = get_logger("marketsentinel.env")
 
 _ENV_INITIALIZED = False
 _ENV_LOCK = threading.Lock()
@@ -21,53 +35,6 @@ _KNOWN_OPENAI_MODELS = {
     "gpt-4",
     "gpt-3.5-turbo",
 }
-
-
-# ============================================================
-# LOGGING CONFIG  (CI + Docker safe)
-# ============================================================
-
-def _configure_logging() -> None:
-    """Set up root logger. Idempotent — safe to call multiple times."""
-
-    if logging.getLogger().handlers:
-        return
-
-    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, log_level, logging.INFO)
-
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-        "%Y-%m-%d %H:%M:%S",
-    )
-
-    root = logging.getLogger()
-    root.setLevel(level)
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(formatter)
-    root.addHandler(console)
-
-    # Optional file logging
-    if os.getenv("ENABLE_FILE_LOGGING", "0") == "1":
-        log_dir = os.getenv("LOG_DIR", "logs")
-        os.makedirs(log_dir, exist_ok=True)
-
-        fh = RotatingFileHandler(
-            os.path.join(log_dir, "marketsentinel.log"),
-            maxBytes=10_000_000,
-            backupCount=3,
-            encoding="utf-8",
-        )
-        fh.setFormatter(formatter)
-        root.addHandler(fh)
-
-    logger.info(
-        "Logging initialised | level=%s | python=%s | pid=%s",
-        log_level,
-        sys.version.split()[0],
-        os.getpid(),
-    )
 
 
 # ============================================================
@@ -94,6 +61,43 @@ def _ensure_path(key: str, default: str) -> None:
         raise RuntimeError(
             f"Failed to create/access path for {key}='{path}': {exc}"
         ) from exc
+
+
+# ============================================================
+# DATABASE VALIDATION
+# ============================================================
+
+def _validate_database() -> None:
+    """
+    Validate PostgreSQL configuration.
+
+    Checks that either DATABASE_URL or individual POSTGRES_* vars
+    are set. Logs the target host (without password).
+    """
+
+    full_url = os.getenv("DATABASE_URL")
+
+    if full_url:
+        # Mask password in log output
+        safe_url = full_url.split("@")[-1] if "@" in full_url else full_url
+        logger.info(
+            "Database configured via DATABASE_URL | host=%s",
+            safe_url,
+            extra={"component": "env_loader", "function": "_validate_database"},
+        )
+        return
+
+    host = os.getenv("POSTGRES_HOST", "localhost")
+    port = os.getenv("POSTGRES_PORT", "5432")
+    db_name = os.getenv("POSTGRES_DB", "marketsentinel")
+
+    logger.info(
+        "Database configured via POSTGRES_* vars | host=%s:%s db=%s",
+        host,
+        port,
+        db_name,
+        extra={"component": "env_loader", "function": "_validate_database"},
+    )
 
 
 # ============================================================
@@ -183,6 +187,8 @@ def _environment_fingerprint() -> None:
         os.getenv("MARKET_PROVIDERS_ACTIVE", ""),
         os.getenv("YAHOO_SOFT_FAIL", ""),
         os.getenv("YFINANCE_SOFT_MODE", ""),
+        os.getenv("POSTGRES_HOST", ""),
+        os.getenv("POSTGRES_DB", ""),
     ])
 
     fp = hashlib.sha256(payload.encode()).hexdigest()[:12]
@@ -215,7 +221,9 @@ def init_env() -> None:
         if os.getenv("DOTENV_ENABLED", "1") == "1":
             load_dotenv(override=False)
 
-        _configure_logging()
+        # Logging is now handled by core.logging.logger
+        # setup_logging() is called automatically on first get_logger()
+        # No need to call _configure_logging() here
 
         defaults = {
 
@@ -238,9 +246,15 @@ def init_env() -> None:
             "YFINANCE_SOFT_MODE": "1",
             "YAHOO_MAX_CONCURRENT": "1",
 
+            # PostgreSQL
+            "POSTGRES_HOST": "localhost",
+            "POSTGRES_PORT": "5432",
+            "POSTGRES_USER": "sentinel",
+            "POSTGRES_PASSWORD": "sentinel",
+            "POSTGRES_DB": "marketsentinel",
+
             # Logging
             "LOG_LEVEL": "INFO",
-            "ENABLE_FILE_LOGGING": "0",
         }
 
         for key, value in defaults.items():
@@ -249,7 +263,9 @@ def init_env() -> None:
         _ensure_path("MODEL_REGISTRY_PATH", "artifacts/registry")
         _ensure_path("FEATURE_STORE_PATH", "artifacts/feature_store")
         _ensure_path("XGB_REGISTRY_DIR", "artifacts/xgboost")
+        _ensure_path("LOG_DIR", "logs")
 
+        _validate_database()
         _validate_market_providers()
         _validate_llm()
 
