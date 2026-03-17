@@ -1,3 +1,8 @@
+# =========================================================
+# PERFORMANCE ROUTE v2.2
+# DB-Backed | CV-Optimized
+# =========================================================
+
 import logging
 import pandas as pd
 import numpy as np
@@ -9,92 +14,113 @@ from fastapi.concurrency import run_in_threadpool
 from core.analytics.performance_engine import PerformanceEngine
 from core.data.market_data_service import MarketDataService
 from core.market.universe import MarketUniverse
-from core.features.feature_engineering import FeatureEngineer
-from core.schema.feature_schema import (
-    MODEL_FEATURES,
-    validate_feature_schema,
-    DTYPE,
-)
-
-from app.inference.pipeline import InferencePipeline, get_shared_model_loader
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
-    API_ERROR_COUNT
+    API_ERROR_COUNT,
 )
+from core.logging.logger import get_logger
+
+logger = get_logger("marketsentinel.performance")
 
 router = APIRouter()
-logger = logging.getLogger("marketsentinel.performance")
-
-MIN_HISTORY_ROWS = 60
-BENCHMARK_TICKER = "SPY"
-MIN_SCORE_STD = 1e-6
-REQUEST_TIMEOUT = 180
-MAX_CONCURRENT = 2
-
-performance_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-_pipeline = None
-
-
-def get_pipeline():
-    global _pipeline
-    if _pipeline is None:
-        _pipeline = InferencePipeline()
-    return _pipeline
 
 
 # =========================================================
-# INTERNAL PORTFOLIO BUILDER (Stable + CV-Level Clean)
-# =========================================================
-
-def construct_portfolio(longs: pd.DataFrame,
-                        shorts: pd.DataFrame) -> dict:
-    """
-    Equal-weight long/short portfolio.
-    Keeps project simple and stable.
-    """
-
-    weights = {}
-
-    if not longs.empty:
-        long_weight = 1.0 / len(longs)
-        for _, row in longs.iterrows():
-            weights[row["ticker"]] = float(long_weight)
-
-    if not shorts.empty:
-        short_weight = -1.0 / len(shorts)
-        for _, row in shorts.iterrows():
-            weights[row["ticker"]] = float(short_weight)
-
-    return weights
-
-
-# =========================================================
-# ASYNC ENTRYPOINT
+# PERFORMANCE SUMMARY ENDPOINT
 # =========================================================
 
 @router.get("/performance")
-async def compute_performance(days: int = 120):
+async def performance_summary(tickers: str = "", days: int = 252):
+    """
+    Returns portfolio-level performance metrics.
+    tickers: comma-separated list (default: full universe)
+    days: lookback window (default 252 = 1 year, max 500)
+    """
 
     endpoint = "/performance"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
 
+    days = max(30, min(days, 500))
+
     try:
-        async with performance_semaphore:
-            result = await asyncio.wait_for(
-                run_in_threadpool(_compute_performance_sync, days),
-                timeout=REQUEST_TIMEOUT
+        universe = MarketUniverse.snapshot()
+        all_tickers = universe.get("tickers", [])
+
+        if tickers:
+            requested = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+            valid = set(all_tickers)
+            ticker_list = [t for t in requested if t in valid]
+            if not ticker_list:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No valid tickers in request"
+                )
+        else:
+            ticker_list = all_tickers
+
+        def _fetch_and_compute():
+            svc = MarketDataService()
+            price_map, errors = svc.get_price_data_batch(
+                ticker_list,
+                interval="1d",
+                min_history=days,
             )
+
+            if not price_map:
+                return None, errors
+
+            # Build close price matrix
+            close_frames = {}
+            for t, df in price_map.items():
+                if df is not None and not df.empty and "Close" in df.columns:
+                    close_frames[t] = df["Close"].tail(days)
+
+            if not close_frames:
+                return None, errors
+
+            close_matrix = pd.DataFrame(close_frames).dropna(how="all")
+
+            engine = PerformanceEngine()
+            report = engine.compute(close_matrix)
+            return report, errors
+
+        report, errors = await run_in_threadpool(_fetch_and_compute)
+
+        if report is None:
+            raise HTTPException(
+                status_code=503,
+                detail="No price data available for performance computation"
+            )
+
+        result = {
+            "tickers_requested": len(ticker_list),
+            "tickers_computed": len(ticker_list) - len(errors),
+            "lookback_days": days,
+            "data_source": "postgresql",
+            "metrics": {
+                "cumulative_return": round(float(report.cumulative_return), 6),
+                "sharpe_ratio": round(float(report.sharpe_ratio), 4),
+                "sortino_ratio": round(float(report.sortino_ratio), 4),
+                "calmar_ratio": round(float(report.calmar_ratio), 4),
+                "max_drawdown": round(float(report.max_drawdown), 6),
+                "volatility_ann": round(float(report.volatility_ann), 6),
+                "win_rate": round(float(report.win_rate), 4),
+            },
+        }
+
+        if errors:
+            result["fetch_errors"] = errors
+
         return result
 
-    except asyncio.TimeoutError:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        raise HTTPException(status_code=504, detail="Performance computation timeout")
+    except HTTPException:
+        raise
 
     except Exception as e:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.exception("Performance computation failed")
+        logger.exception("Performance endpoint failure")
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
@@ -102,238 +128,71 @@ async def compute_performance(days: int = 120):
 
 
 # =========================================================
-# SYNC LOGIC
+# PER-TICKER PERFORMANCE ENDPOINT
 # =========================================================
 
-def _compute_performance_sync(days: int):
+@router.get("/performance/{ticker}")
+async def ticker_performance(ticker: str, days: int = 252):
+    """
+    Returns performance metrics for a single ticker.
+    """
 
+    endpoint = "/performance/ticker"
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
 
-    engine = PerformanceEngine()
-    pipeline = get_pipeline()
-    loader = get_shared_model_loader()
-    market_data = MarketDataService()
+    ticker = ticker.upper().strip()
+    days = max(30, min(days, 500))
 
-    universe = list(set(MarketUniverse.get_universe()))
+    try:
+        universe = MarketUniverse.snapshot()
+        valid_tickers = set(universe.get("tickers", []))
 
-    end_date = pd.Timestamp.utcnow().normalize()
-    start_date = end_date - pd.Timedelta(days=days + 365)
-
-    start_str = start_date.strftime("%Y-%m-%d")
-    end_str = end_date.strftime("%Y-%m-%d")
-
-    # =========================================================
-    # FETCH PRICE DATA
-    # =========================================================
-
-    # get_price_data_batch returns (results_dict, failures_dict)
-    price_results, price_failures = market_data.get_price_data_batch(
-        tickers=universe,
-        start_date=start_str,
-        end_date=end_str,
-        interval="1d",
-        min_history=MIN_HISTORY_ROWS,
-    )
-
-    if price_failures:
-        logger.warning(
-            "Performance: price fetch failed for %d tickers: %s",
-            len(price_failures), list(price_failures.keys()),
-        )
-
-    # Build forward returns lookup from raw price data
-    cleaned_history = {}
-
-    for ticker, df in price_results.items():
-
-        if df is None or len(df) < MIN_HISTORY_ROWS:
-            continue
-
-        df = df.sort_values("date").reset_index(drop=True)
-        df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-
-        df["forward_return"] = df["close"].shift(-1) / df["close"] - 1
-        df["forward_return"] = df["forward_return"].replace(
-            [np.inf, -np.inf], np.nan
-        )
-
-        cleaned_history[ticker] = df
-
-    if not cleaned_history:
-        raise RuntimeError("No valid price data available.")
-
-    # =========================================================
-    # BUILD FEATURES — concat all tickers, pipeline once
-    # =========================================================
-
-    combined_prices = pd.concat(
-        list(price_results.values()), ignore_index=True
-    )
-
-    full_df = FeatureEngineer.build_feature_pipeline(
-        combined_prices, training=False
-    )
-
-    if full_df.empty:
-        raise RuntimeError("Feature pipeline produced empty dataset.")
-
-    full_df = full_df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
-    portfolio_records = []
-    eval_dates = sorted(full_df["date"].unique())[-days:]
-    model = loader.xgb
-
-    # =========================================================
-    # DAILY PORTFOLIO SIMULATION
-    # =========================================================
-
-    for eval_date in eval_dates:
-
-        daily_slice = full_df[full_df["date"] == eval_date].copy()
-
-        if daily_slice["ticker"].nunique() < pipeline.MIN_UNIVERSE_WIDTH:
-            continue
-
-        feature_df = validate_feature_schema(
-            daily_slice.loc[:, MODEL_FEATURES],
-            mode="inference"
-        ).astype(DTYPE)
-
-        scores = model.predict(feature_df)
-
-        # Skip unstable low-dispersion days (yfinance noise control)
-        if np.std(scores) < MIN_SCORE_STD:
-            continue
-
-        scores = (scores - scores.mean()) / (scores.std() + 1e-12)
-        daily_slice["score"] = scores
-
-        # Drift scaling
-        drift_result = pipeline._safe_drift(feature_df)
-        exposure_scale = drift_result.get("exposure_scale", 1.0)
-
-        ranked = daily_slice.sort_values("score")
-
-        longs = ranked.tail(pipeline.TOP_K)
-        shorts = ranked.head(pipeline.BOTTOM_K)
-
-        if longs.empty or shorts.empty:
-            continue
-
-        weights = construct_portfolio(longs, shorts)
-
-        for _, row in daily_slice.iterrows():
-            base_weight = weights.get(row["ticker"], 0.0)
-            portfolio_records.append({
-                "date": row["date"],
-                "ticker": row["ticker"],
-                "weight": float(base_weight * exposure_scale)
-            })
-
-    if not portfolio_records:
-        raise RuntimeError("No portfolio history generated.")
-
-    portfolio_df = pd.DataFrame(portfolio_records)
-
-    # =========================================================
-    # FORWARD RETURNS
-    # =========================================================
-
-    forward_frames = []
-
-    for ticker, df in cleaned_history.items():
-        tmp = df[["date", "forward_return"]].copy()
-        tmp["ticker"] = ticker
-        forward_frames.append(tmp)
-
-    forward_df = pd.concat(forward_frames, ignore_index=True)
-    forward_df = forward_df.dropna(subset=["forward_return"])
-
-    report = engine.evaluate(portfolio_df, forward_df)
-
-    # =========================================================
-    # BENCHMARK
-    # =========================================================
-
-    benchmark_results, _ = market_data.get_price_data_batch(
-        tickers=[BENCHMARK_TICKER],
-        start_date=start_str,
-        end_date=end_str,
-        interval="1d",
-        min_history=MIN_HISTORY_ROWS,
-    )
-
-    benchmark_df = benchmark_results.get(BENCHMARK_TICKER)
-
-    benchmark_cumulative = 0.0
-    alpha = 0.0
-    info_ratio = 0.0
-
-    if benchmark_df is not None and not benchmark_df.empty:
-
-        benchmark_df = benchmark_df.sort_values("date")
-        benchmark_df["forward_return"] = (
-            benchmark_df["close"].shift(-1) /
-            benchmark_df["close"] - 1
-        )
-
-        benchmark_returns = (
-            benchmark_df
-            .set_index("date")["forward_return"]
-            .reindex(report.daily_returns.index)
-            .dropna()
-        )
-
-        if len(benchmark_returns) > 2:
-
-            benchmark_equity = (1 + benchmark_returns).cumprod()
-            benchmark_cumulative = float(
-                benchmark_equity.iloc[-1] - 1
+        if ticker not in valid_tickers:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Ticker '{ticker}' not in universe"
             )
 
-            aligned_strategy = report.daily_returns.loc[
-                benchmark_returns.index
-            ]
+        def _fetch_and_compute():
+            svc = MarketDataService()
+            df = svc.get_price_data(ticker, interval="1d", min_history=days)
+            if df is None or df.empty:
+                return None
+            close = df["Close"].tail(days).to_frame()
+            engine = PerformanceEngine()
+            return engine.compute(close)
 
-            excess_returns = aligned_strategy - benchmark_returns
+        report = await run_in_threadpool(_fetch_and_compute)
 
-            if excess_returns.std() > 0:
-                info_ratio = float(
-                    (excess_returns.mean() /
-                     excess_returns.std()) * np.sqrt(252)
-                )
-
-            years = len(benchmark_returns) / 252
-            benchmark_annual = (
-                (1 + benchmark_cumulative) ** (1 / years) - 1
-                if years > 0 else 0.0
+        if report is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"No price data available for {ticker}"
             )
 
-            alpha = float(report.annual_return - benchmark_annual)
+        return {
+            "ticker": ticker,
+            "lookback_days": days,
+            "data_source": "postgresql",
+            "metrics": {
+                "cumulative_return": round(float(report.cumulative_return), 6),
+                "sharpe_ratio": round(float(report.sharpe_ratio), 4),
+                "sortino_ratio": round(float(report.sortino_ratio), 4),
+                "calmar_ratio": round(float(report.calmar_ratio), 4),
+                "max_drawdown": round(float(report.max_drawdown), 6),
+                "volatility_ann": round(float(report.volatility_ann), 6),
+                "win_rate": round(float(report.win_rate), 4),
+            },
+        }
 
-    return {
-        "strategy": {
-            "cumulative_return": float(report.cumulative_return),
-            "annual_return": float(report.annual_return),
-            "annual_volatility": float(report.annual_volatility),
-            "sharpe_ratio": float(report.sharpe_ratio),
-            "max_drawdown": float(report.max_drawdown),
-            "hit_rate": float(report.hit_rate),
-            "turnover": float(report.turnover),
-        },
-        "benchmark": {
-            "ticker": BENCHMARK_TICKER,
-            "cumulative_return": float(benchmark_cumulative),
-        },
-        "relative": {
-            "alpha": float(alpha),
-            "information_ratio": float(info_ratio),
-        },
-        "governance": {
-            "model_version": loader.xgb_version,
-            "schema_signature": loader.schema_signature,
-            "artifact_hash": loader.artifact_hash,
-        },
-        "latency_ms": int((time.time() - start_time) * 1000),
-        "timestamp": int(time.time())
-    }
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        logger.exception("Ticker performance failure | ticker=%s", ticker)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
