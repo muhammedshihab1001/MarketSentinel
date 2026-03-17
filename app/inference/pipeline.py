@@ -1,13 +1,12 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v5.1
-# Stable | Drift-Aware | CV-Optimized | Noise-Controlled
+# INSTITUTIONAL INFERENCE PIPELINE v5.2
+# Stable | Drift-Aware | CV-Optimized | DB-Backed
 # =========================================================
 
 import time
 import threading
 import numpy as np
 import pandas as pd
-import logging
 import os
 from typing import List
 
@@ -30,6 +29,9 @@ from core.agent.technical_risk_agent import TechnicalRiskAgent
 from core.agent.portfolio_decision_agent import PortfolioDecisionAgent
 from core.agent.political_risk_agent import PoliticalRiskAgent
 
+from core.db.repository import PredictionRepository
+from core.logging.logger import get_logger
+
 from app.monitoring.metrics import (
     MODEL_INFERENCE_COUNT,
     MODEL_INFERENCE_LATENCY,
@@ -37,7 +39,7 @@ from app.monitoring.metrics import (
     INFERENCE_IN_PROGRESS,
 )
 
-logger = logging.getLogger("marketsentinel.pipeline")
+logger = get_logger("marketsentinel.pipeline")
 
 EPSILON = 1e-12
 
@@ -59,7 +61,10 @@ def get_shared_model_loader():
 
             if _SHARED_MODEL_LOADER is None:
 
-                logger.info("Initializing shared ModelLoader")
+                logger.info(
+                    "Initializing shared ModelLoader",
+                    extra={"component": "pipeline", "function": "get_shared_model_loader"},
+                )
 
                 _SHARED_MODEL_LOADER = ModelLoader()
 
@@ -87,6 +92,9 @@ class InferencePipeline:
 
     SNAPSHOT_CACHE_TTL = int(os.getenv("SNAPSHOT_CACHE_TTL", "120"))
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
+
+    # Whether to store predictions in PostgreSQL for audit trail
+    STORE_PREDICTIONS = os.getenv("STORE_PREDICTIONS", "1") == "1"
 
     # -----------------------------------------------------
 
@@ -118,15 +126,26 @@ class InferencePipeline:
         if container.schema_signature != get_schema_signature():
             raise RuntimeError("Schema signature mismatch.")
 
-        logger.info("Model verified | version=%s", container.version)
+        logger.info(
+            "Model verified | version=%s",
+            container.version,
+            extra={"component": "pipeline", "function": "_validate_models_loaded"},
+        )
 
     # =========================================================
     # FEATURE FRAME BUILDER
     # =========================================================
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
+        """
+        Build the full cross-sectional feature frame.
 
-        end_date = pd.Timestamp.utcnow()
+        Now reads from PostgreSQL via MarketDataService (DB-backed).
+        No Yahoo Finance calls happen here.
+        """
+
+        # FIX: pd.Timestamp.utcnow() is deprecated
+        end_date = pd.Timestamp.now(tz="UTC")
         start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
 
         data, failures = self.market_data.get_price_data_batch(
@@ -140,6 +159,7 @@ class InferencePipeline:
                 "Market data partial failure | success=%d | failed=%d",
                 len(data),
                 len(failures),
+                extra={"component": "pipeline", "function": "_build_cross_sectional_frame"},
             )
 
         if len(data) < self.MIN_UNIVERSE_WIDTH:
@@ -160,6 +180,7 @@ class InferencePipeline:
             "Cross-sectional frame built | rows=%d tickers=%d",
             len(combined),
             combined["ticker"].nunique(),
+            extra={"component": "pipeline", "function": "_build_cross_sectional_frame"},
         )
 
         return combined
@@ -187,7 +208,10 @@ class InferencePipeline:
         try:
             return self.drift_detector.detect(feature_df)
         except Exception:
-            logger.warning("Drift detector failed.")
+            logger.warning(
+                "Drift detector failed.",
+                extra={"component": "pipeline", "function": "_safe_drift"},
+            )
             return {
                 "drift_state": "unknown",
                 "severity_score": 0.0,
@@ -203,7 +227,10 @@ class InferencePipeline:
         try:
             return agent.analyze(context)
         except Exception:
-            logger.exception("Agent failure.")
+            logger.exception(
+                "Agent failure.",
+                extra={"component": "pipeline", "function": "_safe_agent"},
+            )
             return {"score": 0.0, "agent_score": 0.0, "hybrid": {"score": 0.0}}
 
     # =========================================================
@@ -242,6 +269,46 @@ class InferencePipeline:
         return weights
 
     # =========================================================
+    # STORE PREDICTIONS (NEW — audit trail in PostgreSQL)
+    # =========================================================
+
+    def _store_predictions(self, snapshot_rows, drift_result, container):
+        """
+        Store prediction results in PostgreSQL for audit trail.
+        Non-blocking — failures are logged but don't crash the pipeline.
+        """
+
+        if not self.STORE_PREDICTIONS:
+            return
+
+        try:
+
+            predictions = []
+
+            for row in snapshot_rows:
+                predictions.append({
+                    "ticker": row["ticker"],
+                    "date": row["date"],
+                    "model_version": container.version,
+                    "schema_signature": container.schema_signature,
+                    "raw_model_score": row["raw_model_score"],
+                    "hybrid_score": row.get("hybrid_consensus_score", 0.0),
+                    "weight": row.get("weight", 0.0),
+                    "signal": "LONG" if row.get("weight", 0) > 0 else (
+                        "SHORT" if row.get("weight", 0) < 0 else "NEUTRAL"
+                    ),
+                    "drift_state": drift_result.get("drift_state", "unknown"),
+                })
+
+            PredictionRepository.store_predictions(predictions)
+
+        except Exception:
+            logger.warning(
+                "Failed to store predictions in DB (non-blocking)",
+                extra={"component": "pipeline", "function": "_store_predictions"},
+            )
+
+    # =========================================================
     # MAIN SNAPSHOT
     # =========================================================
 
@@ -275,7 +342,7 @@ class InferencePipeline:
             latest_df = df[df["date"] == latest_date].copy()
             latest_df = latest_df[latest_df["ticker"].isin(requested)]
 
-            # 🔥 FIX: safer cleaning
+            # Safer cleaning
             latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
             latest_df = latest_df.dropna(subset=MODEL_FEATURES, how="any")
 
@@ -290,7 +357,6 @@ class InferencePipeline:
             drift_result = self._safe_drift(feature_df)
             exposure_scale = drift_result.get("exposure_scale", 1.0)
 
-            # 🔥 FIX: PASS DATAFRAME (NOT NUMPY)
             raw_scores = model.predict(feature_df)
 
             raw_scores = self._winsorize(raw_scores)
@@ -298,7 +364,10 @@ class InferencePipeline:
             score_std = raw_scores.std()
 
             if score_std < self.MIN_SCORE_STD:
-                logger.warning("Score collapse detected.")
+                logger.warning(
+                    "Score collapse detected.",
+                    extra={"component": "pipeline", "function": "run_snapshot"},
+                )
                 score_std = 1.0  # fallback instead of crash
 
             raw_scores = (
@@ -350,6 +419,9 @@ class InferencePipeline:
                 "signals": snapshot_rows
             }
 
+            # Store predictions in PostgreSQL for audit trail
+            self._store_predictions(snapshot_rows, drift_result, container)
+
             self.cache.set(cache_key, result, ex=self.SNAPSHOT_CACHE_TTL)
 
             MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
@@ -357,12 +429,25 @@ class InferencePipeline:
                 time.time() - start_time
             )
 
+            latency_sec = round(time.time() - start_time, 2)
+
+            logger.info(
+                "Snapshot complete | tickers=%d model=%s latency=%.2fs",
+                len(snapshot_rows),
+                container.version,
+                latency_sec,
+                extra={"component": "pipeline", "function": "run_snapshot"},
+            )
+
             return result
 
         except Exception:
 
             PIPELINE_FAILURES.labels(stage="snapshot").inc()
-            logger.exception("Snapshot failure.")
+            logger.exception(
+                "Snapshot failure.",
+                extra={"component": "pipeline", "function": "run_snapshot"},
+            )
             raise
 
         finally:
