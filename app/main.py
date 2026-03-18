@@ -1,6 +1,6 @@
 # =====================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v3.1
-# Hybrid Multi-Agent | DB-Backed | CV-Optimized
+# MARKET SENTINEL APPLICATION ENTRYPOINT v3.2
+# Hybrid Multi-Agent | DB-Backed | Auth-Enabled
 # =====================================================
 
 import asyncio
@@ -38,6 +38,10 @@ from app.api.routes import (
     agent,
 )
 
+# ── Auth imports ─────────────────────────────────────
+from app.api.routes import auth as auth_router
+from app.core.auth.middleware import AuthMiddleware
+
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
 from core.monitoring.drift_detector import DriftDetector
@@ -67,6 +71,8 @@ APP_VERSION = get_env("APP_VERSION", "5.0.0")
 CORS_ORIGINS = get_env("CORS_ORIGINS", "*")
 CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS.split(",")]
 
+# Legacy API key — kept for backward compat with external tools
+# Auth middleware handles JWT-based auth for the frontend
 API_KEY = os.getenv("API_KEY")
 
 RATE_LIMIT = int(os.getenv("API_RATE_LIMIT_PER_MIN", "180"))
@@ -74,16 +80,25 @@ WINDOW_SECONDS = 180
 
 SKIP_DATA_SYNC = os.getenv("SKIP_DATA_SYNC", "0") == "1"
 
-# Background snapshot pre-computation interval (seconds)
 SNAPSHOT_PRECOMPUTE_INTERVAL = int(os.getenv("SNAPSHOT_PRECOMPUTE_INTERVAL", "120"))
 
+# Auth paths are always public — never require API key or JWT
 PUBLIC_PATHS = {
     "/",
     "/docs",
     "/openapi.json",
+    "/redoc",
     "/metrics",
     "/health/live",
     "/health/ready",
+    "/health/db",
+    "/health/model",
+    "/universe",
+    "/auth/owner-login",
+    "/auth/demo-login",
+    "/auth/me",
+    "/auth/logout",
+    "/favicon.ico",
 }
 
 request_store = defaultdict(lambda: deque())
@@ -136,7 +151,6 @@ readiness = ReadinessState()
 # =====================================================
 
 def api_success(data):
-
     return {
         "success": True,
         "data": data,
@@ -146,7 +160,6 @@ def api_success(data):
 
 
 def api_error(message):
-
     return {
         "success": False,
         "data": None,
@@ -209,10 +222,9 @@ async def _daily_sync_loop():
 async def _background_snapshot_loop():
     """
     Pre-computes the full snapshot every SNAPSHOT_PRECOMPUTE_INTERVAL seconds
-    and stores the result in Redis. This means POST /snapshot returns instantly
-    from cache instead of waiting 10-30s for inference.
+    and stores the result in Redis. POST /snapshot and GET /portfolio/drift
+    serve from this cache — instant responses instead of 10-30s inference.
     """
-    # Wait for initial startup to complete before starting
     await asyncio.sleep(30)
 
     while True:
@@ -252,7 +264,7 @@ async def lifespan(app: FastAPI):
     try:
 
         logger.info("===================================")
-        logger.info(" MarketSentinel Boot Sequence v3.1 ")
+        logger.info(" MarketSentinel Boot Sequence v3.2 ")
         logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("===================================")
 
@@ -262,33 +274,28 @@ async def lifespan(app: FastAPI):
             init_db()
             db_health = check_db_health()
             readiness.db_connected = db_health["status"] == "healthy"
-
             logger.info(
                 "Database ready | status=%s latency=%.1fms",
                 db_health["status"],
                 db_health.get("latency_ms", 0),
             )
-
         except Exception:
             readiness.db_connected = False
             logger.exception("Database initialization failed")
 
-        # ── Step 2: Sync market data (Yahoo → PostgreSQL) ──
+        # ── Step 2: Sync market data ──────────────────────
 
         if readiness.db_connected and not SKIP_DATA_SYNC:
-
             try:
                 sync_service = DataSyncService()
                 readiness.sync_report = sync_service.sync_universe()
                 readiness.data_synced = True
-
                 logger.info(
                     "Data sync complete | synced=%d skipped=%d errors=%d",
                     readiness.sync_report.get("synced", 0),
                     readiness.sync_report.get("skipped", 0),
                     readiness.sync_report.get("errors", 0),
                 )
-
             except Exception:
                 readiness.data_synced = False
                 logger.exception("Data sync failed — DB may have stale data")
@@ -344,7 +351,6 @@ async def lifespan(app: FastAPI):
         readiness.boot_memory_mb = round(
             process.memory_info().rss / (1024 * 1024), 2
         )
-
         readiness.config_fingerprint = hashlib.sha256(
             str(sorted(os.environ.items())).encode()
         ).hexdigest()[:16]
@@ -407,7 +413,7 @@ app.add_exception_handler(Exception, global_exception_handler)
 # MIDDLEWARE (order matters — outermost first)
 # =====================================================
 
-# GZip — compresses responses > 1KB (cuts JSON payload 60-80%)
+# GZip — compresses responses > 1KB
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 app.add_middleware(
@@ -418,9 +424,15 @@ app.add_middleware(
     allow_credentials=True,
 )
 
+# Auth middleware — JWT validation + demo feature group tracking
+# Runs AFTER CORS so preflight OPTIONS requests pass through
+app.add_middleware(AuthMiddleware)
+
 
 # =====================================================
 # REQUEST MIDDLEWARE
+# Legacy API key check + rate limiting
+# Auth middleware above handles JWT — this handles API_KEY and rate limits
 # =====================================================
 
 @app.middleware("http")
@@ -428,35 +440,29 @@ async def request_context_middleware(request: Request, call_next):
 
     path = request.url.path
 
+    # Legacy API key check — only if API_KEY is set in .env
+    # Auth middleware already handles JWT — this is for external API clients
     if path not in PUBLIC_PATHS and API_KEY:
-
         client_key = request.headers.get("X-API-KEY")
-
-        if client_key != API_KEY:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid API key",
-            )
+        # Skip API key check if JWT auth is present (cookie or Bearer)
+        has_jwt = (
+            request.cookies.get("ms_token") or
+            request.headers.get("Authorization", "").startswith("Bearer ")
+        )
+        if not has_jwt and client_key != API_KEY:
+            raise HTTPException(status_code=401, detail="Invalid API key")
 
     forwarded = request.headers.get("X-Forwarded-For")
-
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
-    else:
-        client_ip = request.client.host
+    client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
 
     now = time.time()
-
     queue = request_store[client_ip]
 
     while queue and queue[0] < now - WINDOW_SECONDS:
         queue.popleft()
 
     if len(queue) >= RATE_LIMIT:
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded",
-        )
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
     queue.append(now)
 
@@ -469,10 +475,8 @@ async def request_context_middleware(request: Request, call_next):
     try:
         response = await call_next(request)
         latency = time.time() - start
-
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time"] = str(round(latency, 4))
-
         return response
 
     except Exception:
@@ -484,10 +488,14 @@ async def request_context_middleware(request: Request, call_next):
 # ROUTERS
 # =====================================================
 
+# Auth routes — registered first, all public
+app.include_router(auth_router.router)
+
+# Data routes
 app.include_router(predict.router)
 app.include_router(health.router)
 app.include_router(universe.router)
-app.include_router(model_info.router, prefix="/model")   # FIX: /model/info, /model/model-info → /model/info
+app.include_router(model_info.router, prefix="/model")
 app.include_router(drift.router)
 app.include_router(portfolio.router)
 app.include_router(performance.router)
@@ -497,18 +505,80 @@ app.include_router(agent.router)
 
 # =====================================================
 # ROOT-LEVEL SNAPSHOT ALIAS
-# FIX: predict.router uses prefix=/predict so POST /snapshot
-# was returning 404. This aliases it at the root level.
 # =====================================================
 
 @app.post("/snapshot")
 async def snapshot():
-    """
-    Full inference run — all tickers, multi-agent pipeline, portfolio construction.
-    Alias for POST /predict/live-snapshot at the root level.
-    """
+    """Full inference run — alias for /predict/live-snapshot."""
     from app.api.routes.predict import live_snapshot
     return await live_snapshot()
+
+
+# =====================================================
+# ADMIN — MANUAL RETRAIN TRIGGER
+# Owner only. Triggers training container with --promote-baseline.
+# Writes cooldown lock before starting subprocess.
+# =====================================================
+
+@app.post("/admin/retrain")
+async def admin_retrain(request: Request):
+    """
+    Owner-only endpoint to manually trigger model retraining.
+    Uses --promote-baseline (not --create-baseline) since a baseline
+    already exists from the first training run.
+    """
+
+    # Owner-only check
+    role = getattr(request.state, "role", None)
+    if role != "owner":
+        raise HTTPException(
+            status_code=403,
+            detail="Owner access required for retraining.",
+        )
+
+    import subprocess
+    from core.monitoring.retrain_trigger import RetrainTrigger
+
+    trigger = RetrainTrigger()
+
+    # Write cooldown lock before starting — prevents duplicate triggers
+    if hasattr(trigger, "write_lock"):
+        trigger.write_lock()
+
+    # Check if training container is already running
+    try:
+        check = subprocess.run(
+            ["docker", "ps", "--filter", "name=marketsentinel-training", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if "marketsentinel-training" in check.stdout:
+            return api_success({
+                "status": "already_running",
+                "message": "Training container is already running.",
+            })
+    except Exception:
+        pass
+
+    try:
+        subprocess.Popen([
+            "docker-compose", "run", "--rm", "training",
+            "python", "-m", "training.pipelines.train_pipeline",
+            "--promote-baseline",
+        ])
+
+        logger.info("Manual retrain triggered by owner")
+
+        return api_success({
+            "status": "triggered",
+            "message": "Retraining started with --promote-baseline.",
+            "note": "API continues serving current model until new model is loaded.",
+        })
+
+    except Exception as e:
+        logger.exception("Failed to trigger retraining")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =====================================================
@@ -544,7 +614,6 @@ async def root():
 
 @app.get("/metrics")
 def metrics():
-
     return Response(
         generate_latest(),
         media_type=CONTENT_TYPE_LATEST,
