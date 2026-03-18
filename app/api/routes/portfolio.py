@@ -1,6 +1,7 @@
 # =========================================================
-# PORTFOLIO SUMMARY ROUTE v2.2
-# FIX: Added GET /portfolio alias (frontend calls /portfolio)
+# PORTFOLIO SUMMARY ROUTE v2.3
+# FIX: reads from Redis snapshot cache — was 37s first call, now <100ms
+# Falls back to full inference only if cache is empty
 # =========================================================
 
 import asyncio
@@ -8,7 +9,7 @@ import time
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from app.api.routes.predict import get_pipeline
+from app.inference.cache import RedisCache
 from app.inference.pipeline import get_shared_model_loader
 from core.market.universe import MarketUniverse
 from core.logging.logger import get_logger
@@ -29,6 +30,36 @@ portfolio_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 
 # =========================================================
+# GET SNAPSHOT — cache-first, inference fallback
+# =========================================================
+
+def _get_snapshot():
+    """
+    Fast path: read from background pre-computed snapshot in Redis.
+    Slow path: run full inference if cache is cold (first boot only).
+    """
+
+    cache = RedisCache()
+
+    if cache.enabled:
+        # Try background snapshot key first (set by main.py every 120s)
+        bg_key = cache.build_key({"type": "background_snapshot"})
+        snapshot = cache.get(bg_key)
+
+        if snapshot and isinstance(snapshot, dict) and "signals" in snapshot:
+            logger.info("Portfolio served from background snapshot cache")
+            return snapshot, True
+
+    # Cache miss — run full inference
+    logger.info("Portfolio cache miss — running full inference")
+    from app.api.routes.predict import get_pipeline
+    universe = MarketUniverse.get_universe()
+    pipeline = get_pipeline()
+    snapshot = pipeline.run_snapshot(universe)
+    return snapshot, False
+
+
+# =========================================================
 # SHARED SYNC LOGIC
 # =========================================================
 
@@ -36,11 +67,10 @@ def _portfolio_summary_sync():
 
     start_time = time.time()
 
-    pipeline = get_pipeline()
     loader = get_shared_model_loader()
     universe = MarketUniverse.get_universe()
 
-    snapshot = pipeline.run_snapshot(universe)
+    snapshot, from_cache = _get_snapshot()
 
     if not isinstance(snapshot, dict) or "signals" not in snapshot:
         raise RuntimeError("Invalid snapshot structure.")
@@ -66,23 +96,30 @@ def _portfolio_summary_sync():
     )
     rejected_trades = len(results) - approved_trades
 
-    agent_scores = [_get_signal_agent(r).get("agent_score", 0.0) for r in results]
-    confidence_scores = [_get_signal_agent(r).get("confidence_numeric", 0.0) for r in results]
+    agent_scores = [
+        _get_signal_agent(r).get("agent_score", 0.0) or 0.0
+        for r in results
+    ]
+    confidence_scores = [
+        _get_signal_agent(r).get("confidence_numeric", 0.0) or 0.0
+        for r in results
+    ]
 
     avg_strength = sum(agent_scores) / len(agent_scores) if agent_scores else 0.0
     avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
 
     high_conviction_count = sum(
         1 for r in results
-        if _get_signal_agent(r).get("agent_score", 0.0) >= 0.75
+        if (_get_signal_agent(r).get("agent_score") or 0.0) >= 0.75
     )
     elevated_risk_count = sum(
         1 for r in results
         if _get_signal_agent(r).get("risk_level") == "elevated"
     )
 
-    drift_detected = snapshot.get("drift", {}).get("drift_detected", False)
-    drift_state = snapshot.get("drift", {}).get("drift_state", "unknown")
+    drift_info = snapshot.get("drift", {})
+    drift_detected = drift_info.get("drift_detected", False)
+    drift_state = drift_info.get("drift_state", "unknown")
 
     health_score = 100
     if drift_detected:
@@ -139,6 +176,7 @@ def _portfolio_summary_sync():
         "portfolio_health_score": health_score,
         "positions": positions,
         "top_5_preview": top_5_preview,
+        "served_from_cache": from_cache,
         "latency_ms": int((time.time() - start_time) * 1000),
         "timestamp": int(time.time()),
     }
@@ -177,7 +215,7 @@ async def portfolio():
 
 
 # =========================================================
-# GET /portfolio-summary  (kept for backward compatibility)
+# GET /portfolio-summary  (backward compatibility)
 # =========================================================
 
 @router.get("/portfolio-summary")

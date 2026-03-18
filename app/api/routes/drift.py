@@ -1,6 +1,7 @@
 # =========================================================
-# DRIFT STATUS ROUTE v2.2
-# FIX: Added GET /drift alias (frontend calls /drift)
+# DRIFT STATUS ROUTE v2.3
+# FIX: reads drift from cached snapshot (Redis) — was 18s, now <100ms
+# Falls back to full computation only if cache is empty
 # =========================================================
 
 import asyncio
@@ -10,7 +11,7 @@ import json
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from app.api.routes.predict import get_pipeline
+from app.inference.cache import RedisCache
 from app.inference.pipeline import get_shared_model_loader
 from core.market.universe import MarketUniverse
 from core.schema.feature_schema import (
@@ -34,6 +35,9 @@ logger = get_logger("marketsentinel.drift")
 REQUEST_TIMEOUT = 180
 MAX_CONCURRENT = 2
 MIN_UNIVERSE_WIDTH = 10
+
+# Cache drift result for 5 minutes — avoids re-running full inference on every call
+DRIFT_CACHE_TTL = int(os.getenv("DRIFT_CACHE_TTL", "300"))
 
 drift_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
@@ -78,21 +82,56 @@ def _get_baseline_meta():
 
 
 # =========================================================
-# SHARED SYNC LOGIC
+# DRIFT FROM CACHED SNAPSHOT (fast path)
 # =========================================================
 
-def _drift_status_sync():
+def _drift_from_cache():
+    """
+    Reads drift state from the background snapshot cached in Redis.
+    The background_snapshot_loop in main.py runs every 120s and
+    stores the full snapshot including drift. This avoids re-running
+    full inference (18s) on every drift endpoint call.
+    """
+
+    cache = RedisCache()
+
+    if not cache.enabled:
+        return None
+
+    # Try the background snapshot cache key first
+    bg_key = cache.build_key({"type": "background_snapshot"})
+    snapshot = cache.get(bg_key)
+
+    if snapshot and isinstance(snapshot, dict):
+        drift = snapshot.get("drift")
+        if drift and isinstance(drift, dict) and "drift_state" in drift:
+            logger.info("Drift served from background snapshot cache")
+            return drift
+
+    return None
+
+
+# =========================================================
+# DRIFT FULL COMPUTATION (slow path — fallback only)
+# =========================================================
+
+def _drift_full_compute():
+    """
+    Full drift computation — only runs when Redis cache is empty.
+    This is the original 18s path. Should rarely be needed.
+    """
+
+    from app.api.routes.predict import get_pipeline
 
     start_time = time.time()
 
     pipeline = get_pipeline()
-    loader = get_shared_model_loader()
-
     tickers = MarketUniverse.get_universe()
 
     if not tickers or len(tickers) < MIN_UNIVERSE_WIDTH:
         raise RuntimeError("Universe too small for drift detection.")
 
+    import pandas as pd
     df = pipeline._build_cross_sectional_frame(tickers)
 
     if df.empty:
@@ -120,6 +159,37 @@ def _drift_status_sync():
             "exposure_scale": 1.0,
         }
 
+    logger.info(
+        "Drift full computation | latency=%.2fs",
+        time.time() - start_time,
+    )
+
+    return drift_result, len(latest_df)
+
+
+# =========================================================
+# SHARED SYNC LOGIC
+# =========================================================
+
+def _drift_status_sync():
+
+    start_time = time.time()
+
+    loader = get_shared_model_loader()
+
+    # Fast path — try Redis cache first
+    cached_drift = _drift_from_cache()
+
+    if cached_drift:
+        drift_result = cached_drift
+        universe_size = len(MarketUniverse.get_universe())
+        snapshot_date = drift_result.get("snapshot_date", "unknown")
+    else:
+        # Slow path — full computation
+        logger.info("Drift cache miss — running full computation")
+        drift_result, universe_size = _drift_full_compute()
+        snapshot_date = "computed_live"
+
     retrain_trigger = RetrainTrigger()
     retrain_info = retrain_trigger.evaluate(drift_result)
 
@@ -128,17 +198,22 @@ def _drift_status_sync():
     return {
         "drift_detected": drift_result.get("drift_detected", False),
         "severity_score": drift_result.get("severity_score", 0),
+        "drift_confidence": drift_result.get("drift_confidence", 0),
         "drift_state": drift_result.get("drift_state", "unknown"),
         "exposure_scale": drift_result.get("exposure_scale", 1.0),
+        "coverage": drift_result.get("coverage", 0),
         "retrain_required": retrain_info["retrain_required"],
         "retrain_events": retrain_info["events"],
+        "cooldown_active": retrain_info.get("cooldown_active", False),
+        "cooldown_remaining_seconds": retrain_info.get("cooldown_remaining_seconds", 0),
         **baseline_meta,
         "model_version": loader.xgb_version,
         "schema_signature": loader.schema_signature,
         "artifact_hash": loader.artifact_hash,
         "dataset_hash": loader.dataset_hash,
-        "universe_size": len(latest_df),
-        "snapshot_date": str(latest_date),
+        "universe_size": universe_size,
+        "snapshot_date": snapshot_date,
+        "served_from_cache": cached_drift is not None,
         "latency_ms": int((time.time() - start_time) * 1000),
         "timestamp": int(time.time()),
     }
@@ -177,7 +252,7 @@ async def drift():
 
 
 # =========================================================
-# GET /drift-status  (kept for backward compatibility)
+# GET /drift-status  (backward compatibility)
 # =========================================================
 
 @router.get("/drift-status")

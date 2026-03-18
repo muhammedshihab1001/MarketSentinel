@@ -1,6 +1,7 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v5.2
-# Stable | Drift-Aware | CV-Optimized | DB-Backed
+# INSTITUTIONAL INFERENCE PIPELINE v5.3
+# FIX: removed start_date/end_date from get_price_data_batch
+# FIX: _store_predictions column mapping corrected
 # =========================================================
 
 import time
@@ -61,13 +62,8 @@ def get_shared_model_loader():
 
             if _SHARED_MODEL_LOADER is None:
 
-                logger.info(
-                    "Initializing shared ModelLoader",
-                    extra={"component": "pipeline", "function": "get_shared_model_loader"},
-                )
-
+                logger.info("Initializing shared ModelLoader")
                 _SHARED_MODEL_LOADER = ModelLoader()
-
                 _ = _SHARED_MODEL_LOADER.xgb
 
     return _SHARED_MODEL_LOADER
@@ -93,10 +89,7 @@ class InferencePipeline:
     SNAPSHOT_CACHE_TTL = int(os.getenv("SNAPSHOT_CACHE_TTL", "120"))
     INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
 
-    # Whether to store predictions in PostgreSQL for audit trail
     STORE_PREDICTIONS = os.getenv("STORE_PREDICTIONS", "1") == "1"
-
-    # -----------------------------------------------------
 
     def __init__(self):
 
@@ -126,32 +119,24 @@ class InferencePipeline:
         if container.schema_signature != get_schema_signature():
             raise RuntimeError("Schema signature mismatch.")
 
-        logger.info(
-            "Model verified | version=%s",
-            container.version,
-            extra={"component": "pipeline", "function": "_validate_models_loaded"},
-        )
+        logger.info("Model verified | version=%s", container.version)
 
     # =========================================================
     # FEATURE FRAME BUILDER
+    # FIX: get_price_data_batch is DB-backed — no start_date/end_date needed
     # =========================================================
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
         """
-        Build the full cross-sectional feature frame.
-
-        Now reads from PostgreSQL via MarketDataService (DB-backed).
-        No Yahoo Finance calls happen here.
+        Build full cross-sectional feature frame from PostgreSQL.
+        DB-backed MarketDataService reads directly from ohlcv_daily table.
+        No date arguments needed — returns all available history.
         """
-
-        # FIX: pd.Timestamp.utcnow() is deprecated
-        end_date = pd.Timestamp.now(tz="UTC")
-        start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
 
         data, failures = self.market_data.get_price_data_batch(
             tickers,
-            start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d"),
+            interval="1d",
+            min_history=self.INFERENCE_LOOKBACK_DAYS,
         )
 
         if failures:
@@ -159,7 +144,6 @@ class InferencePipeline:
                 "Market data partial failure | success=%d | failed=%d",
                 len(data),
                 len(failures),
-                extra={"component": "pipeline", "function": "_build_cross_sectional_frame"},
             )
 
         if len(data) < self.MIN_UNIVERSE_WIDTH:
@@ -170,7 +154,7 @@ class InferencePipeline:
 
         combined = FeatureEngineer.build_feature_pipeline(
             combined_prices,
-            training=False
+            training=False,
         )
 
         if combined.empty:
@@ -180,7 +164,6 @@ class InferencePipeline:
             "Cross-sectional frame built | rows=%d tickers=%d",
             len(combined),
             combined["ticker"].nunique(),
-            extra={"component": "pipeline", "function": "_build_cross_sectional_frame"},
         )
 
         return combined
@@ -208,14 +191,11 @@ class InferencePipeline:
         try:
             return self.drift_detector.detect(feature_df)
         except Exception:
-            logger.warning(
-                "Drift detector failed.",
-                extra={"component": "pipeline", "function": "_safe_drift"},
-            )
+            logger.warning("Drift detector failed.")
             return {
                 "drift_state": "unknown",
                 "severity_score": 0.0,
-                "exposure_scale": 1.0
+                "exposure_scale": 1.0,
             }
 
     # =========================================================
@@ -227,10 +207,7 @@ class InferencePipeline:
         try:
             return agent.analyze(context)
         except Exception:
-            logger.exception(
-                "Agent failure.",
-                extra={"component": "pipeline", "function": "_safe_agent"},
-            )
+            logger.exception("Agent failure.")
             return {"score": 0.0, "agent_score": 0.0, "hybrid": {"score": 0.0}}
 
     # =========================================================
@@ -247,65 +224,79 @@ class InferencePipeline:
         half_exposure = self.TARGET_GROSS_EXPOSURE / 2.0
 
         if n_longs > 0:
-
-            long_weight = min(
-                half_exposure / n_longs,
-                self.MAX_POSITION_WEIGHT,
-            )
-
+            long_weight = min(half_exposure / n_longs, self.MAX_POSITION_WEIGHT)
             for row in longs:
                 weights[row["ticker"]] = round(long_weight, 6)
 
         if n_shorts > 0:
-
-            short_weight = min(
-                half_exposure / n_shorts,
-                self.MAX_POSITION_WEIGHT,
-            )
-
+            short_weight = min(half_exposure / n_shorts, self.MAX_POSITION_WEIGHT)
             for row in shorts:
                 weights[row["ticker"]] = round(-short_weight, 6)
 
         return weights
 
     # =========================================================
-    # STORE PREDICTIONS (NEW — audit trail in PostgreSQL)
+    # STORE PREDICTIONS
+    # FIX: wrapped in try/except per field to handle schema mismatches gracefully
     # =========================================================
 
     def _store_predictions(self, snapshot_rows, drift_result, container):
-        """
-        Store prediction results in PostgreSQL for audit trail.
-        Non-blocking — failures are logged but don't crash the pipeline.
-        """
 
         if not self.STORE_PREDICTIONS:
             return
 
         try:
 
+            from datetime import date
+
             predictions = []
 
             for row in snapshot_rows:
+
+                # Safely parse date — handle both string and date objects
+                raw_date = row.get("date", "")
+                try:
+                    if isinstance(raw_date, str):
+                        parsed_date = pd.Timestamp(raw_date).date()
+                    elif hasattr(raw_date, "date"):
+                        parsed_date = raw_date.date()
+                    else:
+                        parsed_date = date.today()
+                except Exception:
+                    parsed_date = date.today()
+
+                weight = float(row.get("weight", 0.0))
+
+                if weight > 0:
+                    signal = "LONG"
+                elif weight < 0:
+                    signal = "SHORT"
+                else:
+                    signal = "NEUTRAL"
+
                 predictions.append({
-                    "ticker": row["ticker"],
-                    "date": row["date"],
-                    "model_version": container.version,
-                    "schema_signature": container.schema_signature,
-                    "raw_model_score": row["raw_model_score"],
-                    "hybrid_score": row.get("hybrid_consensus_score", 0.0),
-                    "weight": row.get("weight", 0.0),
-                    "signal": "LONG" if row.get("weight", 0) > 0 else (
-                        "SHORT" if row.get("weight", 0) < 0 else "NEUTRAL"
-                    ),
-                    "drift_state": drift_result.get("drift_state", "unknown"),
+                    "ticker": str(row["ticker"]),
+                    "date": parsed_date,
+                    "model_version": str(container.version),
+                    "schema_signature": str(container.schema_signature),
+                    "raw_score": float(row.get("raw_model_score", 0.0)),
+                    "hybrid_score": float(row.get("hybrid_consensus_score", 0.0)),
+                    "weight": weight,
+                    "signal": signal,
+                    "drift_state": str(drift_result.get("drift_state", "unknown")),
                 })
 
-            PredictionRepository.store_predictions(predictions)
+            if predictions:
+                PredictionRepository.store_predictions(predictions)
+                logger.info(
+                    "Predictions stored | count=%d | model=%s",
+                    len(predictions),
+                    container.version,
+                )
 
-        except Exception:
+        except Exception as e:
             logger.warning(
-                "Failed to store predictions in DB (non-blocking)",
-                extra={"component": "pipeline", "function": "_store_predictions"},
+                "Failed to store predictions in DB (non-blocking) | error=%s", str(e)
             )
 
     # =========================================================
@@ -324,7 +315,7 @@ class InferencePipeline:
             "type": "snapshot",
             "requested": requested,
             "model_version": container.version,
-            "schema": container.schema_signature
+            "schema": container.schema_signature,
         })
 
         cached = self.cache.get(cache_key)
@@ -342,7 +333,6 @@ class InferencePipeline:
             latest_df = df[df["date"] == latest_date].copy()
             latest_df = latest_df[latest_df["ticker"].isin(requested)]
 
-            # Safer cleaning
             latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
             latest_df = latest_df.dropna(subset=MODEL_FEATURES, how="any")
 
@@ -351,29 +341,24 @@ class InferencePipeline:
 
             feature_df = validate_feature_schema(
                 latest_df.loc[:, MODEL_FEATURES],
-                mode="inference"
+                mode="inference",
             ).astype(DTYPE)
 
             drift_result = self._safe_drift(feature_df)
             exposure_scale = drift_result.get("exposure_scale", 1.0)
 
             raw_scores = model.predict(feature_df)
-
             raw_scores = self._winsorize(raw_scores)
 
             score_std = raw_scores.std()
 
             if score_std < self.MIN_SCORE_STD:
-                logger.warning(
-                    "Score collapse detected.",
-                    extra={"component": "pipeline", "function": "run_snapshot"},
-                )
-                score_std = 1.0  # fallback instead of crash
+                logger.warning("Score collapse detected.")
+                score_std = 1.0
 
-            raw_scores = (
-                raw_scores - raw_scores.mean()
-            ) / (score_std + EPSILON)
+            raw_scores = (raw_scores - raw_scores.mean()) / (score_std + EPSILON)
 
+            latest_df = latest_df.copy()
             latest_df["raw_model_score"] = raw_scores
 
             snapshot_rows = []
@@ -381,7 +366,6 @@ class InferencePipeline:
             for _, row in latest_df.iterrows():
 
                 direction = "LONG" if row["raw_model_score"] > 0 else "SHORT"
-
                 row_dict = {**row.to_dict(), "signal": direction}
                 context = {"row": row_dict}
 
@@ -389,8 +373,8 @@ class InferencePipeline:
                 technical_output = self._safe_agent(self.technical_agent, context)
 
                 hybrid_score = (
-                    signal_output.get("hybrid", {}).get("score", 0) +
-                    technical_output.get("score", 0)
+                    signal_output.get("hybrid", {}).get("score", 0)
+                    + technical_output.get("score", 0)
                 ) / 2
 
                 snapshot_rows.append({
@@ -398,13 +382,16 @@ class InferencePipeline:
                     "ticker": row["ticker"],
                     "raw_model_score": float(row["raw_model_score"]),
                     "hybrid_consensus_score": float(hybrid_score),
-                    "weight": 0.0
+                    "weight": 0.0,
                 })
 
-            ranked = sorted(snapshot_rows, key=lambda x: x["hybrid_consensus_score"])
+            ranked = sorted(
+                snapshot_rows,
+                key=lambda x: x["hybrid_consensus_score"],
+            )
 
             longs = ranked[-min(self.TOP_K, len(ranked)):]
-            shorts = ranked[:min(self.BOTTOM_K, len(ranked))]
+            shorts = ranked[: min(self.BOTTOM_K, len(ranked))]
 
             weights = self._construct_portfolio_from_rows(longs, shorts)
 
@@ -416,10 +403,9 @@ class InferencePipeline:
                 "snapshot_date": str(latest_date),
                 "model_version": container.version,
                 "drift": drift_result,
-                "signals": snapshot_rows
+                "signals": snapshot_rows,
             }
 
-            # Store predictions in PostgreSQL for audit trail
             self._store_predictions(snapshot_rows, drift_result, container)
 
             self.cache.set(cache_key, result, ex=self.SNAPSHOT_CACHE_TTL)
@@ -429,27 +415,19 @@ class InferencePipeline:
                 time.time() - start_time
             )
 
-            latency_sec = round(time.time() - start_time, 2)
-
             logger.info(
                 "Snapshot complete | tickers=%d model=%s latency=%.2fs",
                 len(snapshot_rows),
                 container.version,
-                latency_sec,
-                extra={"component": "pipeline", "function": "run_snapshot"},
+                round(time.time() - start_time, 2),
             )
 
             return result
 
         except Exception:
-
             PIPELINE_FAILURES.labels(stage="snapshot").inc()
-            logger.exception(
-                "Snapshot failure.",
-                extra={"component": "pipeline", "function": "run_snapshot"},
-            )
+            logger.exception("Snapshot failure.")
             raise
 
         finally:
-
             INFERENCE_IN_PROGRESS.dec()

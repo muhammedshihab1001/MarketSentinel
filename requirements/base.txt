@@ -75,3 +75,7 @@ filelock==3.20.3
 frozendict==2.4.7
 multitasking==0.0.12
 six==1.17.0
+
+bcrypt==4.0.1
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
