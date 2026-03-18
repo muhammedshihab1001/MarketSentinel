@@ -7,4 +7,8 @@
 
 # ── High-performance async event loop ────────────────────
 # Used by uvicorn in inference.Dockerfile CMD
-uvloop==0.19.0
+# Linux / macOS only — not supported on Windows
+# The Docker container is Linux so this is safe for production.
+# For local Windows development this line is intentionally excluded
+# from the local install — uvicorn falls back to the default loop.
+uvloop==0.19.0; sys_platform != "win32"

@@ -1,5 +1,6 @@
 ############################################################
 # MarketSentinel — Training Container (CV-Optimized)
+# FIX: Added XGBOOST_NO_CUDA=1 — removes 293MB GPU dep
 ############################################################
 
 ############################################################
@@ -13,7 +14,8 @@ WORKDIR /install
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    XGBOOST_NO_CUDA=1
 
 ############################################################
 # Build Dependencies
@@ -51,6 +53,7 @@ WORKDIR /app
 
 ############################################################
 # Runtime Environment
+# XGBOOST_NO_CUDA=1 prevents GPU package download at runtime
 ############################################################
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -62,7 +65,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NUMEXPR_NUM_THREADS=1 \
     APP_ENV=training \
     PYTHONPATH=/app \
-    LANG=C.UTF-8
+    LANG=C.UTF-8 \
+    XGBOOST_NO_CUDA=1
 
 ############################################################
 # Runtime System Packages

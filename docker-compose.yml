@@ -46,6 +46,49 @@ services:
 
 
   ####################################################
+  # POSTGRESQL BACKUP (Daily pg_dump — 7-day retention)
+  ####################################################
+  pg-backup:
+    container_name: marketsentinel-backup
+    image: postgres:16-alpine
+    restart: unless-stopped
+
+    networks:
+      - marketsentinel-net
+
+    volumes:
+      - ./backups:/backups
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+      PGPASSWORD: sentinel
+
+    entrypoint: >
+      sh -c "
+        echo 'Backup service started. Running daily at midnight.';
+        while true; do
+          FILENAME=/backups/backup_$$(date +%Y%m%d_%H%M).sql;
+          echo \"Starting backup: $$FILENAME\";
+          pg_dump -U sentinel -h postgres marketsentinel > $$FILENAME;
+          if [ $$? -eq 0 ]; then
+            echo \"Backup successful: $$FILENAME\";
+          else
+            echo \"Backup FAILED\";
+          fi;
+          find /backups -name '*.sql' -mtime +7 -delete;
+          echo 'Sleeping 24h until next backup...';
+          sleep 86400;
+        done
+      "
+
+    mem_limit: 128m
+    cpus: 0.25
+
+
+  ####################################################
   # REDIS (Optional Cache)
   ####################################################
   redis:
