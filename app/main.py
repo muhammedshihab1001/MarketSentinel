@@ -238,7 +238,7 @@ async def _background_snapshot_loop():
 
             cache = RedisCache()
             if cache.enabled:
-                key = cache.build_key({"type": "background_snapshot"})
+                key = "ms:background_snapshot:latest"
                 cache.set(key, result)
                 logger.info(
                     "Background snapshot cached | signals=%d | model=%s",

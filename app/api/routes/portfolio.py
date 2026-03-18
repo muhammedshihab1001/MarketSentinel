@@ -1,7 +1,8 @@
 # =========================================================
-# PORTFOLIO SUMMARY ROUTE v2.3
-# FIX: reads from Redis snapshot cache — was 37s first call, now <100ms
-# Falls back to full inference only if cache is empty
+# PORTFOLIO SUMMARY ROUTE v2.4
+# FIX: use fixed Redis key for background snapshot
+#      Dynamic build_key() includes model/schema fingerprints
+#      that may differ between main.py loop and this route.
 # =========================================================
 
 import asyncio
@@ -26,26 +27,23 @@ logger = get_logger("marketsentinel.portfolio")
 REQUEST_TIMEOUT = 180
 MAX_CONCURRENT = 3
 
+# Fixed Redis key for background snapshot — same key used in main.py loop
+BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
+
 portfolio_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 
 # =========================================================
-# GET SNAPSHOT — cache-first, inference fallback
+# GET SNAPSHOT — fixed key cache-first, inference fallback
 # =========================================================
 
 def _get_snapshot():
-    """
-    Fast path: read from background pre-computed snapshot in Redis.
-    Slow path: run full inference if cache is cold (first boot only).
-    """
 
     cache = RedisCache()
 
+    # Try fixed background snapshot key first
     if cache.enabled:
-        # Try background snapshot key first (set by main.py every 120s)
-        bg_key = cache.build_key({"type": "background_snapshot"})
-        snapshot = cache.get(bg_key)
-
+        snapshot = cache.get(BACKGROUND_SNAPSHOT_KEY)
         if snapshot and isinstance(snapshot, dict) and "signals" in snapshot:
             logger.info("Portfolio served from background snapshot cache")
             return snapshot, True
@@ -91,30 +89,21 @@ def _portfolio_summary_sync():
         return r.get("agents", {}).get("signal_agent", {})
 
     approved_trades = sum(
-        1 for r in results
-        if _get_signal_agent(r).get("trade_approved", False)
+        1 for r in results if _get_signal_agent(r).get("trade_approved", False)
     )
     rejected_trades = len(results) - approved_trades
 
-    agent_scores = [
-        _get_signal_agent(r).get("agent_score", 0.0) or 0.0
-        for r in results
-    ]
-    confidence_scores = [
-        _get_signal_agent(r).get("confidence_numeric", 0.0) or 0.0
-        for r in results
-    ]
+    agent_scores = [_get_signal_agent(r).get("agent_score", 0.0) or 0.0 for r in results]
+    confidence_scores = [_get_signal_agent(r).get("confidence_numeric", 0.0) or 0.0 for r in results]
 
     avg_strength = sum(agent_scores) / len(agent_scores) if agent_scores else 0.0
     avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
 
     high_conviction_count = sum(
-        1 for r in results
-        if (_get_signal_agent(r).get("agent_score") or 0.0) >= 0.75
+        1 for r in results if (_get_signal_agent(r).get("agent_score") or 0.0) >= 0.75
     )
     elevated_risk_count = sum(
-        1 for r in results
-        if _get_signal_agent(r).get("risk_level") == "elevated"
+        1 for r in results if _get_signal_agent(r).get("risk_level") == "elevated"
     )
 
     drift_info = snapshot.get("drift", {})
@@ -134,10 +123,9 @@ def _portfolio_summary_sync():
         {
             "ticker": r["ticker"],
             "weight": round(r.get("weight", 0.0), 4),
-            "signal": _get_signal_agent(r).get("signal", "NEUTRAL"),
+            "signal": "LONG" if r.get("weight", 0.0) > 0 else ("SHORT" if r.get("weight", 0.0) < 0 else "NEUTRAL"),
         }
-        for r in results
-        if r.get("weight", 0.0) != 0.0
+        for r in results if r.get("weight", 0.0) != 0.0
     ]
 
     top_5_preview = [
@@ -145,14 +133,8 @@ def _portfolio_summary_sync():
             "ticker": r["ticker"],
             "score": round(r.get("raw_model_score", 0.0), 4),
             "weight": round(r.get("weight", 0.0), 4),
-            "confidence": _get_signal_agent(r).get("confidence_numeric"),
-            "approved": _get_signal_agent(r).get("trade_approved"),
         }
-        for r in sorted(
-            results,
-            key=lambda x: x.get("raw_model_score", 0.0),
-            reverse=True,
-        )[:5]
+        for r in sorted(results, key=lambda x: x.get("raw_model_score", 0.0), reverse=True)[:5]
     ]
 
     return {
@@ -183,7 +165,7 @@ def _portfolio_summary_sync():
 
 
 # =========================================================
-# GET /portfolio  (frontend calls this)
+# GET /portfolio
 # =========================================================
 
 @router.get("/portfolio")
@@ -215,7 +197,7 @@ async def portfolio():
 
 
 # =========================================================
-# GET /portfolio-summary  (backward compatibility)
+# GET /portfolio-summary (backward compat)
 # =========================================================
 
 @router.get("/portfolio-summary")

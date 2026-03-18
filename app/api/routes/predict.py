@@ -1,6 +1,7 @@
 # =========================================================
-# PREDICTION & SNAPSHOT ROUTES v3.6
-# FIX: price_history now uses get_price_data (no start/end args)
+# PREDICTION & SNAPSHOT ROUTES v3.7
+# FIX: price_history passes start_date/end_date to get_price_data
+#      MarketDataService requires these as positional args
 # =========================================================
 
 import time
@@ -116,6 +117,13 @@ def load_default_universe() -> List[str]:
     return unique
 
 
+def _date_window(days: int):
+    """Compute start/end date strings from lookback days."""
+    end = pd.Timestamp.now(tz="UTC")
+    start = end - pd.Timedelta(days=days + 30)
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+
 # =========================================================
 # LIVE SNAPSHOT
 # =========================================================
@@ -149,22 +157,27 @@ async def live_snapshot():
         short_count = sum(1 for s in signals if s.get("weight", 0.0) < 0)
 
         hybrid_scores = [s.get("hybrid_consensus_score", 0.0) * 100 for s in signals]
-
         avg_strength = (
             round(sum(hybrid_scores) / len(hybrid_scores), 2)
             if hybrid_scores else 0.0
         )
 
-        top_5 = snapshot.get("top_5", [])
-        decision_report = snapshot.get("decision_report", {})
         drift = snapshot.get("drift", {})
+
+        # Compute gross/net exposure from weights
+        weights = [s.get("weight", 0.0) for s in signals]
+        gross_exposure = sum(abs(w) for w in weights)
+        net_exposure = sum(weights)
+
+        # Top 5 by raw_model_score
+        top_5 = sorted(signals, key=lambda x: x.get("raw_model_score", 0.0), reverse=True)[:5]
 
         executive_summary = {
             "top_5_tickers": [t["ticker"] for t in top_5],
-            "portfolio_bias": decision_report.get("portfolio_bias"),
-            "risk_regime": drift.get("drift_state"),
-            "gross_exposure": snapshot.get("gross_exposure"),
-            "net_exposure": snapshot.get("net_exposure"),
+            "portfolio_bias": "LONG" if net_exposure > 0 else "SHORT" if net_exposure < 0 else "NEUTRAL",
+            "risk_regime": drift.get("drift_state", "unknown"),
+            "gross_exposure": round(gross_exposure, 4),
+            "net_exposure": round(net_exposure, 4),
         }
 
         meta = {
@@ -247,10 +260,14 @@ async def signal_explanation(ticker: str):
         agents = row.get("agents", {})
         signal_agent = agents.get("signal_agent", {})
 
+        # Derive signal from weight if agents not present
+        weight = row.get("weight", 0.0)
+        derived_signal = "LONG" if weight > 0 else ("SHORT" if weight < 0 else "NEUTRAL")
+
         explanation = SignalExplanationResponse(
             ticker=row["ticker"],
             score=row.get("raw_model_score", 0.0),
-            signal=signal_agent.get("signal", "NEUTRAL"),
+            signal=signal_agent.get("signal", derived_signal),
             agent_score=row.get("hybrid_consensus_score", row.get("agent_score", 0.0)),
             alpha_strength=signal_agent.get("alpha_strength", 0.0),
             confidence_numeric=signal_agent.get("confidence_numeric", 0.0),
@@ -292,8 +309,7 @@ async def signal_explanation(ticker: str):
 
 # =========================================================
 # PRICE HISTORY
-# FIX: Uses get_price_data() — no start_date/end_date args
-# (MarketDataService is DB-backed, reads directly from PostgreSQL)
+# FIX: pass start_date/end_date — MarketDataService requires them
 # =========================================================
 
 @router.get("/price-history/{ticker}")
@@ -313,12 +329,15 @@ async def price_history(ticker: str, days: int = 365):
     try:
 
         service = MarketDataService()
+        start_date, end_date = _date_window(days)
 
         df = await run_in_threadpool(
             service.get_price_data,
             ticker,
-            interval="1d",
-            min_history=days,
+            start_date,
+            end_date,
+            "1d",
+            days,
         )
 
         if df is None or df.empty:
@@ -331,11 +350,11 @@ async def price_history(ticker: str, days: int = 365):
             date_val = str(idx.date()) if hasattr(idx, "date") else str(idx)
             prices.append({
                 "date": date_val,
-                "open": round(float(row.get("Open", row.get("open", 0))), 4),
-                "high": round(float(row.get("High", row.get("high", 0))), 4),
-                "low": round(float(row.get("Low", row.get("low", 0))), 4),
-                "close": round(float(row.get("Close", row.get("close", 0))), 4),
-                "volume": int(row.get("Volume", row.get("volume", 0))),
+                "open": round(float(row.get("open", row.get("Open", 0))), 4),
+                "high": round(float(row.get("high", row.get("High", 0))), 4),
+                "low": round(float(row.get("low", row.get("Low", 0))), 4),
+                "close": round(float(row.get("close", row.get("Close", 0))), 4),
+                "volume": int(row.get("volume", row.get("Volume", 0))),
             })
 
         return {

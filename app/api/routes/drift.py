@@ -1,13 +1,14 @@
 # =========================================================
-# DRIFT STATUS ROUTE v2.3
-# FIX: reads drift from cached snapshot (Redis) — was 18s, now <100ms
-# Falls back to full computation only if cache is empty
+# DRIFT STATUS ROUTE v2.5
+# FIX: use fixed Redis key for background snapshot
+#      Matches the key written by main.py background loop
 # =========================================================
 
 import asyncio
 import time
 import os
 import json
+import pandas as pd
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
@@ -36,14 +37,14 @@ REQUEST_TIMEOUT = 180
 MAX_CONCURRENT = 2
 MIN_UNIVERSE_WIDTH = 10
 
-# Cache drift result for 5 minutes — avoids re-running full inference on every call
-DRIFT_CACHE_TTL = int(os.getenv("DRIFT_CACHE_TTL", "300"))
+# Fixed key — must match what main.py _background_snapshot_loop writes
+BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
 
 drift_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 
 # =========================================================
-# BASELINE META HELPER
+# BASELINE META
 # =========================================================
 
 def _get_baseline_meta():
@@ -62,16 +63,13 @@ def _get_baseline_meta():
     try:
         with open(path, encoding="utf-8") as f:
             baseline = json.load(f)
-
         meta = baseline.get("meta", {})
-
         return {
             "baseline_exists": True,
             "baseline_version": meta.get("baseline_version"),
             "baseline_model_version": meta.get("model_version"),
             "baseline_dataset_hash": meta.get("dataset_hash"),
         }
-
     except Exception:
         return {
             "baseline_exists": False,
@@ -82,25 +80,17 @@ def _get_baseline_meta():
 
 
 # =========================================================
-# DRIFT FROM CACHED SNAPSHOT (fast path)
+# FAST PATH — READ FROM FIXED REDIS KEY
 # =========================================================
 
 def _drift_from_cache():
-    """
-    Reads drift state from the background snapshot cached in Redis.
-    The background_snapshot_loop in main.py runs every 120s and
-    stores the full snapshot including drift. This avoids re-running
-    full inference (18s) on every drift endpoint call.
-    """
+    """Read drift from fixed background snapshot key."""
 
     cache = RedisCache()
-
     if not cache.enabled:
         return None
 
-    # Try the background snapshot cache key first
-    bg_key = cache.build_key({"type": "background_snapshot"})
-    snapshot = cache.get(bg_key)
+    snapshot = cache.get(BACKGROUND_SNAPSHOT_KEY)
 
     if snapshot and isinstance(snapshot, dict):
         drift = snapshot.get("drift")
@@ -112,26 +102,20 @@ def _drift_from_cache():
 
 
 # =========================================================
-# DRIFT FULL COMPUTATION (slow path — fallback only)
+# SLOW PATH — FULL COMPUTE
 # =========================================================
 
 def _drift_full_compute():
-    """
-    Full drift computation — only runs when Redis cache is empty.
-    This is the original 18s path. Should rarely be needed.
-    """
 
     from app.api.routes.predict import get_pipeline
 
     start_time = time.time()
-
     pipeline = get_pipeline()
     tickers = MarketUniverse.get_universe()
 
     if not tickers or len(tickers) < MIN_UNIVERSE_WIDTH:
         raise RuntimeError("Universe too small for drift detection.")
 
-    import pandas as pd
     df = pipeline._build_cross_sectional_frame(tickers)
 
     if df.empty:
@@ -159,11 +143,7 @@ def _drift_full_compute():
             "exposure_scale": 1.0,
         }
 
-    logger.info(
-        "Drift full computation | latency=%.2fs",
-        time.time() - start_time,
-    )
-
+    logger.info("Drift full computation | latency=%.2fs", time.time() - start_time)
     return drift_result, len(latest_df)
 
 
@@ -174,10 +154,8 @@ def _drift_full_compute():
 def _drift_status_sync():
 
     start_time = time.time()
-
     loader = get_shared_model_loader()
 
-    # Fast path — try Redis cache first
     cached_drift = _drift_from_cache()
 
     if cached_drift:
@@ -185,14 +163,12 @@ def _drift_status_sync():
         universe_size = len(MarketUniverse.get_universe())
         snapshot_date = drift_result.get("snapshot_date", "unknown")
     else:
-        # Slow path — full computation
         logger.info("Drift cache miss — running full computation")
         drift_result, universe_size = _drift_full_compute()
         snapshot_date = "computed_live"
 
     retrain_trigger = RetrainTrigger()
     retrain_info = retrain_trigger.evaluate(drift_result)
-
     baseline_meta = _get_baseline_meta()
 
     return {
@@ -220,7 +196,7 @@ def _drift_status_sync():
 
 
 # =========================================================
-# GET /drift  (frontend calls this)
+# GET /drift
 # =========================================================
 
 @router.get("/drift")
@@ -252,7 +228,7 @@ async def drift():
 
 
 # =========================================================
-# GET /drift-status  (backward compatibility)
+# GET /drift-status (backward compat)
 # =========================================================
 
 @router.get("/drift-status")

@@ -1,7 +1,7 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v5.3
-# FIX: removed start_date/end_date from get_price_data_batch
-# FIX: _store_predictions column mapping corrected
+# INSTITUTIONAL INFERENCE PIPELINE v5.4
+# FIX: _build_cross_sectional_frame now passes start_date/end_date
+#      computed from INFERENCE_LOOKBACK_DAYS (MarketDataService requires them)
 # =========================================================
 
 import time
@@ -122,21 +122,41 @@ class InferencePipeline:
         logger.info("Model verified | version=%s", container.version)
 
     # =========================================================
+    # DATE HELPERS
+    # =========================================================
+
+    def _get_date_window(self):
+        """
+        Compute start_date / end_date from INFERENCE_LOOKBACK_DAYS.
+        MarketDataService.get_price_data_batch() requires these as
+        positional args — it reads from PostgreSQL and filters by date.
+        """
+        end_date = pd.Timestamp.now(tz="UTC")
+        start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
+        return (
+            start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d"),
+        )
+
+    # =========================================================
     # FEATURE FRAME BUILDER
-    # FIX: get_price_data_batch is DB-backed — no start_date/end_date needed
+    # FIX: pass start_date/end_date — MarketDataService requires them
     # =========================================================
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
         """
         Build full cross-sectional feature frame from PostgreSQL.
-        DB-backed MarketDataService reads directly from ohlcv_daily table.
-        No date arguments needed — returns all available history.
+        Passes start_date/end_date computed from INFERENCE_LOOKBACK_DAYS.
         """
+
+        start_date, end_date = self._get_date_window()
 
         data, failures = self.market_data.get_price_data_batch(
             tickers,
+            start_date=start_date,
+            end_date=end_date,
             interval="1d",
-            min_history=self.INFERENCE_LOOKBACK_DAYS,
+            min_history=min(self.INFERENCE_LOOKBACK_DAYS, 60),
         )
 
         if failures:
@@ -217,19 +237,15 @@ class InferencePipeline:
     def _construct_portfolio_from_rows(self, longs, shorts):
 
         weights = {}
-
-        n_longs = len(longs)
-        n_shorts = len(shorts)
-
         half_exposure = self.TARGET_GROSS_EXPOSURE / 2.0
 
-        if n_longs > 0:
-            long_weight = min(half_exposure / n_longs, self.MAX_POSITION_WEIGHT)
+        if longs:
+            long_weight = min(half_exposure / len(longs), self.MAX_POSITION_WEIGHT)
             for row in longs:
                 weights[row["ticker"]] = round(long_weight, 6)
 
-        if n_shorts > 0:
-            short_weight = min(half_exposure / n_shorts, self.MAX_POSITION_WEIGHT)
+        if shorts:
+            short_weight = min(half_exposure / len(shorts), self.MAX_POSITION_WEIGHT)
             for row in shorts:
                 weights[row["ticker"]] = round(-short_weight, 6)
 
@@ -237,7 +253,6 @@ class InferencePipeline:
 
     # =========================================================
     # STORE PREDICTIONS
-    # FIX: wrapped in try/except per field to handle schema mismatches gracefully
     # =========================================================
 
     def _store_predictions(self, snapshot_rows, drift_result, container):
@@ -253,7 +268,6 @@ class InferencePipeline:
 
             for row in snapshot_rows:
 
-                # Safely parse date — handle both string and date objects
                 raw_date = row.get("date", "")
                 try:
                     if isinstance(raw_date, str):
@@ -266,13 +280,7 @@ class InferencePipeline:
                     parsed_date = date.today()
 
                 weight = float(row.get("weight", 0.0))
-
-                if weight > 0:
-                    signal = "LONG"
-                elif weight < 0:
-                    signal = "SHORT"
-                else:
-                    signal = "NEUTRAL"
+                signal = "LONG" if weight > 0 else ("SHORT" if weight < 0 else "NEUTRAL")
 
                 predictions.append({
                     "ticker": str(row["ticker"]),
@@ -351,7 +359,6 @@ class InferencePipeline:
             raw_scores = self._winsorize(raw_scores)
 
             score_std = raw_scores.std()
-
             if score_std < self.MIN_SCORE_STD:
                 logger.warning("Score collapse detected.")
                 score_std = 1.0
@@ -385,13 +392,9 @@ class InferencePipeline:
                     "weight": 0.0,
                 })
 
-            ranked = sorted(
-                snapshot_rows,
-                key=lambda x: x["hybrid_consensus_score"],
-            )
-
+            ranked = sorted(snapshot_rows, key=lambda x: x["hybrid_consensus_score"])
             longs = ranked[-min(self.TOP_K, len(ranked)):]
-            shorts = ranked[: min(self.BOTTOM_K, len(ranked))]
+            shorts = ranked[:min(self.BOTTOM_K, len(ranked))]
 
             weights = self._construct_portfolio_from_rows(longs, shorts)
 
@@ -407,7 +410,6 @@ class InferencePipeline:
             }
 
             self._store_predictions(snapshot_rows, drift_result, container)
-
             self.cache.set(cache_key, result, ex=self.SNAPSHOT_CACHE_TTL)
 
             MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
