@@ -44,7 +44,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements/ ./requirements/
 
+# FIX: Install xgboost[cpu] first to lock the CPU-only wheel
+# before the full requirements install resolves dependencies.
 RUN python -m pip install --upgrade pip setuptools wheel && \
+    pip install --prefer-binary "xgboost[cpu]==2.1.1" && \
     pip install --prefer-binary -r requirements/inference.txt
 
 # Optional LLM support — only installed if INSTALL_LLM=true

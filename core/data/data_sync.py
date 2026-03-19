@@ -1,21 +1,13 @@
 """
-MarketSentinel — Data Sync Service v2.0
+MarketSentinel — Data Sync Service v2.1
 
-The ONLY module that calls Yahoo Finance (or TwelveData fallback)
-at runtime. Everything else reads from PostgreSQL.
-
-Changes from v1.0:
-  - DEFAULT_HISTORY_DAYS: 500 → 730 (2 years)
-    XGBoost needs 50,000+ samples. 100 tickers × 500 days = 50,000.
-    Fetching 730 calendar days gets ~500 trading days reliably.
-  - sync_universe() now uses ThreadPoolExecutor(max_workers=4)
-    for parallel ticker syncs. Reduces full universe sync time
-    from ~100 tickers × 0.3s = 30s → ~8s.
-    Note: max_workers=4 not 8 — Yahoo Finance rate-limits
-    concurrent requests. 4 is safe without triggering 429s.
-  - Per-window history: training uses 730 days, inference/API
-    use their own date windows from pipeline/routes directly.
-    DataSync always syncs the full history window.
+Changes from v2.0:
+  - Added cleanup_old_data() method to DataSyncService class.
+    Deletes ohlcv_daily rows older than RETENTION_DAYS (760 days).
+    Called automatically after every sync to keep DB lean.
+    Without this, rows accumulate forever — after 2 years you'd
+    have 4+ years of data where only the last 2 years are used.
+  - cleanup_old_data() is non-blocking — never stops sync on failure.
 """
 
 import time
@@ -33,8 +25,11 @@ logger = get_logger(__name__)
 
 # Max parallel Yahoo Finance fetches.
 # Keep at 4 — Yahoo rate-limits concurrent requests.
-# Higher values cause 429 errors.
 SYNC_MAX_WORKERS = int(__import__("os").getenv("SYNC_MAX_WORKERS", "4"))
+
+# Rows older than this are never used by training (730 days) or
+# inference (400 days). 30-day buffer above training window.
+RETENTION_DAYS = int(__import__("os").getenv("DATA_RETENTION_DAYS", "760"))
 
 
 class DataSyncService:
@@ -183,15 +178,8 @@ class DataSyncService:
     ) -> Dict:
         """
         Sync all tickers in the universe from Yahoo → PostgreSQL.
-
         Uses ThreadPoolExecutor(max_workers=4) for parallel fetches.
-        Yahoo Finance rate limit: safe at 4 concurrent, 429s at 8+.
-
-        Args:
-            tickers: Optional list. If None, loads from MarketUniverse.
-
-        Returns:
-            Dict with overall sync report.
+        Runs cleanup_old_data() after sync to keep DB lean.
         """
 
         from core.market.universe import MarketUniverse
@@ -213,7 +201,6 @@ class DataSyncService:
         skip_count = 0
         total_inserted = 0
 
-        # Parallel sync — respects Yahoo rate limits at max_workers=4
         with ThreadPoolExecutor(max_workers=SYNC_MAX_WORKERS) as pool:
 
             future_to_ticker = {
@@ -270,7 +257,55 @@ class DataSyncService:
                 extra={"component": "data_sync", "function": "sync_universe"},
             )
 
+        # Cleanup old rows after every sync — keeps DB size bounded
+        self.cleanup_old_data()
+
         return report
+
+    # ─── Cleanup old data ────────────────────────────────
+
+    def cleanup_old_data(self) -> int:
+        """
+        Delete ohlcv_daily rows older than RETENTION_DAYS (default 760).
+
+        Training uses 730 days. Inference uses 400 days.
+        Rows beyond 760 days are never read by any part of the system.
+        Running this after every sync keeps DB size permanently bounded.
+
+        Non-blocking — returns 0 on failure, never raises.
+        """
+
+        try:
+            from core.db.engine import get_session
+            from core.db.models import OHLCVDaily
+
+            cutoff = (
+                pd.Timestamp.now(tz="UTC")
+                - pd.Timedelta(days=RETENTION_DAYS)
+            ).date()
+
+            with get_session() as session:
+                deleted = (
+                    session.query(OHLCVDaily)
+                    .filter(OHLCVDaily.date < cutoff)
+                    .delete(synchronize_session=False)
+                )
+
+            logger.info(
+                "DB cleanup complete | deleted=%d rows older than %s "
+                "(retention=%d days)",
+                deleted, cutoff, RETENTION_DAYS,
+                extra={"component": "data_sync", "function": "cleanup_old_data"},
+            )
+
+            return deleted
+
+        except Exception as exc:
+            logger.warning(
+                "DB cleanup failed (non-blocking) | error=%s", exc,
+                extra={"component": "data_sync", "function": "cleanup_old_data"},
+            )
+            return 0
 
     # ─── Health check ────────────────────────────────────
 
