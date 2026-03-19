@@ -2,6 +2,15 @@
 # JWT HANDLER
 # Owner: 30-day token, full access
 # Demo:  24-hour token, limited access tracked by IP in Redis
+#
+# FIX: JWT_SECRET now raises RuntimeError if not set in .env.
+#      Previous code silently used a visible fallback string
+#      which anyone reading the source code could use to forge
+#      valid tokens. Now the container refuses to start without
+#      a proper secret.
+#
+# Setup: run this once and paste output into .env:
+#   openssl rand -hex 32
 # =========================================================
 
 import os
@@ -17,10 +26,20 @@ from core.logging.logger import get_logger
 logger = get_logger("marketsentinel.auth")
 
 # =========================================================
-# CONFIG
+# CONFIG — JWT_SECRET is REQUIRED
 # =========================================================
 
-JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_IN_PRODUCTION_USE_generate_owner_hash_script")
+_JWT_SECRET_RAW = os.getenv("JWT_SECRET", "")
+
+if not _JWT_SECRET_RAW:
+    raise RuntimeError(
+        "JWT_SECRET is not set in .env — "
+        "this is a security requirement. "
+        "Generate one with: openssl rand -hex 32 "
+        "then add JWT_SECRET=<output> to your .env file."
+    )
+
+JWT_SECRET = _JWT_SECRET_RAW
 JWT_ALGORITHM = "HS256"
 JWT_OWNER_EXPIRE_DAYS = int(os.getenv("JWT_OWNER_EXPIRE_DAYS", "30"))
 JWT_DEMO_EXPIRE_HOURS = int(os.getenv("JWT_DEMO_EXPIRE_HOURS", "24"))
@@ -70,7 +89,10 @@ def create_owner_token(username: str) -> str:
 
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-    logger.info("Owner token created | username=%s | expires=%s", username, expire.isoformat())
+    logger.info(
+        "Owner token created | username=%s | expires=%s",
+        username, expire.isoformat(),
+    )
 
     return token
 
@@ -79,8 +101,7 @@ def create_demo_token(ip_hash: str, fingerprint: str) -> str:
     """
     Create a short-lived JWT for demo users.
     Expires in JWT_DEMO_EXPIRE_HOURS (default 24 hours).
-    The token expiry and the Redis usage tracking are independent —
-    Redis counters survive token expiry (7-day TTL).
+    Redis usage counters survive token expiry (7-day TTL).
     """
 
     expire = datetime.now(timezone.utc) + timedelta(hours=JWT_DEMO_EXPIRE_HOURS)

@@ -1,7 +1,16 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v5.4
-# FIX: _build_cross_sectional_frame now passes start_date/end_date
-#      computed from INFERENCE_LOOKBACK_DAYS (MarketDataService requires them)
+# INSTITUTIONAL INFERENCE PIPELINE v5.5
+#
+# Changes from v5.4:
+#   FIX 1: snapshot_rows now include "agents" dict so
+#           /agent/explain and PortfolioDecisionAgent work.
+#   FIX 2: TOP_K / BOTTOM_K reduced from 10 → 5 for better
+#           selectivity with 30-100 ticker universe.
+#   FIX 3: run_snapshot checks fixed background cache key
+#           ("ms:background_snapshot:latest") before running
+#           full inference — matches main.py background loop.
+#   FIX 4: hybrid_score now includes political_agent output
+#           weighted correctly across all three agents.
 # =========================================================
 
 import time
@@ -44,6 +53,11 @@ logger = get_logger("marketsentinel.pipeline")
 
 EPSILON = 1e-12
 
+# Fixed Redis key written by main.py background loop.
+# live-snapshot checks this first so it never re-runs inference
+# when the background loop already has a fresh result.
+BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
+
 _SHARED_MODEL_LOADER = None
 _MODEL_LOCK = threading.Lock()
 
@@ -81,8 +95,10 @@ class InferencePipeline:
     MIN_SCORE_STD = 1e-6
     MAX_POSITION_WEIGHT = 0.20
 
-    TOP_K = 10
-    BOTTOM_K = 10
+    # Reduced from 10 → 5: with 100 tickers, top-5 long + bottom-5 short
+    # = 10% of universe selected. Much more selective signal.
+    TOP_K = int(os.getenv("PIPELINE_TOP_K", "5"))
+    BOTTOM_K = int(os.getenv("PIPELINE_BOTTOM_K", "5"))
 
     SCORE_WINSOR_Q = 0.02
 
@@ -128,8 +144,7 @@ class InferencePipeline:
     def _get_date_window(self):
         """
         Compute start_date / end_date from INFERENCE_LOOKBACK_DAYS.
-        MarketDataService.get_price_data_batch() requires these as
-        positional args — it reads from PostgreSQL and filters by date.
+        MarketDataService.get_price_data_batch() requires these.
         """
         end_date = pd.Timestamp.now(tz="UTC")
         start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
@@ -140,7 +155,6 @@ class InferencePipeline:
 
     # =========================================================
     # FEATURE FRAME BUILDER
-    # FIX: pass start_date/end_date — MarketDataService requires them
     # =========================================================
 
     def _build_cross_sectional_frame(self, tickers: List[str]):
@@ -211,7 +225,7 @@ class InferencePipeline:
         try:
             return self.drift_detector.detect(feature_df)
         except Exception:
-            logger.warning("Drift detector failed.")
+            logger.warning("Drift detector failed — using safe defaults.")
             return {
                 "drift_state": "unknown",
                 "severity_score": 0.0,
@@ -229,6 +243,28 @@ class InferencePipeline:
         except Exception:
             logger.exception("Agent failure.")
             return {"score": 0.0, "agent_score": 0.0, "hybrid": {"score": 0.0}}
+
+    # =========================================================
+    # HYBRID SCORE
+    # Combines signal_agent + technical_agent + political_agent.
+    # All three return scores on 0-1 scale via agent_score field.
+    # Weights: signal=0.5, technical=0.3, political=0.2
+    # =========================================================
+
+    def _compute_hybrid_score(self, signal_output, technical_output, political_output):
+        """
+        Weighted combination of three agent scores.
+        All agent_score fields are 0-1 normalized.
+        """
+
+        sa = float(signal_output.get("agent_score", 0.0))
+        ta = float(technical_output.get("score", 0.0))
+        pa = float(political_output.get("agent_score", 0.0))
+
+        # Weight: signal matters most, technical confirms, political gates
+        hybrid = 0.5 * sa + 0.3 * ta + 0.2 * pa
+
+        return float(np.clip(hybrid, 0.0, 1.0))
 
     # =========================================================
     # PORTFOLIO CONSTRUCTION
@@ -304,7 +340,7 @@ class InferencePipeline:
 
         except Exception as e:
             logger.warning(
-                "Failed to store predictions in DB (non-blocking) | error=%s", str(e)
+                "Failed to store predictions (non-blocking) | error=%s", str(e)
             )
 
     # =========================================================
@@ -319,6 +355,26 @@ class InferencePipeline:
         full_universe = list(MarketUniverse.get_universe())
         requested = sorted(set(tickers)) if tickers else full_universe
 
+        # ----------------------------------------------------------
+        # FIX: Check fixed background snapshot key FIRST.
+        # main.py _background_snapshot_loop writes to this key.
+        # If it's there, serve it instantly — no inference needed.
+        # Dynamic build_key() below is a secondary cache for when
+        # the background key doesn't exist yet (first boot).
+        # ----------------------------------------------------------
+        bg_cached = self.cache.get(BACKGROUND_SNAPSHOT_KEY)
+        if bg_cached and isinstance(bg_cached, dict) and "signals" in bg_cached:
+            # Filter signals to requested tickers if needed
+            if set(requested) != set(full_universe):
+                bg_cached = dict(bg_cached)
+                bg_cached["signals"] = [
+                    s for s in bg_cached["signals"]
+                    if s.get("ticker") in requested
+                ]
+            logger.info("Snapshot served from background cache key")
+            return bg_cached
+
+        # Secondary cache key (model/schema/ticker fingerprinted)
         cache_key = self.cache.build_key({
             "type": "snapshot",
             "requested": requested,
@@ -374,27 +430,43 @@ class InferencePipeline:
 
                 direction = "LONG" if row["raw_model_score"] > 0 else "SHORT"
                 row_dict = {**row.to_dict(), "signal": direction}
-                context = {"row": row_dict}
+                context = {
+                    "row": row_dict,
+                    "drift_state": drift_result.get("drift_state"),
+                }
 
                 signal_output = self._safe_agent(self.signal_agent, context)
                 technical_output = self._safe_agent(self.technical_agent, context)
+                political_output = self._safe_agent(self.political_agent, context)
 
-                hybrid_score = (
-                    signal_output.get("hybrid", {}).get("score", 0)
-                    + technical_output.get("score", 0)
-                ) / 2
+                hybrid_score = self._compute_hybrid_score(
+                    signal_output, technical_output, political_output
+                )
 
+                # --------------------------------------------------
+                # FIX: Write agents into each row.
+                # agent.py _explain_logic reads row.get("agents")
+                # PortfolioDecisionAgent reads stock.get("agents")
+                # Both were always getting empty dicts before this fix.
+                # --------------------------------------------------
                 snapshot_rows.append({
                     "date": str(row["date"]),
                     "ticker": row["ticker"],
                     "raw_model_score": float(row["raw_model_score"]),
                     "hybrid_consensus_score": float(hybrid_score),
                     "weight": 0.0,
+                    "agents": {
+                        "signal_agent": signal_output,
+                        "technical_agent": technical_output,
+                        "political_agent": political_output,
+                    },
                 })
 
-            ranked = sorted(snapshot_rows, key=lambda x: x["hybrid_consensus_score"])
+            ranked = sorted(
+                snapshot_rows, key=lambda x: x["hybrid_consensus_score"]
+            )
             longs = ranked[-min(self.TOP_K, len(ranked)):]
-            shorts = ranked[:min(self.BOTTOM_K, len(ranked))]
+            shorts = ranked[: min(self.BOTTOM_K, len(ranked))]
 
             weights = self._construct_portfolio_from_rows(longs, shorts)
 

@@ -1,7 +1,13 @@
 # =========================================================
-# PREDICTION & SNAPSHOT ROUTES v3.7
-# FIX: price_history passes start_date/end_date to get_price_data
-#      MarketDataService requires these as positional args
+# PREDICTION & SNAPSHOT ROUTES v3.8
+#
+# Changes from v3.7:
+#   FIX 1: price_history route reads date from row["date"]
+#           column, not idx (which is a RangeIndex after
+#           _validate_dataset calls reset_index(drop=True)).
+#   FIX 2: live_snapshot checks fixed background cache key
+#           "ms:background_snapshot:latest" first before
+#           running full inference. Matches main.py loop key.
 # =========================================================
 
 import time
@@ -17,6 +23,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline, get_shared_model_loader
+from app.inference.cache import RedisCache
 from core.data.market_data_service import MarketDataService
 from core.logging.logger import get_logger
 
@@ -37,6 +44,9 @@ logger = get_logger("marketsentinel.api")
 
 _pipeline: Optional[InferencePipeline] = None
 _universe_cache: Optional[List[str]] = None
+
+# Fixed background snapshot key — must match main.py background loop
+BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
 
 
 # =========================================================
@@ -126,6 +136,10 @@ def _date_window(days: int):
 
 # =========================================================
 # LIVE SNAPSHOT
+# FIX: Check fixed background cache key first.
+#      Background loop in main.py writes "ms:background_snapshot:latest".
+#      Serving from that key is instant (~1ms) vs running
+#      full inference (~30-120s cold).
 # =========================================================
 
 @router.get("/live-snapshot")
@@ -142,11 +156,28 @@ async def live_snapshot():
         loader = get_shared_model_loader()
         container = loader._xgb_container
 
-        async with inference_semaphore:
-            snapshot = await asyncio.wait_for(
-                run_in_threadpool(pipeline.run_snapshot, tickers),
-                timeout=REQUEST_TIMEOUT,
-            )
+        # --------------------------------------------------
+        # FIX: Try fixed background snapshot key first.
+        # This is what /snapshot alias also does via pipeline.run_snapshot().
+        # But here we check directly to avoid the inference semaphore overhead.
+        # --------------------------------------------------
+        cache = RedisCache()
+        snapshot = None
+
+        if cache.enabled or cache._memory_get(BACKGROUND_SNAPSHOT_KEY):
+            snapshot = cache.get(BACKGROUND_SNAPSHOT_KEY)
+            if snapshot and isinstance(snapshot, dict) and "signals" in snapshot:
+                logger.info("live-snapshot served from background cache")
+            else:
+                snapshot = None
+
+        # Cache miss — run full inference
+        if snapshot is None:
+            async with inference_semaphore:
+                snapshot = await asyncio.wait_for(
+                    run_in_threadpool(pipeline.run_snapshot, tickers),
+                    timeout=REQUEST_TIMEOUT,
+                )
 
         if not isinstance(snapshot, dict) or "signals" not in snapshot:
             raise RuntimeError("Invalid snapshot structure.")
@@ -164,17 +195,24 @@ async def live_snapshot():
 
         drift = snapshot.get("drift", {})
 
-        # Compute gross/net exposure from weights
         weights = [s.get("weight", 0.0) for s in signals]
         gross_exposure = sum(abs(w) for w in weights)
         net_exposure = sum(weights)
 
-        # Top 5 by raw_model_score
-        top_5 = sorted(signals, key=lambda x: x.get("raw_model_score", 0.0), reverse=True)[:5]
+        # Top 5 by hybrid_consensus_score (more meaningful than raw model score)
+        top_5 = sorted(
+            signals,
+            key=lambda x: x.get("hybrid_consensus_score", 0.0),
+            reverse=True,
+        )[:5]
 
         executive_summary = {
             "top_5_tickers": [t["ticker"] for t in top_5],
-            "portfolio_bias": "LONG" if net_exposure > 0 else "SHORT" if net_exposure < 0 else "NEUTRAL",
+            "portfolio_bias": (
+                "LONG" if net_exposure > 0
+                else "SHORT" if net_exposure < 0
+                else "NEUTRAL"
+            ),
             "risk_regime": drift.get("drift_state", "unknown"),
             "gross_exposure": round(gross_exposure, 4),
             "net_exposure": round(net_exposure, 4),
@@ -260,7 +298,6 @@ async def signal_explanation(ticker: str):
         agents = row.get("agents", {})
         signal_agent = agents.get("signal_agent", {})
 
-        # Derive signal from weight if agents not present
         weight = row.get("weight", 0.0)
         derived_signal = "LONG" if weight > 0 else ("SHORT" if weight < 0 else "NEUTRAL")
 
@@ -309,7 +346,9 @@ async def signal_explanation(ticker: str):
 
 # =========================================================
 # PRICE HISTORY
-# FIX: pass start_date/end_date — MarketDataService requires them
+# FIX: read date from row["date"] column, not from index.
+#      _validate_dataset() calls reset_index(drop=True) at
+#      the end — so the index is always an integer RangeIndex.
 # =========================================================
 
 @router.get("/price-history/{ticker}")
@@ -346,15 +385,17 @@ async def price_history(ticker: str, days: int = 365):
         df = df.tail(days)
 
         prices = []
-        for idx, row in df.iterrows():
-            date_val = str(idx.date()) if hasattr(idx, "date") else str(idx)
+        for _, row in df.iterrows():
+            # FIX: read from the "date" column, not from the integer index.
+            # _validate_dataset() calls reset_index(drop=True) so idx is int.
+            date_val = str(pd.Timestamp(row["date"]).date())
             prices.append({
                 "date": date_val,
-                "open": round(float(row.get("open", row.get("Open", 0))), 4),
-                "high": round(float(row.get("high", row.get("High", 0))), 4),
-                "low": round(float(row.get("low", row.get("Low", 0))), 4),
-                "close": round(float(row.get("close", row.get("Close", 0))), 4),
-                "volume": int(row.get("volume", row.get("Volume", 0))),
+                "open": round(float(row.get("open", 0)), 4),
+                "high": round(float(row.get("high", 0)), 4),
+                "low": round(float(row.get("low", 0)), 4),
+                "close": round(float(row.get("close", 0)), 4),
+                "volume": int(row.get("volume", 0)),
             })
 
         return {

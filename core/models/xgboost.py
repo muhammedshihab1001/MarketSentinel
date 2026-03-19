@@ -1,8 +1,22 @@
 """
-MarketSentinel v4.5.0
+MarketSentinel v4.5.1
 
 XGBoost regression model wrapper with safer inference handling,
 feature integrity checks, and production-like robustness.
+
+Changes from v4.5.0:
+  FIX: NUM_BOOST_ROUNDS reduced 1200 → 400
+       EARLY_STOPPING_ROUNDS reduced 75 → 30
+       MIN_BOOST_ROUNDS reduced 25 → 10
+
+  Reason: with ~193 rows per ticker × 30 tickers = ~5790 training
+  rows and 15% validation split (~870 rows), the previous settings
+  caused XGBoost to stop at iteration 0-22 because the validation
+  loss plateau was reached immediately on tiny data.
+
+  These settings will produce meaningful training on current data
+  (~9 months). Revert to NUM_BOOST_ROUNDS=1200 / EARLY_STOPPING=75
+  once 2+ years of data are available for 100 tickers.
 """
 
 import hashlib
@@ -18,17 +32,19 @@ import xgboost as xgb
 
 logger = logging.getLogger("marketsentinel.xgboost")
 
-# ── Training constants ─────────────────────────────────────────────
+# ── Training constants ─────────────────────────────────────────
 
 SEED = 42
-NUM_BOOST_ROUNDS = 1200
-EARLY_STOPPING_ROUNDS = 75
+
+# Adjusted for current data volume (~9 months, 30 tickers)
+# Revert to 1200/75/25 when 2+ years × 100 tickers available
+NUM_BOOST_ROUNDS = 400
+EARLY_STOPPING_ROUNDS = 30
+MIN_BOOST_ROUNDS = 10
+
 VALIDATION_SPLIT = 0.15
 
-MIN_BOOST_ROUNDS = 25
-MIN_TRAIN_ROWS = 120
-
-# ── Sanity thresholds ──────────────────────────────────────────────
+# ── Sanity thresholds ──────────────────────────────────────────
 
 MIN_SCORE_STD = 1e-6
 MIN_TARGET_STD = 1e-6
@@ -36,8 +52,9 @@ MAX_MODEL_SIZE_MB = 150
 MAX_ABS_SCORE = 50
 EPSILON = 1e-12
 
-MIN_VALIDATION_ROWS = 50
+MIN_VALIDATION_ROWS = 30   # lowered from 50 — matches reduced data volume
 MAX_TARGET_ABS = 50
+MIN_TRAIN_ROWS = 80        # lowered from 120 — CV portfolio may have sparse tickers
 
 
 class SafeXGBRegressor:
@@ -66,7 +83,7 @@ class SafeXGBRegressor:
         np.random.seed(SEED)
 
     # ==========================================================
-    # FIT (STRICT - KEEP AS IS)
+    # FIT
     # ==========================================================
 
     def fit(self, X, y):
@@ -105,11 +122,10 @@ class SafeXGBRegressor:
         split_idx = int(len(X) * (1 - VALIDATION_SPLIT))
 
         if len(X) - split_idx < MIN_VALIDATION_ROWS:
-            split_idx = len(X) - MIN_VALIDATION_ROWS
+            split_idx = max(len(X) - MIN_VALIDATION_ROWS, int(len(X) * 0.7))
 
         X_train = X.iloc[:split_idx]
         y_train = y[:split_idx]
-
         X_valid = X.iloc[split_idx:]
         y_valid = y[split_idx:]
 
@@ -124,14 +140,14 @@ class SafeXGBRegressor:
         params = {
             "objective": "reg:squarederror",
             "eval_metric": "rmse",
-            "max_depth": 6,
-            "eta": 0.03,
-            "subsample": 0.85,
-            "colsample_bytree": 0.85,
-            "min_child_weight": 2,
-            "gamma": 0.05,
-            "reg_alpha": 0.3,
-            "reg_lambda": 1.2,
+            "max_depth": 4,        # reduced from 6 — less overfit on small data
+            "eta": 0.05,           # slightly higher than 0.03 — faster convergence
+            "subsample": 0.80,
+            "colsample_bytree": 0.80,
+            "min_child_weight": 3,
+            "gamma": 0.1,
+            "reg_alpha": 0.5,
+            "reg_lambda": 1.5,
             "tree_method": "hist",
             "seed": SEED,
             "verbosity": 0,
@@ -155,22 +171,29 @@ class SafeXGBRegressor:
 
         self.best_iteration = getattr(self.model, "best_iteration", NUM_BOOST_ROUNDS)
 
-        # FIX: Ensure at least 1 boosting round is used for prediction
         if self.best_iteration < 1:
-            logger.warning("Model stopped extremely early (iter=%d).", self.best_iteration)
+            logger.warning("Model stopped at iter=0. Forcing iter=1.")
             self.best_iteration = 1
         elif self.best_iteration < MIN_BOOST_ROUNDS:
-            logger.warning("Model stopped extremely early (iter=%d).", self.best_iteration)
+            logger.warning(
+                "Model stopped very early (iter=%d). "
+                "Consider adding more training data.",
+                self.best_iteration,
+            )
 
         self.train_rmse = float(evals_result["train"]["rmse"][-1])
-        self.valid_rmse = float(evals_result.get("valid", {}).get("rmse", [self.train_rmse])[-1])
+        self.valid_rmse = float(
+            evals_result.get("valid", {}).get("rmse", [self.train_rmse])[-1]
+        )
 
+        raw = self.model.save_raw()
         self.booster_checksum = hashlib.sha256(
-            self.model.save_raw().tobytes() if hasattr(self.model.save_raw(), 'tobytes') else self.model.save_raw()
+            raw.tobytes() if hasattr(raw, "tobytes") else raw
         ).hexdigest()
 
         logger.info(
-            "XGBoost trained | iter=%d | features=%d | train_rmse=%.5f | valid_rmse=%.5f",
+            "XGBoost trained | iter=%d | features=%d | "
+            "train_rmse=%.5f | valid_rmse=%.5f",
             self.best_iteration,
             len(self.feature_names),
             self.train_rmse,
@@ -180,7 +203,7 @@ class SafeXGBRegressor:
         return self
 
     # ==========================================================
-    # PREDICT (FIXED + SAFE)
+    # PREDICT
     # ==========================================================
 
     def predict(self, X):
@@ -191,27 +214,20 @@ class SafeXGBRegressor:
         if X is None:
             raise RuntimeError("Inference input is None.")
 
-        # 🔥 FIX 1: Convert numpy → DataFrame
         if isinstance(X, np.ndarray):
             X = pd.DataFrame(X, columns=self.feature_names)
 
         if X.empty:
             raise RuntimeError("Inference features empty.")
 
-        # 🔥 FIX 2: Add missing features safely
         missing = set(self.feature_names) - set(X.columns)
-
         if missing:
             logger.warning("Missing features filled with 0: %s", list(missing))
             for col in missing:
                 X[col] = 0.0
 
-        # enforce order
         X = X.reindex(columns=self.feature_names)
-
-        # 🔥 FIX 3: Handle NaN / inf safely
         X = X.replace([np.inf, -np.inf], 0).fillna(0)
-
         X = X.astype(np.float32)
 
         dmatrix = xgb.DMatrix(X, feature_names=self.feature_names)
@@ -242,5 +258,5 @@ class SafeXGBRegressor:
 # ==========================================================
 
 def build_xgboost_pipeline():
-    logger.info("Building XGBoost Regressor | MarketSentinel v4.5.0")
+    logger.info("Building XGBoost Regressor | MarketSentinel v4.5.1")
     return SafeXGBRegressor()

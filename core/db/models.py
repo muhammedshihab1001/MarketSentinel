@@ -2,31 +2,34 @@
 MarketSentinel — ORM Models
 
 Three core tables:
-  1. ohlcv_daily     — Raw price data from Yahoo Finance
-  2. computed_features — Pre-computed feature engineering output
-  3. model_predictions — Stored inference results for audit trail
+  1. ohlcv_daily        — Raw price data from Yahoo Finance
+  2. computed_features  — Pre-computed feature engineering output
+  3. model_predictions  — Stored inference results for audit trail
 
 All tables use (ticker, date) as the logical key with proper
 indexes for the query patterns used in the inference pipeline.
+
+FIX v2: schema_signature changed String(32) → String(64)
+         sha256 hex digest is always 64 characters.
+         Previous String(32) caused StringDataRightTruncation
+         on every INSERT to model_predictions.
 """
 
 import datetime
 from typing import Optional
 
 from sqlalchemy import (
-    Column,
-    String,
-    Float,
     BigInteger,
-    DateTime,
     Date,
-    Text,
+    DateTime,
+    Float,
     Index,
+    String,
     UniqueConstraint,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db.engine import Base
 
@@ -57,7 +60,6 @@ class OHLCVDaily(Base):
     close: Mapped[float] = mapped_column(Float, nullable=False)
     volume: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
-    # Metadata
     fetched_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -92,13 +94,6 @@ class ComputedFeature(Base):
     Keyed by (ticker, date, feature_version) so that when
     the feature pipeline changes, old cached features are
     automatically ignored.
-
-    The feature_data column stores all computed features as
-    a JSON blob — this avoids schema changes when new features
-    are added to MODEL_FEATURES.
-
-    Query pattern: WHERE ticker IN (?) AND date BETWEEN ? AND ?
-                   AND feature_version = ?
     """
 
     __tablename__ = "computed_features"
@@ -109,7 +104,7 @@ class ComputedFeature(Base):
     date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
 
     feature_version: Mapped[str] = mapped_column(
-        String(32),
+        String(64),
         nullable=False,
         doc="Hash of MODEL_FEATURES list — invalidates cache on schema change",
     )
@@ -148,13 +143,12 @@ class ModelPrediction(Base):
     """
     Audit trail for model inference results.
 
-    Stores the raw model score and final hybrid score for
-    each ticker on each prediction date. Useful for:
-      - Debugging model behavior over time
-      - Comparing predictions across model versions
-      - Building a backtest from stored predictions
+    FIX: schema_signature was String(32) — sha256 hex is 64 chars.
+    Changed to String(64) to prevent StringDataRightTruncation errors.
 
-    Query pattern: WHERE date = ? AND model_version = ?
+    Run this migration on existing DBs:
+        ALTER TABLE model_predictions
+        ALTER COLUMN schema_signature TYPE varchar(64);
     """
 
     __tablename__ = "model_predictions"
@@ -165,13 +159,14 @@ class ModelPrediction(Base):
     date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
 
     model_version: Mapped[str] = mapped_column(String(64), nullable=False)
-    schema_signature: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    # FIX: was String(32) — sha256 hex digest is always 64 chars
+    schema_signature: Mapped[str] = mapped_column(String(64), nullable=False)
 
     raw_model_score: Mapped[float] = mapped_column(Float, nullable=False)
     hybrid_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     weight: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     signal: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
-
     drift_state: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     predicted_at: Mapped[datetime.datetime] = mapped_column(

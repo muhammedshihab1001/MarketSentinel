@@ -1,6 +1,9 @@
 # =========================================================
-# REDIS CACHE v10
-# Stable | Drift-Safe | CV-Optimized | Memory Fallback
+# REDIS CACHE v11
+# FIX: Added _redis property so DemoTracker can access
+#      the raw Redis client for incr/expire/ttl/exists ops.
+#      DemoTracker calls self._cache._redis.incr() etc —
+#      these need the raw client, not the JSON wrapper.
 # =========================================================
 
 import redis
@@ -11,7 +14,6 @@ import os
 import random
 import time
 import zlib
-import numpy as np
 from typing import Optional
 
 from core.schema.feature_schema import get_schema_signature
@@ -28,7 +30,7 @@ class RedisCache:
     _client = None
     _pool = None
 
-    # 🔥 NEW: in-memory fallback cache
+    # In-memory fallback cache (used when Redis is down)
     _memory_cache = {}
 
     BASE_RETRY = 15
@@ -38,9 +40,11 @@ class RedisCache:
     MIN_TTL = 30
 
     MAX_PAYLOAD_BYTES = 256_000
-    CACHE_NAMESPACE_VERSION = "v10"
+    CACHE_NAMESPACE_VERSION = "v11"
 
-    ###################################################
+    # =========================================================
+    # INIT
+    # =========================================================
 
     def __init__(self):
 
@@ -60,9 +64,30 @@ class RedisCache:
 
         self._connect()
 
-    ###################################################
+    # =========================================================
+    # _redis PROPERTY — exposes raw Redis client for DemoTracker
+    # DemoTracker uses: .get() .incr() .expire() .ttl() .exists() .setex()
+    # These are raw Redis commands that need the client directly.
+    # =========================================================
+
+    @property
+    def _redis(self):
+        """
+        Expose raw Redis client for operations that need it directly.
+        Used by DemoTracker for atomic incr/expire/ttl/exists ops.
+        Returns None if Redis is not connected.
+        """
+        if self.enabled and RedisCache._client is not None:
+            return RedisCache._client
+        # Attempt reconnect before returning None
+        self._maybe_reconnect()
+        if self.enabled and RedisCache._client is not None:
+            return RedisCache._client
+        return None
+
+    # =========================================================
     # CONNECTION
-    ###################################################
+    # =========================================================
 
     def _connect(self):
 
@@ -80,7 +105,7 @@ class RedisCache:
                     socket_connect_timeout=2,
                     max_connections=8,
                     retry_on_timeout=True,
-                    decode_responses=False
+                    decode_responses=False,
                 )
 
             if RedisCache._client is None:
@@ -102,25 +127,16 @@ class RedisCache:
             self.enabled = False
 
             jitter = random.randint(0, 5)
-
-            self._disabled_until = (
-                time.time() +
-                self._retry_delay +
-                jitter
-            )
-
-            self._retry_delay = min(
-                self._retry_delay * 2,
-                self.MAX_RETRY
-            )
+            self._disabled_until = time.time() + self._retry_delay + jitter
+            self._retry_delay = min(self._retry_delay * 2, self.MAX_RETRY)
 
             logger.warning(
                 "Redis unavailable (%s). Retry in %ss",
                 exc,
-                self._retry_delay
+                self._retry_delay,
             )
 
-    ###################################################
+    # =========================================================
 
     def _maybe_reconnect(self):
 
@@ -133,9 +149,9 @@ class RedisCache:
         logger.info("Attempting Redis reconnect...")
         self._connect()
 
-    ###################################################
+    # =========================================================
     # CANONICAL JSON
-    ###################################################
+    # =========================================================
 
     def _canonical_json(self, payload):
 
@@ -143,17 +159,16 @@ class RedisCache:
             payload,
             sort_keys=True,
             separators=(",", ":"),
-            default=str
+            default=str,
         )
 
-    ###################################################
+    # =========================================================
     # CACHE KEY
-    ###################################################
+    # =========================================================
 
     def build_key(self, payload: dict) -> str:
 
         raw = self._canonical_json(payload)
-
         fingerprint = hashlib.sha256(raw.encode()).hexdigest()
 
         return (
@@ -164,9 +179,9 @@ class RedisCache:
             f"{fingerprint}"
         )
 
-    ###################################################
+    # =========================================================
     # MEMORY CACHE HELPERS
-    ###################################################
+    # =========================================================
 
     def _memory_get(self, key):
 
@@ -187,15 +202,15 @@ class RedisCache:
 
         expiry = time.time() + ttl
 
-        # limit memory size (simple LRU-like cleanup)
+        # Simple size cap — evict oldest entry
         if len(self._memory_cache) > 500:
             self._memory_cache.pop(next(iter(self._memory_cache)))
 
         self._memory_cache[key] = (value, expiry)
 
-    ###################################################
-    # VALIDATION (RELAXED)
-    ###################################################
+    # =========================================================
+    # VALIDATION
+    # =========================================================
 
     def _validate_snapshot(self, value):
 
@@ -210,21 +225,21 @@ class RedisCache:
 
         return True
 
-    ###################################################
+    # =========================================================
     # GET
-    ###################################################
+    # =========================================================
 
     def get(self, key: str):
 
         self._maybe_reconnect()
 
-        # 🔥 1. Try memory cache first
+        # 1. Try memory cache first (fastest path)
         mem = self._memory_get(key)
         if mem:
             CACHE_HITS.inc()
             return mem
 
-        # 🔥 2. Try Redis
+        # 2. Try Redis
         if not self.enabled:
             CACHE_MISSES.inc()
             return None
@@ -245,7 +260,7 @@ class RedisCache:
                 CACHE_MISSES.inc()
                 return None
 
-            # 🔥 store in memory cache
+            # Warm memory cache
             self._memory_set(key, obj, 60)
 
             CACHE_HITS.inc()
@@ -254,22 +269,20 @@ class RedisCache:
         except Exception:
 
             logger.exception("Redis GET failure.")
-
             self.enabled = False
             self._disabled_until = time.time() + self._retry_delay
-
             return None
 
-    ###################################################
+    # =========================================================
     # SET
-    ###################################################
+    # =========================================================
 
     def set(
         self,
         key: str,
         value,
         ttl: Optional[int] = None,
-        ex: Optional[int] = None
+        ex: Optional[int] = None,
     ):
 
         self._maybe_reconnect()
@@ -281,7 +294,7 @@ class RedisCache:
 
         ttl_value = max(self.MIN_TTL, min(ttl_value, self.MAX_TTL))
 
-        # 🔥 Always store in memory
+        # Always store in memory (works even when Redis is down)
         self._memory_set(key, value, ttl_value)
 
         if not self.enabled:
@@ -292,15 +305,17 @@ class RedisCache:
             serialized = self._canonical_json(value).encode()
 
             if len(serialized) > self.MAX_PAYLOAD_BYTES:
+                logger.warning(
+                    "Cache payload too large (%d bytes) — skipping Redis SET",
+                    len(serialized),
+                )
                 return
 
             payload = zlib.compress(serialized)
-
             self.client.set(key, payload, ex=ttl_value)
 
         except Exception:
 
             logger.exception("Redis SET failure.")
-
             self.enabled = False
             self._disabled_until = time.time() + self._retry_delay

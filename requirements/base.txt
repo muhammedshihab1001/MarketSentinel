@@ -1,6 +1,10 @@
 # =========================================================
-# MarketSentinel — Base Requirements
+# MarketSentinel — Base Requirements v2
 # Shared across inference, training, and CI
+#
+# Change: openai moved to requirements/llm.txt
+#         Install only when LLM_ENABLED=true
+#         Saves ~35MB from base inference image
 # =========================================================
 
 # ── Web framework ─────────────────────────────────────────
@@ -39,9 +43,6 @@ httpx==0.27.0
 # ── Observability ─────────────────────────────────────────
 prometheus_client==0.20.0
 psutil==6.0.0
-
-# ── LLM (optional — disabled by default via LLM_ENABLED=false) ──
-openai==2.21.0
 
 # ── Config / env ──────────────────────────────────────────
 python-dotenv==1.0.1

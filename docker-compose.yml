@@ -13,7 +13,7 @@ volumes:
 services:
 
   ####################################################
-  # POSTGRESQL (Persistent Data Store)
+  # POSTGRESQL
   ####################################################
   postgres:
     container_name: marketsentinel-postgres
@@ -46,7 +46,7 @@ services:
 
 
   ####################################################
-  # POSTGRESQL BACKUP (Daily pg_dump — 7-day retention)
+  # POSTGRESQL BACKUP (Daily — 7-day retention)
   ####################################################
   pg-backup:
     container_name: marketsentinel-backup
@@ -89,7 +89,7 @@ services:
 
 
   ####################################################
-  # REDIS (Optional Cache)
+  # REDIS
   ####################################################
   redis:
     container_name: marketsentinel-redis
@@ -138,8 +138,7 @@ services:
       - .env
 
     environment:
-      - MARKET_MAX_WORKERS=2
-      - YAHOO_MAX_CONCURRENT=1
+      - MARKET_MAX_WORKERS=8
       - DRIFT_HARD_FAIL=false
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
@@ -147,6 +146,9 @@ services:
       - POSTGRES_PASSWORD=sentinel
       - POSTGRES_DB=marketsentinel
       - REDIS_HOST=redis
+      - XGBOOST_NO_CUDA=1
+      - PIPELINE_TOP_K=5
+      - PIPELINE_BOTTOM_K=5
 
     volumes:
       - ./artifacts:/app/artifacts
@@ -191,6 +193,7 @@ services:
       - POSTGRES_USER=sentinel
       - POSTGRES_PASSWORD=sentinel
       - POSTGRES_DB=marketsentinel
+      - XGBOOST_NO_CUDA=1
 
     volumes:
       - ./artifacts:/app/artifacts
@@ -209,11 +212,11 @@ services:
 
 
   ####################################################
-  # PROMETHEUS
+  # PROMETHEUS — pinned version
   ####################################################
   prometheus:
     container_name: marketsentinel-prometheus
-    image: prom/prometheus
+    image: prom/prometheus:v2.53.0
 
     restart: unless-stopped
 
@@ -235,11 +238,11 @@ services:
 
 
   ####################################################
-  # GRAFANA
+  # GRAFANA — pinned version
   ####################################################
   grafana:
     container_name: marketsentinel-grafana
-    image: grafana/grafana
+    image: grafana/grafana:11.1.0
 
     restart: unless-stopped
 

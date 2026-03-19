@@ -1,28 +1,23 @@
 """
-MarketSentinel — Market Data Service v5.0
+MarketSentinel — Market Data Service v5.1
 
 Provides OHLCV price data to the inference pipeline, API endpoints,
 and training pipeline. Reads EXCLUSIVELY from PostgreSQL.
 
-Yahoo Finance is NEVER called here. Data sync is handled by
-core.data.data_sync.DataSyncService (runs on startup).
-
-Changes from v4.x:
-  - Removed: MarketProviderRouter dependency (Yahoo calls)
-  - Removed: in-memory OrderedDict cache (replaced by DB)
-  - Removed: rate limiting (not needed for DB reads)
-  - Removed: _dataset_hash (was only used by dead cache)
-  - Removed: DATA_DIR = Path("data/lake") (never used)
-  - Removed: _inflight_requests deduplication (DB handles this)
-  - Kept: _sanitize_ticker, _validate_dataset, _cap_to_safe_date
-  - Kept: get_price_data, get_price_data_batch (same interface)
-  - Added: DB reads via OHLCVRepository
+Changes from v5.0:
+  FIX: get_price_data_batch() now uses ThreadPoolExecutor(max_workers=8)
+       for parallel DB reads.
+       Sequential reads: 30 tickers × ~30ms = ~900ms
+                         100 tickers × ~30ms = ~3000ms
+       Parallel reads:   100 tickers / 8 workers = ~400ms
+       SQLAlchemy get_session() is thread-safe (session-per-call).
 """
 
 import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -33,14 +28,17 @@ from core.logging.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Max parallel DB connections for batch reads
+# Matches SQLAlchemy pool max_overflow default
+BATCH_MAX_WORKERS = int(os.getenv("MARKET_MAX_WORKERS", "8"))
+
 
 class MarketDataService:
     """
     Serves OHLCV data from PostgreSQL.
 
     Same public interface as before — get_price_data() and
-    get_price_data_batch() — so all callers (pipeline.py,
-    predict.py, equity.py, performance.py) work without changes.
+    get_price_data_batch() — so all callers work without changes.
     """
 
     REQUIRED_COLUMNS = {
@@ -57,7 +55,7 @@ class MarketDataService:
     def __init__(self) -> None:
 
         logger.info(
-            "MarketDataService initialized (DB-backed)",
+            "MarketDataService initialized (DB-backed, parallel batch)",
             extra={"component": "market_data_service", "function": "__init__"},
         )
 
@@ -78,15 +76,11 @@ class MarketDataService:
         return ticker
 
     # --------------------------------------------------
-    # SAFE DATE
+    # SAFE DATE CAP
     # --------------------------------------------------
 
     @classmethod
     def _cap_to_safe_date(cls, date_input: str) -> pd.Timestamp:
-        """
-        Cap the requested end date to a safe cutoff (today minus lag).
-        Prevents requesting data from the future or incomplete trading days.
-        """
 
         requested = pd.Timestamp(date_input, tz="UTC").normalize()
 
@@ -103,11 +97,6 @@ class MarketDataService:
     # --------------------------------------------------
 
     def _validate_dataset(self, df: pd.DataFrame, ticker: str, min_rows: int):
-        """
-        Validate and clean a DataFrame from the DB.
-        Same validation logic as before — ensures data quality
-        regardless of source.
-        """
 
         if df is None or df.empty:
             raise RuntimeError(f"Market data empty for {ticker}")
@@ -115,7 +104,6 @@ class MarketDataService:
         df = df.copy()
 
         missing = self.REQUIRED_COLUMNS - set(df.columns)
-
         if missing:
             raise RuntimeError(
                 f"Schema violation for {ticker}. Missing: {missing}"
@@ -123,16 +111,12 @@ class MarketDataService:
 
         df["ticker"] = ticker
 
-        # Enforce UTC + normalize
         df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
         df["date"] = df["date"].dt.normalize()
-
         df = df.dropna(subset=["date"])
-
         df = df.sort_values("date").drop_duplicates("date")
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
-
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -141,7 +125,6 @@ class MarketDataService:
         if not np.isfinite(df[numeric_cols].values).all():
             raise RuntimeError(f"Non-finite values detected for {ticker}")
 
-        # Prevent corrupted prices
         if (df[["open", "high", "low", "close"]] <= 0).any().any():
             raise RuntimeError(f"Invalid price values detected for {ticker}")
 
@@ -150,9 +133,7 @@ class MarketDataService:
         df["low"] = np.minimum.reduce([df["low"], df["open"], df["close"]])
 
         if df["close"].nunique() < 5:
-            raise RuntimeError(
-                f"Flat price series detected for {ticker}"
-            )
+            raise RuntimeError(f"Flat price series detected for {ticker}")
 
         df = df[df["volume"] >= 0]
 
@@ -160,16 +141,12 @@ class MarketDataService:
             df = df.tail(self.MAX_ROWS).reset_index(drop=True)
 
         span_days = (df["date"].max() - df["date"].min()).days + 1
-
         if span_days > 0:
-
             density = df["date"].nunique() / span_days
-
             if density < self.MIN_TRADING_DENSITY:
                 logger.warning(
                     "Low trading density for %s: %.2f",
-                    ticker,
-                    density,
+                    ticker, density,
                     extra={
                         "component": "market_data_service",
                         "function": "_validate_dataset",
@@ -177,14 +154,11 @@ class MarketDataService:
                 )
 
         if len(df) < min_rows:
-
             soft_threshold = int(min_rows * 0.7)
-
             if self.SOFT_FAIL_MODE and len(df) >= soft_threshold:
                 logger.warning(
                     "Short history accepted for %s (%d rows)",
-                    ticker,
-                    len(df),
+                    ticker, len(df),
                     extra={
                         "component": "market_data_service",
                         "function": "_validate_dataset",
@@ -198,7 +172,7 @@ class MarketDataService:
         return df.reset_index(drop=True)
 
     # --------------------------------------------------
-    # SINGLE FETCH (from DB)
+    # SINGLE FETCH
     # --------------------------------------------------
 
     def get_price_data(
@@ -209,12 +183,6 @@ class MarketDataService:
         interval: str = "1d",
         min_history: Optional[int] = None,
     ) -> pd.DataFrame:
-        """
-        Load OHLCV data for a single ticker from PostgreSQL.
-
-        Same interface as before — callers don't need to change.
-        Typical latency: ~20-50ms (vs 2-25s from Yahoo).
-        """
 
         ticker = self._sanitize_ticker(ticker)
 
@@ -227,8 +195,6 @@ class MarketDataService:
 
         start_time = time.time()
 
-        # ── Read from PostgreSQL ─────────────────────────
-
         df = OHLCVRepository.get_price_data(ticker, start_str, end_str)
 
         if df is None or df.empty:
@@ -237,17 +203,13 @@ class MarketDataService:
                 f"Run data sync first."
             )
 
-        # ── Validate (same checks as before) ────────────
-
         df = self._validate_dataset(df, ticker, min_history)
 
         latency_ms = round((time.time() - start_time) * 1000, 1)
 
         logger.info(
             "Market data served (DB) | ticker=%s rows=%d latency=%.1fms",
-            ticker,
-            len(df),
-            latency_ms,
+            ticker, len(df), latency_ms,
             extra={
                 "component": "market_data_service",
                 "function": "get_price_data",
@@ -257,7 +219,7 @@ class MarketDataService:
         return df
 
     # --------------------------------------------------
-    # BATCH FETCH (from DB)
+    # BATCH FETCH — parallel with ThreadPoolExecutor
     # --------------------------------------------------
 
     def get_price_data_batch(
@@ -269,43 +231,50 @@ class MarketDataService:
         min_history: Optional[int] = None,
     ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, str]]:
         """
-        Load OHLCV data for multiple tickers from PostgreSQL.
+        Load OHLCV data for multiple tickers from PostgreSQL in parallel.
 
-        Same interface as before — returns (results_dict, failures_dict).
-        No threading needed — DB reads are fast (~20ms per ticker).
+        Uses ThreadPoolExecutor(max_workers=8) for concurrent DB reads.
+        SQLAlchemy get_session() is thread-safe — each call opens its own
+        session from the connection pool.
+
+        Performance: 100 tickers sequential = ~3000ms
+                     100 tickers parallel (8 workers) = ~400ms
         """
 
         results: Dict[str, pd.DataFrame] = {}
         failures: Dict[str, str] = {}
 
-        tickers = [self._sanitize_ticker(t) for t in list(dict.fromkeys(tickers))]
+        tickers = [
+            self._sanitize_ticker(t)
+            for t in list(dict.fromkeys(tickers))  # deduplicate, preserve order
+        ]
 
         start_time = time.time()
 
-        for ticker in tickers:
+        def _fetch_one(ticker: str):
+            return ticker, self.get_price_data(
+                ticker, start_date, end_date, interval, min_history
+            )
 
-            try:
-                results[ticker] = self.get_price_data(
-                    ticker,
-                    start_date,
-                    end_date,
-                    interval,
-                    min_history,
-                )
+        with ThreadPoolExecutor(max_workers=BATCH_MAX_WORKERS) as pool:
 
-            except Exception as exc:
+            futures = {pool.submit(_fetch_one, t): t for t in tickers}
 
-                failures[ticker] = str(exc)
-
-                logger.warning(
-                    "Batch fetch failed | ticker=%s | error=%s",
-                    ticker,
-                    exc,
-                    extra={
-                        "component": "market_data_service",
-                        "function": "get_price_data_batch",
-                    },
-                )
+            for fut in as_completed(futures):
+                ticker = futures[fut]
+                try:
+                    _, df = fut.result()
+                    results[ticker] = df
+                except Exception as exc:
+                    failures[ticker] = str(exc)
+                    logger.warning(
+                        "Batch fetch failed | ticker=%s | error=%s",
+                        ticker, exc,
+                        extra={
+                            "component": "market_data_service",
+                            "function": "get_price_data_batch",
+                        },
+                    )
 
         if not results:
             raise RuntimeError(
@@ -316,8 +285,7 @@ class MarketDataService:
         if failures:
             logger.warning(
                 "Batch partial failure | success=%d failed=%d",
-                len(results),
-                len(failures),
+                len(results), len(failures),
                 extra={
                     "component": "market_data_service",
                     "function": "get_price_data_batch",
@@ -327,11 +295,9 @@ class MarketDataService:
         total_ms = round((time.time() - start_time) * 1000, 1)
 
         logger.info(
-            "Batch fetch complete (DB) | tickers=%d success=%d failed=%d total=%.1fms",
-            len(tickers),
-            len(results),
-            len(failures),
-            total_ms,
+            "Batch fetch complete (DB, parallel) | tickers=%d "
+            "success=%d failed=%d total=%.1fms",
+            len(tickers), len(results), len(failures), total_ms,
             extra={
                 "component": "market_data_service",
                 "function": "get_price_data_batch",
