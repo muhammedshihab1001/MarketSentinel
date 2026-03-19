@@ -1,7 +1,23 @@
 # ==========================================================
-# TRAIN XGBOOST REGRESSION v2.11
-# FIX: load_training_data uses DB-backed get_price_data
-#      (no start_date/end_date args — reads from PostgreSQL)
+# TRAIN XGBOOST REGRESSION v2.12
+#
+# Changes from v2.11:
+#   FIX 1: load_training_data now passes start_date + end_date
+#           to get_price_data_batch() — new MarketDataService
+#           requires these as positional args (no defaults).
+#           Old call: get_price_data(ticker, interval, min_history)
+#           New call: get_price_data_batch(tickers, start, end, ...)
+#           Also switched to batch call (parallel, faster).
+#
+#   FIX 2: Training window uses TRAINING_LOOKBACK_DAYS=730 (2 years)
+#           not INFERENCE_LOOKBACK_DAYS=400. Training and inference
+#           use different windows intentionally:
+#             Training:  730 days (50,000+ samples for XGBoost)
+#             Inference: 400 days (feature engineering only)
+#
+#   FIX 3: Added cleanup_old_data() call after sync — deletes DB
+#           rows older than TRAINING_LOOKBACK_DAYS + 30 day buffer.
+#           Keeps DB lean. Without this, rows accumulate forever.
 # ==========================================================
 
 import os
@@ -41,11 +57,19 @@ BASELINE_PATH = os.path.join(DRIFT_DIR, "baseline.json")
 PRODUCTION_POINTER = os.path.join(MODEL_DIR, "production_pointer.json")
 
 SEED = 42
-MIN_TRAINING_ROWS = 1200
+MIN_TRAINING_ROWS = 500       # lowered from 1200 — we have ~9 months currently
 TARGET_CLIP = 5.0
 LOW_VARIANCE_THRESHOLD = 1e-6
 MAX_DATASET_ROWS = 1_000_000
 MIN_SUCCESSFUL_TICKERS = 8
+
+# Training uses 2 years — inference uses 400 days.
+# These are intentionally different window sizes.
+TRAINING_LOOKBACK_DAYS = int(os.getenv("TRAINING_LOOKBACK_DAYS", "730"))
+
+# Cleanup: delete rows older than training window + 30 day buffer.
+# Keeps DB lean. Rows beyond this are never used by training or inference.
+CLEANUP_RETENTION_DAYS = TRAINING_LOOKBACK_DAYS + 30
 
 
 def enforce_determinism():
@@ -144,65 +168,127 @@ def export_artifacts(
             model_version=model_version,
             allow_overwrite=True,
         )
+        logger.info("Drift baseline created.")
 
     logger.info("Artifact export completed.")
     return model_version
 
 
 # ==========================================================
-# DATA LOADING
-# FIX: DB-backed — no start_date/end_date passed to get_price_data.
-# Reads from PostgreSQL ohlcv_daily table using min_history.
-# Window filter applied in Python after fetching.
+# DATA CLEANUP
+# Deletes DB rows older than CLEANUP_RETENTION_DAYS.
+# Keeps the DB lean — rows beyond the training window are
+# never used by training or inference so they are pure waste.
 # ==========================================================
 
-def load_training_data(start_date, end_date):
+def cleanup_old_data():
+    """
+    Delete ohlcv_daily rows older than CLEANUP_RETENTION_DAYS.
+    Called after every training run to keep DB size bounded.
+
+    Retention = TRAINING_LOOKBACK_DAYS (730) + 30 day buffer = 760 days.
+    Rows older than 760 days are never used by training or inference.
+    """
+    try:
+        from core.db.engine import get_session
+        from core.db.models import OHLCVDaily
+        import datetime
+
+        cutoff = (
+            pd.Timestamp.now(tz="UTC")
+            - pd.Timedelta(days=CLEANUP_RETENTION_DAYS)
+        ).date()
+
+        with get_session() as session:
+            deleted = (
+                session.query(OHLCVDaily)
+                .filter(OHLCVDaily.date < cutoff)
+                .delete(synchronize_session=False)
+            )
+
+        logger.info(
+            "DB cleanup complete | deleted=%d rows older than %s "
+            "(retention=%d days)",
+            deleted,
+            cutoff,
+            CLEANUP_RETENTION_DAYS,
+        )
+
+        return deleted
+
+    except Exception as exc:
+        # Non-blocking — cleanup failure must never stop training
+        logger.warning("DB cleanup failed (non-blocking) | error=%s", exc)
+        return 0
+
+
+# ==========================================================
+# DATA LOADING
+# FIX: Uses get_price_data_batch() which requires start_date
+#      and end_date. Previous version called get_price_data()
+#      without these args which broke with new MarketDataService.
+#      Also uses TRAINING_LOOKBACK_DAYS=730 not INFERENCE=400.
+# ==========================================================
+
+def load_training_data(start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Load and build feature frame for all universe tickers.
+
+    Uses get_price_data_batch() for parallel DB reads (8 workers).
+    Training window: 730 days (2 years) for sufficient XGBoost samples.
+    Inference window: 400 days (set separately in pipeline.py).
+    """
 
     market_data = MarketDataService()
-    universe = MarketUniverse.get_universe()
+    universe = list(MarketUniverse.get_universe())
 
-    lookback_days = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
+    logger.info(
+        "Loading training data | tickers=%d | window=%s → %s",
+        len(universe), start_date, end_date,
+    )
 
-    price_frames = []
+    # FIX: use batch call with explicit start/end dates.
+    # get_price_data_batch() runs parallel reads (8 workers),
+    # much faster than the old sequential loop.
+    # min_history=60 is lenient — we want as many tickers as possible,
+    # the build_target() cross-sectional z-score handles short series.
+    price_map, failures = market_data.get_price_data_batch(
+        tickers=universe,
+        start_date=start_date,
+        end_date=end_date,
+        interval="1d",
+        min_history=60,
+    )
 
-    for ticker in universe:
-        try:
-            df = market_data.get_price_data(
-                ticker=ticker,
-                interval="1d",
-                min_history=lookback_days,
-            )
+    if failures:
+        logger.warning(
+            "Training data fetch partial failures | failed=%d tickers: %s",
+            len(failures),
+            list(failures.keys()),
+        )
 
-            if df is None or df.empty:
-                logger.warning(
-                    "Empty price data | ticker=%s | function=load_training_data",
-                    ticker,
-                )
-                continue
+    if len(price_map) < MIN_SUCCESSFUL_TICKERS:
+        raise RuntimeError(
+            f"Too few tickers loaded ({len(price_map)}) — "
+            f"need at least {MIN_SUCCESSFUL_TICKERS}. "
+            f"Run DataSyncService.sync_universe() first."
+        )
 
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
-                df = df.dropna(subset=["date"])
+    logger.info(
+        "Price data loaded | success=%d failed=%d",
+        len(price_map), len(failures),
+    )
 
-                try:
-                    start_ts = pd.Timestamp(start_date, tz="UTC")
-                    end_ts = pd.Timestamp(end_date, tz="UTC")
-                    df = df[(df["date"] >= start_ts) & (df["date"] <= end_ts)]
-                except Exception:
-                    pass
-
-            price_frames.append(df)
-
-        except Exception as exc:
-            logger.warning(
-                "Price fetch failed | ticker=%s | error=%s | function=load_training_data",
-                ticker, exc,
-            )
-
-    if len(price_frames) < MIN_SUCCESSFUL_TICKERS:
-        raise RuntimeError(f"Too many tickers failed ({len(price_frames)} usable)")
-
+    # Combine all ticker DataFrames into one cross-sectional frame
+    price_frames = list(price_map.values())
     combined_prices = pd.concat(price_frames, ignore_index=True)
+    combined_prices = combined_prices.dropna(subset=["close"])
+
+    logger.info(
+        "Building feature pipeline | total_rows=%d tickers=%d",
+        len(combined_prices),
+        combined_prices["ticker"].nunique(),
+    )
 
     df = FeatureEngineer.build_feature_pipeline(combined_prices, training=True)
     df = df.loc[:, ~df.columns.duplicated(keep="first")]
@@ -213,14 +299,25 @@ def load_training_data(start_date, end_date):
         logger.warning("Dataset too large — sampling | rows=%d", len(df))
         df = df.sample(MAX_DATASET_ROWS, random_state=SEED)
 
+    logger.info(
+        "Training dataset ready | rows=%d tickers=%d features=%d",
+        len(df),
+        df["ticker"].nunique() if "ticker" in df.columns else 0,
+        len(MODEL_FEATURES),
+    )
+
     return df
 
 
 # ==========================================================
-# TARGET
+# TARGET CONSTRUCTION
+# Cross-sectional z-score of log forward returns.
+# Each date: z = (ticker_return - mean_return) / std_return
+# This removes market-wide direction bias and focuses on
+# which stocks outperform vs underperform their peers.
 # ==========================================================
 
-def build_target(df):
+def build_target(df: pd.DataFrame) -> pd.DataFrame:
 
     required = {"date", "ticker", "close"}
     if not required.issubset(df.columns):
@@ -228,6 +325,7 @@ def build_target(df):
 
     df = df.sort_values(["date", "ticker"]).copy()
 
+    # Log return FORWARD_DAYS ahead (what the model predicts)
     df["raw_forward"] = (
         df.groupby("ticker")["close"]
         .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
@@ -235,6 +333,7 @@ def build_target(df):
 
     df = df.dropna(subset=["raw_forward"])
 
+    # Cross-sectional z-score — relative return vs universe on same day
     cs_mean = df.groupby("date")["raw_forward"].transform("mean")
     cs_std = (
         df.groupby("date")["raw_forward"]
@@ -254,7 +353,7 @@ def build_target(df):
 # TRAINER
 # ==========================================================
 
-def trainer(train_df):
+def trainer(train_df: pd.DataFrame):
 
     train_df = train_df.copy()
     train_df = train_df.loc[:, ~train_df.columns.duplicated(keep="first")]
@@ -270,7 +369,12 @@ def trainer(train_df):
         y = np.random.normal(0, 1, size=len(X))
 
     if len(X) < MIN_TRAINING_ROWS:
-        logger.warning("Small training dataset | rows=%d", len(X))
+        logger.warning(
+            "Small training dataset | rows=%d | "
+            "model will train but performance may be limited. "
+            "Sync more historical data to improve.",
+            len(X),
+        )
 
     if np.std(y) < LOW_VARIANCE_THRESHOLD:
         logger.warning("Low target variance — injecting noise.")
@@ -286,26 +390,69 @@ def trainer(train_df):
 
 
 # ==========================================================
+# TRAINING DATE WINDOW
+# Returns (start_date, end_date) for the training window.
+# Uses TRAINING_LOOKBACK_DAYS=730 (2 years of calendar days
+# = ~500 trading days = ~50,000 rows with 100 tickers).
+# ==========================================================
+
+def get_training_window():
+    """
+    Compute training date window.
+
+    Uses TRAINING_LOOKBACK_DAYS env var (default 730 = 2 years).
+    This is separate from INFERENCE_LOOKBACK_DAYS (400 days)
+    used by the inference pipeline.
+    """
+    end = pd.Timestamp.now(tz="UTC")
+    start = end - pd.Timedelta(days=TRAINING_LOOKBACK_DAYS)
+    return (
+        start.strftime("%Y-%m-%d"),
+        end.strftime("%Y-%m-%d"),
+    )
+
+
+# ==========================================================
 # MAIN
 # ==========================================================
 
-def main(start_date=None, end_date=None, create_baseline=False, promote_baseline=False):
+def main(
+    start_date=None,
+    end_date=None,
+    create_baseline=False,
+    promote_baseline=False,
+):
 
     init_env()
     enforce_determinism()
 
+    # Determine training window
     if start_date is None or end_date is None:
-        start_date, end_date = MarketTime.window_for("xgboost")
+        # Try MarketTime first (respects market calendar)
+        # Fall back to simple calendar window
+        try:
+            start_date, end_date = MarketTime.window_for("xgboost")
+        except Exception:
+            start_date, end_date = get_training_window()
 
+    logger.info(
+        "Training window | start=%s end=%s lookback_days=%d",
+        start_date, end_date, TRAINING_LOOKBACK_DAYS,
+    )
+
+    # Load data and build features
     raw_df = load_training_data(start_date, end_date)
 
+    # Walk-forward validation (produces metrics without data leakage)
     validator = WalkForwardValidator(trainer)
     metrics = validator.run(raw_df.copy())
 
+    # Final model trained on full dataset
     final_df = build_target(raw_df)
     dataset_hash = compute_dataset_hash(final_df)
     final_model = trainer(raw_df)
 
+    # Save model, metadata, pointer, optional baseline
     export_artifacts(
         final_model, metrics, dataset_hash, len(final_df),
         start_date, end_date, final_df,
@@ -313,18 +460,46 @@ def main(start_date=None, end_date=None, create_baseline=False, promote_baseline
         create_baseline=create_baseline,
     )
 
+    # Clean up old DB rows beyond retention window
+    # Non-blocking — never stops training on failure
+    cleanup_old_data()
+
     logger.info("Training completed successfully.")
     return metrics
 
 
 if __name__ == "__main__":
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--create-baseline", action="store_true")
-    parser.add_argument("--promote-baseline", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="MarketSentinel XGBoost Training Pipeline"
+    )
+    parser.add_argument(
+        "--create-baseline",
+        action="store_true",
+        help="Create a new drift baseline (first time only)",
+    )
+    parser.add_argument(
+        "--promote-baseline",
+        action="store_true",
+        help="Update drift baseline from new training data (every retrain)",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Override training start date (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="Override training end date (YYYY-MM-DD)",
+    )
     args = parser.parse_args()
 
     main(
+        start_date=args.start_date,
+        end_date=args.end_date,
         create_baseline=args.create_baseline,
         promote_baseline=args.promote_baseline,
     )
