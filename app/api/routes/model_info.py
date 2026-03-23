@@ -1,9 +1,7 @@
 # =========================================================
-# MODEL INFO ROUTE v2.2
-# FIX: Routes renamed to work with prefix="/model" in main.py
-# /model-info      → /model/info
-# /feature-importance → /model/feature-importance
-# /model-diagnostics  → /model/diagnostics
+# MODEL INFO ROUTE v2.3
+# FIX: Import get_shared_model_loader from model_loader,
+#      not pipeline (it was never defined there).
 # =========================================================
 
 import asyncio
@@ -13,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from typing import Dict, Any
 
-from app.inference.pipeline import get_shared_model_loader
+from app.inference.model_loader import get_shared_model_loader  # FIX: was pipeline
 from core.schema.feature_schema import MODEL_FEATURES
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
