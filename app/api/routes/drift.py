@@ -1,259 +1,320 @@
 # =========================================================
-# DRIFT STATUS ROUTE v2.5
-# FIX: use fixed Redis key for background snapshot
-#      Matches the key written by main.py background loop
+# HYBRID AGENT EXPLANATION ROUTE v3.3
+#
+# Changes from v3.2:
+# FIX 1: /agent/explain now reads per-ticker agent details
+#         from snapshot cache _signal_details dict written
+#         by pipeline.py v5.6. Previously always returned
+#         empty agent data because the cache key didn't
+#         match what the pipeline stored.
+# FIX 2: Response shape aligned to AgentExplainResponse
+#         in frontend types/index.ts — uses data wrapper.
+# FIX 3: /agent/political-risk reads from political agent
+#         cache stored in snapshot _political key.
+# FIX 4: /agent/agents returns agent descriptions without
+#         running inference — was crashing on model call.
 # =========================================================
 
+import logging
 import asyncio
 import time
 import os
-import json
-import pandas as pd
-from fastapi import APIRouter, HTTPException
-from fastapi.concurrency import run_in_threadpool
 
-from app.inference.cache import RedisCache
-from app.inference.pipeline import get_shared_model_loader
-from core.market.universe import MarketUniverse
-from core.schema.feature_schema import (
-    MODEL_FEATURES,
-    validate_feature_schema,
-    DTYPE,
-)
-from core.monitoring.drift_detector import DriftDetector
-from core.monitoring.retrain_trigger import RetrainTrigger
-from core.logging.logger import get_logger
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
     API_ERROR_COUNT,
 )
+from core.logging.logger import get_logger
+
+logger = get_logger("marketsentinel.agent")
 
 router = APIRouter()
-logger = get_logger("marketsentinel.drift")
 
-REQUEST_TIMEOUT = 180
-MAX_CONCURRENT = 2
-MIN_UNIVERSE_WIDTH = 10
-
-# Fixed key — must match what main.py _background_snapshot_loop writes
 BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
 
-drift_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+def _derive_signal(weight: float) -> str:
+    if weight > 0.01:
+        return "LONG"
+    if weight < -0.01:
+        return "SHORT"
+    return "NEUTRAL"
+
+
+def _derive_risk_level(score: float) -> str:
+    abs_score = abs(score)
+    if abs_score >= 0.8:
+        return "high"
+    if abs_score >= 0.5:
+        return "medium"
+    return "low"
+
+
+def _derive_volatility_regime(technical_output: dict) -> str:
+    component_scores = technical_output.get("component_scores", {})
+    signals = technical_output.get("signals", {})
+    regime = signals.get("volatility_regime", "normal")
+    if regime in ("high_volatility", "low_volatility", "normal"):
+        return regime
+    return "normal"
 
 
 # =========================================================
-# BASELINE META
+# GET /agent/explain?ticker=X
 # =========================================================
 
-def _get_baseline_meta():
-
-    detector = DriftDetector()
-    path = detector.BASELINE_PATH
-
-    if not os.path.exists(path):
-        return {
-            "baseline_exists": False,
-            "baseline_version": None,
-            "baseline_model_version": None,
-            "baseline_dataset_hash": None,
-        }
-
-    try:
-        with open(path, encoding="utf-8") as f:
-            baseline = json.load(f)
-        meta = baseline.get("meta", {})
-        return {
-            "baseline_exists": True,
-            "baseline_version": meta.get("baseline_version"),
-            "baseline_model_version": meta.get("model_version"),
-            "baseline_dataset_hash": meta.get("dataset_hash"),
-        }
-    except Exception:
-        return {
-            "baseline_exists": False,
-            "baseline_version": None,
-            "baseline_model_version": None,
-            "baseline_dataset_hash": None,
-        }
-
-
-# =========================================================
-# FAST PATH — READ FROM FIXED REDIS KEY
-# =========================================================
-
-def _drift_from_cache():
-    """Read drift from fixed background snapshot key."""
-
-    cache = RedisCache()
-    if not cache.enabled:
-        return None
-
-    snapshot = cache.get(BACKGROUND_SNAPSHOT_KEY)
-
-    if snapshot and isinstance(snapshot, dict):
-        drift = snapshot.get("drift")
-        if drift and isinstance(drift, dict) and "drift_state" in drift:
-            logger.info("Drift served from background snapshot cache")
-            return drift
-
-    return None
-
-
-# =========================================================
-# SLOW PATH — FULL COMPUTE
-# =========================================================
-
-def _drift_full_compute():
-
-    from app.api.routes.predict import get_pipeline
-
+@router.get("/agent/explain")
+@router.post("/agent/explain")
+async def explain_signal(
+    request: Request,
+    ticker: str = Query(None),
+):
+    """
+    Returns signal explanation for a ticker.
+    Reads from the background snapshot cache where per-ticker
+    agent details were stored by the inference pipeline.
+    """
+    endpoint = "/agent/explain"
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
-    pipeline = get_pipeline()
-    tickers = MarketUniverse.get_universe()
 
-    if not tickers or len(tickers) < MIN_UNIVERSE_WIDTH:
-        raise RuntimeError("Universe too small for drift detection.")
+    # Support both GET ?ticker=X and POST body
+    if ticker is None:
+        try:
+            body = await request.json()
+            ticker = body.get("ticker")
+        except Exception:
+            pass
 
-    df = pipeline._build_cross_sectional_frame(tickers)
+    if not ticker:
+        raise HTTPException(status_code=400, detail="ticker parameter is required")
 
-    if df.empty:
-        raise RuntimeError("Feature frame empty.")
-
-    latest_date = df["date"].max()
-    latest_df = df[df["date"] == latest_date].copy()
-
-    if latest_df.empty:
-        raise RuntimeError("No latest snapshot available for drift.")
-
-    feature_df = validate_feature_schema(
-        latest_df.loc[:, MODEL_FEATURES],
-        mode="inference",
-    ).astype(DTYPE)
+    ticker = ticker.upper().strip()
 
     try:
-        drift_result = pipeline.drift_detector.detect(feature_df)
+        cache = request.app.state.cache
+    except AttributeError:
+        from app.inference.cache import RedisCache
+        cache = RedisCache()
+
+    try:
+        # ── Load snapshot from cache ──────────────────
+        snapshot_result = cache.get(BACKGROUND_SNAPSHOT_KEY)
+
+        if not snapshot_result:
+            raise HTTPException(
+                status_code=503,
+                detail="No snapshot available. Background compute is pending.",
+            )
+
+        # ── Find ticker in signals ────────────────────
+        signals = snapshot_result.get("snapshot", {}).get("signals", [])
+        signal_row = next((s for s in signals if s["ticker"] == ticker), None)
+
+        if signal_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{ticker} not found in current snapshot. Check universe.",
+            )
+
+        # ── FIX: Read agent details from _signal_details ─
+        signal_details = snapshot_result.get("_signal_details", {})
+        agents = signal_details.get(ticker, {})
+
+        signal_agent_output = agents.get("signal_agent", {})
+        technical_output = agents.get("technical_agent", {})
+
+        # Derive values from agent outputs
+        raw_score = float(signal_row.get("raw_model_score", 0.0))
+        hybrid_score = float(signal_row.get("hybrid_consensus_score", 0.0))
+        weight = float(signal_row.get("weight", 0.0))
+
+        signal_direction = (
+            signal_agent_output.get("signals", {}).get("signal")
+            or _derive_signal(weight)
+        )
+
+        confidence_numeric = signal_agent_output.get("confidence")
+        if confidence_numeric is not None:
+            confidence_numeric = round(float(confidence_numeric), 4)
+
+        governance_score = signal_agent_output.get("governance_score")
+        if governance_score is not None:
+            governance_score = int(governance_score)
+
+        risk_level = (
+            signal_agent_output.get("risk_level")
+            or _derive_risk_level(raw_score)
+        )
+
+        volatility_regime = _derive_volatility_regime(technical_output)
+
+        technical_bias = (
+            technical_output.get("bias")
+            or technical_output.get("signals", {}).get("bias", "neutral")
+        )
+
+        warnings = signal_agent_output.get("warnings", [])
+        explanation = signal_agent_output.get("explanation", "")
+
+        drift_state = (
+            snapshot_result.get("snapshot", {})
+            .get("drift", {})
+            .get("drift_state", "none")
+        )
+
+        # ── LLM section (disabled unless LLM_ENABLED=true) ─
+        llm_output = None
+        if os.getenv("LLM_ENABLED", "false").lower() == "true":
+            try:
+                from app.agent.llm_explainer import LLMExplainer
+                explainer = LLMExplainer()
+                if explainer._enabled:
+                    llm_result = await asyncio.to_thread(
+                        explainer.explain,
+                        ticker=ticker,
+                        signal=signal_direction,
+                        score=raw_score,
+                        context={
+                            "risk_level": risk_level,
+                            "warnings": warnings,
+                            "drift_state": drift_state,
+                        },
+                    )
+                    llm_output = llm_result
+            except Exception as e:
+                logger.debug("LLM explain failed: %s", e)
+
+        latency_ms = round((time.time() - start_time) * 1000, 1)
+
+        # ── FIX: Response wrapped in data key ────────
+        return {
+            "success": True,
+            "data": {
+                "ticker": ticker,
+                "snapshot_date": signal_row.get("date", ""),
+                "raw_model_score": round(raw_score, 6),
+                "weight": round(weight, 6),
+                "hybrid_consensus_score": round(hybrid_score, 6),
+                "signal": signal_direction,
+                "confidence_numeric": confidence_numeric,
+                "governance_score": governance_score,
+                "risk_level": risk_level,
+                "volatility_regime": volatility_regime,
+                "technical_bias": technical_bias,
+                "drift_state": drift_state,
+                "warnings": warnings,
+                "explanation": explanation,
+                "llm": llm_output,
+                "latency_ms": latency_ms,
+            },
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning("Drift detector failure: %s", str(e))
-        drift_result = {
-            "drift_detected": False,
-            "severity_score": 0.0,
-            "drift_state": "baseline_missing",
-            "exposure_scale": 1.0,
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        logger.exception("Agent explain failed | ticker=%s", ticker)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
+
+
+# =========================================================
+# GET /agent/political-risk?ticker=X
+# =========================================================
+
+@router.get("/agent/political-risk")
+async def political_risk(
+    request: Request,
+    ticker: str = Query(...),
+):
+    """
+    Returns political risk for a ticker's country (US default).
+    Reads from snapshot cache _political key — no extra API call.
+    """
+    endpoint = "/agent/political-risk"
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
+    start_time = time.time()
+
+    ticker = ticker.upper().strip()
+
+    try:
+        cache = request.app.state.cache
+    except AttributeError:
+        from app.inference.cache import RedisCache
+        cache = RedisCache()
+
+    try:
+        # FIX: Read from snapshot cache _political key
+        snapshot_result = cache.get(BACKGROUND_SNAPSHOT_KEY)
+        political = {}
+
+        if snapshot_result:
+            political = snapshot_result.get("_political", {})
+
+        if not political:
+            # Live fallback
+            from core.agent.political_risk_agent import PoliticalRiskAgent
+            agent = PoliticalRiskAgent()
+            political = agent.get_political_risk(ticker, country="US")
+
+        return {
+            "ticker": ticker,
+            "political_risk_score": float(political.get("political_risk_score", 0.0)),
+            "political_risk_label": political.get("political_risk_label", "LOW"),
+            "top_events": political.get("top_events", [])[:5],
+            "source": political.get("source", "gdelt"),
+            "served_from_cache": bool(snapshot_result),
+            "latency_ms": round((time.time() - start_time) * 1000, 1),
         }
 
-    logger.info("Drift full computation | latency=%.2fs", time.time() - start_time)
-    return drift_result, len(latest_df)
+    except Exception as e:
+        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
+        logger.exception("Political risk failed | ticker=%s", ticker)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
 
 
 # =========================================================
-# SHARED SYNC LOGIC
+# GET /agent/agents
+# FIX: Returns static descriptions — no inference call
 # =========================================================
 
-def _drift_status_sync():
-
-    start_time = time.time()
-    loader = get_shared_model_loader()
-
-    cached_drift = _drift_from_cache()
-
-    if cached_drift:
-        drift_result = cached_drift
-        universe_size = len(MarketUniverse.get_universe())
-        snapshot_date = drift_result.get("snapshot_date", "unknown")
-    else:
-        logger.info("Drift cache miss — running full computation")
-        drift_result, universe_size = _drift_full_compute()
-        snapshot_date = "computed_live"
-
-    retrain_trigger = RetrainTrigger()
-    retrain_info = retrain_trigger.evaluate(drift_result)
-    baseline_meta = _get_baseline_meta()
-
+@router.get("/agent/agents")
+async def list_agents():
+    """
+    Returns descriptions of all agents in the pipeline.
+    Static response — no inference required.
+    """
     return {
-        "drift_detected": drift_result.get("drift_detected", False),
-        "severity_score": drift_result.get("severity_score", 0),
-        "drift_confidence": drift_result.get("drift_confidence", 0),
-        "drift_state": drift_result.get("drift_state", "unknown"),
-        "exposure_scale": drift_result.get("exposure_scale", 1.0),
-        "coverage": drift_result.get("coverage", 0),
-        "retrain_required": retrain_info["retrain_required"],
-        "retrain_events": retrain_info["events"],
-        "cooldown_active": retrain_info.get("cooldown_active", False),
-        "cooldown_remaining_seconds": retrain_info.get("cooldown_remaining_seconds", 0),
-        **baseline_meta,
-        "model_version": loader.xgb_version,
-        "schema_signature": loader.schema_signature,
-        "artifact_hash": loader.artifact_hash,
-        "dataset_hash": loader.dataset_hash,
-        "universe_size": universe_size,
-        "snapshot_date": snapshot_date,
-        "served_from_cache": cached_drift is not None,
-        "latency_ms": int((time.time() - start_time) * 1000),
-        "timestamp": int(time.time()),
+        "agents": {
+            "signal_agent": {
+                "name": "SignalAgent",
+                "description": "Interprets XGBoost model output into LONG/SHORT/NEUTRAL signal with confidence and risk level.",
+                "weight": 0.5,
+            },
+            "technical_risk_agent": {
+                "name": "TechnicalRiskAgent",
+                "description": "Evaluates momentum, EMA structure, RSI, and volatility regime for technical quality score.",
+                "weight": 0.2,
+            },
+            "portfolio_decision_agent": {
+                "name": "PortfolioDecisionAgent",
+                "description": "Aggregates per-ticker signals into portfolio-level decisions with exposure control.",
+                "weight": 0.2,
+            },
+            "political_risk_agent": {
+                "name": "PoliticalRiskAgent",
+                "description": "Detects geopolitical and macro risk events via GDELT headlines. CRITICAL label overrides trading signals.",
+                "weight": 0.1,
+            },
+        }
     }
-
-
-# =========================================================
-# GET /drift
-# =========================================================
-
-@router.get("/drift")
-async def drift():
-
-    endpoint = "/drift"
-    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
-    start_time = time.time()
-
-    try:
-        async with drift_semaphore:
-            result = await asyncio.wait_for(
-                run_in_threadpool(_drift_status_sync),
-                timeout=REQUEST_TIMEOUT,
-            )
-        return result
-
-    except asyncio.TimeoutError:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        raise HTTPException(status_code=504, detail="Drift check timeout")
-
-    except Exception as e:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.exception("Drift status check failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
-
-
-# =========================================================
-# GET /drift-status (backward compat)
-# =========================================================
-
-@router.get("/drift-status")
-async def drift_status():
-
-    endpoint = "/drift-status"
-    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
-    start_time = time.time()
-
-    try:
-        async with drift_semaphore:
-            result = await asyncio.wait_for(
-                run_in_threadpool(_drift_status_sync),
-                timeout=REQUEST_TIMEOUT,
-            )
-        return result
-
-    except asyncio.TimeoutError:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        raise HTTPException(status_code=504, detail="Drift check timeout")
-
-    except Exception as e:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.exception("Drift status check failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
