@@ -24,11 +24,15 @@ class StockPriceFetcher:
     BASE_RETRY_SLEEP = 1.0
     MAX_BACKOFF = 8.0
 
-    MIN_ROWS = 50
+    # FIX: Lowered from 50 to 1 — the min_rows gate belongs in the
+    # provider layer (yahoo_provider / twelvedata_provider), not here.
+    # data_fetcher should return whatever yfinance gives and let the
+    # provider decide if it's sufficient. The old MIN_ROWS=50 caused
+    # delta fetches (4-5 rows) to always fail in soft-fail mode.
+    MIN_ROWS = 1
 
     REQUEST_TIMEOUT = 25
 
-    # FIX: must be class variable for classmethod access
     MIN_REQUEST_INTERVAL = float(os.getenv("YFINANCE_MIN_INTERVAL", "2.5"))
 
     def __init__(self):
@@ -50,7 +54,6 @@ class StockPriceFetcher:
 
             now = time.time()
             elapsed = now - cls._last_request_time
-
             wait = cls.MIN_REQUEST_INTERVAL - elapsed
 
             if wait > 0:
@@ -83,6 +86,18 @@ class StockPriceFetcher:
 
     @staticmethod
     def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalize DataFrame columns to canonical OHLCV names.
+
+        FIX: The original code checked ALL parts of the MultiIndex tuple
+        for field names. For ticker 'LOW', the column ("Volume", "LOW")
+        produces parts = ["volume", "low"]. The loop found "low" before
+        "volume" and mapped Volume → "low", making volume disappear.
+
+        Fix: Only check parts[0] (the field name from yfinance) for
+        canonical matching. The ticker name (parts[1]) is irrelevant
+        for field identification and caused false matches.
+        """
 
         if isinstance(df.columns, pd.MultiIndex):
 
@@ -90,19 +105,31 @@ class StockPriceFetcher:
 
             for col in df.columns:
 
-                parts = [str(x).lower().strip() for x in col if str(x).strip()]
+                # FIX: Only use parts[0] — the field name.
+                # parts[1] is the ticker symbol and must be ignored.
+                # e.g. ("Volume", "LOW") → field="volume", ticker="low"
+                # We only want to match on field="volume".
+                field = str(col[0]).lower().strip() if len(col) > 0 else ""
 
-                canonical = None
+                # Map yfinance field names to canonical names
+                if "adj close" in field or "adj_close" in field:
+                    canonical = "adj_close"
+                elif field == "open":
+                    canonical = "open"
+                elif field == "high":
+                    canonical = "high"
+                elif field == "low":
+                    canonical = "low"
+                elif field == "close":
+                    canonical = "close"
+                elif field == "volume":
+                    canonical = "volume"
+                else:
+                    # Fallback: use the full joined parts as before
+                    parts = [str(x).lower().strip() for x in col if str(x).strip()]
+                    canonical = parts[0] if parts else "unknown"
 
-                for field in ("adj close", "open", "high", "low", "close", "volume"):
-
-                    if field in parts:
-                        canonical = field.replace(" ", "_")
-                        break
-
-                normalized.append(
-                    canonical if canonical else (parts[0] if parts else "unknown")
-                )
+                normalized.append(canonical)
 
             df.columns = normalized
 
@@ -152,12 +179,9 @@ class StockPriceFetcher:
         """
         Convert any datetime series to UTC safely.
 
-        FIX: Uses pd.to_datetime(utc=True) which handles BOTH cases:
+        Uses pd.to_datetime(utc=True) which handles BOTH cases:
           - tz-naive timestamps → localized to UTC
           - tz-aware timestamps → converted to UTC
-        This avoids the 'Cannot localize tz-aware Timestamp' error
-        that occurs when yfinance returns tz-aware DatetimeIndex and
-        the old code path incorrectly tried tz_localize on tz-aware data.
         """
 
         s = pd.to_datetime(series, utc=True, errors="coerce")
@@ -307,23 +331,13 @@ class StockPriceFetcher:
         if df["date"].max() > now_utc:
             df = df[df["date"] <= now_utc]
 
+        # FIX: MIN_ROWS lowered to 1 — row sufficiency is enforced by
+        # yahoo_provider._normalize() and twelvedata_provider._normalize()
+        # which are delta-aware. This layer should just pass data through.
         if len(df) < self.MIN_ROWS:
-
-            soft_threshold = int(self.MIN_ROWS * self.soft_fail_ratio)
-
-            if self.soft_fail_mode and len(df) >= soft_threshold:
-
-                logger.warning(
-                    "Short history accepted in soft-fail mode for %s (%d rows).",
-                    ticker,
-                    len(df),
-                )
-
-            else:
-
-                raise RuntimeError(
-                    f"Insufficient history for '{ticker}': got {len(df)}"
-                )
+            raise RuntimeError(
+                f"Insufficient history for '{ticker}': got {len(df)}"
+            )
 
         df["ticker"] = ticker
 
