@@ -26,8 +26,10 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: marketsentinel
-          POSTGRES_PASSWORD: marketsentinel
+          # FIX (item 35): Aligned to sentinel/sentinel — matches docker-compose.yml
+          # was: marketsentinel/marketsentinel
+          POSTGRES_USER: sentinel
+          POSTGRES_PASSWORD: sentinel
           POSTGRES_DB: marketsentinel
         ports:
           - 5432:5432
@@ -43,13 +45,13 @@ jobs:
       MKL_NUM_THREADS: 1
       TOKENIZERS_PARALLELISM: false
       PYTHONUNBUFFERED: 1
-      # Database — points at the service above
+      # FIX (item 35): Aligned creds to sentinel/sentinel
       POSTGRES_HOST: localhost
       POSTGRES_PORT: 5432
-      POSTGRES_USER: marketsentinel
-      POSTGRES_PASSWORD: marketsentinel
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
       POSTGRES_DB: marketsentinel
-      DATABASE_URL: postgresql+psycopg2://marketsentinel:marketsentinel@localhost:5432/marketsentinel
+      DATABASE_URL: postgresql+psycopg2://sentinel:sentinel@localhost:5432/marketsentinel
       # Skip Yahoo sync in CI — no live data needed for unit tests
       SKIP_DATA_SYNC: "1"
       STORE_PREDICTIONS: "0"
@@ -101,8 +103,9 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: marketsentinel
-          POSTGRES_PASSWORD: marketsentinel
+          # FIX (item 35): Aligned to sentinel/sentinel
+          POSTGRES_USER: sentinel
+          POSTGRES_PASSWORD: sentinel
           POSTGRES_DB: marketsentinel
         ports:
           - 5432:5432
@@ -120,10 +123,10 @@ jobs:
       PYTHONUNBUFFERED: 1
       POSTGRES_HOST: localhost
       POSTGRES_PORT: 5432
-      POSTGRES_USER: marketsentinel
-      POSTGRES_PASSWORD: marketsentinel
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
       POSTGRES_DB: marketsentinel
-      DATABASE_URL: postgresql+psycopg2://marketsentinel:marketsentinel@localhost:5432/marketsentinel
+      DATABASE_URL: postgresql+psycopg2://sentinel:sentinel@localhost:5432/marketsentinel
       SKIP_DATA_SYNC: "1"
       STORE_PREDICTIONS: "0"
       REDIS_HOST: invalid-host

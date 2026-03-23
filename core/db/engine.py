@@ -1,18 +1,12 @@
 """
 MarketSentinel — Database Engine & Session Factory
 
-Provides SQLAlchemy async-compatible engine with connection pooling,
-health checks, and graceful fallback for local development.
-
-Usage:
-    from core.db.engine import get_session, get_engine, init_db
-
-    # Initialize tables on startup
-    init_db()
-
-    # Use in request handlers
-    with get_session() as session:
-        session.query(OHLCVDaily).filter_by(ticker="AAPL").all()
+FIX (item 17): Pool settings now read from environment variables
+instead of being hardcoded. Set these in your .env:
+  DB_POOL_SIZE=5
+  DB_MAX_OVERFLOW=3
+  DB_POOL_TIMEOUT=10
+  DB_POOL_RECYCLE=1800
 """
 
 import os
@@ -31,41 +25,22 @@ from core.logging.logger import get_logger
 logger = get_logger(__name__)
 
 
-# ─── Base Model ───────────────────────────────────────────────
-
 class Base(DeclarativeBase):
     """Shared declarative base for all ORM models."""
     pass
 
 
-# ─── Configuration ────────────────────────────────────────────
-
 def _build_database_url() -> str:
-    """
-    Build database URL from environment variables.
-
-    Supports:
-      - DATABASE_URL (full connection string)
-      - Individual POSTGRES_* variables (for docker-compose)
-    """
-
     full_url = os.getenv("DATABASE_URL")
-
     if full_url:
         return full_url
-
     host = os.getenv("POSTGRES_HOST", "localhost")
     port = os.getenv("POSTGRES_PORT", "5432")
     user = os.getenv("POSTGRES_USER", "sentinel")
     password = os.getenv("POSTGRES_PASSWORD", "sentinel")
     db_name = os.getenv("POSTGRES_DB", "marketsentinel")
+    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db_name}"
 
-    url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db_name}"
-
-    return url
-
-
-# ─── Engine Singleton ─────────────────────────────────────────
 
 _engine = None
 _SessionFactory = None
@@ -75,11 +50,14 @@ def get_engine():
     """
     Return the shared SQLAlchemy engine (singleton).
 
-    Pool settings tuned for inference workload:
-      - pool_size=5   : enough for concurrent API requests
-      - max_overflow=3 : burst capacity during batch fetches
-      - pool_timeout=10: fail fast if DB is overloaded
-      - pool_recycle=1800: refresh connections every 30min
+    FIX (item 17): Pool settings read from env vars — no longer hardcoded.
+    Defaults match previous hardcoded values for zero-config compatibility.
+
+    Env vars:
+      DB_POOL_SIZE      — number of persistent connections (default: 5)
+      DB_MAX_OVERFLOW   — burst connections above pool_size (default: 3)
+      DB_POOL_TIMEOUT   — seconds to wait for a connection (default: 10)
+      DB_POOL_RECYCLE   — seconds before recycling a connection (default: 1800)
     """
 
     global _engine
@@ -89,18 +67,23 @@ def get_engine():
 
     url = _build_database_url()
 
+    # FIX: Read from env vars with sensible defaults
+    pool_size    = int(os.getenv("DB_POOL_SIZE", "5"))
+    max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "3"))
+    pool_timeout = int(os.getenv("DB_POOL_TIMEOUT", "10"))
+    pool_recycle = int(os.getenv("DB_POOL_RECYCLE", "1800"))
+
     _engine = create_engine(
         url,
         poolclass=QueuePool,
-        pool_size=5,
-        max_overflow=3,
-        pool_timeout=10,
-        pool_recycle=1800,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_timeout=pool_timeout,
+        pool_recycle=pool_recycle,
         pool_pre_ping=True,
         echo=os.getenv("SQL_ECHO", "0") == "1",
     )
 
-    # Log slow queries (> 500ms)
     @event.listens_for(_engine, "before_cursor_execute")
     def _before_execute(conn, cursor, statement, parameters, context, executemany):
         conn.info.setdefault("query_start", []).append(time.time())
@@ -113,14 +96,12 @@ def get_engine():
                 "Slow query detected | duration=%.3fs | statement=%s",
                 total,
                 statement[:200],
-                extra={
-                    "component": "db.engine",
-                    "duration_sec": round(total, 3),
-                },
+                extra={"component": "db.engine", "duration_sec": round(total, 3)},
             )
 
     logger.info(
-        "Database engine initialized | pool_size=5 | host=%s",
+        "Database engine initialized | pool_size=%d | host=%s",
+        pool_size,
         url.split("@")[-1].split("/")[0] if "@" in url else "localhost",
         extra={"component": "db.engine"},
     )
@@ -129,10 +110,7 @@ def get_engine():
 
 
 def get_session_factory() -> sessionmaker:
-    """Return the shared session factory."""
-
     global _SessionFactory
-
     if _SessionFactory is None:
         _SessionFactory = sessionmaker(
             bind=get_engine(),
@@ -140,99 +118,46 @@ def get_session_factory() -> sessionmaker:
             autoflush=False,
             expire_on_commit=False,
         )
-
     return _SessionFactory
 
 
-# ─── Session Context Manager ─────────────────────────────────
-
 @contextmanager
 def get_session():
-    """
-    Provide a transactional session scope.
-
-    Usage:
-        with get_session() as session:
-            session.add(record)
-            # auto-commits on success, auto-rollbacks on exception
-    """
-
     factory = get_session_factory()
     session: Session = factory()
-
     try:
         yield session
         session.commit()
-
     except Exception:
         session.rollback()
         raise
-
     finally:
         session.close()
 
 
-# ─── Initialization ──────────────────────────────────────────
-
 def init_db():
-    """
-    Create all tables that don't exist yet.
-
-    Safe to call multiple times — uses CREATE IF NOT EXISTS.
-    Call this once during application startup.
-    """
-
     engine = get_engine()
-
     Base.metadata.create_all(engine)
-
-    logger.info(
-        "Database tables initialized",
-        extra={"component": "db.engine"},
-    )
+    logger.info("Database tables initialized", extra={"component": "db.engine"})
 
 
 def check_db_health() -> dict:
-    """
-    Quick health check for the database connection.
-
-    Returns:
-        {"status": "healthy", "latency_ms": float}
-        {"status": "unhealthy", "error": str}
-    """
-
     try:
         start = time.time()
-
         with get_session() as session:
             session.execute(text("SELECT 1"))
-
         latency_ms = round((time.time() - start) * 1000, 2)
-
         return {"status": "healthy", "latency_ms": latency_ms}
-
     except Exception as exc:
-
-        logger.error(
-            "Database health check failed | error=%s",
-            exc,
-            extra={"component": "db.engine"},
-        )
-
+        logger.error("Database health check failed | error=%s", exc,
+                     extra={"component": "db.engine"})
         return {"status": "unhealthy", "error": str(exc)}
 
 
 def dispose_engine():
-    """Dispose the engine and connection pool. For clean shutdown."""
-
     global _engine, _SessionFactory
-
     if _engine:
         _engine.dispose()
         _engine = None
         _SessionFactory = None
-
-        logger.info(
-            "Database engine disposed",
-            extra={"component": "db.engine"},
-        )
+        logger.info("Database engine disposed", extra={"component": "db.engine"})
