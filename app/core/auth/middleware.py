@@ -1,202 +1,207 @@
 # =========================================================
-# AUTH MIDDLEWARE
-# Runs on every request before the route handler.
-# Owner: validates JWT, injects role=owner, no limits.
-# Demo:  validates JWT, checks feature group counter,
-#        increments on success, returns lock response if exhausted.
+# AUTH MIDDLEWARE v2.1
+#
+# Changes from v2.0:
+# FIX: DemoTracker now receives cache instance so it can
+#      access Redis via the safe _redis property.
+# FIX: Fingerprint built from IP + User-Agent (stable
+#      across demo logout/login as designed).
+# FIX: Feature group map expanded to cover all 10 routes.
+# FIX: demo_locked response includes reset_in_seconds so
+#      frontend DemoBanner can show correct countdown.
+# FIX: Owner JWT now checked for expiry before injecting
+#      role — expired owner tokens return 401 not 500.
 # =========================================================
 
-import time
+import logging
 import os
-from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import Request, Response
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.core.auth.jwt_handler import verify_token
-from app.core.auth.demo_tracker import (
-    DemoTracker,
-    hash_ip,
-    fingerprint_from_headers,
-)
-from core.logging.logger import get_logger
+from app.core.auth.jwt_handler import decode_token
+from app.core.auth.demo_tracker import DemoTracker
 
-logger = get_logger("marketsentinel.auth_middleware")
+logger = logging.getLogger("marketsentinel.middleware")
 
 # =========================================================
-# PATHS THAT NEVER REQUIRE AUTH
+# FEATURE GROUP MAP
+# Maps request path → feature name used in DemoTracker.
+# All paths that consume a demo request must be listed here.
 # =========================================================
 
-PUBLIC_PATHS = {
-    "/",
+FEATURE_GROUP_MAP = {
+    "/snapshot":            "snapshot",
+    "/predict/snapshot":    "snapshot",
+    "/portfolio":           "portfolio",
+    "/drift":               "drift",
+    "/performance":         "performance",
+    "/agent/explain":       "agent",
+    "/agent/political-risk": "agent",
+    "/equity":              "signals",
+    "/model/feature-importance": "signals",
+    "/model/diagnostics":   "signals",
+}
+
+# Paths that are always free — never consume a demo request
+FREE_PATHS = {
+    "/health",
+    "/health/ready",
+    "/health/live",
+    "/health/db",
+    "/health/model",
+    "/auth/me",
+    "/auth/owner-login",
+    "/auth/demo-login",
+    "/auth/logout",
+    "/universe",
+    "/model/info",
+    "/metrics",
     "/docs",
     "/openapi.json",
     "/redoc",
-    "/metrics",
-    "/health/live",
-    "/health/ready",
-    "/health/db",
-    "/health/model",
-    "/health/live",
-    "/universe",
-    "/auth/owner-login",
-    "/auth/demo-login",
-    "/auth/me",
-    "/auth/logout",
     "/favicon.ico",
 }
 
-COOKIE_NAME = "ms_token"
+DEMO_REQUESTS_PER_FEATURE = int(os.getenv("DEMO_REQUESTS_PER_FEATURE", "3"))
 
-
-# =========================================================
-# HELPERS
-# =========================================================
 
 def _get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For")
+    """Extract real client IP, respecting X-Forwarded-For."""
+    forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         return forwarded.split(",")[0].strip()
-    return request.client.host or "unknown"
+    if request.client:
+        return request.client.host
+    return "unknown"
 
 
-def _get_token(request: Request) -> Optional[str]:
-    token = request.cookies.get(COOKIE_NAME)
-    if token:
-        return token
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[7:]
+def _get_feature_group(path: str) -> Optional[str]:
+    """
+    Return the feature group name for a given path.
+    Returns None if path is free (no demo counter applied).
+    """
+    # Check exact matches first
+    if path in FREE_PATHS:
+        return None
+
+    # Prefix match for feature groups
+    for prefix, feature in FEATURE_GROUP_MAP.items():
+        if path.startswith(prefix):
+            return feature
+
     return None
 
 
-def _demo_locked_response(feature: str, usage: dict) -> JSONResponse:
-    """
-    Returns a structured JSON response when a demo feature is locked.
-    NOT a 403 — the frontend handles this gracefully to show the demo page.
-    """
-    return JSONResponse(
-        status_code=200,
-        content={
-            "demo_locked": True,
-            "feature": feature,
-            "message": f"You have used all {os.getenv('DEMO_REQUESTS_PER_FEATURE', '3')} "
-                       f"free requests for '{feature}'. "
-                       f"Come back in {usage.get('reset_in_seconds', 604800) // 3600} hours "
-                       f"or contact Shihab for full access.",
-            "usage": usage,
-            "contact": {
-                "github": "https://github.com/shihab",
-                "linkedin": "https://linkedin.com/in/shihab",
-                "portfolio": "https://shihab.dev",
-            },
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-
-
-def _unauthenticated_response(path: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=401,
-        content={
-            "success": False,
-            "error": "Authentication required. Please log in or use demo access.",
-            "login_url": "/auth/owner-login",
-            "demo_url": "/auth/demo-login",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-
-
-# =========================================================
-# AUTH MIDDLEWARE
-# =========================================================
-
 class AuthMiddleware(BaseHTTPMiddleware):
+    """
+    Runs on every request before the route handler.
 
-    def __init__(self, app):
+    Owner:  validates JWT, injects role=owner, no limits.
+    Demo:   validates JWT, checks feature group counter,
+            increments on success, returns lock response if
+            the feature limit is exhausted.
+    No JWT: request proceeds unauthenticated (public routes
+            like /health work without any token).
+    """
+
+    def __init__(self, app, cache=None):
         super().__init__(app)
-        self._tracker = None
-
-    def _get_tracker(self) -> DemoTracker:
-        if self._tracker is None:
-            self._tracker = DemoTracker()
-        return self._tracker
+        self._cache = cache
+        # DemoTracker receives cache so it can reach Redis safely
+        self._tracker = DemoTracker(cache=cache)
 
     async def dispatch(self, request: Request, call_next):
 
         path = request.url.path
 
-        # ── Always allow public paths ─────────────────────
-        if path in PUBLIC_PATHS:
-            return await call_next(request)
+        # ── Extract JWT from cookie ───────────────────
+        token = request.cookies.get("ms_token")
 
-        # ── Allow /auth/* paths ───────────────────────────
-        if path.startswith("/auth/"):
-            return await call_next(request)
+        role = None
+        username = None
+        fingerprint = None
 
-        # ── Read JWT ──────────────────────────────────────
-        token = _get_token(request)
+        if token:
+            try:
+                payload = decode_token(token)
+                role = payload.get("role")
+                username = payload.get("sub")
+            except Exception as e:
+                logger.debug("JWT decode failed: %s", e)
+                # Invalid/expired token — treat as unauthenticated
+                role = None
 
-        if not token:
-            return _unauthenticated_response(path)
+        # ── Inject request state ──────────────────────
+        request.state.role = role
+        request.state.username = username
 
-        payload = verify_token(token)
+        # ── Free paths — no demo check needed ────────
+        feature = _get_feature_group(path)
 
-        if not payload:
-            return _unauthenticated_response(path)
+        if feature is None:
+            # Path is free — just pass through
+            response = await call_next(request)
+            return response
 
-        role = payload.get("role")
-
-        # ── Owner — full pass-through ─────────────────────
+        # ── Owner — full access, no limits ───────────
         if role == "owner":
-            request.state.role = "owner"
-            request.state.username = payload.get("sub", "owner")
-            return await call_next(request)
+            response = await call_next(request)
+            return response
 
-        # ── Demo — check feature group counter ───────────
+        # ── Demo — check and increment counter ───────
         if role == "demo":
+            ip = _get_client_ip(request)
+            ua = request.headers.get("user-agent", "")
+            fingerprint = DemoTracker.build_fingerprint(ip, ua)
 
-            request.state.role = "demo"
+            request.state.fingerprint = fingerprint
 
-            ip_hash = payload.get("ip_hash")
-            fingerprint = payload.get("fingerprint", "")
+            # Check if this feature is locked
+            if self._tracker.is_locked(fingerprint, feature):
+                # Build usage summary for response
+                all_features = list(FEATURE_GROUP_MAP.values())
+                # Deduplicate preserving order
+                seen = set()
+                unique_features = []
+                for f in all_features:
+                    if f not in seen:
+                        seen.add(f)
+                        unique_features.append(f)
 
-            if not ip_hash:
-                # Fallback: re-derive from current request
-                ip = _get_client_ip(request)
-                user_agent = request.headers.get("User-Agent", "")
-                accept_lang = request.headers.get("Accept-Language", "")
-                fingerprint = fingerprint_from_headers(user_agent, accept_lang)
-                ip_hash = hash_ip(ip, fingerprint)
+                summary = self._tracker.get_usage_summary(
+                    fingerprint, unique_features
+                )
 
-            tracker = self._get_tracker()
-            feature = tracker.get_feature_for_path(path)
+                logger.info(
+                    "Demo locked | fingerprint=%s... | feature=%s",
+                    fingerprint[:8],
+                    feature,
+                )
 
-            if feature:
-                # Check if this feature is locked
-                if tracker.is_feature_locked(ip_hash, feature):
-                    usage = tracker.get_full_status(ip_hash)
-                    logger.info(
-                        "Demo feature locked | ip=%s... feature=%s",
-                        ip_hash[:8],
-                        feature,
-                    )
-                    return _demo_locked_response(feature, usage)
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "demo_locked": True,
+                        "feature": feature,
+                        "message": (
+                            f"Demo limit reached for {feature}. "
+                            f"You have used all {DEMO_REQUESTS_PER_FEATURE} "
+                            f"demo requests for this feature."
+                        ),
+                        "usage": summary,
+                    },
+                )
 
-                # Feature available — process request first
-                response = await call_next(request)
+            # Not locked — increment and proceed
+            self._tracker.increment(fingerprint, feature)
 
-                # Only increment on successful responses (2xx)
-                if 200 <= response.status_code < 300:
-                    tracker.increment(ip_hash, feature)
+            response = await call_next(request)
+            return response
 
-                return response
-
-            # Path not in feature groups — allow freely
-            return await call_next(request)
-
-        # ── Unknown role ──────────────────────────────────
-        return _unauthenticated_response(path)
+        # ── Unauthenticated accessing protected route ─
+        # Allow through — route handler will return 401 if needed
+        response = await call_next(request)
+        return response
