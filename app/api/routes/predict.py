@@ -1,13 +1,8 @@
 # =========================================================
-# PREDICTION & SNAPSHOT ROUTES v3.8
-#
-# Changes from v3.7:
-#   FIX 1: price_history route reads date from row["date"]
-#           column, not idx (which is a RangeIndex after
-#           _validate_dataset calls reset_index(drop=True)).
-#   FIX 2: live_snapshot checks fixed background cache key
-#           "ms:background_snapshot:latest" first before
-#           running full inference. Matches main.py loop key.
+# PREDICTION & SNAPSHOT ROUTES v3.9
+# FIX: get_shared_model_loader → get_model_loader from model_loader
+# FIX: loader._xgb_container → loader directly
+# FIX: loader.xgb_version → loader.version
 # =========================================================
 
 import time
@@ -22,7 +17,8 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from app.inference.pipeline import InferencePipeline, get_shared_model_loader
+from app.inference.pipeline import InferencePipeline
+from app.inference.model_loader import get_model_loader          # FIX
 from app.inference.cache import RedisCache
 from core.data.market_data_service import MarketDataService
 from core.logging.logger import get_logger
@@ -45,7 +41,6 @@ logger = get_logger("marketsentinel.api")
 _pipeline: Optional[InferencePipeline] = None
 _universe_cache: Optional[List[str]] = None
 
-# Fixed background snapshot key — must match main.py background loop
 BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
 
 
@@ -128,7 +123,6 @@ def load_default_universe() -> List[str]:
 
 
 def _date_window(days: int):
-    """Compute start/end date strings from lookback days."""
     end = pd.Timestamp.now(tz="UTC")
     start = end - pd.Timedelta(days=days + 30)
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
@@ -136,10 +130,6 @@ def _date_window(days: int):
 
 # =========================================================
 # LIVE SNAPSHOT
-# FIX: Check fixed background cache key first.
-#      Background loop in main.py writes "ms:background_snapshot:latest".
-#      Serving from that key is instant (~1ms) vs running
-#      full inference (~30-120s cold).
 # =========================================================
 
 @router.get("/live-snapshot")
@@ -153,25 +143,17 @@ async def live_snapshot():
 
         tickers = load_default_universe()
         pipeline = get_pipeline()
-        loader = get_shared_model_loader()
-        container = loader._xgb_container
+        loader = get_model_loader()              # FIX: was get_shared_model_loader()
+        meta_info = loader.metadata or {}
 
-        # --------------------------------------------------
-        # FIX: Try fixed background snapshot key first.
-        # This is what /snapshot alias also does via pipeline.run_snapshot().
-        # But here we check directly to avoid the inference semaphore overhead.
-        # --------------------------------------------------
         cache = RedisCache()
         snapshot = None
 
-        if cache.enabled or cache._memory_get(BACKGROUND_SNAPSHOT_KEY):
-            snapshot = cache.get(BACKGROUND_SNAPSHOT_KEY)
-            if snapshot and isinstance(snapshot, dict) and "signals" in snapshot:
-                logger.info("live-snapshot served from background cache")
-            else:
-                snapshot = None
+        cached = cache.get(BACKGROUND_SNAPSHOT_KEY)
+        if cached and isinstance(cached, dict) and "signals" in cached:
+            snapshot = cached
+            logger.info("live-snapshot served from background cache")
 
-        # Cache miss — run full inference
         if snapshot is None:
             async with inference_semaphore:
                 snapshot = await asyncio.wait_for(
@@ -179,10 +161,16 @@ async def live_snapshot():
                     timeout=REQUEST_TIMEOUT,
                 )
 
-        if not isinstance(snapshot, dict) or "signals" not in snapshot:
+        if not isinstance(snapshot, dict) or "signals" in snapshot or "snapshot" in snapshot:
+            # support both flat and nested shapes
+            if "snapshot" in snapshot:
+                signals = snapshot["snapshot"].get("signals", [])
+            else:
+                signals = snapshot.get("signals", [])
+        else:
             raise RuntimeError("Invalid snapshot structure.")
 
-        signals = snapshot["signals"]
+        signals = snapshot.get("signals", snapshot.get("snapshot", {}).get("signals", []))
 
         long_count = sum(1 for s in signals if s.get("weight", 0.0) > 0)
         short_count = sum(1 for s in signals if s.get("weight", 0.0) < 0)
@@ -193,13 +181,12 @@ async def live_snapshot():
             if hybrid_scores else 0.0
         )
 
-        drift = snapshot.get("drift", {})
+        drift = snapshot.get("drift", snapshot.get("snapshot", {}).get("drift", {}))
 
         weights = [s.get("weight", 0.0) for s in signals]
         gross_exposure = sum(abs(w) for w in weights)
         net_exposure = sum(weights)
 
-        # Top 5 by hybrid_consensus_score (more meaningful than raw model score)
         top_5 = sorted(
             signals,
             key=lambda x: x.get("hybrid_consensus_score", 0.0),
@@ -219,11 +206,11 @@ async def live_snapshot():
         }
 
         meta = {
-            "model_version": container.version if container else None,
-            "schema_signature": container.schema_signature if container else None,
-            "dataset_hash": container.dataset_hash if container else None,
-            "artifact_hash": container.artifact_hash if container else None,
-            "feature_checksum": container.feature_checksum if container else None,
+            "model_version": loader.version,           # FIX: was container.version
+            "schema_signature": loader.schema_signature,
+            "dataset_hash": meta_info.get("dataset_hash"),
+            "artifact_hash": loader.artifact_hash,
+            "feature_checksum": meta_info.get("feature_checksum"),
             "universe_size": len(tickers),
             "long_signals": long_count,
             "short_signals": short_count,
@@ -274,7 +261,7 @@ async def signal_explanation(ticker: str):
     try:
 
         pipeline = get_pipeline()
-        loader = get_shared_model_loader()
+        loader = get_model_loader()              # FIX: was get_shared_model_loader()
         universe_tickers = load_default_universe()
 
         if ticker not in universe_tickers:
@@ -289,7 +276,7 @@ async def signal_explanation(ticker: str):
                 timeout=REQUEST_TIMEOUT,
             )
 
-        signals = snapshot.get("signals", [])
+        signals = snapshot.get("signals", snapshot.get("snapshot", {}).get("signals", []))
         row = next((s for s in signals if s["ticker"] == ticker), None)
 
         if row is None:
@@ -316,11 +303,12 @@ async def signal_explanation(ticker: str):
             explanation=signal_agent.get("explanation", ""),
         )
 
+        meta_info = loader.metadata or {}
         meta = SignalExplanationMeta(
-            model_version=getattr(loader, "xgb_version", None),
-            schema_signature=getattr(loader, "schema_signature", None),
-            dataset_hash=getattr(loader, "dataset_hash", None),
-            artifact_hash=getattr(loader, "artifact_hash", None),
+            model_version=loader.version,               # FIX: was loader.xgb_version
+            schema_signature=loader.schema_signature,
+            dataset_hash=meta_info.get("dataset_hash"),
+            artifact_hash=loader.artifact_hash,
             latency_ms=int((time.time() - start_time) * 1000),
             timestamp=int(time.time()),
         )
@@ -346,9 +334,6 @@ async def signal_explanation(ticker: str):
 
 # =========================================================
 # PRICE HISTORY
-# FIX: read date from row["date"] column, not from index.
-#      _validate_dataset() calls reset_index(drop=True) at
-#      the end — so the index is always an integer RangeIndex.
 # =========================================================
 
 @router.get("/price-history/{ticker}")
@@ -386,8 +371,6 @@ async def price_history(ticker: str, days: int = 365):
 
         prices = []
         for _, row in df.iterrows():
-            # FIX: read from the "date" column, not from the integer index.
-            # _validate_dataset() calls reset_index(drop=True) so idx is int.
             date_val = str(pd.Timestamp(row["date"]).date())
             prices.append({
                 "date": date_val,

@@ -1,7 +1,9 @@
 # =========================================================
-# MODEL INFO ROUTE v2.3
-# FIX: Import get_shared_model_loader from model_loader,
-#      not pipeline (it was never defined there).
+# MODEL INFO ROUTE v2.4
+# FIX: get_shared_model_loader → get_model_loader
+# FIX: loader.xgb_version → loader.version
+# FIX: loader.xgb → loader.model
+# FIX: metadata fields read from loader.metadata dict
 # =========================================================
 
 import asyncio
@@ -11,7 +13,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from typing import Dict, Any
 
-from app.inference.model_loader import get_shared_model_loader  # FIX: was pipeline
+from app.inference.model_loader import get_model_loader
 from core.schema.feature_schema import MODEL_FEATURES
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
@@ -63,15 +65,16 @@ async def model_info():
 def _model_info_sync():
 
     start_time = time.time()
-    loader = get_shared_model_loader()
+    loader = get_model_loader()
+    meta = loader.metadata or {}
 
     return {
-        "model_version": loader.xgb_version,
-        "schema_signature": loader.schema_signature,
-        "dataset_hash": loader.dataset_hash,
-        "training_code_hash": loader.training_code_hash,
-        "artifact_hash": loader.artifact_hash,
-        "feature_checksum": loader.feature_checksum,
+        "model_version": loader.version or "unknown",
+        "schema_signature": loader.schema_signature or "unknown",
+        "dataset_hash": meta.get("dataset_hash", "unknown"),
+        "training_code_hash": meta.get("training_code_hash", "unknown"),
+        "artifact_hash": loader.artifact_hash or "unknown",
+        "feature_checksum": meta.get("feature_checksum", "unknown"),
         "feature_count": len(MODEL_FEATURES),
         "latency_ms": int((time.time() - start_time) * 1000),
         "timestamp": int(time.time()),
@@ -113,21 +116,34 @@ async def feature_importance():
 def _feature_importance_sync():
 
     start_time = time.time()
-    loader = get_shared_model_loader()
-    model = loader.xgb
+    loader = get_model_loader()
+    model = loader.model
+    meta = loader.metadata or {}
 
-    importance_list = loader.get_feature_importance()
-
-    importance = [
-        {"feature": item["feature"], "importance": float(item["importance"])}
-        for item in importance_list
-    ]
+    importance = []
+    try:
+        if model is not None and hasattr(model, "export_feature_importance"):
+            raw = model.export_feature_importance()
+            importance = [
+                {"feature": item["feature"], "importance": float(item["importance"])}
+                for item in raw.get("feature_importance", [])
+            ]
+        elif model is not None and hasattr(model, "model") and model.model is not None:
+            scores = model.model.get_score(importance_type="gain")
+            total = sum(scores.values()) or 1.0
+            importance = sorted(
+                [{"feature": f, "importance": round(v / total, 6)} for f, v in scores.items()],
+                key=lambda x: x["importance"],
+                reverse=True,
+            )
+    except Exception as e:
+        logger.warning("Feature importance extraction failed: %s", e)
 
     return {
-        "model_version": loader.xgb_version,
-        "feature_checksum": loader.feature_checksum,
-        "best_iteration": getattr(model, "best_iteration", None),
-        "training_fingerprint": getattr(model, "training_fingerprint", None),
+        "model_version": loader.version or "unknown",
+        "feature_checksum": meta.get("feature_checksum", "unknown"),
+        "best_iteration": getattr(model, "best_iteration", None) if model else None,
+        "training_fingerprint": getattr(model, "training_fingerprint", None) if model else None,
         "importance": importance,
         "latency_ms": int((time.time() - start_time) * 1000),
         "timestamp": int(time.time()),
@@ -169,22 +185,23 @@ async def model_diagnostics() -> Dict[str, Any]:
 def _model_diagnostics_sync():
 
     start_time = time.time()
-    loader = get_shared_model_loader()
-    model = loader.xgb
+    loader = get_model_loader()
+    model = loader.model
+    meta = loader.metadata or {}
 
     return {
-        "model_version": loader.xgb_version,
-        "artifact_hash": loader.artifact_hash,
-        "schema_signature": loader.schema_signature,
-        "dataset_hash": loader.dataset_hash,
-        "training_code_hash": loader.training_code_hash,
-        "feature_checksum": loader.feature_checksum,
+        "model_version": loader.version or "unknown",
+        "artifact_hash": loader.artifact_hash or "unknown",
+        "schema_signature": loader.schema_signature or "unknown",
+        "dataset_hash": meta.get("dataset_hash", "unknown"),
+        "training_code_hash": meta.get("training_code_hash", "unknown"),
+        "feature_checksum": meta.get("feature_checksum", "unknown"),
         "feature_count": len(MODEL_FEATURES),
-        "training_fingerprint": getattr(model, "training_fingerprint", None),
-        "training_cols": getattr(model, "training_cols", None),
-        "param_checksum": getattr(model, "param_checksum", None),
-        "booster_checksum": getattr(model, "booster_checksum", None),
-        "best_iteration": getattr(model, "best_iteration", None),
+        "training_fingerprint": getattr(model, "training_fingerprint", None) if model else None,
+        "training_cols": getattr(model, "training_cols", None) if model else None,
+        "param_checksum": getattr(model, "param_checksum", None) if model else None,
+        "booster_checksum": getattr(model, "booster_checksum", None) if model else None,
+        "best_iteration": getattr(model, "best_iteration", None) if model else None,
         "latency_ms": int((time.time() - start_time) * 1000),
         "timestamp": int(time.time()),
     }
