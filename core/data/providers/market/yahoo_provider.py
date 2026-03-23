@@ -2,6 +2,7 @@ import logging
 import os
 import time
 import random
+from datetime import datetime, timedelta
 from typing import Optional
 
 import numpy as np
@@ -19,6 +20,12 @@ class YahooProvider(MarketDataProvider):
 
     DEFAULT_MIN_ROWS = 120
     MAX_ROWS = 20_000
+
+    # FIX: If the requested window is <= this many calendar days,
+    # we treat it as a delta fetch and skip the min_rows check.
+    # Data sync requests ~5 trading days at a time. Full historical
+    # fetches request 730+ days. 30 is a safe boundary between them.
+    DELTA_WINDOW_DAYS = 30
 
     ALLOWED_INTERVALS = {
         "1d", "D",
@@ -54,7 +61,31 @@ class YahooProvider(MarketDataProvider):
         logger.info("YahooProvider initialised (PRIMARY market data provider).")
 
     ############################################################
-    # SAFE DATETIME NORMALIZATION (FIX TZ BUG)
+    # DELTA WINDOW DETECTION
+    # FIX: Determines if this is a small delta fetch vs full
+    # historical fetch, to skip min_rows validation on deltas.
+    ############################################################
+
+    @staticmethod
+    def _is_delta_fetch(start_date: str, end_date: str, delta_threshold_days: int = 30) -> bool:
+        """
+        Returns True if the requested date window is short enough
+        to be a delta (incremental) sync rather than a full history fetch.
+
+        Delta syncs legitimately return only 1-10 rows. Applying the
+        DEFAULT_MIN_ROWS=120 check on these would always fail and force
+        unnecessary fallback to TwelveData on every daily sync.
+        """
+        try:
+            start = datetime.strptime(start_date[:10], "%Y-%m-%d")
+            end = datetime.strptime(end_date[:10], "%Y-%m-%d")
+            window_days = (end - start).days
+            return window_days <= delta_threshold_days
+        except Exception:
+            return False
+
+    ############################################################
+    # SAFE DATETIME NORMALIZATION
     ############################################################
 
     @staticmethod
@@ -177,7 +208,13 @@ class YahooProvider(MarketDataProvider):
     # NORMALIZATION PIPELINE
     ############################################################
 
-    def _normalize(self, df: pd.DataFrame, ticker: str, min_rows: int) -> pd.DataFrame:
+    def _normalize(
+        self,
+        df: pd.DataFrame,
+        ticker: str,
+        min_rows: int,
+        is_delta: bool = False,
+    ) -> pd.DataFrame:
 
         ticker = ticker.strip().upper()
 
@@ -231,7 +268,7 @@ class YahooProvider(MarketDataProvider):
             raise RuntimeError(f"Normalization produced empty dataset for {ticker}.")
 
         ############################################################
-        # FIX: DATE NORMALIZATION
+        # DATE NORMALIZATION
         ############################################################
 
         clean["date"] = self._normalize_datetime(clean["date"])
@@ -300,25 +337,40 @@ class YahooProvider(MarketDataProvider):
 
         ############################################################
         # HISTORY CHECK
+        #
+        # FIX: Skip min_rows check for delta fetches.
+        # Delta syncs request only 5-14 days of data so they
+        # legitimately return few rows. Applying DEFAULT_MIN_ROWS=120
+        # here caused Yahoo to always fail on daily syncs, forcing
+        # every ticker to retry twice before falling back to TwelveData.
+        # This wasted ~4s per ticker × 100 tickers = 400s per sync.
         ############################################################
 
-        if len(clean) < min_rows:
-
-            soft_threshold = int(min_rows * self.soft_fail_ratio)
-
-            if self.soft_fail_mode and len(clean) >= soft_threshold:
-
-                logger.warning(
-                    "Short history accepted | provider=yahoo ticker=%s rows=%d",
-                    ticker,
-                    len(clean),
-                )
-
-            else:
-
+        if is_delta:
+            # Delta fetch: any non-empty result is acceptable
+            if len(clean) == 0:
                 raise RuntimeError(
-                    f"Insufficient history for {ticker}: got {len(clean)}, need {min_rows}"
+                    f"Delta fetch returned zero rows for {ticker}"
                 )
+        else:
+            # Full historical fetch: enforce minimum row count
+            if len(clean) < min_rows:
+
+                soft_threshold = int(min_rows * self.soft_fail_ratio)
+
+                if self.soft_fail_mode and len(clean) >= soft_threshold:
+
+                    logger.warning(
+                        "Short history accepted | provider=yahoo ticker=%s rows=%d",
+                        ticker,
+                        len(clean),
+                    )
+
+                else:
+
+                    raise RuntimeError(
+                        f"Insufficient history for '{ticker}': got {len(clean)}, need {min_rows}"
+                    )
 
         clean["ticker"] = ticker
 
@@ -346,6 +398,11 @@ class YahooProvider(MarketDataProvider):
         yf_interval = self._INTERVAL_ALIAS.get(interval, interval)
 
         min_rows = kwargs.get("min_rows", self.DEFAULT_MIN_ROWS)
+
+        # FIX: Detect delta vs full fetch from the date window size.
+        # Passes is_delta=True to _normalize() to skip the min_rows
+        # check when the router requests only a short window.
+        is_delta = self._is_delta_fetch(start_date, end_date, self.DELTA_WINDOW_DAYS)
 
         raw_df: Optional[pd.DataFrame] = None
         last_error: Optional[Exception] = None
@@ -419,6 +476,7 @@ class YahooProvider(MarketDataProvider):
             df=raw_df,
             ticker=ticker,
             min_rows=min_rows,
+            is_delta=is_delta,
         )
 
         return self.validate_contract(normalised)
