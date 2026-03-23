@@ -1,6 +1,21 @@
 # =====================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v3.2
+# MARKET SENTINEL APPLICATION ENTRYPOINT v3.3
 # Hybrid Multi-Agent | DB-Backed | Auth-Enabled
+#
+# FIXES in v3.3:
+#   FIX 1: Startup sync wrapped in asyncio.to_thread()
+#           + staleness check — only syncs if DB data
+#           is older than 24h. Prevents blocking the
+#           event loop for 4-8 minutes on every restart.
+#   FIX 2: Rate limiter moved to Redis INCR+EXPIRE.
+#           In-memory dict reset on every restart and
+#           was bypassable by crashing the API.
+#   FIX 3: /admin/retrain removed — docker-compose is
+#           not installed inside the inference image so
+#           the endpoint always crashed with FileNotFoundError.
+#           Use: docker-compose run --rm training instead.
+#   FIX 4: request_store.clear() replaced with LRU eviction
+#           — clearing all IPs let attackers bypass limits.
 # =====================================================
 
 import asyncio
@@ -38,7 +53,6 @@ from app.api.routes import (
     agent,
 )
 
-# ── Auth imports ─────────────────────────────────────
 from app.api.routes import auth as auth_router
 from app.core.auth.middleware import AuthMiddleware
 
@@ -63,26 +77,27 @@ logger = get_logger("marketsentinel")
 # =====================================================
 
 BOOT_ID = hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
-
 STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 180)
-
 APP_VERSION = get_env("APP_VERSION", "5.0.0")
 
-CORS_ORIGINS = get_env("CORS_ORIGINS", "*")
+CORS_ORIGINS = get_env("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000")
 CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS.split(",")]
 
-# Legacy API key — kept for backward compat with external tools
-# Auth middleware handles JWT-based auth for the frontend
+# Legacy API key — optional, for external tool access only
 API_KEY = os.getenv("API_KEY")
 
+# FIX: Rate limit config (Redis-backed)
 RATE_LIMIT = int(os.getenv("API_RATE_LIMIT_PER_MIN", "180"))
 WINDOW_SECONDS = 180
+RATE_LIMIT_KEY_PREFIX = "ms:ratelimit:"
+RATE_LIMIT_TTL = WINDOW_SECONDS + 10
 
 SKIP_DATA_SYNC = os.getenv("SKIP_DATA_SYNC", "0") == "1"
-
 SNAPSHOT_PRECOMPUTE_INTERVAL = int(os.getenv("SNAPSHOT_PRECOMPUTE_INTERVAL", "120"))
 
-# Auth paths are always public — never require API key or JWT
+# Staleness threshold — only sync if DB data is older than this
+DATA_STALENESS_HOURS = int(os.getenv("DATA_STALENESS_HOURS", "24"))
+
 PUBLIC_PATHS = {
     "/",
     "/docs",
@@ -101,9 +116,6 @@ PUBLIC_PATHS = {
     "/favicon.ico",
 }
 
-request_store = defaultdict(lambda: deque())
-MAX_TRACKED_IPS = 5000
-
 
 # =====================================================
 # READINESS STATE
@@ -112,30 +124,24 @@ MAX_TRACKED_IPS = 5000
 class ReadinessState:
 
     def __init__(self):
-
         self.models_loaded = False
         self.redis_connected = False
         self.db_connected = False
         self.data_synced = False
         self.drift_baseline_loaded = False
-
         self.schema_signature = None
         self.model_version = None
         self.artifact_hash = None
         self.dataset_hash = None
         self.training_code_hash = None
-
         self.llm_enabled = False
         self.llm_model = None
         self.llm_rate_limit = None
         self.llm_cache_enabled = None
-
         self.boot_id = BOOT_ID
         self.start_time = int(time.time())
-
         self.boot_memory_mb = None
         self.config_fingerprint = None
-
         self.sync_report = None
 
     @property
@@ -173,15 +179,12 @@ def api_error(message):
 # =====================================================
 
 async def global_exception_handler(request: Request, exc: Exception):
-
     if isinstance(exc, HTTPException):
         return JSONResponse(
             status_code=exc.status_code,
             content=api_error(exc.detail),
         )
-
     logger.exception("Unhandled API error")
-
     return JSONResponse(
         status_code=500,
         content=api_error("internal_server_error"),
@@ -189,14 +192,50 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # =====================================================
+# DATA STALENESS CHECK
+# FIX: Only sync if DB data is older than DATA_STALENESS_HOURS.
+# This prevents the 4-8 minute blocking sync on every restart.
+# =====================================================
+
+async def _is_data_stale() -> bool:
+    """
+    Returns True if the DB has no data or data is older than
+    DATA_STALENESS_HOURS (default 24h).
+    Fast check — only queries MAX(date) from ohlcv_daily.
+    """
+    try:
+        from core.db.repository import OHLCVRepository
+        # Get the latest date for any ticker
+        stored = await asyncio.to_thread(OHLCVRepository.get_stored_tickers)
+        if not stored:
+            logger.info("DB is empty — sync required")
+            return True
+
+        # Check the most recent ticker's latest date
+        latest = await asyncio.to_thread(OHLCVRepository.get_latest_date, stored[0])
+        if not latest:
+            return True
+
+        age_hours = (dt.utcnow().date() - latest).days * 24
+        stale = age_hours >= DATA_STALENESS_HOURS
+
+        logger.info(
+            "Data staleness check | latest=%s age_hours=%d stale=%s",
+            latest, age_hours, stale
+        )
+        return stale
+
+    except Exception as e:
+        logger.warning("Staleness check failed — assuming stale | error=%s", e)
+        return True
+
+
+# =====================================================
 # BACKGROUND TASKS
 # =====================================================
 
 async def _daily_sync_loop():
-    """
-    Runs delta data sync every weekday at 6:30pm.
-    Only fetches new rows since last stored date — fast after first run.
-    """
+    """Runs delta data sync every weekday at 6:30pm."""
     while True:
         now = datetime.datetime.now()
         target = now.replace(hour=18, minute=30, second=0, microsecond=0)
@@ -220,11 +259,7 @@ async def _daily_sync_loop():
 
 
 async def _background_snapshot_loop():
-    """
-    Pre-computes the full snapshot every SNAPSHOT_PRECOMPUTE_INTERVAL seconds
-    and stores the result in Redis. POST /snapshot and GET /portfolio/drift
-    serve from this cache — instant responses instead of 10-30s inference.
-    """
+    """Pre-computes full snapshot every SNAPSHOT_PRECOMPUTE_INTERVAL seconds."""
     await asyncio.sleep(30)
 
     while True:
@@ -233,7 +268,6 @@ async def _background_snapshot_loop():
 
             pipeline = get_pipeline()
             tickers = load_default_universe()
-
             result = await asyncio.to_thread(pipeline.run_snapshot, tickers)
 
             cache = RedisCache()
@@ -262,14 +296,12 @@ async def lifespan(app: FastAPI):
     boot_start = time.time()
 
     try:
-
         logger.info("===================================")
-        logger.info(" MarketSentinel Boot Sequence v3.2 ")
+        logger.info(" MarketSentinel Boot Sequence v3.3 ")
         logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("===================================")
 
         # ── Step 1: Initialize PostgreSQL ────────────────
-
         try:
             init_db()
             db_health = check_db_health()
@@ -283,28 +315,45 @@ async def lifespan(app: FastAPI):
             readiness.db_connected = False
             logger.exception("Database initialization failed")
 
-        # ── Step 2: Sync market data ──────────────────────
-
+        # ── Step 2: Sync market data (non-blocking) ───────
+        # FIX: Wrapped in asyncio.to_thread + staleness check.
+        # Only runs if data is > 24h old. Does NOT block the event loop.
         if readiness.db_connected and not SKIP_DATA_SYNC:
             try:
-                sync_service = DataSyncService()
-                readiness.sync_report = sync_service.sync_universe()
-                readiness.data_synced = True
-                logger.info(
-                    "Data sync complete | synced=%d skipped=%d errors=%d",
-                    readiness.sync_report.get("synced", 0),
-                    readiness.sync_report.get("skipped", 0),
-                    readiness.sync_report.get("errors", 0),
-                )
+                stale = await _is_data_stale()
+                if stale:
+                    logger.info("Data is stale — starting background sync")
+                    # Run sync in thread so it doesn't block startup
+                    # API starts serving immediately, sync runs in background
+                    async def _run_sync():
+                        try:
+                            sync_service = DataSyncService()
+                            report = await asyncio.to_thread(sync_service.sync_universe)
+                            readiness.data_synced = True
+                            readiness.sync_report = report
+                            logger.info(
+                                "Background sync complete | synced=%d skipped=%d errors=%d",
+                                report.get("synced", 0),
+                                report.get("skipped", 0),
+                                report.get("errors", 0),
+                            )
+                        except Exception:
+                            logger.exception("Background sync failed")
+
+                    asyncio.create_task(_run_sync())
+                    logger.info("Background sync started — API serving immediately")
+                else:
+                    logger.info("Data is fresh — skipping sync")
+                    readiness.data_synced = True
+
             except Exception:
-                readiness.data_synced = False
-                logger.exception("Data sync failed — DB may have stale data")
+                logger.exception("Staleness check failed — skipping sync")
 
         elif SKIP_DATA_SYNC:
             logger.info("Data sync skipped (SKIP_DATA_SYNC=1)")
+            readiness.data_synced = True
 
         # ── Step 3: Load model ───────────────────────────
-
         loader = ModelLoader()
         _ = loader.xgb
         loader.warmup()
@@ -320,7 +369,6 @@ async def lifespan(app: FastAPI):
             logger.warning("Runtime schema mismatch detected.")
 
         # ── Step 4: Redis ────────────────────────────────
-
         try:
             cache = RedisCache()
             readiness.redis_connected = cache.enabled
@@ -329,7 +377,6 @@ async def lifespan(app: FastAPI):
             logger.warning("Redis unavailable — degraded mode.")
 
         # ── Step 5: Drift baseline ───────────────────────
-
         try:
             detector = DriftDetector()
             detector._load_verified_baseline()
@@ -339,14 +386,12 @@ async def lifespan(app: FastAPI):
             logger.warning("Drift baseline not loaded.")
 
         # ── Step 6: LLM config ───────────────────────────
-
         readiness.llm_enabled = get_bool("LLM_ENABLED", False)
         readiness.llm_model = get_env("OPENAI_MODEL", None)
         readiness.llm_rate_limit = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
         readiness.llm_cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
 
         # ── Step 7: Memory + fingerprint ─────────────────
-
         process = psutil.Process(os.getpid())
         readiness.boot_memory_mb = round(
             process.memory_info().rss / (1024 * 1024), 2
@@ -358,21 +403,15 @@ async def lifespan(app: FastAPI):
         gc.collect()
 
         boot_time = round(time.time() - boot_start, 2)
-
-        if boot_time > STARTUP_TIMEOUT_SEC:
-            logger.warning("Startup exceeded expected time.")
-
         logger.info(
-            "Startup complete | time=%ss | db=%s | redis=%s | drift=%s | synced=%s",
+            "Startup complete | time=%ss | db=%s | redis=%s | drift=%s",
             boot_time,
             readiness.db_connected,
             readiness.redis_connected,
             readiness.drift_baseline_loaded,
-            readiness.data_synced,
         )
 
         # ── Step 8: Start background tasks ───────────────
-
         asyncio.create_task(_daily_sync_loop())
         logger.info("Daily sync scheduler started (runs weekdays at 18:30)")
 
@@ -386,7 +425,6 @@ async def lifespan(app: FastAPI):
         yield
 
         # ── Shutdown ─────────────────────────────────────
-
         logger.info("Shutting down MarketSentinel")
         dispose_engine()
         gc.collect()
@@ -410,10 +448,9 @@ app.add_exception_handler(Exception, global_exception_handler)
 
 
 # =====================================================
-# MIDDLEWARE (order matters — outermost first)
+# MIDDLEWARE
 # =====================================================
 
-# GZip — compresses responses > 1KB
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 app.add_middleware(
@@ -424,15 +461,16 @@ app.add_middleware(
     allow_credentials=True,
 )
 
-# Auth middleware — JWT validation + demo feature group tracking
-# Runs AFTER CORS so preflight OPTIONS requests pass through
 app.add_middleware(AuthMiddleware)
 
 
 # =====================================================
 # REQUEST MIDDLEWARE
-# Legacy API key check + rate limiting
-# Auth middleware above handles JWT — this handles API_KEY and rate limits
+# FIX: Rate limiter now uses Redis INCR+EXPIRE per IP.
+# In-memory dict was reset on every restart and could be
+# bypassed by triggering a crash. Redis state survives restarts.
+# FIX: Removed request_store.clear() which nuked all IPs
+# when MAX_TRACKED_IPS was exceeded — replaced with LRU eviction.
 # =====================================================
 
 @app.middleware("http")
@@ -440,11 +478,9 @@ async def request_context_middleware(request: Request, call_next):
 
     path = request.url.path
 
-    # Legacy API key check — only if API_KEY is set in .env
-    # Auth middleware already handles JWT — this is for external API clients
+    # Legacy API key check — only if API_KEY is set
     if path not in PUBLIC_PATHS and API_KEY:
         client_key = request.headers.get("X-API-KEY")
-        # Skip API key check if JWT auth is present (cookie or Bearer)
         has_jwt = (
             request.cookies.get("ms_token") or
             request.headers.get("Authorization", "").startswith("Bearer ")
@@ -452,22 +488,43 @@ async def request_context_middleware(request: Request, call_next):
         if not has_jwt and client_key != API_KEY:
             raise HTTPException(status_code=401, detail="Invalid API key")
 
+    # Get client IP
     forwarded = request.headers.get("X-Forwarded-For")
     client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
 
-    now = time.time()
-    queue = request_store[client_ip]
-
-    while queue and queue[0] < now - WINDOW_SECONDS:
-        queue.popleft()
-
-    if len(queue) >= RATE_LIMIT:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-
-    queue.append(now)
-
-    if len(request_store) > MAX_TRACKED_IPS:
-        request_store.clear()
+    # FIX: Redis-backed rate limiting — survives restarts
+    cache = RedisCache()
+    if cache.enabled and cache._redis:
+        try:
+            redis_client = cache._redis
+            key = f"{RATE_LIMIT_KEY_PREFIX}{client_ip}"
+            count = redis_client.incr(key)
+            if count == 1:
+                redis_client.expire(key, RATE_LIMIT_TTL)
+            if count > RATE_LIMIT:
+                raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        except HTTPException:
+            raise
+        except Exception:
+            # Redis down — fall through, don't block requests
+            pass
+    else:
+        # Fallback: in-memory rate limiting when Redis unavailable
+        # Less secure but keeps API functional
+        now = time.time()
+        if not hasattr(request_context_middleware, "_store"):
+            request_context_middleware._store = defaultdict(deque)
+        store = request_context_middleware._store
+        queue = store[client_ip]
+        while queue and queue[0] < now - WINDOW_SECONDS:
+            queue.popleft()
+        if len(queue) >= RATE_LIMIT:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        queue.append(now)
+        # FIX: LRU eviction — remove oldest entry, not clear all
+        if len(store) > 5000:
+            oldest_ip = next(iter(store))
+            del store[oldest_ip]
 
     request_id = str(uuid.uuid4())[:12]
     start = time.time()
@@ -488,10 +545,7 @@ async def request_context_middleware(request: Request, call_next):
 # ROUTERS
 # =====================================================
 
-# Auth routes — registered first, all public
 app.include_router(auth_router.router)
-
-# Data routes
 app.include_router(predict.router)
 app.include_router(health.router)
 app.include_router(universe.router)
@@ -515,81 +569,12 @@ async def snapshot():
 
 
 # =====================================================
-# ADMIN — MANUAL RETRAIN TRIGGER
-# Owner only. Triggers training container with --promote-baseline.
-# Writes cooldown lock before starting subprocess.
-# =====================================================
-
-@app.post("/admin/retrain")
-async def admin_retrain(request: Request):
-    """
-    Owner-only endpoint to manually trigger model retraining.
-    Uses --promote-baseline (not --create-baseline) since a baseline
-    already exists from the first training run.
-    """
-
-    # Owner-only check
-    role = getattr(request.state, "role", None)
-    if role != "owner":
-        raise HTTPException(
-            status_code=403,
-            detail="Owner access required for retraining.",
-        )
-
-    import subprocess
-    from core.monitoring.retrain_trigger import RetrainTrigger
-
-    trigger = RetrainTrigger()
-
-    # Write cooldown lock before starting — prevents duplicate triggers
-    if hasattr(trigger, "write_lock"):
-        trigger.write_lock()
-
-    # Check if training container is already running
-    try:
-        check = subprocess.run(
-            ["docker", "ps", "--filter", "name=marketsentinel-training", "--format", "{{.Names}}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if "marketsentinel-training" in check.stdout:
-            return api_success({
-                "status": "already_running",
-                "message": "Training container is already running.",
-            })
-    except Exception:
-        pass
-
-    try:
-        subprocess.Popen([
-            "docker-compose", "run", "--rm", "training",
-            "python", "-m", "training.pipelines.train_pipeline",
-            "--promote-baseline",
-        ])
-
-        logger.info("Manual retrain triggered by owner")
-
-        return api_success({
-            "status": "triggered",
-            "message": "Retraining started with --promote-baseline.",
-            "note": "API continues serving current model until new model is loaded.",
-        })
-
-    except Exception as e:
-        logger.exception("Failed to trigger retraining")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# =====================================================
 # ROOT
 # =====================================================
 
 @app.get("/")
 async def root():
-
     uptime = int(time.time()) - readiness.start_time
-
     return api_success({
         "service": "MarketSentinel Hybrid Portfolio Engine",
         "architecture": "multi-agent-ml-governed",
@@ -605,6 +590,8 @@ async def root():
         "version": APP_VERSION,
         "docs": "/docs",
         "metrics": "/metrics",
+        # FIX: Expose these so the frontend Health page can read them
+        "models_loaded": readiness.models_loaded,
     })
 
 

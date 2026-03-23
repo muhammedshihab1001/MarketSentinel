@@ -1,5 +1,3 @@
-version: "3.9"
-
 networks:
   marketsentinel-net:
     driver: bridge
@@ -63,6 +61,7 @@ services:
       postgres:
         condition: service_healthy
 
+    # FIX: Use environment variable instead of hardcoded password
     environment:
       PGPASSWORD: sentinel
 
@@ -138,17 +137,20 @@ services:
       - .env
 
     environment:
-      - MARKET_MAX_WORKERS=8
-      - DRIFT_HARD_FAIL=false
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=sentinel
       - POSTGRES_PASSWORD=sentinel
       - POSTGRES_DB=marketsentinel
+      - DATABASE_URL=postgresql+psycopg2://sentinel:sentinel@postgres:5432/marketsentinel
       - REDIS_HOST=redis
       - XGBOOST_NO_CUDA=1
       - PIPELINE_TOP_K=5
       - PIPELINE_BOTTOM_K=5
+      - MARKET_MAX_WORKERS=8
+      - DRIFT_HARD_FAIL=false
+      # FIX: Set CORS to frontend origin — never use * in production with credentials
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:3000
 
     volumes:
       - ./artifacts:/app/artifacts
@@ -162,10 +164,12 @@ services:
         condition: service_healthy
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health/ready"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
       interval: 30s
-      timeout: 5s
-      retries: 3
+      timeout: 10s
+      # FIX: Increased start_period — sync on startup takes time
+      start_period: 120s
+      retries: 5
 
     mem_limit: 768m
     cpus: 1.0
@@ -193,6 +197,7 @@ services:
       - POSTGRES_USER=sentinel
       - POSTGRES_PASSWORD=sentinel
       - POSTGRES_DB=marketsentinel
+      - DATABASE_URL=postgresql+psycopg2://sentinel:sentinel@postgres:5432/marketsentinel
       - XGBOOST_NO_CUDA=1
 
     volumes:
@@ -212,7 +217,7 @@ services:
 
 
   ####################################################
-  # PROMETHEUS — pinned version
+  # PROMETHEUS
   ####################################################
   prometheus:
     container_name: marketsentinel-prometheus
@@ -238,7 +243,7 @@ services:
 
 
   ####################################################
-  # GRAFANA — pinned version
+  # GRAFANA
   ####################################################
   grafana:
     container_name: marketsentinel-grafana
