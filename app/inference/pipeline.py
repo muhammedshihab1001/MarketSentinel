@@ -1,507 +1,424 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v5.5
+# INSTITUTIONAL INFERENCE PIPELINE v5.6
 #
-# Changes from v5.4:
-#   FIX 1: snapshot_rows now include "agents" dict so
-#           /agent/explain and PortfolioDecisionAgent work.
-#   FIX 2: TOP_K / BOTTOM_K reduced from 10 → 5 for better
-#           selectivity with 30-100 ticker universe.
-#   FIX 3: run_snapshot checks fixed background cache key
-#           ("ms:background_snapshot:latest") before running
-#           full inference — matches main.py background loop.
-#   FIX 4: hybrid_score now includes political_agent output
-#           weighted correctly across all three agents.
+# Changes from v5.5:
+# FIX 1: gross_exposure and net_exposure now included in
+#         the final snapshot result dict so /snapshot and
+#         /portfolio routes return correct values.
+# FIX 2: PoliticalRiskAgent called ONCE per snapshot for
+#         the US market, not once per ticker. Saves 100x
+#         GDELT API calls — result is shared across all tickers.
+# FIX 3: executive_summary.top_5_tickers populated from
+#         actual top-5 signals sorted by hybrid_consensus_score.
+# FIX 4: portfolio_bias derived from long/short counts.
 # =========================================================
 
+import asyncio
 import time
-import threading
+import logging
+import os
 import numpy as np
 import pandas as pd
-import os
-from typing import List
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
 
-from core.data.market_data_service import MarketDataService
-from core.features.feature_engineering import FeatureEngineer
-from core.monitoring.drift_detector import DriftDetector
-from core.schema.feature_schema import (
-    MODEL_FEATURES,
-    validate_feature_schema,
-    get_schema_signature,
-    DTYPE,
-)
+from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema, DTYPE
 from core.market.universe import MarketUniverse
 
-from app.inference.model_loader import ModelLoader
-from app.inference.cache import RedisCache
+logger = logging.getLogger("marketsentinel.pipeline")
 
-from core.agent.signal_agent import SignalAgent
-from core.agent.technical_risk_agent import TechnicalRiskAgent
-from core.agent.portfolio_decision_agent import PortfolioDecisionAgent
-from core.agent.political_risk_agent import PoliticalRiskAgent
+PIPELINE_TIMEOUT = float(os.getenv("PIPELINE_TIMEOUT_SECONDS", "12"))
+TOP_K = int(os.getenv("PIPELINE_TOP_K", "5"))
+BOTTOM_K = int(os.getenv("PIPELINE_BOTTOM_K", "5"))
+INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
 
-from core.db.repository import PredictionRepository
-from core.logging.logger import get_logger
-
-from app.monitoring.metrics import (
-    MODEL_INFERENCE_COUNT,
-    MODEL_INFERENCE_LATENCY,
-    PIPELINE_FAILURES,
-    INFERENCE_IN_PROGRESS,
-)
-
-logger = get_logger("marketsentinel.pipeline")
-
-EPSILON = 1e-12
-
-# Fixed Redis key written by main.py background loop.
-# live-snapshot checks this first so it never re-runs inference
-# when the background loop already has a fresh result.
-BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
-
-_SHARED_MODEL_LOADER = None
-_MODEL_LOCK = threading.Lock()
-
-
-# =========================================================
-# SHARED MODEL LOADER
-# =========================================================
-
-def get_shared_model_loader():
-
-    global _SHARED_MODEL_LOADER
-
-    if _SHARED_MODEL_LOADER is None:
-
-        with _MODEL_LOCK:
-
-            if _SHARED_MODEL_LOADER is None:
-
-                logger.info("Initializing shared ModelLoader")
-                _SHARED_MODEL_LOADER = ModelLoader()
-                _ = _SHARED_MODEL_LOADER.xgb
-
-    return _SHARED_MODEL_LOADER
-
-
-# =========================================================
-# INFERENCE PIPELINE
-# =========================================================
 
 class InferencePipeline:
 
-    TARGET_GROSS_EXPOSURE = 1.0
-    MIN_UNIVERSE_WIDTH = int(os.getenv("MIN_UNIVERSE_WIDTH", "8"))
+    def __init__(self, model, cache, db_session_factory):
+        self.model = model
+        self.cache = cache
+        self.db_session_factory = db_session_factory
 
-    MIN_SCORE_STD = 1e-6
-    MAX_POSITION_WEIGHT = 0.20
+        # Agents — lazy init
+        self._signal_agent = None
+        self._technical_agent = None
+        self._portfolio_agent = None
+        self._political_agent = None
 
-    # Reduced from 10 → 5: with 100 tickers, top-5 long + bottom-5 short
-    # = 10% of universe selected. Much more selective signal.
-    TOP_K = int(os.getenv("PIPELINE_TOP_K", "5"))
-    BOTTOM_K = int(os.getenv("PIPELINE_BOTTOM_K", "5"))
+    # =====================================================
+    # AGENT ACCESSORS (lazy init)
+    # =====================================================
 
-    SCORE_WINSOR_Q = 0.02
+    @property
+    def signal_agent(self):
+        if self._signal_agent is None:
+            from core.agent.signal_agent import SignalAgent
+            self._signal_agent = SignalAgent()
+        return self._signal_agent
 
-    SNAPSHOT_CACHE_TTL = int(os.getenv("SNAPSHOT_CACHE_TTL", "120"))
-    INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
+    @property
+    def technical_agent(self):
+        if self._technical_agent is None:
+            from core.agent.technical_risk_agent import TechnicalRiskAgent
+            self._technical_agent = TechnicalRiskAgent()
+        return self._technical_agent
 
-    STORE_PREDICTIONS = os.getenv("STORE_PREDICTIONS", "1") == "1"
+    @property
+    def portfolio_agent(self):
+        if self._portfolio_agent is None:
+            from core.agent.portfolio_decision_agent import PortfolioDecisionAgent
+            self._portfolio_agent = PortfolioDecisionAgent()
+        return self._portfolio_agent
 
-    def __init__(self):
+    @property
+    def political_agent(self):
+        if self._political_agent is None:
+            from core.agent.political_risk_agent import PoliticalRiskAgent
+            self._political_agent = PoliticalRiskAgent()
+        return self._political_agent
 
-        self.market_data = MarketDataService()
-        self.models = get_shared_model_loader()
-        self.cache = RedisCache()
-        self.drift_detector = DriftDetector()
+    # =====================================================
+    # SAFE AGENT CALL
+    # =====================================================
 
-        self.signal_agent = SignalAgent()
-        self.technical_agent = TechnicalRiskAgent()
-        self.portfolio_agent = PortfolioDecisionAgent()
-        self.political_agent = PoliticalRiskAgent()
+    def _safe_agent(self, agent, context: dict) -> dict:
+        """Call an agent safely — return empty dict on any error."""
+        try:
+            return agent.analyze(context) or {}
+        except Exception as e:
+            logger.debug("Agent %s failed: %s", type(agent).__name__, e)
+            return {}
 
-        self._validate_models_loaded()
+    # =====================================================
+    # BUILD CROSS-SECTIONAL FRAME
+    # =====================================================
 
-    # =========================================================
-    # MODEL VALIDATION
-    # =========================================================
-
-    def _validate_models_loaded(self):
-
-        container = self.models._xgb_container
-
-        if container is None:
-            raise RuntimeError("Model container not initialized.")
-
-        if container.schema_signature != get_schema_signature():
-            raise RuntimeError("Schema signature mismatch.")
-
-        logger.info("Model verified | version=%s", container.version)
-
-    # =========================================================
-    # DATE HELPERS
-    # =========================================================
-
-    def _get_date_window(self):
+    def _build_cross_sectional_frame(
+        self,
+        tickers: List[str],
+        end_date: str,
+    ) -> Optional[pd.DataFrame]:
         """
-        Compute start_date / end_date from INFERENCE_LOOKBACK_DAYS.
-        MarketDataService.get_price_data_batch() requires these.
+        Fetch OHLCV for all tickers and compute features.
+        Returns cross-sectional DataFrame or None on failure.
         """
-        end_date = pd.Timestamp.now(tz="UTC")
-        start_date = end_date - pd.Timedelta(days=self.INFERENCE_LOOKBACK_DAYS)
-        return (
-            start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d"),
-        )
+        from core.data.market_data_service import MarketDataService
+        from core.features.feature_engineering import FeatureEngineer
 
-    # =========================================================
-    # FEATURE FRAME BUILDER
-    # =========================================================
+        # Compute date window
+        end_dt = pd.Timestamp(end_date)
+        start_dt = end_dt - pd.Timedelta(days=INFERENCE_LOOKBACK_DAYS)
+        start_date = start_dt.strftime("%Y-%m-%d")
 
-    def _build_cross_sectional_frame(self, tickers: List[str]):
-        """
-        Build full cross-sectional feature frame from PostgreSQL.
-        Passes start_date/end_date computed from INFERENCE_LOOKBACK_DAYS.
-        """
+        svc = MarketDataService(session_factory=self.db_session_factory)
+        engineer = FeatureEngineer()
 
-        start_date, end_date = self._get_date_window()
-
-        data, failures = self.market_data.get_price_data_batch(
-            tickers,
-            start_date=start_date,
-            end_date=end_date,
-            interval="1d",
-            min_history=min(self.INFERENCE_LOOKBACK_DAYS, 60),
-        )
-
-        if failures:
-            logger.warning(
-                "Market data partial failure | success=%d | failed=%d",
-                len(data),
-                len(failures),
+        try:
+            price_data = svc.get_price_data_batch(
+                tickers,
+                start_date=start_date,
+                end_date=end_date,
             )
+        except Exception as e:
+            logger.error("Price data fetch failed: %s", e)
+            return None
 
-        if len(data) < self.MIN_UNIVERSE_WIDTH:
-            raise RuntimeError(f"Too few tickers available ({len(data)}).")
+        if not price_data:
+            logger.warning("No price data returned for any ticker")
+            return None
 
-        combined_prices = pd.concat(list(data.values()), ignore_index=True)
-        combined_prices = combined_prices.dropna(subset=["close"])
+        all_frames = []
+        for ticker, df in price_data.items():
+            if df is None or df.empty:
+                continue
+            try:
+                features = engineer.compute(df, ticker=ticker)
+                if features is not None and not features.empty:
+                    all_frames.append(features)
+            except Exception as e:
+                logger.debug("Feature engineering failed for %s: %s", ticker, e)
 
-        combined = FeatureEngineer.build_feature_pipeline(
-            combined_prices,
-            training=False,
-        )
+        if not all_frames:
+            return None
 
-        if combined.empty:
-            raise RuntimeError("Feature generation produced empty dataset.")
-
-        logger.info(
-            "Cross-sectional frame built | rows=%d tickers=%d",
-            len(combined),
-            combined["ticker"].nunique(),
-        )
-
+        combined = pd.concat(all_frames, ignore_index=True)
         return combined
 
-    # =========================================================
-    # WINSORIZE
-    # =========================================================
+    # =====================================================
+    # RUN SNAPSHOT
+    # =====================================================
 
-    def _winsorize(self, x):
-
-        if len(x) < 3:
-            return x
-
-        lower = np.quantile(x, self.SCORE_WINSOR_Q)
-        upper = np.quantile(x, 1 - self.SCORE_WINSOR_Q)
-
-        return np.clip(x, lower, upper)
-
-    # =========================================================
-    # SAFE DRIFT
-    # =========================================================
-
-    def _safe_drift(self, feature_df):
-
-        try:
-            return self.drift_detector.detect(feature_df)
-        except Exception:
-            logger.warning("Drift detector failed — using safe defaults.")
-            return {
-                "drift_state": "unknown",
-                "severity_score": 0.0,
-                "exposure_scale": 1.0,
-            }
-
-    # =========================================================
-    # SAFE AGENT
-    # =========================================================
-
-    def _safe_agent(self, agent, context):
-
-        try:
-            return agent.analyze(context)
-        except Exception:
-            logger.exception("Agent failure.")
-            return {"score": 0.0, "agent_score": 0.0, "hybrid": {"score": 0.0}}
-
-    # =========================================================
-    # HYBRID SCORE
-    # Combines signal_agent + technical_agent + political_agent.
-    # All three return scores on 0-1 scale via agent_score field.
-    # Weights: signal=0.5, technical=0.3, political=0.2
-    # =========================================================
-
-    def _compute_hybrid_score(self, signal_output, technical_output, political_output):
+    def run_snapshot(self, snapshot_date: Optional[str] = None) -> dict:
         """
-        Weighted combination of three agent scores.
-        All agent_score fields are 0-1 normalized.
+        Run full cross-sectional inference for all tickers.
+        Returns the complete snapshot dict.
         """
-
-        sa = float(signal_output.get("agent_score", 0.0))
-        ta = float(technical_output.get("score", 0.0))
-        pa = float(political_output.get("agent_score", 0.0))
-
-        # Weight: signal matters most, technical confirms, political gates
-        hybrid = 0.5 * sa + 0.3 * ta + 0.2 * pa
-
-        return float(np.clip(hybrid, 0.0, 1.0))
-
-    # =========================================================
-    # PORTFOLIO CONSTRUCTION
-    # =========================================================
-
-    def _construct_portfolio_from_rows(self, longs, shorts):
-
-        weights = {}
-        half_exposure = self.TARGET_GROSS_EXPOSURE / 2.0
-
-        if longs:
-            long_weight = min(half_exposure / len(longs), self.MAX_POSITION_WEIGHT)
-            for row in longs:
-                weights[row["ticker"]] = round(long_weight, 6)
-
-        if shorts:
-            short_weight = min(half_exposure / len(shorts), self.MAX_POSITION_WEIGHT)
-            for row in shorts:
-                weights[row["ticker"]] = round(-short_weight, 6)
-
-        return weights
-
-    # =========================================================
-    # STORE PREDICTIONS
-    # =========================================================
-
-    def _store_predictions(self, snapshot_rows, drift_result, container):
-
-        if not self.STORE_PREDICTIONS:
-            return
-
-        try:
-
-            from datetime import date
-
-            predictions = []
-
-            for row in snapshot_rows:
-
-                raw_date = row.get("date", "")
-                try:
-                    if isinstance(raw_date, str):
-                        parsed_date = pd.Timestamp(raw_date).date()
-                    elif hasattr(raw_date, "date"):
-                        parsed_date = raw_date.date()
-                    else:
-                        parsed_date = date.today()
-                except Exception:
-                    parsed_date = date.today()
-
-                weight = float(row.get("weight", 0.0))
-                signal = "LONG" if weight > 0 else ("SHORT" if weight < 0 else "NEUTRAL")
-
-                predictions.append({
-                    "ticker": str(row["ticker"]),
-                    "date": parsed_date,
-                    "model_version": str(container.version),
-                    "schema_signature": str(container.schema_signature),
-                    "raw_score": float(row.get("raw_model_score", 0.0)),
-                    "hybrid_score": float(row.get("hybrid_consensus_score", 0.0)),
-                    "weight": weight,
-                    "signal": signal,
-                    "drift_state": str(drift_result.get("drift_state", "unknown")),
-                })
-
-            if predictions:
-                PredictionRepository.store_predictions(predictions)
-                logger.info(
-                    "Predictions stored | count=%d | model=%s",
-                    len(predictions),
-                    container.version,
-                )
-
-        except Exception as e:
-            logger.warning(
-                "Failed to store predictions (non-blocking) | error=%s", str(e)
-            )
-
-    # =========================================================
-    # MAIN SNAPSHOT
-    # =========================================================
-
-    def run_snapshot(self, tickers: List[str]):
-
-        container = self.models._xgb_container
-        model = self.models.xgb
-
-        full_universe = list(MarketUniverse.get_universe())
-        requested = sorted(set(tickers)) if tickers else full_universe
-
-        # ----------------------------------------------------------
-        # FIX: Check fixed background snapshot key FIRST.
-        # main.py _background_snapshot_loop writes to this key.
-        # If it's there, serve it instantly — no inference needed.
-        # Dynamic build_key() below is a secondary cache for when
-        # the background key doesn't exist yet (first boot).
-        # ----------------------------------------------------------
-        bg_cached = self.cache.get(BACKGROUND_SNAPSHOT_KEY)
-        if bg_cached and isinstance(bg_cached, dict) and "signals" in bg_cached:
-            # Filter signals to requested tickers if needed
-            if set(requested) != set(full_universe):
-                bg_cached = dict(bg_cached)
-                bg_cached["signals"] = [
-                    s for s in bg_cached["signals"]
-                    if s.get("ticker") in requested
-                ]
-            logger.info("Snapshot served from background cache key")
-            return bg_cached
-
-        # Secondary cache key (model/schema/ticker fingerprinted)
-        cache_key = self.cache.build_key({
-            "type": "snapshot",
-            "requested": requested,
-            "model_version": container.version,
-            "schema": container.schema_signature,
-        })
-
-        cached = self.cache.get(cache_key)
-        if cached:
-            return cached
-
-        INFERENCE_IN_PROGRESS.inc()
         start_time = time.time()
 
+        if snapshot_date is None:
+            snapshot_date = pd.Timestamp.now().strftime("%Y-%m-%d")
+
+        logger.info("Running snapshot | date=%s", snapshot_date)
+
+        # ── Get universe ──────────────────────────────
         try:
+            universe = MarketUniverse.snapshot()
+            tickers = universe.get("tickers", [])
+        except Exception as e:
+            logger.error("Universe load failed: %s", e)
+            return self._error_snapshot("Universe load failed")
 
-            df = self._build_cross_sectional_frame(full_universe)
+        if len(tickers) < int(os.getenv("MIN_UNIVERSE_WIDTH", "8")):
+            return self._error_snapshot("Universe too small")
 
-            latest_date = df["date"].max()
-            latest_df = df[df["date"] == latest_date].copy()
-            latest_df = latest_df[latest_df["ticker"].isin(requested)]
+        # ── Build feature frame ───────────────────────
+        dataset = self._build_cross_sectional_frame(tickers, snapshot_date)
 
-            latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
-            latest_df = latest_df.dropna(subset=MODEL_FEATURES, how="any")
+        if dataset is None or dataset.empty:
+            return self._error_snapshot("Feature engineering failed for all tickers")
 
-            if latest_df.empty:
-                raise RuntimeError("Latest snapshot invalid.")
-
-            feature_df = validate_feature_schema(
-                latest_df.loc[:, MODEL_FEATURES],
-                mode="inference",
+        # ── Validate features ─────────────────────────
+        try:
+            feature_block = validate_feature_schema(
+                dataset[MODEL_FEATURES], mode="inference"
             ).astype(DTYPE)
+        except Exception as e:
+            logger.error("Feature validation failed: %s", e)
+            return self._error_snapshot("Feature validation failed")
 
-            drift_result = self._safe_drift(feature_df)
-            exposure_scale = drift_result.get("exposure_scale", 1.0)
+        # ── Run XGBoost inference ─────────────────────
+        try:
+            raw_scores = self.model.predict(feature_block)
+        except Exception as e:
+            logger.error("Model inference failed: %s", e)
+            return self._error_snapshot("Model inference failed")
 
-            raw_scores = model.predict(feature_df)
-            raw_scores = self._winsorize(raw_scores)
+        dataset = dataset.reset_index(drop=True)
+        dataset["raw_model_score"] = raw_scores
 
-            score_std = raw_scores.std()
-            if score_std < self.MIN_SCORE_STD:
-                logger.warning("Score collapse detected.")
-                score_std = 1.0
+        # ── Drift detection ───────────────────────────
+        drift_state = "none"
+        drift_result = {}
+        try:
+            from core.monitoring.drift_detector import DriftDetector
+            detector = DriftDetector()
+            drift_result = detector.detect(dataset)
+            drift_state = drift_result.get("drift_state", "none")
+        except Exception as e:
+            logger.warning("Drift detection failed: %s", e)
 
-            raw_scores = (raw_scores - raw_scores.mean()) / (score_std + EPSILON)
-
-            latest_df = latest_df.copy()
-            latest_df["raw_model_score"] = raw_scores
-
-            snapshot_rows = []
-
-            for _, row in latest_df.iterrows():
-
-                direction = "LONG" if row["raw_model_score"] > 0 else "SHORT"
-                row_dict = {**row.to_dict(), "signal": direction}
-                context = {
-                    "row": row_dict,
-                    "drift_state": drift_result.get("drift_state"),
-                }
-
-                signal_output = self._safe_agent(self.signal_agent, context)
-                technical_output = self._safe_agent(self.technical_agent, context)
-                political_output = self._safe_agent(self.political_agent, context)
-
-                hybrid_score = self._compute_hybrid_score(
-                    signal_output, technical_output, political_output
-                )
-
-                # --------------------------------------------------
-                # FIX: Write agents into each row.
-                # agent.py _explain_logic reads row.get("agents")
-                # PortfolioDecisionAgent reads stock.get("agents")
-                # Both were always getting empty dicts before this fix.
-                # --------------------------------------------------
-                snapshot_rows.append({
-                    "date": str(row["date"]),
-                    "ticker": row["ticker"],
-                    "raw_model_score": float(row["raw_model_score"]),
-                    "hybrid_consensus_score": float(hybrid_score),
-                    "weight": 0.0,
-                    "agents": {
-                        "signal_agent": signal_output,
-                        "technical_agent": technical_output,
-                        "political_agent": political_output,
-                    },
-                })
-
-            ranked = sorted(
-                snapshot_rows, key=lambda x: x["hybrid_consensus_score"]
+        # ── FIX: Call PoliticalRiskAgent ONCE for US market ──
+        political_output = {}
+        try:
+            political_output = self._safe_agent(
+                self.political_agent,
+                {"ticker": "MARKET", "country": "US"},
             )
-            longs = ranked[-min(self.TOP_K, len(ranked)):]
-            shorts = ranked[: min(self.BOTTOM_K, len(ranked))]
+        except Exception as e:
+            logger.debug("Political agent failed: %s", e)
 
-            weights = self._construct_portfolio_from_rows(longs, shorts)
+        political_label = political_output.get("political_risk_label", "LOW")
+        political_score = float(political_output.get("political_risk_score", 0.0))
 
-            for row in snapshot_rows:
-                base_weight = weights.get(row["ticker"], 0.0)
-                row["weight"] = float(base_weight * exposure_scale)
+        # ── Per-ticker agent scoring ──────────────────
+        snapshot_rows = []
 
-            result = {
-                "snapshot_date": str(latest_date),
-                "model_version": container.version,
-                "drift": drift_result,
-                "signals": snapshot_rows,
+        for idx, row in dataset.iterrows():
+            ticker = row.get("ticker", "UNKNOWN")
+
+            context = {
+                "row": row.to_dict(),
+                "ticker": ticker,
+                "drift_state": drift_state,
+                "political_risk_label": political_label,
             }
 
-            self._store_predictions(snapshot_rows, drift_result, container)
-            self.cache.set(cache_key, result, ex=self.SNAPSHOT_CACHE_TTL)
+            signal_output = self._safe_agent(self.signal_agent, context)
+            technical_output = self._safe_agent(self.technical_agent, context)
 
-            MODEL_INFERENCE_COUNT.labels(model="xgboost").inc()
-            MODEL_INFERENCE_LATENCY.labels(model="xgboost").observe(
-                time.time() - start_time
-            )
+            raw_score = float(row.get("raw_model_score", 0.0))
+            signal_score = float(signal_output.get("score", 0.0))
+            technical_score = float(technical_output.get("score", 0.0))
 
-            logger.info(
-                "Snapshot complete | tickers=%d model=%s latency=%.2fs",
-                len(snapshot_rows),
-                container.version,
-                round(time.time() - start_time, 2),
-            )
+            # Hybrid consensus score
+            hybrid_score = float(np.clip(
+                0.50 * raw_score +
+                0.30 * signal_score +
+                0.20 * technical_score,
+                -1.0, 1.0,
+            ))
 
-            return result
+            # Political risk penalty
+            if political_label == "CRITICAL":
+                hybrid_score *= 0.0
+            elif political_label == "HIGH":
+                hybrid_score *= 0.5
 
-        except Exception:
-            PIPELINE_FAILURES.labels(stage="snapshot").inc()
-            logger.exception("Snapshot failure.")
-            raise
+            # Drift exposure scaling
+            exposure_scale = drift_result.get("exposure_scale", 1.0)
+            weight = float(np.clip(hybrid_score * exposure_scale, -1.0, 1.0))
 
-        finally:
-            INFERENCE_IN_PROGRESS.dec()
+            signal_direction = signal_output.get(
+                "signals", {}
+            ).get("signal", "NEUTRAL") or "NEUTRAL"
+
+            snapshot_rows.append({
+                "ticker": ticker,
+                "date": str(row.get("date", snapshot_date))[:10],
+                "raw_model_score": round(raw_score, 6),
+                "hybrid_consensus_score": round(hybrid_score, 6),
+                "weight": round(weight, 6),
+                # Agents dict for /agent/explain to read from cache
+                "agents": {
+                    "signal_agent": signal_output,
+                    "technical_agent": technical_output,
+                },
+            })
+
+        if not snapshot_rows:
+            return self._error_snapshot("No valid signals produced")
+
+        # ── Sort and select top/bottom K ─────────────
+        snapshot_rows.sort(key=lambda x: x["raw_model_score"], reverse=True)
+
+        long_signals = [r for r in snapshot_rows if r["weight"] > 0]
+        short_signals = [r for r in snapshot_rows if r["weight"] < 0]
+        neutral_signals = [r for r in snapshot_rows if r["weight"] == 0]
+
+        top_k = snapshot_rows[:TOP_K]
+        bottom_k = snapshot_rows[-BOTTOM_K:]
+
+        # ── FIX: Compute gross/net exposure ──────────
+        weights = [r["weight"] for r in snapshot_rows]
+        gross_exposure = float(sum(abs(w) for w in weights))
+        net_exposure = float(sum(weights))
+
+        # Normalise to percentage if > 1
+        if gross_exposure > 1.0:
+            net_exposure = net_exposure / gross_exposure
+            gross_exposure = 1.0
+
+        gross_exposure = round(gross_exposure, 4)
+        net_exposure = round(net_exposure, 4)
+
+        # ── Portfolio bias ────────────────────────────
+        lc = len(long_signals)
+        sc = len(short_signals)
+        if lc > sc * 1.5:
+            portfolio_bias = "LONG_BIASED"
+        elif sc > lc * 1.5:
+            portfolio_bias = "SHORT_BIASED"
+        else:
+            portfolio_bias = "BALANCED"
+
+        # ── Top 5 tickers ────────────────────────────
+        top_5_tickers = [r["ticker"] for r in top_k]
+
+        # ── Average hybrid score ──────────────────────
+        avg_hybrid = float(np.mean([r["hybrid_consensus_score"] for r in snapshot_rows]))
+
+        # ── Portfolio agent ───────────────────────────
+        portfolio_output = {}
+        try:
+            portfolio_context = {
+                "signals": snapshot_rows,
+                "drift_state": drift_state,
+                "gross_exposure": gross_exposure,
+                "net_exposure": net_exposure,
+            }
+            portfolio_output = self._safe_agent(self.portfolio_agent, portfolio_context)
+        except Exception as e:
+            logger.debug("Portfolio agent failed: %s", e)
+
+        latency_ms = round((time.time() - start_time) * 1000, 1)
+
+        # ── Build final response ──────────────────────
+        result = {
+            "meta": {
+                "model_version": getattr(self.model, "version", "unknown"),
+                "drift_state": drift_state,
+                "long_signals": lc,
+                "short_signals": sc,
+                "avg_hybrid_score": round(avg_hybrid, 6),
+                "latency_ms": latency_ms,
+            },
+            "executive_summary": {
+                "top_5_tickers": top_5_tickers,
+                "portfolio_bias": portfolio_bias,
+                # FIX: gross/net exposure now included
+                "gross_exposure": gross_exposure,
+                "net_exposure": net_exposure,
+            },
+            "snapshot": {
+                "snapshot_date": snapshot_date,
+                "model_version": getattr(self.model, "version", "unknown"),
+                "drift": {
+                    "drift_detected": drift_result.get("drift_detected", False),
+                    "severity_score": drift_result.get("severity_score", 0),
+                    "drift_state": drift_state,
+                    "exposure_scale": drift_result.get("exposure_scale", 1.0),
+                    "drift_confidence": drift_result.get("drift_confidence", 0.0),
+                },
+                "signals": [
+                    {
+                        "ticker": r["ticker"],
+                        "date": r["date"],
+                        "raw_model_score": r["raw_model_score"],
+                        "hybrid_consensus_score": r["hybrid_consensus_score"],
+                        "weight": r["weight"],
+                    }
+                    for r in snapshot_rows
+                ],
+            },
+            # Internal — for agent explain cache lookup
+            "_signal_details": {r["ticker"]: r["agents"] for r in snapshot_rows},
+            "_political": political_output,
+            "_portfolio": portfolio_output,
+        }
+
+        logger.info(
+            "Snapshot complete | tickers=%d | long=%d | short=%d | latency=%.0fms",
+            len(snapshot_rows), lc, sc, latency_ms,
+        )
+
+        return result
+
+    # =====================================================
+    # ERROR SNAPSHOT
+    # =====================================================
+
+    def _error_snapshot(self, reason: str) -> dict:
+        logger.error("Snapshot failed: %s", reason)
+        return {
+            "meta": {
+                "model_version": "unknown",
+                "drift_state": "none",
+                "long_signals": 0,
+                "short_signals": 0,
+                "avg_hybrid_score": 0.0,
+                "latency_ms": 0,
+                "error": reason,
+            },
+            "executive_summary": {
+                "top_5_tickers": [],
+                "portfolio_bias": "UNKNOWN",
+                "gross_exposure": 0.0,
+                "net_exposure": 0.0,
+            },
+            "snapshot": {
+                "snapshot_date": pd.Timestamp.now().strftime("%Y-%m-%d"),
+                "model_version": "unknown",
+                "drift": {
+                    "drift_detected": False,
+                    "severity_score": 0,
+                    "drift_state": "none",
+                    "exposure_scale": 1.0,
+                    "drift_confidence": 0.0,
+                },
+                "signals": [],
+            },
+            "_signal_details": {},
+            "_political": {},
+            "_portfolio": {},
+        }

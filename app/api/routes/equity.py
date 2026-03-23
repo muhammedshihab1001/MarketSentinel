@@ -1,18 +1,27 @@
 # =========================================================
-# EQUITY ROUTE v2.3
-# FIX: pass start_date/end_date to get_price_data
-#      MarketDataService requires these as positional args
+# EQUITY ROUTE v2.4
+#
+# Changes from v2.3:
+# FIX 1: get_price_data() result is a DataFrame with a
+#         reset integer index after _validate_dataset.
+#         Reading latest.name gives RangeIndex (integer),
+#         not a date string. Fix: read row["date"] column.
+# FIX 2: /equity/{ticker}/history response aligns to the
+#         EquityHistoryResponse type in frontend types/index.ts
+# FIX 3: Safe NaN handling before JSON serialisation —
+#         np.nan is not JSON-serialisable.
 # =========================================================
 
 import time
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException
-from fastapi.concurrency import run_in_threadpool
+from datetime import datetime, timedelta
 
-from core.market.universe import MarketUniverse
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse
+
 from core.data.market_data_service import MarketDataService
+from core.db.engine import get_session
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
@@ -24,174 +33,204 @@ logger = get_logger("marketsentinel.equity")
 
 router = APIRouter()
 
+DEFAULT_HISTORY_DAYS = 90
+MAX_HISTORY_DAYS = 730
 
-def _date_window(days: int):
-    end = pd.Timestamp.now(tz="UTC")
-    start = end - pd.Timedelta(days=days + 30)
-    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+def _safe_float(val, default=0.0) -> float:
+    """Convert to float, replacing NaN/Inf with default."""
+    try:
+        v = float(val)
+        return default if not np.isfinite(v) else v
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_str(val, default="") -> str:
+    """Convert date-like value to YYYY-MM-DD string."""
+    if val is None:
+        return default
+    if isinstance(val, (pd.Timestamp, datetime)):
+        return val.strftime("%Y-%m-%d")
+    s = str(val)
+    return s[:10] if len(s) >= 10 else s
 
 
 # =========================================================
-# EQUITY DETAIL ENDPOINT
+# GET /equity/{ticker}
+# Latest OHLCV + returns + volatility
 # =========================================================
 
 @router.get("/equity/{ticker}")
-async def equity_detail(ticker: str):
-
+def get_equity(ticker: str):
+    """
+    Returns the latest OHLCV row plus calculated returns and
+    volatility for a single ticker.
+    """
     endpoint = f"/equity/{ticker}"
-    API_REQUEST_COUNT.labels(endpoint="/equity").inc()
+    API_REQUEST_COUNT.labels(endpoint="/equity/ticker").inc()
     start_time = time.time()
 
     ticker = ticker.upper().strip()
 
     try:
-        universe = MarketUniverse.snapshot()
-        valid_tickers = set(universe.get("tickers", []))
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
 
-        if ticker not in valid_tickers:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Ticker '{ticker}' not in universe",
-            )
+        svc = MarketDataService(session_factory=get_session)
 
-        def _fetch():
-            svc = MarketDataService()
-            start_date, end_date = _date_window(30)
-            return svc.get_price_data(
-                ticker,
-                start_date=start_date,
-                end_date=end_date,
-                interval="1d",
-                min_history=30,
-            )
-
-        df = await run_in_threadpool(_fetch)
+        df = svc.get_price_data(
+            ticker,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         if df is None or df.empty:
-            raise HTTPException(
-                status_code=503,
-                detail=f"No price data available for {ticker}",
-            )
+            raise HTTPException(status_code=404, detail=f"No data found for {ticker}")
 
+        # FIX: After reset_index(drop=True) the index is RangeIndex.
+        # Read date from the "date" column, not from index.
         latest = df.iloc[-1]
 
-        def _get(row, *keys):
-            for k in keys:
-                if k in row.index:
-                    return row[k]
-            return np.nan
+        # Safe date extraction
+        if "date" in df.columns:
+            date_val = latest["date"]
+        else:
+            date_val = df.index[-1]
 
-        ohlcv = {
-            "date": str(latest.name.date()) if hasattr(latest.name, "date") else str(latest.name),
-            "open": round(float(_get(latest, "open", "Open")), 4),
-            "high": round(float(_get(latest, "high", "High")), 4),
-            "low": round(float(_get(latest, "low", "Low")), 4),
-            "close": round(float(_get(latest, "close", "Close")), 4),
-            "volume": int(_get(latest, "volume", "Volume") or 0),
-        }
+        date_str = _safe_str(date_val)
 
-        close_col = "close" if "close" in df.columns else "Close"
-        returns = {}
-
+        # 5-day return
+        ret_5d = 0.0
         if len(df) >= 6:
-            returns["5d_return"] = round(float(df[close_col].iloc[-1] / df[close_col].iloc[-6] - 1), 6)
+            price_now = _safe_float(latest.get("close", latest.get("adj_close")))
+            price_5d = _safe_float(
+                df.iloc[-6].get("close", df.iloc[-6].get("adj_close"))
+            )
+            if price_5d > 0:
+                ret_5d = (price_now - price_5d) / price_5d
+
+        # 20-day return
+        ret_20d = 0.0
         if len(df) >= 21:
-            returns["20d_return"] = round(float(df[close_col].iloc[-1] / df[close_col].iloc[-21] - 1), 6)
-            log_rets = np.log(df[close_col] / df[close_col].shift(1)).dropna()
-            returns["volatility_20d_ann"] = round(float(log_rets.tail(20).std() * np.sqrt(252)), 6)
+            price_now = _safe_float(latest.get("close", latest.get("adj_close")))
+            price_20d = _safe_float(
+                df.iloc[-21].get("close", df.iloc[-21].get("adj_close"))
+            )
+            if price_20d > 0:
+                ret_20d = (price_now - price_20d) / price_20d
+
+        # 20-day annualised volatility
+        vol_20d = 0.0
+        if len(df) >= 21:
+            close_col = "close" if "close" in df.columns else "adj_close"
+            closes = df[close_col].iloc[-21:].astype(float)
+            daily_returns = closes.pct_change().dropna()
+            if len(daily_returns) > 1:
+                vol_20d = float(daily_returns.std() * np.sqrt(252))
+                if not np.isfinite(vol_20d):
+                    vol_20d = 0.0
 
         return {
             "ticker": ticker,
-            "ohlcv": ohlcv,
-            "returns": returns,
+            "ohlcv": {
+                "date": date_str,
+                "open": _safe_float(latest.get("open")),
+                "high": _safe_float(latest.get("high")),
+                "low": _safe_float(latest.get("low")),
+                "close": _safe_float(latest.get("close", latest.get("adj_close"))),
+                "volume": int(_safe_float(latest.get("volume"), 0)),
+            },
+            "returns": {
+                "5d_return": round(ret_5d, 6),
+                "20d_return": round(ret_20d, 6),
+                "volatility_20d_ann": round(vol_20d, 6),
+            },
             "data_source": "postgresql",
             "rows_available": len(df),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     except HTTPException:
         raise
-
     except Exception as e:
-        API_ERROR_COUNT.labels(endpoint="/equity").inc()
-        logger.exception("Equity endpoint failure | ticker=%s", ticker)
+        API_ERROR_COUNT.labels(endpoint="/equity/ticker").inc()
+        logger.exception("Equity detail failed | ticker=%s", ticker)
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        API_LATENCY.labels(endpoint="/equity").observe(time.time() - start_time)
+        API_LATENCY.labels(endpoint="/equity/ticker").observe(
+            time.time() - start_time
+        )
 
 
 # =========================================================
-# EQUITY HISTORY ENDPOINT
+# GET /equity/{ticker}/history
+# OHLCV history array
 # =========================================================
 
 @router.get("/equity/{ticker}/history")
-async def equity_history(ticker: str, days: int = 90):
-
-    endpoint = "/equity/history"
+def get_equity_history(
+    ticker: str,
+    days: int = Query(default=DEFAULT_HISTORY_DAYS, ge=1, le=MAX_HISTORY_DAYS),
+):
+    """
+    Returns historical OHLCV rows for a ticker.
+    Default: 90 days. Max: 730 days.
+    """
+    endpoint = "/equity/ticker/history"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
 
     ticker = ticker.upper().strip()
-    days = max(5, min(days, 500))
 
     try:
-        universe = MarketUniverse.snapshot()
-        valid_tickers = set(universe.get("tickers", []))
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
 
-        if ticker not in valid_tickers:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Ticker '{ticker}' not in universe",
-            )
+        svc = MarketDataService(session_factory=get_session)
 
-        def _fetch():
-            svc = MarketDataService()
-            start_date, end_date = _date_window(days)
-            return svc.get_price_data(
-                ticker,
-                start_date=start_date,
-                end_date=end_date,
-                interval="1d",
-                min_history=days,
-            )
-
-        df = await run_in_threadpool(_fetch)
+        df = svc.get_price_data(
+            ticker,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         if df is None or df.empty:
-            raise HTTPException(
-                status_code=503,
-                detail=f"No price data available for {ticker}",
-            )
+            raise HTTPException(status_code=404, detail=f"No data found for {ticker}")
 
+        # Trim to requested days
         df = df.tail(days)
 
-        records = []
-        for dt, row in df.iterrows():
-            records.append({
-                "date": str(dt.date()) if hasattr(dt, "date") else str(dt),
-                "open": round(float(row.get("open", row.get("Open", np.nan))), 4),
-                "high": round(float(row.get("high", row.get("High", np.nan))), 4),
-                "low": round(float(row.get("low", row.get("Low", np.nan))), 4),
-                "close": round(float(row.get("close", row.get("Close", np.nan))), 4),
-                "volume": int(row.get("volume", row.get("Volume", 0))),
+        history = []
+        for _, row in df.iterrows():
+            # FIX: Read date from column, not from index
+            if "date" in df.columns:
+                date_val = row["date"]
+            else:
+                date_val = row.name
+
+            history.append({
+                "date": _safe_str(date_val),
+                "open": _safe_float(row.get("open")),
+                "high": _safe_float(row.get("high")),
+                "low": _safe_float(row.get("low")),
+                "close": _safe_float(row.get("close", row.get("adj_close"))),
+                "volume": int(_safe_float(row.get("volume"), 0)),
             })
 
         return {
             "ticker": ticker,
             "days_requested": days,
-            "rows_returned": len(records),
+            "rows_returned": len(history),
             "data_source": "postgresql",
-            "history": records,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "history": history,
         }
 
     except HTTPException:
         raise
-
     except Exception as e:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.exception("Equity history failure | ticker=%s", ticker)
+        logger.exception("Equity history failed | ticker=%s", ticker)
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
