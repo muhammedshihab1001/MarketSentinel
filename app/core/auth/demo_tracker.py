@@ -1,5 +1,9 @@
 # =========================================================
-# DEMO TRACKER
+# DEMO TRACKER v1.3
+# FIX: Wrap every _redis call in try/except — fail-open
+#      when Redis is down so API doesn't crash.
+# FIX: Removed bare _redis attribute access — all ops go
+#      through safe helper methods with fallback returns.
 # Tracks demo user feature usage in Redis.
 # IP + fingerprint keyed, 7-day TTL, survives logout/login.
 # =========================================================
@@ -7,251 +11,260 @@
 import os
 import time
 import hashlib
-from typing import Dict, Optional
-
-from app.inference.cache import RedisCache
-from core.logging.logger import get_logger
-
-logger = get_logger("marketsentinel.demo_tracker")
-
-# =========================================================
-# CONFIG
-# =========================================================
+from typing import Optional
 
 DEMO_REQUESTS_PER_FEATURE = int(os.getenv("DEMO_REQUESTS_PER_FEATURE", "3"))
 DEMO_BLOCK_DAYS = int(os.getenv("DEMO_BLOCK_DAYS", "7"))
-DEMO_BLOCK_SECONDS = DEMO_BLOCK_DAYS * 86400
+DEMO_TTL_SECONDS = DEMO_BLOCK_DAYS * 86400
 
-# Feature groups — maps endpoint paths to feature group names
-# Any endpoint not listed here is NOT counted (health, docs, metrics, etc.)
-FEATURE_GROUPS = {
-    "/snapshot": "snapshot",
-    "/predict/live-snapshot": "snapshot",
-    "/predict/signal-explanation": "signals",
-    "/portfolio": "portfolio",
-    "/portfolio-summary": "portfolio",
-    "/drift": "drift",
-    "/drift-status": "drift",
-    "/agent/explain": "agent",
-    "/performance": "performance",
-    "/equity": "equity",
-    "/predict/price-history": "equity",
-}
-
-ALL_FEATURES = list(set(FEATURE_GROUPS.values()))
-
-
-# =========================================================
-# IP HASHING
-# =========================================================
-
-def hash_ip(ip: str, fingerprint: str = "") -> str:
-    """
-    Hash IP + fingerprint into a stable anonymous key.
-    Never stores the raw IP address.
-    """
-    raw = f"{ip}:{fingerprint}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:32]
-
-
-def fingerprint_from_headers(user_agent: str, accept_language: str = "") -> str:
-    """
-    Create a simple browser fingerprint from request headers.
-    Not foolproof but catches most casual VPN resets.
-    """
-    raw = f"{user_agent}:{accept_language}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-
-# =========================================================
-# DEMO TRACKER CLASS
-# =========================================================
 
 class DemoTracker:
+    """
+    Tracks per-feature demo usage in Redis.
 
-    def __init__(self):
-        self._cache = RedisCache()
+    Keys:
+        demo:usage:{fingerprint}:{feature}  → integer counter
+        demo:reg:{fingerprint}              → registration timestamp
 
-    def _key(self, ip_hash: str, feature: str) -> str:
-        return f"demo:{ip_hash}:feature:{feature}"
+    All operations fail-open: if Redis is unavailable,
+    usage is not tracked and requests are allowed through.
+    This prevents Redis downtime from breaking the demo flow.
+    """
 
-    def _blocked_key(self, ip_hash: str) -> str:
-        return f"demo:{ip_hash}:blocked_until"
+    KEY_PREFIX = "demo:usage"
+    REG_PREFIX = "demo:reg"
 
-    def _first_visit_key(self, ip_hash: str) -> str:
-        return f"demo:{ip_hash}:first_visit"
+    def __init__(self, cache=None):
+        self._cache = cache
+        self._redis = None
 
-    # =========================================================
-    # CORE OPERATIONS
-    # =========================================================
-
-    def get_usage(self, ip_hash: str) -> Dict[str, int]:
-        """
-        Get current usage counts for all feature groups.
-        Returns dict like {"snapshot": 2, "portfolio": 0, ...}
-        """
-
-        usage = {}
-
-        for feature in ALL_FEATURES:
-            key = self._key(ip_hash, feature)
+        if cache is not None:
             try:
-                raw = self._cache._redis.get(key)
-                usage[feature] = int(raw) if raw else 0
+                self._redis = cache._redis
             except Exception:
-                usage[feature] = 0
+                self._redis = None
 
-        return usage
+    # =====================================================
+    # FINGERPRINT
+    # =====================================================
 
-    def increment(self, ip_hash: str, feature: str) -> int:
+    @staticmethod
+    def build_fingerprint(ip: str, user_agent: str = "") -> str:
         """
-        Increment usage counter for a feature group.
-        Returns the new count after increment.
-        Sets TTL to DEMO_BLOCK_SECONDS if not already set.
+        Build a stable fingerprint from IP + User-Agent.
+        Survives logout/login — tied to the browser/client.
         """
+        raw = f"{ip}:{user_agent}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
-        if feature not in ALL_FEATURES:
-            return 0
+    # =====================================================
+    # KEY BUILDERS
+    # =====================================================
 
-        key = self._key(ip_hash, feature)
+    def _usage_key(self, fingerprint: str, feature: str) -> str:
+        return f"{self.KEY_PREFIX}:{fingerprint}:{feature}"
 
+    def _reg_key(self, fingerprint: str) -> str:
+        return f"{self.REG_PREFIX}:{fingerprint}"
+
+    # =====================================================
+    # SAFE REDIS HELPERS
+    # All operations wrapped in try/except — fail-open.
+    # =====================================================
+
+    def _safe_incr(self, key: str) -> Optional[int]:
+        """Increment key, return new value or None on failure."""
+        if self._redis is None:
+            return None
         try:
-            new_count = self._cache._redis.incr(key)
+            return self._redis.incr(key)
+        except Exception:
+            return None
 
-            # Set TTL on first use
-            if new_count == 1:
-                self._cache._redis.expire(key, DEMO_BLOCK_SECONDS)
-                self._set_first_visit(ip_hash)
-
-            logger.info(
-                "Demo usage | ip=%s... feature=%s count=%d/%d",
-                ip_hash[:8],
-                feature,
-                new_count,
-                DEMO_REQUESTS_PER_FEATURE,
-            )
-
-            return new_count
-
-        except Exception as e:
-            logger.warning("Demo tracker increment failed | %s", str(e))
-            return 0
-
-    def is_feature_locked(self, ip_hash: str, feature: str) -> bool:
-        """Returns True if this IP has exhausted their tries for this feature."""
-
-        key = self._key(ip_hash, feature)
-
+    def _safe_expire(self, key: str, ttl: int) -> bool:
+        """Set TTL on key, return True on success."""
+        if self._redis is None:
+            return False
         try:
-            raw = self._cache._redis.get(key)
-            count = int(raw) if raw else 0
-            return count >= DEMO_REQUESTS_PER_FEATURE
+            self._redis.expire(key, ttl)
+            return True
         except Exception:
             return False
 
-    def is_fully_locked(self, ip_hash: str) -> bool:
-        """Returns True if ALL features are exhausted."""
-
-        for feature in ALL_FEATURES:
-            if not self.is_feature_locked(ip_hash, feature):
-                return False
-        return True
-
-    def get_remaining(self, ip_hash: str, feature: str) -> int:
-        """Returns how many requests remain for a feature (0 = locked)."""
-
-        key = self._key(ip_hash, feature)
-
+    def _safe_get(self, key: str) -> Optional[str]:
+        """Get string value of key, return None on failure."""
+        if self._redis is None:
+            return None
         try:
-            raw = self._cache._redis.get(key)
-            count = int(raw) if raw else 0
-            return max(0, DEMO_REQUESTS_PER_FEATURE - count)
-        except Exception:
-            return DEMO_REQUESTS_PER_FEATURE
-
-    def get_reset_in_seconds(self, ip_hash: str) -> int:
-        """
-        Returns seconds until the first feature key expires (TTL).
-        This is when the demo resets.
-        """
-
-        min_ttl = DEMO_BLOCK_SECONDS
-
-        for feature in ALL_FEATURES:
-            key = self._key(ip_hash, feature)
-            try:
-                raw = self._cache._redis.get(key)
-                if raw and int(raw) > 0:
-                    ttl = self._cache._redis.ttl(key)
-                    if ttl > 0:
-                        min_ttl = min(min_ttl, ttl)
-            except Exception:
-                pass
-
-        return min_ttl
-
-    def get_full_status(self, ip_hash: str) -> dict:
-        """
-        Returns complete demo status for the frontend.
-        Used by GET /auth/me and the demo profile page.
-        """
-
-        usage = self.get_usage(ip_hash)
-
-        features_status = {}
-        for feature in ALL_FEATURES:
-            count = usage.get(feature, 0)
-            features_status[feature] = {
-                "used": count,
-                "limit": DEMO_REQUESTS_PER_FEATURE,
-                "remaining": max(0, DEMO_REQUESTS_PER_FEATURE - count),
-                "locked": count >= DEMO_REQUESTS_PER_FEATURE,
-            }
-
-        return {
-            "ip_hash": ip_hash[:8] + "...",
-            "features": features_status,
-            "fully_locked": self.is_fully_locked(ip_hash),
-            "reset_in_seconds": self.get_reset_in_seconds(ip_hash),
-            "limit_per_feature": DEMO_REQUESTS_PER_FEATURE,
-            "block_days": DEMO_BLOCK_DAYS,
-        }
-
-    def get_feature_for_path(self, path: str) -> Optional[str]:
-        """
-        Maps a request path to a feature group name.
-        Returns None if the path is not a counted endpoint.
-        """
-
-        # Exact match first
-        if path in FEATURE_GROUPS:
-            return FEATURE_GROUPS[path]
-
-        # Prefix match for dynamic routes like /equity/AAPL
-        for prefix, feature in FEATURE_GROUPS.items():
-            if path.startswith(prefix):
-                return feature
-
-        return None
-
-    def _set_first_visit(self, ip_hash: str):
-        """Records first visit timestamp — used for demo page greeting."""
-
-        key = self._first_visit_key(ip_hash)
-
-        try:
-            if not self._cache._redis.exists(key):
-                self._cache._redis.setex(key, DEMO_BLOCK_SECONDS, str(int(time.time())))
-        except Exception:
-            pass
-
-    def get_first_visit(self, ip_hash: str) -> Optional[int]:
-        """Returns first visit timestamp or None."""
-
-        key = self._first_visit_key(ip_hash)
-
-        try:
-            raw = self._cache._redis.get(key)
-            return int(raw) if raw else None
+            val = self._redis.get(key)
+            return val.decode() if isinstance(val, bytes) else val
         except Exception:
             return None
+
+    def _safe_set(self, key: str, value: str, ex: int) -> bool:
+        """Set key with expiry, return True on success."""
+        if self._redis is None:
+            return False
+        try:
+            self._redis.set(key, value, ex=ex)
+            return True
+        except Exception:
+            return False
+
+    def _safe_ttl(self, key: str) -> int:
+        """Return TTL of key in seconds, -1 on failure."""
+        if self._redis is None:
+            return -1
+        try:
+            return self._redis.ttl(key)
+        except Exception:
+            return -1
+
+    def _safe_exists(self, key: str) -> bool:
+        """Return True if key exists, False on failure."""
+        if self._redis is None:
+            return False
+        try:
+            return bool(self._redis.exists(key))
+        except Exception:
+            return False
+
+    # =====================================================
+    # REGISTRATION
+    # =====================================================
+
+    def register(self, fingerprint: str) -> bool:
+        """
+        Register a new demo session fingerprint.
+        Sets a 7-day TTL on the registration key.
+        Returns True if registered, False if already registered or Redis down.
+        """
+        key = self._reg_key(fingerprint)
+
+        if self._safe_exists(key):
+            return False
+
+        return self._safe_set(key, str(int(time.time())), ex=DEMO_TTL_SECONDS)
+
+    def is_registered(self, fingerprint: str) -> bool:
+        """Return True if this fingerprint has an active demo session."""
+        return self._safe_exists(self._reg_key(fingerprint))
+
+    # =====================================================
+    # USAGE TRACKING
+    # =====================================================
+
+    def increment(self, fingerprint: str, feature: str) -> int:
+        """
+        Increment usage counter for (fingerprint, feature).
+        Returns new count, or 0 if Redis is unavailable (fail-open).
+        On first increment, sets a 7-day TTL.
+        """
+        key = _usage_key = self._usage_key(fingerprint, feature)
+
+        new_count = self._safe_incr(key)
+
+        if new_count is None:
+            # Redis down — fail open, don't block the request
+            return 0
+
+        if new_count == 1:
+            # First use — set expiry
+            self._safe_expire(key, DEMO_TTL_SECONDS)
+
+        return new_count
+
+    def get_count(self, fingerprint: str, feature: str) -> int:
+        """Return current usage count for (fingerprint, feature)."""
+        val = self._safe_get(self._usage_key(fingerprint, feature))
+        try:
+            return int(val) if val is not None else 0
+        except (ValueError, TypeError):
+            return 0
+
+    def is_locked(self, fingerprint: str, feature: str) -> bool:
+        """
+        Return True if this feature is exhausted for this fingerprint.
+        Fails open — returns False (not locked) if Redis is down.
+        """
+        count = self.get_count(fingerprint, feature)
+        return count >= DEMO_REQUESTS_PER_FEATURE
+
+    # =====================================================
+    # USAGE SUMMARY
+    # =====================================================
+
+    def get_usage_summary(
+        self,
+        fingerprint: str,
+        features: list,
+    ) -> dict:
+        """
+        Return usage summary for all tracked features.
+        Used by GET /auth/me to populate the demo usage block.
+
+        Returns:
+            {
+                "features": {
+                    "snapshot": { "used": 2, "limit": 3, "remaining": 1, "locked": False },
+                    ...
+                },
+                "fully_locked": False,
+                "reset_in_seconds": 604800,
+                "limit_per_feature": 3,
+            }
+        """
+        result = {}
+        any_unlocked = False
+
+        for feature in features:
+            used = self.get_count(fingerprint, feature)
+            remaining = max(0, DEMO_REQUESTS_PER_FEATURE - used)
+            locked = used >= DEMO_REQUESTS_PER_FEATURE
+
+            result[feature] = {
+                "used": used,
+                "limit": DEMO_REQUESTS_PER_FEATURE,
+                "remaining": remaining,
+                "locked": locked,
+            }
+
+            if not locked:
+                any_unlocked = True
+
+        # Reset time = TTL of the registration key
+        reset_in_seconds = self._safe_ttl(self._reg_key(fingerprint))
+        if reset_in_seconds < 0:
+            reset_in_seconds = DEMO_TTL_SECONDS
+
+        fully_locked = not any_unlocked and len(features) > 0
+
+        return {
+            "features": result,
+            "fully_locked": fully_locked,
+            "reset_in_seconds": max(0, reset_in_seconds),
+            "limit_per_feature": DEMO_REQUESTS_PER_FEATURE,
+        }
+
+    # =====================================================
+    # RESET (owner tool)
+    # =====================================================
+
+    def reset_fingerprint(self, fingerprint: str, features: list) -> bool:
+        """
+        Reset all usage counters for a fingerprint.
+        Called by owner to manually unlock a demo session.
+        """
+        if self._redis is None:
+            return False
+
+        try:
+            keys = [self._usage_key(fingerprint, f) for f in features]
+            keys.append(self._reg_key(fingerprint))
+            pipe = self._redis.pipeline()
+            for k in keys:
+                pipe.delete(k)
+            pipe.execute()
+            return True
+        except Exception:
+            return False

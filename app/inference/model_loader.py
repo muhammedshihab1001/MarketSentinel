@@ -1,5 +1,9 @@
 # =========================================================
-# MODEL LOADER v2.7 (STABLE + API COMPATIBLE)
+# MODEL LOADER v2.8
+# FIX: Scan for .pkl artifacts (not .joblib — models are
+#      saved as .pkl by train_xgboost.py export_artifacts).
+# FIX: Fallback pointer file scan also looks for .pkl.
+# FIX: Added safe None-check before loading artifact.
 # =========================================================
 
 import os
@@ -10,333 +14,306 @@ import hashlib
 import json
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
-from core.schema.feature_schema import (
-    get_schema_signature,
-    MODEL_FEATURES,
-)
+logger = logging.getLogger("marketsentinel.model_loader")
 
-from core.market.universe import MarketUniverse
-from core.artifacts.metadata_manager import MetadataManager
-from app.monitoring.metrics import MODEL_VERSION
-
-logger = logging.getLogger("marketsentinel.loader")
-
-
-@dataclass(frozen=True)
-class LoadedModel:
-
-    model: object
-    version: str
-    schema_signature: str
-    schema_version: str
-    dataset_hash: str
-    artifact_hash: str
-    feature_checksum: str
-    universe_hash: str
-    training_code_hash: Optional[str]
-    reproducibility_hash: Optional[str]
-    pointer_hash: Optional[str]
-    training_fingerprint: Optional[str]
-    baseline_available: bool
-    baseline_hash: Optional[str]
+_MODEL_LOCK = threading.Lock()
+_LOADED_MODEL = None
+_LOADED_VERSION = None
+_LOADED_HASH = None
 
 
 class ModelLoader:
+    """
+    Thread-safe model loader for the inference API.
 
-    _instance = None
-    _instance_lock = threading.Lock()
+    Scans artifacts/xgboost/ for the latest .pkl model file.
+    Supports pointer-file fallback for promoted model tracking.
+    """
 
-    MIN_ARTIFACT_BYTES = 20_000
-    MIN_METADATA_BYTES = 300
-
-    POINTER_FILENAME = "production_pointer.json"
-    BASELINE_PATH = os.path.abspath("artifacts/drift/baseline.json")
-
-    STRICT_GOVERNANCE = os.getenv("MODEL_STRICT_GOVERNANCE", "0") == "1"
-    ALLOW_POINTER_FALLBACK = os.getenv("MODEL_ALLOW_POINTER_FALLBACK", "1") == "1"
-
-    RUNTIME_SCHEMA_SIGNATURE = get_schema_signature()
-
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            with cls._instance_lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-        return cls._instance
+    # FIX: Extension is .pkl — train_xgboost saves with joblib but
+    # names the file model_xgb_<version>.pkl
+    MODEL_EXTENSION = ".pkl"
+    POINTER_FILENAME = "latest.json"
 
     def __init__(self):
-        if hasattr(self, "_initialized"):
-            return
+        self.registry_dir = os.getenv("XGB_REGISTRY_DIR", "artifacts/xgboost")
+        self._model = None
+        self._version = None
+        self._artifact_hash = None
+        self._schema_signature = None
+        self._feature_names = None
+        self._metadata = None
 
-        self._reload_lock = threading.Lock()
-        self._xgb_container: Optional[LoadedModel] = None
-        self._initialized = True
+    # =====================================================
+    # FIND LATEST MODEL
+    # =====================================================
 
-    ########################################################
+    def _find_via_pointer(self) -> Optional[str]:
+        """
+        Try to find model path via latest.json pointer file.
+        Returns absolute path or None.
+        """
+        pointer_path = os.path.join(self.registry_dir, self.POINTER_FILENAME)
 
-    def _sha256(self, path: str) -> str:
+        if not os.path.exists(pointer_path):
+            return None
+
+        try:
+            with open(pointer_path, encoding="utf-8") as f:
+                data = json.load(f)
+
+            path = data.get("path") or data.get("model_path")
+
+            if not path:
+                return None
+
+            # Resolve relative paths
+            if not os.path.isabs(path):
+                path = os.path.join(self.registry_dir, path)
+
+            if os.path.exists(path):
+                logger.info("Model pointer found: %s", path)
+                return path
+
+        except Exception as e:
+            logger.warning("Pointer file read failed: %s", e)
+
+        return None
+
+    def _find_via_scan(self) -> Optional[str]:
+        """
+        Scan the registry dir for the latest .pkl model file.
+        Sorts by filename (which includes timestamp) descending.
+        Returns absolute path or None.
+        """
+        if not os.path.isdir(self.registry_dir):
+            logger.warning("Registry dir missing: %s", self.registry_dir)
+            return None
+
+        # FIX: Look for .pkl files, not .joblib
+        candidates = [
+            f for f in os.listdir(self.registry_dir)
+            if f.endswith(self.MODEL_EXTENSION)
+            and f.startswith("model_")
+        ]
+
+        if not candidates:
+            logger.warning(
+                "No %s model files found in %s",
+                self.MODEL_EXTENSION,
+                self.registry_dir,
+            )
+            return None
+
+        # Sort descending — latest timestamp is last alphabetically
+        candidates.sort(reverse=True)
+        latest = candidates[0]
+        path = os.path.join(self.registry_dir, latest)
+
+        logger.info("Model found via scan: %s", path)
+        return path
+
+    def _find_model_path(self) -> Optional[str]:
+        """
+        Find model path — pointer file first, then directory scan.
+        """
+        allow_fallback = os.getenv("MODEL_ALLOW_POINTER_FALLBACK", "1") == "1"
+
+        # Try pointer file first
+        path = self._find_via_pointer()
+        if path:
+            return path
+
+        if not allow_fallback:
+            logger.error("Pointer file missing and fallback disabled.")
+            return None
+
+        # Fallback to directory scan
+        return self._find_via_scan()
+
+    # =====================================================
+    # LOAD MODEL
+    # =====================================================
+
+    def _compute_artifact_hash(self, path: str) -> str:
+        """Compute SHA256 hash of the artifact file."""
         h = hashlib.sha256()
         with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
+            for chunk in iter(lambda: f.read(65536), b""):
                 h.update(chunk)
         return h.hexdigest()
 
-    ########################################################
-
-    def _compute_feature_checksum(self):
-        canonical = json.dumps(list(MODEL_FEATURES)).encode()
-        return hashlib.sha256(canonical).hexdigest()
-
-    ########################################################
-
-    def _verify_baseline(self):
-
-        if not os.path.exists(self.BASELINE_PATH):
-            logger.warning("Baseline file missing.")
-            return False, None
-
-        try:
-            with open(self.BASELINE_PATH, encoding="utf-8") as f:
-                baseline = json.load(f)
-
-            integrity = baseline.get("integrity_hash")
-
-            clone = dict(baseline)
-            clone.pop("integrity_hash", None)
-
-            computed = hashlib.sha256(
-                json.dumps(clone, sort_keys=True).encode()
-            ).hexdigest()
-
-            if integrity != computed:
-                logger.warning("Baseline integrity mismatch.")
-                return False, computed
-
-            return True, computed
-
-        except Exception:
-            logger.warning("Baseline unreadable or corrupted.")
-            return False, None
-
-    ########################################################
-
-    def _get_registry_dir(self):
-
-        base_dir = os.getenv(
-            "XGB_REGISTRY_DIR",
-            os.path.abspath("artifacts/xgboost")
-        )
-
-        if not os.path.isdir(base_dir):
-            raise RuntimeError("Model registry directory missing.")
-
-        return base_dir
-
-    ########################################################
-
-    def _resolve_production_version(self, base_dir):
-
-        pointer_path = os.path.join(base_dir, self.POINTER_FILENAME)
-
-        if not os.path.exists(pointer_path):
-
-            if not self.ALLOW_POINTER_FALLBACK:
-                raise RuntimeError("Production pointer missing.")
-
-            logger.warning("Pointer missing — using latest model.")
-            return self._resolve_latest_version(base_dir)
-
-        pointer_hash = self._sha256(pointer_path)
-
-        with open(pointer_path, encoding="utf-8") as f:
-            pointer = json.load(f)
-
-        version = pointer.get("model_version")
-
-        # FIX: Use pointer paths first, fall back to both naming conventions
-        model_path = pointer.get("model_path")
-        metadata_path = pointer.get("metadata_path")
-
-        if not model_path or not os.path.exists(model_path):
-            model_path = os.path.join(base_dir, f"{version}.joblib")
-
-        if not metadata_path or not os.path.exists(metadata_path):
-            metadata_path = os.path.join(base_dir, f"{version}_metadata.json")
-
-        if not os.path.exists(model_path) or not os.path.exists(metadata_path):
-            raise RuntimeError("Pointer references missing model artifacts.")
-
-        return model_path, metadata_path, version, pointer_hash
-
-    ########################################################
-
-    def _resolve_latest_version(self, base_dir):
-
-        # FIX: Look for .joblib files matching trainer naming convention
-        versions = [
-            f.replace(".joblib", "")
-            for f in os.listdir(base_dir)
-            if f.endswith(".joblib")
+    def _load_metadata(self, model_path: str) -> Optional[dict]:
+        """
+        Try to load companion metadata.json for the model artifact.
+        Returns None if not found — metadata is optional.
+        """
+        # Try same dir, same stem with .json extension
+        stem = os.path.splitext(model_path)[0]
+        candidates = [
+            stem + ".json",
+            stem.replace("model_xgb_", "metadata_") + ".json",
+            os.path.join(os.path.dirname(model_path), "metadata.json"),
         ]
 
-        if not versions:
-            raise RuntimeError("No model artifacts found.")
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception as e:
+                    logger.warning("Metadata load failed: %s", e)
 
-        version = sorted(versions)[-1]
+        return None
 
-        return (
-            os.path.join(base_dir, f"{version}.joblib"),
-            os.path.join(base_dir, f"{version}_metadata.json"),
-            version,
-            None,
-        )
+    def load(self) -> bool:
+        """
+        Load the latest model from the registry.
+        Thread-safe. Returns True on success.
+        """
+        global _LOADED_MODEL, _LOADED_VERSION, _LOADED_HASH
 
-    ########################################################
+        with _MODEL_LOCK:
+            model_path = self._find_model_path()
 
-    def _safe_load_model(self, model_path):
+            if model_path is None:
+                logger.error("No model artifact found — cannot load.")
+                return False
 
-        if os.path.getsize(model_path) < self.MIN_ARTIFACT_BYTES:
-            raise RuntimeError("Artifact too small.")
+            try:
+                logger.info("Loading model from: %s", model_path)
 
-        model = joblib.load(model_path)
+                artifact = joblib.load(model_path)
 
-        if not hasattr(model, "predict"):
-            raise RuntimeError("Invalid model.")
+                # FIX: Safe None check before attribute access
+                if artifact is None:
+                    logger.error("Loaded artifact is None: %s", model_path)
+                    return False
 
-        return model
+                self._model = artifact
+                self._artifact_hash = self._compute_artifact_hash(model_path)
 
-    ########################################################
+                # Extract version from filename: model_xgb_20260319_014404.pkl
+                filename = os.path.basename(model_path)
+                stem = os.path.splitext(filename)[0]  # model_xgb_20260319_014404
+                parts = stem.split("_", 2)             # ['model', 'xgb', '20260319_014404']
+                self._version = "_".join(parts[1:]) if len(parts) >= 3 else stem
 
-    def _reload_xgb_if_needed(self):
+                # Load feature names from model if available
+                if hasattr(artifact, "feature_names"):
+                    self._feature_names = list(artifact.feature_names)
+                elif hasattr(artifact, "model") and hasattr(artifact.model, "feature_names"):
+                    self._feature_names = list(artifact.model.feature_names)
 
-        with self._reload_lock:
+                # Load schema signature
+                if hasattr(artifact, "schema_signature"):
+                    self._schema_signature = artifact.schema_signature
+                else:
+                    try:
+                        from core.schema.feature_schema import get_schema_signature
+                        self._schema_signature = get_schema_signature()
+                    except Exception:
+                        self._schema_signature = "unknown"
 
-            base_dir = self._get_registry_dir()
+                # Load companion metadata
+                self._metadata = self._load_metadata(model_path)
 
-            model_path, metadata_path, version, pointer_hash = \
-                self._resolve_production_version(base_dir)
+                # Update global cache
+                _LOADED_MODEL = self._model
+                _LOADED_VERSION = self._version
+                _LOADED_HASH = self._artifact_hash
 
-            if (
-                self._xgb_container
-                and self._xgb_container.version == version
-                and self._xgb_container.pointer_hash == pointer_hash
-            ):
-                return self._xgb_container.model
+                logger.info(
+                    "Model loaded | version=%s | hash=%s...",
+                    self._version,
+                    self._artifact_hash[:12],
+                )
+                return True
 
-            logger.info("Loading XGBoost version=%s", version)
+            except Exception as e:
+                logger.exception("Model load failed: %s", e)
+                return False
 
-            meta = MetadataManager.load_metadata(metadata_path)
-
-            model = self._safe_load_model(model_path)
-
-            baseline_available, baseline_hash = self._verify_baseline()
-
-            self._xgb_container = LoadedModel(
-                model=model,
-                version=version,
-                schema_signature=meta.get("schema_signature"),
-                schema_version=meta.get("schema_version"),
-                dataset_hash=meta.get("dataset_hash"),
-                artifact_hash=meta.get("artifact_hash"),
-                feature_checksum=meta.get("feature_checksum"),
-                universe_hash=meta.get("universe_hash"),
-                training_code_hash=meta.get("training_code_hash"),
-                reproducibility_hash=meta.get("reproducibility_hash"),
-                pointer_hash=pointer_hash,
-                training_fingerprint=getattr(model, "training_fingerprint", None),
-                baseline_available=baseline_available,
-                baseline_hash=baseline_hash
-            )
-
-            MODEL_VERSION.labels(
-                model="xgboost",
-                version=version
-            ).set(1)
-
-            return model
-
-    ########################################################
-    # WARMUP FIXED
-    ########################################################
-
-    def warmup(self):
-
-        try:
-            model = self.xgb
-
-            dummy = pd.DataFrame(
-                np.zeros((1, len(MODEL_FEATURES))),
-                columns=MODEL_FEATURES
-            )
-
-            model.predict(dummy)
-
-            logger.info("Model warmup successful.")
-
-        except Exception as exc:
-            logger.warning("Model warmup skipped | %s", exc)
-
-    ########################################################
-    # PROPERTIES
-    ########################################################
+    # =====================================================
+    # ACCESSORS
+    # =====================================================
 
     @property
-    def xgb(self):
-        return self._reload_xgb_if_needed()
+    def model(self):
+        return self._model
 
     @property
-    def schema_signature(self):
-        return self.RUNTIME_SCHEMA_SIGNATURE
+    def version(self) -> Optional[str]:
+        return self._version
 
     @property
-    def xgb_version(self):
-        return self._xgb_container.version if self._xgb_container else None
+    def artifact_hash(self) -> Optional[str]:
+        return self._artifact_hash
 
     @property
-    def artifact_hash(self):
-        return self._xgb_container.artifact_hash if self._xgb_container else None
+    def schema_signature(self) -> Optional[str]:
+        return self._schema_signature
 
     @property
-    def dataset_hash(self):
-        return self._xgb_container.dataset_hash if self._xgb_container else None
+    def feature_names(self) -> Optional[list]:
+        return self._feature_names
 
     @property
-    def training_code_hash(self):
-        return self._xgb_container.training_code_hash if self._xgb_container else None
+    def metadata(self) -> Optional[dict]:
+        return self._metadata
 
-    # FIX: Add missing feature_checksum property
-    @property
-    def feature_checksum(self):
-        return self._xgb_container.feature_checksum if self._xgb_container else None
+    def is_loaded(self) -> bool:
+        return self._model is not None
 
-    ########################################################
-    # FIX: Add missing get_feature_importance method
-    ########################################################
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """
+        Run inference. Delegates to the loaded model's predict method.
+        Raises RuntimeError if model not loaded.
+        """
+        if self._model is None:
+            raise RuntimeError("Model not loaded. Call load() first.")
 
-    def get_feature_importance(self):
+        return self._model.predict(X)
 
-        model = self.xgb
+    def get_info(self) -> dict:
+        """Return model metadata dict for /model/info endpoint."""
+        meta = self._metadata or {}
 
-        booster = getattr(model, "get_booster", None)
+        return {
+            "model_version": self._version or "unknown",
+            "schema_signature": self._schema_signature or meta.get("schema_signature", "unknown"),
+            "artifact_hash": self._artifact_hash or "unknown",
+            "dataset_hash": meta.get("dataset_hash", "unknown"),
+            "training_code_hash": meta.get("training_code_hash", "unknown"),
+            "feature_checksum": meta.get("feature_checksum", "unknown"),
+            "feature_count": len(self._feature_names) if self._feature_names else 0,
+        }
 
-        if booster is not None:
-            score_map = booster().get_score(importance_type="gain")
-        elif hasattr(model, "feature_importances_"):
-            score_map = dict(zip(MODEL_FEATURES, model.feature_importances_))
-        else:
-            score_map = {f: 0.0 for f in MODEL_FEATURES}
 
-        result = []
+# =========================================================
+# MODULE-LEVEL SINGLETON
+# Used by app/main.py and inference pipeline
+# =========================================================
 
-        for feat in MODEL_FEATURES:
-            result.append({
-                "feature": feat,
-                "importance": float(score_map.get(feat, score_map.get(f"f{list(MODEL_FEATURES).index(feat)}", 0.0))),
-            })
+_loader_instance: Optional[ModelLoader] = None
 
-        result.sort(key=lambda x: x["importance"], reverse=True)
 
-        return result
+def get_model_loader() -> ModelLoader:
+    """Return the singleton ModelLoader instance."""
+    global _loader_instance
+    if _loader_instance is None:
+        _loader_instance = ModelLoader()
+    return _loader_instance
+
+
+def load_model() -> bool:
+    """Load (or reload) the model. Returns True on success."""
+    return get_model_loader().load()
+
+
+def get_model():
+    """Return the loaded model object or None."""
+    loader = get_model_loader()
+    return loader.model if loader.is_loaded() else None

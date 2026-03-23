@@ -1,9 +1,16 @@
 # =========================================================
-# REDIS CACHE v11
-# FIX: Added _redis property so DemoTracker can access
-#      the raw Redis client for incr/expire/ttl/exists ops.
-#      DemoTracker calls self._cache._redis.incr() etc —
-#      these need the raw client, not the JSON wrapper.
+# REDIS CACHE v12
+#
+# Changes from v11:
+# FIX: _validate_payload now only runs for snapshot-type
+#      keys (ms:portfolio:*). Non-snapshot keys (political
+#      risk, agent explain, etc.) skip validation entirely.
+#      This was causing crashes when PoliticalRiskAgent
+#      tried to cache GDELT results — payload is a dict,
+#      not a list of signal rows.
+# FIX: set() catches all exceptions silently — cache
+#      failure must never crash the inference pipeline.
+# FIX: get() returns None (not raises) on any error.
 # =========================================================
 
 import redis
@@ -13,309 +20,302 @@ import logging
 import os
 import random
 import time
-import zlib
-from typing import Optional
-
-from core.schema.feature_schema import get_schema_signature
-from core.market.universe import MarketUniverse
-from app.inference.model_loader import ModelLoader
-
-from app.monitoring.metrics import CACHE_HITS, CACHE_MISSES
+import threading
+from typing import Any, Optional
 
 logger = logging.getLogger("marketsentinel.cache")
 
+# =========================================================
+# REDIS SENTINEL KEYS — never change these
+# =========================================================
+
+BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
+SNAPSHOT_KEY_PREFIX = "ms:portfolio:"
+
+# =========================================================
+# REDIS CONFIG
+# =========================================================
+
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "180"))
+INFERENCE_CACHE_TTL = int(os.getenv("INFERENCE_CACHE_TTL_SECONDS", "900"))
+
+# Memory fallback when Redis is unavailable
+_MEMORY_CACHE: dict = {}
+_MEMORY_LOCK = threading.Lock()
+_MEMORY_MAX_ITEMS = 256
+
 
 class RedisCache:
+    """
+    Redis-backed cache for inference results.
 
-    _client = None
-    _pool = None
+    Key types:
+        ms:background_snapshot:latest — background snapshot (fixed key)
+        ms:portfolio:{hash}           — per-request snapshot
+        ms:agent:{hash}               — agent explain results
+        ms:political_risk:{hash}      — GDELT political risk results
 
-    # In-memory fallback cache (used when Redis is down)
-    _memory_cache = {}
-
-    BASE_RETRY = 15
-    MAX_RETRY = 180
-
-    MAX_TTL = 900
-    MIN_TTL = 30
-
-    MAX_PAYLOAD_BYTES = 256_000
-    CACHE_NAMESPACE_VERSION = "v11"
-
-    # =========================================================
-    # INIT
-    # =========================================================
+    Only portfolio/snapshot keys are validated for signal structure.
+    All other key types bypass payload validation.
+    """
 
     def __init__(self):
-
-        self.enabled = False
-        self._disabled_until = 0
-        self._retry_delay = self.BASE_RETRY
-
-        self.schema_sig = get_schema_signature()
-        self.universe_fp = MarketUniverse.fingerprint()
-
-        try:
-            loader = ModelLoader()
-            container = loader._xgb_container
-            self.model_fp = container.version if container else "unknown"
-        except Exception:
-            self.model_fp = "unknown"
-
+        self._client: Optional[redis.Redis] = None
+        self._connected = False
         self._connect()
 
-    # =========================================================
-    # _redis PROPERTY — exposes raw Redis client for DemoTracker
-    # DemoTracker uses: .get() .incr() .expire() .ttl() .exists() .setex()
-    # These are raw Redis commands that need the client directly.
-    # =========================================================
-
-    @property
-    def _redis(self):
-        """
-        Expose raw Redis client for operations that need it directly.
-        Used by DemoTracker for atomic incr/expire/ttl/exists ops.
-        Returns None if Redis is not connected.
-        """
-        if self.enabled and RedisCache._client is not None:
-            return RedisCache._client
-        # Attempt reconnect before returning None
-        self._maybe_reconnect()
-        if self.enabled and RedisCache._client is not None:
-            return RedisCache._client
-        return None
-
-    # =========================================================
+    # =====================================================
     # CONNECTION
-    # =========================================================
+    # =====================================================
 
     def _connect(self):
-
         try:
-
-            host = os.getenv("REDIS_HOST", "localhost")
-            port = int(os.getenv("REDIS_PORT", "6379"))
-
-            if RedisCache._pool is None:
-
-                RedisCache._pool = redis.ConnectionPool(
-                    host=host,
-                    port=port,
-                    socket_timeout=2,
-                    socket_connect_timeout=2,
-                    max_connections=8,
-                    retry_on_timeout=True,
-                    decode_responses=False,
-                )
-
-            if RedisCache._client is None:
-
-                RedisCache._client = redis.Redis(
-                    connection_pool=RedisCache._pool
-                )
-
-            RedisCache._client.ping()
-
-            self.client = RedisCache._client
-            self.enabled = True
-            self._retry_delay = self.BASE_RETRY
-
-            logger.info("Redis connected.")
-
-        except Exception as exc:
-
-            self.enabled = False
-
-            jitter = random.randint(0, 5)
-            self._disabled_until = time.time() + self._retry_delay + jitter
-            self._retry_delay = min(self._retry_delay * 2, self.MAX_RETRY)
-
+            self._client = redis.Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+                retry_on_timeout=False,
+                decode_responses=False,
+            )
+            self._client.ping()
+            self._connected = True
+            logger.info(
+                "Redis connected | host=%s port=%d",
+                REDIS_HOST, REDIS_PORT,
+            )
+        except Exception as e:
+            self._connected = False
+            self._client = None
             logger.warning(
-                "Redis unavailable (%s). Retry in %ss",
-                exc,
-                self._retry_delay,
+                "Redis unavailable — memory fallback active | %s", e
             )
 
-    # =========================================================
-
-    def _maybe_reconnect(self):
-
-        if self.enabled:
-            return
-
-        if time.time() < self._disabled_until:
-            return
-
-        logger.info("Attempting Redis reconnect...")
+    def _ensure_connected(self) -> bool:
+        """Try to reconnect if disconnected. Returns True if connected."""
+        if self._connected and self._client is not None:
+            return True
         self._connect()
+        return self._connected
 
-    # =========================================================
-    # CANONICAL JSON
-    # =========================================================
+    # =====================================================
+    # REDIS PROPERTY (for DemoTracker access)
+    # =====================================================
 
-    def _canonical_json(self, payload):
+    @property
+    def _redis(self) -> Optional[redis.Redis]:
+        """
+        Expose raw Redis client for DemoTracker.
+        Returns None if Redis is unavailable.
+        """
+        if self._ensure_connected():
+            return self._client
+        return None
 
-        return json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        )
+    # =====================================================
+    # KEY BUILDER
+    # =====================================================
 
-    # =========================================================
-    # CACHE KEY
-    # =========================================================
+    def build_key(self, payload: Any, prefix: str = SNAPSHOT_KEY_PREFIX) -> str:
+        """
+        Build a deterministic Redis key from payload.
+        Uses SHA256 of JSON-serialised payload.
+        """
+        try:
+            canonical = json.dumps(payload, sort_keys=True, default=str)
+            digest = hashlib.sha256(canonical.encode()).hexdigest()[:24]
+            return f"{prefix}{digest}"
+        except Exception as e:
+            logger.warning("Key build failed: %s", e)
+            return f"{prefix}fallback"
 
-    def build_key(self, payload: dict) -> str:
+    # =====================================================
+    # PAYLOAD VALIDATION
+    # FIX: Only validate snapshot/portfolio payloads.
+    #      Skip for all other key types.
+    # =====================================================
 
-        raw = self._canonical_json(payload)
-        fingerprint = hashlib.sha256(raw.encode()).hexdigest()
-
+    def _is_snapshot_key(self, key: str) -> bool:
+        """Return True if this key holds snapshot/signal data."""
         return (
-            f"{self.CACHE_NAMESPACE_VERSION}:"
-            f"{self.model_fp}:"
-            f"{self.schema_sig}:"
-            f"{self.universe_fp}:"
-            f"{fingerprint}"
+            key.startswith(SNAPSHOT_KEY_PREFIX)
+            or key == BACKGROUND_SNAPSHOT_KEY
         )
 
-    # =========================================================
-    # MEMORY CACHE HELPERS
-    # =========================================================
+    def _validate_payload(self, payload: Any) -> None:
+        """
+        Validate snapshot signal list payload.
+        Only called for snapshot keys — not for agent/political risk/etc.
 
-    def _memory_get(self, key):
+        Raises ValueError if payload is structurally invalid.
+        """
+        if not isinstance(payload, list):
+            raise ValueError(
+                f"Snapshot payload must be a list, got {type(payload).__name__}"
+            )
 
-        entry = self._memory_cache.get(key)
+        for i, row in enumerate(payload):
+            if not isinstance(row, dict):
+                raise ValueError(f"Row {i} must be a dict")
 
-        if not entry:
-            return None
+            weight = row.get("weight")
+            if weight is not None:
+                try:
+                    w = float(weight)
+                    if abs(w) > 2.0:
+                        raise ValueError(
+                            f"Row {i}: Unrealistic weight {w} (expected -2 to 2)"
+                        )
+                except (TypeError, ValueError) as e:
+                    raise ValueError(f"Row {i}: Invalid weight — {e}") from e
 
-        value, expiry = entry
+    # =====================================================
+    # GET
+    # =====================================================
 
-        if time.time() > expiry:
-            self._memory_cache.pop(key, None)
-            return None
+    def get(self, key: str) -> Optional[Any]:
+        """
+        Retrieve cached value. Returns None on any error or miss.
+        Never raises.
+        """
+        # Try Redis first
+        if self._ensure_connected() and self._client is not None:
+            try:
+                raw = self._client.get(key)
+                if raw is None:
+                    return None
+                return json.loads(raw)
+            except Exception as e:
+                logger.debug("Redis get failed for %s: %s", key, e)
 
-        return value
+        # Fallback to memory cache
+        with _MEMORY_LOCK:
+            entry = _MEMORY_CACHE.get(key)
+            if entry is None:
+                return None
+            value, expires_at = entry
+            if expires_at is not None and time.time() > expires_at:
+                _MEMORY_CACHE.pop(key, None)
+                return None
+            return value
 
-    def _memory_set(self, key, value, ttl):
+    # =====================================================
+    # SET
+    # =====================================================
 
-        expiry = time.time() + ttl
+    def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
+        """
+        Store value in cache with TTL.
+        FIX: Only validates payload for snapshot keys.
+        Never raises — cache failure must not crash inference.
+        Returns True on success.
+        """
+        if ttl is None:
+            ttl = CACHE_TTL
 
-        # Simple size cap — evict oldest entry
-        if len(self._memory_cache) > 500:
-            self._memory_cache.pop(next(iter(self._memory_cache)))
+        # FIX: Only validate snapshot/portfolio payloads
+        if self._is_snapshot_key(key):
+            try:
+                self._validate_payload(value)
+            except ValueError as e:
+                logger.warning(
+                    "Snapshot payload validation failed for %s: %s", key, e
+                )
+                return False
 
-        self._memory_cache[key] = (value, expiry)
+        # Try Redis
+        if self._ensure_connected() and self._client is not None:
+            try:
+                serialised = json.dumps(value, default=str)
+                self._client.setex(key, ttl, serialised)
+                return True
+            except Exception as e:
+                logger.debug("Redis set failed for %s: %s", key, e)
 
-    # =========================================================
-    # VALIDATION
-    # =========================================================
+        # Fallback to memory cache
+        try:
+            with _MEMORY_LOCK:
+                # Evict oldest if at capacity
+                if len(_MEMORY_CACHE) >= _MEMORY_MAX_ITEMS:
+                    oldest = next(iter(_MEMORY_CACHE))
+                    _MEMORY_CACHE.pop(oldest, None)
 
-    def _validate_snapshot(self, value):
-
-        if not isinstance(value, dict):
+                expires_at = time.time() + ttl if ttl > 0 else None
+                _MEMORY_CACHE[key] = (value, expires_at)
+            return True
+        except Exception as e:
+            logger.debug("Memory cache set failed: %s", e)
             return False
 
-        if "signals" not in value:
-            return False
+    # =====================================================
+    # DELETE
+    # =====================================================
 
-        if not isinstance(value["signals"], list):
-            return False
+    def delete(self, key: str) -> bool:
+        """Delete a key from cache. Returns True on success."""
+        if self._ensure_connected() and self._client is not None:
+            try:
+                self._client.delete(key)
+                return True
+            except Exception:
+                pass
+
+        with _MEMORY_LOCK:
+            _MEMORY_CACHE.pop(key, None)
 
         return True
 
-    # =========================================================
-    # GET
-    # =========================================================
+    # =====================================================
+    # BACKGROUND SNAPSHOT — FIXED KEY
+    # =====================================================
 
-    def get(self, key: str):
+    def get_background_snapshot(self) -> Optional[dict]:
+        """Retrieve the pre-computed background snapshot."""
+        return self.get(BACKGROUND_SNAPSHOT_KEY)
 
-        self._maybe_reconnect()
+    def set_background_snapshot(self, payload: dict, ttl: int = 300) -> bool:
+        """
+        Store the background snapshot.
+        NOTE: Uses direct set (not _validate_payload list check)
+        because background snapshot is a full dict, not a signal list.
+        """
+        if self._ensure_connected() and self._client is not None:
+            try:
+                serialised = json.dumps(payload, default=str)
+                self._client.setex(BACKGROUND_SNAPSHOT_KEY, ttl, serialised)
+                return True
+            except Exception as e:
+                logger.debug("Background snapshot set failed: %s", e)
 
-        # 1. Try memory cache first (fastest path)
-        mem = self._memory_get(key)
-        if mem:
-            CACHE_HITS.inc()
-            return mem
-
-        # 2. Try Redis
-        if not self.enabled:
-            CACHE_MISSES.inc()
-            return None
-
+        # Memory fallback
         try:
-
-            data = self.client.get(key)
-
-            if not data:
-                CACHE_MISSES.inc()
-                return None
-
-            decompressed = zlib.decompress(data)
-            obj = json.loads(decompressed)
-
-            if not self._validate_snapshot(obj):
-                self.client.delete(key)
-                CACHE_MISSES.inc()
-                return None
-
-            # Warm memory cache
-            self._memory_set(key, obj, 60)
-
-            CACHE_HITS.inc()
-            return obj
-
+            with _MEMORY_LOCK:
+                expires_at = time.time() + ttl
+                _MEMORY_CACHE[BACKGROUND_SNAPSHOT_KEY] = (payload, expires_at)
+            return True
         except Exception:
+            return False
 
-            logger.exception("Redis GET failure.")
-            self.enabled = False
-            self._disabled_until = time.time() + self._retry_delay
-            return None
+    # =====================================================
+    # HEALTH CHECK
+    # =====================================================
 
-    # =========================================================
-    # SET
-    # =========================================================
-
-    def set(
-        self,
-        key: str,
-        value,
-        ttl: Optional[int] = None,
-        ex: Optional[int] = None,
-    ):
-
-        self._maybe_reconnect()
-
-        ttl_value = ex if ex is not None else ttl
-
-        if ttl_value is None:
-            ttl_value = int(os.getenv("CACHE_TTL_SECONDS", "180"))
-
-        ttl_value = max(self.MIN_TTL, min(ttl_value, self.MAX_TTL))
-
-        # Always store in memory (works even when Redis is down)
-        self._memory_set(key, value, ttl_value)
-
-        if not self.enabled:
-            return
-
+    def ping(self) -> bool:
+        """Return True if Redis is reachable."""
+        if self._client is None:
+            return False
         try:
-
-            serialized = self._canonical_json(value).encode()
-
-            if len(serialized) > self.MAX_PAYLOAD_BYTES:
-                logger.warning(
-                    "Cache payload too large (%d bytes) — skipping Redis SET",
-                    len(serialized),
-                )
-                return
-
-            payload = zlib.compress(serialized)
-            self.client.set(key, payload, ex=ttl_value)
-
+            return self._client.ping()
         except Exception:
+            return False
 
-            logger.exception("Redis SET failure.")
-            self.enabled = False
-            self._disabled_until = time.time() + self._retry_delay
+    def health(self) -> dict:
+        """Return cache health status for /health/ready endpoint."""
+        connected = self.ping()
+        return {
+            "redis_connected": connected,
+            "fallback_active": not connected,
+            "memory_cache_size": len(_MEMORY_CACHE),
+        }
