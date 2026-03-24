@@ -1,14 +1,9 @@
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 import time
 
 from app.main import app
-
-# ---------------------------------------------------
-# MOCK SNAPSHOT matches pipeline v5.6 shape
-# /agent/explain reads from _signal_details[ticker]
-# ---------------------------------------------------
 
 MOCK_SNAPSHOT = {
     "meta": {
@@ -72,12 +67,12 @@ MOCK_SNAPSHOT = {
 
 @pytest.fixture
 def client_with_snapshot():
-    """TestClient with mock cache returning MOCK_SNAPSHOT."""
     cache = MagicMock()
     cache.get.side_effect = lambda key: (
         MOCK_SNAPSHOT if key == "ms:background_snapshot:latest" else None
     )
     cache.ping.return_value = True
+    cache.enabled = False
 
     model_loader = MagicMock()
     model_loader.is_loaded.return_value = True
@@ -98,10 +93,6 @@ def owner_cookies():
     return {"ms_token": token}
 
 
-# ---------------------------------------------------
-# TESTS
-# ---------------------------------------------------
-
 class TestAgentExplain:
 
     def test_explain_returns_200(self, client_with_snapshot, owner_cookies):
@@ -112,7 +103,6 @@ class TestAgentExplain:
         assert resp.status_code == 200
 
     def test_explain_response_has_data_wrapper(self, client_with_snapshot, owner_cookies):
-        """FIX: Response is wrapped in { success, data: {...} } not flat."""
         resp = client_with_snapshot.get(
             "/agent/explain?ticker=NVDA",
             cookies=owner_cookies,
@@ -123,7 +113,6 @@ class TestAgentExplain:
         assert body["success"] is True
 
     def test_explain_data_has_required_fields(self, client_with_snapshot, owner_cookies):
-        """FIX: Fields read from data wrapper not root."""
         resp = client_with_snapshot.get(
             "/agent/explain?ticker=NVDA",
             cookies=owner_cookies,
@@ -144,17 +133,11 @@ class TestAgentExplain:
         assert data["signal"] in ("LONG", "SHORT", "NEUTRAL")
 
     def test_explain_no_agents_sub_object_on_signals(self, client_with_snapshot, owner_cookies):
-        """
-        Signals in the snapshot no longer have an agents sub-object.
-        Agent details come from _signal_details separately.
-        """
         resp = client_with_snapshot.get(
             "/agent/explain?ticker=NVDA",
             cookies=owner_cookies,
         )
         data = resp.json()["data"]
-        # The response itself has agent-level fields (confidence, governance_score etc.)
-        # but the raw signal row does NOT have an agents key
         assert "agents" not in data
 
     def test_explain_unknown_ticker_returns_404(self, client_with_snapshot, owner_cookies):
@@ -172,7 +155,6 @@ class TestAgentExplain:
         assert resp.status_code == 400
 
     def test_explain_post_also_works(self, client_with_snapshot, owner_cookies):
-        """Route supports both GET and POST."""
         resp = client_with_snapshot.post(
             "/agent/explain",
             json={"ticker": "NVDA"},
@@ -182,9 +164,7 @@ class TestAgentExplain:
         assert resp.json()["data"]["ticker"] == "NVDA"
 
     def test_explain_no_auth_still_processes(self, client_with_snapshot):
-        """No auth = unauthenticated, but route still responds (middleware passes through)."""
         resp = client_with_snapshot.get("/agent/explain?ticker=NVDA")
-        # May return 200 or 401 depending on middleware config — just not 500
         assert resp.status_code != 500
 
     def test_explain_warnings_list(self, client_with_snapshot, owner_cookies):
@@ -196,13 +176,11 @@ class TestAgentExplain:
         assert isinstance(data.get("warnings", []), list)
 
     def test_explain_llm_null_when_disabled(self, client_with_snapshot, owner_cookies):
-        """LLM section is None when LLM_ENABLED=false (default)."""
         resp = client_with_snapshot.get(
             "/agent/explain?ticker=NVDA",
             cookies=owner_cookies,
         )
         data = resp.json()["data"]
-        # llm field should be None or have llm_enabled=False
         llm = data.get("llm")
         if llm is not None:
             assert llm.get("llm_enabled") is False
@@ -210,22 +188,33 @@ class TestAgentExplain:
 
 class TestAgentAgents:
 
-    def test_agents_list_returns_200(self, client_with_snapshot):
-        resp = client_with_snapshot.get("/agent/agents")
+    def test_agents_list_returns_200(self, client_with_snapshot, owner_cookies):
+        # FIX: /agent/agents requires auth — pass owner_cookies
+        resp = client_with_snapshot.get(
+            "/agent/agents",
+            cookies=owner_cookies,
+        )
         assert resp.status_code == 200
 
-    def test_agents_list_has_four_agents(self, client_with_snapshot):
-        resp = client_with_snapshot.get("/agent/agents")
-        agents = resp.json()["agents"]
+    def test_agents_list_has_four_agents(self, client_with_snapshot, owner_cookies):
+        # FIX: response is wrapped in { success, data: { agents: {...} } }
+        resp = client_with_snapshot.get(
+            "/agent/agents",
+            cookies=owner_cookies,
+        )
+        body = resp.json()
+        # Support both wrapped { data: { agents: ... } } and flat { agents: ... }
+        agents = body.get("data", body).get("agents", body.get("agents", {}))
         assert len(agents) == 4
         assert "signal_agent" in agents
         assert "technical_risk_agent" in agents
         assert "portfolio_decision_agent" in agents
         assert "political_risk_agent" in agents
 
-    def test_agents_list_no_inference(self, client_with_snapshot):
-        """FIX: /agent/agents is now static — does not trigger model inference."""
-        # If it ran inference on a mock it would fail with model errors
-        # The fact it returns 200 confirms it's static
-        resp = client_with_snapshot.get("/agent/agents")
+    def test_agents_list_no_inference(self, client_with_snapshot, owner_cookies):
+        # FIX: pass owner_cookies — endpoint requires auth
+        resp = client_with_snapshot.get(
+            "/agent/agents",
+            cookies=owner_cookies,
+        )
         assert resp.status_code == 200
