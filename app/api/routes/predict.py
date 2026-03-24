@@ -1,14 +1,12 @@
 # =========================================================
-# PREDICTION & SNAPSHOT ROUTES v4.0
+# PREDICTION & SNAPSHOT ROUTES v4.1
 #
-# FIX (issue 1): get_pipeline() now initializes InferencePipeline
-#   properly. Added init_pipeline() called from main.py startup
-#   so model_loader and cache are available before first request.
-# FIX (issue 3): pipeline.run_snapshot() called WITHOUT tickers arg.
-#   Tickers are loaded inside pipeline from MarketUniverse.
-#   Old: pipeline.run_snapshot(tickers) → tickers went to snapshot_date param → WRONG
-#   New: pipeline.run_snapshot()        → uses MarketUniverse internally → CORRECT
-# FIX: Background snapshot uses set_background_snapshot() not set()
+# SWAGGER FIX v4.1:
+# - Added tags, summary, description to all routes
+# - live-snapshot: documented 503 vs 200 behavior
+# - signal-explanation: ticker path param documented
+# - price-history: days Query param with min/max/example
+# - All routes show proper response descriptions in /docs
 # =========================================================
 
 import time
@@ -20,7 +18,7 @@ import pandas as pd
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline
@@ -44,73 +42,12 @@ from app.api.schemas import (
 router = APIRouter(prefix="/predict", tags=["prediction"])
 logger = get_logger("marketsentinel.api")
 
-# =========================================================
-# MODULE-LEVEL SINGLETONS
-# Set by init_pipeline() during app startup.
-# get_pipeline() uses these to construct InferencePipeline.
-# =========================================================
-
 _pipeline: Optional[InferencePipeline] = None
-_model_loader = None     # ModelLoader instance — used by pipeline.py fallback
-_cache_instance = None   # RedisCache instance
-
+_model_loader = None
+_cache_instance = None
 _universe_cache: Optional[List[str]] = None
 
 BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
-
-
-# =========================================================
-# PIPELINE INIT — called from main.py during startup
-# =========================================================
-
-def init_pipeline(model_loader, cache):
-    """
-    Initialize the InferencePipeline singleton with model and cache.
-    Called from main.py lifespan after model and cache are loaded.
-
-    Args:
-        model_loader: ModelLoader instance (has .predict(), .version, etc.)
-        cache:        RedisCache instance
-    """
-    global _pipeline, _model_loader, _cache_instance
-    _model_loader = model_loader
-    _cache_instance = cache
-    _pipeline = InferencePipeline(model=model_loader, cache=cache)
-    logger.info(
-        "InferencePipeline initialized | model=%s",
-        getattr(model_loader, "version", "unknown"),
-    )
-
-
-# =========================================================
-# PIPELINE SINGLETON ACCESSOR
-# =========================================================
-
-def get_pipeline() -> InferencePipeline:
-    """
-    Return the InferencePipeline singleton.
-    Raises RuntimeError if init_pipeline() was not called.
-    """
-    global _pipeline
-    if _pipeline is None:
-        # Fallback: try to init lazily from get_model_loader()
-        try:
-            loader = get_model_loader()
-            cache = RedisCache()
-            init_pipeline(loader, cache)
-            logger.warning(
-                "InferencePipeline lazily initialized (init_pipeline not called at startup)"
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"InferencePipeline not initialized. Call init_pipeline() during startup. Error: {e}"
-            )
-    return _pipeline
-
-
-# =========================================================
-# CONFIG
-# =========================================================
 
 MAX_CONCURRENT_INFERENCES = int(os.getenv("MAX_CONCURRENT_INFERENCES", "4"))
 REQUEST_TIMEOUT = int(os.getenv("INFERENCE_TIMEOUT_SEC", "180"))
@@ -122,8 +59,39 @@ PRIMARY_UNIVERSE_PATH = Path(
 FALLBACK_UNIVERSE_PATH = Path("config/universe.json")
 
 inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
-
 TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
+
+
+# =========================================================
+# PIPELINE INIT
+# =========================================================
+
+def init_pipeline(model_loader, cache):
+    global _pipeline, _model_loader, _cache_instance
+    _model_loader = model_loader
+    _cache_instance = cache
+    _pipeline = InferencePipeline(model=model_loader, cache=cache)
+    logger.info(
+        "InferencePipeline initialized | model=%s",
+        getattr(model_loader, "version", "unknown"),
+    )
+
+
+def get_pipeline() -> InferencePipeline:
+    global _pipeline
+    if _pipeline is None:
+        try:
+            loader = get_model_loader()
+            cache = RedisCache()
+            init_pipeline(loader, cache)
+            logger.warning(
+                "InferencePipeline lazily initialized (init_pipeline not called at startup)"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"InferencePipeline not initialized. Error: {e}"
+            )
+    return _pipeline
 
 
 # =========================================================
@@ -131,14 +99,11 @@ TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 # =========================================================
 
 def load_default_universe() -> List[str]:
-
     global _universe_cache
-
     if _universe_cache is not None:
         return _universe_cache
 
     universe_path = None
-
     if PRIMARY_UNIVERSE_PATH.exists():
         universe_path = PRIMARY_UNIVERSE_PATH
     elif FALLBACK_UNIVERSE_PATH.exists():
@@ -161,7 +126,6 @@ def load_default_universe() -> List[str]:
         for t in tickers
         if TICKER_REGEX.match(str(t).upper().strip())
     ]
-
     unique = sorted(set(cleaned))
 
     if len(unique) < MIN_BATCH_SIZE:
@@ -178,24 +142,46 @@ def _date_window(days: int):
 
 
 # =========================================================
-# LIVE SNAPSHOT
+# GET /predict/live-snapshot
 # =========================================================
 
-@router.get("/live-snapshot")
-@router.post("/live-snapshot")
-async def live_snapshot():
+@router.get(
+    "/live-snapshot",
+    summary="Live Market Snapshot",
+    description="""
+Returns the full inference snapshot for all 100 S&P 500 universe tickers.
 
+**How it works:**
+1. First checks the background snapshot cache (refreshed every 300s)
+2. If cache miss, runs full inference pipeline (~90s cold start)
+
+**Response includes:**
+- `meta`: model version, schema signature, timestamp
+- `executive_summary`: top 5 tickers, gross/net exposure, regime
+- `snapshot.signals`: all 100 tickers with scores, weights, signals
+
+**503** = snapshot cache empty + live computation in progress.
+Retry in 30s — the background loop will cache a result soon.
+
+**Requires:** Owner or Demo authentication (demo gets 3 requests).
+""",
+    response_description="Full snapshot with signals for all universe tickers.",
+)
+@router.post(
+    "/live-snapshot",
+    summary="Live Market Snapshot (POST)",
+    description="Same as GET /predict/live-snapshot. POST supported for compatibility.",
+    include_in_schema=False,
+)
+async def live_snapshot():
     endpoint = "/predict/live-snapshot"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
 
     try:
         pipeline = get_pipeline()
-        loader = get_model_loader()
-        meta_info = loader.metadata or {}
         cache = RedisCache()
 
-        # Try background cache first
         snapshot = None
         cached = cache.get(BACKGROUND_SNAPSHOT_KEY)
         if cached and isinstance(cached, dict) and "snapshot" in cached:
@@ -203,7 +189,6 @@ async def live_snapshot():
             logger.info("live-snapshot served from background cache")
 
         if snapshot is None:
-            # FIX: run_snapshot() with NO args — tickers loaded internally
             async with inference_semaphore:
                 snapshot = await asyncio.wait_for(
                     run_in_threadpool(pipeline.run_snapshot),
@@ -233,15 +218,33 @@ async def live_snapshot():
 
 
 # =========================================================
-# SIGNAL EXPLANATION
+# GET /predict/signal-explanation/{ticker}
 # =========================================================
 
 @router.get(
     "/signal-explanation/{ticker}",
+    summary="Signal Explanation for Ticker",
+    description="""
+Returns detailed signal explanation for a specific ticker.
+
+Runs a full snapshot and extracts per-ticker signal data including:
+- Raw model score and hybrid consensus score
+- Signal direction (LONG / SHORT / NEUTRAL)
+- Confidence, governance score, risk level
+- Agent warnings and natural language explanation
+- LLM rationale (if LLM_ENABLED=true)
+
+**Example tickers:** AAPL, NVDA, MSFT, GOOGL, JPM
+
+**Note:** This runs a fresh inference pipeline call (~90s).
+For cached results use GET /agent/explain?ticker=AAPL instead.
+""",
+    response_description="Structured signal explanation with agent outputs.",
     response_model=SignalExplanationEnvelope,
 )
-async def signal_explanation(ticker: str):
-
+async def signal_explanation(
+    ticker: str,
+):
     endpoint = "/predict/signal-explanation"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
@@ -259,10 +262,9 @@ async def signal_explanation(ticker: str):
         if ticker not in universe_tickers:
             raise HTTPException(
                 status_code=404,
-                detail="Ticker not in production universe.",
+                detail=f"Ticker '{ticker}' not in production universe.",
             )
 
-        # FIX: run_snapshot() with NO args
         async with inference_semaphore:
             snapshot = await asyncio.wait_for(
                 run_in_threadpool(pipeline.run_snapshot),
@@ -327,12 +329,32 @@ async def signal_explanation(ticker: str):
 
 
 # =========================================================
-# PRICE HISTORY
+# GET /predict/price-history/{ticker}
 # =========================================================
 
-@router.get("/price-history/{ticker}")
-async def price_history(ticker: str, days: int = 365):
+@router.get(
+    "/price-history/{ticker}",
+    summary="OHLCV Price History",
+    description="""
+Returns daily OHLCV price history for a ticker from the PostgreSQL database.
 
+**Example tickers:** AAPL, NVDA, MSFT, GOOGL, JPM, AMZN
+
+**days:** Number of trading days to return (default: 365, max: 2000).
+Data is sourced from the local DB — no external API calls.
+""",
+    response_description="Array of daily OHLCV rows sorted oldest to newest.",
+)
+async def price_history(
+    ticker: str,
+    days: int = Query(
+        default=365,
+        ge=10,
+        le=2000,
+        description="Number of trading days to return (10–2000)",
+        example=252,
+    ),
+):
     endpoint = "/predict/price-history"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()

@@ -1,12 +1,6 @@
 # =========================================================
-# HYBRID AGENT EXPLANATION ROUTE v3.4
-#
-# FIX (item 11): /agent/explain now reads from background
-#   snapshot cache — no longer re-runs full 100-ticker
-#   inference per request (was 30-120s, now <1ms).
-# FIX: /agent/agents returns static descriptions — no model call.
-# FIX: /agent/political-risk reads from _political cache key.
-# FIX: LLM sections gated by detail.llm?.llm_enabled.
+# HYBRID AGENT EXPLANATION ROUTE v3.5
+# SWAGGER FIX: Added tags, summary, description, examples
 # =========================================================
 
 import logging
@@ -58,20 +52,49 @@ def _get_cache(request: Request):
 
 # =========================================================
 # GET /agent/explain?ticker=X
-# FIX: Reads from background snapshot cache — no inference
 # =========================================================
 
-@router.get("/explain")
-@router.post("/explain")
+@router.get(
+    "/explain",
+    summary="Signal Explanation for Ticker",
+    description="""
+Returns signal explanation for a specific ticker from the background snapshot cache.
+
+**ticker** (required): Any ticker in the universe. See GET /universe for the full list.
+
+**Example tickers:** AAPL, NVDA, MSFT, GOOGL, JPM, AMZN, TSLA, META
+
+**Response includes:**
+- `signal`: LONG / SHORT / NEUTRAL
+- `raw_model_score`: raw XGBoost output
+- `hybrid_consensus_score`: agent-weighted consensus
+- `confidence_numeric`: signal confidence (0–1)
+- `risk_level`: low / medium / high
+- `volatility_regime`: normal / high_volatility / low_volatility
+- `technical_bias`: bullish / bearish / neutral
+- `warnings`: list of risk flags from the signal agent
+- `explanation`: natural language explanation
+- `llm`: LLM rationale (null unless LLM_ENABLED=true)
+
+**503** = snapshot not yet computed. Wait ~90s and retry.
+
+**Requires:** Owner or Demo authentication (demo: counts against `agent` quota).
+""",
+    response_description="Signal explanation from background snapshot cache.",
+)
+@router.post("/explain", include_in_schema=False)
 async def explain_signal(
     request: Request,
-    ticker: str = Query(None),
+    ticker: str = Query(
+        None,
+        description="Ticker symbol from the universe (e.g. AAPL, NVDA, MSFT)",
+        example="AAPL",
+    ),
 ):
     endpoint = "/agent/explain"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
 
-    # Support both GET ?ticker=X and POST body
     if ticker is None:
         try:
             body = await request.json()
@@ -91,20 +114,18 @@ async def explain_signal(
         if not snapshot_result:
             raise HTTPException(
                 status_code=503,
-                detail="No snapshot available. Background compute is pending.",
+                detail="No snapshot available. Background compute is pending (~90s on first load).",
             )
 
-        # Find ticker in signals
         signals = snapshot_result.get("snapshot", {}).get("signals", [])
         signal_row = next((s for s in signals if s["ticker"] == ticker), None)
 
         if signal_row is None:
             raise HTTPException(
                 status_code=404,
-                detail=f"{ticker} not found in current snapshot.",
+                detail=f"{ticker} not found in current snapshot. Check GET /universe.",
             )
 
-        # FIX: Read agent details from _signal_details — written by pipeline v5.6
         signal_details = snapshot_result.get("_signal_details", {})
         agents = signal_details.get(ticker, {})
 
@@ -146,7 +167,6 @@ async def explain_signal(
         warnings = signal_agent_output.get("warnings", [])
         explanation = signal_agent_output.get("explanation", "")
 
-        # LLM section — only when LLM_ENABLED=true
         llm_output = None
         if os.getenv("LLM_ENABLED", "false").lower() in ("1", "true"):
             try:
@@ -201,13 +221,39 @@ async def explain_signal(
 
 # =========================================================
 # GET /agent/political-risk?ticker=X
-# Reads from snapshot cache _political key — no GDELT call
 # =========================================================
 
-@router.get("/political-risk")
+@router.get(
+    "/political-risk",
+    summary="Political Risk Score for Ticker",
+    description="""
+Returns geopolitical and macro risk score for a ticker's country (US default).
+
+Reads from the snapshot cache `_political` key — no live GDELT call on cache hit.
+Falls back to live GDELT query if no snapshot is cached yet.
+
+**ticker** (required): Any ticker in the universe.
+
+**Response includes:**
+- `political_risk_score`: 0.0–1.0 (higher = more risk)
+- `political_risk_label`: LOW / MEDIUM / HIGH / CRITICAL
+- `top_events`: up to 5 recent geopolitical events
+- `served_from_cache`: true if read from snapshot, false if live GDELT call
+
+**Note:** GDELT may timeout in restricted network environments.
+If `top_events` is empty, GDELT timed out — score defaults to 0.0 (LOW).
+
+**Requires:** Owner or Demo authentication (counts against `agent` quota).
+""",
+    response_description="Political risk score and top geopolitical events.",
+)
 async def political_risk(
     request: Request,
-    ticker: str = Query(...),
+    ticker: str = Query(
+        ...,
+        description="Ticker symbol (e.g. AAPL). Used to determine country (US default).",
+        example="AAPL",
+    ),
 ):
     endpoint = "/agent/political-risk"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
@@ -224,7 +270,6 @@ async def political_risk(
             political = snapshot_result.get("_political", {})
 
         if not political:
-            # Live fallback when no snapshot cached yet
             from core.agent.political_risk_agent import PoliticalRiskAgent
             agent = PoliticalRiskAgent()
             political = agent.get_political_risk(ticker, country="US")
@@ -250,10 +295,23 @@ async def political_risk(
 
 # =========================================================
 # GET /agent/agents
-# FIX: Static response — no model inference call needed
 # =========================================================
 
-@router.get("/agents")
+@router.get(
+    "/agents",
+    summary="Agent Pipeline Descriptions",
+    description="""
+Returns static descriptions of all agents in the hybrid inference pipeline.
+No authentication required. No inference is run.
+
+**Agents:**
+- `signal_agent` (weight: 0.5): Interprets XGBoost scores into signals
+- `technical_risk_agent` (weight: 0.2): Evaluates momentum, RSI, EMA, volatility
+- `portfolio_decision_agent` (weight: 0.2): Aggregates signals into portfolio decisions
+- `political_risk_agent` (weight: 0.1): GDELT geopolitical risk detector
+""",
+    response_description="Static agent descriptions with weights.",
+)
 async def list_agents():
     return _success({
         "agents": {

@@ -1,6 +1,6 @@
 # =========================================================
-# UNIVERSE ROUTE v2.1
-# DB-Aware | CV-Optimized
+# UNIVERSE ROUTE v2.2
+# SWAGGER FIX: Added tags, summary, description
 # =========================================================
 
 import time
@@ -16,19 +16,26 @@ from core.logging.logger import get_logger
 
 logger = get_logger("marketsentinel.universe")
 
-router = APIRouter()
+router = APIRouter(tags=["universe"])
 
 
-# =========================================================
-# UNIVERSE INFO ENDPOINT
-# =========================================================
+@router.get(
+    "/universe",
+    summary="Stock Universe",
+    description="""
+Returns the current S&P 500 stock universe used by the inference pipeline.
 
-@router.get("/universe")
+**Response includes:**
+- `tickers`: list of all 100 ticker symbols (use these for equity, performance, agent endpoints)
+- `count`: number of tickers (should be 100)
+- `version`: universe config version
+- `universe_hash`: SHA256 hash of the ticker list
+
+**No authentication required.**
+""",
+    response_description="List of all universe tickers with version and hash.",
+)
 def universe_info():
-    """
-    Returns the current stock universe: tickers, version, hash.
-    """
-
     endpoint = "/universe"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()

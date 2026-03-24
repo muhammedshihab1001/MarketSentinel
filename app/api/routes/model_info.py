@@ -1,13 +1,12 @@
 # =========================================================
-# MODEL INFO ROUTE v2.5
+# MODEL INFO ROUTE v2.6
 #
-# FIX: All imports corrected (get_model_loader, loader.version,
-#      loader.model, loader.metadata)
-# NEW (item 60): GET /model/ic-stats — Information Coefficient
-#   monitoring endpoint. Computes Spearman IC between model's
-#   raw_model_score predictions and actual 1-day forward returns.
-#   IC > 0.05 is meaningful. IC < 0 means the model is predicting
-#   against actual moves. Exposed so you can track signal decay.
+# SWAGGER FIX v2.6:
+# - Added tags, summary, description to all routes
+# - ic-stats: clarified interpretation in description
+# - diagnostics: noted it requires owner role
+# - feature-importance: documented response key names
+#   (response uses "importance" array not "feature_importance")
 # =========================================================
 
 import asyncio
@@ -15,7 +14,7 @@ import time
 import logging
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from app.inference.model_loader import get_model_loader
 from core.schema.feature_schema import MODEL_FEATURES
@@ -25,7 +24,7 @@ from app.monitoring.metrics import (
     API_ERROR_COUNT,
 )
 
-router = APIRouter()
+router = APIRouter(tags=["model"])
 logger = logging.getLogger("marketsentinel.model_info")
 
 REQUEST_TIMEOUT = 20
@@ -35,12 +34,27 @@ model_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 
 # =========================================================
-# MODEL INFO  →  GET /model/info
+# GET /model/info
 # =========================================================
 
-@router.get("/info")
-async def model_info():
+@router.get(
+    "/info",
+    summary="Model Version Info",
+    description="""
+Returns metadata about the currently loaded XGBoost model.
 
+**Response includes:**
+- `model_version`: timestamp-based version string (e.g. `xgb_20260324_060707`)
+- `schema_signature`: SHA256 hash of the feature schema (64 chars)
+- `dataset_hash`: hash of the training dataset
+- `artifact_hash`: hash of the model pickle file
+- `feature_count`: number of features (should be 64)
+
+**No authentication required.**
+""",
+    response_description="Model version and integrity hashes.",
+)
+async def model_info():
     endpoint = "/model/info"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
@@ -67,7 +81,6 @@ async def model_info():
 
 
 def _model_info_sync():
-
     start_time = time.time()
     loader = get_model_loader()
     meta = loader.metadata or {}
@@ -86,12 +99,28 @@ def _model_info_sync():
 
 
 # =========================================================
-# FEATURE IMPORTANCE  →  GET /model/feature-importance
+# GET /model/feature-importance
 # =========================================================
 
-@router.get("/feature-importance")
-async def feature_importance():
+@router.get(
+    "/feature-importance",
+    summary="Feature Importance",
+    description="""
+Returns XGBoost feature importance (gain-based) for the loaded model.
 
+**Response key:** `importance` — array of `{feature, importance}` objects,
+sorted descending by importance score. Scores sum to 1.0.
+
+**Additional fields:**
+- `best_iteration`: boosting rounds used
+- `model_version`: which model produced these importances
+- `feature_checksum`: hash of the feature list
+
+**Requires:** Owner or Demo authentication (demo: counts against `signals` quota).
+""",
+    response_description="Feature importance array sorted by gain, descending.",
+)
+async def feature_importance():
     endpoint = "/model/feature-importance"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
@@ -118,7 +147,6 @@ async def feature_importance():
 
 
 def _feature_importance_sync():
-
     start_time = time.time()
     loader = get_model_loader()
     model = loader.model
@@ -136,7 +164,10 @@ def _feature_importance_sync():
             scores = model.model.get_score(importance_type="gain")
             total = sum(scores.values()) or 1.0
             importance = sorted(
-                [{"feature": f, "importance": round(v / total, 6)} for f, v in scores.items()],
+                [
+                    {"feature": f, "importance": round(v / total, 6)}
+                    for f, v in scores.items()
+                ],
                 key=lambda x: x["importance"],
                 reverse=True,
             )
@@ -147,7 +178,10 @@ def _feature_importance_sync():
         "model_version": loader.version or "unknown",
         "feature_checksum": meta.get("feature_checksum", "unknown"),
         "best_iteration": getattr(model, "best_iteration", None) if model else None,
-        "training_fingerprint": getattr(model, "training_fingerprint", None) if model else None,
+        "training_fingerprint": (
+            getattr(model, "training_fingerprint", None) if model else None
+        ),
+        "feature_count": len(importance),
         "importance": importance,
         "latency_ms": int((time.time() - start_time) * 1000),
         "timestamp": int(time.time()),
@@ -155,12 +189,28 @@ def _feature_importance_sync():
 
 
 # =========================================================
-# MODEL DIAGNOSTICS  →  GET /model/diagnostics
+# GET /model/diagnostics
 # =========================================================
 
-@router.get("/diagnostics")
-async def model_diagnostics() -> Dict[str, Any]:
+@router.get(
+    "/diagnostics",
+    summary="Model Diagnostics (Owner Only)",
+    description="""
+Returns full model diagnostics including all integrity checksums.
 
+**Owner only** — demo users and unauthenticated requests receive 403.
+
+**Response includes all checksums:**
+- `booster_checksum`: SHA256 of the raw XGBoost booster bytes
+- `param_checksum`: SHA256 of training hyperparameters
+- `feature_checksum`: SHA256 of the feature list
+- `training_fingerprint`: SHA256 of training data (X + y)
+- `best_iteration`: early stopping result
+- `training_cols`: number of features used in training
+""",
+    response_description="Full model diagnostics with all integrity hashes.",
+)
+async def model_diagnostics() -> Dict[str, Any]:
     endpoint = "/model/diagnostics"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
@@ -187,7 +237,6 @@ async def model_diagnostics() -> Dict[str, Any]:
 
 
 def _model_diagnostics_sync():
-
     start_time = time.time()
     loader = get_model_loader()
     model = loader.model
@@ -201,7 +250,9 @@ def _model_diagnostics_sync():
         "training_code_hash": meta.get("training_code_hash", "unknown"),
         "feature_checksum": meta.get("feature_checksum", "unknown"),
         "feature_count": len(MODEL_FEATURES),
-        "training_fingerprint": getattr(model, "training_fingerprint", None) if model else None,
+        "training_fingerprint": (
+            getattr(model, "training_fingerprint", None) if model else None
+        ),
         "training_cols": getattr(model, "training_cols", None) if model else None,
         "param_checksum": getattr(model, "param_checksum", None) if model else None,
         "booster_checksum": getattr(model, "booster_checksum", None) if model else None,
@@ -212,26 +263,43 @@ def _model_diagnostics_sync():
 
 
 # =========================================================
-# IC STATS  →  GET /model/ic-stats  (item 60)
-#
-# Information Coefficient monitoring.
-# Computes Spearman rank correlation between model's
-# raw_model_score predictions and actual 1-day forward returns.
-#
-# Interpretation:
-#   IC > 0.05  → meaningful predictive signal
-#   IC ≈ 0     → random (model not predicting direction)
-#   IC < 0     → model predicting against actual moves (decay)
-#
-# Reads stored predictions from PredictionRepository and
-# matches them against actual price returns from DB.
+# GET /model/ic-stats
 # =========================================================
 
-@router.get("/ic-stats")
-async def ic_stats(
-    days: int = Query(30, ge=5, le=252, description="Lookback days for IC calculation"),
-):
+@router.get(
+    "/ic-stats",
+    summary="Information Coefficient Stats (Owner Only)",
+    description="""
+Computes Spearman Information Coefficient (IC) between model predictions
+and actual 1-day forward returns. Measures how well the model predicts
+real price movements.
 
+**Owner only** — demo users receive 403.
+
+**Interpretation:**
+| IC | Signal Quality |
+|---|---|
+| > 0.08 | Strong — model has meaningful alpha |
+| 0.04–0.08 | Moderate — usable signal |
+| 0.02–0.04 | Weak — marginal signal |
+| < 0.02 | Noise — investigate model decay |
+
+**Requires:** `STORE_PREDICTIONS=1` in `.env` (default: enabled).
+IC is computed from stored prediction records — minimum 5 days needed.
+
+**days:** Lookback window for IC computation (5–252 trading days).
+""",
+    response_description="IC mean, std, t-stat, signal quality, and daily IC series.",
+)
+async def ic_stats(
+    days: int = Query(
+        default=30,
+        ge=5,
+        le=252,
+        description="Lookback days for IC calculation (5–252)",
+        example=30,
+    ),
+):
     endpoint = "/model/ic-stats"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
@@ -258,24 +326,12 @@ async def ic_stats(
 
 
 def _ic_stats_sync(days: int) -> Dict[str, Any]:
-    """
-    Compute Information Coefficient from stored predictions + actual returns.
-
-    Steps:
-    1. Load stored predictions from PredictionRepository
-    2. Load actual price data for the same tickers + dates
-    3. Compute 1-day forward return for each ticker-date
-    4. Spearman rank correlation between raw_model_score and forward_return
-    5. Return per-day IC and rolling stats
-    """
-
     import pandas as pd
     import numpy as np
     from scipy import stats as scipy_stats
 
     start_time = time.time()
 
-    # ── Step 1: Load stored predictions ───────────────────
     try:
         from core.db.repository import PredictionRepository
         import datetime
@@ -292,7 +348,10 @@ def _ic_stats_sync(days: int) -> Dict[str, Any]:
         if not ic_rows:
             return {
                 "status": "no_predictions",
-                "message": "No stored predictions found. Predictions are stored when STORE_PREDICTIONS=1.",
+                "message": (
+                    "No stored predictions found. "
+                    "Ensure STORE_PREDICTIONS=1 in .env."
+                ),
                 "ic_mean": None,
                 "ic_std": None,
                 "ic_t_stat": None,
@@ -315,7 +374,6 @@ def _ic_stats_sync(days: int) -> Dict[str, Any]:
             "latency_ms": int((time.time() - start_time) * 1000),
         }
 
-    # ── Step 2: Load actual returns ────────────────────────
     try:
         from core.data.market_data_service import MarketDataService
 
@@ -333,7 +391,6 @@ def _ic_stats_sync(days: int) -> Dict[str, Any]:
             min_history=5,
         )
 
-        # Build forward returns DataFrame
         return_frames = []
         for ticker, df in (price_map or {}).items():
             if df is None or df.empty:
@@ -342,8 +399,12 @@ def _ic_stats_sync(days: int) -> Dict[str, Any]:
             s = df[["date", col]].copy().rename(columns={col: "close"})
             s["ticker"] = ticker
             s["date"] = pd.to_datetime(s["date"]).dt.date.astype(str)
-            s["forward_return"] = s["close"].pct_change().shift(-1).clip(-0.5, 0.5)
-            return_frames.append(s[["date", "ticker", "forward_return"]].dropna())
+            s["forward_return"] = (
+                s["close"].pct_change().shift(-1).clip(-0.5, 0.5)
+            )
+            return_frames.append(
+                s[["date", "ticker", "forward_return"]].dropna()
+            )
 
         if not return_frames:
             raise RuntimeError("No price data for IC computation")
@@ -362,14 +423,13 @@ def _ic_stats_sync(days: int) -> Dict[str, Any]:
             "latency_ms": int((time.time() - start_time) * 1000),
         }
 
-    # ── Step 3: Merge and compute IC per date ──────────────
     predictions["date"] = predictions["date"].astype(str)
     merged = predictions.merge(actual_returns, on=["date", "ticker"], how="inner")
 
     if len(merged) < 10:
         return {
             "status": "insufficient_data",
-            "message": f"Only {len(merged)} matched prediction-return pairs. Need >= 10.",
+            "message": f"Only {len(merged)} matched pairs. Need >= 10.",
             "ic_mean": None,
             "ic_std": None,
             "daily_ic": [],
@@ -377,9 +437,7 @@ def _ic_stats_sync(days: int) -> Dict[str, Any]:
             "latency_ms": int((time.time() - start_time) * 1000),
         }
 
-    # ── Step 4: Spearman IC per date ──────────────────────
     daily_ic = []
-
     for date, group in merged.groupby("date"):
         if len(group) < 5:
             continue
@@ -411,15 +469,11 @@ def _ic_stats_sync(days: int) -> Dict[str, Any]:
     ic_values = [row["ic"] for row in daily_ic]
     ic_mean = float(np.mean(ic_values))
     ic_std = float(np.std(ic_values, ddof=1)) if len(ic_values) > 1 else 0.0
-
-    # t-stat: tests if IC is significantly different from 0
     ic_t_stat = (
         float(ic_mean / (ic_std / np.sqrt(len(ic_values)) + 1e-9))
-        if ic_std > 0
-        else 0.0
+        if ic_std > 0 else 0.0
     )
 
-    # Signal quality label
     if abs(ic_mean) >= 0.08:
         signal_quality = "strong"
     elif abs(ic_mean) >= 0.04:
@@ -440,10 +494,10 @@ def _ic_stats_sync(days: int) -> Dict[str, Any]:
         "ic_t_stat": round(ic_t_stat, 4),
         "signal_quality": signal_quality,
         "interpretation": {
-            "strong":   "IC > 0.08: strong predictive signal",
+            "strong": "IC > 0.08: strong predictive signal",
             "moderate": "IC 0.04-0.08: meaningful signal",
-            "weak":     "IC 0.02-0.04: weak signal",
-            "noise":    "IC < 0.02: near-random, investigate model",
+            "weak": "IC 0.02-0.04: weak signal",
+            "noise": "IC < 0.02: near-random, investigate model",
         }[signal_quality],
         "daily_ic": sorted(daily_ic, key=lambda x: x["date"], reverse=True),
         "latency_ms": int((time.time() - start_time) * 1000),

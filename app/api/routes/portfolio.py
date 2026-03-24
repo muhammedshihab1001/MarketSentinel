@@ -1,25 +1,19 @@
 # =========================================================
-# PORTFOLIO SUMMARY ROUTE v2.5
+# PORTFOLIO SUMMARY ROUTE v2.6
 #
-# Changes from v2.4:
-# FIX 1: gross_exposure and net_exposure now read from the
-#         executive_summary block of the cached snapshot —
-#         they were previously always 0 because the old
-#         pipeline didn't include them in the result dict.
-# FIX 2: positions list now built from snapshot signals
-#         with correct signal direction derived from weight.
-# FIX 3: portfolio_health_score derived from drift severity
-#         and exposure scale when no portfolio agent output.
-# FIX 4: top_5_preview built from executive_summary.top_5_tickers.
-# FIX 5: approved_trades / rejected_trades counts from
-#         portfolio agent output when available.
+# SWAGGER FIX v2.6:
+# BUG FIX: get_portfolio(request=None) was using optional
+#   Request which caused AttributeError when FastAPI
+#   injected the real Request object. Changed to proper
+#   FastAPI dependency injection: get_portfolio(request: Request).
+# SWAGGER: Added summary, description, response_description
+#   so the endpoint is fully documented in /docs.
 # =========================================================
 
 import time
 import logging
-import os
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from app.monitoring.metrics import (
@@ -31,7 +25,7 @@ from core.logging.logger import get_logger
 
 logger = get_logger("marketsentinel.portfolio")
 
-router = APIRouter()
+router = APIRouter(tags=["portfolio"])
 
 BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
 
@@ -45,10 +39,6 @@ def _weight_to_signal(weight: float) -> str:
 
 
 def _drift_to_health(drift_state: str, severity_score: int) -> float:
-    """
-    Derive a 0-100 portfolio health score from drift state.
-    Used when portfolio agent doesn't return an explicit score.
-    """
     if drift_state == "hard":
         return max(0.0, 40.0 - severity_score * 2)
     if drift_state == "soft":
@@ -56,19 +46,30 @@ def _drift_to_health(drift_state: str, severity_score: int) -> float:
     return 92.0
 
 
-@router.get("/portfolio")
-async def get_portfolio(request=None):
+@router.get(
+    "/portfolio",
+    summary="Portfolio Summary",
+    description="""
+Returns the current portfolio state derived from the latest background snapshot.
+
+**Requires authentication** (owner or demo — demo gets 3 requests before lock).
+
+Returns:
+- `positions`: all 100 tickers with weight and signal direction (LONG/SHORT/NEUTRAL)
+- `top_5_preview`: highest-scoring tickers this snapshot
+- `gross_exposure` / `net_exposure`: portfolio exposure metrics
+- `drift_state`: current model drift (none/low/moderate/high/critical)
+- `portfolio_health_score`: 0-100 score derived from drift + exposure
+
+**503** = background snapshot is still computing (~90s on first load).
+Wait and retry — the snapshot cache refreshes every 300s.
+""",
+    response_description="Portfolio summary with positions, exposure, and health score.",
+)
+async def get_portfolio(request: Request):
     """
     Returns portfolio summary derived from the latest background snapshot.
-
-    Response shape:
-        snapshot_date, gross_exposure, net_exposure,
-        long_count, short_count, neutral_count,
-        approved_trades, rejected_trades,
-        drift_detected, drift_state,
-        portfolio_health_score,
-        positions: [{ ticker, weight, signal }],
-        top_5_preview: [{ ticker, score, weight }]
+    Returns 503 if no snapshot is cached yet (computing takes ~90s on first load).
     """
     endpoint = "/portfolio"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
@@ -76,14 +77,9 @@ async def get_portfolio(request=None):
 
     try:
         # ── Get cache from app state ──────────────────
-        cache = None
-        if request is not None:
-            try:
-                cache = request.app.state.cache
-            except AttributeError:
-                pass
-
-        if cache is None:
+        try:
+            cache = request.app.state.cache
+        except AttributeError:
             from app.inference.cache import RedisCache
             cache = RedisCache()
 
@@ -93,11 +89,14 @@ async def get_portfolio(request=None):
         if not snapshot_result:
             raise HTTPException(
                 status_code=503,
-                detail="No snapshot available yet. Background compute is pending.",
+                detail=(
+                    "No snapshot available yet. "
+                    "Background compute is pending (~90s on first load). "
+                    "Retry in 30 seconds."
+                ),
             )
 
         # ── Extract data from snapshot result ─────────
-        meta = snapshot_result.get("meta", {})
         exec_summary = snapshot_result.get("executive_summary", {})
         snapshot = snapshot_result.get("snapshot", {})
         portfolio_agent = snapshot_result.get("_portfolio", {})
@@ -109,7 +108,6 @@ async def get_portfolio(request=None):
         drift_detected = drift.get("drift_detected", False)
         severity_score = int(drift.get("severity_score", 0))
 
-        # ── FIX: Read gross/net from executive_summary ─
         gross_exposure = float(exec_summary.get("gross_exposure", 0.0))
         net_exposure = float(exec_summary.get("net_exposure", 0.0))
 
@@ -136,10 +134,9 @@ async def get_portfolio(request=None):
                 "signal": direction,
             })
 
-        # Sort by abs weight descending
         positions.sort(key=lambda x: abs(x["weight"]), reverse=True)
 
-        # ── FIX: top_5_preview from executive_summary ─
+        # ── top_5_preview ─────────────────────────────
         top_5_tickers = exec_summary.get("top_5_tickers", [])
         ticker_score_map = {
             s["ticker"]: s.get("hybrid_consensus_score", s.get("raw_model_score", 0.0))
@@ -156,14 +153,15 @@ async def get_portfolio(request=None):
             for t in top_5_tickers
         ]
 
-        # ── FIX: portfolio_health_score ───────────────
+        # ── portfolio_health_score ────────────────────
         if portfolio_agent and "score" in portfolio_agent:
             health_score = round(float(portfolio_agent["score"]) * 100, 1)
         else:
             health_score = round(_drift_to_health(drift_state, severity_score), 1)
 
-        # ── Approved / rejected trades ────────────────
-        approved_trades = portfolio_agent.get("approved_trades", long_count + short_count)
+        approved_trades = portfolio_agent.get(
+            "approved_trades", long_count + short_count
+        )
         rejected_trades = portfolio_agent.get("rejected_trades", 0)
 
         return {

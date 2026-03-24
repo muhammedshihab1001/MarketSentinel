@@ -1,20 +1,6 @@
 # =========================================================
-# DRIFT STATUS ROUTE v2.7
-#
-# FIX v2.7: Route changed from @router.get("") back to
-#   @router.get("/drift") because main.py includes this
-#   router WITHOUT a prefix:
-#     app.include_router(drift.router)   ← no prefix=
-#   FastAPI raises FastAPIError when BOTH prefix and path
-#   are empty. Since main.py has no prefix, the route
-#   path itself must carry "/drift".
-#
-# All other fixes from v2.6 retained:
-#   - cache.ping() not cache.enabled
-#   - get_model_loader() not get_shared_model_loader()
-#   - loader.version / loader.metadata not loader.xgb_version
-#   - trigger.evaluate(int) not trigger.evaluate(dict)
-#   - snapshot["snapshot"]["drift"] not snapshot["drift"]
+# DRIFT STATUS ROUTE v2.8
+# SWAGGER FIX: Added tags, summary, description
 # =========================================================
 
 import asyncio
@@ -36,7 +22,7 @@ from app.monitoring.metrics import (
     API_ERROR_COUNT,
 )
 
-router = APIRouter()
+router = APIRouter(tags=["drift"])
 logger = get_logger("marketsentinel.drift")
 
 REQUEST_TIMEOUT = 60
@@ -46,10 +32,6 @@ BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
 
 drift_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-
-# =========================================================
-# BASELINE META
-# =========================================================
 
 def _get_baseline_meta() -> dict:
     try:
@@ -83,15 +65,7 @@ def _get_baseline_meta() -> dict:
         }
 
 
-# =========================================================
-# CACHE READ
-# =========================================================
-
 def _drift_from_cache(cache):
-    """
-    Read drift block from background snapshot.
-    Returns (drift_dict, full_snapshot) or None.
-    """
     try:
         if not cache.ping():
             return None
@@ -108,7 +82,6 @@ def _drift_from_cache(cache):
         )
 
         if drift and isinstance(drift, dict) and "drift_state" in drift:
-            logger.info("Drift served from background snapshot cache")
             return drift, snapshot_result
 
         return None
@@ -118,15 +91,9 @@ def _drift_from_cache(cache):
         return None
 
 
-# =========================================================
-# SYNC HANDLER
-# =========================================================
-
 def _drift_status_sync(cache) -> dict:
-
     start_time = time.time()
 
-    # Model loader attributes
     model_version = ""
     schema_signature = ""
     artifact_hash = ""
@@ -143,7 +110,6 @@ def _drift_status_sync(cache) -> dict:
     except Exception as e:
         logger.debug("Model loader unavailable for drift: %s", e)
 
-    # Try cache fast path
     cache_result = _drift_from_cache(cache)
     served_from_cache = False
     snapshot_date = "unknown"
@@ -153,9 +119,7 @@ def _drift_status_sync(cache) -> dict:
         drift_result, snapshot_result = cache_result
         served_from_cache = True
         snapshot_date = (
-            snapshot_result
-            .get("snapshot", {})
-            .get("snapshot_date", "unknown")
+            snapshot_result.get("snapshot", {}).get("snapshot_date", "unknown")
         )
     else:
         logger.info("Drift cache miss — reading from DriftDetector.health()")
@@ -183,7 +147,6 @@ def _drift_status_sync(cache) -> dict:
 
     severity_score = int(drift_result.get("severity_score", 0))
 
-    # RetrainTrigger
     retrain_required = False
     cooldown_remaining_seconds = 0
     cooldown_active = False
@@ -221,21 +184,31 @@ def _drift_status_sync(cache) -> dict:
     }
 
 
-# =========================================================
-# GET /drift
-# FIX v2.7: Path is "/drift" not "" because main.py does
-#   app.include_router(drift.router) with NO prefix.
-#   Both prefix="" and path="" → FastAPIError on startup.
-# =========================================================
+@router.get(
+    "/drift",
+    summary="Model Drift State",
+    description="""
+Returns the current model drift state and retrain trigger status.
 
-@router.get("/drift")
+**severity_score:** Integer 0–15. NOT a percentage. Display as `"7 / 15"`.
+| Score | State | Meaning |
+|---|---|---|
+| 0–4 | none/low | Model stable |
+| 5–8 | moderate | Monitor closely |
+| 9–12 | high | Consider retraining |
+| 13–15 | critical | Retrain immediately |
+
+**drift_state:** `none` | `low` | `moderate` | `high` | `critical` | `unavailable`
+
+**retrain_required:** True when severity_score >= DRIFT_RETRAIN_THRESHOLD (default: 8)
+
+**baseline_exists:** False = no baseline.json on disk. Run training to create one.
+
+**Requires:** Owner or Demo authentication (counts against `drift` quota).
+""",
+    response_description="Drift state, severity score, retrain trigger, and baseline info.",
+)
 async def get_drift(request: Request):
-    """
-    Returns current model drift state and retrain trigger status.
-
-    severity_score: integer 0-15 — NOT a percentage.
-    drift_state: none | low | moderate | high | critical | unavailable
-    """
     endpoint = "/drift"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
@@ -266,7 +239,11 @@ async def get_drift(request: Request):
         API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
 
 
-@router.get("/drift-status")
+@router.get(
+    "/drift-status",
+    summary="Drift Status (alias)",
+    description="Backward compatibility alias for GET /drift.",
+    include_in_schema=False,
+)
 async def drift_status(request: Request):
-    """Backward compat alias for GET /drift."""
     return await get_drift(request)

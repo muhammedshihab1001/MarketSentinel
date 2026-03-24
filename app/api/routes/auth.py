@@ -1,8 +1,11 @@
 # =========================================================
-# AUTH ROUTES v2.2
-# FIX: create_demo_token(fingerprint) — was passing wrong args
-# FIX: verify_owner_credentials → authenticate_owner (correct name)
-# FIX: decode_token now exists in jwt_handler v1.1
+# AUTH ROUTES v2.3
+#
+# SWAGGER FIX: Added Pydantic request body models so
+#   /auth/owner-login and /auth/demo-login show input
+#   fields in Swagger UI instead of raw JSON textarea.
+#   Previously used request.json() directly which gives
+#   Swagger no schema to render.
 # =========================================================
 
 import logging
@@ -11,6 +14,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from app.core.auth.jwt_handler import (
     create_owner_token,
@@ -22,10 +26,10 @@ from app.core.auth.demo_tracker import DemoTracker
 
 logger = logging.getLogger("marketsentinel.auth")
 
-router = APIRouter()
+router = APIRouter(tags=["auth"])
 
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "shihab")
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() in ("true", "1")
 COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
 
 TRACKED_FEATURES = [
@@ -37,6 +41,44 @@ TRACKED_FEATURES = [
     "signals",
 ]
 
+
+# =========================================================
+# REQUEST BODY MODELS
+# =========================================================
+
+class OwnerLoginRequest(BaseModel):
+    username: str = Field(
+        ...,
+        example="shihab",
+        description="Owner username set in OWNER_USERNAME env var",
+    )
+    password: str = Field(
+        ...,
+        example="your_password",
+        description="Owner password (plaintext — compared against bcrypt hash)",
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "username": "shihab",
+                "password": "your_password",
+            }
+        }
+
+
+class DemoLoginRequest(BaseModel):
+    """
+    No body fields required. Fingerprint is derived from IP + User-Agent.
+    Submit an empty JSON body {} or leave body empty.
+    """
+    class Config:
+        json_schema_extra = {"example": {}}
+
+
+# =========================================================
+# HELPERS
+# =========================================================
 
 def _get_client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for")
@@ -59,15 +101,26 @@ def _get_tracker(request: Request) -> DemoTracker:
 # POST /auth/owner-login
 # =========================================================
 
-@router.post("/auth/owner-login")
-async def owner_login(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"detail": "Invalid JSON body"})
+@router.post(
+    "/auth/owner-login",
+    summary="Owner Login",
+    description="""
+Authenticate as owner. Returns an httpOnly JWT cookie (`ms_token`).
 
-    username = body.get("username", "").strip()
-    password = body.get("password", "").strip()
+**Steps in Swagger:**
+1. Click **Try it out**
+2. Enter your username and password in the request body
+3. Click **Execute**
+4. The `ms_token` cookie is set automatically — all subsequent
+   Swagger requests will use it for authentication.
+
+Owner role unlocks: `/admin/*`, `/model/ic-stats`, `/model/diagnostics`.
+""",
+    response_description="Sets ms_token cookie. Returns role and username.",
+)
+async def owner_login(body: OwnerLoginRequest, request: Request):
+    username = body.username.strip()
+    password = body.password.strip()
 
     if not username or not password:
         return JSONResponse(
@@ -75,10 +128,12 @@ async def owner_login(request: Request):
             content={"detail": "username and password are required"},
         )
 
-    # FIX: use authenticate_owner directly — no more verify_owner_credentials
     if not authenticate_owner(username, password):
         logger.warning("Owner login failed | username=%s", username)
-        return JSONResponse(status_code=401, content={"detail": "Invalid credentials"})
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid credentials"},
+        )
 
     token = create_owner_token(username)
 
@@ -107,8 +162,26 @@ async def owner_login(request: Request):
 # POST /auth/demo-login
 # =========================================================
 
-@router.post("/auth/demo-login")
-async def demo_login(request: Request):
+@router.post(
+    "/auth/demo-login",
+    summary="Demo Login",
+    description="""
+Start a demo session. No credentials required.
+
+Fingerprint is derived from your IP + User-Agent and persists for 7 days.
+Demo accounts get **3 requests per feature group** before being locked.
+
+Feature groups:
+- `snapshot` — /snapshot, /predict/live-snapshot
+- `portfolio` — /portfolio
+- `drift` — /drift
+- `performance` — /performance
+- `agent` — /agent/explain, /agent/political-risk
+- `signals` — /equity, /model/feature-importance
+""",
+    response_description="Sets ms_token cookie. Returns usage summary.",
+)
+async def demo_login(request: Request, body: DemoLoginRequest = None):
     ip = _get_client_ip(request)
     ua = request.headers.get("user-agent", "")
     fingerprint = DemoTracker.build_fingerprint(ip, ua)
@@ -116,9 +189,7 @@ async def demo_login(request: Request):
     tracker = _get_tracker(request)
     tracker.register(fingerprint)
 
-    # FIX: create_demo_token takes fingerprint only — ip_hash is optional
     token = create_demo_token(fingerprint)
-
     summary = tracker.get_usage_summary(fingerprint, TRACKED_FEATURES)
 
     resp = JSONResponse(content={
@@ -145,7 +216,17 @@ async def demo_login(request: Request):
 # GET /auth/me
 # =========================================================
 
-@router.get("/auth/me")
+@router.get(
+    "/auth/me",
+    summary="Current User",
+    description="""
+Returns current authentication state from the `ms_token` cookie.
+
+- **Owner**: returns role, username, usage=null
+- **Demo**: returns role, usage summary with per-feature request counts
+- **Unauthenticated**: returns authenticated=false
+""",
+)
 async def get_me(request: Request):
     token = request.cookies.get("ms_token")
 
@@ -186,7 +267,11 @@ async def get_me(request: Request):
 # POST /auth/logout
 # =========================================================
 
-@router.post("/auth/logout")
+@router.post(
+    "/auth/logout",
+    summary="Logout",
+    description="Clears the `ms_token` cookie. Works for both owner and demo sessions.",
+)
 async def logout():
     resp = JSONResponse(content={"logged_out": True})
     resp.delete_cookie(
