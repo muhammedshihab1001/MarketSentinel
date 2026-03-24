@@ -1,13 +1,13 @@
 """
-MarketSentinel v4.6.0
+MarketSentinel v4.7.0
 
 Feature engineering pipeline for ML model training and inference.
 
-FIX (item 57): Added FeatureRepository caching to build_feature_pipeline().
-  - On inference: checks DB cache first (keyed by schema_signature + date range)
-  - On cache miss: runs full pipeline, stores result to DB
-  - Cache skip: training=True always bypasses cache (fresh features for training)
-  - Speedup: ~35s cold → ~2s warm on repeated inference calls
+Changes from v4.6.0:
+  FIX (item 57): FeatureRepository caching — inference 35s → ~2s warm.
+  NEW (item 61): regime_multiplier from MarketRegimeDetector added as
+    XGBoost feature. Gives model explicit market context:
+    BULL=1.2, SIDEWAYS=1.0, BEAR=0.6, CRISIS=0.3
 """
 
 import logging
@@ -159,7 +159,10 @@ class FeatureEngineer:
             .shift(1)
         ).fillna(0).clip(-3, 3)
 
+        ########################################################
         # LIQUIDITY FEATURES
+        ########################################################
+
         df["volume"] = df["volume"].clip(lower=cls.MIN_VOLUME)
 
         df["volume_mean_20"] = (
@@ -183,7 +186,10 @@ class FeatureEngineer:
         ).fillna(0)
         df["amihud"] = np.log1p(df["amihud"] * 1e6).clip(0, 20)
 
+        ########################################################
         # RSI
+        ########################################################
+
         try:
             df["rsi"] = (
                 grouped["close"]
@@ -198,7 +204,10 @@ class FeatureEngineer:
 
         df["rsi"] = df["rsi"].clip(0, 100)
 
+        ########################################################
         # EMA FEATURES
+        ########################################################
+
         df["ema_10"] = grouped["close"].transform(
             lambda x: x.ewm(span=10, adjust=False).mean()
         )
@@ -207,7 +216,10 @@ class FeatureEngineer:
         )
         df["ema_ratio"] = (df["ema_10"] / (df["ema_50"] + cls.EPSILON)).clip(0.5, 1.5)
 
+        ########################################################
         # LONG TERM TREND
+        ########################################################
+
         rolling_high = (
             grouped["close"]
             .transform(lambda x: x.rolling(252, min_periods=60).max())
@@ -217,7 +229,10 @@ class FeatureEngineer:
             (df["close"] / (rolling_high + cls.EPSILON)) - 1
         ).clip(-1, 0)
 
+        ########################################################
         # VOL REGIME
+        ########################################################
+
         vol_mean = grouped["volatility"].transform(
             lambda x: x.rolling(60, min_periods=20).mean()
         )
@@ -231,6 +246,32 @@ class FeatureEngineer:
         df["momentum_regime_interaction"] = (
             df["momentum_composite"] * df["regime_feature"]
         ).clip(-5, 5)
+
+        ########################################################
+        # REGIME MULTIPLIER  (item 61)
+        #
+        # MarketRegimeDetector classifies each date into:
+        #   BULL=1.2, SIDEWAYS=1.0, BEAR=0.6, CRISIS=0.3
+        # Gives XGBoost explicit market context it cannot derive
+        # from individual ticker features alone.
+        # Fails safe — fills with 1.0 (SIDEWAYS) on any error.
+        ########################################################
+
+        try:
+            from core.monitoring.market_regime_detector import MarketRegimeDetector
+            detector = MarketRegimeDetector()
+            df = detector.add_regime_feature(df)
+
+        except Exception as e:
+            logger.warning(
+                "regime_multiplier feature failed (non-blocking): %s", e
+            )
+            if "regime_multiplier" not in df.columns:
+                df["regime_multiplier"] = np.float32(1.0)
+            if "regime" not in df.columns:
+                df["regime"] = "SIDEWAYS"
+            if "market_regime" not in df.columns:
+                df["market_regime"] = "SIDEWAYS"
 
         return df
 
@@ -325,16 +366,14 @@ class FeatureEngineer:
         return df.reset_index(drop=True)
 
     ############################################################
-    # PIPELINE (item 57: FeatureRepository caching)
+    # PIPELINE
     #
-    # On training=True:  always run full pipeline (no cache read/write)
-    # On training=False: check DB cache first, run pipeline on miss,
-    #                    store result to DB for next call.
+    # item 57: FeatureRepository caching
+    #   training=True  → always fresh, never cached
+    #   training=False → check DB cache first, compute on miss,
+    #                    store to DB for next call
     #
-    # Cache key = schema_signature (changes when MODEL_FEATURES changes)
-    # + date range of the input data.
-    #
-    # Speedup: 35s cold → ~2s warm on repeated inference calls.
+    # item 61: regime_multiplier added inside add_core_features()
     ############################################################
 
     @classmethod
@@ -348,27 +387,29 @@ class FeatureEngineer:
             df = cls.finalize(df)
 
             logger.info(
-                "Feature pipeline complete (training) | rows=%d tickers=%d features=%d",
-                len(df), df["ticker"].nunique(),
+                "Feature pipeline complete (training) | "
+                "rows=%d tickers=%d features=%d",
+                len(df),
+                df["ticker"].nunique(),
                 len([c for c in df.columns if c in MODEL_FEATURES]),
             )
 
             return df
 
         # ── Inference: try cache first ─────────────────────────
+        feature_version = None
+
         try:
             from core.schema.feature_schema import get_schema_signature
             from core.db.repository import FeatureRepository
 
             feature_version = get_schema_signature()
 
-            # Determine date range from input
             tickers = price_df["ticker"].unique().tolist()
             dates = pd.to_datetime(price_df["date"], utc=True, errors="coerce")
             start_date = dates.min().date().isoformat()
             end_date = dates.max().date().isoformat()
 
-            # Cache read
             cached_df = FeatureRepository.get_features(
                 tickers=tickers,
                 start_date=start_date,
@@ -377,18 +418,19 @@ class FeatureEngineer:
             )
 
             if cached_df is not None and not cached_df.empty:
-                # Verify all required features present
                 missing = set(MODEL_FEATURES) - set(cached_df.columns)
                 if not missing:
                     logger.info(
                         "Feature cache HIT | rows=%d tickers=%d version=%s...",
-                        len(cached_df), cached_df["ticker"].nunique(),
+                        len(cached_df),
+                        cached_df["ticker"].nunique(),
                         feature_version[:8],
                     )
                     return cached_df
                 else:
                     logger.warning(
-                        "Feature cache partial miss — missing %d features, recomputing.",
+                        "Feature cache partial miss — %d features missing, "
+                        "recomputing.",
                         len(missing),
                     )
 
@@ -403,8 +445,10 @@ class FeatureEngineer:
         df = cls.finalize(df)
 
         logger.info(
-            "Feature pipeline complete (inference) | rows=%d tickers=%d features=%d",
-            len(df), df["ticker"].nunique(),
+            "Feature pipeline complete (inference) | "
+            "rows=%d tickers=%d features=%d",
+            len(df),
+            df["ticker"].nunique(),
             len([c for c in df.columns if c in MODEL_FEATURES]),
         )
 
@@ -418,9 +462,13 @@ class FeatureEngineer:
                 )
                 logger.info(
                     "Feature cache STORE | rows=%d stored=%d version=%s...",
-                    len(df), stored, feature_version[:8],
+                    len(df),
+                    stored,
+                    feature_version[:8],
                 )
             except Exception as e:
-                logger.warning("Feature cache store failed (non-blocking): %s", e)
+                logger.warning(
+                    "Feature cache store failed (non-blocking): %s", e
+                )
 
         return df
