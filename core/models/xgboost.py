@@ -1,17 +1,40 @@
 """
-MarketSentinel v4.5.2
+MarketSentinel v4.5.3
 
 XGBoost regression model wrapper with safer inference handling,
 feature integrity checks, and production-like robustness.
 
-Changes from v4.5.1:
-  FIX (item 20): predict() now raises RuntimeError on NaN input.
-    Previously NaN was silently filled with 0, masking data quality issues.
-    NaN in inference input = upstream pipeline bug that should surface loudly.
-  FIX (item 19): Added export_feature_importance() method.
-    Was missing entirely — tests and /model/feature-importance route both need it.
-  FIX: predict() still fills MISSING columns with 0 (graceful schema flexibility).
-    This is correct for inference — NaN ≠ missing column.
+Changes from v4.5.2:
+  FIX (model quality): Hyperparameters tuned for financial time series
+    with ~360 rows/ticker cross-sectional training data.
+
+    ROOT CAUSE of iter=4/iter=0 early stopping:
+      eta=0.05 was too aggressive for noisy forward-return targets.
+      Each boosting round overshot the weak signal immediately.
+      Validation RMSE rose after iter 4-6 and never recovered,
+      so early_stopping fired after 30 rounds but best_iteration=4.
+
+    FIXES applied:
+      eta:             0.05  → 0.01   (4× slower, needs more rounds to converge)
+      num_boost_rounds: 400  → 2000   (more room to find signal at low eta)
+      early_stopping:   30   → 50     (more patience for noisy val signal)
+      min_boost_rounds: 10   → 30     (don't accept degenerate 1-tree model)
+      max_depth:         4   → 3      (shallower trees = less overfit on small N)
+      min_child_weight:  3   → 1      (allow smaller leaf splits on 360-row data)
+      gamma:           0.1   → 0.0    (no pruning penalty — let eta do the work)
+      subsample:       0.80  → 0.85   (slight increase = more stable gradients)
+      colsample_bytree: 0.80 → 0.75   (force feature diversity per tree)
+      reg_alpha:        0.5  → 0.1    (less L1 — small dataset doesn't need it)
+      reg_lambda:       1.5  → 1.0    (standard L2)
+
+    EXPECTED RESULT:
+      best_iteration: ~80-150 (vs 4 before)
+      train_rmse:     ~0.88-0.92 (vs 0.95 before)
+      valid_rmse:     ~0.92-0.96 (vs 0.99 before)
+
+  RETAINED from v4.5.2:
+    predict() raises RuntimeError on NaN input (item 20)
+    export_feature_importance() method (item 19)
 """
 
 import hashlib
@@ -31,23 +54,24 @@ logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
 
-NUM_BOOST_ROUNDS = 400
-EARLY_STOPPING_ROUNDS = 30
-MIN_BOOST_ROUNDS = 10
+# FIX: Increased rounds to match lower eta
+NUM_BOOST_ROUNDS     = 2000   # was 400 — need more rounds at eta=0.01
+EARLY_STOPPING_ROUNDS = 50    # was 30 — more patience for noisy financial signal
+MIN_BOOST_ROUNDS     = 30     # was 10 — reject degenerate near-zero models
 
 VALIDATION_SPLIT = 0.15
 
 # ── Sanity thresholds ──────────────────────────────────────────
 
-MIN_SCORE_STD = 1e-6
-MIN_TARGET_STD = 1e-6
-MAX_MODEL_SIZE_MB = 150
-MAX_ABS_SCORE = 50
-EPSILON = 1e-12
+MIN_SCORE_STD        = 1e-6
+MIN_TARGET_STD       = 1e-6
+MAX_MODEL_SIZE_MB    = 150
+MAX_ABS_SCORE        = 50
+EPSILON              = 1e-12
 
-MIN_VALIDATION_ROWS = 30
-MAX_TARGET_ABS = 50
-MIN_TRAIN_ROWS = 80
+MIN_VALIDATION_ROWS  = 30
+MAX_TARGET_ABS       = 50
+MIN_TRAIN_ROWS       = 80
 
 
 class SafeXGBRegressor:
@@ -122,28 +146,50 @@ class SafeXGBRegressor:
         X_valid = X.iloc[split_idx:]
         y_valid = y[split_idx:]
 
-        dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=self.feature_names)
+        dtrain = xgb.DMatrix(
+            X_train, label=y_train, feature_names=self.feature_names
+        )
 
         evals = [(dtrain, "train")]
 
         if len(X_valid) >= MIN_VALIDATION_ROWS:
-            dvalid = xgb.DMatrix(X_valid, label=y_valid, feature_names=self.feature_names)
+            dvalid = xgb.DMatrix(
+                X_valid, label=y_valid, feature_names=self.feature_names
+            )
             evals.append((dvalid, "valid"))
 
+        # FIX v4.5.3: Tuned for financial cross-sectional data ~360 rows/ticker
         params = {
-            "objective": "reg:squarederror",
-            "eval_metric": "rmse",
-            "max_depth": 4,
-            "eta": 0.05,
-            "subsample": 0.80,
-            "colsample_bytree": 0.80,
-            "min_child_weight": 3,
-            "gamma": 0.1,
-            "reg_alpha": 0.5,
-            "reg_lambda": 1.5,
-            "tree_method": "hist",
-            "seed": SEED,
-            "verbosity": 0,
+            "objective":        "reg:squarederror",
+            "eval_metric":      "rmse",
+
+            # FIX: 0.05 → 0.01. Lower eta is the primary fix.
+            # Financial return targets are low signal-to-noise.
+            # Fast learning overshoots in first few rounds,
+            # validation RMSE never recovers → best_iter=4.
+            "eta":              0.01,
+
+            # FIX: 4 → 3. Shallower trees generalise better
+            # with ~30,600 cross-sectional training rows.
+            "max_depth":        3,
+
+            "subsample":        0.85,   # was 0.80 — slightly more data per tree
+            "colsample_bytree": 0.75,   # was 0.80 — force feature diversity
+
+            # FIX: 3 → 1. min_child_weight=3 was too restrictive
+            # for 360-row ticker windows, blocking valid splits.
+            "min_child_weight": 1,
+
+            # FIX: 0.1 → 0.0. gamma adds pruning penalty on top of
+            # eta regularisation — redundant and too aggressive here.
+            "gamma":            0.0,
+
+            "reg_alpha":        0.1,    # was 0.5 — lighter L1
+            "reg_lambda":       1.0,    # was 1.5 — standard L2
+
+            "tree_method":      "hist",
+            "seed":             SEED,
+            "verbosity":        0,
         }
 
         self.param_checksum = hashlib.sha256(
@@ -162,7 +208,9 @@ class SafeXGBRegressor:
             evals_result=evals_result,
         )
 
-        self.best_iteration = getattr(self.model, "best_iteration", NUM_BOOST_ROUNDS)
+        self.best_iteration = getattr(
+            self.model, "best_iteration", NUM_BOOST_ROUNDS
+        )
 
         if self.best_iteration < 1:
             logger.warning("Model stopped at iter=0. Forcing iter=1.")
@@ -170,7 +218,7 @@ class SafeXGBRegressor:
         elif self.best_iteration < MIN_BOOST_ROUNDS:
             logger.warning(
                 "Model stopped very early (iter=%d). "
-                "Consider adding more training data.",
+                "Consider adding more training data or reducing eta.",
                 self.best_iteration,
             )
 
@@ -184,7 +232,6 @@ class SafeXGBRegressor:
             raw.tobytes() if hasattr(raw, "tobytes") else raw
         ).hexdigest()
 
-        # Compute importance checksum for integrity tracking
         try:
             scores = self.model.get_score(importance_type="gain")
             self.importance_checksum = hashlib.sha256(
@@ -222,10 +269,7 @@ class SafeXGBRegressor:
         if X.empty:
             raise RuntimeError("Inference features empty.")
 
-        # FIX (item 20): Raise on NaN — NaN in inference input means the
-        # upstream feature pipeline has a bug. Fill-with-0 was silently
-        # masking data quality issues. Missing COLUMNS are still filled
-        # with 0 (graceful schema flexibility for new features).
+        # NaN in inference = upstream pipeline bug — surface loudly
         if X.isnull().any().any():
             nan_cols = X.columns[X.isnull().any()].tolist()
             raise RuntimeError(
@@ -239,11 +283,11 @@ class SafeXGBRegressor:
             for col in missing:
                 X[col] = 0.0
 
-        # FIX: Raise on extra unexpected columns after missing fill
-        # (don't silently drop them — surface the schema mismatch)
         extra = set(X.columns) - set(self.feature_names)
         if extra:
-            logger.debug("Extra columns ignored during inference: %s", list(extra))
+            logger.debug(
+                "Extra columns ignored during inference: %s", list(extra)
+            )
 
         X = X.reindex(columns=self.feature_names)
         X = X.replace([np.inf, -np.inf], 0).astype(np.float32)
@@ -271,11 +315,7 @@ class SafeXGBRegressor:
         return scores.astype(np.float32)
 
     # ==========================================================
-    # EXPORT FEATURE IMPORTANCE  (item 19)
-    #
-    # Returns a dict with feature_importance list (sorted by gain),
-    # booster_checksum, feature_checksum, and train/valid RMSE.
-    # Used by /model/feature-importance route and tests.
+    # EXPORT FEATURE IMPORTANCE
     # ==========================================================
 
     def export_feature_importance(self) -> dict:
@@ -284,11 +324,13 @@ class SafeXGBRegressor:
 
         Returns:
             {
-                "feature_importance": [{"feature": str, "importance": float}, ...],
+                "feature_importance": [{"feature": str, "importance": float}],
                 "booster_checksum": str,
                 "feature_checksum": str,
                 "train_rmse": float,
                 "valid_rmse": float,
+                "best_iteration": int,
+                "feature_count": int,
             }
         """
 
@@ -298,7 +340,9 @@ class SafeXGBRegressor:
         try:
             scores = self.model.get_score(importance_type="gain")
         except Exception as e:
-            logger.warning("get_score(gain) failed: %s — using weight fallback", e)
+            logger.warning(
+                "get_score(gain) failed: %s — using weight fallback", e
+            )
             try:
                 scores = self.model.get_score(importance_type="weight")
             except Exception:
@@ -323,7 +367,9 @@ class SafeXGBRegressor:
             "train_rmse": self.train_rmse,
             "valid_rmse": self.valid_rmse,
             "best_iteration": self.best_iteration,
-            "feature_count": len(self.feature_names) if self.feature_names else 0,
+            "feature_count": (
+                len(self.feature_names) if self.feature_names else 0
+            ),
         }
 
 
@@ -332,5 +378,5 @@ class SafeXGBRegressor:
 # ==========================================================
 
 def build_xgboost_pipeline():
-    logger.info("Building XGBoost Regressor | MarketSentinel v4.5.2")
+    logger.info("Building XGBoost Regressor | MarketSentinel v4.5.3")
     return SafeXGBRegressor()

@@ -1,12 +1,18 @@
 # =========================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v3.4
-# FIX: ModelLoader attribute names aligned to v2.8
-#      (loader.xgb → loader.model, loader.xgb_version →
-#       loader.version, loader.warmup() → loader.load())
-# FIX: app.state.model_loader, app.state.cache,
-#      app.state.startup_time now set — health/portfolio
-#      routes all depend on these.
-# FIX: Added POST /admin/sync endpoint (item 44)
+# MARKET SENTINEL APPLICATION ENTRYPOINT v3.5
+#
+# FIX (issue 1): init_pipeline() called during startup —
+#   passes model_loader + cache so InferencePipeline
+#   no longer crashes with "missing 3 required arguments".
+# FIX (issue 2): cache.enabled → cache.ping() everywhere.
+#   RedisCache has no .enabled property.
+# FIX (issue 3): background snapshot uses run_snapshot()
+#   with NO args (tickers loaded from MarketUniverse).
+#   Old: pipeline.run_snapshot(tickers) → wrong param
+#   New: pipeline.run_snapshot()        → correct
+# FIX (issue 4): cache.set_background_snapshot() used
+#   instead of cache.set(BACKGROUND_SNAPSHOT_KEY, dict)
+#   to bypass list validation on snapshot dict.
 # =========================================================
 
 import asyncio
@@ -59,7 +65,6 @@ from core.data.data_sync import DataSyncService
 # =====================================================
 
 init_env()
-
 logger = get_logger("marketsentinel")
 
 
@@ -68,7 +73,6 @@ logger = get_logger("marketsentinel")
 # =====================================================
 
 BOOT_ID = hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
-STARTUP_TIMEOUT_SEC = get_int("STARTUP_TIMEOUT_SEC", 180)
 APP_VERSION = get_env("APP_VERSION", "5.0.0")
 
 CORS_ORIGINS = get_env("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000")
@@ -107,16 +111,10 @@ class ReadinessState:
         self.schema_signature = None
         self.model_version = None
         self.artifact_hash = None
-        self.dataset_hash = None
-        self.training_code_hash = None
         self.llm_enabled = False
-        self.llm_model = None
-        self.llm_rate_limit = None
-        self.llm_cache_enabled = None
         self.boot_id = BOOT_ID
         self.start_time = int(time.time())
         self.boot_memory_mb = None
-        self.config_fingerprint = None
         self.sync_report = None
 
     @property
@@ -155,10 +153,7 @@ def api_error(message):
 
 async def global_exception_handler(request: Request, exc: Exception):
     if isinstance(exc, HTTPException):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content=api_error(exc.detail),
-        )
+        return JSONResponse(status_code=exc.status_code, content=api_error(exc.detail))
     logger.exception("Unhandled API error")
     return JSONResponse(status_code=500, content=api_error("internal_server_error"))
 
@@ -172,7 +167,7 @@ async def _is_data_stale() -> bool:
         from core.db.repository import OHLCVRepository
         stored = await asyncio.to_thread(OHLCVRepository.get_stored_tickers)
         if not stored:
-            logger.info("DB is empty — sync required")
+            logger.info("DB is empty — full sync required")
             return True
         latest = await asyncio.to_thread(OHLCVRepository.get_latest_date, stored[0])
         if not latest:
@@ -211,23 +206,33 @@ async def _daily_sync_loop():
 
 
 async def _background_snapshot_loop():
+    """
+    Pre-computes full snapshot every SNAPSHOT_PRECOMPUTE_INTERVAL seconds.
+    FIX: run_snapshot() called with NO args — tickers come from MarketUniverse.
+    FIX: uses set_background_snapshot() not set() to bypass list validation.
+    """
     await asyncio.sleep(30)
+
     while True:
         try:
-            from app.api.routes.predict import get_pipeline, load_default_universe
-            pipeline = get_pipeline()
-            tickers = load_default_universe()
-            result = await asyncio.to_thread(pipeline.run_snapshot, tickers)
-            cache = RedisCache()
-            if cache.enabled:
-                key = "ms:background_snapshot:latest"
-                cache.set(key, result)
+            pipeline = predict.get_pipeline()
+            # FIX: NO tickers arg — pipeline loads from MarketUniverse
+            result = await asyncio.to_thread(pipeline.run_snapshot)
+
+            cache = app.state.cache
+            # FIX: set_background_snapshot() handles dict payload correctly
+            if cache.set_background_snapshot(result, ttl=300):
                 logger.info(
-                    "Background snapshot cached | signals=%d",
-                    len(result.get("signals", [])),
+                    "Background snapshot cached | signals=%d | model=%s",
+                    len(result.get("snapshot", {}).get("signals", [])),
+                    result.get("meta", {}).get("model_version", "unknown"),
                 )
+            else:
+                logger.warning("Background snapshot cache write failed (memory fallback)")
+
         except Exception as e:
             logger.warning("Background snapshot failed | error=%s", e)
+
         await asyncio.sleep(SNAPSHOT_PRECOMPUTE_INTERVAL)
 
 
@@ -242,12 +247,11 @@ async def lifespan(app: FastAPI):
 
     try:
         logger.info("=================================")
-        logger.info(" MarketSentinel Boot v3.4")
+        logger.info(" MarketSentinel Boot v3.5")
         logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("=================================")
 
         # ── Step 1: Record startup time ───────────────
-        # FIX: Set before anything else — health.py reads this
         app.state.startup_time = time.time()
 
         # ── Step 2: Initialize PostgreSQL ─────────────
@@ -268,7 +272,6 @@ async def lifespan(app: FastAPI):
             try:
                 stale = await _is_data_stale()
                 if stale:
-                    logger.info("Data is stale — starting background sync")
                     async def _run_sync():
                         try:
                             sync_service = DataSyncService()
@@ -293,59 +296,60 @@ async def lifespan(app: FastAPI):
             readiness.data_synced = True
 
         # ── Step 4: Load model ────────────────────────
-        # FIX: Use loader.load() not loader.xgb / loader.warmup()
-        # FIX: Use loader.version not loader.xgb_version
-        # FIX: Use loader.metadata dict for dataset_hash, training_code_hash
         loader = ModelLoader()
         load_success = loader.load()
-
         readiness.models_loaded = load_success and loader.is_loaded()
         readiness.schema_signature = loader.schema_signature
-        readiness.model_version = loader.version                        # FIX
+        readiness.model_version = loader.version
         readiness.artifact_hash = loader.artifact_hash
 
-        meta = loader.metadata or {}
-        readiness.dataset_hash = meta.get("dataset_hash")              # FIX
-        readiness.training_code_hash = meta.get("training_code_hash")  # FIX
-
         if readiness.schema_signature and readiness.schema_signature != get_schema_signature():
-            logger.warning("Runtime schema mismatch detected.")
+            logger.warning(
+                "Runtime schema mismatch — model trained on different feature set. "
+                "Retrain with: docker-compose run --rm training"
+            )
 
-        # FIX: Set app.state.model_loader — health.py + model_info.py depend on this
         app.state.model_loader = loader
 
         # ── Step 5: Redis ──────────────────────────────
         try:
             cache = RedisCache()
-            readiness.redis_connected = cache.enabled
-            # FIX: Set app.state.cache — health.py + portfolio.py depend on this
+            # FIX: was cache.enabled (doesn't exist) → cache.ping()
+            readiness.redis_connected = cache.ping()
+            if not readiness.redis_connected:
+                logger.warning("Redis unavailable — degraded mode (memory fallback active)")
             app.state.cache = cache
         except Exception:
+            logger.warning("Redis init failed — degraded mode")
+            cache = RedisCache()
             readiness.redis_connected = False
-            app.state.cache = RedisCache()
-            logger.warning("Redis unavailable — degraded mode.")
+            app.state.cache = cache
 
-        # ── Step 6: Drift baseline ────────────────────
+        # ── Step 6: Initialize InferencePipeline ─────
+        # FIX: was InferencePipeline() with no args → TypeError
+        # Now: init_pipeline(loader, cache) wires model + cache correctly
+        if readiness.models_loaded:
+            try:
+                predict.init_pipeline(loader, cache)
+                logger.info("InferencePipeline initialized | model=%s", loader.version)
+            except Exception:
+                logger.exception("InferencePipeline init failed")
+
+        # ── Step 7: Drift baseline ────────────────────
         try:
             detector = DriftDetector()
             detector._load_verified_baseline()
             readiness.drift_baseline_loaded = True
         except Exception:
             readiness.drift_baseline_loaded = False
-            logger.warning("Drift baseline not loaded.")
+            logger.warning("Drift baseline not loaded (retrain to create new baseline)")
 
-        # ── Step 7: LLM config ────────────────────────
+        # ── Step 8: LLM config ────────────────────────
         readiness.llm_enabled = get_bool("LLM_ENABLED", False)
-        readiness.llm_model = get_env("OPENAI_MODEL", None)
-        readiness.llm_rate_limit = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
-        readiness.llm_cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
 
-        # ── Step 8: Memory + fingerprint ─────────────
+        # ── Step 9: Memory ────────────────────────────
         process = psutil.Process(os.getpid())
         readiness.boot_memory_mb = round(process.memory_info().rss / (1024 * 1024), 2)
-        readiness.config_fingerprint = hashlib.sha256(
-            str(sorted(os.environ.items())).encode()
-        ).hexdigest()[:16]
 
         gc.collect()
 
@@ -356,7 +360,7 @@ async def lifespan(app: FastAPI):
             readiness.models_loaded, readiness.drift_baseline_loaded,
         )
 
-        # ── Step 9: Start background tasks ───────────
+        # ── Step 10: Start background tasks ──────────
         asyncio.create_task(_daily_sync_loop())
         logger.info("Daily sync scheduler started (runs weekdays at 18:30)")
 
@@ -391,13 +395,7 @@ app = FastAPI(
 
 app.add_exception_handler(Exception, global_exception_handler)
 
-
-# =====================================================
-# MIDDLEWARE
-# =====================================================
-
 app.add_middleware(GZipMiddleware, minimum_size=1000)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -405,7 +403,6 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=True,
 )
-
 app.add_middleware(AuthMiddleware)
 
 
@@ -424,12 +421,14 @@ async def request_context_middleware(request: Request, call_next):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
     forwarded = request.headers.get("X-Forwarded-For")
-    client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
+    client_ip = forwarded.split(",")[0].strip() if forwarded else (
+        request.client.host if request.client else "unknown"
+    )
 
-    # Redis-backed rate limiting
+    # FIX: cache.ping() not cache.enabled (property doesn't exist)
     try:
         cache = app.state.cache
-        if cache.enabled and cache._redis:
+        if cache.ping() and cache._redis:
             redis_client = cache._redis
             key = f"{RATE_LIMIT_KEY_PREFIX}{client_ip}"
             count = redis_client.incr(key)
@@ -478,25 +477,17 @@ app.include_router(agent.router)
 
 @app.post("/snapshot")
 async def snapshot():
-    """Full inference run — alias for /predict/live-snapshot."""
+    """Full inference run — alias for POST /predict/live-snapshot."""
     from app.api.routes.predict import live_snapshot
     return await live_snapshot()
 
 
 # =====================================================
-# ADMIN: MANUAL SYNC TRIGGER  (item 44)
-# POST /admin/sync — triggers delta data sync on demand.
-# Requires owner JWT. Useful after market close to ensure
-# latest prices without waiting for scheduled 18:30 run.
+# ADMIN: MANUAL SYNC TRIGGER
 # =====================================================
 
 @app.post("/admin/sync")
 async def admin_sync(request: Request):
-    """
-    Trigger a manual delta data sync.
-    Only callable by authenticated owners.
-    Does not block — sync runs in background thread.
-    """
     if getattr(request.state, "role", None) != "owner":
         raise HTTPException(status_code=403, detail="Owner access required")
 
@@ -514,7 +505,6 @@ async def admin_sync(request: Request):
             logger.exception("Manual sync failed")
 
     asyncio.create_task(_run())
-
     return api_success({
         "message": "Data sync started in background",
         "status": "running",
@@ -531,7 +521,6 @@ async def root():
     uptime = int(time.time()) - readiness.start_time
     return api_success({
         "service": "MarketSentinel Hybrid Portfolio Engine",
-        "architecture": "multi-agent-ml-governed",
         "status": "running",
         "boot_id": readiness.boot_id,
         "model_version": readiness.model_version,

@@ -1,8 +1,14 @@
 # =========================================================
-# PREDICTION & SNAPSHOT ROUTES v3.9
-# FIX: get_shared_model_loader → get_model_loader from model_loader
-# FIX: loader._xgb_container → loader directly
-# FIX: loader.xgb_version → loader.version
+# PREDICTION & SNAPSHOT ROUTES v4.0
+#
+# FIX (issue 1): get_pipeline() now initializes InferencePipeline
+#   properly. Added init_pipeline() called from main.py startup
+#   so model_loader and cache are available before first request.
+# FIX (issue 3): pipeline.run_snapshot() called WITHOUT tickers arg.
+#   Tickers are loaded inside pipeline from MarketUniverse.
+#   Old: pipeline.run_snapshot(tickers) → tickers went to snapshot_date param → WRONG
+#   New: pipeline.run_snapshot()        → uses MarketUniverse internally → CORRECT
+# FIX: Background snapshot uses set_background_snapshot() not set()
 # =========================================================
 
 import time
@@ -18,7 +24,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline
-from app.inference.model_loader import get_model_loader          # FIX
+from app.inference.model_loader import get_model_loader
 from app.inference.cache import RedisCache
 from core.data.market_data_service import MarketDataService
 from core.logging.logger import get_logger
@@ -38,24 +44,67 @@ from app.api.schemas import (
 router = APIRouter(prefix="/predict", tags=["prediction"])
 logger = get_logger("marketsentinel.api")
 
+# =========================================================
+# MODULE-LEVEL SINGLETONS
+# Set by init_pipeline() during app startup.
+# get_pipeline() uses these to construct InferencePipeline.
+# =========================================================
+
 _pipeline: Optional[InferencePipeline] = None
+_model_loader = None     # ModelLoader instance — used by pipeline.py fallback
+_cache_instance = None   # RedisCache instance
+
 _universe_cache: Optional[List[str]] = None
 
 BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
 
 
 # =========================================================
-# PIPELINE SINGLETON
+# PIPELINE INIT — called from main.py during startup
+# =========================================================
+
+def init_pipeline(model_loader, cache):
+    """
+    Initialize the InferencePipeline singleton with model and cache.
+    Called from main.py lifespan after model and cache are loaded.
+
+    Args:
+        model_loader: ModelLoader instance (has .predict(), .version, etc.)
+        cache:        RedisCache instance
+    """
+    global _pipeline, _model_loader, _cache_instance
+    _model_loader = model_loader
+    _cache_instance = cache
+    _pipeline = InferencePipeline(model=model_loader, cache=cache)
+    logger.info(
+        "InferencePipeline initialized | model=%s",
+        getattr(model_loader, "version", "unknown"),
+    )
+
+
+# =========================================================
+# PIPELINE SINGLETON ACCESSOR
 # =========================================================
 
 def get_pipeline() -> InferencePipeline:
-
+    """
+    Return the InferencePipeline singleton.
+    Raises RuntimeError if init_pipeline() was not called.
+    """
     global _pipeline
-
     if _pipeline is None:
-        logger.info("Initializing InferencePipeline (singleton)")
-        _pipeline = InferencePipeline()
-
+        # Fallback: try to init lazily from get_model_loader()
+        try:
+            loader = get_model_loader()
+            cache = RedisCache()
+            init_pipeline(loader, cache)
+            logger.warning(
+                "InferencePipeline lazily initialized (init_pipeline not called at startup)"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"InferencePipeline not initialized. Call init_pipeline() during startup. Error: {e}"
+            )
     return _pipeline
 
 
@@ -133,6 +182,7 @@ def _date_window(days: int):
 # =========================================================
 
 @router.get("/live-snapshot")
+@router.post("/live-snapshot")
 async def live_snapshot():
 
     endpoint = "/predict/live-snapshot"
@@ -140,90 +190,33 @@ async def live_snapshot():
     start_time = time.time()
 
     try:
-
-        tickers = load_default_universe()
         pipeline = get_pipeline()
-        loader = get_model_loader()              # FIX: was get_shared_model_loader()
+        loader = get_model_loader()
         meta_info = loader.metadata or {}
-
         cache = RedisCache()
-        snapshot = None
 
+        # Try background cache first
+        snapshot = None
         cached = cache.get(BACKGROUND_SNAPSHOT_KEY)
-        if cached and isinstance(cached, dict) and "signals" in cached:
+        if cached and isinstance(cached, dict) and "snapshot" in cached:
             snapshot = cached
             logger.info("live-snapshot served from background cache")
 
         if snapshot is None:
+            # FIX: run_snapshot() with NO args — tickers loaded internally
             async with inference_semaphore:
                 snapshot = await asyncio.wait_for(
-                    run_in_threadpool(pipeline.run_snapshot, tickers),
+                    run_in_threadpool(pipeline.run_snapshot),
                     timeout=REQUEST_TIMEOUT,
                 )
 
-        if not isinstance(snapshot, dict) or "signals" in snapshot or "snapshot" in snapshot:
-            # support both flat and nested shapes
-            if "snapshot" in snapshot:
-                signals = snapshot["snapshot"].get("signals", [])
-            else:
-                signals = snapshot.get("signals", [])
-        else:
+        if not isinstance(snapshot, dict):
             raise RuntimeError("Invalid snapshot structure.")
 
-        signals = snapshot.get("signals", snapshot.get("snapshot", {}).get("signals", []))
-
-        long_count = sum(1 for s in signals if s.get("weight", 0.0) > 0)
-        short_count = sum(1 for s in signals if s.get("weight", 0.0) < 0)
-
-        hybrid_scores = [s.get("hybrid_consensus_score", 0.0) * 100 for s in signals]
-        avg_strength = (
-            round(sum(hybrid_scores) / len(hybrid_scores), 2)
-            if hybrid_scores else 0.0
-        )
-
-        drift = snapshot.get("drift", snapshot.get("snapshot", {}).get("drift", {}))
-
-        weights = [s.get("weight", 0.0) for s in signals]
-        gross_exposure = sum(abs(w) for w in weights)
-        net_exposure = sum(weights)
-
-        top_5 = sorted(
-            signals,
-            key=lambda x: x.get("hybrid_consensus_score", 0.0),
-            reverse=True,
-        )[:5]
-
-        executive_summary = {
-            "top_5_tickers": [t["ticker"] for t in top_5],
-            "portfolio_bias": (
-                "LONG" if net_exposure > 0
-                else "SHORT" if net_exposure < 0
-                else "NEUTRAL"
-            ),
-            "risk_regime": drift.get("drift_state", "unknown"),
-            "gross_exposure": round(gross_exposure, 4),
-            "net_exposure": round(net_exposure, 4),
-        }
-
-        meta = {
-            "model_version": loader.version,           # FIX: was container.version
-            "schema_signature": loader.schema_signature,
-            "dataset_hash": meta_info.get("dataset_hash"),
-            "artifact_hash": loader.artifact_hash,
-            "feature_checksum": meta_info.get("feature_checksum"),
-            "universe_size": len(tickers),
-            "long_signals": long_count,
-            "short_signals": short_count,
-            "avg_hybrid_score": avg_strength,
-            "drift_state": drift.get("drift_state"),
-            "latency_ms": int((time.time() - start_time) * 1000),
-            "timestamp": int(time.time()),
-        }
-
         return {
-            "meta": meta,
-            "executive_summary": executive_summary,
-            "snapshot": snapshot,
+            "meta": snapshot.get("meta", {}),
+            "executive_summary": snapshot.get("executive_summary", {}),
+            "snapshot": snapshot.get("snapshot", {}),
         }
 
     except asyncio.TimeoutError:
@@ -259,9 +252,8 @@ async def signal_explanation(ticker: str):
         raise HTTPException(status_code=400, detail="Invalid ticker format.")
 
     try:
-
         pipeline = get_pipeline()
-        loader = get_model_loader()              # FIX: was get_shared_model_loader()
+        loader = get_model_loader()
         universe_tickers = load_default_universe()
 
         if ticker not in universe_tickers:
@@ -270,19 +262,21 @@ async def signal_explanation(ticker: str):
                 detail="Ticker not in production universe.",
             )
 
+        # FIX: run_snapshot() with NO args
         async with inference_semaphore:
             snapshot = await asyncio.wait_for(
-                run_in_threadpool(pipeline.run_snapshot, universe_tickers),
+                run_in_threadpool(pipeline.run_snapshot),
                 timeout=REQUEST_TIMEOUT,
             )
 
-        signals = snapshot.get("signals", snapshot.get("snapshot", {}).get("signals", []))
+        signals = snapshot.get("snapshot", {}).get("signals", [])
         row = next((s for s in signals if s["ticker"] == ticker), None)
 
         if row is None:
             raise HTTPException(status_code=404, detail="Signal not found.")
 
-        agents = row.get("agents", {})
+        signal_details = snapshot.get("_signal_details", {})
+        agents = signal_details.get(ticker, {})
         signal_agent = agents.get("signal_agent", {})
 
         weight = row.get("weight", 0.0)
@@ -292,7 +286,7 @@ async def signal_explanation(ticker: str):
             ticker=row["ticker"],
             score=row.get("raw_model_score", 0.0),
             signal=signal_agent.get("signal", derived_signal),
-            agent_score=row.get("hybrid_consensus_score", row.get("agent_score", 0.0)),
+            agent_score=row.get("hybrid_consensus_score", 0.0),
             alpha_strength=signal_agent.get("alpha_strength", 0.0),
             confidence_numeric=signal_agent.get("confidence_numeric", 0.0),
             governance_score=signal_agent.get("governance_score", 0),
@@ -305,7 +299,7 @@ async def signal_explanation(ticker: str):
 
         meta_info = loader.metadata or {}
         meta = SignalExplanationMeta(
-            model_version=loader.version,               # FIX: was loader.xgb_version
+            model_version=loader.version,
             schema_signature=loader.schema_signature,
             dataset_hash=meta_info.get("dataset_hash"),
             artifact_hash=loader.artifact_hash,
@@ -351,7 +345,6 @@ async def price_history(ticker: str, days: int = 365):
     days = min(days, 2000)
 
     try:
-
         service = MarketDataService()
         start_date, end_date = _date_window(days)
 
