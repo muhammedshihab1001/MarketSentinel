@@ -8,7 +8,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "45.4"
+# FIX (item 61): Bumped schema version — regime_multiplier added to CORE_FEATURES.
+# This invalidates all existing feature caches (correct behaviour).
+# After deploying, retrain: docker-compose run --rm -e SKIP_SYNC=1 training
+SCHEMA_VERSION = "45.5"
 
 LONG_PERCENTILE = 0.70
 SHORT_PERCENTILE = 0.30
@@ -37,6 +40,10 @@ CORE_FEATURES: Tuple[str, ...] = (
     "regime_feature",
     "market_dispersion",
     "breadth",
+    # NEW (item 61): Market regime multiplier from MarketRegimeDetector.
+    # BULL=1.2, SIDEWAYS=1.0, BEAR=0.6, CRISIS=0.3.
+    # Gives XGBoost explicit market context beyond individual ticker features.
+    "regime_multiplier",
 )
 
 BASE_CS_COLS: Tuple[str, ...] = (
@@ -109,10 +116,7 @@ def _check_forbidden_columns(df: pd.DataFrame, mode: str) -> None:
             continue
 
         if FORBIDDEN_REGEX.search(col):
-
-            raise RuntimeError(
-                f"Lookahead column detected: {col}"
-            )
+            raise RuntimeError(f"Lookahead column detected: {col}")
 
 
 def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
@@ -126,13 +130,10 @@ def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
         block = df[col]
 
         if isinstance(block, pd.DataFrame):
-
             series = pd.Series(block.iloc[:, 0].values, index=df.index)
             df = df.loc[:, ~df.columns.duplicated(keep="first")]
             df[col] = pd.to_numeric(series, errors="coerce")
-
         else:
-
             series = pd.Series(block.values, index=df.index)
             df[col] = pd.to_numeric(series, errors="coerce")
 
@@ -151,11 +152,7 @@ def _check_dtype_stability(df: pd.DataFrame) -> None:
     ]
 
     if bad:
-
-        logger.debug(
-            "Unexpected dtype detected: %s",
-            bad
-        )
+        logger.debug("Unexpected dtype detected: %s", bad)
 
 
 def _check_variance(df: pd.DataFrame):
@@ -165,22 +162,16 @@ def _check_variance(df: pd.DataFrame):
         var = df[col].var()
 
         if var < MIN_VARIANCE and col not in _logged_low_variance_core:
-
             logger.debug(
-                "Low variance feature detected: %s (var=%s)",
-                col,
-                var
+                "Low variance feature detected: %s (var=%s)", col, var
             )
-
             _logged_low_variance_core.add(col)
 
 
 def _fill_nan_defaults(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in df.columns:
-
         if df[col].isna().any():
-
             if col.endswith("_rank"):
                 df[col] = df[col].fillna(0.5)
             else:
@@ -190,7 +181,6 @@ def _fill_nan_defaults(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
-
     return df.loc[:, MODEL_FEATURES]
 
 
@@ -205,23 +195,17 @@ def validate_feature_schema(
         raise RuntimeError("Empty feature dataset.")
 
     if mode not in {"training", "inference", "strict_contract"}:
-        raise RuntimeError(
-            f"Unknown validation mode: {mode}"
-        )
+        raise RuntimeError(f"Unknown validation mode: {mode}")
 
     if mode == "training" and len(df) < MIN_ROWS_TRAINING:
-        raise RuntimeError(
-            "Dataset below minimum rows for training."
-        )
+        raise RuntimeError("Dataset below minimum rows for training.")
 
     _check_forbidden_columns(df, mode)
 
     missing_core = set(CORE_FEATURES) - set(df.columns)
 
     if missing_core:
-        raise RuntimeError(
-            f"Missing core features: {missing_core}"
-        )
+        raise RuntimeError(f"Missing core features: {missing_core}")
 
     feature_df = df.copy()
 
@@ -230,7 +214,6 @@ def validate_feature_schema(
         missing_all = set(MODEL_FEATURES) - set(feature_df.columns)
 
         if missing_all:
-
             raise RuntimeError(
                 f"Missing required features under strict contract: {missing_all}"
             )
@@ -240,20 +223,17 @@ def validate_feature_schema(
     elif mode == "inference":
 
         for col in MODEL_FEATURES:
-
             if col not in feature_df.columns:
-
                 if col not in _logged_missing_inference:
-
                     logger.warning(
-                        "Missing inference feature: %s (default inserted)",
-                        col
+                        "Missing inference feature: %s (default inserted)", col
                     )
-
                     _logged_missing_inference.add(col)
 
                 if col.endswith("_rank"):
                     feature_df[col] = 0.5
+                elif col == "regime_multiplier":
+                    feature_df[col] = 1.0   # safe default: SIDEWAYS
                 else:
                     feature_df[col] = 0.0
 
@@ -262,29 +242,18 @@ def validate_feature_schema(
     feature_df = _safe_numeric_block(feature_df)
 
     if mode == "inference":
-
         feature_df = _fill_nan_defaults(feature_df)
-
     else:
-
         if feature_df.isnull().any().any():
-
-            raise RuntimeError(
-                "NaN detected after schema validation."
-            )
+            raise RuntimeError("NaN detected after schema validation.")
 
     if not np.isfinite(feature_df.values).all():
-
-        raise RuntimeError(
-            "Non-finite values detected."
-        )
+        raise RuntimeError("Non-finite values detected.")
 
     _check_dtype_stability(feature_df)
-
     _check_variance(feature_df)
 
     feature_df = feature_df.loc[:, MODEL_FEATURES]
-
     feature_df = feature_df.clip(-1e9, 1e9)
 
     return feature_df.astype(DTYPE, copy=False)
@@ -303,14 +272,9 @@ def get_schema_signature() -> str:
         "feature_count": len(MODEL_FEATURES),
     }
 
-    canonical = json.dumps(
-        contract,
-        sort_keys=True
-    )
+    canonical = json.dumps(contract, sort_keys=True)
 
-    return hashlib.sha256(
-        canonical.encode()
-    ).hexdigest()
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def schema_snapshot() -> Dict:

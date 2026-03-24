@@ -5,6 +5,8 @@
 
 -r base.txt
 
+openai==1.30.5
+
 # ── High-performance async event loop ────────────────────
 # Used by uvicorn in inference.Dockerfile CMD
 # Linux / macOS only — not supported on Windows
