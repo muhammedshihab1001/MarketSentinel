@@ -1,8 +1,18 @@
 # =========================================================
-# PERFORMANCE ROUTE v2.4
-# FIX: PerformanceEngine uses evaluate(), not compute()
-#      evaluate() needs portfolio_df + forward_returns format.
-#      We compute simple daily returns from close prices instead.
+# PERFORMANCE ROUTE v2.5
+#
+# FIX (item 58): Now wired to PerformanceEngine.evaluate()
+#   instead of the previous hand-rolled _compute_metrics().
+#   PerformanceEngine provides: rolling Sharpe, beta,
+#   tracking error, drawdown duration, information ratio,
+#   sortino, calmar — all missing from the old version.
+#
+# How it works:
+#   1. Load price data from DB for requested tickers + window
+#   2. Build equal-weight portfolio_df (date, ticker, weight=1/N)
+#   3. Compute forward_returns (next-day return per ticker)
+#   4. Call PerformanceEngine.evaluate(portfolio_df, forward_returns)
+#   5. Return full PerformanceReport as JSON
 # =========================================================
 
 import pandas as pd
@@ -14,6 +24,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from core.data.market_data_service import MarketDataService
 from core.market.universe import MarketUniverse
+from core.analytics.performance_engine import PerformanceEngine
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
@@ -26,71 +37,68 @@ logger = get_logger("marketsentinel.performance")
 router = APIRouter()
 
 TRADING_DAYS = 252
-EPSILON = 1e-12
 
 
 def _date_window(days: int):
-    """Compute start/end date strings from lookback days."""
     end = pd.Timestamp.now(tz="UTC")
-    start = end - pd.Timedelta(days=days + 30)
+    # Fetch extra days so we have enough for forward return calculation
+    start = end - pd.Timedelta(days=days + 60)
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 
-def _compute_metrics(close_series: pd.Series) -> dict:
+def _build_inputs(price_map: dict, days: int):
     """
-    Compute performance metrics directly from a close price series.
-    PerformanceEngine.evaluate() requires portfolio_df + forward_returns
-    which we don't have here — so we compute metrics directly.
+    Build portfolio_df and forward_returns from price data.
+
+    portfolio_df:    date, ticker, weight (equal weight = 1/N)
+    forward_returns: date, ticker, forward_return (next day return)
     """
 
-    close_series = close_series.dropna()
+    close_frames = []
 
-    if len(close_series) < 5:
-        raise RuntimeError("Insufficient price data for metrics computation")
+    for ticker, df in price_map.items():
+        if df is None or df.empty:
+            continue
+        col = "close" if "close" in df.columns else "Close"
+        if col not in df.columns:
+            continue
+        s = df[["date", col]].copy().rename(columns={col: "close"})
+        s["ticker"] = ticker
+        s = s.tail(days + 10)  # keep extra for forward return shift
+        close_frames.append(s)
 
-    daily_returns = close_series.pct_change().dropna()
-    daily_returns = daily_returns.clip(-0.5, 0.5)
+    if not close_frames:
+        return None, None
 
-    # Cumulative return
-    equity = (1 + daily_returns).cumprod()
-    cumulative_return = float(equity.iloc[-1] - 1.0)
+    prices = pd.concat(close_frames, ignore_index=True)
+    prices["date"] = pd.to_datetime(prices["date"], utc=True).dt.normalize()
+    prices = prices.sort_values(["ticker", "date"])
 
-    # Sharpe ratio
-    std = daily_returns.std(ddof=1)
-    sharpe = float((daily_returns.mean() / (std + EPSILON)) * np.sqrt(TRADING_DAYS))
+    # Forward return = next-day price change
+    prices["forward_return"] = (
+        prices.groupby("ticker")["close"]
+        .pct_change()
+        .shift(-1)          # shift back so today's row has tomorrow's return
+        .clip(-0.5, 0.5)
+    )
 
-    # Sortino ratio
-    downside = daily_returns[daily_returns < 0]
-    downside_std = downside.std(ddof=1) if len(downside) > 1 else 0.0
-    sortino = float((daily_returns.mean() / (downside_std + EPSILON)) * np.sqrt(TRADING_DAYS))
+    # Drop the last date per ticker (no forward return)
+    prices = prices.dropna(subset=["forward_return"])
 
-    # Max drawdown
-    rolling_max = equity.cummax()
-    drawdown = (equity - rolling_max) / (rolling_max + EPSILON)
-    max_drawdown = float(drawdown.min())
+    # Trim to requested window
+    all_dates = prices["date"].drop_duplicates().sort_values()
+    if len(all_dates) > days:
+        cutoff = all_dates.iloc[-days]
+        prices = prices[prices["date"] >= cutoff]
 
-    # Annualised volatility
-    volatility_ann = float(std * np.sqrt(TRADING_DAYS))
+    # Equal weight = 1 / number of tickers present on each date
+    n_per_date = prices.groupby("date")["ticker"].transform("count")
+    prices["weight"] = 1.0 / n_per_date
 
-    # Annualised return
-    years = len(daily_returns) / TRADING_DAYS
-    ann_return = float((1 + cumulative_return) ** (1.0 / max(years, 0.01)) - 1.0) if cumulative_return > -1 else -1.0
+    portfolio_df = prices[["date", "ticker", "weight"]].copy()
+    forward_returns = prices[["date", "ticker", "forward_return"]].copy()
 
-    # Calmar ratio
-    calmar = float(ann_return / abs(max_drawdown)) if abs(max_drawdown) > EPSILON else 0.0
-
-    # Win rate (hit rate)
-    win_rate = float((daily_returns > 0).mean())
-
-    return {
-        "cumulative_return": round(cumulative_return, 6),
-        "sharpe_ratio": round(sharpe, 4),
-        "sortino_ratio": round(sortino, 4),
-        "calmar_ratio": round(calmar, 4),
-        "max_drawdown": round(max_drawdown, 6),
-        "volatility_ann": round(volatility_ann, 6),
-        "win_rate": round(win_rate, 4),
-    }
+    return portfolio_df, forward_returns
 
 
 # =========================================================
@@ -119,7 +127,7 @@ async def performance_summary(tickers: str = "", days: int = 252):
         else:
             ticker_list = all_tickers
 
-        def _fetch_and_compute():
+        def _fetch_and_evaluate():
             svc = MarketDataService()
             start_date, end_date = _date_window(days)
 
@@ -134,49 +142,41 @@ async def performance_summary(tickers: str = "", days: int = 252):
             if not price_map:
                 return None, errors
 
-            # Build equal-weight portfolio daily returns
-            close_series_list = []
-            for t, df in price_map.items():
-                if df is not None and not df.empty:
-                    col = "close" if "close" in df.columns else "Close"
-                    if col in df.columns:
-                        s = df[col].tail(days)
-                        if len(s) > 5:
-                            close_series_list.append(s.pct_change().dropna())
+            portfolio_df, forward_returns = _build_inputs(price_map, days)
 
-            if not close_series_list:
+            if portfolio_df is None or portfolio_df.empty:
                 return None, errors
 
-            # Equal-weight average daily return across tickers
-            close_matrix = pd.concat(close_series_list, axis=1).dropna(how="all")
-            portfolio_returns = close_matrix.mean(axis=1)
+            # FIX (item 58): Use PerformanceEngine.evaluate() — full institutional metrics
+            engine = PerformanceEngine()
+            report = engine.evaluate(
+                portfolio_df=portfolio_df,
+                forward_returns=forward_returns,
+                benchmark_returns=None,  # no benchmark — equal-weight universe is the portfolio
+            )
 
-            # Rebuild close series from returns for metric computation
-            synthetic_close = (1 + portfolio_returns).cumprod()
+            return report.to_dict(), errors
 
-            metrics = _compute_metrics(synthetic_close)
-            return metrics, errors
+        result_dict, errors = await run_in_threadpool(_fetch_and_evaluate)
 
-        result_metrics, errors = await run_in_threadpool(_fetch_and_compute)
-
-        if result_metrics is None:
+        if result_dict is None:
             raise HTTPException(
                 status_code=503,
                 detail="No price data available for performance computation",
             )
 
-        result = {
+        response = {
             "tickers_requested": len(ticker_list),
             "tickers_computed": len(ticker_list) - len(errors),
             "lookback_days": days,
             "data_source": "postgresql",
-            "metrics": result_metrics,
+            "metrics": result_dict,
         }
 
         if errors:
-            result["fetch_errors"] = errors
+            response["fetch_errors"] = errors
 
-        return result
+        return response
 
     except HTTPException:
         raise
@@ -214,7 +214,7 @@ async def ticker_performance(ticker: str, days: int = 252):
                 detail=f"Ticker '{ticker}' not in universe",
             )
 
-        def _fetch_and_compute():
+        def _fetch_and_evaluate():
             svc = MarketDataService()
             start_date, end_date = _date_window(days)
 
@@ -229,13 +229,34 @@ async def ticker_performance(ticker: str, days: int = 252):
             if df is None or df.empty:
                 return None
 
+            # Build single-ticker portfolio (weight = 1.0)
             col = "close" if "close" in df.columns else "Close"
-            close = df[col].tail(days)
-            return _compute_metrics(close)
+            prices = df[["date", col]].copy().rename(columns={col: "close"})
+            prices["ticker"] = ticker
+            prices["date"] = pd.to_datetime(prices["date"], utc=True).dt.normalize()
+            prices = prices.sort_values("date").tail(days + 10)
 
-        metrics = await run_in_threadpool(_fetch_and_compute)
+            prices["forward_return"] = (
+                prices["close"].pct_change().shift(-1).clip(-0.5, 0.5)
+            )
+            prices = prices.dropna(subset=["forward_return"])
+            prices["weight"] = 1.0
 
-        if metrics is None:
+            portfolio_df = prices[["date", "ticker", "weight"]].copy()
+            forward_returns = prices[["date", "ticker", "forward_return"]].copy()
+
+            engine = PerformanceEngine()
+            report = engine.evaluate(
+                portfolio_df=portfolio_df,
+                forward_returns=forward_returns,
+                benchmark_returns=None,
+            )
+
+            return report.to_dict()
+
+        result_dict = await run_in_threadpool(_fetch_and_evaluate)
+
+        if result_dict is None:
             raise HTTPException(
                 status_code=503,
                 detail=f"No price data available for {ticker}",
@@ -245,7 +266,7 @@ async def ticker_performance(ticker: str, days: int = 252):
             "ticker": ticker,
             "lookback_days": days,
             "data_source": "postgresql",
-            "metrics": metrics,
+            "metrics": result_dict,
         }
 
     except HTTPException:
