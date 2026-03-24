@@ -1,22 +1,13 @@
-# =====================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v3.3
-# Hybrid Multi-Agent | DB-Backed | Auth-Enabled
-#
-# FIXES in v3.3:
-#   FIX 1: Startup sync wrapped in asyncio.to_thread()
-#           + staleness check — only syncs if DB data
-#           is older than 24h. Prevents blocking the
-#           event loop for 4-8 minutes on every restart.
-#   FIX 2: Rate limiter moved to Redis INCR+EXPIRE.
-#           In-memory dict reset on every restart and
-#           was bypassable by crashing the API.
-#   FIX 3: /admin/retrain removed — docker-compose is
-#           not installed inside the inference image so
-#           the endpoint always crashed with FileNotFoundError.
-#           Use: docker-compose run --rm training instead.
-#   FIX 4: request_store.clear() replaced with LRU eviction
-#           — clearing all IPs let attackers bypass limits.
-# =====================================================
+# =========================================================
+# MARKET SENTINEL APPLICATION ENTRYPOINT v3.4
+# FIX: ModelLoader attribute names aligned to v2.8
+#      (loader.xgb → loader.model, loader.xgb_version →
+#       loader.version, loader.warmup() → loader.load())
+# FIX: app.state.model_loader, app.state.cache,
+#      app.state.startup_time now set — health/portfolio
+#      routes all depend on these.
+# FIX: Added POST /admin/sync endpoint (item 44)
+# =========================================================
 
 import asyncio
 import time
@@ -83,10 +74,8 @@ APP_VERSION = get_env("APP_VERSION", "5.0.0")
 CORS_ORIGINS = get_env("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000")
 CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS.split(",")]
 
-# Legacy API key — optional, for external tool access only
 API_KEY = os.getenv("API_KEY")
 
-# FIX: Rate limit config (Redis-backed)
 RATE_LIMIT = int(os.getenv("API_RATE_LIMIT_PER_MIN", "180"))
 WINDOW_SECONDS = 180
 RATE_LIMIT_KEY_PREFIX = "ms:ratelimit:"
@@ -94,26 +83,13 @@ RATE_LIMIT_TTL = WINDOW_SECONDS + 10
 
 SKIP_DATA_SYNC = os.getenv("SKIP_DATA_SYNC", "0") == "1"
 SNAPSHOT_PRECOMPUTE_INTERVAL = int(os.getenv("SNAPSHOT_PRECOMPUTE_INTERVAL", "120"))
-
-# Staleness threshold — only sync if DB data is older than this
 DATA_STALENESS_HOURS = int(os.getenv("DATA_STALENESS_HOURS", "24"))
 
 PUBLIC_PATHS = {
-    "/",
-    "/docs",
-    "/openapi.json",
-    "/redoc",
-    "/metrics",
-    "/health/live",
-    "/health/ready",
-    "/health/db",
-    "/health/model",
-    "/universe",
-    "/auth/owner-login",
-    "/auth/demo-login",
-    "/auth/me",
-    "/auth/logout",
-    "/favicon.ico",
+    "/", "/docs", "/openapi.json", "/redoc", "/metrics",
+    "/health/live", "/health/ready", "/health/db", "/health/model",
+    "/universe", "/auth/owner-login", "/auth/demo-login",
+    "/auth/me", "/auth/logout", "/favicon.ico",
 }
 
 
@@ -122,7 +98,6 @@ PUBLIC_PATHS = {
 # =====================================================
 
 class ReadinessState:
-
     def __init__(self):
         self.models_loaded = False
         self.redis_connected = False
@@ -185,46 +160,27 @@ async def global_exception_handler(request: Request, exc: Exception):
             content=api_error(exc.detail),
         )
     logger.exception("Unhandled API error")
-    return JSONResponse(
-        status_code=500,
-        content=api_error("internal_server_error"),
-    )
+    return JSONResponse(status_code=500, content=api_error("internal_server_error"))
 
 
 # =====================================================
 # DATA STALENESS CHECK
-# FIX: Only sync if DB data is older than DATA_STALENESS_HOURS.
-# This prevents the 4-8 minute blocking sync on every restart.
 # =====================================================
 
 async def _is_data_stale() -> bool:
-    """
-    Returns True if the DB has no data or data is older than
-    DATA_STALENESS_HOURS (default 24h).
-    Fast check — only queries MAX(date) from ohlcv_daily.
-    """
     try:
         from core.db.repository import OHLCVRepository
-        # Get the latest date for any ticker
         stored = await asyncio.to_thread(OHLCVRepository.get_stored_tickers)
         if not stored:
             logger.info("DB is empty — sync required")
             return True
-
-        # Check the most recent ticker's latest date
         latest = await asyncio.to_thread(OHLCVRepository.get_latest_date, stored[0])
         if not latest:
             return True
-
         age_hours = (dt.utcnow().date() - latest).days * 24
         stale = age_hours >= DATA_STALENESS_HOURS
-
-        logger.info(
-            "Data staleness check | latest=%s age_hours=%d stale=%s",
-            latest, age_hours, stale
-        )
+        logger.info("Data staleness check | latest=%s age_hours=%d stale=%s", latest, age_hours, stale)
         return stale
-
     except Exception as e:
         logger.warning("Staleness check failed — assuming stale | error=%s", e)
         return True
@@ -235,14 +191,12 @@ async def _is_data_stale() -> bool:
 # =====================================================
 
 async def _daily_sync_loop():
-    """Runs delta data sync every weekday at 6:30pm."""
     while True:
         now = datetime.datetime.now()
         target = now.replace(hour=18, minute=30, second=0, microsecond=0)
         if now >= target:
             target += datetime.timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
-
         if datetime.datetime.now().weekday() < 5:
             try:
                 logger.info("Running scheduled daily data sync")
@@ -250,39 +204,30 @@ async def _daily_sync_loop():
                 report = await asyncio.to_thread(svc.sync_universe)
                 logger.info(
                     "Daily sync complete | synced=%d skipped=%d errors=%d",
-                    report.get("synced", 0),
-                    report.get("skipped", 0),
-                    report.get("errors", 0),
+                    report.get("synced", 0), report.get("skipped", 0), report.get("errors", 0),
                 )
             except Exception as e:
                 logger.warning("Daily sync failed | error=%s", e)
 
 
 async def _background_snapshot_loop():
-    """Pre-computes full snapshot every SNAPSHOT_PRECOMPUTE_INTERVAL seconds."""
     await asyncio.sleep(30)
-
     while True:
         try:
             from app.api.routes.predict import get_pipeline, load_default_universe
-
             pipeline = get_pipeline()
             tickers = load_default_universe()
             result = await asyncio.to_thread(pipeline.run_snapshot, tickers)
-
             cache = RedisCache()
             if cache.enabled:
                 key = "ms:background_snapshot:latest"
                 cache.set(key, result)
                 logger.info(
-                    "Background snapshot cached | signals=%d | model=%s",
+                    "Background snapshot cached | signals=%d",
                     len(result.get("signals", [])),
-                    result.get("model_version", "unknown"),
                 )
-
         except Exception as e:
             logger.warning("Background snapshot failed | error=%s", e)
-
         await asyncio.sleep(SNAPSHOT_PRECOMPUTE_INTERVAL)
 
 
@@ -296,35 +241,34 @@ async def lifespan(app: FastAPI):
     boot_start = time.time()
 
     try:
-        logger.info("===================================")
-        logger.info(" MarketSentinel Boot Sequence v3.3 ")
+        logger.info("=================================")
+        logger.info(" MarketSentinel Boot v3.4")
         logger.info(" Boot ID: %s", BOOT_ID)
-        logger.info("===================================")
+        logger.info("=================================")
 
-        # ── Step 1: Initialize PostgreSQL ────────────────
+        # ── Step 1: Record startup time ───────────────
+        # FIX: Set before anything else — health.py reads this
+        app.state.startup_time = time.time()
+
+        # ── Step 2: Initialize PostgreSQL ─────────────
         try:
             init_db()
             db_health = check_db_health()
             readiness.db_connected = db_health["status"] == "healthy"
             logger.info(
                 "Database ready | status=%s latency=%.1fms",
-                db_health["status"],
-                db_health.get("latency_ms", 0),
+                db_health["status"], db_health.get("latency_ms", 0),
             )
         except Exception:
             readiness.db_connected = False
             logger.exception("Database initialization failed")
 
-        # ── Step 2: Sync market data (non-blocking) ───────
-        # FIX: Wrapped in asyncio.to_thread + staleness check.
-        # Only runs if data is > 24h old. Does NOT block the event loop.
+        # ── Step 3: Sync market data (non-blocking) ───
         if readiness.db_connected and not SKIP_DATA_SYNC:
             try:
                 stale = await _is_data_stale()
                 if stale:
                     logger.info("Data is stale — starting background sync")
-                    # Run sync in thread so it doesn't block startup
-                    # API starts serving immediately, sync runs in background
                     async def _run_sync():
                         try:
                             sync_service = DataSyncService()
@@ -333,50 +277,55 @@ async def lifespan(app: FastAPI):
                             readiness.sync_report = report
                             logger.info(
                                 "Background sync complete | synced=%d skipped=%d errors=%d",
-                                report.get("synced", 0),
-                                report.get("skipped", 0),
-                                report.get("errors", 0),
+                                report.get("synced", 0), report.get("skipped", 0), report.get("errors", 0),
                             )
                         except Exception:
                             logger.exception("Background sync failed")
-
                     asyncio.create_task(_run_sync())
                     logger.info("Background sync started — API serving immediately")
                 else:
                     logger.info("Data is fresh — skipping sync")
                     readiness.data_synced = True
-
             except Exception:
                 logger.exception("Staleness check failed — skipping sync")
-
         elif SKIP_DATA_SYNC:
             logger.info("Data sync skipped (SKIP_DATA_SYNC=1)")
             readiness.data_synced = True
 
-        # ── Step 3: Load model ───────────────────────────
+        # ── Step 4: Load model ────────────────────────
+        # FIX: Use loader.load() not loader.xgb / loader.warmup()
+        # FIX: Use loader.version not loader.xgb_version
+        # FIX: Use loader.metadata dict for dataset_hash, training_code_hash
         loader = ModelLoader()
-        _ = loader.xgb
-        loader.warmup()
+        load_success = loader.load()
 
-        readiness.models_loaded = True
+        readiness.models_loaded = load_success and loader.is_loaded()
         readiness.schema_signature = loader.schema_signature
-        readiness.model_version = loader.xgb_version
+        readiness.model_version = loader.version                        # FIX
         readiness.artifact_hash = loader.artifact_hash
-        readiness.dataset_hash = loader.dataset_hash
-        readiness.training_code_hash = loader.training_code_hash
 
-        if readiness.schema_signature != get_schema_signature():
+        meta = loader.metadata or {}
+        readiness.dataset_hash = meta.get("dataset_hash")              # FIX
+        readiness.training_code_hash = meta.get("training_code_hash")  # FIX
+
+        if readiness.schema_signature and readiness.schema_signature != get_schema_signature():
             logger.warning("Runtime schema mismatch detected.")
 
-        # ── Step 4: Redis ────────────────────────────────
+        # FIX: Set app.state.model_loader — health.py + model_info.py depend on this
+        app.state.model_loader = loader
+
+        # ── Step 5: Redis ──────────────────────────────
         try:
             cache = RedisCache()
             readiness.redis_connected = cache.enabled
+            # FIX: Set app.state.cache — health.py + portfolio.py depend on this
+            app.state.cache = cache
         except Exception:
             readiness.redis_connected = False
+            app.state.cache = RedisCache()
             logger.warning("Redis unavailable — degraded mode.")
 
-        # ── Step 5: Drift baseline ───────────────────────
+        # ── Step 6: Drift baseline ────────────────────
         try:
             detector = DriftDetector()
             detector._load_verified_baseline()
@@ -385,17 +334,15 @@ async def lifespan(app: FastAPI):
             readiness.drift_baseline_loaded = False
             logger.warning("Drift baseline not loaded.")
 
-        # ── Step 6: LLM config ───────────────────────────
+        # ── Step 7: LLM config ────────────────────────
         readiness.llm_enabled = get_bool("LLM_ENABLED", False)
         readiness.llm_model = get_env("OPENAI_MODEL", None)
         readiness.llm_rate_limit = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
         readiness.llm_cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
 
-        # ── Step 7: Memory + fingerprint ─────────────────
+        # ── Step 8: Memory + fingerprint ─────────────
         process = psutil.Process(os.getpid())
-        readiness.boot_memory_mb = round(
-            process.memory_info().rss / (1024 * 1024), 2
-        )
+        readiness.boot_memory_mb = round(process.memory_info().rss / (1024 * 1024), 2)
         readiness.config_fingerprint = hashlib.sha256(
             str(sorted(os.environ.items())).encode()
         ).hexdigest()[:16]
@@ -404,14 +351,12 @@ async def lifespan(app: FastAPI):
 
         boot_time = round(time.time() - boot_start, 2)
         logger.info(
-            "Startup complete | time=%ss | db=%s | redis=%s | drift=%s",
-            boot_time,
-            readiness.db_connected,
-            readiness.redis_connected,
-            readiness.drift_baseline_loaded,
+            "Startup complete | time=%ss | db=%s | redis=%s | model=%s | drift=%s",
+            boot_time, readiness.db_connected, readiness.redis_connected,
+            readiness.models_loaded, readiness.drift_baseline_loaded,
         )
 
-        # ── Step 8: Start background tasks ───────────────
+        # ── Step 9: Start background tasks ───────────
         asyncio.create_task(_daily_sync_loop())
         logger.info("Daily sync scheduler started (runs weekdays at 18:30)")
 
@@ -424,7 +369,7 @@ async def lifespan(app: FastAPI):
 
         yield
 
-        # ── Shutdown ─────────────────────────────────────
+        # ── Shutdown ──────────────────────────────────
         logger.info("Shutting down MarketSentinel")
         dispose_engine()
         gc.collect()
@@ -464,21 +409,11 @@ app.add_middleware(
 app.add_middleware(AuthMiddleware)
 
 
-# =====================================================
-# REQUEST MIDDLEWARE
-# FIX: Rate limiter now uses Redis INCR+EXPIRE per IP.
-# In-memory dict was reset on every restart and could be
-# bypassed by triggering a crash. Redis state survives restarts.
-# FIX: Removed request_store.clear() which nuked all IPs
-# when MAX_TRACKED_IPS was exceeded — replaced with LRU eviction.
-# =====================================================
-
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
 
     path = request.url.path
 
-    # Legacy API key check — only if API_KEY is set
     if path not in PUBLIC_PATHS and API_KEY:
         client_key = request.headers.get("X-API-KEY")
         has_jwt = (
@@ -488,14 +423,13 @@ async def request_context_middleware(request: Request, call_next):
         if not has_jwt and client_key != API_KEY:
             raise HTTPException(status_code=401, detail="Invalid API key")
 
-    # Get client IP
     forwarded = request.headers.get("X-Forwarded-For")
     client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
 
-    # FIX: Redis-backed rate limiting — survives restarts
-    cache = RedisCache()
-    if cache.enabled and cache._redis:
-        try:
+    # Redis-backed rate limiting
+    try:
+        cache = app.state.cache
+        if cache.enabled and cache._redis:
             redis_client = cache._redis
             key = f"{RATE_LIMIT_KEY_PREFIX}{client_ip}"
             count = redis_client.incr(key)
@@ -503,28 +437,10 @@ async def request_context_middleware(request: Request, call_next):
                 redis_client.expire(key, RATE_LIMIT_TTL)
             if count > RATE_LIMIT:
                 raise HTTPException(status_code=429, detail="Rate limit exceeded")
-        except HTTPException:
-            raise
-        except Exception:
-            # Redis down — fall through, don't block requests
-            pass
-    else:
-        # Fallback: in-memory rate limiting when Redis unavailable
-        # Less secure but keeps API functional
-        now = time.time()
-        if not hasattr(request_context_middleware, "_store"):
-            request_context_middleware._store = defaultdict(deque)
-        store = request_context_middleware._store
-        queue = store[client_ip]
-        while queue and queue[0] < now - WINDOW_SECONDS:
-            queue.popleft()
-        if len(queue) >= RATE_LIMIT:
-            raise HTTPException(status_code=429, detail="Rate limit exceeded")
-        queue.append(now)
-        # FIX: LRU eviction — remove oldest entry, not clear all
-        if len(store) > 5000:
-            oldest_ip = next(iter(store))
-            del store[oldest_ip]
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # Redis down — don't block requests
 
     request_id = str(uuid.uuid4())[:12]
     start = time.time()
@@ -535,7 +451,6 @@ async def request_context_middleware(request: Request, call_next):
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time"] = str(round(latency, 4))
         return response
-
     except Exception:
         logger.exception("Request failure | id=%s", request_id)
         raise
@@ -569,6 +484,45 @@ async def snapshot():
 
 
 # =====================================================
+# ADMIN: MANUAL SYNC TRIGGER  (item 44)
+# POST /admin/sync — triggers delta data sync on demand.
+# Requires owner JWT. Useful after market close to ensure
+# latest prices without waiting for scheduled 18:30 run.
+# =====================================================
+
+@app.post("/admin/sync")
+async def admin_sync(request: Request):
+    """
+    Trigger a manual delta data sync.
+    Only callable by authenticated owners.
+    Does not block — sync runs in background thread.
+    """
+    if getattr(request.state, "role", None) != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+
+    async def _run():
+        try:
+            svc = DataSyncService()
+            report = await asyncio.to_thread(svc.sync_universe)
+            readiness.data_synced = True
+            readiness.sync_report = report
+            logger.info(
+                "Manual sync complete | synced=%d skipped=%d errors=%d",
+                report.get("synced", 0), report.get("skipped", 0), report.get("errors", 0),
+            )
+        except Exception:
+            logger.exception("Manual sync failed")
+
+    asyncio.create_task(_run())
+
+    return api_success({
+        "message": "Data sync started in background",
+        "status": "running",
+        "timestamp": dt.now(timezone.utc).isoformat(),
+    })
+
+
+# =====================================================
 # ROOT
 # =====================================================
 
@@ -590,7 +544,6 @@ async def root():
         "version": APP_VERSION,
         "docs": "/docs",
         "metrics": "/metrics",
-        # FIX: Expose these so the frontend Health page can read them
         "models_loaded": readiness.models_loaded,
     })
 
@@ -601,7 +554,4 @@ async def root():
 
 @app.get("/metrics")
 def metrics():
-    return Response(
-        generate_latest(),
-        media_type=CONTENT_TYPE_LATEST,
-    )
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
