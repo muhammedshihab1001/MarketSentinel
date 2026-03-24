@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 import os
 import json
+
+pd.set_option("future.no_silent_downcasting", True)
 import logging
 import hashlib
 
