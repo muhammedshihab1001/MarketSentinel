@@ -6,7 +6,7 @@ from app.core.auth.jwt_handler import (
     verify_password,
     get_password_hash,
 )
-from app.core.auth.demo_tracker import DemoTracker, hash_ip, fingerprint_from_headers
+from app.core.auth.demo_tracker import DemoTracker
 from app.core.auth.middleware import AuthMiddleware
 
 __all__ = [
@@ -17,7 +17,5 @@ __all__ = [
     "verify_password",
     "get_password_hash",
     "DemoTracker",
-    "hash_ip",
-    "fingerprint_from_headers",
     "AuthMiddleware",
 ]

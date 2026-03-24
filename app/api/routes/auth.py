@@ -1,15 +1,8 @@
 # =========================================================
-# AUTH ROUTES v2.1
-#
-# Changes from v2.0:
-# FIX: GET /auth/me now calls DemoTracker.get_usage_summary()
-#      instead of building usage manually — matches the
-#      shape frontend authStore.setAuth() expects.
-# FIX: /auth/me returns reset_in_seconds correctly.
-# FIX: /auth/demo-login registers fingerprint in DemoTracker
-#      so usage tracking starts immediately after login.
-# FIX: /auth/logout clears cookie with correct same_site
-#      and secure settings from env.
+# AUTH ROUTES v2.2
+# FIX: create_demo_token(fingerprint) — was passing wrong args
+# FIX: verify_owner_credentials → authenticate_owner (correct name)
+# FIX: decode_token now exists in jwt_handler v1.1
 # =========================================================
 
 import logging
@@ -19,7 +12,12 @@ from typing import Optional
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
-from app.core.auth.jwt_handler import create_owner_token, create_demo_token, decode_token
+from app.core.auth.jwt_handler import (
+    create_owner_token,
+    create_demo_token,
+    decode_token,
+    authenticate_owner,
+)
 from app.core.auth.demo_tracker import DemoTracker
 
 logger = logging.getLogger("marketsentinel.auth")
@@ -30,7 +28,6 @@ OWNER_USERNAME = os.getenv("OWNER_USERNAME", "shihab")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
 
-# Feature groups tracked for demo usage display
 TRACKED_FEATURES = [
     "snapshot",
     "portfolio",
@@ -50,8 +47,7 @@ def _get_client_ip(request: Request) -> str:
     return "unknown"
 
 
-def _get_tracker(request: Request) -> Optional[DemoTracker]:
-    """Get DemoTracker from app state if available."""
+def _get_tracker(request: Request) -> DemoTracker:
     try:
         cache = request.app.state.cache
         return DemoTracker(cache=cache)
@@ -64,11 +60,7 @@ def _get_tracker(request: Request) -> Optional[DemoTracker]:
 # =========================================================
 
 @router.post("/auth/owner-login")
-async def owner_login(request: Request, response: Response):
-    """
-    Authenticate as owner with username + password.
-    Sets a 30-day httpOnly JWT cookie on success.
-    """
+async def owner_login(request: Request):
     try:
         body = await request.json()
     except Exception:
@@ -83,31 +75,19 @@ async def owner_login(request: Request, response: Response):
             content={"detail": "username and password are required"},
         )
 
-    # Verify credentials via jwt_handler (bcrypt compare)
-    try:
-        from app.core.auth.jwt_handler import verify_owner_credentials
-        if not verify_owner_credentials(username, password):
-            logger.warning("Owner login failed | username=%s", username)
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Invalid credentials"},
-            )
-    except Exception as e:
-        logger.error("Owner credential check error: %s", e)
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "Authentication error"},
-        )
+    # FIX: use authenticate_owner directly — no more verify_owner_credentials
+    if not authenticate_owner(username, password):
+        logger.warning("Owner login failed | username=%s", username)
+        return JSONResponse(status_code=401, content={"detail": "Invalid credentials"})
 
     token = create_owner_token(username)
 
-    resp = JSONResponse(
-        content={
-            "authenticated": True,
-            "role": "owner",
-            "username": username,
-        }
-    )
+    resp = JSONResponse(content={
+        "authenticated": True,
+        "role": "owner",
+        "username": username,
+        "message": "Authentication successful.",
+    })
 
     resp.set_cookie(
         key="ms_token",
@@ -115,7 +95,7 @@ async def owner_login(request: Request, response: Response):
         httponly=True,
         secure=COOKIE_SECURE,
         samesite=COOKIE_SAMESITE,
-        max_age=60 * 60 * 24 * 30,  # 30 days
+        max_age=60 * 60 * 24 * 30,
         path="/",
     )
 
@@ -129,31 +109,23 @@ async def owner_login(request: Request, response: Response):
 
 @router.post("/auth/demo-login")
 async def demo_login(request: Request):
-    """
-    Start a demo session — no credentials required.
-    Sets a 24-hour httpOnly JWT cookie.
-    Registers fingerprint in DemoTracker for usage tracking.
-    """
     ip = _get_client_ip(request)
     ua = request.headers.get("user-agent", "")
     fingerprint = DemoTracker.build_fingerprint(ip, ua)
 
-    # Register fingerprint (starts the 7-day TTL clock)
     tracker = _get_tracker(request)
     tracker.register(fingerprint)
 
+    # FIX: create_demo_token takes fingerprint only — ip_hash is optional
     token = create_demo_token(fingerprint)
 
-    # Build initial usage summary (all zeros)
     summary = tracker.get_usage_summary(fingerprint, TRACKED_FEATURES)
 
-    resp = JSONResponse(
-        content={
-            "authenticated": True,
-            "role": "demo",
-            "usage": summary,
-        }
-    )
+    resp = JSONResponse(content={
+        "authenticated": True,
+        "role": "demo",
+        "usage": summary,
+    })
 
     resp.set_cookie(
         key="ms_token",
@@ -161,7 +133,7 @@ async def demo_login(request: Request):
         httponly=True,
         secure=COOKIE_SECURE,
         samesite=COOKIE_SAMESITE,
-        max_age=60 * 60 * 24,  # 24 hours
+        max_age=60 * 60 * 24,
         path="/",
     )
 
@@ -175,18 +147,6 @@ async def demo_login(request: Request):
 
 @router.get("/auth/me")
 async def get_me(request: Request):
-    """
-    Return current authentication state and usage.
-
-    Owner response:
-        { authenticated: true, role: "owner", username: "shihab", usage: null }
-
-    Demo response:
-        { authenticated: true, role: "demo", usage: { features: {...}, fully_locked, reset_in_seconds } }
-
-    Unauthenticated:
-        { authenticated: false, role: null }
-    """
     token = request.cookies.get("ms_token")
 
     if not token:
@@ -210,10 +170,8 @@ async def get_me(request: Request):
 
     if role == "demo":
         fingerprint = payload.get("fingerprint") or username
-
         tracker = _get_tracker(request)
         summary = tracker.get_usage_summary(fingerprint, TRACKED_FEATURES)
-
         return JSONResponse(content={
             "authenticated": True,
             "role": "demo",
@@ -221,7 +179,6 @@ async def get_me(request: Request):
             "usage": summary,
         })
 
-    # Unknown role in token
     return JSONResponse(content={"authenticated": False, "role": None})
 
 
@@ -231,9 +188,7 @@ async def get_me(request: Request):
 
 @router.post("/auth/logout")
 async def logout():
-    """Clear the auth cookie and end the session."""
     resp = JSONResponse(content={"logged_out": True})
-
     resp.delete_cookie(
         key="ms_token",
         httponly=True,
@@ -241,5 +196,4 @@ async def logout():
         samesite=COOKIE_SAMESITE,
         path="/",
     )
-
     return resp
