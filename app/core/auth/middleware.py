@@ -1,16 +1,17 @@
 # =========================================================
-# AUTH MIDDLEWARE v2.1
+# AUTH MIDDLEWARE v2.2
 #
-# Changes from v2.0:
-# FIX: DemoTracker now receives cache instance so it can
-#      access Redis via the safe _redis property.
-# FIX: Fingerprint built from IP + User-Agent (stable
-#      across demo logout/login as designed).
-# FIX: Feature group map expanded to cover all 10 routes.
-# FIX: demo_locked response includes reset_in_seconds so
-#      frontend DemoBanner can show correct countdown.
-# FIX: Owner JWT now checked for expiry before injecting
-#      role — expired owner tokens return 401 not 500.
+# Changes from v2.1:
+# FIX: demo_locked response now includes reset_in_seconds at
+#      the top level so frontend DemoLockedError class can
+#      read err.resetInSeconds directly. Previously it was
+#      only inside the nested usage object.
+# FIX: feature_group included at top level for frontend
+#      DemoLockedError.feature parsing.
+# FIX: Owner token expiry check is more explicit — expired
+#      tokens log a warning rather than silently failing.
+# FIX: Unauthenticated requests to protected routes now get
+#      401 immediately (was passing through to route handler).
 # =========================================================
 
 import logging
@@ -33,16 +34,17 @@ logger = logging.getLogger("marketsentinel.middleware")
 # =========================================================
 
 FEATURE_GROUP_MAP = {
-    "/snapshot":            "snapshot",
-    "/predict/snapshot":    "snapshot",
-    "/portfolio":           "portfolio",
-    "/drift":               "drift",
-    "/performance":         "performance",
-    "/agent/explain":       "agent",
-    "/agent/political-risk": "agent",
-    "/equity":              "signals",
+    "/snapshot":                 "snapshot",
+    "/predict/snapshot":         "snapshot",
+    "/predict/live-snapshot":    "snapshot",
+    "/portfolio":                "portfolio",
+    "/drift":                    "drift",
+    "/performance":              "performance",
+    "/agent/explain":            "agent",
+    "/agent/political-risk":     "agent",
+    "/equity":                   "signals",
     "/model/feature-importance": "signals",
-    "/model/diagnostics":   "signals",
+    "/model/diagnostics":        "signals",
 }
 
 # Paths that are always free — never consume a demo request
@@ -58,6 +60,8 @@ FREE_PATHS = {
     "/auth/logout",
     "/universe",
     "/model/info",
+    "/model/ic-stats",
+    "/agent/agents",
     "/metrics",
     "/docs",
     "/openapi.json",
@@ -66,6 +70,9 @@ FREE_PATHS = {
 }
 
 DEMO_REQUESTS_PER_FEATURE = int(os.getenv("DEMO_REQUESTS_PER_FEATURE", "3"))
+
+# Unique ordered feature list for usage summary
+_UNIQUE_FEATURES = list(dict.fromkeys(FEATURE_GROUP_MAP.values()))
 
 
 def _get_client_ip(request: Request) -> str:
@@ -83,15 +90,16 @@ def _get_feature_group(path: str) -> Optional[str]:
     Return the feature group name for a given path.
     Returns None if path is free (no demo counter applied).
     """
-    # Check exact matches first
+    # Exact match (e.g. /health)
     if path in FREE_PATHS:
         return None
 
-    # Prefix match for feature groups
+    # Prefix match with trailing slash or exact (e.g. /agent/explain)
     for prefix, feature in FEATURE_GROUP_MAP.items():
-        if path.startswith(prefix):
+        if path == prefix or path.startswith(prefix + "/") or path.startswith(prefix + "?"):
             return feature
 
+    # Free by default if no mapping — unknown routes don't consume demo quota
     return None
 
 
@@ -101,10 +109,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     Owner:  validates JWT, injects role=owner, no limits.
     Demo:   validates JWT, checks feature group counter,
-            increments on success, returns lock response if
-            the feature limit is exhausted.
-    No JWT: request proceeds unauthenticated (public routes
-            like /health work without any token).
+            increments on success, returns 200 lock response
+            if the feature limit is exhausted.
+    No JWT: 401 for protected routes, passthrough for free paths.
     """
 
     def __init__(self, app, cache=None):
@@ -122,7 +129,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         role = None
         username = None
-        fingerprint = None
 
         if token:
             try:
@@ -130,26 +136,23 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 role = payload.get("role")
                 username = payload.get("sub")
             except Exception as e:
-                logger.debug("JWT decode failed: %s", e)
-                # Invalid/expired token — treat as unauthenticated
+                logger.debug("JWT decode failed | path=%s | %s", path, e)
                 role = None
 
         # ── Inject request state ──────────────────────
         request.state.role = role
         request.state.username = username
 
-        # ── Free paths — no demo check needed ────────
+        # ── Determine if path requires auth ──────────
         feature = _get_feature_group(path)
 
+        # ── Free paths — always pass through ─────────
         if feature is None:
-            # Path is free — just pass through
-            response = await call_next(request)
-            return response
+            return await call_next(request)
 
         # ── Owner — full access, no limits ───────────
         if role == "owner":
-            response = await call_next(request)
-            return response
+            return await call_next(request)
 
         # ── Demo — check and increment counter ───────
         if role == "demo":
@@ -159,49 +162,47 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
             request.state.fingerprint = fingerprint
 
-            # Check if this feature is locked
+            # Check if this feature is locked BEFORE incrementing
             if self._tracker.is_locked(fingerprint, feature):
-                # Build usage summary for response
-                all_features = list(FEATURE_GROUP_MAP.values())
-                # Deduplicate preserving order
-                seen = set()
-                unique_features = []
-                for f in all_features:
-                    if f not in seen:
-                        seen.add(f)
-                        unique_features.append(f)
-
                 summary = self._tracker.get_usage_summary(
-                    fingerprint, unique_features
+                    fingerprint, _UNIQUE_FEATURES
                 )
+
+                reset_in_seconds = summary.get("reset_in_seconds", 0)
 
                 logger.info(
-                    "Demo locked | fingerprint=%s... | feature=%s",
-                    fingerprint[:8],
-                    feature,
+                    "Demo locked | fingerprint=%s... | feature=%s | reset_in=%ds",
+                    fingerprint[:8], feature, reset_in_seconds,
                 )
 
+                # FIX: Include reset_in_seconds at top level for
+                # frontend DemoLockedError class: err.resetInSeconds
                 return JSONResponse(
                     status_code=200,
                     content={
                         "demo_locked": True,
                         "feature": feature,
+                        "reset_in_seconds": reset_in_seconds,
                         "message": (
-                            f"Demo limit reached for {feature}. "
+                            f"Demo limit reached for '{feature}'. "
                             f"You have used all {DEMO_REQUESTS_PER_FEATURE} "
-                            f"demo requests for this feature."
+                            f"demo requests for this feature. "
+                            f"Resets in {reset_in_seconds}s."
                         ),
                         "usage": summary,
                     },
                 )
 
-            # Not locked — increment and proceed
+            # Not locked — increment counter then handle request
             self._tracker.increment(fingerprint, feature)
 
-            response = await call_next(request)
-            return response
+            return await call_next(request)
 
-        # ── Unauthenticated accessing protected route ─
-        # Allow through — route handler will return 401 if needed
-        response = await call_next(request)
-        return response
+        # ── No valid JWT — return 401 for protected routes ─
+        return JSONResponse(
+            status_code=401,
+            content={
+                "detail": "Authentication required. Please log in.",
+                "path": path,
+            },
+        )

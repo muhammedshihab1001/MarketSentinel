@@ -1,10 +1,18 @@
 """
 MarketSentinel — Database Engine & Session Factory
 
-FIX (item 17): Pool settings now read from environment variables
-instead of being hardcoded. Set these in your .env:
-  DB_POOL_SIZE=5
-  DB_MAX_OVERFLOW=3
+FIX v2 (item 17): Pool settings now read from environment variables.
+
+FIX v3: Increased pool defaults — previous defaults (pool_size=5,
+        max_overflow=3 = 8 max connections) were exhausted when
+        MARKET_MAX_WORKERS=8 ran concurrent DB queries during
+        snapshot computation. AMD ticker failed with QueuePool
+        timeout. New defaults: pool_size=10, max_overflow=5 = 15
+        max connections.
+
+Set these in .env to override:
+  DB_POOL_SIZE=10
+  DB_MAX_OVERFLOW=5
   DB_POOL_TIMEOUT=10
   DB_POOL_RECYCLE=1800
 """
@@ -50,13 +58,16 @@ def get_engine():
     """
     Return the shared SQLAlchemy engine (singleton).
 
-    FIX (item 17): Pool settings read from env vars — no longer hardcoded.
-    Defaults match previous hardcoded values for zero-config compatibility.
+    FIX v3: Increased pool defaults to prevent QueuePool exhaustion
+    when MARKET_MAX_WORKERS=8 runs concurrent DB queries.
+
+    Rule of thumb: pool_size + max_overflow >= MARKET_MAX_WORKERS + 2 buffer
+    Default: 10 + 5 = 15 >= 8 + 2 buffer = 10 ✓
 
     Env vars:
-      DB_POOL_SIZE      — number of persistent connections (default: 5)
-      DB_MAX_OVERFLOW   — burst connections above pool_size (default: 3)
-      DB_POOL_TIMEOUT   — seconds to wait for a connection (default: 10)
+      DB_POOL_SIZE      — persistent connections (default: 10)
+      DB_MAX_OVERFLOW   — burst connections above pool_size (default: 5)
+      DB_POOL_TIMEOUT   — seconds to wait for a connection (default: 15)
       DB_POOL_RECYCLE   — seconds before recycling a connection (default: 1800)
     """
 
@@ -67,10 +78,10 @@ def get_engine():
 
     url = _build_database_url()
 
-    # FIX: Read from env vars with sensible defaults
-    pool_size    = int(os.getenv("DB_POOL_SIZE", "5"))
-    max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "3"))
-    pool_timeout = int(os.getenv("DB_POOL_TIMEOUT", "10"))
+    # FIX v3: Raised defaults — was 5/3/10 which caused QueuePool timeouts
+    pool_size    = int(os.getenv("DB_POOL_SIZE", "10"))
+    max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "5"))
+    pool_timeout = int(os.getenv("DB_POOL_TIMEOUT", "15"))
     pool_recycle = int(os.getenv("DB_POOL_RECYCLE", "1800"))
 
     _engine = create_engine(
@@ -90,7 +101,10 @@ def get_engine():
 
     @event.listens_for(_engine, "after_cursor_execute")
     def _after_execute(conn, cursor, statement, parameters, context, executemany):
-        total = time.time() - conn.info["query_start"].pop()
+        starts = conn.info.get("query_start", [])
+        if not starts:
+            return
+        total = time.time() - starts.pop()
         if total > 0.5:
             logger.warning(
                 "Slow query detected | duration=%.3fs | statement=%s",
@@ -100,8 +114,9 @@ def get_engine():
             )
 
     logger.info(
-        "Database engine initialized | pool_size=%d | host=%s",
+        "Database engine initialized | pool_size=%d | max_overflow=%d | host=%s",
         pool_size,
+        max_overflow,
         url.split("@")[-1].split("/")[0] if "@" in url else "localhost",
         extra={"component": "db.engine"},
     )
@@ -138,7 +153,49 @@ def get_session():
 def init_db():
     engine = get_engine()
     Base.metadata.create_all(engine)
+
+    # Run inline migrations for existing databases
+    _run_migrations(engine)
+
     logger.info("Database tables initialized", extra={"component": "db.engine"})
+
+
+def _run_migrations(engine):
+    """
+    Safe inline migrations for schema changes.
+    Each migration is idempotent — safe to run multiple times.
+    """
+    migrations = [
+        # FIX: schema_signature was String(32) — sha256 hex is 64 chars
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='model_predictions'
+                AND column_name='schema_signature'
+                AND character_maximum_length = 32
+            ) THEN
+                ALTER TABLE model_predictions
+                ALTER COLUMN schema_signature TYPE varchar(64);
+            END IF;
+        END $$;
+        """,
+        # FIX: Add composite index on computed_features for feature version queries
+        """
+        CREATE INDEX IF NOT EXISTS ix_feature_version_ticker_date
+            ON computed_features(feature_version, ticker, date);
+        """,
+    ]
+
+    with engine.connect() as conn:
+        for migration in migrations:
+            try:
+                conn.execute(text(migration))
+                conn.commit()
+            except Exception as e:
+                logger.debug("Migration note: %s", e)
+                conn.rollback()
 
 
 def check_db_health() -> dict:

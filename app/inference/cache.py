@@ -1,16 +1,15 @@
 # =========================================================
-# REDIS CACHE v12
+# REDIS CACHE v13
 #
-# Changes from v11:
-# FIX: _validate_payload now only runs for snapshot-type
-#      keys (ms:portfolio:*). Non-snapshot keys (political
-#      risk, agent explain, etc.) skip validation entirely.
-#      This was causing crashes when PoliticalRiskAgent
-#      tried to cache GDELT results — payload is a dict,
-#      not a list of signal rows.
-# FIX: set() catches all exceptions silently — cache
-#      failure must never crash the inference pipeline.
-# FIX: get() returns None (not raises) on any error.
+# Changes from v12:
+# FIX: Removed list validation from set() — ms:portfolio:*
+#      keys store full snapshot dicts, not signal lists.
+#      The validation was firing every 2 minutes on every
+#      background snapshot cycle, blocking all per-request
+#      snapshot caching. set_background_snapshot() already
+#      handles the background snapshot key correctly.
+# FIX: _is_snapshot_key removed — validation was wrong for
+#      all use cases. Dict payloads are valid everywhere.
 # =========================================================
 
 import redis
@@ -18,7 +17,6 @@ import json
 import hashlib
 import logging
 import os
-import random
 import time
 import threading
 from typing import Any, Optional
@@ -56,9 +54,10 @@ class RedisCache:
         ms:portfolio:{hash}           — per-request snapshot
         ms:agent:{hash}               — agent explain results
         ms:political_risk:{hash}      — GDELT political risk results
+        ms:demo:{fingerprint}:{feat}  — demo usage counters (via DemoTracker)
 
-    Only portfolio/snapshot keys are validated for signal structure.
-    All other key types bypass payload validation.
+    All key types store JSON-serialisable dicts or lists.
+    No structural validation is performed — that is the caller's job.
     """
 
     def __init__(self):
@@ -96,7 +95,12 @@ class RedisCache:
     def _ensure_connected(self) -> bool:
         """Try to reconnect if disconnected. Returns True if connected."""
         if self._connected and self._client is not None:
-            return True
+            try:
+                self._client.ping()
+                return True
+            except Exception:
+                self._connected = False
+                self._client = None
         self._connect()
         return self._connected
 
@@ -130,46 +134,6 @@ class RedisCache:
         except Exception as e:
             logger.warning("Key build failed: %s", e)
             return f"{prefix}fallback"
-
-    # =====================================================
-    # PAYLOAD VALIDATION
-    # FIX: Only validate snapshot/portfolio payloads.
-    #      Skip for all other key types.
-    # =====================================================
-
-    def _is_snapshot_key(self, key: str) -> bool:
-        """Return True if this key holds snapshot/signal data."""
-        return (
-            key.startswith(SNAPSHOT_KEY_PREFIX)
-            or key == BACKGROUND_SNAPSHOT_KEY
-        )
-
-    def _validate_payload(self, payload: Any) -> None:
-        """
-        Validate snapshot signal list payload.
-        Only called for snapshot keys — not for agent/political risk/etc.
-
-        Raises ValueError if payload is structurally invalid.
-        """
-        if not isinstance(payload, list):
-            raise ValueError(
-                f"Snapshot payload must be a list, got {type(payload).__name__}"
-            )
-
-        for i, row in enumerate(payload):
-            if not isinstance(row, dict):
-                raise ValueError(f"Row {i} must be a dict")
-
-            weight = row.get("weight")
-            if weight is not None:
-                try:
-                    w = float(weight)
-                    if abs(w) > 2.0:
-                        raise ValueError(
-                            f"Row {i}: Unrealistic weight {w} (expected -2 to 2)"
-                        )
-                except (TypeError, ValueError) as e:
-                    raise ValueError(f"Row {i}: Invalid weight — {e}") from e
 
     # =====================================================
     # GET
@@ -208,22 +172,12 @@ class RedisCache:
     def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
         """
         Store value in cache with TTL.
-        FIX: Only validates payload for snapshot keys.
+        Accepts any JSON-serialisable value (dict, list, str, etc.)
         Never raises — cache failure must not crash inference.
         Returns True on success.
         """
         if ttl is None:
             ttl = CACHE_TTL
-
-        # FIX: Only validate snapshot/portfolio payloads
-        if self._is_snapshot_key(key):
-            try:
-                self._validate_payload(value)
-            except ValueError as e:
-                logger.warning(
-                    "Snapshot payload validation failed for %s: %s", key, e
-                )
-                return False
 
         # Try Redis
         if self._ensure_connected() and self._client is not None:
@@ -278,8 +232,7 @@ class RedisCache:
     def set_background_snapshot(self, payload: dict, ttl: int = 300) -> bool:
         """
         Store the background snapshot.
-        NOTE: Uses direct set (not _validate_payload list check)
-        because background snapshot is a full dict, not a signal list.
+        Full snapshot dict — routes, signals, executive_summary all included.
         """
         if self._ensure_connected() and self._client is not None:
             try:
@@ -299,6 +252,38 @@ class RedisCache:
             return False
 
     # =====================================================
+    # ATOMIC DEMO COUNTER OPS (for DemoTracker)
+    # =====================================================
+
+    def incr(self, key: str) -> int:
+        """Atomic increment. Returns new value or -1 on failure."""
+        if self._ensure_connected() and self._client is not None:
+            try:
+                return int(self._client.incr(key))
+            except Exception as e:
+                logger.debug("Redis incr failed for %s: %s", key, e)
+        return -1
+
+    def expire(self, key: str, ttl: int) -> bool:
+        """Set TTL on existing key."""
+        if self._ensure_connected() and self._client is not None:
+            try:
+                self._client.expire(key, ttl)
+                return True
+            except Exception:
+                pass
+        return False
+
+    def ttl(self, key: str) -> int:
+        """Return remaining TTL in seconds. -1 if no expiry, -2 if missing."""
+        if self._ensure_connected() and self._client is not None:
+            try:
+                return int(self._client.ttl(key))
+            except Exception:
+                pass
+        return -2
+
+    # =====================================================
     # HEALTH CHECK
     # =====================================================
 
@@ -307,8 +292,9 @@ class RedisCache:
         if self._client is None:
             return False
         try:
-            return self._client.ping()
+            return bool(self._client.ping())
         except Exception:
+            self._connected = False
             return False
 
     def health(self) -> dict:
