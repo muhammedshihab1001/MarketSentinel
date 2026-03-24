@@ -61,7 +61,6 @@ services:
       postgres:
         condition: service_healthy
 
-    # FIX: Use environment variable instead of hardcoded password
     environment:
       PGPASSWORD: sentinel
 
@@ -149,7 +148,6 @@ services:
       - PIPELINE_BOTTOM_K=5
       - MARKET_MAX_WORKERS=8
       - DRIFT_HARD_FAIL=false
-      # FIX: Set CORS to frontend origin — never use * in production with credentials
       - CORS_ORIGINS=http://localhost:5173,http://localhost:3000
 
     volumes:
@@ -167,16 +165,17 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
       interval: 30s
       timeout: 10s
-      # FIX: Increased start_period — sync on startup takes time
       start_period: 120s
       retries: 5
 
-    mem_limit: 768m
+    # FIX: Raised from 768m — XGBoost + 27400-row feature frame
+    # + FastAPI + Redis client exceeds 768m and causes OOM kills
+    mem_limit: 1536m
     cpus: 1.0
 
 
   ####################################################
-  # TRAINING (Manual Profile)
+  # TRAINING (run manually with: docker-compose run --rm training)
   ####################################################
   training:
     container_name: marketsentinel-training
@@ -209,8 +208,10 @@ services:
       postgres:
         condition: service_healthy
 
-    profiles:
-      - training
+    # FIX: Removed "profiles: [training]" — in Compose v2 this silently
+    # skips the service unless you pass --profile training on every command.
+    # Training is manual-run-only so the profile adds no value and only
+    # causes confusion when docker-compose run --rm training does nothing.
 
     mem_limit: 2g
     cpus: 2.0
