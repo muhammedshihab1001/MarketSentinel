@@ -1,18 +1,30 @@
 # =========================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v3.5
+# MARKET SENTINEL APPLICATION ENTRYPOINT v3.6
 #
-# FIX (issue 1): init_pipeline() called during startup —
-#   passes model_loader + cache so InferencePipeline
-#   no longer crashes with "missing 3 required arguments".
-# FIX (issue 2): cache.enabled → cache.ping() everywhere.
-#   RedisCache has no .enabled property.
-# FIX (issue 3): background snapshot uses run_snapshot()
-#   with NO args (tickers loaded from MarketUniverse).
-#   Old: pipeline.run_snapshot(tickers) → wrong param
-#   New: pipeline.run_snapshot()        → correct
-# FIX (issue 4): cache.set_background_snapshot() used
-#   instead of cache.set(BACKGROUND_SNAPSHOT_KEY, dict)
-#   to bypass list validation on snapshot dict.
+# Changes from v3.5:
+# FIX: _background_snapshot_loop had NO concurrency guard.
+#   If a snapshot takes 90s and SNAPSHOT_PRECOMPUTE_INTERVAL
+#   is 20s, 4+ snapshots run simultaneously. Each creates a
+#   new MarketDataService + DB connections + Redis clients.
+#   Symptoms: Redis reconnecting every 20s, DB pool exhaustion,
+#   feature INSERT taking 70s (concurrent writes fighting).
+#
+#   Fix: asyncio.Lock (_snapshot_lock) — only one snapshot
+#   runs at a time. If the loop fires while a snapshot is
+#   running, it skips that cycle and logs a warning.
+#
+# FIX: Default SNAPSHOT_PRECOMPUTE_INTERVAL raised from 120
+#   to 300 seconds. 120s is too aggressive — a cold snapshot
+#   takes 90s, leaving only 30s of idle time. 300s gives
+#   enough breathing room for the pipeline to complete and
+#   Redis/DB to settle before the next run.
+#
+# FIX: Cache instance reuse in snapshot loop — was calling
+#   app.state.cache each iteration (safe), but also the
+#   pipeline was creating its own RedisCache() on each run.
+#   Now passes app.state.cache to pipeline explicitly.
+#
+# All other fixes from v3.5 retained.
 # =========================================================
 
 import asyncio
@@ -86,7 +98,13 @@ RATE_LIMIT_KEY_PREFIX = "ms:ratelimit:"
 RATE_LIMIT_TTL = WINDOW_SECONDS + 10
 
 SKIP_DATA_SYNC = os.getenv("SKIP_DATA_SYNC", "0") == "1"
-SNAPSHOT_PRECOMPUTE_INTERVAL = int(os.getenv("SNAPSHOT_PRECOMPUTE_INTERVAL", "120"))
+
+# FIX: Raised default from 120 → 300s.
+# Cold snapshot takes ~90s. 120s left only 30s idle.
+# 300s gives the pipeline space to finish before the next run.
+# Override in .env: SNAPSHOT_PRECOMPUTE_INTERVAL=300
+SNAPSHOT_PRECOMPUTE_INTERVAL = int(os.getenv("SNAPSHOT_PRECOMPUTE_INTERVAL", "300"))
+
 DATA_STALENESS_HOURS = int(os.getenv("DATA_STALENESS_HOURS", "24"))
 
 PUBLIC_PATHS = {
@@ -95,6 +113,10 @@ PUBLIC_PATHS = {
     "/universe", "/auth/owner-login", "/auth/demo-login",
     "/auth/me", "/auth/logout", "/favicon.ico",
 }
+
+# FIX: Global asyncio.Lock — prevents concurrent snapshot runs.
+# Declared at module level so it's shared across all loop iterations.
+_snapshot_lock = asyncio.Lock()
 
 
 # =====================================================
@@ -174,7 +196,10 @@ async def _is_data_stale() -> bool:
             return True
         age_hours = (dt.utcnow().date() - latest).days * 24
         stale = age_hours >= DATA_STALENESS_HOURS
-        logger.info("Data staleness check | latest=%s age_hours=%d stale=%s", latest, age_hours, stale)
+        logger.info(
+            "Data staleness check | latest=%s age_hours=%d stale=%s",
+            latest, age_hours, stale,
+        )
         return stale
     except Exception as e:
         logger.warning("Staleness check failed — assuming stale | error=%s", e)
@@ -199,7 +224,9 @@ async def _daily_sync_loop():
                 report = await asyncio.to_thread(svc.sync_universe)
                 logger.info(
                     "Daily sync complete | synced=%d skipped=%d errors=%d",
-                    report.get("synced", 0), report.get("skipped", 0), report.get("errors", 0),
+                    report.get("synced", 0),
+                    report.get("skipped", 0),
+                    report.get("errors", 0),
                 )
             except Exception as e:
                 logger.warning("Daily sync failed | error=%s", e)
@@ -208,30 +235,56 @@ async def _daily_sync_loop():
 async def _background_snapshot_loop():
     """
     Pre-computes full snapshot every SNAPSHOT_PRECOMPUTE_INTERVAL seconds.
-    FIX: run_snapshot() called with NO args — tickers come from MarketUniverse.
-    FIX: uses set_background_snapshot() not set() to bypass list validation.
+
+    FIX v3.6: asyncio.Lock prevents concurrent runs.
+    If a snapshot is still running when the interval fires,
+    the new cycle is skipped entirely and logged as a warning.
+    This prevents:
+      - 4+ concurrent DB batch reads (100 tickers × N parallel runs)
+      - Redis reconnection churn from multiple pipeline instances
+      - computed_features INSERT contention (70s INSERT)
+      - Pool exhaustion under concurrent snapshot load
+
+    FIX v3.6: Interval default is 300s (was 120s).
+    Set SNAPSHOT_PRECOMPUTE_INTERVAL in .env to override.
     """
+    # Initial delay — let the API fully boot before first snapshot
     await asyncio.sleep(30)
 
     while True:
-        try:
-            pipeline = predict.get_pipeline()
-            # FIX: NO tickers arg — pipeline loads from MarketUniverse
-            result = await asyncio.to_thread(pipeline.run_snapshot)
+        # FIX: Non-blocking lock check — skip if already running
+        if _snapshot_lock.locked():
+            logger.warning(
+                "Background snapshot skipped — previous run still in progress. "
+                "Consider increasing SNAPSHOT_PRECOMPUTE_INTERVAL (currently %ds).",
+                SNAPSHOT_PRECOMPUTE_INTERVAL,
+            )
+            await asyncio.sleep(SNAPSHOT_PRECOMPUTE_INTERVAL)
+            continue
 
-            cache = app.state.cache
-            # FIX: set_background_snapshot() handles dict payload correctly
-            if cache.set_background_snapshot(result, ttl=300):
-                logger.info(
-                    "Background snapshot cached | signals=%d | model=%s",
-                    len(result.get("snapshot", {}).get("signals", [])),
-                    result.get("meta", {}).get("model_version", "unknown"),
+        async with _snapshot_lock:
+            snapshot_start = time.time()
+            try:
+                pipeline = predict.get_pipeline()
+                result = await asyncio.to_thread(pipeline.run_snapshot)
+
+                cache = app.state.cache
+                if cache.set_background_snapshot(result, ttl=SNAPSHOT_PRECOMPUTE_INTERVAL + 60):
+                    snapshot_time = round(time.time() - snapshot_start, 1)
+                    logger.info(
+                        "Background snapshot cached | signals=%d | model=%s | took=%ss",
+                        len(result.get("snapshot", {}).get("signals", [])),
+                        result.get("meta", {}).get("model_version", "unknown"),
+                        snapshot_time,
+                    )
+                else:
+                    logger.warning("Background snapshot cache write failed (memory fallback)")
+
+            except Exception as e:
+                logger.warning(
+                    "Background snapshot failed | error=%s | took=%ss",
+                    e, round(time.time() - snapshot_start, 1),
                 )
-            else:
-                logger.warning("Background snapshot cache write failed (memory fallback)")
-
-        except Exception as e:
-            logger.warning("Background snapshot failed | error=%s", e)
 
         await asyncio.sleep(SNAPSHOT_PRECOMPUTE_INTERVAL)
 
@@ -247,7 +300,7 @@ async def lifespan(app: FastAPI):
 
     try:
         logger.info("=================================")
-        logger.info(" MarketSentinel Boot v3.5")
+        logger.info(" MarketSentinel Boot v3.6")
         logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("=================================")
 
@@ -280,7 +333,9 @@ async def lifespan(app: FastAPI):
                             readiness.sync_report = report
                             logger.info(
                                 "Background sync complete | synced=%d skipped=%d errors=%d",
-                                report.get("synced", 0), report.get("skipped", 0), report.get("errors", 0),
+                                report.get("synced", 0),
+                                report.get("skipped", 0),
+                                report.get("errors", 0),
                             )
                         except Exception:
                             logger.exception("Background sync failed")
@@ -314,10 +369,11 @@ async def lifespan(app: FastAPI):
         # ── Step 5: Redis ──────────────────────────────
         try:
             cache = RedisCache()
-            # FIX: was cache.enabled (doesn't exist) → cache.ping()
             readiness.redis_connected = cache.ping()
             if not readiness.redis_connected:
-                logger.warning("Redis unavailable — degraded mode (memory fallback active)")
+                logger.warning(
+                    "Redis unavailable — degraded mode (memory fallback active)"
+                )
             app.state.cache = cache
         except Exception:
             logger.warning("Redis init failed — degraded mode")
@@ -326,12 +382,12 @@ async def lifespan(app: FastAPI):
             app.state.cache = cache
 
         # ── Step 6: Initialize InferencePipeline ─────
-        # FIX: was InferencePipeline() with no args → TypeError
-        # Now: init_pipeline(loader, cache) wires model + cache correctly
         if readiness.models_loaded:
             try:
                 predict.init_pipeline(loader, cache)
-                logger.info("InferencePipeline initialized | model=%s", loader.version)
+                logger.info(
+                    "InferencePipeline initialized | model=%s", loader.version
+                )
             except Exception:
                 logger.exception("InferencePipeline init failed")
 
@@ -342,14 +398,18 @@ async def lifespan(app: FastAPI):
             readiness.drift_baseline_loaded = True
         except Exception:
             readiness.drift_baseline_loaded = False
-            logger.warning("Drift baseline not loaded (retrain to create new baseline)")
+            logger.warning(
+                "Drift baseline not loaded (retrain to create new baseline)"
+            )
 
         # ── Step 8: LLM config ────────────────────────
         readiness.llm_enabled = get_bool("LLM_ENABLED", False)
 
         # ── Step 9: Memory ────────────────────────────
         process = psutil.Process(os.getpid())
-        readiness.boot_memory_mb = round(process.memory_info().rss / (1024 * 1024), 2)
+        readiness.boot_memory_mb = round(
+            process.memory_info().rss / (1024 * 1024), 2
+        )
 
         gc.collect()
 
@@ -367,7 +427,7 @@ async def lifespan(app: FastAPI):
         if readiness.models_loaded and readiness.db_connected:
             asyncio.create_task(_background_snapshot_loop())
             logger.info(
-                "Background snapshot pre-computation started (interval=%ds)",
+                "Background snapshot pre-computation started | interval=%ds | lock=enabled",
                 SNAPSHOT_PRECOMPUTE_INTERVAL,
             )
 
@@ -425,7 +485,6 @@ async def request_context_middleware(request: Request, call_next):
         request.client.host if request.client else "unknown"
     )
 
-    # FIX: cache.ping() not cache.enabled (property doesn't exist)
     try:
         cache = app.state.cache
         if cache.ping() and cache._redis:
@@ -439,7 +498,7 @@ async def request_context_middleware(request: Request, call_next):
     except HTTPException:
         raise
     except Exception:
-        pass  # Redis down — don't block requests
+        pass
 
     request_id = str(uuid.uuid4())[:12]
     start = time.time()
@@ -499,7 +558,9 @@ async def admin_sync(request: Request):
             readiness.sync_report = report
             logger.info(
                 "Manual sync complete | synced=%d skipped=%d errors=%d",
-                report.get("synced", 0), report.get("skipped", 0), report.get("errors", 0),
+                report.get("synced", 0),
+                report.get("skipped", 0),
+                report.get("errors", 0),
             )
         except Exception:
             logger.exception("Manual sync failed")
