@@ -1,17 +1,19 @@
 # =========================================================
-# AUTH MIDDLEWARE v2.2
+# AUTH MIDDLEWARE v2.3
 #
-# Changes from v2.1:
-# FIX: demo_locked response now includes reset_in_seconds at
-#      the top level so frontend DemoLockedError class can
-#      read err.resetInSeconds directly. Previously it was
-#      only inside the nested usage object.
-# FIX: feature_group included at top level for frontend
-#      DemoLockedError.feature parsing.
-# FIX: Owner token expiry check is more explicit — expired
-#      tokens log a warning rather than silently failing.
-# FIX: Unauthenticated requests to protected routes now get
-#      401 immediately (was passing through to route handler).
+# Changes from v2.2:
+# NEW: OWNER_ONLY_PATHS — routes that return 403 for demo
+#      users and 401 for unauthenticated users:
+#        /admin/*       — sync, retrain triggers
+#        /model/ic-stats — IC monitoring (owner tool)
+#        /model/diagnostics — raw diagnostics
+# FIX: reset_in_seconds at top level of demo_locked so
+#      frontend DemoLockedError.resetInSeconds works.
+# FIX: feature in demo_locked response so frontend
+#      DemoLockedError.feature works.
+# FIX: /predict/live-snapshot added to FEATURE_GROUP_MAP.
+# FIX: Unauthenticated requests to protected routes now
+#      return 401 immediately rather than passing through.
 # =========================================================
 
 import logging
@@ -28,26 +30,36 @@ from app.core.auth.demo_tracker import DemoTracker
 logger = logging.getLogger("marketsentinel.middleware")
 
 # =========================================================
+# OWNER-ONLY PATHS
+# Demo users get 403. Unauthenticated users get 401.
+# These are administrative or sensitive endpoints.
+# =========================================================
+
+OWNER_ONLY_PREFIXES = {
+    "/admin",                  # /admin/sync, /admin/retrain etc
+    "/model/ic-stats",         # IC monitoring — owner tool
+    "/model/diagnostics",      # Raw model diagnostics
+}
+
+# =========================================================
 # FEATURE GROUP MAP
-# Maps request path → feature name used in DemoTracker.
-# All paths that consume a demo request must be listed here.
+# Demo users get 3 requests per feature group then locked.
 # =========================================================
 
 FEATURE_GROUP_MAP = {
-    "/snapshot":                 "snapshot",
-    "/predict/snapshot":         "snapshot",
-    "/predict/live-snapshot":    "snapshot",
-    "/portfolio":                "portfolio",
-    "/drift":                    "drift",
-    "/performance":              "performance",
-    "/agent/explain":            "agent",
-    "/agent/political-risk":     "agent",
-    "/equity":                   "signals",
-    "/model/feature-importance": "signals",
-    "/model/diagnostics":        "signals",
+    "/snapshot":                  "snapshot",
+    "/predict/snapshot":          "snapshot",
+    "/predict/live-snapshot":     "snapshot",
+    "/portfolio":                 "portfolio",
+    "/drift":                     "drift",
+    "/performance":               "performance",
+    "/agent/explain":             "agent",
+    "/agent/political-risk":      "agent",
+    "/equity":                    "signals",
+    "/model/feature-importance":  "signals",
 }
 
-# Paths that are always free — never consume a demo request
+# Paths always free — no auth check, no demo counter
 FREE_PATHS = {
     "/health",
     "/health/ready",
@@ -60,7 +72,6 @@ FREE_PATHS = {
     "/auth/logout",
     "/universe",
     "/model/info",
-    "/model/ic-stats",
     "/agent/agents",
     "/metrics",
     "/docs",
@@ -71,12 +82,11 @@ FREE_PATHS = {
 
 DEMO_REQUESTS_PER_FEATURE = int(os.getenv("DEMO_REQUESTS_PER_FEATURE", "3"))
 
-# Unique ordered feature list for usage summary
+# Unique ordered feature list for usage summaries
 _UNIQUE_FEATURES = list(dict.fromkeys(FEATURE_GROUP_MAP.values()))
 
 
 def _get_client_ip(request: Request) -> str:
-    """Extract real client IP, respecting X-Forwarded-For."""
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         return forwarded.split(",")[0].strip()
@@ -85,39 +95,39 @@ def _get_client_ip(request: Request) -> str:
     return "unknown"
 
 
+def _is_owner_only(path: str) -> bool:
+    """Return True if path requires owner role."""
+    for prefix in OWNER_ONLY_PREFIXES:
+        if path == prefix or path.startswith(prefix + "/") or path.startswith(prefix + "?"):
+            return True
+    return False
+
+
 def _get_feature_group(path: str) -> Optional[str]:
-    """
-    Return the feature group name for a given path.
-    Returns None if path is free (no demo counter applied).
-    """
-    # Exact match (e.g. /health)
+    """Return feature group for demo quota, or None if free."""
     if path in FREE_PATHS:
         return None
-
-    # Prefix match with trailing slash or exact (e.g. /agent/explain)
     for prefix, feature in FEATURE_GROUP_MAP.items():
         if path == prefix or path.startswith(prefix + "/") or path.startswith(prefix + "?"):
             return feature
-
-    # Free by default if no mapping — unknown routes don't consume demo quota
     return None
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
     """
-    Runs on every request before the route handler.
+    Request lifecycle:
 
-    Owner:  validates JWT, injects role=owner, no limits.
-    Demo:   validates JWT, checks feature group counter,
-            increments on success, returns 200 lock response
-            if the feature limit is exhausted.
-    No JWT: 401 for protected routes, passthrough for free paths.
+    1. Free path           → pass through (no token needed)
+    2. Owner-only path     → owner token required, else 401/403
+    3. Authenticated path:
+       a. owner token      → full access, no limits
+       b. demo token       → check + increment demo counter
+       c. no token         → 401
     """
 
     def __init__(self, app, cache=None):
         super().__init__(app)
         self._cache = cache
-        # DemoTracker receives cache so it can reach Redis safely
         self._tracker = DemoTracker(cache=cache)
 
     async def dispatch(self, request: Request, call_next):
@@ -126,7 +136,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         # ── Extract JWT from cookie ───────────────────
         token = request.cookies.get("ms_token")
-
         role = None
         username = None
 
@@ -137,37 +146,55 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 username = payload.get("sub")
             except Exception as e:
                 logger.debug("JWT decode failed | path=%s | %s", path, e)
-                role = None
 
-        # ── Inject request state ──────────────────────
         request.state.role = role
         request.state.username = username
 
-        # ── Determine if path requires auth ──────────
-        feature = _get_feature_group(path)
-
-        # ── Free paths — always pass through ─────────
-        if feature is None:
+        # ── 1. Free paths ─────────────────────────────
+        if path in FREE_PATHS:
             return await call_next(request)
 
-        # ── Owner — full access, no limits ───────────
+        # ── 2. Owner-only paths ───────────────────────
+        if _is_owner_only(path):
+            if role == "owner":
+                return await call_next(request)
+            if role == "demo":
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "detail": "This feature is restricted to owner accounts.",
+                        "path": path,
+                    },
+                )
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "detail": "Authentication required.",
+                    "path": path,
+                },
+            )
+
+        # ── 3a. Owner — full access ───────────────────
         if role == "owner":
             return await call_next(request)
 
-        # ── Demo — check and increment counter ───────
+        # ── 3b. Demo — feature quota ──────────────────
         if role == "demo":
+            feature = _get_feature_group(path)
+
+            if feature is None:
+                # No quota for this path — pass through
+                return await call_next(request)
+
             ip = _get_client_ip(request)
             ua = request.headers.get("user-agent", "")
             fingerprint = DemoTracker.build_fingerprint(ip, ua)
-
             request.state.fingerprint = fingerprint
 
-            # Check if this feature is locked BEFORE incrementing
             if self._tracker.is_locked(fingerprint, feature):
                 summary = self._tracker.get_usage_summary(
                     fingerprint, _UNIQUE_FEATURES
                 )
-
                 reset_in_seconds = summary.get("reset_in_seconds", 0)
 
                 logger.info(
@@ -175,8 +202,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     fingerprint[:8], feature, reset_in_seconds,
                 )
 
-                # FIX: Include reset_in_seconds at top level for
-                # frontend DemoLockedError class: err.resetInSeconds
                 return JSONResponse(
                     status_code=200,
                     content={
@@ -185,24 +210,25 @@ class AuthMiddleware(BaseHTTPMiddleware):
                         "reset_in_seconds": reset_in_seconds,
                         "message": (
                             f"Demo limit reached for '{feature}'. "
-                            f"You have used all {DEMO_REQUESTS_PER_FEATURE} "
-                            f"demo requests for this feature. "
                             f"Resets in {reset_in_seconds}s."
                         ),
                         "usage": summary,
                     },
                 )
 
-            # Not locked — increment counter then handle request
             self._tracker.increment(fingerprint, feature)
-
             return await call_next(request)
 
-        # ── No valid JWT — return 401 for protected routes ─
-        return JSONResponse(
-            status_code=401,
-            content={
-                "detail": "Authentication required. Please log in.",
-                "path": path,
-            },
-        )
+        # ── 3c. No valid token ────────────────────────
+        feature = _get_feature_group(path)
+        if feature is not None:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "detail": "Authentication required. Please log in.",
+                    "path": path,
+                },
+            )
+
+        # Unknown path with no token — let route handler decide
+        return await call_next(request)
