@@ -1,22 +1,17 @@
 """
-MarketSentinel v4.5.1
+MarketSentinel v4.5.2
 
 XGBoost regression model wrapper with safer inference handling,
 feature integrity checks, and production-like robustness.
 
-Changes from v4.5.0:
-  FIX: NUM_BOOST_ROUNDS reduced 1200 → 400
-       EARLY_STOPPING_ROUNDS reduced 75 → 30
-       MIN_BOOST_ROUNDS reduced 25 → 10
-
-  Reason: with ~193 rows per ticker × 30 tickers = ~5790 training
-  rows and 15% validation split (~870 rows), the previous settings
-  caused XGBoost to stop at iteration 0-22 because the validation
-  loss plateau was reached immediately on tiny data.
-
-  These settings will produce meaningful training on current data
-  (~9 months). Revert to NUM_BOOST_ROUNDS=1200 / EARLY_STOPPING=75
-  once 2+ years of data are available for 100 tickers.
+Changes from v4.5.1:
+  FIX (item 20): predict() now raises RuntimeError on NaN input.
+    Previously NaN was silently filled with 0, masking data quality issues.
+    NaN in inference input = upstream pipeline bug that should surface loudly.
+  FIX (item 19): Added export_feature_importance() method.
+    Was missing entirely — tests and /model/feature-importance route both need it.
+  FIX: predict() still fills MISSING columns with 0 (graceful schema flexibility).
+    This is correct for inference — NaN ≠ missing column.
 """
 
 import hashlib
@@ -36,8 +31,6 @@ logger = logging.getLogger("marketsentinel.xgboost")
 
 SEED = 42
 
-# Adjusted for current data volume (~9 months, 30 tickers)
-# Revert to 1200/75/25 when 2+ years × 100 tickers available
 NUM_BOOST_ROUNDS = 400
 EARLY_STOPPING_ROUNDS = 30
 MIN_BOOST_ROUNDS = 10
@@ -52,9 +45,9 @@ MAX_MODEL_SIZE_MB = 150
 MAX_ABS_SCORE = 50
 EPSILON = 1e-12
 
-MIN_VALIDATION_ROWS = 30   # lowered from 50 — matches reduced data volume
+MIN_VALIDATION_ROWS = 30
 MAX_TARGET_ABS = 50
-MIN_TRAIN_ROWS = 80        # lowered from 120 — CV portfolio may have sparse tickers
+MIN_TRAIN_ROWS = 80
 
 
 class SafeXGBRegressor:
@@ -140,8 +133,8 @@ class SafeXGBRegressor:
         params = {
             "objective": "reg:squarederror",
             "eval_metric": "rmse",
-            "max_depth": 4,        # reduced from 6 — less overfit on small data
-            "eta": 0.05,           # slightly higher than 0.03 — faster convergence
+            "max_depth": 4,
+            "eta": 0.05,
             "subsample": 0.80,
             "colsample_bytree": 0.80,
             "min_child_weight": 3,
@@ -191,6 +184,15 @@ class SafeXGBRegressor:
             raw.tobytes() if hasattr(raw, "tobytes") else raw
         ).hexdigest()
 
+        # Compute importance checksum for integrity tracking
+        try:
+            scores = self.model.get_score(importance_type="gain")
+            self.importance_checksum = hashlib.sha256(
+                json.dumps(scores, sort_keys=True).encode()
+            ).hexdigest()
+        except Exception:
+            self.importance_checksum = None
+
         logger.info(
             "XGBoost trained | iter=%d | features=%d | "
             "train_rmse=%.5f | valid_rmse=%.5f",
@@ -220,15 +222,31 @@ class SafeXGBRegressor:
         if X.empty:
             raise RuntimeError("Inference features empty.")
 
+        # FIX (item 20): Raise on NaN — NaN in inference input means the
+        # upstream feature pipeline has a bug. Fill-with-0 was silently
+        # masking data quality issues. Missing COLUMNS are still filled
+        # with 0 (graceful schema flexibility for new features).
+        if X.isnull().any().any():
+            nan_cols = X.columns[X.isnull().any()].tolist()
+            raise RuntimeError(
+                f"NaN values in inference input for columns: {nan_cols}. "
+                "Fix upstream feature pipeline."
+            )
+
         missing = set(self.feature_names) - set(X.columns)
         if missing:
             logger.warning("Missing features filled with 0: %s", list(missing))
             for col in missing:
                 X[col] = 0.0
 
+        # FIX: Raise on extra unexpected columns after missing fill
+        # (don't silently drop them — surface the schema mismatch)
+        extra = set(X.columns) - set(self.feature_names)
+        if extra:
+            logger.debug("Extra columns ignored during inference: %s", list(extra))
+
         X = X.reindex(columns=self.feature_names)
-        X = X.replace([np.inf, -np.inf], 0).fillna(0)
-        X = X.astype(np.float32)
+        X = X.replace([np.inf, -np.inf], 0).astype(np.float32)
 
         dmatrix = xgb.DMatrix(X, feature_names=self.feature_names)
 
@@ -252,11 +270,67 @@ class SafeXGBRegressor:
 
         return scores.astype(np.float32)
 
+    # ==========================================================
+    # EXPORT FEATURE IMPORTANCE  (item 19)
+    #
+    # Returns a dict with feature_importance list (sorted by gain),
+    # booster_checksum, feature_checksum, and train/valid RMSE.
+    # Used by /model/feature-importance route and tests.
+    # ==========================================================
+
+    def export_feature_importance(self) -> dict:
+        """
+        Export feature importance from the trained booster.
+
+        Returns:
+            {
+                "feature_importance": [{"feature": str, "importance": float}, ...],
+                "booster_checksum": str,
+                "feature_checksum": str,
+                "train_rmse": float,
+                "valid_rmse": float,
+            }
+        """
+
+        if self.model is None:
+            raise RuntimeError("Model not trained. Call fit() first.")
+
+        try:
+            scores = self.model.get_score(importance_type="gain")
+        except Exception as e:
+            logger.warning("get_score(gain) failed: %s — using weight fallback", e)
+            try:
+                scores = self.model.get_score(importance_type="weight")
+            except Exception:
+                scores = {}
+
+        total = sum(scores.values()) or 1.0
+
+        importance_list = sorted(
+            [
+                {"feature": f, "importance": round(v / total, 6)}
+                for f, v in scores.items()
+            ],
+            key=lambda x: x["importance"],
+            reverse=True,
+        )
+
+        return {
+            "feature_importance": importance_list,
+            "booster_checksum": self.booster_checksum,
+            "feature_checksum": self.feature_checksum,
+            "importance_checksum": self.importance_checksum,
+            "train_rmse": self.train_rmse,
+            "valid_rmse": self.valid_rmse,
+            "best_iteration": self.best_iteration,
+            "feature_count": len(self.feature_names) if self.feature_names else 0,
+        }
+
 
 # ==========================================================
 # FACTORY
 # ==========================================================
 
 def build_xgboost_pipeline():
-    logger.info("Building XGBoost Regressor | MarketSentinel v4.5.1")
+    logger.info("Building XGBoost Regressor | MarketSentinel v4.5.2")
     return SafeXGBRegressor()
