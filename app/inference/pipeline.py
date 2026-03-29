@@ -1,21 +1,19 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v5.8
+# INSTITUTIONAL INFERENCE PIPELINE v5.9
 #
 # FIX v5.8: run_snapshot() was processing ALL 27,400 rows
 #   (274 days × 100 tickers) in the per-ticker loop.
-#   Root cause: dataset from _build_cross_sectional_frame()
-#   is the full lookback window — needed for cross-sectional
-#   feature computation — but per-ticker scoring must only
-#   use the LATEST date row per ticker.
+#   Fix: filter to latest date per ticker before scoring.
+#   Result: 100 rows → ~5s. signals=100.
 #
-#   Fix: after feature engineering, filter dataset to the
-#   latest available date per ticker before the scoring loop.
-#   Result: 100 rows (one per ticker) → snapshot takes ~5s
-#   instead of 182s. signals=100 not signals=27400.
-#
-#   Also fixed: _build_cross_sectional_frame() now checks
-#   feature cache HIT correctly — if cache returns all rows
-#   for all dates, we still only score on latest per ticker.
+# NEW v5.9: Added top_5_rationale to snapshot response.
+#   Each approved stock now includes:
+#     - which agents approved it and their scores
+#     - why it was selected (natural language reason)
+#     - what signal direction and confidence each agent gave
+#     - sector, drift context, political risk context
+#   Exposed in executive_summary.top_5_rationale array.
+#   Used by frontend Agent page to show approved stock cards.
 # =========================================================
 
 import time
@@ -109,10 +107,6 @@ class InferencePipeline:
 
     # =====================================================
     # BUILD CROSS-SECTIONAL FRAME
-    # Returns the FULL lookback window for ALL tickers.
-    # Cross-sectional features (z-scores, ranks) need the
-    # full history to be computed correctly. Caller is
-    # responsible for filtering to latest date per ticker.
     # =====================================================
 
     def _build_cross_sectional_frame(
@@ -178,42 +172,18 @@ class InferencePipeline:
         return features
 
     # =====================================================
-    # FILTER TO LATEST DATE PER TICKER
-    #
-    # FIX v5.8: This is the core fix.
-    #
-    # _build_cross_sectional_frame() returns 274 days × 100
-    # tickers = 27,400 rows. Cross-sectional features need the
-    # full window to compute z-scores correctly.
-    #
-    # But the scoring loop must only process ONE row per ticker:
-    # the most recent date with valid data.
-    #
-    # This method reduces 27,400 rows → 100 rows.
-    # Result: snapshot takes ~5s not 182s.
-    # signals=100 not signals=27,400.
-    # Sector neutralisation no longer sees duplicate tickers.
+    # FILTER TO LATEST DATE PER TICKER (v5.8 fix)
     # =====================================================
 
     @staticmethod
     def _filter_latest_per_ticker(dataset: pd.DataFrame) -> pd.DataFrame:
-        """
-        Reduce a multi-date feature frame to one row per ticker:
-        the row with the latest valid date.
-
-        Input:  27,400 rows (274 days × 100 tickers)
-        Output: 100 rows (latest date per ticker)
-        """
         if dataset is None or dataset.empty:
             return dataset
 
         dataset = dataset.copy()
-
-        # Normalise date column — may be Timestamp or string
         dataset["date"] = pd.to_datetime(dataset["date"], utc=True, errors="coerce")
         dataset = dataset.dropna(subset=["date"])
 
-        # Keep only the latest row per ticker
         latest = (
             dataset
             .sort_values("date")
@@ -228,6 +198,179 @@ class InferencePipeline:
         )
 
         return latest
+
+    # =====================================================
+    # BUILD TOP-5 RATIONALE (v5.9 new)
+    #
+    # Produces a structured explanation for each of the top-5
+    # approved stocks. Includes:
+    #   - agent scores (signal, technical, raw model)
+    #   - why it was selected
+    #   - what context influenced the decision
+    #   - which agents approved vs flagged
+    # =====================================================
+
+    @staticmethod
+    def _build_top5_rationale(
+        top5_rows: List[Dict],
+        drift_state: str,
+        political_label: str,
+        political_score: float,
+    ) -> List[Dict]:
+        """
+        Build detailed rationale for each top-5 approved stock.
+
+        Args:
+            top5_rows:        list of snapshot_rows for top-5 tickers
+            drift_state:      current drift state string
+            political_label:  political risk label (LOW/MEDIUM/HIGH/CRITICAL)
+            political_score:  political risk score 0.0–1.0
+
+        Returns:
+            List of rationale dicts, one per stock.
+        """
+        rationale_list = []
+
+        for rank, row in enumerate(top5_rows, start=1):
+            ticker = row.get("ticker", "")
+            raw_score = row.get("raw_model_score", 0.0)
+            hybrid_score = row.get("hybrid_consensus_score", 0.0)
+            weight = row.get("weight", 0.0)
+
+            agents = row.get("agents", {})
+            signal_out = agents.get("signal_agent", {}) or {}
+            technical_out = agents.get("technical_agent", {}) or {}
+
+            # ── Signal agent fields ───────────────────────────
+            signal_direction = (
+                signal_out.get("signals", {}).get("signal")
+                or signal_out.get("signal")
+                or ("LONG" if weight > 0.01 else ("SHORT" if weight < -0.01 else "NEUTRAL"))
+            )
+            confidence = float(signal_out.get("confidence_numeric", 0.0))
+            risk_level = signal_out.get("risk_level", "unknown")
+            governance_score = signal_out.get("governance_score", 0)
+            signal_warnings = signal_out.get("warnings", []) or []
+            signal_agent_score = float(signal_out.get("score", 0.0))
+
+            # ── Technical agent fields ────────────────────────
+            volatility_regime = (
+                technical_out.get("signals", {}).get("volatility_regime")
+                or technical_out.get("volatility_regime")
+                or "normal"
+            )
+            technical_bias = (
+                technical_out.get("bias")
+                or technical_out.get("signals", {}).get("bias")
+                or "neutral"
+            )
+            technical_agent_score = float(technical_out.get("score", 0.0))
+            technical_warnings = technical_out.get("warnings", []) or []
+
+            # ── Approval status per agent ────────────────────
+            signal_approved = signal_agent_score > 0.3 and risk_level != "high"
+            technical_approved = technical_agent_score > 0.3
+            political_approved = political_label not in ("HIGH", "CRITICAL")
+
+            agents_approved = []
+            agents_flagged = []
+
+            if signal_approved:
+                agents_approved.append("SignalAgent")
+            else:
+                agents_flagged.append(
+                    f"SignalAgent (score={signal_agent_score:.2f}, risk={risk_level})"
+                )
+
+            if technical_approved:
+                agents_approved.append("TechnicalRiskAgent")
+            else:
+                agents_flagged.append(
+                    f"TechnicalRiskAgent (score={technical_agent_score:.2f})"
+                )
+
+            if political_approved:
+                agents_approved.append("PoliticalRiskAgent")
+            else:
+                agents_flagged.append(
+                    f"PoliticalRiskAgent (label={political_label})"
+                )
+
+            # ── Natural language selection reason ─────────────
+            reason_parts = []
+
+            reason_parts.append(
+                f"{ticker} ranked #{rank} with hybrid consensus score "
+                f"{hybrid_score:.4f} (raw model: {raw_score:.4f})."
+            )
+
+            reason_parts.append(
+                f"Signal: {signal_direction} | Confidence: {confidence:.1%} | "
+                f"Risk level: {risk_level}."
+            )
+
+            reason_parts.append(
+                f"Technical bias is {technical_bias} with "
+                f"{volatility_regime.replace('_', ' ')} volatility regime."
+            )
+
+            if drift_state not in ("none", "low"):
+                reason_parts.append(
+                    f"Drift state is {drift_state} — position weight scaled down "
+                    f"by exposure_scale to manage regime risk."
+                )
+            else:
+                reason_parts.append("Model drift is within normal range.")
+
+            if political_label in ("HIGH", "CRITICAL"):
+                reason_parts.append(
+                    f"Political risk is {political_label} "
+                    f"(score: {political_score:.2f}) — "
+                    f"hybrid score reduced by political risk overlay."
+                )
+            else:
+                reason_parts.append(
+                    f"Political environment is LOW risk "
+                    f"(score: {political_score:.2f})."
+                )
+
+            if signal_warnings or technical_warnings:
+                all_warnings = list(set(signal_warnings + technical_warnings))
+                reason_parts.append(
+                    f"Active warnings: {', '.join(all_warnings[:3])}."
+                )
+
+            reason_parts.append(
+                f"Portfolio weight assigned: {weight:.4f} "
+                f"({abs(weight) * 100:.2f}% of portfolio)."
+            )
+
+            rationale_list.append({
+                "rank": rank,
+                "ticker": ticker,
+                "signal": signal_direction,
+                "hybrid_score": round(hybrid_score, 6),
+                "raw_model_score": round(raw_score, 6),
+                "weight": round(weight, 6),
+                "confidence": round(confidence, 4),
+                "risk_level": risk_level,
+                "governance_score": governance_score,
+                "volatility_regime": volatility_regime,
+                "technical_bias": technical_bias,
+                "drift_context": drift_state,
+                "political_context": political_label,
+                "agent_scores": {
+                    "signal_agent": round(signal_agent_score, 4),
+                    "technical_agent": round(technical_agent_score, 4),
+                    "raw_model": round(raw_score, 4),
+                },
+                "agents_approved": agents_approved,
+                "agents_flagged": agents_flagged,
+                "warnings": list(set(signal_warnings + technical_warnings)),
+                "selection_reason": " ".join(reason_parts),
+            })
+
+        return rationale_list
 
     # =====================================================
     # RUN SNAPSHOT
@@ -258,17 +401,13 @@ class InferencePipeline:
         if len(tickers) < int(os.getenv("MIN_UNIVERSE_WIDTH", "8")):
             return self._error_snapshot("Universe too small")
 
-        # ── Build feature frame (full lookback window) ─
+        # ── Build feature frame (full lookback) ───────
         dataset = self._build_cross_sectional_frame(tickers, snapshot_date)
 
         if dataset is None or dataset.empty:
             return self._error_snapshot("Feature engineering failed for all tickers")
 
-        # ── FIX v5.8: Reduce to ONE row per ticker ────
-        # Cross-sectional features need the full history for z-score
-        # computation. But inference only needs the latest row per ticker.
-        # Without this filter: 27,400 rows processed → 182s, signals=27400.
-        # With this filter: 100 rows processed → ~5s, signals=100.
+        # ── Filter to ONE row per ticker (v5.8 fix) ───
         dataset = self._filter_latest_per_ticker(dataset)
 
         if dataset.empty:
@@ -322,10 +461,9 @@ class InferencePipeline:
             logger.debug("Political agent failed: %s", e)
 
         political_label = political_output.get("political_risk_label", "LOW")
+        political_score = float(political_output.get("political_risk_score", 0.0))
 
         # ── Per-ticker scoring loop ───────────────────
-        # dataset now has exactly one row per ticker (latest date).
-        # No duplicate tickers, no sector neutralisation spam.
         snapshot_rows = []
         tickers_set = set(tickers)
         exposure_scale = float(drift_result.get("exposure_scale", 1.0))
@@ -406,6 +544,7 @@ class InferencePipeline:
         top_5 = snapshot_rows[:TOP_K]
         avg_hybrid = float(np.mean([r["hybrid_consensus_score"] for r in snapshot_rows]))
 
+        # ── Portfolio agent ───────────────────────────
         portfolio_output = {}
         try:
             portfolio_context = {
@@ -417,6 +556,17 @@ class InferencePipeline:
             portfolio_output = self._safe_agent(self.portfolio_agent, portfolio_context)
         except Exception as e:
             logger.debug("Portfolio agent failed: %s", e)
+
+        # ── NEW v5.9: Build top-5 rationale ──────────
+        # Gives frontend the full agent decision explanation
+        # for each approved stock. Includes agent scores,
+        # approval status, selection reason, and warnings.
+        top_5_rationale = self._build_top5_rationale(
+            top5_rows=top_5,
+            drift_state=drift_state,
+            political_label=political_label,
+            political_score=political_score,
+        )
 
         latency_ms = round((time.time() - start_time) * 1000, 1)
 
@@ -431,6 +581,8 @@ class InferencePipeline:
             },
             "executive_summary": {
                 "top_5_tickers": [r["ticker"] for r in top_5],
+                # NEW v5.9: full rationale for each top-5 stock
+                "top_5_rationale": top_5_rationale,
                 "portfolio_bias": portfolio_bias,
                 "gross_exposure": round(gross_exposure, 4),
                 "net_exposure": round(net_exposure, 4),
@@ -486,6 +638,7 @@ class InferencePipeline:
             },
             "executive_summary": {
                 "top_5_tickers": [],
+                "top_5_rationale": [],
                 "portfolio_bias": "UNKNOWN",
                 "gross_exposure": 0.0,
                 "net_exposure": 0.0,
