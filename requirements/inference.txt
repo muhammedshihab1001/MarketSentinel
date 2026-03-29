@@ -7,6 +7,11 @@
 
 openai==1.30.5
 
+# ── Rate limiting ─────────────────────────────────────────
+# Per-endpoint IP-based rate limiting
+# Fixes #19 — /health/live and inference endpoints unprotected
+slowapi==0.1.9
+
 # ── High-performance async event loop ────────────────────
 # Used by uvicorn in inference.Dockerfile CMD
 # Linux / macOS only — not supported on Windows

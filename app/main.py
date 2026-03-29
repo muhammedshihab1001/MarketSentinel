@@ -1,30 +1,28 @@
 # =========================================================
-# MARKET SENTINEL APPLICATION ENTRYPOINT v3.6
+# MARKET SENTINEL APPLICATION ENTRYPOINT v3.7
 #
-# Changes from v3.5:
-# FIX: _background_snapshot_loop had NO concurrency guard.
-#   If a snapshot takes 90s and SNAPSHOT_PRECOMPUTE_INTERVAL
-#   is 20s, 4+ snapshots run simultaneously. Each creates a
-#   new MarketDataService + DB connections + Redis clients.
-#   Symptoms: Redis reconnecting every 20s, DB pool exhaustion,
-#   feature INSERT taking 70s (concurrent writes fighting).
+# Changes from v3.6:
+# FIX #19: Per-endpoint IP rate limits added to middleware.
+#   Previously only a global rate limit existed (180 req/3min).
+#   An attacker could hammer /health/live millions of times
+#   with no per-endpoint protection — generating cloud costs.
 #
-#   Fix: asyncio.Lock (_snapshot_lock) — only one snapshot
-#   runs at a time. If the loop fires while a snapshot is
-#   running, it skips that cycle and logs a warning.
+#   Per-endpoint limits now enforced via Redis per IP:
+#     /auth/owner-login          5  req / 60s  (brute force guard)
+#     /auth/demo-login          10  req / 60s
+#     /predict/live-snapshot    10  req / 60s  (expensive inference)
+#     /snapshot                 10  req / 60s  (alias)
+#     /agent/explain            20  req / 60s
+#     /agent/political-risk     20  req / 60s
+#     /performance              20  req / 60s
+#     /health/live              60  req / 60s  (Docker probe)
+#     /health/ready             60  req / 60s
+#     ALL OTHER paths           60  req / 60s  (global fallback)
 #
-# FIX: Default SNAPSHOT_PRECOMPUTE_INTERVAL raised from 120
-#   to 300 seconds. 120s is too aggressive — a cold snapshot
-#   takes 90s, leaving only 30s of idle time. 300s gives
-#   enough breathing room for the pipeline to complete and
-#   Redis/DB to settle before the next run.
+#   On limit exceeded: 429 with Retry-After header.
+#   Redis unavailable: fails open (no block during downtime).
 #
-# FIX: Cache instance reuse in snapshot loop — was calling
-#   app.state.cache each iteration (safe), but also the
-#   pipeline was creating its own RedisCache() on each run.
-#   Now passes app.state.cache to pipeline explicitly.
-#
-# All other fixes from v3.5 retained.
+# All other fixes from v3.6 retained.
 # =========================================================
 
 import asyncio
@@ -38,7 +36,6 @@ import datetime
 from contextlib import asynccontextmanager
 from datetime import timezone
 from datetime import datetime as dt
-from collections import defaultdict, deque
 
 from fastapi import FastAPI, Response, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -51,20 +48,11 @@ from core.schema.feature_schema import get_schema_signature
 from core.logging.logger import get_logger
 
 from app.api.routes import (
-    drift,
-    model_info,
-    portfolio,
-    universe,
-    health,
-    predict,
-    performance,
-    equity,
-    agent,
+    drift, model_info, portfolio, universe,
+    health, predict, performance, equity, agent,
 )
-
 from app.api.routes import auth as auth_router
 from app.core.auth.middleware import AuthMiddleware
-
 from app.inference.model_loader import ModelLoader
 from app.inference.cache import RedisCache
 from core.monitoring.drift_detector import DriftDetector
@@ -92,19 +80,8 @@ CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS.split(",")]
 
 API_KEY = os.getenv("API_KEY")
 
-RATE_LIMIT = int(os.getenv("API_RATE_LIMIT_PER_MIN", "180"))
-WINDOW_SECONDS = 180
-RATE_LIMIT_KEY_PREFIX = "ms:ratelimit:"
-RATE_LIMIT_TTL = WINDOW_SECONDS + 10
-
 SKIP_DATA_SYNC = os.getenv("SKIP_DATA_SYNC", "0") == "1"
-
-# FIX: Raised default from 120 → 300s.
-# Cold snapshot takes ~90s. 120s left only 30s idle.
-# 300s gives the pipeline space to finish before the next run.
-# Override in .env: SNAPSHOT_PRECOMPUTE_INTERVAL=300
 SNAPSHOT_PRECOMPUTE_INTERVAL = int(os.getenv("SNAPSHOT_PRECOMPUTE_INTERVAL", "300"))
-
 DATA_STALENESS_HOURS = int(os.getenv("DATA_STALENESS_HOURS", "24"))
 
 PUBLIC_PATHS = {
@@ -114,9 +91,66 @@ PUBLIC_PATHS = {
     "/auth/me", "/auth/logout", "/favicon.ico",
 }
 
-# FIX: Global asyncio.Lock — prevents concurrent snapshot runs.
-# Declared at module level so it's shared across all loop iterations.
+# =====================================================
+# FIX #19 — PER-ENDPOINT RATE LIMITS
+#
+# Format: { path_prefix: (max_requests, window_seconds) }
+# First prefix match wins. Unlisted paths use default.
+# =====================================================
+
+PER_PATH_RATE_LIMITS = {
+    "/auth/owner-login":        (5,  60),   # brute force guard
+    "/auth/demo-login":         (10, 60),   # registration throttle
+    "/predict/live-snapshot":   (10, 60),   # expensive full inference
+    "/snapshot":                (10, 60),   # alias for live-snapshot
+    "/agent/explain":           (20, 60),   # reads from cache but guarded
+    "/agent/political-risk":    (20, 60),   # triggers news API calls
+    "/performance":             (20, 60),   # DB heavy query
+    "/health/live":             (60, 60),   # Docker probe — allow frequent
+    "/health/ready":            (60, 60),
+}
+
+RATE_LIMIT_DEFAULT = (60, 60)       # fallback for all other paths
+RATE_LIMIT_KEY_PREFIX = "ms:ratelimit:"
+
 _snapshot_lock = asyncio.Lock()
+
+
+# =====================================================
+# RATE LIMIT HELPERS
+# =====================================================
+
+def _get_path_limit(path: str) -> tuple:
+    """Return (max_requests, window_seconds) for the given path."""
+    for prefix, limits in PER_PATH_RATE_LIMITS.items():
+        if path == prefix or path.startswith(prefix + "/") or path.startswith(prefix + "?"):
+            return limits
+    return RATE_LIMIT_DEFAULT
+
+
+def _check_rate_limit(redis_client, client_ip: str, path: str) -> tuple:
+    """
+    Check and increment rate limit counter for (ip, path).
+
+    Returns:
+        (allowed: bool, count: int, limit: int, retry_after: int)
+
+    Fails open if Redis is unavailable — never blocks on downtime.
+    """
+    max_requests, window_seconds = _get_path_limit(path)
+    safe_path = path.replace("/", "_").replace("?", "_").strip("_")
+    key = f"{RATE_LIMIT_KEY_PREFIX}{client_ip}:{safe_path}"
+
+    try:
+        count = int(redis_client.incr(key))
+        if count == 1:
+            redis_client.expire(key, window_seconds)
+        if count > max_requests:
+            ttl = int(redis_client.ttl(key))
+            return False, count, max_requests, max(0, ttl)
+        return True, count, max_requests, 0
+    except Exception:
+        return True, 0, max_requests, 0   # fail open
 
 
 # =====================================================
@@ -175,7 +209,10 @@ def api_error(message):
 
 async def global_exception_handler(request: Request, exc: Exception):
     if isinstance(exc, HTTPException):
-        return JSONResponse(status_code=exc.status_code, content=api_error(exc.detail))
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=api_error(exc.detail),
+        )
     logger.exception("Unhandled API error")
     return JSONResponse(status_code=500, content=api_error("internal_server_error"))
 
@@ -234,29 +271,16 @@ async def _daily_sync_loop():
 
 async def _background_snapshot_loop():
     """
-    Pre-computes full snapshot every SNAPSHOT_PRECOMPUTE_INTERVAL seconds.
-
-    FIX v3.6: asyncio.Lock prevents concurrent runs.
-    If a snapshot is still running when the interval fires,
-    the new cycle is skipped entirely and logged as a warning.
-    This prevents:
-      - 4+ concurrent DB batch reads (100 tickers × N parallel runs)
-      - Redis reconnection churn from multiple pipeline instances
-      - computed_features INSERT contention (70s INSERT)
-      - Pool exhaustion under concurrent snapshot load
-
-    FIX v3.6: Interval default is 300s (was 120s).
-    Set SNAPSHOT_PRECOMPUTE_INTERVAL in .env to override.
+    Pre-computes snapshot every SNAPSHOT_PRECOMPUTE_INTERVAL seconds.
+    asyncio.Lock prevents concurrent runs (v3.6 fix retained).
     """
-    # Initial delay — let the API fully boot before first snapshot
     await asyncio.sleep(30)
 
     while True:
-        # FIX: Non-blocking lock check — skip if already running
         if _snapshot_lock.locked():
             logger.warning(
-                "Background snapshot skipped — previous run still in progress. "
-                "Consider increasing SNAPSHOT_PRECOMPUTE_INTERVAL (currently %ds).",
+                "Background snapshot skipped — previous run still in progress | "
+                "interval=%ds",
                 SNAPSHOT_PRECOMPUTE_INTERVAL,
             )
             await asyncio.sleep(SNAPSHOT_PRECOMPUTE_INTERVAL)
@@ -267,19 +291,20 @@ async def _background_snapshot_loop():
             try:
                 pipeline = predict.get_pipeline()
                 result = await asyncio.to_thread(pipeline.run_snapshot)
-
                 cache = app.state.cache
-                if cache.set_background_snapshot(result, ttl=SNAPSHOT_PRECOMPUTE_INTERVAL + 60):
-                    snapshot_time = round(time.time() - snapshot_start, 1)
+                if cache.set_background_snapshot(
+                    result, ttl=SNAPSHOT_PRECOMPUTE_INTERVAL + 60
+                ):
                     logger.info(
                         "Background snapshot cached | signals=%d | model=%s | took=%ss",
                         len(result.get("snapshot", {}).get("signals", [])),
                         result.get("meta", {}).get("model_version", "unknown"),
-                        snapshot_time,
+                        round(time.time() - snapshot_start, 1),
                     )
                 else:
-                    logger.warning("Background snapshot cache write failed (memory fallback)")
-
+                    logger.warning(
+                        "Background snapshot cache write failed (memory fallback)"
+                    )
             except Exception as e:
                 logger.warning(
                     "Background snapshot failed | error=%s | took=%ss",
@@ -290,7 +315,7 @@ async def _background_snapshot_loop():
 
 
 # =====================================================
-# LIFESPAN MANAGEMENT
+# LIFESPAN
 # =====================================================
 
 @asynccontextmanager
@@ -300,14 +325,13 @@ async def lifespan(app: FastAPI):
 
     try:
         logger.info("=================================")
-        logger.info(" MarketSentinel Boot v3.6")
+        logger.info(" MarketSentinel Boot v3.7")
         logger.info(" Boot ID: %s", BOOT_ID)
         logger.info("=================================")
 
-        # ── Step 1: Record startup time ───────────────
         app.state.startup_time = time.time()
 
-        # ── Step 2: Initialize PostgreSQL ─────────────
+        # ── PostgreSQL ────────────────────────────────
         try:
             init_db()
             db_health = check_db_health()
@@ -320,15 +344,15 @@ async def lifespan(app: FastAPI):
             readiness.db_connected = False
             logger.exception("Database initialization failed")
 
-        # ── Step 3: Sync market data (non-blocking) ───
+        # ── Data sync ─────────────────────────────────
         if readiness.db_connected and not SKIP_DATA_SYNC:
             try:
                 stale = await _is_data_stale()
                 if stale:
                     async def _run_sync():
                         try:
-                            sync_service = DataSyncService()
-                            report = await asyncio.to_thread(sync_service.sync_universe)
+                            svc = DataSyncService()
+                            report = await asyncio.to_thread(svc.sync_universe)
                             readiness.data_synced = True
                             readiness.sync_report = report
                             logger.info(
@@ -350,7 +374,7 @@ async def lifespan(app: FastAPI):
             logger.info("Data sync skipped (SKIP_DATA_SYNC=1)")
             readiness.data_synced = True
 
-        # ── Step 4: Load model ────────────────────────
+        # ── Model ─────────────────────────────────────
         loader = ModelLoader()
         load_success = loader.load()
         readiness.models_loaded = load_success and loader.is_loaded()
@@ -358,22 +382,23 @@ async def lifespan(app: FastAPI):
         readiness.model_version = loader.version
         readiness.artifact_hash = loader.artifact_hash
 
-        if readiness.schema_signature and readiness.schema_signature != get_schema_signature():
+        if (
+            readiness.schema_signature
+            and readiness.schema_signature != get_schema_signature()
+        ):
             logger.warning(
-                "Runtime schema mismatch — model trained on different feature set. "
-                "Retrain with: docker-compose run --rm training"
+                "Runtime schema mismatch — retrain with: "
+                "docker-compose run --rm training"
             )
 
         app.state.model_loader = loader
 
-        # ── Step 5: Redis ──────────────────────────────
+        # ── Redis ─────────────────────────────────────
         try:
             cache = RedisCache()
             readiness.redis_connected = cache.ping()
             if not readiness.redis_connected:
-                logger.warning(
-                    "Redis unavailable — degraded mode (memory fallback active)"
-                )
+                logger.warning("Redis unavailable — degraded mode (memory fallback)")
             app.state.cache = cache
         except Exception:
             logger.warning("Redis init failed — degraded mode")
@@ -381,7 +406,7 @@ async def lifespan(app: FastAPI):
             readiness.redis_connected = False
             app.state.cache = cache
 
-        # ── Step 6: Initialize InferencePipeline ─────
+        # ── InferencePipeline ─────────────────────────
         if readiness.models_loaded:
             try:
                 predict.init_pipeline(loader, cache)
@@ -391,26 +416,21 @@ async def lifespan(app: FastAPI):
             except Exception:
                 logger.exception("InferencePipeline init failed")
 
-        # ── Step 7: Drift baseline ────────────────────
+        # ── Drift baseline ────────────────────────────
         try:
             detector = DriftDetector()
             detector._load_verified_baseline()
             readiness.drift_baseline_loaded = True
         except Exception:
             readiness.drift_baseline_loaded = False
-            logger.warning(
-                "Drift baseline not loaded (retrain to create new baseline)"
-            )
+            logger.warning("Drift baseline not loaded — retrain to create one")
 
-        # ── Step 8: LLM config ────────────────────────
+        # ── LLM + memory ──────────────────────────────
         readiness.llm_enabled = get_bool("LLM_ENABLED", False)
-
-        # ── Step 9: Memory ────────────────────────────
         process = psutil.Process(os.getpid())
         readiness.boot_memory_mb = round(
             process.memory_info().rss / (1024 * 1024), 2
         )
-
         gc.collect()
 
         boot_time = round(time.time() - boot_start, 2)
@@ -420,14 +440,23 @@ async def lifespan(app: FastAPI):
             readiness.models_loaded, readiness.drift_baseline_loaded,
         )
 
-        # ── Step 10: Start background tasks ──────────
+        # Log rate limit config
+        logger.info(
+            "Rate limits active | endpoints=%d | default=%d req/%ds | fails-open",
+            len(PER_PATH_RATE_LIMITS),
+            RATE_LIMIT_DEFAULT[0],
+            RATE_LIMIT_DEFAULT[1],
+        )
+
+        # ── Background tasks ──────────────────────────
         asyncio.create_task(_daily_sync_loop())
         logger.info("Daily sync scheduler started (runs weekdays at 18:30)")
 
         if readiness.models_loaded and readiness.db_connected:
             asyncio.create_task(_background_snapshot_loop())
             logger.info(
-                "Background snapshot pre-computation started | interval=%ds | lock=enabled",
+                "Background snapshot pre-computation started | "
+                "interval=%ds | lock=enabled",
                 SNAPSHOT_PRECOMPUTE_INTERVAL,
             )
 
@@ -454,7 +483,6 @@ app = FastAPI(
 )
 
 app.add_exception_handler(Exception, global_exception_handler)
-
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
@@ -466,40 +494,62 @@ app.add_middleware(
 app.add_middleware(AuthMiddleware)
 
 
+# =====================================================
+# REQUEST MIDDLEWARE — FIX #19 per-endpoint rate limit
+# =====================================================
+
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
 
     path = request.url.path
 
+    # ── API key check ─────────────────────────────────
     if path not in PUBLIC_PATHS and API_KEY:
         client_key = request.headers.get("X-API-KEY")
         has_jwt = (
-            request.cookies.get("ms_token") or
-            request.headers.get("Authorization", "").startswith("Bearer ")
+            request.cookies.get("ms_token")
+            or request.headers.get("Authorization", "").startswith("Bearer ")
         )
         if not has_jwt and client_key != API_KEY:
             raise HTTPException(status_code=401, detail="Invalid API key")
 
+    # ── Client IP ─────────────────────────────────────
     forwarded = request.headers.get("X-Forwarded-For")
-    client_ip = forwarded.split(",")[0].strip() if forwarded else (
-        request.client.host if request.client else "unknown"
+    client_ip = (
+        forwarded.split(",")[0].strip()
+        if forwarded
+        else (request.client.host if request.client else "unknown")
     )
 
+    # ── FIX #19: Per-endpoint rate limit check ────────
     try:
         cache = app.state.cache
         if cache.ping() and cache._redis:
-            redis_client = cache._redis
-            key = f"{RATE_LIMIT_KEY_PREFIX}{client_ip}"
-            count = redis_client.incr(key)
-            if count == 1:
-                redis_client.expire(key, RATE_LIMIT_TTL)
-            if count > RATE_LIMIT:
-                raise HTTPException(status_code=429, detail="Rate limit exceeded")
+            allowed, count, limit, retry_after = _check_rate_limit(
+                cache._redis, client_ip, path
+            )
+            if not allowed:
+                logger.warning(
+                    "Rate limit exceeded | ip=%s path=%s count=%d limit=%d",
+                    client_ip, path, count, limit,
+                )
+                resp = JSONResponse(
+                    status_code=429,
+                    content=api_error(
+                        f"Rate limit exceeded. Max {limit} requests/60s "
+                        f"for this endpoint. Retry after {retry_after}s."
+                    ),
+                )
+                resp.headers["Retry-After"] = str(retry_after)
+                resp.headers["X-RateLimit-Limit"] = str(limit)
+                resp.headers["X-RateLimit-Remaining"] = "0"
+                return resp
     except HTTPException:
         raise
     except Exception:
-        pass
+        pass  # Redis down — fail open
 
+    # ── Request tracking ──────────────────────────────
     request_id = str(uuid.uuid4())[:12]
     start = time.time()
 
@@ -531,7 +581,7 @@ app.include_router(agent.router)
 
 
 # =====================================================
-# ROOT-LEVEL SNAPSHOT ALIAS
+# SNAPSHOT ALIAS
 # =====================================================
 
 @app.post("/snapshot")
@@ -542,7 +592,7 @@ async def snapshot():
 
 
 # =====================================================
-# ADMIN: MANUAL SYNC TRIGGER
+# ADMIN: MANUAL SYNC
 # =====================================================
 
 @app.post("/admin/sync")
