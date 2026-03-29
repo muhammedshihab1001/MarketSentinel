@@ -6,9 +6,11 @@ Changes from v1.0:
        Dev  (APP_ENV=development): DEBUG level, console + all 4 files
        Prod (APP_ENV=production):  INFO level, files only (no console),
                                    no stack traces in HTTP responses
+
   NEW: Full file PATH in every log entry (was module name only)
        Format: core/data/data_fetcher.py:fetch:142
        Previously: data_fetcher:fetch:142
+       
   NEW: logs/debug.log — DEBUG only, dev mode only (never in prod)
   NEW: logs/access.log — HTTP request log (Uvicorn access events)
   KEPT: logs/marketsentinel.log — INFO+ all environments
