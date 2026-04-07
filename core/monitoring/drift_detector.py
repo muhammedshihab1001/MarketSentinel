@@ -178,7 +178,7 @@ class DriftDetector:
 
             if not np.isfinite(mean) or not np.isfinite(std) or std < self.EPSILON:
                 continue
-            
+
             block[col] = block[col].clip(
                 mean - self.FEATURE_CLIP_SIGMA * std,
                 mean + self.FEATURE_CLIP_SIGMA * std
