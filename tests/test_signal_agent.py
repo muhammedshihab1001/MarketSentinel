@@ -1,4 +1,3 @@
-import pytest
 from copy import deepcopy
 
 from core.agent.signal_agent import SignalAgent

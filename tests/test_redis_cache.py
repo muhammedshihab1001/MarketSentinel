@@ -12,8 +12,7 @@ All tests in this file match the current v13 API exactly.
 
 import time
 import json
-import pytest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 from app.inference.cache import (
     RedisCache,

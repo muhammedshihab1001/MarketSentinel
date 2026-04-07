@@ -192,7 +192,6 @@ def cleanup_old_data():
     try:
         from core.db.engine import get_session
         from core.db.models import OHLCVDaily
-        import datetime
 
         cutoff = (
             pd.Timestamp.now(tz="UTC")

@@ -4,8 +4,7 @@ Covers issue #5 (hash quoting) and auth flow end-to-end.
 """
 
 import pytest
-from unittest.mock import MagicMock, patch
-from passlib.context import CryptContext
+from unittest.mock import patch
 
 from app.core.auth.jwt_handler import (
     verify_password,

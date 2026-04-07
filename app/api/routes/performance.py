@@ -9,8 +9,6 @@
 # =========================================================
 
 import pandas as pd
-import numpy as np
-import asyncio
 import time
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool

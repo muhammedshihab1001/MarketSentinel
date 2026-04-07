@@ -11,10 +11,8 @@
 # =========================================================
 
 import time
-import logging
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
 
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,

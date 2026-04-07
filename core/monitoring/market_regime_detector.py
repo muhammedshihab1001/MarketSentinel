@@ -18,7 +18,7 @@ Regime logic:
 import logging
 import numpy as np
 import pandas as pd
-from typing import Dict, Optional
+from typing import Dict
 
 logger = logging.getLogger(__name__)
 

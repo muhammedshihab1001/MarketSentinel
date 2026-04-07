@@ -3,9 +3,7 @@ Tests for DemoTracker — fingerprint, increment, lock, TTL, reset.
 Covers issue #10 (dead Redis client cached at init).
 """
 
-import pytest
-import time
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, PropertyMock
 
 from app.core.auth.demo_tracker import DemoTracker, DEMO_REQUESTS_PER_FEATURE, DEMO_TTL_SECONDS
 
@@ -58,9 +56,7 @@ class TestRedisClientProperty:
 
         # Simulate Redis reconnect — property returns different objects
         mock_cache._redis = mock_redis_1
-        tracker = DemoTracker(cache=mock_cache)
-
-        first_call = tracker._redis
+        tracker = DemoTracker(cache=mock_cache)        tracker._redis  # access to verify live client
         mock_cache._redis = mock_redis_2   # simulates reconnect
         second_call = tracker._redis
 

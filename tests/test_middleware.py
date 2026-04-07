@@ -3,13 +3,8 @@ Tests for AuthMiddleware — owner-only routes, demo quota,
 unauthenticated requests.
 """
 
-import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
-from starlette.testclient import TestClient
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 
-from app.core.auth.middleware import AuthMiddleware, _is_owner_only, _get_feature_group
+from app.core.auth.middleware import _is_owner_only, _get_feature_group
 
 
 # =====================================================

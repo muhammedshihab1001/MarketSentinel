@@ -13,7 +13,6 @@ Changes from v5.0:
        SQLAlchemy get_session() is thread-safe (session-per-call).
 """
 
-import logging
 import os
 import re
 import time

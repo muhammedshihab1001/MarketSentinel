@@ -3,14 +3,12 @@
 # SWAGGER FIX: Added tags, summary, description, examples
 # =========================================================
 
-import logging
 import asyncio
 import time
 import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
 
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,

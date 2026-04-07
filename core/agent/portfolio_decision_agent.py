@@ -13,7 +13,7 @@ Changes from v4.2.0:
 
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import numpy as np
 

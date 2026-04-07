@@ -2,12 +2,10 @@ import numpy as np
 import pandas as pd
 import json
 import pytest
-import tempfile
 import os
 
 from core.monitoring.drift_detector import DriftDetector
 from core.schema.feature_schema import MODEL_FEATURES
-from core.artifacts.metadata_manager import MetadataManager
 
 
 ############################################################

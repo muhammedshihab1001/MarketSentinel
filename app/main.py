@@ -43,7 +43,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
-from core.config.env_loader import init_env, get_int, get_env, get_bool
+from core.config.env_loader import init_env, get_env, get_bool
 from core.schema.feature_schema import get_schema_signature
 from core.logging.logger import get_logger
 

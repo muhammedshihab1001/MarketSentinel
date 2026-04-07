@@ -10,9 +10,8 @@
 
 import logging
 import os
-from typing import Optional
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 

@@ -18,15 +18,12 @@ Set these in .env to override:
 """
 
 import os
-import logging
 import time
 from contextlib import contextmanager
-from typing import Optional
 
 from sqlalchemy import create_engine, text, event
 from sqlalchemy.orm import sessionmaker, Session, DeclarativeBase
 from sqlalchemy.pool import QueuePool
-from sqlalchemy.exc import OperationalError
 
 from core.logging.logger import get_logger
 

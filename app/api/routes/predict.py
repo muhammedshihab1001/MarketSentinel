@@ -78,7 +78,6 @@ def init_pipeline(model_loader, cache):
 
 
 def get_pipeline() -> InferencePipeline:
-    global _pipeline
     if _pipeline is None:
         try:
             loader = get_model_loader()

@@ -3,8 +3,7 @@ import os
 import pytest
 import numpy as np
 import random
-import socket
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 # ---------------------------------------------------
 # FIX: Set JWT_SECRET before importing app.main.

@@ -19,7 +19,6 @@ FIX: OWNER_PASSWORD_HASH is now printed WITH double quotes.
 """
 
 import sys
-import os
 import secrets
 
 
@@ -65,13 +64,13 @@ def main():
     print("\n" + "=" * 52)
     print("  Add these to your .env file:")
     print("=" * 52)
-    print(f"\nOWNER_USERNAME=shihab")
+    print("\nOWNER_USERNAME=shihab")
     print(f'OWNER_PASSWORD_HASH="{hashed}"')   # FIX: quoted — prevents Docker $ mangling
     print(f'JWT_SECRET="{jwt_secret}"')
-    print(f"DEMO_REQUESTS_PER_FEATURE=3")
-    print(f"DEMO_BLOCK_DAYS=7")
-    print(f"JWT_OWNER_EXPIRE_DAYS=30")
-    print(f"JWT_DEMO_EXPIRE_HOURS=24")
+    print("DEMO_REQUESTS_PER_FEATURE=3")
+    print("DEMO_BLOCK_DAYS=7")
+    print("JWT_OWNER_EXPIRE_DAYS=30")
+    print("JWT_DEMO_EXPIRE_HOURS=24")
     print("\n" + "=" * 52)
     print("  IMPORTANT:")
     print("  - Hash is wrapped in double quotes — required for Docker Compose")

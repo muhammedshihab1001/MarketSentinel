@@ -12,15 +12,14 @@ Changes from v2.x:
 """
 
 import hashlib
-import logging
 import os
 import sys
 import threading
 from typing import List, Optional
 
 from dotenv import load_dotenv
+from core.logging.logger import get_logger
 
-from core.logging.logger import setup_logging, get_logger
 
 logger = get_logger("marketsentinel.env")
 

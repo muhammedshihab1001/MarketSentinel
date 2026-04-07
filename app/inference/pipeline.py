@@ -21,7 +21,7 @@ import logging
 import os
 import numpy as np
 import pandas as pd
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema, DTYPE
 from core.market.universe import MarketUniverse

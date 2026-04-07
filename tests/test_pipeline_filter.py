@@ -3,10 +3,9 @@ Tests for InferencePipeline._filter_latest_per_ticker.
 Covers issue #6 — snapshot was returning 27400 rows instead of 100.
 """
 
-import pytest
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from app.inference.pipeline import InferencePipeline
 

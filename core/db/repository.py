@@ -19,12 +19,11 @@ Changes from v2.0:
 """
 
 import datetime
-import logging
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import select, delete, func, and_
+from sqlalchemy import select, delete, func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.db.engine import get_session
