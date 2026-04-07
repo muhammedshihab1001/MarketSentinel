@@ -65,7 +65,7 @@ def get_equity(ticker: str):
 
     try:
         end_date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
 
         svc = MarketDataService()  # FIX #21: no session_factory kwarg
         df = svc.get_price_data(ticker, start_date=start_date, end_date=end_date)

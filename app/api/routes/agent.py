@@ -187,6 +187,15 @@ async def explain_signal(
 
         latency_ms = round((time.time() - start_time) * 1000, 1)
 
+        # Look up rationale from top_5_rationale if ticker is in top-5
+        # These fields only exist in the rationale, not in signal_details
+        rationale_list = snapshot_result.get(
+            "executive_summary", {}
+        ).get("top_5_rationale", [])
+        rationale = next(
+            (r for r in rationale_list if r.get("ticker") == ticker), {}
+        )
+
         return _success({
             "ticker": ticker,
             "snapshot_date": signal_row.get("date", ""),
@@ -203,6 +212,13 @@ async def explain_signal(
             "warnings": warnings,
             "explanation": explanation,
             "llm": llm_output,
+            # Rationale fields — populated for top-5 tickers, empty for others
+            "rank": rationale.get("rank"),
+            "agents_approved": rationale.get("agents_approved", []),
+            "agents_flagged": rationale.get("agents_flagged", []),
+            "selection_reason": rationale.get("selection_reason", ""),
+            "agent_scores": rationale.get("agent_scores", {}),
+            "in_top_5": bool(rationale),
             "latency_ms": latency_ms,
         })
 
@@ -278,6 +294,7 @@ async def political_risk(
             "political_risk_label": political.get("political_risk_label", "LOW"),
             "top_events": political.get("top_events", [])[:5],
             "source": political.get("source", "gdelt"),
+            "gdelt_status": political.get("gdelt_status", "unknown"),
             "served_from_cache": bool(snapshot_result),
             "latency_ms": round((time.time() - start_time) * 1000, 1),
         })

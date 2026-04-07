@@ -53,7 +53,7 @@ from app.api.routes import (
 )
 from app.api.routes import auth as auth_router
 from app.core.auth.middleware import AuthMiddleware
-from app.inference.model_loader import ModelLoader
+from app.inference.model_loader import ModelLoader, get_model_loader
 from app.inference.cache import RedisCache
 from core.monitoring.drift_detector import DriftDetector
 from core.db.engine import init_db, check_db_health, dispose_engine
@@ -89,6 +89,10 @@ PUBLIC_PATHS = {
     "/health/live", "/health/ready", "/health/db", "/health/model",
     "/universe", "/auth/owner-login", "/auth/demo-login",
     "/auth/me", "/auth/logout", "/favicon.ico",
+    # Model info and agent list — public read-only endpoints
+    # Must match middleware FREE_PATHS or they get blocked by main.py
+    "/model/info",
+    "/agent/agents",
 }
 
 # =====================================================
@@ -375,7 +379,10 @@ async def lifespan(app: FastAPI):
             readiness.data_synced = True
 
         # ── Model ─────────────────────────────────────
-        loader = ModelLoader()
+        # FIX: use get_model_loader() singleton so model_info.py
+        # and feature-importance routes share the same loaded instance.
+        # ModelLoader() creates a new empty instance every time.
+        loader = get_model_loader()
         load_success = loader.load()
         readiness.models_loaded = load_success and loader.is_loaded()
         readiness.schema_signature = loader.schema_signature
