@@ -1,19 +1,20 @@
 # =========================================================
-# AUTH MIDDLEWARE v2.3
+# AUTH MIDDLEWARE v2.4
 #
-# Changes from v2.2:
-# NEW: OWNER_ONLY_PATHS — routes that return 403 for demo
-#      users and 401 for unauthenticated users:
-#        /admin/*       — sync, retrain triggers
-#        /model/ic-stats — IC monitoring (owner tool)
-#        /model/diagnostics — raw diagnostics
-# FIX: reset_in_seconds at top level of demo_locked so
-#      frontend DemoLockedError.resetInSeconds works.
-# FIX: feature in demo_locked response so frontend
-#      DemoLockedError.feature works.
-# FIX: /predict/live-snapshot added to FEATURE_GROUP_MAP.
-# FIX: Unauthenticated requests to protected routes now
-#      return 401 immediately rather than passing through.
+# Changes from v2.3:
+# FIX: DemoTracker was initialized with cache=None at startup.
+#      Redis cache is set up AFTER middleware init in lifespan.
+#      Result: all demo usage tracking silently failed-open.
+#      used count never incremented in Redis.
+#      Fix: get cache from request.app.state.cache dynamically
+#      on each request — always gets live Redis client.
+#
+# FIX: API key authentication now handled here.
+#      When X-API-KEY matches API_KEY env var, request gets
+#      owner-level access. Previously the API key passed
+#      main.py but AuthMiddleware rejected it (no JWT = no role).
+#
+# All other fixes from v2.3 retained.
 # =========================================================
 
 import logging
@@ -29,22 +30,13 @@ from app.core.auth.demo_tracker import DemoTracker
 
 logger = logging.getLogger("marketsentinel.middleware")
 
-# =========================================================
-# OWNER-ONLY PATHS
-# Demo users get 403. Unauthenticated users get 401.
-# These are administrative or sensitive endpoints.
-# =========================================================
+_API_KEY = os.getenv("API_KEY", "")
 
 OWNER_ONLY_PREFIXES = {
-    "/admin",                  # /admin/sync, /admin/retrain etc
-    "/model/ic-stats",         # IC monitoring — owner tool
-    "/model/diagnostics",      # Raw model diagnostics
+    "/admin",
+    "/model/ic-stats",
+    "/model/diagnostics",
 }
-
-# =========================================================
-# FEATURE GROUP MAP
-# Demo users get 3 requests per feature group then locked.
-# =========================================================
 
 FEATURE_GROUP_MAP = {
     "/snapshot":                  "snapshot",
@@ -59,7 +51,6 @@ FEATURE_GROUP_MAP = {
     "/model/feature-importance":  "signals",
 }
 
-# Paths always free — no auth check, no demo counter
 FREE_PATHS = {
     "/health",
     "/health/ready",
@@ -80,9 +71,8 @@ FREE_PATHS = {
     "/favicon.ico",
 }
 
-DEMO_REQUESTS_PER_FEATURE = int(os.getenv("DEMO_REQUESTS_PER_FEATURE", "3"))
+DEMO_REQUESTS_PER_FEATURE = int(os.getenv("DEMO_REQUESTS_PER_FEATURE", "10"))
 
-# Unique ordered feature list for usage summaries
 _UNIQUE_FEATURES = list(dict.fromkeys(FEATURE_GROUP_MAP.values()))
 
 
@@ -96,7 +86,6 @@ def _get_client_ip(request: Request) -> str:
 
 
 def _is_owner_only(path: str) -> bool:
-    """Return True if path requires owner role."""
     for prefix in OWNER_ONLY_PREFIXES:
         if path == prefix or path.startswith(prefix + "/") or path.startswith(prefix + "?"):
             return True
@@ -104,7 +93,6 @@ def _is_owner_only(path: str) -> bool:
 
 
 def _get_feature_group(path: str) -> Optional[str]:
-    """Return feature group for demo quota, or None if free."""
     if path in FREE_PATHS:
         return None
     for prefix, feature in FEATURE_GROUP_MAP.items():
@@ -113,28 +101,45 @@ def _get_feature_group(path: str) -> Optional[str]:
     return None
 
 
+def _has_valid_api_key(request: Request) -> bool:
+    """Return True if request has a valid X-API-KEY header."""
+    if not _API_KEY:
+        return False
+    return request.headers.get("X-API-KEY", "") == _API_KEY
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     """
     Request lifecycle:
-
-    1. Free path           → pass through (no token needed)
-    2. Owner-only path     → owner token required, else 401/403
-    3. Authenticated path:
-       a. owner token      → full access, no limits
-       b. demo token       → check + increment demo counter
-       c. no token         → 401
+    1. Free path        → pass through
+    2. Valid API key    → owner access (FIX v2.4)
+    3. Owner-only path  → owner JWT required
+    4a. owner JWT       → full access
+    4b. demo JWT        → quota check + increment (FIX v2.4: live Redis)
+    4c. no token        → 401
     """
 
-    def __init__(self, app, cache=None):
+    def __init__(self, app):
         super().__init__(app)
-        self._cache = cache
-        self._tracker = DemoTracker(cache=cache)
+
+    def _get_tracker(self, request: Request) -> DemoTracker:
+        """
+        FIX v2.4: Get DemoTracker with live Redis cache from app.state.
+        Previously: DemoTracker(cache=None) stored at init time.
+        Cache was not yet available when middleware was created.
+        Now: fetch from request.app.state.cache on every request.
+        """
+        try:
+            cache = request.app.state.cache
+            return DemoTracker(cache=cache)
+        except AttributeError:
+            return DemoTracker(cache=None)
 
     async def dispatch(self, request: Request, call_next):
 
         path = request.url.path
 
-        # ── Extract JWT from cookie ───────────────────
+        # ── Extract JWT ───────────────────────────────
         token = request.cookies.get("ms_token")
         role = None
         username = None
@@ -154,36 +159,35 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if path in FREE_PATHS:
             return await call_next(request)
 
-        # ── 2. Owner-only paths ───────────────────────
+        # ── 2. API key → owner access ─────────────────
+        if _has_valid_api_key(request):
+            request.state.role = "owner"
+            request.state.username = "api_key_client"
+            return await call_next(request)
+
+        # ── 3. Owner-only paths ───────────────────────
         if _is_owner_only(path):
             if role == "owner":
                 return await call_next(request)
             if role == "demo":
                 return JSONResponse(
                     status_code=403,
-                    content={
-                        "detail": "This feature is restricted to owner accounts.",
-                        "path": path,
-                    },
+                    content={"detail": "Owner access required.", "path": path},
                 )
             return JSONResponse(
                 status_code=401,
-                content={
-                    "detail": "Authentication required.",
-                    "path": path,
-                },
+                content={"detail": "Authentication required.", "path": path},
             )
 
-        # ── 3a. Owner — full access ───────────────────
+        # ── 4a. Owner ─────────────────────────────────
         if role == "owner":
             return await call_next(request)
 
-        # ── 3b. Demo — feature quota ──────────────────
+        # ── 4b. Demo + quota ──────────────────────────
         if role == "demo":
             feature = _get_feature_group(path)
 
             if feature is None:
-                # No quota for this path — pass through
                 return await call_next(request)
 
             ip = _get_client_ip(request)
@@ -191,10 +195,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
             fingerprint = DemoTracker.build_fingerprint(ip, ua)
             request.state.fingerprint = fingerprint
 
-            if self._tracker.is_locked(fingerprint, feature):
-                summary = self._tracker.get_usage_summary(
-                    fingerprint, _UNIQUE_FEATURES
-                )
+            tracker = self._get_tracker(request)
+
+            if tracker.is_locked(fingerprint, feature):
+                summary = tracker.get_usage_summary(fingerprint, _UNIQUE_FEATURES)
                 reset_in_seconds = summary.get("reset_in_seconds", 0)
 
                 logger.info(
@@ -216,10 +220,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     },
                 )
 
-            self._tracker.increment(fingerprint, feature)
+            tracker.increment(fingerprint, feature)
             return await call_next(request)
 
-        # ── 3c. No valid token ────────────────────────
+        # ── 4c. No token ──────────────────────────────
         feature = _get_feature_group(path)
         if feature is not None:
             return JSONResponse(
@@ -230,5 +234,4 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 },
             )
 
-        # Unknown path with no token — let route handler decide
         return await call_next(request)

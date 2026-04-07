@@ -448,6 +448,16 @@ async def lifespan(app: FastAPI):
             RATE_LIMIT_DEFAULT[1],
         )
 
+        # Security: warn if API_KEY not configured
+        if not API_KEY:
+            logger.warning(
+                "API_KEY is not set — programmatic access blocked. "
+                "Only JWT-authenticated requests (browser login) are accepted. "
+                "Generate a key: python scripts/generate_api_key.py"
+            )
+        else:
+            logger.info("API key configured | programmatic access enabled")
+
         # ── Background tasks ──────────────────────────
         asyncio.create_task(_daily_sync_loop())
         logger.info("Daily sync scheduler started (runs weekdays at 18:30)")
@@ -503,15 +513,35 @@ async def request_context_middleware(request: Request, call_next):
 
     path = request.url.path
 
-    # ── API key check ─────────────────────────────────
-    if path not in PUBLIC_PATHS and API_KEY:
-        client_key = request.headers.get("X-API-KEY")
+    # ── API key / auth check ─────────────────────────
+    # Always enforced for non-public paths.
+    # Browser users: must have ms_token JWT cookie (set on login).
+    # External programmatic access: must pass X-API-KEY header.
+    #
+    # Security fix: removed "and API_KEY" condition.
+    # Old code: if path not in PUBLIC_PATHS and API_KEY:
+    #   → if API_KEY="" entire block skipped → anyone could access
+    # New code: always check, require JWT or valid API key.
+    if path not in PUBLIC_PATHS:
         has_jwt = (
             request.cookies.get("ms_token")
             or request.headers.get("Authorization", "").startswith("Bearer ")
         )
-        if not has_jwt and client_key != API_KEY:
-            raise HTTPException(status_code=401, detail="Invalid API key")
+        if not has_jwt:
+            # No JWT cookie — check X-API-KEY header
+            client_key = request.headers.get("X-API-KEY")
+            if not API_KEY:
+                # API_KEY not configured — programmatic access disabled
+                # All non-browser access rejected
+                raise HTTPException(
+                    status_code=401,
+                    detail="Authentication required. Please log in.",
+                )
+            if client_key != API_KEY:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid or missing API key.",
+                )
 
     # ── Client IP ─────────────────────────────────────
     forwarded = request.headers.get("X-Forwarded-For")
