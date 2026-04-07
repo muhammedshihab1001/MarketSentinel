@@ -1,10 +1,9 @@
 # =========================================================
-# EQUITY ROUTE v2.5
-#
-# SWAGGER FIX v2.5:
-# - Added tags, summary, description to both endpoints
-# - days Query param documented with ge/le/example
-# - ticker path param examples added
+# EQUITY ROUTE v2.6
+# FIX #21: Removed session_factory=get_session from both
+# MarketDataService() calls. MarketDataService.__init__()
+# does not accept this kwarg — caused 500 on all price
+# chart requests from the Agent page.
 # =========================================================
 
 import time
@@ -13,10 +12,9 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import JSONResponse
 
 from core.data.market_data_service import MarketDataService
-from core.db.engine import get_session
+from core.db.engine import get_session  # noqa: F401 — kept for other imports
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
@@ -56,30 +54,20 @@ def _safe_str(val, default="") -> str:
 Returns the latest OHLCV row plus calculated returns and volatility
 for a single ticker from the PostgreSQL database.
 
-**Example tickers:** AAPL, NVDA, MSFT, GOOGL, JPM, AMZN, TSLA
-
-**Response includes:**
-- `ohlcv`: latest date, open, high, low, close, volume
-- `returns.5d_return`: 5-day price return
-- `returns.20d_return`: 20-day price return
-- `returns.volatility_20d_ann`: 20-day annualised volatility
-
 **Requires:** Owner or Demo authentication (counts against `signals` quota).
 """,
     response_description="Latest OHLCV + returns + volatility for the ticker.",
 )
 def get_equity(ticker: str):
-    endpoint = f"/equity/{ticker}"
     API_REQUEST_COUNT.labels(endpoint="/equity/ticker").inc()
     start_time = time.time()
-
     ticker = ticker.upper().strip()
 
     try:
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
 
-        svc = MarketDataService(session_factory=get_session)
+        svc = MarketDataService()  # FIX #21: no session_factory kwarg
         df = svc.get_price_data(ticker, start_date=start_date, end_date=end_date)
 
         if df is None or df.empty:
@@ -87,7 +75,6 @@ def get_equity(ticker: str):
 
         latest = df.iloc[-1]
         date_val = latest["date"] if "date" in df.columns else df.index[-1]
-        date_str = _safe_str(date_val)
 
         ret_5d = 0.0
         if len(df) >= 6:
@@ -116,7 +103,7 @@ def get_equity(ticker: str):
         return {
             "ticker": ticker,
             "ohlcv": {
-                "date": date_str,
+                "date": _safe_str(date_val),
                 "open": _safe_float(latest.get("open")),
                 "high": _safe_float(latest.get("high")),
                 "low": _safe_float(latest.get("low")),
@@ -148,12 +135,9 @@ def get_equity(ticker: str):
     summary="OHLCV History for Ticker",
     description="""
 Returns historical daily OHLCV rows for a ticker from the PostgreSQL database.
-
-**Example tickers:** AAPL, NVDA, MSFT, GOOGL, JPM
+Used by the Agent page price chart.
 
 **days:** Number of trading days to return (1–730). Default: 90.
-
-Data is served entirely from the local DB — no Yahoo Finance calls.
 """,
     response_description="Array of daily OHLCV rows oldest to newest.",
 )
@@ -170,14 +154,13 @@ def get_equity_history(
     endpoint = "/equity/ticker/history"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
-
     ticker = ticker.upper().strip()
 
     try:
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
 
-        svc = MarketDataService(session_factory=get_session)
+        svc = MarketDataService()  # FIX #21: no session_factory kwarg
         df = svc.get_price_data(ticker, start_date=start_date, end_date=end_date)
 
         if df is None or df.empty:
