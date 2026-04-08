@@ -1,0 +1,16 @@
+# =========================================================
+# MarketSentinel — Training Requirements
+# Offline training container only
+# =========================================================
+
+-r base.txt
+
+# ── Statistical computation ───────────────────────────────
+# Used by backtesting/performance_engine for regime detection,
+# Sharpe, Sortino, drawdown calculations
+scipy==1.15.3
+
+# ── Columnar data / parquet ───────────────────────────────
+# Used by feature store and data pipeline for efficient
+# serialisation of large DataFrames
+pyarrow==15.0.2

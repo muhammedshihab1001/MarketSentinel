@@ -1,0 +1,6 @@
+[flake8]
+          max-line-length = 100
+          extend-ignore = E501, W503, E203, E402, E221, E272, E128
+          exclude = .git,__pycache__,venv,.venv,migrations,artifacts,build,dist
+          per-file-ignores =
+              __init__.py: F401, F403
