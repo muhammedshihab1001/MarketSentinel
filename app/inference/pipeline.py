@@ -613,6 +613,74 @@ class InferencePipeline:
             "_portfolio": portfolio_output,
         }
 
+        # ── Store predictions for IC stats ───────────────
+        # STORE_PREDICTIONS=1 enables this. Predictions saved to
+        # DB allow /model/ic-stats to compute Spearman IC between
+        # model scores and actual next-day returns.
+        store_preds = os.getenv("STORE_PREDICTIONS", "0") == "1"
+        if store_preds:
+            try:
+                from core.db.repository import PredictionRepository
+                model_ver = getattr(loader, "version", "unknown")
+                pred_records = [
+                    {
+                        "ticker": r["ticker"],
+                        "date": r["date"],
+                        "model_version": model_ver,
+                        "raw_model_score": r["raw_model_score"],
+                        "hybrid_score": r["hybrid_consensus_score"],
+                        "weight": r["weight"],
+                        "signal": (
+                            "LONG" if r["weight"] > 0.01
+                            else "SHORT" if r["weight"] < -0.01
+                            else "NEUTRAL"
+                        ),
+                        "drift_state": drift_state,
+                    }
+                    for r in snapshot_rows
+                ]
+                PredictionRepository.store_predictions(pred_records)
+                logger.info(
+                    "Predictions stored | date=%s | count=%d",
+                    snapshot_date, len(pred_records),
+                )
+            except Exception as e:
+                logger.warning("Prediction storage failed (non-blocking): %s", e)
+
+        # ── Store predictions for IC stats ───────────────
+        # STORE_PREDICTIONS=1 enables this. Predictions saved to
+        # DB allow /model/ic-stats to compute Spearman IC between
+        # model scores and actual next-day returns.
+        store_preds = os.getenv("STORE_PREDICTIONS", "0") == "1"
+        if store_preds:
+            try:
+                from core.db.repository import PredictionRepository
+                model_ver = getattr(loader, "version", "unknown")
+                pred_records = [
+                    {
+                        "ticker": r["ticker"],
+                        "date": r["date"],
+                        "model_version": model_ver,
+                        "raw_model_score": r["raw_model_score"],
+                        "hybrid_score": r["hybrid_consensus_score"],
+                        "weight": r["weight"],
+                        "signal": (
+                            "LONG" if r["weight"] > 0.01
+                            else "SHORT" if r["weight"] < -0.01
+                            else "NEUTRAL"
+                        ),
+                        "drift_state": drift_state,
+                    }
+                    for r in snapshot_rows
+                ]
+                PredictionRepository.store_predictions(pred_records)
+                logger.info(
+                    "Predictions stored | date=%s | count=%d",
+                    snapshot_date, len(pred_records),
+                )
+            except Exception as e:
+                logger.warning("Prediction storage failed (non-blocking): %s", e)
+
         logger.info(
             "Snapshot complete | tickers=%d | long=%d | short=%d | latency=%.0fms",
             len(snapshot_rows), lc, sc, latency_ms,

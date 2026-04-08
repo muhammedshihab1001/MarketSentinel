@@ -53,7 +53,7 @@ from app.api.routes import (
 )
 from app.api.routes import auth as auth_router
 from app.core.auth.middleware import AuthMiddleware
-from app.inference.model_loader import ModelLoader, get_model_loader
+from app.inference.model_loader import get_model_loader
 from app.inference.cache import RedisCache
 from core.monitoring.drift_detector import DriftDetector
 from core.db.engine import init_db, check_db_health, dispose_engine

@@ -56,7 +56,8 @@ class TestRedisClientProperty:
 
         # Simulate Redis reconnect — property returns different objects
         mock_cache._redis = mock_redis_1
-        tracker = DemoTracker(cache=mock_cache)        tracker._redis  # access to verify live client
+        tracker = DemoTracker(cache=mock_cache)
+        tracker._redis  # access to verify live client
         mock_cache._redis = mock_redis_2   # simulates reconnect
         second_call = tracker._redis
 

@@ -27,3 +27,5 @@ pyarrow==15.0.2
 
 # ── Async test support ────────────────────────────────────
 anyio[trio]==4.4.0
+
+flake8

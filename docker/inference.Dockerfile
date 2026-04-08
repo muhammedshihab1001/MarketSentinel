@@ -50,10 +50,6 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
     pip install --prefer-binary "xgboost[cpu]==2.1.1" && \
     pip install --prefer-binary -r requirements/inference.txt
 
-# Optional LLM support — only installed if INSTALL_LLM=true
-ARG INSTALL_LLM=false
-RUN if [ "$INSTALL_LLM" = "true" ]; then \
-    pip install -r requirements/llm.txt; fi
 
 
 ############################################################
