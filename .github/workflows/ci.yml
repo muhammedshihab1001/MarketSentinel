@@ -151,12 +151,6 @@ jobs:
       - name: Tests — pytest (115 tests)
         run: pytest tests -v --maxfail=5 --disable-warnings -q
 
-      - name: Model evaluation (skips if no artifact)
-        # run_evaluation checks artifacts/xgboost/*.pkl first.
-        # No artifact in CI → logs skip message → exits 0.
-        # Artifact present → runs full walk-forward evaluation.
-        run: python -m training.run_evaluation
-
 
 # ===================================================
 # JOB 2 — DOCKER BUILD CHECK
