@@ -1,4 +1,4 @@
-from typing import Tuple, List, Dict
+from typing import Tuple, Dict
 import pandas as pd
 import hashlib
 import numpy as np
@@ -8,69 +8,43 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# SCHEMA VERSION (BUMPED)
-# ============================================================
-
-SCHEMA_VERSION = "44.0"  # enhanced-alpha schema contract
-
-
-############################################################
-# SIGNAL CONTRACT
-############################################################
+# FIX (item 61): Bumped schema version — regime_multiplier added to CORE_FEATURES.
+# This invalidates all existing feature caches (correct behaviour).
+# After deploying, retrain: docker-compose run --rm -e SKIP_SYNC=1 training
+SCHEMA_VERSION = "45.5"
 
 LONG_PERCENTILE = 0.70
 SHORT_PERCENTILE = 0.30
 
-
-############################################################
-# CORE FEATURES (ENHANCED)
-############################################################
-
 CORE_FEATURES: Tuple[str, ...] = (
-
-    # Returns
     "return",
     "return_lag1",
     "return_lag5",
     "return_mean_20",
     "reversal_5",
-
-    # Momentum
     "momentum_20",
     "momentum_60",
     "momentum_composite",
     "mom_vol_adj",
     "momentum_regime_interaction",
-
-    # Volatility
     "volatility",
     "volatility_20",
     "vol_of_vol",
     "return_skew_20",
-
-    # Liquidity
     "volume_momentum",
     "dollar_volume",
     "amihud",
-
-    # Technical
     "rsi",
     "ema_ratio",
-
-    # Structure
     "dist_from_52w_high",
     "regime_feature",
-
-    # Market-level context
     "market_dispersion",
     "breadth",
+    # NEW (item 61): Market regime multiplier from MarketRegimeDetector.
+    # BULL=1.2, SIDEWAYS=1.0, BEAR=0.6, CRISIS=0.3.
+    # Gives XGBoost explicit market context beyond individual ticker features.
+    "regime_multiplier",
 )
-
-
-############################################################
-# CROSS-SECTIONAL BASE COLUMNS
-############################################################
 
 BASE_CS_COLS: Tuple[str, ...] = (
     "momentum_20",
@@ -100,57 +74,122 @@ CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = tuple(
     [f"{col}_rank" for col in BASE_CS_COLS]
 )
 
-
-############################################################
-# MODEL FEATURE CONTRACT
-############################################################
-
-MODEL_FEATURES: List[str] = list(
+MODEL_FEATURES: Tuple[str, ...] = tuple(
     CORE_FEATURES + CROSS_SECTIONAL_FEATURES
 )
 
 DTYPE = np.float32
+
 MIN_ROWS_TRAINING = 300
 MIN_VARIANCE = 1e-8
 MIN_CS_VARIANCE = 1e-6
 
 FORBIDDEN_REGEX = re.compile(
-    r"\b(future|next|forward|target|label|tomorrow|lead|horizon|lookahead|outcome|response)\b",
-    re.IGNORECASE
+    r"\b(future|next|forward|label|tomorrow|lead|horizon|lookahead|outcome|response)\b",
+    re.IGNORECASE,
 )
 
+_logged_low_variance_core = set()
+_logged_low_variance_cs = set()
+_logged_constant_cs = set()
+_logged_missing_inference = set()
 
-############################################################
-# INTERNAL UTILITIES
-############################################################
 
-def _check_forbidden_columns(df: pd.DataFrame):
+def _check_duplicate_features():
+
+    duplicates = [
+        x for x in MODEL_FEATURES
+        if MODEL_FEATURES.count(x) > 1
+    ]
+
+    if duplicates:
+        raise RuntimeError(
+            f"Duplicate features detected in schema: {set(duplicates)}"
+        )
+
+
+def _check_forbidden_columns(df: pd.DataFrame, mode: str) -> None:
+
     for col in df.columns:
+
+        if mode == "training" and col.lower() == "target":
+            continue
+
         if FORBIDDEN_REGEX.search(col):
             raise RuntimeError(f"Lookahead column detected: {col}")
 
 
 def _safe_numeric_block(df: pd.DataFrame) -> pd.DataFrame:
+
     df = df.copy()
-    for col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    cols = [c for c in MODEL_FEATURES if c in df.columns]
+
+    for col in cols:
+
+        block = df[col]
+
+        if isinstance(block, pd.DataFrame):
+            series = pd.Series(block.iloc[:, 0].values, index=df.index)
+            df = df.loc[:, ~df.columns.duplicated(keep="first")]
+            df[col] = pd.to_numeric(series, errors="coerce")
+        else:
+            series = pd.Series(block.values, index=df.index)
+            df[col] = pd.to_numeric(series, errors="coerce")
+
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
     return df
 
 
-def _check_dtype_stability(df: pd.DataFrame):
-    if df.dtypes.nunique() > 1:
-        logger.debug("Mixed dtypes detected before cast.")
+def _check_dtype_stability(df: pd.DataFrame) -> None:
+
+    numeric_cols = df.select_dtypes(include=["number"]).columns
+
+    bad = [
+        c for c in numeric_cols
+        if not np.issubdtype(df[c].dtype, np.number)
+    ]
+
+    if bad:
+        logger.debug("Unexpected dtype detected: %s", bad)
 
 
-############################################################
-# VALIDATION
-############################################################
+def _check_variance(df: pd.DataFrame):
+
+    for col in df.columns:
+
+        var = df[col].var()
+
+        if var < MIN_VARIANCE and col not in _logged_low_variance_core:
+            logger.debug(
+                "Low variance feature detected: %s (var=%s)", col, var
+            )
+            _logged_low_variance_core.add(col)
+
+
+def _fill_nan_defaults(df: pd.DataFrame) -> pd.DataFrame:
+
+    for col in df.columns:
+        if df[col].isna().any():
+            if col.endswith("_rank"):
+                df[col] = df[col].fillna(0.5)
+            else:
+                df[col] = df[col].fillna(0.0)
+
+    return df
+
+
+def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
+    return df.loc[:, MODEL_FEATURES]
+
 
 def validate_feature_schema(
     df: pd.DataFrame,
-    mode: str = "training"
+    mode: str = "training",
 ) -> pd.DataFrame:
+
+    _check_duplicate_features()
 
     if df is None or df.empty:
         raise RuntimeError("Empty feature dataset.")
@@ -161,21 +200,19 @@ def validate_feature_schema(
     if mode == "training" and len(df) < MIN_ROWS_TRAINING:
         raise RuntimeError("Dataset below minimum rows for training.")
 
-    _check_forbidden_columns(df)
+    _check_forbidden_columns(df, mode)
 
     missing_core = set(CORE_FEATURES) - set(df.columns)
+
     if missing_core:
         raise RuntimeError(f"Missing core features: {missing_core}")
 
     feature_df = df.copy()
 
-    ########################################################
-    # STRICT CONTRACT ENFORCEMENT
-    ########################################################
-
     if mode in {"training", "strict_contract"}:
 
         missing_all = set(MODEL_FEATURES) - set(feature_df.columns)
+
         if missing_all:
             raise RuntimeError(
                 f"Missing required features under strict contract: {missing_all}"
@@ -187,82 +224,40 @@ def validate_feature_schema(
 
         for col in MODEL_FEATURES:
             if col not in feature_df.columns:
+                if col not in _logged_missing_inference:
+                    logger.warning(
+                        "Missing inference feature: %s (default inserted)", col
+                    )
+                    _logged_missing_inference.add(col)
+
                 if col.endswith("_rank"):
                     feature_df[col] = 0.5
+                elif col == "regime_multiplier":
+                    feature_df[col] = 1.0   # safe default: SIDEWAYS
                 else:
                     feature_df[col] = 0.0
 
-        feature_df = feature_df.loc[:, MODEL_FEATURES]
-
-    ########################################################
-    # NUMERIC + CLEANUP
-    ########################################################
+        feature_df = _reorder_columns(feature_df)
 
     feature_df = _safe_numeric_block(feature_df)
 
-    ########################################################
-    # CORE VALIDATION
-    ########################################################
-
-    for col in CORE_FEATURES:
-
-        series = feature_df[col]
-        finite_vals = series[np.isfinite(series)]
-
-        if finite_vals.empty:
-            raise RuntimeError(f"Core feature fully invalid: {col}")
-
-        if mode in {"training", "strict_contract"}:
-            if finite_vals.nunique() <= 1:
-                raise RuntimeError(f"Constant CORE feature detected: {col}")
-
-        if finite_vals.var(ddof=0) < MIN_VARIANCE:
-            logger.warning(f"Low variance core feature: {col}")
-
-    ########################################################
-    # CROSS-SECTIONAL VALIDATION
-    ########################################################
-
-    for col in CROSS_SECTIONAL_FEATURES:
-
-        series = feature_df[col]
-        finite_vals = series[np.isfinite(series)]
-
-        if finite_vals.nunique() <= 1:
-
-            if mode == "training":
-                logger.warning("Constant CS feature in training: %s", col)
-                continue
-
-            if col.endswith("_z"):
-                feature_df[col] = 0.0
-                continue
-
-            if col.endswith("_rank"):
-                feature_df[col] = 0.5
-                continue
-
-        if finite_vals.var(ddof=0) < MIN_CS_VARIANCE:
-            logger.warning("Low variance CS feature: %s", col)
-
-    ########################################################
-    # FINAL SANITY
-    ########################################################
-
-    if feature_df.isnull().any().any():
-        raise RuntimeError("NaN detected after schema validation.")
+    if mode == "inference":
+        feature_df = _fill_nan_defaults(feature_df)
+    else:
+        if feature_df.isnull().any().any():
+            raise RuntimeError("NaN detected after schema validation.")
 
     if not np.isfinite(feature_df.values).all():
         raise RuntimeError("Non-finite values detected.")
 
     _check_dtype_stability(feature_df)
+    _check_variance(feature_df)
+
+    feature_df = feature_df.loc[:, MODEL_FEATURES]
+    feature_df = feature_df.clip(-1e9, 1e9)
 
     return feature_df.astype(DTYPE, copy=False)
 
-
-############################################################
-# SCHEMA SIGNATURE
-############################################################
 
 def get_schema_signature() -> str:
 
@@ -278,12 +273,9 @@ def get_schema_signature() -> str:
     }
 
     canonical = json.dumps(contract, sort_keys=True)
+
     return hashlib.sha256(canonical.encode()).hexdigest()
 
-
-############################################################
-# SCHEMA SNAPSHOT
-############################################################
 
 def schema_snapshot() -> Dict:
 

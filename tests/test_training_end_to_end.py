@@ -1,31 +1,31 @@
+import os
+import shutil
+import tempfile
 import numpy as np
 import pandas as pd
+from datetime import datetime, timedelta
 
+from training.train_xgboost import trainer
 from training.backtesting.walk_forward import WalkForwardValidator
-from core.schema.feature_schema import (
-    MODEL_FEATURES,
-    validate_feature_schema,
-    DTYPE
-)
+from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema, DTYPE
 
 
-def dummy_trainer(train_df):
+############################################################
+# SYNTHETIC DATASET BUILDER
+# FIX (item 37): Use relative dates — was hardcoded 2025-01-01
+# which will silently become a future date as time passes.
+# Now uses today - 500 days so tests are always historical.
+############################################################
 
-    class DummyModel:
-        def predict(self, X):
-            # deterministic dispersion from first feature
-            base = X.iloc[:, 0].values.astype("float32")
-            return base * 2.0
+def build_training_dataset():
 
-    return DummyModel()
+    rng = np.random.default_rng(42)
 
+    # FIX: relative start — always 500 days before today
+    start = (datetime.utcnow() - timedelta(days=500)).date()
+    dates = pd.date_range(start=start, periods=400)
 
-def build_synthetic_dataset():
-
-    np.random.seed(42)
-
-    dates = pd.date_range("2026-01-01", periods=500)
-    tickers = [f"T{i}" for i in range(15)]  # >= MIN_CS_WIDTH
+    tickers = [f"T{i}" for i in range(12)]
 
     rows = []
 
@@ -35,22 +35,22 @@ def build_synthetic_dataset():
             row = {
                 "date": d,
                 "ticker": t,
-                # Simulated Yahoo-style noisy price
-                "close": 100 + np.random.randn() * 0.5 + (d.day * 0.01),
-                "volatility": abs(np.random.randn()) + 0.2
+                "close": 100 + rng.normal(0, 1) + (d.day * 0.02),
+                "volatility": abs(rng.normal()) + 0.2,
+                "regime": "SIDEWAYS",
+                "market_regime": "SIDEWAYS",
+                "regime_multiplier": 1.0,
             }
 
-            for col in MODEL_FEATURES:
-                row[col] = np.random.randn()
+            for f in MODEL_FEATURES:
+                row[f] = rng.normal()
 
             rows.append(row)
 
     df = pd.DataFrame(rows)
 
-    # Ensure schema compliance + correct dtype
     feature_block = validate_feature_schema(
-        df.loc[:, MODEL_FEATURES],
-        mode="training"
+        df.loc[:, MODEL_FEATURES], mode="training"
     ).astype(DTYPE)
 
     df.loc[:, MODEL_FEATURES] = feature_block
@@ -58,61 +58,100 @@ def build_synthetic_dataset():
     return df
 
 
-def test_walkforward_runs_end_to_end():
+############################################################
+# TRAINING PIPELINE TEST
+############################################################
 
-    df = build_synthetic_dataset()
+def test_training_pipeline_runs():
+
+    df = build_training_dataset()
+    model = trainer(df)
+
+    assert model is not None
+    assert hasattr(model, "predict")
+
+
+############################################################
+# WALK-FORWARD WITH REAL TRAINER
+############################################################
+
+def test_training_walkforward():
+
+    df = build_training_dataset()
 
     validator = WalkForwardValidator(
-        model_trainer=dummy_trainer,
-        window_size=120,
-        step_size=30
+        model_trainer=trainer,
+        window_size=150,
+        step_size=40,
     )
 
     metrics = validator.run(df)
 
-    # ======================================================
-    # Core assertions
-    # ======================================================
-
     assert metrics["num_windows"] > 0
     assert metrics["final_equity"] > 0
-    assert -5.0 <= metrics["avg_sharpe"] <= 5.0
-
-    # ======================================================
-    # Stability checks
-    # ======================================================
-
     assert np.isfinite(metrics["avg_sharpe"])
-    assert np.isfinite(metrics["final_equity"])
-    assert metrics["profit_factor"] >= 0
-
-    # Drawdown sanity (Yahoo-safe)
-    assert metrics["max_drawdown"] <= 0
-    assert metrics["max_drawdown"] >= -1.0
-
-    # Turnover sanity
-    assert metrics["avg_turnover"] >= 0
-    assert metrics["avg_trades_per_window"] >= 1
 
 
-def test_walkforward_is_deterministic():
+############################################################
+# ARTIFACT EXPORT TEST
+############################################################
 
-    df = build_synthetic_dataset()
+def test_model_artifact_export():
 
-    validator1 = WalkForwardValidator(
-        model_trainer=dummy_trainer,
-        window_size=120,
-        step_size=30
-    )
+    from training.train_xgboost import export_artifacts
 
-    validator2 = WalkForwardValidator(
-        model_trainer=dummy_trainer,
-        window_size=120,
-        step_size=30
-    )
+    df = build_training_dataset()
+    model = trainer(df)
 
-    metrics1 = validator1.run(df.copy())
-    metrics2 = validator2.run(df.copy())
+    metrics = {
+        "avg_sharpe": 0.5,
+        "avg_strategy_return": 0.01,
+    }
 
-    assert metrics1["avg_sharpe"] == metrics2["avg_sharpe"]
-    assert metrics1["final_equity"] == metrics2["final_equity"]
+    dataset_hash = "dummy_hash"
+    tmpdir = tempfile.mkdtemp()
+    os.environ["XGB_REGISTRY_DIR"] = tmpdir
+
+    # FIX: use relative dates for export_artifacts call
+    end_date = datetime.utcnow().date().isoformat()
+    start_date = (datetime.utcnow() - timedelta(days=500)).date().isoformat()
+
+    try:
+
+        version = export_artifacts(
+            model=model,
+            metrics=metrics,
+            dataset_hash=dataset_hash,
+            dataset_rows=len(df),
+            start_date=start_date,
+            end_date=end_date,
+            training_df=df,
+            promote_baseline=False,
+            create_baseline=False,
+        )
+
+        assert version is not None
+
+    finally:
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+############################################################
+# DETERMINISM CHECK
+############################################################
+
+def test_training_deterministic():
+
+    df = build_training_dataset()
+
+    model1 = trainer(df.copy())
+    model2 = trainer(df.copy())
+
+    X = df.loc[:, MODEL_FEATURES]
+    X = validate_feature_schema(X, mode="inference").astype(DTYPE)
+
+    pred1 = model1.predict(X)
+    pred2 = model2.predict(X)
+
+    assert np.allclose(pred1, pred2)

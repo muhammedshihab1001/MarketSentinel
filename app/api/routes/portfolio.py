@@ -1,218 +1,189 @@
-import logging
-import asyncio
-import time
-from fastapi import APIRouter, HTTPException
-from fastapi.concurrency import run_in_threadpool
+# =========================================================
+# PORTFOLIO SUMMARY ROUTE v2.6
+#
+# SWAGGER FIX v2.6:
+# BUG FIX: get_portfolio(request=None) was using optional
+#   Request which caused AttributeError when FastAPI
+#   injected the real Request object. Changed to proper
+#   FastAPI dependency injection: get_portfolio(request: Request).
+# SWAGGER: Added summary, description, response_description
+#   so the endpoint is fully documented in /docs.
+# =========================================================
 
-from app.inference.pipeline import (
-    InferencePipeline,
-    get_shared_model_loader,
-)
-from core.market.universe import MarketUniverse
+import time
+
+from fastapi import APIRouter, HTTPException, Request
+
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
-    API_ERROR_COUNT
+    API_ERROR_COUNT,
 )
+from core.logging.logger import get_logger
 
-router = APIRouter()
-logger = logging.getLogger("marketsentinel.portfolio")
+logger = get_logger("marketsentinel.portfolio")
 
-REQUEST_TIMEOUT = 180
-MAX_CONCURRENT = 3
+router = APIRouter(tags=["portfolio"])
 
-portfolio_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
-_pipeline: InferencePipeline | None = None
+BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
 
 
-def get_pipeline():
-    global _pipeline
-    if _pipeline is None:
-        _pipeline = InferencePipeline()
-    return _pipeline
+def _weight_to_signal(weight: float) -> str:
+    if weight > 0.01:
+        return "LONG"
+    if weight < -0.01:
+        return "SHORT"
+    return "NEUTRAL"
 
 
-@router.get("/portfolio-summary")
-async def portfolio_summary():
+def _drift_to_health(drift_state: str, severity_score: int) -> float:
+    if drift_state == "hard":
+        return max(0.0, 40.0 - severity_score * 2)
+    if drift_state == "soft":
+        return max(40.0, 75.0 - severity_score * 3)
+    return 92.0
 
-    endpoint = "/portfolio-summary"
+
+@router.get(
+    "/portfolio",
+    summary="Portfolio Summary",
+    description="""
+Returns the current portfolio state derived from the latest background snapshot.
+
+**Requires authentication** (owner or demo — demo gets 3 requests before lock).
+
+Returns:
+- `positions`: all 100 tickers with weight and signal direction (LONG/SHORT/NEUTRAL)
+- `top_5_preview`: highest-scoring tickers this snapshot
+- `gross_exposure` / `net_exposure`: portfolio exposure metrics
+- `drift_state`: current model drift (none/low/moderate/high/critical)
+- `portfolio_health_score`: 0-100 score derived from drift + exposure
+
+**503** = background snapshot is still computing (~90s on first load).
+Wait and retry — the snapshot cache refreshes every 300s.
+""",
+    response_description="Portfolio summary with positions, exposure, and health score.",
+)
+async def get_portfolio(request: Request):
+    """
+    Returns portfolio summary derived from the latest background snapshot.
+    Returns 503 if no snapshot is cached yet (computing takes ~90s on first load).
+    """
+    endpoint = "/portfolio"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
 
     try:
-        async with portfolio_semaphore:
-            snapshot = await asyncio.wait_for(
-                run_in_threadpool(_portfolio_summary_sync),
-                timeout=REQUEST_TIMEOUT
+        # ── Get cache from app state ──────────────────
+        try:
+            cache = request.app.state.cache
+        except AttributeError:
+            from app.inference.cache import RedisCache
+            cache = RedisCache()
+
+        # ── Load background snapshot ──────────────────
+        snapshot_result = cache.get(BACKGROUND_SNAPSHOT_KEY)
+
+        if not snapshot_result:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "No snapshot available yet. "
+                    "Background compute is pending (~90s on first load). "
+                    "Retry in 30 seconds."
+                ),
             )
 
-        return snapshot
+        # ── Extract data from snapshot result ─────────
+        exec_summary = snapshot_result.get("executive_summary", {})
+        snapshot = snapshot_result.get("snapshot", {})
+        portfolio_agent = snapshot_result.get("_portfolio", {})
 
-    except asyncio.TimeoutError:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        raise HTTPException(status_code=504, detail="Portfolio summary timeout")
+        signals = snapshot.get("signals", [])
+        drift = snapshot.get("drift", {})
 
+        drift_state = drift.get("drift_state", "none")
+        drift_detected = drift.get("drift_detected", False)
+        severity_score = int(drift.get("severity_score", 0))
+
+        gross_exposure = float(exec_summary.get("gross_exposure", 0.0))
+        net_exposure = float(exec_summary.get("net_exposure", 0.0))
+
+        # ── Build positions list ──────────────────────
+        positions = []
+        long_count = 0
+        short_count = 0
+        neutral_count = 0
+
+        for sig in signals:
+            weight = float(sig.get("weight", 0.0))
+            direction = _weight_to_signal(weight)
+
+            if direction == "LONG":
+                long_count += 1
+            elif direction == "SHORT":
+                short_count += 1
+            else:
+                neutral_count += 1
+
+            positions.append({
+                "ticker": sig.get("ticker", ""),
+                "weight": round(weight, 6),
+                "signal": direction,
+            })
+
+        positions.sort(key=lambda x: abs(x["weight"]), reverse=True)
+
+        # ── top_5_preview ─────────────────────────────
+        top_5_tickers = exec_summary.get("top_5_tickers", [])
+        ticker_score_map = {
+            s["ticker"]: s.get("hybrid_consensus_score", s.get("raw_model_score", 0.0))
+            for s in signals
+        }
+        ticker_weight_map = {s["ticker"]: s.get("weight", 0.0) for s in signals}
+
+        top_5_preview = [
+            {
+                "ticker": t,
+                "score": round(float(ticker_score_map.get(t, 0.0)), 6),
+                "weight": round(float(ticker_weight_map.get(t, 0.0)), 6),
+            }
+            for t in top_5_tickers
+        ]
+
+        # ── portfolio_health_score ────────────────────
+        if portfolio_agent and "score" in portfolio_agent:
+            health_score = round(float(portfolio_agent["score"]) * 100, 1)
+        else:
+            health_score = round(_drift_to_health(drift_state, severity_score), 1)
+
+        approved_trades = portfolio_agent.get(
+            "approved_trades", long_count + short_count
+        )
+        rejected_trades = portfolio_agent.get("rejected_trades", 0)
+
+        return {
+            "snapshot_date": snapshot.get("snapshot_date", ""),
+            "gross_exposure": gross_exposure,
+            "net_exposure": net_exposure,
+            "long_count": long_count,
+            "short_count": short_count,
+            "neutral_count": neutral_count,
+            "approved_trades": int(approved_trades),
+            "rejected_trades": int(rejected_trades),
+            "drift_detected": drift_detected,
+            "drift_state": drift_state,
+            "portfolio_health_score": health_score,
+            "positions": positions,
+            "top_5_preview": top_5_preview,
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.exception("Portfolio summary failed")
+        logger.exception("Portfolio route failed")
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
         API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
-
-
-# =========================================================
-# SYNC EXECUTION
-# =========================================================
-
-def _portfolio_summary_sync():
-
-    start_time = time.time()
-
-    pipeline = get_pipeline()
-    loader = get_shared_model_loader()
-    universe = MarketUniverse.get_universe()
-
-    snapshot = pipeline.run_snapshot(universe)
-
-    if not isinstance(snapshot, dict) or "signals" not in snapshot:
-        raise RuntimeError("Invalid snapshot structure.")
-
-    results = snapshot["signals"]
-
-    if not results:
-        raise RuntimeError("No signals generated.")
-
-    # ===============================
-    # SIGNAL COUNTS
-    # ===============================
-
-    long_count = sum(1 for r in results if r.get("weight", 0.0) > 0)
-    short_count = sum(1 for r in results if r.get("weight", 0.0) < 0)
-    neutral_count = sum(1 for r in results if r.get("weight", 0.0) == 0)
-
-    # ===============================
-    # EXPOSURE
-    # ===============================
-
-    gross_exposure = sum(abs(r.get("weight", 0.0)) for r in results)
-    net_exposure = sum(r.get("weight", 0.0) for r in results)
-
-    # ===============================
-    # AGENT METRICS
-    # ===============================
-
-    approved_trades = sum(
-        1 for r in results
-        if r.get("agent", {}).get("trade_approved", False)
-    )
-
-    rejected_trades = len(results) - approved_trades
-
-    agent_scores = [
-        r.get("agent", {}).get("agent_score", 0.0)
-        for r in results
-    ]
-
-    confidence_scores = [
-        r.get("agent", {}).get("confidence_numeric", 0.0)
-        for r in results
-    ]
-
-    avg_strength = (
-        sum(agent_scores) / len(agent_scores)
-    ) if agent_scores else 0.0
-
-    avg_confidence = (
-        sum(confidence_scores) / len(confidence_scores)
-    ) if confidence_scores else 0.0
-
-    high_conviction_count = sum(
-        1 for r in results
-        if r.get("agent", {}).get("agent_score", 0.0) >= 0.75
-    )
-
-    elevated_risk_count = sum(
-        1 for r in results
-        if r.get("agent", {}).get("risk_level") == "elevated"
-    )
-
-    drift_detected = snapshot.get("drift", {}).get("drift_detected", False)
-    drift_state = snapshot.get("drift", {}).get("drift_state", "unknown")
-
-    # ===============================
-    # PORTFOLIO HEALTH SCORE
-    # ===============================
-
-    health_score = 100
-
-    if drift_detected:
-        health_score -= 15
-
-    if elevated_risk_count > len(results) * 0.3:
-        health_score -= 10
-
-    if avg_confidence < 0.4:
-        health_score -= 10
-
-    health_score = max(0, min(100, health_score))
-
-    # ===============================
-    # TOP 5 SUMMARY
-    # ===============================
-
-    top_5_preview = [
-        {
-            "ticker": r["ticker"],
-            "score": round(r.get("raw_model_score", 0.0), 4),
-            "weight": round(r.get("weight", 0.0), 4),
-            "confidence": r.get("agent", {}).get("confidence_numeric"),
-            "approved": r.get("agent", {}).get("trade_approved")
-        }
-        for r in sorted(
-            results,
-            key=lambda x: x.get("raw_model_score", 0.0),
-            reverse=True
-        )[:5]
-    ]
-
-    return {
-        "snapshot_date": snapshot.get("snapshot_date"),
-        "universe_size": snapshot.get("universe_size"),
-
-        # Governance
-        "model_version": loader.xgb_version,
-        "schema_signature": loader.schema_signature,
-
-        # Exposure
-        "gross_exposure": round(gross_exposure, 6),
-        "net_exposure": round(net_exposure, 6),
-
-        # Signal breakdown
-        "long_count": long_count,
-        "short_count": short_count,
-        "neutral_count": neutral_count,
-
-        # Agent metrics
-        "approved_trades": approved_trades,
-        "rejected_trades": rejected_trades,
-        "avg_strength_score": round(avg_strength, 3),
-        "avg_confidence": round(avg_confidence, 3),
-        "high_conviction_count": high_conviction_count,
-        "elevated_risk_count": elevated_risk_count,
-
-        # Drift
-        "drift_detected": drift_detected,
-        "drift_state": drift_state,
-
-        # Health
-        "portfolio_health_score": health_score,
-
-        # Preview
-        "top_5_preview": top_5_preview,
-
-        # Observability
-        "latency_ms": int((time.time() - start_time) * 1000),
-        "timestamp": int(time.time())
-    }

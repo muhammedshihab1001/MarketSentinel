@@ -1,12 +1,15 @@
 # =========================================================
-# DRIFT DETECTOR v2.0
+# DRIFT DETECTOR v2.7
 # Hybrid Multi-Agent Compatible | CV-Optimized
+# Noise-Tolerant for yfinance data
 # =========================================================
 
 import numpy as np
 import pandas as pd
 import os
 import json
+
+pd.set_option("future.no_silent_downcasting", True)
 import logging
 import hashlib
 
@@ -15,8 +18,6 @@ from core.schema.feature_schema import (
     MODEL_FEATURES,
     DTYPE
 )
-
-from core.artifacts.metadata_manager import MetadataManager
 
 logger = logging.getLogger("marketsentinel.drift")
 
@@ -30,17 +31,9 @@ except Exception:
 
 
 class DriftDetector:
-    """
-    Lightweight but robust drift detection system.
-
-    Designed for:
-    - Hybrid consensus architecture
-    - Noisy yfinance data
-    - CV demonstration of governance layer
-    """
 
     BASELINE_FILENAME = "baseline.json"
-    BASELINE_VERSION = "26.0"
+    BASELINE_VERSION = "26.3"
 
     MIN_SAMPLE_INFERENCE = 25
     MIN_FEATURE_EVAL_RATIO = 0.3
@@ -60,13 +53,22 @@ class DriftDetector:
     HARD_SEVERITY_THRESHOLD = 10
 
     RECENT_WEIGHT_FACTOR = 1.5
+    FEATURE_CLIP_SIGMA = 6.0
 
-    # -----------------------------------------------------
+    MIN_BASELINE_FEATURES = 10
+
+    FEATURE_SET = set(MODEL_FEATURES)
+
+    # =====================================================
+    # INIT
+    # =====================================================
 
     def __init__(self, z_threshold: float = 4.0, baseline_dir: str = "artifacts/drift"):
 
         self.z_threshold = z_threshold
+
         self.baseline_dir = os.path.realpath(baseline_dir)
+
         os.makedirs(self.baseline_dir, exist_ok=True)
 
         self.BASELINE_PATH = os.path.join(
@@ -80,20 +82,107 @@ class DriftDetector:
         ).lower() == "true"
 
     # =====================================================
+    # BASELINE CREATION
+    # =====================================================
+
+    def create_baseline(
+        self,
+        dataset: pd.DataFrame,
+        dataset_hash: str,
+        training_code_hash: str,
+        feature_checksum: str,
+        model_version: str,
+        allow_overwrite: bool = False
+    ):
+
+        if dataset is None or dataset.empty:
+            raise RuntimeError("Cannot create baseline from empty dataset.")
+
+        if os.path.exists(self.BASELINE_PATH) and not allow_overwrite:
+            raise RuntimeError("Baseline already exists.")
+
+        numeric = self._safe_feature_block(dataset)
+
+        features = {}
+
+        for col in MODEL_FEATURES:
+
+            if col not in numeric.columns:
+                continue
+
+            series = numeric[col].dropna()
+
+            if len(series) < 20:
+                continue
+
+            counts, bin_edges = np.histogram(series, bins=20)
+
+            if counts.sum() == 0:
+                continue
+
+            features[col] = {
+                "mean": float(series.mean()),
+                "std": float(series.std()),
+                "variance": float(series.var()),
+                "bin_edges": bin_edges.tolist(),
+                "expected_counts": counts.tolist()
+            }
+
+        if len(features) < self.MIN_BASELINE_FEATURES:
+            raise RuntimeError(
+                "Insufficient baseline features detected."
+            )
+
+        payload = {
+            "meta": {
+                "baseline_version": self.BASELINE_VERSION,
+                "schema_signature": get_schema_signature(),
+                "feature_checksum": feature_checksum,
+                "dataset_hash": dataset_hash,
+                "training_code_hash": training_code_hash,
+                "model_version": model_version
+            },
+            "features": features
+        }
+
+        payload["integrity_hash"] = self._baseline_hash(payload)
+
+        with open(self.BASELINE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        logger.info("Drift baseline created: %s", self.BASELINE_PATH)
+
+        return self.BASELINE_PATH
+
+    # =====================================================
     # SAFE FEATURE BLOCK
     # =====================================================
 
     def _safe_feature_block(self, dataset: pd.DataFrame):
 
-        missing = set(MODEL_FEATURES) - set(dataset.columns)
+        missing = self.FEATURE_SET - set(dataset.columns)
+
         if missing:
             raise RuntimeError(f"Missing features: {missing}")
 
         block = dataset.loc[:, MODEL_FEATURES].copy()
 
         for col in MODEL_FEATURES:
+
             block[col] = pd.to_numeric(block[col], errors="coerce").astype(DTYPE)
+
             block[col] = block[col].replace([np.inf, -np.inf], np.nan)
+
+            mean = block[col].mean()
+            std = block[col].std()
+
+            if not np.isfinite(mean) or not np.isfinite(std) or std < self.EPSILON:
+                continue
+
+            block[col] = block[col].clip(
+                mean - self.FEATURE_CLIP_SIGMA * std,
+                mean + self.FEATURE_CLIP_SIGMA * std
+            ).infer_objects(copy=False)
 
         return block
 
@@ -108,10 +197,11 @@ class DriftDetector:
         clone.pop("integrity_hash", None)
 
         canonical = json.dumps(clone, sort_keys=True).encode()
+
         return hashlib.sha256(canonical).hexdigest()
 
     # =====================================================
-    # LOAD VERIFIED BASELINE (SOFTENED)
+    # LOAD BASELINE
     # =====================================================
 
     def _load_verified_baseline(self):
@@ -119,26 +209,24 @@ class DriftDetector:
         if not os.path.exists(self.BASELINE_PATH):
             raise FileNotFoundError("Baseline missing.")
 
-        with open(self.BASELINE_PATH, encoding="utf-8") as f:
-            baseline = json.load(f)
+        try:
+
+            with open(self.BASELINE_PATH, encoding="utf-8") as f:
+                baseline = json.load(f)
+
+        except Exception as exc:
+            raise RuntimeError("Baseline corrupted.") from exc
 
         if baseline.get("integrity_hash") != self._baseline_hash(baseline):
             raise RuntimeError("Baseline integrity failure.")
 
         meta = baseline.get("meta", {})
 
-        if meta.get("baseline_version") != self.BASELINE_VERSION:
-            logger.warning("Baseline version mismatch.")
-
         if meta.get("schema_signature") != get_schema_signature():
-            logger.warning("Schema signature mismatch.")
+            logger.warning("Schema mismatch detected.")
 
-        current_checksum = MetadataManager.fingerprint_features(
-            tuple(MODEL_FEATURES)
-        )
-
-        if meta.get("feature_checksum") != current_checksum:
-            logger.warning("Feature checksum mismatch.")
+        if len(baseline.get("features", {})) < self.MIN_BASELINE_FEATURES:
+            logger.warning("Baseline feature count suspiciously low.")
 
         return baseline
 
@@ -148,12 +236,18 @@ class DriftDetector:
 
     def _psi(self, bin_edges, expected_counts, actual):
 
+        if len(bin_edges) < 2 or len(expected_counts) == 0:
+            return 0.0
+
         actual = np.asarray(actual, dtype=np.float64)
 
         if len(actual) < 5:
             return 0.0
 
-        actual_counts = np.histogram(actual, bins=bin_edges)[0]
+        try:
+            actual_counts = np.histogram(actual, bins=bin_edges)[0]
+        except Exception:
+            return 0.0
 
         expected_perc = expected_counts / max(expected_counts.sum(), self.EPSILON)
         actual_perc = actual_counts / max(actual_counts.sum(), self.EPSILON)
@@ -184,6 +278,26 @@ class DriftDetector:
         return float(np.sum(series.values * weights))
 
     # =====================================================
+    # EXPOSURE SCALE
+    # =====================================================
+
+    def _exposure_scale(self, drift_state):
+
+        if drift_state == "none":
+            return 1.0
+
+        if drift_state == "soft":
+            return 0.6
+
+        if drift_state == "hard":
+            return 0.25
+
+        if drift_state == "detector_failure":
+            return 0.4
+
+        return 0.5
+
+    # =====================================================
     # DETECT
     # =====================================================
 
@@ -205,6 +319,9 @@ class DriftDetector:
             evaluated_features = 0
 
             for col, stats in baseline.get("features", {}).items():
+
+                if col not in numeric.columns:
+                    continue
 
                 current = numeric[col].dropna()
 
@@ -257,7 +374,7 @@ class DriftDetector:
                 severity_accumulator = 0
 
             severity_score = min(
-                int(np.log1p(severity_accumulator)),
+                int(np.sqrt(severity_accumulator)),
                 self.MAX_SEVERITY_CAP
             )
 
@@ -267,30 +384,20 @@ class DriftDetector:
                 else "none"
             )
 
-            drift_detected = drift_count > 0
-            DRIFT_DETECTED.set(1 if drift_detected else 0)
+            drift_confidence = min(1.0, severity_score / self.MAX_SEVERITY_CAP)
 
-            if drift_state == "hard":
-                exposure_scale = 0.2
-            elif drift_state == "soft":
-                exposure_scale = max(0.4, 1 - severity_score * 0.05)
-            else:
-                exposure_scale = 1.0
+            exposure_scale = self._exposure_scale(drift_state)
+
+            DRIFT_DETECTED.set(severity_score)
 
             return {
-                "drift_detected": drift_detected,
+                "drift_detected": drift_count > 0,
                 "severity_score": severity_score,
-                "drift_confidence": float(
-                    min(drift_count / max(total_features, 1), 1.0)
-                ),
+                "drift_confidence": float(drift_confidence),
+                "drift_state": drift_state,
                 "coverage": coverage,
                 "details": report,
-                "drift_state": drift_state,
-                "exposure_scale": float(np.clip(exposure_scale, 0.0, 1.0)),
-                "drift_summary": {
-                    "evaluated_features": evaluated_features,
-                    "total_features": total_features
-                }
+                "exposure_scale": exposure_scale
             }
 
         except FileNotFoundError:
@@ -301,11 +408,10 @@ class DriftDetector:
                 "drift_detected": False,
                 "severity_score": 0,
                 "drift_confidence": 0.0,
-                "coverage": 0.0,
-                "details": {},
                 "drift_state": "baseline_missing",
-                "exposure_scale": 1.0,
-                "reason": "baseline_missing"
+                "coverage": 0,
+                "details": {},
+                "exposure_scale": 1.0
             }
 
         except Exception as exc:
@@ -315,15 +421,38 @@ class DriftDetector:
             if self.hard_fail:
                 raise
 
-            DRIFT_DETECTED.set(1)
+            DRIFT_DETECTED.set(6)
 
             return {
                 "drift_detected": True,
                 "severity_score": 6,
                 "drift_confidence": 0.5,
-                "coverage": 0.0,
-                "details": {},
                 "drift_state": "detector_failure",
-                "exposure_scale": 0.4,
-                "reason": "detector_failure"
+                "coverage": 0,
+                "details": {},
+                "exposure_scale": 0.4
             }
+
+    # =====================================================
+    # BACKWARD COMPATIBILITY
+    # =====================================================
+
+    def compute_drift(self, dataset: pd.DataFrame):
+
+        result = self.detect(dataset)
+
+        if isinstance(result, dict):
+            return result.get("severity_score", 0)
+
+        return 0
+
+    # =====================================================
+    # HEALTH CHECK
+    # =====================================================
+
+    def health(self):
+
+        return {
+            "baseline_exists": os.path.exists(self.BASELINE_PATH),
+            "baseline_path": self.BASELINE_PATH
+        }

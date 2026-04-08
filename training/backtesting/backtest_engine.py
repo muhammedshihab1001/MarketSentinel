@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 
 
 class BacktestEngine:
@@ -10,21 +9,26 @@ class BacktestEngine:
     MAX_DRAWDOWN_KILL = -0.70
     MAX_SHARPE = 5.0
 
-    MIN_HOLD_BARS = 1   # reduced slightly for short horizon
+    MIN_HOLD_BARS = 1
     REENTRY_COOLDOWN = 0
 
     MAX_POSITION_SIZE = 0.30
     MIN_POSITION_SIZE = 0.05
     MAX_SINGLE_BAR_RETURN = 0.40
     MAX_GAP = 0.35
-    MAX_TURNOVER = 12.0   # relaxed slightly for short-term model
+    MAX_TURNOVER = 12.0
 
     VOL_TARGET = 0.02
     EPSILON = 1e-12
 
+    MAX_BACKTEST_LENGTH = 1_000_000
+
     ############################################################
 
     def _validate_inputs(self, prices, signals, position_size):
+
+        prices = np.asarray(prices, dtype=float)
+        signals = list(signals)
 
         if not (0 < position_size <= self.MAX_POSITION_SIZE):
             raise RuntimeError(
@@ -34,10 +38,11 @@ class BacktestEngine:
         if len(prices) != len(signals):
             raise RuntimeError("Prices and signals length mismatch.")
 
-        if len(prices) < 2:
-            return
+        if len(prices) > self.MAX_BACKTEST_LENGTH:
+            raise RuntimeError("Backtest length exceeds safety limit.")
 
-        prices = np.asarray(prices, dtype=float)
+        if len(prices) < 2:
+            return prices, signals
 
         if not np.isfinite(prices).all():
             raise RuntimeError("Non-finite prices detected.")
@@ -49,6 +54,8 @@ class BacktestEngine:
         if unknown:
             raise RuntimeError(f"Unknown signals detected: {unknown}")
 
+        return prices, signals
+
     ############################################################
 
     def _gap_ok(self, prev_price, price):
@@ -58,13 +65,36 @@ class BacktestEngine:
     ############################################################
 
     def _dynamic_position_size(self, base_size, equity, initial_cash):
-        """
-        Correct equity-based compounding scaler.
-        """
+
         growth_factor = equity / initial_cash
+
         scaled = base_size * np.clip(growth_factor, 0.7, 2.0)
-        scaled = np.clip(scaled, self.MIN_POSITION_SIZE, self.MAX_POSITION_SIZE)
+
+        scaled = np.clip(
+            scaled,
+            self.MIN_POSITION_SIZE,
+            self.MAX_POSITION_SIZE
+        )
+
         return float(scaled)
+
+    ############################################################
+
+    def _sanitize_prices(self, prices):
+
+        prices = np.asarray(prices, dtype=float)
+
+        returns = np.diff(prices) / prices[:-1]
+
+        mask = np.abs(returns) > self.MAX_SINGLE_BAR_RETURN
+
+        if mask.any():
+
+            returns[mask] = np.sign(returns[mask]) * self.MAX_SINGLE_BAR_RETURN
+
+            prices = prices[0] * np.cumprod(np.concatenate([[1], 1 + returns]))
+
+        return prices
 
     ############################################################
 
@@ -73,15 +103,20 @@ class BacktestEngine:
         prices,
         signals,
         initial_cash=10_000,
-        transaction_cost=0.0005,   # reduced slightly
-        slippage=0.0003,           # reduced slightly
+        transaction_cost=0.0005,
+        slippage=0.0003,
         position_size=0.25
     ):
 
-        self._validate_inputs(prices, signals, position_size)
+        prices, signals = self._validate_inputs(
+            prices,
+            signals,
+            position_size
+        )
+
+        prices = self._sanitize_prices(prices)
 
         prices = np.asarray(prices, dtype=np.float64)
-        signals = list(signals)
 
         if len(prices) < 2:
             return self._empty_result(initial_cash)
@@ -101,7 +136,6 @@ class BacktestEngine:
         peak_equity = initial_cash
 
         prev_price = prices[0]
-        prev_signal = signals[0]
 
         ####################################################
         # MAIN LOOP
@@ -110,9 +144,10 @@ class BacktestEngine:
         for i in range(1, len(prices)):
 
             price = float(prices[i])
+            signal = signals[i - 1]
 
             if not self._gap_ok(prev_price, price):
-                prev_signal = "HOLD"
+                signal = "HOLD"
 
             current_equity = cash + position * price
 
@@ -127,7 +162,7 @@ class BacktestEngine:
             ################################################
 
             if (
-                prev_signal == "BUY"
+                signal == "BUY"
                 and cash > self.MIN_CAPITAL
                 and position == 0
                 and cooldown == 0
@@ -139,10 +174,9 @@ class BacktestEngine:
                     initial_cash=initial_cash
                 )
 
-                execution_price = price * (1 + slippage)
+                execution_price = max(price * (1 + slippage), self.EPSILON)
 
-                deploy_cash = current_equity * dynamic_size
-                deploy_cash = min(deploy_cash, cash)
+                deploy_cash = cash * dynamic_size
 
                 shares = (
                     deploy_cash * (1 - transaction_cost)
@@ -161,12 +195,12 @@ class BacktestEngine:
             ################################################
 
             elif (
-                prev_signal == "SELL"
+                signal == "SELL"
                 and position > 0
                 and hold_bars >= self.MIN_HOLD_BARS
             ):
 
-                execution_price = price * (1 - slippage)
+                execution_price = max(price * (1 - slippage), self.EPSILON)
 
                 proceeds = (
                     position
@@ -193,6 +227,7 @@ class BacktestEngine:
                 break
 
             peak_equity = max(peak_equity, portfolio_value)
+
             drawdown = (portfolio_value - peak_equity) / peak_equity
 
             if drawdown < self.MAX_DRAWDOWN_KILL:
@@ -200,21 +235,24 @@ class BacktestEngine:
                 break
 
             if portfolio_values:
+
                 step_return = (
-                    portfolio_value / portfolio_values[-1] - 1
+                    portfolio_value
+                    / (portfolio_values[-1] + self.EPSILON)
+                    - 1
                 )
 
-                if abs(step_return) > self.MAX_SINGLE_BAR_RETURN:
-                    raise RuntimeError(
-                        "Unrealistic portfolio jump detected."
-                    )
+                step_return = np.clip(
+                    step_return,
+                    -self.MAX_SINGLE_BAR_RETURN,
+                    self.MAX_SINGLE_BAR_RETURN
+                )
 
             if position > 0:
                 time_in_market += 1
 
             portfolio_values.append(float(portfolio_value))
 
-            prev_signal = signals[i]
             prev_price = price
 
         ####################################################
@@ -224,7 +262,7 @@ class BacktestEngine:
         if position > 0 and portfolio_values:
 
             final_price = prices[-1]
-            liquidation_price = final_price * (1 - slippage)
+            liquidation_price = max(final_price * (1 - slippage), self.EPSILON)
 
             proceeds = (
                 position
@@ -243,6 +281,7 @@ class BacktestEngine:
             return self._empty_result(initial_cash)
 
         portfolio_values = np.array(portfolio_values, dtype=np.float64)
+
         portfolio_values = np.maximum(portfolio_values, self.MIN_CAPITAL)
 
         ####################################################
@@ -250,7 +289,9 @@ class BacktestEngine:
         ####################################################
 
         strategy_return = portfolio_values[-1] / initial_cash - 1
+
         buy_hold_return = prices[-1] / prices[0] - 1
+
         alpha = strategy_return - buy_hold_return
 
         returns = np.diff(portfolio_values) / (
@@ -260,17 +301,25 @@ class BacktestEngine:
         returns = returns[np.isfinite(returns)]
 
         if len(returns) > 1:
+
             std = np.std(returns)
+
             sharpe = (
                 np.mean(returns) / std * np.sqrt(252)
                 if std > 0 else 0.0
             )
-            sharpe = float(np.clip(sharpe, -self.MAX_SHARPE, self.MAX_SHARPE))
+
+            sharpe = float(
+                np.clip(sharpe, -self.MAX_SHARPE, self.MAX_SHARPE)
+            )
+
         else:
+
             sharpe = 0.0
 
         exposure = (
-            time_in_market / max(len(portfolio_values) - 1, 1)
+            time_in_market
+            / max(len(portfolio_values) - 1, 1)
         )
 
         turnover = (

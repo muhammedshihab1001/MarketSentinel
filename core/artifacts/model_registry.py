@@ -117,6 +117,23 @@ class ModelRegistry:
             os.close(fd)
 
     ########################################################
+    # FILE VALIDATION
+    ########################################################
+
+    @staticmethod
+    def _validate_file(path: str, min_bytes: int):
+
+        if not os.path.exists(path):
+            raise RuntimeError(f"File missing: {path}")
+
+        size = os.path.getsize(path)
+
+        if size < min_bytes:
+            raise RuntimeError(
+                f"File too small or corrupted: {path}"
+            )
+
+    ########################################################
     # METADATA HARD VALIDATION
     ########################################################
 
@@ -205,12 +222,26 @@ class ModelRegistry:
 
         try:
 
+            ModelRegistry._validate_file(
+                model_path,
+                ModelRegistry.DEFAULT_MIN_BYTES
+            )
+
+            ModelRegistry._validate_file(
+                metadata_path,
+                100
+            )
+
             meta = MetadataManager.load_metadata(metadata_path)
             ModelRegistry._validate_metadata_structure(meta)
 
             version = ModelRegistry._version()
 
             version_dir = ModelRegistry._safe_join(base_dir, version)
+
+            if os.path.exists(version_dir):
+                raise RuntimeError("Version collision detected.")
+
             staging_dir = version_dir + ".staging"
 
             os.makedirs(staging_dir, exist_ok=False)
@@ -277,56 +308,63 @@ class ModelRegistry:
             ModelRegistry._release_lock(lock)
 
     ########################################################
-    # 🔥 PROMOTION (YOU WERE MISSING THIS)
+    # PROMOTION
     ########################################################
 
     @staticmethod
     def promote_to_production(base_dir: str, version: str):
 
-        version_dir = ModelRegistry._safe_join(base_dir, version)
+        base_dir = os.path.realpath(base_dir)
 
-        manifest_path = ModelRegistry._safe_join(
-            version_dir,
-            ModelRegistry.MANIFEST_NAME
-        )
+        lock = ModelRegistry._acquire_lock(base_dir)
 
-        if not os.path.exists(manifest_path):
-            raise RuntimeError("Manifest missing — cannot promote.")
+        try:
 
-        with open(manifest_path) as f:
-            manifest = json.load(f)
+            version_dir = ModelRegistry._safe_join(base_dir, version)
 
-        manifest["stage"] = "production"
+            manifest_path = ModelRegistry._safe_join(
+                version_dir,
+                ModelRegistry.MANIFEST_NAME
+            )
 
-        manifest["history"].append({
-            "event": "promoted",
-            "utc": datetime.datetime.utcnow().isoformat()
-        })
+            if not os.path.exists(manifest_path):
+                raise RuntimeError("Manifest missing — cannot promote.")
 
-        manifest["manifest_integrity_hash"] = (
-            ModelRegistry._manifest_hash(manifest)
-        )
+            with open(manifest_path) as f:
+                manifest = json.load(f)
 
-        ModelRegistry._atomic_json_write(
-            manifest_path,
-            manifest
-        )
+            manifest["stage"] = "production"
 
-        ####################################################
-        # UPDATE LATEST POINTER
-        ####################################################
+            manifest["history"].append({
+                "event": "promoted",
+                "utc": datetime.datetime.utcnow().isoformat()
+            })
 
-        latest_path = os.path.join(
-            base_dir,
-            ModelRegistry.LATEST_POINTER
-        )
+            manifest["manifest_integrity_hash"] = (
+                ModelRegistry._manifest_hash(manifest)
+            )
 
-        pointer = {
-            "version": version,
-            "updated_utc": datetime.datetime.utcnow().isoformat()
-        }
+            ModelRegistry._atomic_json_write(
+                manifest_path,
+                manifest
+            )
 
-        ModelRegistry._atomic_json_write(
-            latest_path,
-            pointer
-        )
+            latest_path = os.path.join(
+                base_dir,
+                ModelRegistry.LATEST_POINTER
+            )
+
+            pointer = {
+                "version": version,
+                "updated_utc": datetime.datetime.utcnow().isoformat()
+            }
+
+            ModelRegistry._atomic_json_write(
+                latest_path,
+                pointer
+            )
+
+            ModelRegistry._fsync_dir(base_dir)
+
+        finally:
+            ModelRegistry._release_lock(lock)

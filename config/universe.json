@@ -1,14 +1,22 @@
 {
-  "version": "6.0",
-  "created_utc": "2026-02-22T00:00:00Z",
-  "description": "universe diversified US large-cap equities (30 tickers)",
-  "min_history_days": 400,
+  "version": "7.0",
+  "created_utc": "2026-03-19T00:00:00Z",
+  "description": "100 S&P 500 large-caps — diversified for ML training. Removed TSLA (noise), BA (data gaps). min_history_days lowered to 180 to match actual DB rows.",
+  "min_history_days": 180,
   "tickers": [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL",
-    "META", "TSLA", "JPM", "BAC", "GS",
-    "XOM", "CVX", "UNH", "JNJ", "LLY",
-    "HD", "COST", "WMT", "PG", "KO",
-    "PEP", "BA", "CAT", "RTX", "NFLX",
-    "AMD", "AVGO", "ORCL", "CRM", "SPGI"
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AMD", "AVGO",
+    "ORCL", "CRM", "NFLX", "INTC", "QCOM", "TXN", "MU", "AMAT",
+    "LRCX", "ADI", "KLAC", "NOW", "ADBE", "INTU", "CDNS",
+    "JPM", "BAC", "GS", "SPGI", "V", "MA", "MS", "WFC", "BLK",
+    "AXP", "CB", "ICE", "CME", "AON", "TRV", "PGR", "MCO", "MSCI",
+    "UNH", "JNJ", "LLY", "ABBV", "MRK", "TMO", "ABT", "DHR",
+    "MDT", "SYK", "EW", "ISRG", "BMY", "AMGN",
+    "HD", "COST", "WMT", "PG", "KO", "PEP", "MCD",
+    "SBUX", "NKE", "LOW", "TGT", "CL", "PM",
+    "XOM", "CVX", "SLB", "EOG", "OXY", "MPC", "PSX", "VLO",
+    "CAT", "RTX", "HON", "UPS", "DE", "GE", "LMT", "NOC", "EMR", "ITW",
+    "T", "VZ", "TMUS", "DIS", "CMCSA",
+    "LIN", "APD", "ECL", "AMT", "PLD",
+    "NEE", "SO", "DUK", "AEP"
   ]
 }

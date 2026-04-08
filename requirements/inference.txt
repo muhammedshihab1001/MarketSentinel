@@ -1,36 +1,21 @@
+# =========================================================
+# MarketSentinel — Inference Requirements
+# Production API container only
+# =========================================================
+
 -r base.txt
 
-########################################
-# API — RUNTIME
-########################################
+openai==1.30.5
 
-fastapi==0.112.2
-uvicorn[standard]==0.30.6
-pydantic==2.8.2
+# ── Rate limiting ─────────────────────────────────────────
+# Per-endpoint IP-based rate limiting
+# Fixes #19 — /health/live and inference endpoints unprotected
+slowapi==0.1.9
 
-########################################
-# HTTP CLIENT (external APIs)
-########################################
-
-httpx==0.27.0
-
-########################################
-# CACHE (optional — safe to disable via env)
-########################################
-
-redis==5.0.7
-
-########################################
-# ML — INFERENCE
-########################################
-
-scikit-learn==1.5.1
-xgboost==2.1.1
-
-########################################
-# MARKET DATA (LIVE)
-########################################
-
-yfinance==1.1.0
-
-psutil
+# ── High-performance async event loop ────────────────────
+# Used by uvicorn in inference.Dockerfile CMD
+# Linux / macOS only — not supported on Windows
+# The Docker container is Linux so this is safe for production.
+# For local Windows development this line is intentionally excluded
+# from the local install — uvicorn falls back to the default loop.
+uvloop==0.19.0; sys_platform != "win32"

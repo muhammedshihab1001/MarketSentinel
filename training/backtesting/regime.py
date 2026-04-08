@@ -9,7 +9,6 @@ logger = logging.getLogger("marketsentinel.regime")
 @dataclass(frozen=True)
 class RegimeConfig:
 
-    # Shorter windows (Yahoo friendly)
     trend_window: int = 150
     volatility_window: int = 40
 
@@ -27,7 +26,6 @@ class RegimeConfig:
 
     MIN_VOL_FLOOR: float = 0.005
 
-    # NEW (Yahoo stability)
     RETURN_SMOOTH_SPAN: int = 5
     TREND_SMOOTH_SPAN: int = 8
 
@@ -35,6 +33,13 @@ class RegimeConfig:
 class MarketRegimeDetector:
 
     VALID_REGIMES = ("BULL", "BEAR", "SIDEWAYS", "CRISIS")
+
+    REGIME_MULTIPLIER = {
+        "BULL": 1.2,
+        "SIDEWAYS": 1.0,
+        "BEAR": 0.8,
+        "CRISIS": 0.4
+    }
 
     def __init__(self, config: RegimeConfig | None = None):
         self.config = config or RegimeConfig()
@@ -48,8 +53,10 @@ class MarketRegimeDetector:
         logger.warning("Regime fallback → assigning SIDEWAYS")
 
         df = df.copy()
+
         df["regime"] = "SIDEWAYS"
         df["market_regime"] = "SIDEWAYS"
+        df["regime_multiplier"] = 1.0
 
         return df
 
@@ -60,9 +67,14 @@ class MarketRegimeDetector:
     def _apply_persistence(self, regimes):
 
         cfg = self.config
+
         regimes = np.asarray(regimes, dtype=object)
 
+        if len(regimes) == 0:
+            return regimes
+
         confirmed = regimes.copy()
+
         current = regimes[0]
         streak = 0
 
@@ -84,7 +96,7 @@ class MarketRegimeDetector:
         return confirmed
 
     ########################################################
-    # SINGLE ASSET (STRICTLY CAUSAL)
+    # SINGLE ASSET DETECTION
     ########################################################
 
     def _detect_single_asset(self, df: pd.DataFrame):
@@ -98,9 +110,18 @@ class MarketRegimeDetector:
 
         try:
 
+            # ------------------------------------------------
+            # Defensive cleaning for noisy yfinance data
+            # ------------------------------------------------
+
             close = pd.to_numeric(df["close"], errors="coerce")
 
+            close = close.replace([np.inf, -np.inf], np.nan)
+
             if close.isna().any():
+                return self._neutral_regime(df)
+
+            if (close <= 0).any():
                 return self._neutral_regime(df)
 
             raw_returns = close.pct_change()
@@ -110,7 +131,7 @@ class MarketRegimeDetector:
                 return self._neutral_regime(df)
 
             ########################################################
-            # RETURN SMOOTHING (Yahoo stability)
+            # RETURN SMOOTHING
             ########################################################
 
             returns = raw_returns.ewm(
@@ -119,37 +140,32 @@ class MarketRegimeDetector:
             ).mean()
 
             ########################################################
-            # STRICTLY CAUSAL TREND
+            # TREND
             ########################################################
 
-            ma_long = (
-                close
-                .rolling(cfg.trend_window,
-                         min_periods=cfg.trend_window)
-                .mean()
-            )
+            ma_long = close.rolling(
+                cfg.trend_window,
+                min_periods=cfg.trend_window
+            ).mean()
 
             trend_dev = (
                 (close - ma_long) /
                 (ma_long + cfg.EPSILON)
             )
 
-            # slight smoothing
             trend_dev = trend_dev.ewm(
                 span=cfg.TREND_SMOOTH_SPAN,
                 adjust=False
             ).mean()
 
             ########################################################
-            # STRICTLY CAUSAL VOLATILITY
+            # VOLATILITY
             ########################################################
 
-            raw_vol = (
-                returns
-                .rolling(cfg.volatility_window,
-                         min_periods=cfg.volatility_window)
-                .std()
-            )
+            raw_vol = returns.rolling(
+                cfg.volatility_window,
+                min_periods=cfg.volatility_window
+            ).std()
 
             volatility = raw_vol.ewm(
                 span=10,
@@ -167,7 +183,10 @@ class MarketRegimeDetector:
             ready = ma_long.notna() & volatility.notna()
 
             crisis = ready & (
-                volatility > (cfg.crash_vol_threshold + cfg.HYSTERESIS_BUFFER)
+                volatility > (
+                    cfg.crash_vol_threshold
+                    + cfg.HYSTERESIS_BUFFER
+                )
             )
 
             bull = (
@@ -197,20 +216,36 @@ class MarketRegimeDetector:
             df["regime"] = regime
             df["market_regime"] = regime
 
+            ########################################################
+            # MULTIPLIER FEATURE
+            ########################################################
+
+            df["regime_multiplier"] = (
+                pd.Series(regime)
+                .map(self.REGIME_MULTIPLIER)
+                .fillna(1.0)
+                .values
+            )
+
             return df
 
         except Exception as e:
+
             logger.warning("Regime degraded → %s", str(e))
+
             return self._neutral_regime(df)
 
     ########################################################
-    # MULTI ASSET
+    # MULTI ASSET DETECTION
     ########################################################
 
     def detect(self, df: pd.DataFrame):
 
         if df.empty:
             return df
+
+        if "ticker" not in df.columns:
+            raise RuntimeError("Dataset missing 'ticker' column.")
 
         grouped = []
 
@@ -219,6 +254,7 @@ class MarketRegimeDetector:
         ).groupby("ticker", sort=False):
 
             detected = self._detect_single_asset(slice_df)
+
             grouped.append(detected)
 
         result = (

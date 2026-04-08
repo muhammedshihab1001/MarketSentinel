@@ -1,308 +1,199 @@
-import logging
-import pandas as pd
-import numpy as np
-import asyncio
+# =========================================================
+# EQUITY ROUTE v2.6
+# FIX #21: Removed session_factory=get_session from both
+# MarketDataService() calls. MarketDataService.__init__()
+# does not accept this kwarg — caused 500 on all price
+# chart requests from the Agent page.
+# =========================================================
+
 import time
-from fastapi import APIRouter, HTTPException
-from fastapi.concurrency import run_in_threadpool
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
 
-from core.analytics.performance_engine import PerformanceEngine
+from fastapi import APIRouter, HTTPException, Query
+
 from core.data.market_data_service import MarketDataService
-from core.market.universe import MarketUniverse
-from core.features.feature_engineering import FeatureEngineer
-from core.schema.feature_schema import (
-    MODEL_FEATURES,
-    validate_feature_schema,
-    DTYPE,
-)
-
-from app.inference.pipeline import InferencePipeline, get_shared_model_loader
+from core.db.engine import get_session  # noqa: F401 — kept for other imports
 from app.monitoring.metrics import (
     API_REQUEST_COUNT,
     API_LATENCY,
-    API_ERROR_COUNT
+    API_ERROR_COUNT,
 )
+from core.logging.logger import get_logger
 
-router = APIRouter()
-logger = logging.getLogger("marketsentinel.equity")
+logger = get_logger("marketsentinel.equity")
 
-MIN_HISTORY_ROWS = 60
-BENCHMARK_TICKER = "SPY"
-REQUEST_TIMEOUT = 180
-MAX_CONCURRENT = 2
-MIN_SCORE_STD = 1e-6
+router = APIRouter(tags=["equity"])
 
-equity_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-_pipeline: InferencePipeline | None = None
+DEFAULT_HISTORY_DAYS = 90
+MAX_HISTORY_DAYS = 730
 
 
-def get_pipeline():
-    global _pipeline
-    if _pipeline is None:
-        _pipeline = InferencePipeline()
-    return _pipeline
+def _safe_float(val, default=0.0) -> float:
+    try:
+        v = float(val)
+        return default if not np.isfinite(v) else v
+    except (TypeError, ValueError):
+        return default
 
 
-# =========================================================
-# ASYNC ENTRYPOINT
-# =========================================================
+def _safe_str(val, default="") -> str:
+    if val is None:
+        return default
+    if isinstance(val, (pd.Timestamp, datetime)):
+        return val.strftime("%Y-%m-%d")
+    s = str(val)
+    return s[:10] if len(s) >= 10 else s
 
-@router.get("/equity-curve")
-async def equity_curve(days: int = 120):
 
-    endpoint = "/equity-curve"
-    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
+@router.get(
+    "/equity/{ticker}",
+    summary="Latest Equity Data",
+    description="""
+Returns the latest OHLCV row plus calculated returns and volatility
+for a single ticker from the PostgreSQL database.
+
+**Requires:** Owner or Demo authentication (counts against `signals` quota).
+""",
+    response_description="Latest OHLCV + returns + volatility for the ticker.",
+)
+def get_equity(ticker: str):
+    API_REQUEST_COUNT.labels(endpoint="/equity/ticker").inc()
     start_time = time.time()
+    ticker = ticker.upper().strip()
 
     try:
-        async with equity_semaphore:
-            result = await asyncio.wait_for(
-                run_in_threadpool(_equity_curve_sync, days),
-                timeout=REQUEST_TIMEOUT
-            )
-        return result
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
 
-    except asyncio.TimeoutError:
-        API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        raise HTTPException(status_code=504, detail="Equity curve timeout")
+        svc = MarketDataService()  # FIX #21: no session_factory kwarg
+        df = svc.get_price_data(ticker, start_date=start_date, end_date=end_date)
 
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail=f"No data found for {ticker}")
+
+        latest = df.iloc[-1]
+        date_val = latest["date"] if "date" in df.columns else df.index[-1]
+
+        ret_5d = 0.0
+        if len(df) >= 6:
+            p_now = _safe_float(latest.get("close", latest.get("adj_close")))
+            p_5d = _safe_float(df.iloc[-6].get("close", df.iloc[-6].get("adj_close")))
+            if p_5d > 0:
+                ret_5d = (p_now - p_5d) / p_5d
+
+        ret_20d = 0.0
+        if len(df) >= 21:
+            p_now = _safe_float(latest.get("close", latest.get("adj_close")))
+            p_20d = _safe_float(df.iloc[-21].get("close", df.iloc[-21].get("adj_close")))
+            if p_20d > 0:
+                ret_20d = (p_now - p_20d) / p_20d
+
+        vol_20d = 0.0
+        if len(df) >= 21:
+            close_col = "close" if "close" in df.columns else "adj_close"
+            closes = df[close_col].iloc[-21:].astype(float)
+            daily_returns = closes.pct_change().dropna()
+            if len(daily_returns) > 1:
+                vol_20d = float(daily_returns.std() * np.sqrt(252))
+                if not np.isfinite(vol_20d):
+                    vol_20d = 0.0
+
+        return {
+            "ticker": ticker,
+            "ohlcv": {
+                "date": _safe_str(date_val),
+                "open": _safe_float(latest.get("open")),
+                "high": _safe_float(latest.get("high")),
+                "low": _safe_float(latest.get("low")),
+                "close": _safe_float(latest.get("close", latest.get("adj_close"))),
+                "volume": int(_safe_float(latest.get("volume"), 0)),
+            },
+            "returns": {
+                "5d_return": round(ret_5d, 6),
+                "20d_return": round(ret_20d, 6),
+                "volatility_20d_ann": round(vol_20d, 6),
+            },
+            "data_source": "postgresql",
+            "rows_available": len(df),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        API_ERROR_COUNT.labels(endpoint="/equity/ticker").inc()
+        logger.exception("Equity detail failed | ticker=%s", ticker)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        API_LATENCY.labels(endpoint="/equity/ticker").observe(time.time() - start_time)
+
+
+@router.get(
+    "/equity/{ticker}/history",
+    summary="OHLCV History for Ticker",
+    description="""
+Returns historical daily OHLCV rows for a ticker from the PostgreSQL database.
+Used by the Agent page price chart.
+
+**days:** Number of trading days to return (1–730). Default: 90.
+""",
+    response_description="Array of daily OHLCV rows oldest to newest.",
+)
+def get_equity_history(
+    ticker: str,
+    days: int = Query(
+        default=DEFAULT_HISTORY_DAYS,
+        ge=1,
+        le=MAX_HISTORY_DAYS,
+        description="Number of calendar days of history to return (1–730)",
+        example=90,
+    ),
+):
+    endpoint = "/equity/ticker/history"
+    API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
+    start_time = time.time()
+    ticker = ticker.upper().strip()
+
+    try:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
+
+        svc = MarketDataService()  # FIX #21: no session_factory kwarg
+        df = svc.get_price_data(ticker, start_date=start_date, end_date=end_date)
+
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail=f"No data found for {ticker}")
+
+        df = df.tail(days)
+
+        history = []
+        for _, row in df.iterrows():
+            date_val = row["date"] if "date" in df.columns else row.name
+            history.append({
+                "date": _safe_str(date_val),
+                "open": _safe_float(row.get("open")),
+                "high": _safe_float(row.get("high")),
+                "low": _safe_float(row.get("low")),
+                "close": _safe_float(row.get("close", row.get("adj_close"))),
+                "volume": int(_safe_float(row.get("volume"), 0)),
+            })
+
+        return {
+            "ticker": ticker,
+            "days_requested": days,
+            "rows_returned": len(history),
+            "data_source": "postgresql",
+            "history": history,
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
-        logger.exception("Equity curve computation failed")
+        logger.exception("Equity history failed | ticker=%s", ticker)
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
         API_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
-
-
-# =========================================================
-# SYNC LOGIC
-# =========================================================
-
-def _equity_curve_sync(days: int):
-
-    start_time = time.time()
-
-    engine = PerformanceEngine()
-    pipeline = get_pipeline()
-    loader = get_shared_model_loader()
-    market_data = MarketDataService()
-
-    universe = list(set(MarketUniverse.get_universe()))
-
-    end_date = pd.Timestamp.utcnow().normalize()
-    start_date = end_date - pd.Timedelta(days=days + 365)
-
-    start_str = start_date.strftime("%Y-%m-%d")
-    end_str = end_date.strftime("%Y-%m-%d")
-
-    # =========================================================
-    # FETCH PRICE HISTORY
-    # =========================================================
-
-    price_history = market_data.get_price_data_batch(
-        tickers=universe,
-        start_date=start_str,
-        end_date=end_str,
-        interval="1d",
-        min_history=MIN_HISTORY_ROWS
-    )
-
-    cleaned_history = {}
-
-    for ticker, df in price_history.items():
-
-        if df is None or len(df) < MIN_HISTORY_ROWS:
-            continue
-
-        df = df.sort_values("date").reset_index(drop=True)
-        df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-
-        df["forward_return"] = (
-            df["close"].shift(-1) / df["close"] - 1
-        ).replace([np.inf, -np.inf], np.nan)
-
-        cleaned_history[ticker] = df
-
-    if not cleaned_history:
-        raise RuntimeError("No valid price data available.")
-
-    # =========================================================
-    # BUILD FEATURES
-    # =========================================================
-
-    datasets = []
-
-    for ticker, df in cleaned_history.items():
-        try:
-            features = FeatureEngineer.build_feature_pipeline(
-                price_df=df,
-                sentiment_df=None,
-                training=False
-            )
-
-            if features is None or features.empty:
-                continue
-
-            datasets.append(features)
-
-        except Exception:
-            logger.warning("Feature build failed for %s", ticker)
-
-    if not datasets:
-        raise RuntimeError("No feature datasets built.")
-
-    full_df = pd.concat(datasets, ignore_index=True)
-    full_df = full_df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
-    full_df = FeatureEngineer.add_cross_sectional_features(full_df)
-    full_df = FeatureEngineer.finalize(full_df)
-
-    eval_dates = sorted(full_df["date"].unique())[-days:]
-
-    portfolio_records = []
-    model = loader.xgb
-
-    # =========================================================
-    # HISTORICAL SIGNAL GENERATION
-    # =========================================================
-
-    for eval_date in eval_dates:
-
-        snapshot = full_df[full_df["date"] == eval_date].copy()
-
-        if snapshot["ticker"].nunique() < pipeline.MIN_UNIVERSE_WIDTH:
-            continue
-
-        feature_df = validate_feature_schema(
-            snapshot.loc[:, MODEL_FEATURES],
-            mode="inference"
-        ).astype(DTYPE)
-
-        scores = model.predict(feature_df)
-
-        if np.std(scores) < MIN_SCORE_STD:
-            continue
-
-        scores = (scores - scores.mean()) / (scores.std() + 1e-12)
-        snapshot["score"] = scores
-
-        ranked = snapshot.sort_values("score")
-
-        longs_df = ranked.tail(pipeline.TOP_K)
-        shorts_df = ranked.head(pipeline.BOTTOM_K)
-
-        if longs_df.empty or shorts_df.empty:
-            continue
-
-        # Convert to row-style format expected by pipeline
-        longs = [
-            {"ticker": r["ticker"], "hybrid_consensus_score": r["score"]}
-            for _, r in longs_df.iterrows()
-        ]
-
-        shorts = [
-            {"ticker": r["ticker"], "hybrid_consensus_score": r["score"]}
-            for _, r in shorts_df.iterrows()
-        ]
-
-        weights = pipeline._construct_portfolio(longs, shorts)
-
-        # Drift scaling (safe wrapper)
-        drift_result = pipeline._safe_drift(feature_df)
-        exposure_scale = drift_result.get("exposure_scale", 1.0)
-
-        for ticker in weights:
-            weights[ticker] *= exposure_scale
-
-        for _, row in snapshot.iterrows():
-            portfolio_records.append({
-                "date": eval_date,
-                "ticker": row["ticker"],
-                "weight": float(weights.get(row["ticker"], 0.0))
-            })
-
-    if not portfolio_records:
-        raise RuntimeError("No portfolio history generated.")
-
-    portfolio_df = pd.DataFrame(portfolio_records)
-
-    # =========================================================
-    # FORWARD RETURNS
-    # =========================================================
-
-    forward_frames = []
-
-    for ticker, df in cleaned_history.items():
-        tmp = df[["date", "forward_return"]].copy()
-        tmp["ticker"] = ticker
-        forward_frames.append(tmp)
-
-    forward_df = pd.concat(forward_frames, ignore_index=True)
-    forward_df.dropna(inplace=True)
-
-    report = engine.evaluate(portfolio_df, forward_df)
-
-    # =========================================================
-    # BENCHMARK
-    # =========================================================
-
-    benchmark_equity = []
-
-    benchmark_data = market_data.get_price_data_batch(
-        tickers=[BENCHMARK_TICKER],
-        start_date=start_str,
-        end_date=end_str,
-        interval="1d",
-        min_history=MIN_HISTORY_ROWS
-    )
-
-    benchmark_df = benchmark_data.get(BENCHMARK_TICKER)
-
-    if benchmark_df is not None and not benchmark_df.empty:
-
-        benchmark_df = benchmark_df.sort_values("date")
-        benchmark_df["date"] = pd.to_datetime(
-            benchmark_df["date"]
-        ).dt.normalize()
-
-        benchmark_df["forward_return"] = (
-            benchmark_df["close"].shift(-1) /
-            benchmark_df["close"] - 1
-        )
-
-        benchmark_returns = (
-            benchmark_df
-            .set_index("date")["forward_return"]
-            .reindex(report.equity_curve.index)
-            .fillna(0.0)
-        )
-
-        if len(benchmark_returns) > 1:
-            benchmark_equity = (
-                (1 + benchmark_returns).cumprod().tolist()
-            )
-
-    # =========================================================
-    # OUTPUT
-    # =========================================================
-
-    return {
-        "summary": report.to_dict(),
-        "series": {
-            "dates": [d.strftime("%Y-%m-%d") for d in report.equity_curve.index],
-            "strategy_equity": report.equity_curve.tolist(),
-            "drawdown": report.drawdown_series.tolist(),
-        },
-        "benchmark": {
-            "ticker": BENCHMARK_TICKER,
-            "equity": benchmark_equity
-        },
-        "governance": {
-            "model_version": loader.xgb_version,
-            "schema_signature": loader.schema_signature,
-            "artifact_hash": loader.artifact_hash,
-        },
-        "latency_ms": int((time.time() - start_time) * 1000),
-        "timestamp": int(time.time())
-    }

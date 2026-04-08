@@ -1,23 +1,101 @@
-version: "3.9"
-
 networks:
   marketsentinel-net:
     driver: bridge
 
 volumes:
   redis-data:
+  postgres-data:
   grafana-data:
   prometheus-data:
 
 services:
 
   ####################################################
-  # REDIS (Optional Cache)
+  # POSTGRESQL
+  ####################################################
+  postgres:
+    container_name: marketsentinel-postgres
+    image: postgres:16-alpine
+    restart: unless-stopped
+
+    networks:
+      - marketsentinel-net
+
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: marketsentinel
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    ports:
+      - "5432:5432"
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d marketsentinel"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+    mem_limit: 512m
+    cpus: 1.0
+
+
+  ####################################################
+  # POSTGRESQL BACKUP (Daily — 7-day retention)
+  ####################################################
+  pg-backup:
+    container_name: marketsentinel-backup
+    image: postgres:16-alpine
+    restart: unless-stopped
+
+    networks:
+      - marketsentinel-net
+
+    volumes:
+      - ./backups:/backups
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+      PGPASSWORD: sentinel
+
+    entrypoint: >
+      sh -c "
+        echo 'Backup service started. Running daily at midnight.';
+        while true; do
+          FILENAME=/backups/backup_$$(date +%Y%m%d_%H%M).sql;
+          echo \"Starting backup: $$FILENAME\";
+          pg_dump -U sentinel -h postgres marketsentinel > $$FILENAME;
+          if [ $$? -eq 0 ]; then
+            echo \"Backup successful: $$FILENAME\";
+          else
+            echo \"Backup FAILED\";
+          fi;
+          find /backups -name '*.sql' -mtime +7 -delete;
+          echo 'Sleeping 24h until next backup...';
+          sleep 86400;
+        done
+      "
+
+    mem_limit: 128m
+    cpus: 0.25
+
+
+  ####################################################
+  # REDIS
   ####################################################
   redis:
     container_name: marketsentinel-redis
     image: redis:7-alpine
     restart: unless-stopped
+
+    command: redis-server --appendonly yes
+
     networks:
       - marketsentinel-net
 
@@ -39,11 +117,15 @@ services:
   ####################################################
   api:
     container_name: marketsentinel-api
+
     build:
       context: .
       dockerfile: docker/inference.Dockerfile
 
     restart: unless-stopped
+
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
     networks:
       - marketsentinel-net
 
@@ -54,32 +136,50 @@ services:
       - .env
 
     environment:
-      - MARKET_MAX_WORKERS=2
-      - YAHOO_MAX_CONCURRENT=1
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=sentinel
+      - POSTGRES_PASSWORD=sentinel
+      - POSTGRES_DB=marketsentinel
+      - DATABASE_URL=postgresql+psycopg2://sentinel:sentinel@postgres:5432/marketsentinel
+      - REDIS_HOST=redis
+      - XGBOOST_NO_CUDA=1
+      - PIPELINE_TOP_K=5
+      - PIPELINE_BOTTOM_K=5
+      - MARKET_MAX_WORKERS=8
       - DRIFT_HARD_FAIL=false
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:3000
 
     volumes:
       - ./artifacts:/app/artifacts
       - ./data:/app/data
+      - ./logs:/app/logs
 
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
       interval: 30s
-      timeout: 5s
-      retries: 3
+      timeout: 10s
+      start_period: 120s
+      retries: 5
 
-    mem_limit: 768m
+    # FIX: Raised from 768m — XGBoost + 27400-row feature frame
+    # + FastAPI + Redis client exceeds 768m and causes OOM kills
+    mem_limit: 1536m
     cpus: 1.0
 
 
   ####################################################
-  # TRAINING (Manual Profile)
+  # TRAINING (run manually with: docker-compose run --rm training)
   ####################################################
   training:
     container_name: marketsentinel-training
+
     build:
       context: .
       dockerfile: docker/training.Dockerfile
@@ -90,12 +190,28 @@ services:
     env_file:
       - .env
 
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=sentinel
+      - POSTGRES_PASSWORD=sentinel
+      - POSTGRES_DB=marketsentinel
+      - DATABASE_URL=postgresql+psycopg2://sentinel:sentinel@postgres:5432/marketsentinel
+      - XGBOOST_NO_CUDA=1
+
     volumes:
       - ./artifacts:/app/artifacts
       - ./data:/app/data
+      - ./logs:/app/logs
 
-    profiles:
-      - training
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    # FIX: Removed "profiles: [training]" — in Compose v2 this silently
+    # skips the service unless you pass --profile training on every command.
+    # Training is manual-run-only so the profile adds no value and only
+    # causes confusion when docker-compose run --rm training does nothing.
 
     mem_limit: 2g
     cpus: 2.0
@@ -106,8 +222,10 @@ services:
   ####################################################
   prometheus:
     container_name: marketsentinel-prometheus
-    image: prom/prometheus
+    image: prom/prometheus:v2.53.0
+
     restart: unless-stopped
+
     networks:
       - marketsentinel-net
 
@@ -115,14 +233,11 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
 
     volumes:
-      - ./app/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./app/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
 
     ports:
       - "9090:9090"
-
-    depends_on:
-      - api
 
     mem_limit: 256m
     cpus: 0.5
@@ -133,8 +248,10 @@ services:
   ####################################################
   grafana:
     container_name: marketsentinel-grafana
-    image: grafana/grafana
+    image: grafana/grafana:11.1.0
+
     restart: unless-stopped
+
     networks:
       - marketsentinel-net
 
@@ -144,8 +261,9 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
 
-    env_file:
-      - .env
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
 
     depends_on:
       - prometheus

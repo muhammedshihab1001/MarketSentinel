@@ -1,7 +1,12 @@
 import logging
-import pandas as pd
-import numpy as np
 import os
+import time
+import random
+from datetime import datetime
+from typing import Optional
+
+import numpy as np
+import pandas as pd
 
 from core.data.providers.market.base import MarketDataProvider
 from core.data.data_fetcher import StockPriceFetcher
@@ -16,66 +21,128 @@ class YahooProvider(MarketDataProvider):
     DEFAULT_MIN_ROWS = 120
     MAX_ROWS = 20_000
 
+    # FIX: If the requested window is <= this many calendar days,
+    # we treat it as a delta fetch and skip the min_rows check.
+    # Data sync requests ~5 trading days at a time. Full historical
+    # fetches request 730+ days. 30 is a safe boundary between them.
+    DELTA_WINDOW_DAYS = 30
+
     ALLOWED_INTERVALS = {
-        "1d", "1wk", "1mo",
-        "1m", "5m", "15m"
+        "1d", "D",
+        "1wk",
+        "1mo",
+        "1h", "60m",
+        "15m",
+        "5m",
+        "1m",
     }
 
-    SOFT_FAIL_MODE = os.getenv("YAHOO_SOFT_FAIL", "1") == "1"
-    MIN_TRADING_DENSITY = 0.50
+    _INTERVAL_ALIAS = {
+        "D": "1d",
+        "60m": "1h",
+    }
+
     MAX_DAILY_MOVE = 0.85
+    MIN_TRADING_DENSITY = 0.50
 
-    ########################################################
+    MAX_RETRIES = 2
+    RETRY_DELAY_SECONDS = 1.5
 
-    def __init__(self):
+    RATE_LIMIT_WAIT = 4.0
+    FETCH_TIMEOUT_WARN = 10.0
+
+    def __init__(self) -> None:
+
         self.fetcher = StockPriceFetcher()
 
-    ########################################################
-    # SAFE DATETIME NORMALIZATION
-    ########################################################
+        self.soft_fail_mode = os.getenv("YAHOO_SOFT_FAIL", "1") == "1"
+        self.soft_fail_ratio = float(os.getenv("YAHOO_SOFT_FAIL_RATIO", "0.70"))
+
+        logger.info("YahooProvider initialised (PRIMARY market data provider).")
+
+    ############################################################
+    # DELTA WINDOW DETECTION
+    # FIX: Determines if this is a small delta fetch vs full
+    # historical fetch, to skip min_rows validation on deltas.
+    ############################################################
 
     @staticmethod
-    def _normalize_datetime(series: pd.Series):
+    def _is_delta_fetch(start_date: str, end_date: str, delta_threshold_days: int = 30) -> bool:
+        """
+        Returns True if the requested date window is short enough
+        to be a delta (incremental) sync rather than a full history fetch.
 
-        if not isinstance(series, pd.Series):
-            raise RuntimeError("Date column must be a pandas Series.")
+        Delta syncs legitimately return only 1-10 rows. Applying the
+        DEFAULT_MIN_ROWS=120 check on these would always fail and force
+        unnecessary fallback to TwelveData on every daily sync.
+        """
+        try:
+            start = datetime.strptime(start_date[:10], "%Y-%m-%d")
+            end = datetime.strptime(end_date[:10], "%Y-%m-%d")
+            window_days = (end - start).days
+            return window_days <= delta_threshold_days
+        except Exception:
+            return False
 
-        dt = pd.to_datetime(series, errors="coerce", utc=True)
+    ############################################################
+    # SAFE DATETIME NORMALIZATION
+    ############################################################
+
+    @staticmethod
+    def _normalize_datetime(series: pd.Series) -> pd.Series:
+        """
+        Convert any datetime series to normalised UTC dates safely.
+
+        FIX 1: Uses pd.to_datetime(utc=True) to handle both tz-aware
+        and tz-naive timestamps without the 'Cannot localize tz-aware
+        Timestamp' crash.
+
+        FIX 2: Changed isna().any() → isna().all(). A few NaT values
+        from coercion are acceptable (dropped later). Only raise if
+        ALL values are invalid.
+        """
+
+        dt = pd.to_datetime(series, utc=True, errors="coerce")
 
         if dt.isna().all():
-            raise RuntimeError("Datetime parsing failed.")
+            raise RuntimeError("Datetime parsing produced no valid timestamps.")
+
+        dt = dt.dt.normalize()
 
         return dt
 
-    ########################################################
-    # SAFE COLUMN FLATTENER
-    ########################################################
+    ############################################################
+    # COLUMN NORMALIZATION
+    ############################################################
 
     @staticmethod
     def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
 
         if isinstance(df.columns, pd.MultiIndex):
+
             df.columns = [
                 "_".join(
-                    str(level).strip().lower()
-                    for level in col
-                    if level is not None and str(level).strip() != ""
+                    str(lvl).strip().lower()
+                    for lvl in col
+                    if lvl is not None and str(lvl).strip() != ""
                 )
                 for col in df.columns
             ]
+
         else:
+
             df.columns = [str(c).strip().lower() for c in df.columns]
 
         df = df.loc[:, ~df.columns.duplicated()]
 
         return df
 
-    ########################################################
-    # STRICT COLUMN EXTRACTION
-    ########################################################
+    ############################################################
+    # OHLCV EXTRACTION
+    ############################################################
 
     @staticmethod
-    def _extract_ohlcv(df: pd.DataFrame):
+    def _extract_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
         col_map = {}
 
@@ -83,29 +150,30 @@ class YahooProvider(MarketDataProvider):
 
             lc = col.lower()
 
-            if lc.startswith("open") and "open" not in col_map:
+            if "open" in lc and "open" not in col_map:
                 col_map["open"] = col
 
-            elif lc.startswith("high") and "high" not in col_map:
+            elif "high" in lc and "high" not in col_map:
                 col_map["high"] = col
 
-            elif lc.startswith("low") and "low" not in col_map:
+            elif "low" in lc and "low" not in col_map:
                 col_map["low"] = col
 
-            elif lc.startswith("adj close") and "close" not in col_map:
+            elif "adj" in lc and "close" in lc and "close" not in col_map:
                 col_map["close"] = col
 
-            elif lc.startswith("close") and "close" not in col_map:
+            elif "close" in lc and "close" not in col_map:
                 col_map["close"] = col
 
-            elif lc.startswith("volume") and "volume" not in col_map:
+            elif "volume" in lc and "volume" not in col_map:
                 col_map["volume"] = col
 
         required = {"open", "high", "low", "close", "volume"}
 
-        if not required.issubset(col_map.keys()):
-            missing = required - set(col_map.keys())
-            raise RuntimeError(f"Yahoo schema violation: {missing}")
+        missing = required - set(col_map.keys())
+
+        if missing:
+            raise RuntimeError(f"Yahoo schema violation — missing columns: {missing}")
 
         clean = pd.DataFrame()
 
@@ -114,79 +182,100 @@ class YahooProvider(MarketDataProvider):
             series = df[col_map[key]]
 
             if isinstance(series, pd.DataFrame):
+
                 if series.shape[1] == 1:
                     series = series.iloc[:, 0]
                 else:
-                    raise RuntimeError(f"Ambiguous Yahoo column for {key}")
+                    raise RuntimeError(f"Ambiguous Yahoo column for '{key}'")
 
             clean[key] = series
 
         return clean
 
-    ########################################################
-    # CORE NORMALIZER (STABILIZED)
-    ########################################################
+    ############################################################
+    # OHLC REPAIR
+    ############################################################
 
-    def _normalize(self, df, ticker, min_rows):
+    @staticmethod
+    def _repair_ohlc(clean: pd.DataFrame) -> pd.DataFrame:
+
+        clean["high"] = clean[["high", "open", "close"]].max(axis=1)
+        clean["low"] = clean[["low", "open", "close"]].min(axis=1)
+
+        return clean
+
+    ############################################################
+    # NORMALIZATION PIPELINE
+    ############################################################
+
+    def _normalize(
+        self,
+        df: pd.DataFrame,
+        ticker: str,
+        min_rows: int,
+        is_delta: bool = False,
+    ) -> pd.DataFrame:
+
+        ticker = ticker.strip().upper()
 
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            raise RuntimeError("Yahoo fetch returned empty dataframe.")
+            raise RuntimeError(f"Yahoo fetch returned empty DataFrame for {ticker}.")
 
         df = df.copy()
+
         df = self._flatten_columns(df)
 
-        ####################################################
-        # HANDLE DATE COLUMN
-        ####################################################
+        ############################################################
+        # DATE EXTRACTION
+        ############################################################
 
         if "date" not in df.columns:
 
             if isinstance(df.index, pd.DatetimeIndex):
 
-                idx = df.index
-
-                if idx.tz is None:
-                    idx = idx.tz_localize("UTC")
-                else:
-                    idx = idx.tz_convert("UTC")
+                idx = pd.to_datetime(df.index, errors="coerce")
 
                 df = df.reset_index(drop=True)
+
                 df["date"] = idx
 
             else:
-                raise RuntimeError("Yahoo index is not datetime.")
 
-        ####################################################
+                raise RuntimeError(
+                    f"Yahoo DataFrame for {ticker} has no datetime index or 'date' column."
+                )
+
+        ############################################################
         # EXTRACT OHLCV
-        ####################################################
+        ############################################################
 
         clean = self._extract_ohlcv(df)
+
         clean["date"] = df["date"]
 
-        ####################################################
-        # NUMERIC HARDENING
-        ####################################################
+        ############################################################
+        # NUMERIC SANITY
+        ############################################################
 
-        numeric_cols = ["open", "high", "low", "close", "volume"]
-
-        for col in numeric_cols:
+        for col in ("open", "high", "low", "close", "volume"):
             clean[col] = pd.to_numeric(clean[col], errors="coerce")
 
         clean.replace([np.inf, -np.inf], np.nan, inplace=True)
+
         clean.dropna(subset=["open", "high", "low", "close"], inplace=True)
 
         if clean.empty:
-            raise RuntimeError("Normalization produced empty dataset.")
+            raise RuntimeError(f"Normalization produced empty dataset for {ticker}.")
 
-        ####################################################
+        ############################################################
         # DATE NORMALIZATION
-        ####################################################
+        ############################################################
 
         clean["date"] = self._normalize_datetime(clean["date"])
 
-        ####################################################
-        # SORT + DEDUPE
-        ####################################################
+        ############################################################
+        # SORT + DEDUP
+        ############################################################
 
         clean = (
             clean
@@ -196,102 +285,198 @@ class YahooProvider(MarketDataProvider):
             .reset_index(drop=True)
         )
 
-        ####################################################
-        # PRICE REPAIR
-        ####################################################
+        ############################################################
+        # OHLC CONSISTENCY
+        ############################################################
 
-        clean["high"] = clean[["high", "open", "close"]].max(axis=1)
-        clean["low"] = clean[["low", "open", "close"]].min(axis=1)
+        clean = self._repair_ohlc(clean)
 
-        clean = clean[clean["close"] > 0]
-
-        ####################################################
-        # EXTREME MOVE SMOOTHING
-        ####################################################
+        ############################################################
+        # OUTLIER PROTECTION (YFINANCE SPIKES)
+        ############################################################
 
         pct = clean["close"].pct_change().abs().fillna(0)
-        if (pct > self.MAX_DAILY_MOVE).any():
-            clean.loc[pct > self.MAX_DAILY_MOVE, "close"] = np.nan
+
+        extreme_mask = pct > self.MAX_DAILY_MOVE
+
+        if extreme_mask.any():
+
+            logger.warning(
+                "Extreme price moves detected | provider=yahoo ticker=%s bars=%d",
+                ticker,
+                extreme_mask.sum(),
+            )
+
+            clean.loc[extreme_mask, "close"] = np.nan
             clean["close"] = clean["close"].ffill().bfill()
 
-        ####################################################
-        # TRADING DENSITY CHECK (warning only)
-        ####################################################
+        ############################################################
+        # TRADING DENSITY CHECK
+        ############################################################
 
-        unique_days = clean["date"].nunique()
         span_days = (clean["date"].max() - clean["date"].min()).days + 1
 
         if span_days > 0:
-            density = unique_days / span_days
+
+            density = clean["date"].nunique() / span_days
+
             if density < self.MIN_TRADING_DENSITY:
+
                 logger.warning(
-                    "Low trading density detected for %s (%.2f)",
+                    "Low trading density | provider=yahoo ticker=%s density=%.2f",
                     ticker,
-                    density
+                    density,
                 )
 
-        ####################################################
-        # GAP REPAIR
-        ####################################################
+        ############################################################
+        # FINAL CLEAN
+        ############################################################
 
         clean["close"] = clean["close"].ffill().bfill()
         clean["volume"] = clean["volume"].fillna(0).clip(lower=0)
 
-        ####################################################
-        # MIN HISTORY CHECK (adaptive)
-        ####################################################
+        ############################################################
+        # HISTORY CHECK
+        #
+        # FIX: Skip min_rows check for delta fetches.
+        # Delta syncs request only 5-14 days of data so they
+        # legitimately return few rows. Applying DEFAULT_MIN_ROWS=120
+        # here caused Yahoo to always fail on daily syncs, forcing
+        # every ticker to retry twice before falling back to TwelveData.
+        # This wasted ~4s per ticker × 100 tickers = 400s per sync.
+        ############################################################
 
-        if len(clean) < min_rows:
-            if self.SOFT_FAIL_MODE and len(clean) >= int(min_rows * 0.7):
-                logger.warning(
-                    "Short history accepted in soft mode for %s",
-                    ticker
-                )
-            else:
+        if is_delta:
+            # Delta fetch: any non-empty result is acceptable
+            if len(clean) == 0:
                 raise RuntimeError(
-                    f"Insufficient history for {ticker} "
-                    f"({len(clean)} < {min_rows})"
+                    f"Delta fetch returned zero rows for {ticker}"
                 )
+        else:
+            # Full historical fetch: enforce minimum row count
+            if len(clean) < min_rows:
+
+                soft_threshold = int(min_rows * self.soft_fail_ratio)
+
+                if self.soft_fail_mode and len(clean) >= soft_threshold:
+
+                    logger.warning(
+                        "Short history accepted | provider=yahoo ticker=%s rows=%d",
+                        ticker,
+                        len(clean),
+                    )
+
+                else:
+
+                    raise RuntimeError(
+                        f"Insufficient history for '{ticker}': got {len(clean)}, need {min_rows}"
+                    )
 
         clean["ticker"] = ticker
 
         logger.info(
-            "Yahoo normalized | ticker=%s rows=%s",
+            "Yahoo normalised | ticker=%s rows=%d",
             ticker,
-            len(clean)
+            len(clean),
         )
 
         return clean
 
-    ########################################################
-    # PUBLIC FETCH
-    ########################################################
+    ############################################################
+    # FETCH
+    ############################################################
 
-    def fetch(
-        self,
-        ticker,
-        start_date,
-        end_date,
-        interval,
-        **kwargs
-    ):
+    def fetch(self, ticker: str, start_date: str, end_date: str, interval: str, **kwargs) -> pd.DataFrame:
 
         if interval not in self.ALLOWED_INTERVALS:
-            raise ValueError(f"Unsupported interval: {interval}")
+
+            raise ValueError(
+                f"YahooProvider: unsupported interval '{interval}'. "
+                f"Allowed: {sorted(self.ALLOWED_INTERVALS)}"
+            )
+
+        yf_interval = self._INTERVAL_ALIAS.get(interval, interval)
 
         min_rows = kwargs.get("min_rows", self.DEFAULT_MIN_ROWS)
 
-        raw_df = self.fetcher.fetch(
-            ticker,
-            start_date,
-            end_date,
-            interval
-        )
+        # FIX: Detect delta vs full fetch from the date window size.
+        # Passes is_delta=True to _normalize() to skip the min_rows
+        # check when the router requests only a short window.
+        is_delta = self._is_delta_fetch(start_date, end_date, self.DELTA_WINDOW_DAYS)
 
-        normalized = self._normalize(
+        raw_df: Optional[pd.DataFrame] = None
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+
+            start_time = time.time()
+
+            try:
+
+                raw_df = self.fetcher.fetch(
+                    ticker,
+                    start_date,
+                    end_date,
+                    yf_interval,
+                )
+
+                latency = time.time() - start_time
+
+                if latency > self.FETCH_TIMEOUT_WARN:
+                    logger.warning(
+                        "Slow Yahoo fetch | ticker=%s latency=%.2fs",
+                        ticker,
+                        latency,
+                    )
+
+                if raw_df is not None and not raw_df.empty:
+                    break
+
+            except Exception as exc:
+
+                last_error = exc
+
+                msg = str(exc).lower()
+
+                if any(x in msg for x in ["too many requests", "rate limit", "429"]):
+
+                    logger.warning(
+                        "Yahoo rate limit detected for %s — cooling down.",
+                        ticker,
+                    )
+
+                    time.sleep(self.RATE_LIMIT_WAIT + random.uniform(0.5, 1.5))
+
+                else:
+
+                    logger.warning(
+                        "Yahoo fetch error for %s (attempt %d/%d): %s",
+                        ticker,
+                        attempt,
+                        self.MAX_RETRIES,
+                        exc,
+                    )
+
+            if attempt < self.MAX_RETRIES:
+
+                jitter = random.uniform(0.5, 1.5)
+
+                time.sleep(self.RETRY_DELAY_SECONDS * jitter)
+
+        if raw_df is None or raw_df.empty:
+
+            msg = f"Yahoo returned no data for {ticker} after {self.MAX_RETRIES} attempts."
+
+            if last_error:
+                msg += f" Last error: {last_error}"
+
+            raise RuntimeError(msg)
+
+        normalised = self._normalize(
             df=raw_df,
             ticker=ticker,
-            min_rows=min_rows
+            min_rows=min_rows,
+            is_delta=is_delta,
         )
 
-        return self.validate_contract(normalized)
+        return self.validate_contract(normalised)

@@ -1,16 +1,23 @@
 from abc import ABC, abstractmethod
-import pandas as pd
+
 import numpy as np
+import pandas as pd
+
+
+# Floating-point tolerance for OHLC invariant checks.
+# Tiny adj_close substitutions can produce micro-violations (e.g. 1e-8 diff).
+_OHLC_TOLERANCE = 1e-6
 
 
 class MarketDataProvider(ABC):
     """
     Base contract for ALL market data providers.
 
-    Guarantees:
-    - schema stability
-    - provider interchangeability
-    - upstream validation anchor
+    Subclasses must implement fetch() and return a DataFrame
+    that passes validate_contract().
+
+    Provider chain:
+        Yahoo Finance (primary) → TwelveData (fallback)
     """
 
     REQUIRED_COLUMNS = {
@@ -20,10 +27,14 @@ class MarketDataProvider(ABC):
         "low",
         "close",
         "volume",
-        "ticker"
+        "ticker",
     }
 
-    ########################################################
+    PROVIDER_NAME: str = "unknown"
+
+    # ─────────────────────────────────────────────────────────
+    # ABSTRACT INTERFACE
+    # ─────────────────────────────────────────────────────────
 
     @abstractmethod
     def fetch(
@@ -32,65 +43,123 @@ class MarketDataProvider(ABC):
         start_date: str,
         end_date: str,
         interval: str,
-        **kwargs
+        **kwargs,
     ) -> pd.DataFrame:
         """
-        Must return dataframe with REQUIRED_COLUMNS.
+        Fetch OHLCV data for *ticker*.
 
-        **kwargs allows forward-compatible arguments such as:
-        - min_rows
-        - retries
-        - provider-specific tuning
+        Implementations must:
+        - Return REQUIRED_COLUMNS
+        - Call validate_contract()
+        - Ignore unknown kwargs
 
-        Providers must ignore unknown kwargs safely.
+        Supported kwargs:
+            min_rows
+            retries
         """
         raise NotImplementedError
 
-    ########################################################
-    # CONTRACT ENFORCER (institutional safety)
-    ########################################################
+    # ─────────────────────────────────────────────────────────
+    # CONTRACT VALIDATOR
+    # ─────────────────────────────────────────────────────────
 
     @classmethod
     def validate_contract(cls, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Final data-quality gate shared by all providers.
+        """
 
         if df is None:
-            raise RuntimeError("Provider returned None.")
+            raise RuntimeError("Provider returned None instead of DataFrame.")
 
         if not isinstance(df, pd.DataFrame):
-            raise RuntimeError("Provider did not return a DataFrame.")
+            raise RuntimeError(
+                f"Provider did not return DataFrame (got {type(df).__name__})."
+            )
 
         if df.empty:
-            raise RuntimeError("Provider returned empty dataframe.")
+            raise RuntimeError("Provider returned an empty DataFrame.")
 
         missing = cls.REQUIRED_COLUMNS - set(df.columns)
 
         if missing:
             raise RuntimeError(
-                f"Provider contract violated. Missing={missing}"
+                f"Provider contract violated — missing columns: {missing}"
             )
 
-        # Enforce datetime parsing
         df = df.copy()
 
-        df["date"] = pd.to_datetime(df["date"], errors="raise", utc=True)
+        # ── Date parsing
+        try:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
+        except Exception as exc:
+            raise RuntimeError(f"Date parsing failed: {exc}") from exc
 
-        # Enforce numeric types + finite checks
-        numeric_cols = ["open", "high", "low", "close", "volume"]
+        if df["date"].isna().any():
+            raise RuntimeError("Date column contains invalid timestamps.")
+
+        # ── Numeric columns
+        numeric_cols = ("open", "high", "low", "close", "volume")
 
         for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="raise")
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            if not np.isfinite(df[col].to_numpy(dtype=float)).all():
-                raise RuntimeError(f"Non-finite values detected in {col}")
+            if df[col].isna().any():
+                raise RuntimeError(f"Column '{col}' contains NaN values.")
 
-        # Basic price invariant safety
-        if (df["high"] < df[["open", "close"]].max(axis=1)).any():
-            raise RuntimeError("High price invariant violated.")
+            arr = df[col].to_numpy(dtype=float)
 
-        if (df["low"] > df[["open", "close"]].min(axis=1)).any():
-            raise RuntimeError("Low price invariant violated.")
+            if not np.all(np.isfinite(arr)):
+                raise RuntimeError(f"Column '{col}' contains non-finite values.")
 
-        if df.duplicated(subset=["ticker", "date"]).any():
-            raise RuntimeError("Duplicate rows detected in provider output.")
+        # ── OHLC invariants
+        tol = _OHLC_TOLERANCE
+
+        violations = (
+            (df["high"] + tol < df["open"]) |
+            (df["high"] + tol < df["close"]) |
+            (df["low"]  - tol > df["open"]) |
+            (df["low"]  - tol > df["close"]) |
+            (df["high"] + tol < df["low"])
+        )
+
+        if violations.any():
+            raise RuntimeError(
+                "OHLC price invariant violated."
+            )
+
+        # ── Ticker validation
+        if df["ticker"].isna().any():
+            raise RuntimeError("Ticker column contains NaN values.")
+
+        if (df["ticker"].astype(str).str.strip() == "").any():
+            raise RuntimeError("Ticker column contains empty values.")
+
+        # ── Duplicate rows
+        dupes = df.duplicated(subset=["ticker", "date"])
+
+        if dupes.any():
+            raise RuntimeError(
+                f"Provider output has {dupes.sum()} duplicate rows."
+            )
+
+        # ── Sort chronologically
+        df = df.sort_values("date")
+
+        # ── Reset index
+        df = df.reset_index(drop=True)
 
         return df
+
+    # ─────────────────────────────────────────────────────────
+    # OPTIONAL HELPERS
+    # ─────────────────────────────────────────────────────────
+
+    def provider_info(self) -> dict:
+        return {
+            "provider": self.PROVIDER_NAME,
+            "required_columns": sorted(self.REQUIRED_COLUMNS),
+        }
+
+    def __repr__(self) -> str:
+        return f"<MarketDataProvider: {self.PROVIDER_NAME}>"

@@ -1,16 +1,20 @@
 from pydantic import BaseModel, Field, field_validator
 from datetime import date
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 
 MAX_FORECAST_DAYS = 90
 
 
 # =========================================================
-# FORECAST REQUEST
+# FORECAST REQUEST (LEGACY / OPTIONAL)
 # =========================================================
 
 class PredictionRequest(BaseModel):
+    """
+    Optional request schema used by older endpoints.
+    Kept for backward compatibility.
+    """
 
     ticker: str = Field(
         default="AAPL",
@@ -44,6 +48,7 @@ class PredictionRequest(BaseModel):
     @field_validator("end_date")
     @classmethod
     def validate_dates(cls, v, info):
+
         start = info.data.get("start_date")
 
         if v and start and v <= start:
@@ -51,6 +56,7 @@ class PredictionRequest(BaseModel):
 
         if v and start:
             delta = (v - start).days
+
             if delta > MAX_FORECAST_DAYS:
                 raise ValueError(
                     f"Forecast window cannot exceed {MAX_FORECAST_DAYS} days"
@@ -66,10 +72,12 @@ class PredictionRequest(BaseModel):
     @field_validator("forecast_days")
     @classmethod
     def validate_forecast_days(cls, v):
+
         if v and v > MAX_FORECAST_DAYS:
             raise ValueError(
                 f"forecast_days cannot exceed {MAX_FORECAST_DAYS}"
             )
+
         return v
 
 
@@ -83,16 +91,15 @@ class SignalExplanationResponse(BaseModel):
     score: float
     signal: str
 
-    # Primary model agent score (kept for backward compatibility)
+    # Primary model agent score
     agent_score: float
 
-    # Hybrid consensus score (new)
+    # Hybrid consensus score
     hybrid_score: Optional[float] = None
 
-    # Technical confirmation score (new)
+    # Technical confirmation score
     technical_score: Optional[float] = None
 
-    # Model intelligence details
     alpha_strength: float
     confidence_numeric: float
     governance_score: int
@@ -116,19 +123,66 @@ class SignalExplanationMeta(BaseModel):
         "protected_namespaces": ()
     }
 
-    model_version: str
-    schema_signature: str
-    dataset_hash: str
-    artifact_hash: str
+    model_version: Optional[str] = None
+    schema_signature: Optional[str] = None
+    dataset_hash: Optional[str] = None
+    artifact_hash: Optional[str] = None
+
     latency_ms: int
     timestamp: int
 
 
 # =========================================================
-# ENVELOPE
+# SIGNAL EXPLANATION ENVELOPE
 # =========================================================
 
 class SignalExplanationEnvelope(BaseModel):
 
     meta: SignalExplanationMeta
     explanation: SignalExplanationResponse
+
+
+# =========================================================
+# LIVE SNAPSHOT RESPONSE
+# =========================================================
+
+class LiveSnapshotResponse(BaseModel):
+
+    meta: Dict[str, Any]
+    executive_summary: Dict[str, Any]
+    snapshot: Dict[str, Any]
+
+
+# =========================================================
+# AGENT EXPLAIN RESPONSE
+# =========================================================
+
+class AgentExplainResponse(BaseModel):
+
+    success: bool
+    data: Dict[str, Any]
+    error: Optional[str] = None
+    timestamp: str
+
+
+# =========================================================
+# DRIFT STATUS RESPONSE
+# =========================================================
+
+class DriftStatusResponse(BaseModel):
+
+    drift_state: str
+    severity_score: float
+    timestamp: int
+
+
+# =========================================================
+# PORTFOLIO RESPONSE
+# =========================================================
+
+class PortfolioResponse(BaseModel):
+
+    top_positions: List[Dict[str, Any]]
+    gross_exposure: float
+    net_exposure: float
+    timestamp: int
