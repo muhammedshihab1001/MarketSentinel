@@ -8,18 +8,13 @@ import numpy as np
 import pandas as pd
 import os
 import json
-
-pd.set_option("future.no_silent_downcasting", True)
 import logging
 import hashlib
-
 from core.schema.feature_schema import (
     get_schema_signature,
     MODEL_FEATURES,
     DTYPE
 )
-
-logger = logging.getLogger("marketsentinel.drift")
 
 try:
     from app.monitoring.metrics import DRIFT_DETECTED
@@ -28,6 +23,11 @@ except Exception:
         def set(self, *_):
             pass
     DRIFT_DETECTED = _NoOpMetric()
+
+
+logger = logging.getLogger("marketsentinel.drift")
+
+pd.set_option("future.no_silent_downcasting", True)
 
 
 class DriftDetector:

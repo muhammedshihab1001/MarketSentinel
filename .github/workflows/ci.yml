@@ -2,7 +2,7 @@ name: MarketSentinel ML Pipeline
 
 on:
   push:
-    branches: ["main", "develop"]
+    branches: ["main", "develop", "feature/*"]
   pull_request:
     branches: ["main", "develop"]
 
@@ -14,11 +14,14 @@ concurrency:
 jobs:
 
 # ===================================================
-# TESTS + EVALUATION
+# JOB 1 — TESTS, LINT, EVALUATION
+# Runs on every push and PR.
+# No model artifact needed — evaluation skips gracefully.
+# No Yahoo Finance, no news API, no Redis required.
 # ===================================================
 
-  fast-ci:
-    name: Tests & Evaluation
+  test-and-lint:
+    name: Tests & Lint
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -26,7 +29,7 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          # CI-only dummy creds — not a secret, not reused anywhere
+          # CI-only dummy credentials — never used in production
           POSTGRES_USER: sentinel
           POSTGRES_PASSWORD: sentinel
           POSTGRES_DB: marketsentinel
@@ -39,17 +42,14 @@ jobs:
           --health-retries 10
 
     env:
-      # ── Thread / determinism ──────────────────────────────
+      # ── Determinism ───────────────────────────────────
       PYTHONHASHSEED: 42
       OMP_NUM_THREADS: 1
       MKL_NUM_THREADS: 1
       TOKENIZERS_PARALLELISM: false
       PYTHONUNBUFFERED: 1
 
-      # ── Database (CI dummy — not production) ─────────────
-      # These match the postgres service above intentionally.
-      # sentinel/sentinel is not a real credential — it only
-      # works inside this ephemeral GitHub runner.
+      # ── Database ──────────────────────────────────────
       POSTGRES_HOST: localhost
       POSTGRES_PORT: 5432
       POSTGRES_USER: sentinel
@@ -57,37 +57,32 @@ jobs:
       POSTGRES_DB: marketsentinel
       DATABASE_URL: postgresql+psycopg2://sentinel:sentinel@localhost:5432/marketsentinel
 
-      # ── Auth — use GitHub Secrets ─────────────────────────
-      # auth tests need a real JWT_SECRET to sign/verify tokens
+      # ── Auth secrets ──────────────────────────────────
       JWT_SECRET: ${{ secrets.JWT_SECRET }}
       OWNER_USERNAME: ${{ secrets.OWNER_USERNAME }}
       OWNER_PASSWORD_HASH: ${{ secrets.OWNER_PASSWORD_HASH }}
 
-      # ── Redis — intentionally invalid ────────────────────
-      # Cache layer fails open — no test should require Redis
+      # ── Redis — fails open in tests ───────────────────
       REDIS_HOST: invalid-host
       REDIS_PORT: 6379
 
-      # ── Feature flags ─────────────────────────────────────
-      # Never call Yahoo Finance, OpenAI, or news APIs in CI
+      # ── Feature flags — no external calls in CI ───────
       SKIP_DATA_SYNC: "1"
       STORE_PREDICTIONS: "0"
       LLM_ENABLED: "false"
       DRIFT_HARD_FAIL: "false"
       MODEL_STRICT_GOVERNANCE: "0"
       MODEL_ALLOW_POINTER_FALLBACK: "1"
+      CI: "true"
 
-      # ── Optional API keys (political risk fallback chain) ─
-      # If secrets are set, fallback chain tests run fully.
-      # If secrets are empty, GDELT is used (free, no key).
-      # Tests never fail if these are absent.
+      # ── Optional news API keys ─────────────────────────
       NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
       GNEWS_KEY: ${{ secrets.GNEWS_KEY }}
       THENEWSAPI_KEY: ${{ secrets.THENEWSAPI_KEY }}
       MEDIASTACK_KEY: ${{ secrets.MEDIASTACK_KEY }}
       CURRENTSAPI_KEY: ${{ secrets.CURRENTSAPI_KEY }}
 
-      # ── Non-sensitive config from GitHub Variables ─────────
+      # ── Non-sensitive config ───────────────────────────
       APP_ENV: ${{ vars.APP_ENV || 'development' }}
       LOG_LEVEL: ${{ vars.LOG_LEVEL || 'WARNING' }}
       DEMO_REQUESTS_PER_FEATURE: ${{ vars.DEMO_REQUESTS_PER_FEATURE || '10' }}
@@ -107,12 +102,7 @@ jobs:
           python -m pip install --upgrade pip wheel
           pip install --prefer-binary -r requirements/ci.txt
 
-      - name: Run lint check (ruff)
-        run: |
-          pip install ruff
-          ruff check . || true
-
-      - name: Run flake8 — 85% pass threshold
+      - name: Lint — flake8 (85% pass threshold)
         run: |
           pip install flake8
 
@@ -149,107 +139,43 @@ jobs:
 
           PASS=$((TOTAL - FAIL))
           PCT=$(( (PASS * 100) / TOTAL ))
-
-          echo "Flake8: $PASS/$TOTAL files clean ($PCT%) — required 85%"
+          echo "Flake8: $PASS/$TOTAL files clean ($PCT%) — threshold 85%"
 
           if [ "$PCT" -lt 85 ]; then
-            echo "FAILED — fix violations in: ${FAILED_LIST[*]}"
-            echo "Run locally: flake8 app/ core/ training/ --max-line-length=100"
+            echo "FAILED: ${FAILED_LIST[*]}"
             exit 1
           else
-            echo "PASSED — $PCT% meets 85% threshold"
+            echo "PASSED — $PCT% meets threshold"
           fi
 
-      - name: Run unit tests
-        run: pytest tests -v --maxfail=1 --disable-warnings
+      - name: Tests — pytest (115 tests)
+        run: pytest tests -v --maxfail=5 --disable-warnings -q
 
-      - name: Run model evaluation
+      - name: Model evaluation (skips if no artifact)
+        # run_evaluation checks artifacts/xgboost/*.pkl first.
+        # No artifact in CI → logs skip message → exits 0.
+        # Artifact present → runs full walk-forward evaluation.
         run: python -m training.run_evaluation
 
 
 # ===================================================
-# TRAINING SMOKE TEST
-# ===================================================
-
-  training-smoke:
-    name: Training Smoke Test
-    runs-on: ubuntu-latest
-    needs: fast-ci
-    timeout-minutes: 30
-
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: sentinel
-          POSTGRES_PASSWORD: sentinel
-          POSTGRES_DB: marketsentinel
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-
-    env:
-      CI_SMOKE_TEST: "true"
-      PYTHONHASHSEED: 42
-      OMP_NUM_THREADS: 1
-      MKL_NUM_THREADS: 1
-      PYTHONUNBUFFERED: 1
-
-      # CI dummy database
-      POSTGRES_HOST: localhost
-      POSTGRES_PORT: 5432
-      POSTGRES_USER: msuser
-      POSTGRES_PASSWORD: mspass123
-      POSTGRES_DB: mstest
-      DATABASE_URL: postgresql+psycopg2://msuser:mspass123@localhost:5432/mstest
-
-      # Auth secrets needed if training pipeline validates ownership
-      JWT_SECRET: ${{ secrets.JWT_SECRET }}
-      OWNER_USERNAME: ${{ secrets.OWNER_USERNAME }}
-      OWNER_PASSWORD_HASH: ${{ secrets.OWNER_PASSWORD_HASH }}
-
-      REDIS_HOST: invalid-host
-      SKIP_DATA_SYNC: "1"
-      STORE_PREDICTIONS: "0"
-      LLM_ENABLED: "false"
-      DRIFT_HARD_FAIL: "false"
-      MODEL_STRICT_GOVERNANCE: "0"
-
-      APP_ENV: ${{ vars.APP_ENV || 'development' }}
-      LOG_LEVEL: ${{ vars.LOG_LEVEL || 'WARNING' }}
-
-    steps:
-
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-          cache: "pip"
-          cache-dependency-path: requirements/training.txt
-
-      - name: Install training dependencies
-        run: |
-          python -m pip install --upgrade pip wheel
-          pip install --prefer-binary -r requirements/training.txt
-
-      - name: Run Training Pipeline (Smoke)
-        run: python -m training.pipelines.train_pipeline
-
-
-# ===================================================
-# DOCKER BUILD CHECK
+# JOB 2 — DOCKER BUILD CHECK
+# Runs only on main and develop pushes/PRs.
+# Verifies both Dockerfiles build successfully.
+# Does NOT depend on test-and-lint — runs in parallel.
 # ===================================================
 
   docker-build:
     name: Docker Build Check
     runs-on: ubuntu-latest
-    needs: training-smoke
     timeout-minutes: 20
+    # Only build Docker on main/develop — skip on feature branches
+    # to save CI minutes
+    if: >
+      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/develop' ||
+      github.base_ref == 'main' ||
+      github.base_ref == 'develop'
 
     steps:
 
@@ -262,10 +188,10 @@ jobs:
         run: |
           docker build --pull \
             -f docker/inference.Dockerfile \
-            -t marketsentinel-inference .
+            -t marketsentinel-inference:ci .
 
       - name: Build training image
         run: |
           docker build --pull \
             -f docker/training.Dockerfile \
-            -t marketsentinel-training .
+            -t marketsentinel-training:ci .

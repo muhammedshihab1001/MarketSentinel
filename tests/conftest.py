@@ -54,6 +54,36 @@ MOCK_SNAPSHOT = {
     },
     "executive_summary": {
         "top_5_tickers": ["NVDA", "MSFT", "AAPL", "GOOGL", "JPM"],
+        "top_5_rationale": [
+            {
+                "rank": 1,
+                "ticker": "NVDA",
+                "signal": "LONG",
+                "hybrid_score": 0.74,
+                "raw_model_score": 0.82,
+                "weight": 0.12,
+                "confidence": 0.74,
+                "risk_level": "medium",
+                "governance_score": 82,
+                "volatility_regime": "normal",
+                "technical_bias": "bullish",
+                "drift_context": "none",
+                "political_context": "LOW",
+                "agent_scores": {
+                    "signal_agent": 0.82,
+                    "technical_agent": 0.71,
+                    "raw_model": 0.82,
+                },
+                "agents_approved": ["SignalAgent", "TechnicalRiskAgent"],
+                "agents_flagged": [],
+                "warnings": [],
+                "selection_reason": (
+                    "NVDA ranked #1 with hybrid consensus score 0.74 "
+                    "(raw model: 0.82). Signal: LONG | Confidence: 74.0% | "
+                    "Risk level: medium. Technical bias is bullish."
+                ),
+            }
+        ],
         "portfolio_bias": "LONG_BIASED",
         "gross_exposure": 0.42,
         "net_exposure": 0.18,

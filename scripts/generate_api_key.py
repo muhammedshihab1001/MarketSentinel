@@ -1,5 +1,6 @@
 import secrets
 
+
 def generate_api_key(length: int = 32):
     return secrets.token_hex(length)
 

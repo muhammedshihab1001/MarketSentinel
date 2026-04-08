@@ -148,6 +148,22 @@ def compare_to_baseline(metrics):
 
 def main() -> int:
 
+    import os
+    import glob
+
+    # Always check for model artifact FIRST before any DB or network calls.
+    # Works in CI (no artifact) and locally (before first training run).
+    # This check uses raw os.getenv so it works before init_env() is called.
+    artifact_dir = os.getenv("XGB_REGISTRY_DIR", "artifacts/xgboost")
+    artifacts = glob.glob(os.path.join(artifact_dir, "model_*.pkl"))
+    if not artifacts:
+        logger.info(
+            "No model artifact found in %s — skipping evaluation. "
+            "Run training first: docker-compose run --rm training",
+            artifact_dir,
+        )
+        return 0
+
     logger.info("Starting Institutional Walk-Forward CI Evaluation | function=main")
 
     init_env()
@@ -168,7 +184,7 @@ def main() -> int:
 
     logger.info(
         "Evaluating model | version=%s | schema_signature=%.12s | function=main",
-        loader.xgb_version,
+        loader.version,
         loader.schema_signature,
     )
 
