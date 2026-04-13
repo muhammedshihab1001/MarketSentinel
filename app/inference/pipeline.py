@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v5.9
+# INSTITUTIONAL INFERENCE PIPELINE v5.9.1
 #
 # FIX v5.8: run_snapshot() was processing ALL 27,400 rows
 #   (274 days × 100 tickers) in the per-ticker loop.
@@ -14,6 +14,15 @@
 #     - sector, drift context, political risk context
 #   Exposed in executive_summary.top_5_rationale array.
 #   Used by frontend Agent page to show approved stock cards.
+#
+# FIX v5.9.1:
+#   - Double "volatility" word bug fixed in selection_reason.
+#     "low_volatility" was producing "low volatility volatility
+#     regime" because replace('_', ' ') kept the word.
+#     Fixed with _vol_label() mapping: strips suffix correctly.
+#   - Duplicate STORE_PREDICTIONS block removed.
+#     Prediction storage was running twice per snapshot,
+#     causing unnecessary DB writes and log noise.
 # =========================================================
 
 import time
@@ -32,6 +41,25 @@ PIPELINE_TIMEOUT = float(os.getenv("PIPELINE_TIMEOUT_SECONDS", "12"))
 TOP_K = int(os.getenv("PIPELINE_TOP_K", "5"))
 BOTTOM_K = int(os.getenv("PIPELINE_BOTTOM_K", "5"))
 INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
+
+# =========================================================
+# FIX v5.9.1 — Volatility regime display mapping
+# Converts internal enum to clean human-readable label.
+# Prevents double-word: "low_volatility" → "low"
+# Then used as: "low volatility regime" ✅
+# Not:          "low volatility volatility regime" ❌
+# =========================================================
+
+_VOL_DISPLAY: Dict[str, str] = {
+    "high_volatility": "high",
+    "low_volatility":  "low",
+    "normal":          "normal",
+}
+
+
+def _vol_label(regime: str) -> str:
+    """Convert volatility_regime to display word without duplication."""
+    return _VOL_DISPLAY.get(regime, regime.replace("_", " "))
 
 
 class InferencePipeline:
@@ -200,14 +228,7 @@ class InferencePipeline:
         return latest
 
     # =====================================================
-    # BUILD TOP-5 RATIONALE (v5.9 new)
-    #
-    # Produces a structured explanation for each of the top-5
-    # approved stocks. Includes:
-    #   - agent scores (signal, technical, raw model)
-    #   - why it was selected
-    #   - what context influenced the decision
-    #   - which agents approved vs flagged
+    # BUILD TOP-5 RATIONALE (v5.9)
     # =====================================================
 
     @staticmethod
@@ -224,7 +245,7 @@ class InferencePipeline:
             top5_rows:        list of snapshot_rows for top-5 tickers
             drift_state:      current drift state string
             political_label:  political risk label (LOW/MEDIUM/HIGH/CRITICAL)
-            political_score:  political risk score 0.0–1.0
+            political_score:  political risk score 0.0-1.0
 
         Returns:
             List of rationale dicts, one per stock.
@@ -267,7 +288,7 @@ class InferencePipeline:
             technical_agent_score = float(technical_out.get("score", 0.0))
             technical_warnings = technical_out.get("warnings", []) or []
 
-            # ── Approval status per agent ────────────────────
+            # ── Approval status per agent ─────────────────────
             signal_approved = signal_agent_score > 0.3 and risk_level != "high"
             technical_approved = technical_agent_score > 0.3
             political_approved = political_label not in ("HIGH", "CRITICAL")
@@ -297,6 +318,12 @@ class InferencePipeline:
                 )
 
             # ── Natural language selection reason ─────────────
+            # FIX v5.9.1: _vol_label() strips "_volatility" suffix
+            # "low_volatility" → "low" → "low volatility regime" ✅
+            # Previously: .replace('_', ' ') → "low volatility"
+            # → "low volatility volatility regime" ❌
+            vol_display = _vol_label(volatility_regime)
+
             reason_parts = []
 
             reason_parts.append(
@@ -311,7 +338,7 @@ class InferencePipeline:
 
             reason_parts.append(
                 f"Technical bias is {technical_bias} with "
-                f"{volatility_regime.replace('_', ' ')} volatility regime."
+                f"{vol_display} volatility regime."
             )
 
             if drift_state not in ("none", "low"):
@@ -558,9 +585,6 @@ class InferencePipeline:
             logger.debug("Portfolio agent failed: %s", e)
 
         # ── NEW v5.9: Build top-5 rationale ──────────
-        # Gives frontend the full agent decision explanation
-        # for each approved stock. Includes agent scores,
-        # approval status, selection reason, and warnings.
         top_5_rationale = self._build_top5_rationale(
             top5_rows=top_5,
             drift_state=drift_state,
@@ -581,7 +605,6 @@ class InferencePipeline:
             },
             "executive_summary": {
                 "top_5_tickers": [r["ticker"] for r in top_5],
-                # NEW v5.9: full rationale for each top-5 stock
                 "top_5_rationale": top_5_rationale,
                 "portfolio_bias": portfolio_bias,
                 "gross_exposure": round(gross_exposure, 4),
@@ -613,44 +636,9 @@ class InferencePipeline:
             "_portfolio": portfolio_output,
         }
 
-        # ── Store predictions for IC stats ───────────────
-        # STORE_PREDICTIONS=1 enables this. Predictions saved to
-        # DB allow /model/ic-stats to compute Spearman IC between
-        # model scores and actual next-day returns.
-        store_preds = os.getenv("STORE_PREDICTIONS", "0") == "1"
-        if store_preds:
-            try:
-                from core.db.repository import PredictionRepository
-                model_ver = getattr(loader, "version", "unknown")
-                pred_records = [
-                    {
-                        "ticker": r["ticker"],
-                        "date": r["date"],
-                        "model_version": model_ver,
-                        "raw_model_score": r["raw_model_score"],
-                        "hybrid_score": r["hybrid_consensus_score"],
-                        "weight": r["weight"],
-                        "signal": (
-                            "LONG" if r["weight"] > 0.01
-                            else "SHORT" if r["weight"] < -0.01
-                            else "NEUTRAL"
-                        ),
-                        "drift_state": drift_state,
-                    }
-                    for r in snapshot_rows
-                ]
-                PredictionRepository.store_predictions(pred_records)
-                logger.info(
-                    "Predictions stored | date=%s | count=%d",
-                    snapshot_date, len(pred_records),
-                )
-            except Exception as e:
-                logger.warning("Prediction storage failed (non-blocking): %s", e)
-
-        # ── Store predictions for IC stats ───────────────
-        # STORE_PREDICTIONS=1 enables this. Predictions saved to
-        # DB allow /model/ic-stats to compute Spearman IC between
-        # model scores and actual next-day returns.
+        # ── FIX v5.9.1: Single prediction storage block ──────
+        # Removed duplicate — was running twice per snapshot.
+        # STORE_PREDICTIONS=1 enables IC stats computation.
         store_preds = os.getenv("STORE_PREDICTIONS", "0") == "1"
         if store_preds:
             try:
