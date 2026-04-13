@@ -1,5 +1,5 @@
 # =========================================================
-# HYBRID AGENT EXPLANATION ROUTE v3.6
+# HYBRID AGENT EXPLANATION ROUTE v3.7
 # FIXES:
 #   1. explainer._enabled → explainer.enabled
 #   2. asyncio.to_thread(async) → await async directly
@@ -7,6 +7,10 @@
 #   4. Full LLM failure handling — agent always responds
 #      even if LLM times out, rate limit hit, API expired,
 #      or any other LLM error occurs.
+#   5. LLM Singleton — cache preserved between requests
+#      (was creating new instance per request, killing cache)
+#   6. confidence_numeric key fix — tries confidence_numeric
+#      first, falls back to confidence (covers both schemas)
 # =========================================================
 
 import asyncio
@@ -28,6 +32,27 @@ logger = get_logger("marketsentinel.agent")
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 BACKGROUND_SNAPSHOT_KEY = "ms:background_snapshot:latest"
+
+# =========================================================
+# LLM SINGLETON — preserves in-memory cache between requests
+# Without this: new LLMExplainer() per request = cache lost
+# =========================================================
+
+_llm_explainer_instance = None
+
+
+def _get_llm_explainer():
+    """
+    Return singleton LLMExplainer instance.
+    Cache inside LLMExplainer is preserved between requests.
+    Same ticker → second call returns from cache instantly.
+    """
+    global _llm_explainer_instance
+    if _llm_explainer_instance is None:
+        from app.agent.llm_explainer import LLMExplainer
+        _llm_explainer_instance = LLMExplainer()
+        logger.info("LLM singleton initialised | model=%s", _llm_explainer_instance.model_name)
+    return _llm_explainer_instance
 
 
 def _ts():
@@ -101,9 +126,8 @@ async def _safe_llm_explain(
 
     # ── Full LLM call with isolation ──────────────────────
     try:
-        from app.agent.llm_explainer import LLMExplainer
-
-        explainer = LLMExplainer()
+        # FIX 5: Use singleton — cache preserved between requests
+        explainer = _get_llm_explainer()
 
         # FIX 1: correct attribute name (no underscore prefix)
         if not explainer.enabled:
@@ -254,7 +278,7 @@ async def explain_signal(
         agents = signal_details.get(ticker, {})
 
         signal_agent_output = agents.get("signal_agent", {})
-        technical_output = agents.get("technical_agent", {})
+        technical_output    = agents.get("technical_agent", {})
 
         raw_score    = float(signal_row.get("raw_model_score", 0.0))
         hybrid_score = float(signal_row.get("hybrid_consensus_score", 0.0))
@@ -265,15 +289,19 @@ async def explain_signal(
             or _derive_signal(weight)
         )
 
-        confidence_numeric = signal_agent_output.get("confidence")
-        if confidence_numeric is not None:
-            confidence_numeric = round(float(confidence_numeric), 4)
+        # FIX 6: Try confidence_numeric first, fall back to confidence
+        # Signal agent may store under either key depending on version
+        raw_confidence = (
+            signal_agent_output.get("confidence_numeric")
+            or signal_agent_output.get("confidence")
+        )
+        confidence_numeric = round(float(raw_confidence), 4) if raw_confidence is not None else None
 
         governance_score = signal_agent_output.get("governance_score")
         if governance_score is not None:
             governance_score = int(governance_score)
 
-        risk_level       = signal_agent_output.get("risk_level", "low")
+        risk_level        = signal_agent_output.get("risk_level", "low")
         volatility_regime = (
             technical_output.get("signals", {}).get("volatility_regime", "normal")
         )
@@ -398,14 +426,14 @@ async def political_risk(
             political = agent.get_political_risk(ticker, country="US")
 
         return _success({
-            "ticker":                ticker,
-            "political_risk_score":  float(political.get("political_risk_score", 0.0)),
-            "political_risk_label":  political.get("political_risk_label", "LOW"),
-            "top_events":            political.get("top_events", [])[:5],
-            "source":                political.get("source", "gdelt"),
-            "gdelt_status":          political.get("gdelt_status", "unknown"),
-            "served_from_cache":     bool(snapshot_result),
-            "latency_ms":            round((time.time() - start_time) * 1000, 1),
+            "ticker":               ticker,
+            "political_risk_score": float(political.get("political_risk_score", 0.0)),
+            "political_risk_label": political.get("political_risk_label", "LOW"),
+            "top_events":           political.get("top_events", [])[:5],
+            "source":               political.get("source", "gdelt"),
+            "gdelt_status":         political.get("gdelt_status", "unknown"),
+            "served_from_cache":    bool(snapshot_result),
+            "latency_ms":           round((time.time() - start_time) * 1000, 1),
         })
 
     except Exception as e:
