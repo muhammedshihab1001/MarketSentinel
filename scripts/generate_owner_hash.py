@@ -1,4 +1,3 @@
-
 """
 MarketSentinel — Owner Password Hash Generator
 ================================================
@@ -16,6 +15,10 @@ FIX: OWNER_PASSWORD_HASH is now printed WITH double quotes.
      signs as shell variable substitutions and corrupts the
      hash before it reaches the container. The quotes prevent
      this substitution entirely.
+
+FIX: OWNER_USERNAME no longer hardcoded as "shihab".
+     Script now asks for username — avoids exposing real
+     usernames in source code that is publicly visible on GitHub.
 """
 
 import sys
@@ -39,6 +42,13 @@ def main():
 
     print("\nThis script generates a bcrypt hash of your password.")
     print("The hash is stored in .env — your plain password is never saved.\n")
+
+    # FIX: Ask for username instead of hardcoding "shihab"
+    username = input("Enter owner username: ").strip()
+
+    if len(username) < 3:
+        print("\n[ERROR] Username must be at least 3 characters.")
+        sys.exit(1)
 
     password = input("Enter owner password: ").strip()
 
@@ -64,10 +74,10 @@ def main():
     print("\n" + "=" * 52)
     print("  Add these to your .env file:")
     print("=" * 52)
-    print("\nOWNER_USERNAME=shihab")
-    print(f'OWNER_PASSWORD_HASH="{hashed}"')   # FIX: quoted — prevents Docker $ mangling
+    print(f"\nOWNER_USERNAME={username}")
+    print(f'OWNER_PASSWORD_HASH="{hashed}"')   # quoted — prevents Docker $ mangling
     print(f'JWT_SECRET="{jwt_secret}"')
-    print("DEMO_REQUESTS_PER_FEATURE=3")
+    print("DEMO_REQUESTS_PER_FEATURE=10")
     print("DEMO_BLOCK_DAYS=7")
     print("JWT_OWNER_EXPIRE_DAYS=30")
     print("JWT_DEMO_EXPIRE_HOURS=24")
