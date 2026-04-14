@@ -153,7 +153,8 @@ def _drift_status_sync(cache) -> dict:
 
     try:
         trigger = RetrainTrigger()
-        retrain_required = bool(trigger.evaluate(severity_score))
+        _retrain_result = trigger.evaluate(severity_score)
+        retrain_required = bool(_retrain_result.get("retrain_required", False))
         cooldown_remaining_seconds = max(0, int(trigger.cooldown_remaining()))
         cooldown_active = cooldown_remaining_seconds > 0
     except Exception as e:
