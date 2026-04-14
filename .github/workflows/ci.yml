@@ -2,7 +2,7 @@ name: MarketSentinel ML Pipeline
 
 on:
   push:
-    branches: ["main", "develop", "feature/*"]
+    branches: ["main", "develop"]
   pull_request:
     branches: ["main", "develop"]
 
@@ -15,9 +15,6 @@ jobs:
 
 # ===================================================
 # JOB 1 — TESTS, LINT, EVALUATION
-# Runs on every push and PR.
-# No model artifact needed — evaluation skips gracefully.
-# No Yahoo Finance, no news API, no Redis required.
 # ===================================================
 
   test-and-lint:
@@ -29,7 +26,6 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          # CI-only dummy credentials — never used in production
           POSTGRES_USER: sentinel
           POSTGRES_PASSWORD: sentinel
           POSTGRES_DB: marketsentinel
@@ -42,14 +38,12 @@ jobs:
           --health-retries 10
 
     env:
-      # ── Determinism ───────────────────────────────────
       PYTHONHASHSEED: 42
       OMP_NUM_THREADS: 1
       MKL_NUM_THREADS: 1
       TOKENIZERS_PARALLELISM: false
       PYTHONUNBUFFERED: 1
 
-      # ── Database ──────────────────────────────────────
       POSTGRES_HOST: localhost
       POSTGRES_PORT: 5432
       POSTGRES_USER: sentinel
@@ -57,16 +51,13 @@ jobs:
       POSTGRES_DB: marketsentinel
       DATABASE_URL: postgresql+psycopg2://sentinel:sentinel@localhost:5432/marketsentinel
 
-      # ── Auth secrets ──────────────────────────────────
       JWT_SECRET: ${{ secrets.JWT_SECRET }}
       OWNER_USERNAME: ${{ secrets.OWNER_USERNAME }}
       OWNER_PASSWORD_HASH: ${{ secrets.OWNER_PASSWORD_HASH }}
 
-      # ── Redis — fails open in tests ───────────────────
       REDIS_HOST: invalid-host
       REDIS_PORT: 6379
 
-      # ── Feature flags — no external calls in CI ───────
       SKIP_DATA_SYNC: "1"
       STORE_PREDICTIONS: "0"
       LLM_ENABLED: "false"
@@ -75,14 +66,12 @@ jobs:
       MODEL_ALLOW_POINTER_FALLBACK: "1"
       CI: "true"
 
-      # ── Optional news API keys ─────────────────────────
       NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
       GNEWS_KEY: ${{ secrets.GNEWS_KEY }}
       THENEWSAPI_KEY: ${{ secrets.THENEWSAPI_KEY }}
       MEDIASTACK_KEY: ${{ secrets.MEDIASTACK_KEY }}
       CURRENTSAPI_KEY: ${{ secrets.CURRENTSAPI_KEY }}
 
-      # ── Non-sensitive config ───────────────────────────
       APP_ENV: ${{ vars.APP_ENV || 'development' }}
       LOG_LEVEL: ${{ vars.LOG_LEVEL || 'WARNING' }}
       DEMO_REQUESTS_PER_FEATURE: ${{ vars.DEMO_REQUESTS_PER_FEATURE || '10' }}
@@ -103,17 +92,10 @@ jobs:
           pip install --prefer-binary -r requirements/ci.txt
 
       - name: Lint — flake8 (85% pass threshold)
+        # FIX: Uses repo .flake8 config instead of inline config.
+        # Local and CI linting rules are now identical.
         run: |
           pip install flake8
-
-          cat > /tmp/.flake8ci << 'EOF'
-          [flake8]
-          max-line-length = 100
-          extend-ignore = E501, W503, E203, E402, E221, E272, E128
-          exclude = .git,__pycache__,venv,.venv,migrations,artifacts,build,dist
-          per-file-ignores =
-              __init__.py: F401, F403
-          EOF
 
           mapfile -t ALL_FILES < <(
             find app/ core/ training/ scripts/ tests/ \
@@ -129,7 +111,7 @@ jobs:
           FAILED_LIST=()
 
           for f in "${ALL_FILES[@]}"; do
-            OUT=$(flake8 "$f" --config=/tmp/.flake8ci 2>&1)
+            OUT=$(flake8 "$f" 2>&1)
             if [ -n "$OUT" ]; then
               FAIL=$((FAIL+1))
               FAILED_LIST+=("$f")
@@ -148,23 +130,19 @@ jobs:
             echo "PASSED — $PCT% meets threshold"
           fi
 
-      - name: Tests — pytest (115 tests)
+      - name: Tests — pytest
         run: pytest tests -v --maxfail=5 --disable-warnings -q
 
 
 # ===================================================
 # JOB 2 — DOCKER BUILD CHECK
 # Runs only on main and develop pushes/PRs.
-# Verifies both Dockerfiles build successfully.
-# Does NOT depend on test-and-lint — runs in parallel.
 # ===================================================
 
   docker-build:
     name: Docker Build Check
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Only build Docker on main/develop — skip on feature branches
-    # to save CI minutes
     if: >
       github.ref == 'refs/heads/main' ||
       github.ref == 'refs/heads/develop' ||
