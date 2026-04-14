@@ -65,7 +65,10 @@ STRICT_GOVERNANCE = os.getenv("TRAINING_STRICT_GOVERNANCE", "1") == "1"
 
 # FIX 2: SKIP_SYNC=1 skips data sync (use on retrain when data exists)
 # SKIP_SYNC=0 (default) always syncs before training
-SKIP_SYNC = os.getenv("SKIP_SYNC", "0") == "1"
+SKIP_SYNC = (
+    os.getenv("SKIP_SYNC", "0") == "1"
+    or os.getenv("SKIP_DATA_SYNC", "0") == "1"
+)
 
 os.makedirs(RUNS_DIR, exist_ok=True)
 
