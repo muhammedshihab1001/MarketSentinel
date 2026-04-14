@@ -6,6 +6,10 @@
 #   fields in Swagger UI instead of raw JSON textarea.
 #   Previously used request.json() directly which gives
 #   Swagger no schema to render.
+#
+# FIX: OWNER_USERNAME fallback changed from "shihab" to ""
+#   Hardcoded username was a security risk — anyone who
+#   knew the default could use it as a username hint.
 # =========================================================
 
 import logging
@@ -27,7 +31,8 @@ logger = logging.getLogger("marketsentinel.auth")
 
 router = APIRouter(tags=["auth"])
 
-OWNER_USERNAME = os.getenv("OWNER_USERNAME", "shihab")
+# FIX: removed hardcoded "shihab" fallback — empty string is safe default
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() in ("true", "1")
 COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
 
@@ -48,7 +53,7 @@ TRACKED_FEATURES = [
 class OwnerLoginRequest(BaseModel):
     username: str = Field(
         ...,
-        example="shihab",
+        example="your_username",
         description="Owner username set in OWNER_USERNAME env var",
     )
     password: str = Field(
@@ -60,7 +65,7 @@ class OwnerLoginRequest(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
-                "username": "shihab",
+                "username": "your_username",
                 "password": "your_password",
             }
         }
@@ -168,7 +173,7 @@ async def owner_login(body: OwnerLoginRequest, request: Request):
 Start a demo session. No credentials required.
 
 Fingerprint is derived from your IP + User-Agent and persists for 7 days.
-Demo accounts get **3 requests per feature group** before being locked.
+Demo accounts get **10 requests per feature group** before being locked.
 
 Feature groups:
 - `snapshot` — /snapshot, /predict/live-snapshot
