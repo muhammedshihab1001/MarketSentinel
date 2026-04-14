@@ -964,9 +964,6 @@ The feature cache (`computed_features` table) reduces inference warm start from 
 
 Building production ML systems, MLOps platforms, and decision intelligence engines.
 
-- GitHub: [muhammedshihab1001](https://github.com/muhammedshihab1001)
-- Project: [MarketSentinel](https://github.com/muhammedshihab1001/MarketSentinel)
-
 ---
 
 ## License
