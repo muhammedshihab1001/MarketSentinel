@@ -11,24 +11,35 @@
   "id": null,
   "links": [],
   "panels": [
+
     {
       "id": 1,
       "type": "stat",
       "title": "Total API Requests",
+      "description": "Total number of API requests since last restart",
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"] },
         "colorMode": "background",
         "graphMode": "area"
       },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [{ "color": "green", "value": 0 }]
+          }
+        }
+      },
       "targets": [
         { "expr": "sum(api_requests_total)", "legendFormat": "Total", "refId": "A" }
       ]
     },
+
     {
       "id": 2,
       "type": "stat",
       "title": "Error Rate %",
+      "description": "Percentage of API requests that returned errors. Alert at 2%, critical at 5%.",
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"] },
@@ -54,16 +65,29 @@
         }
       ]
     },
+
     {
       "id": 3,
       "type": "stat",
       "title": "Cache Hit Rate %",
+      "description": "Redis cache hits vs total lookups. Below 50% means Redis may be down or cache TTL too short.",
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"] },
         "colorMode": "background"
       },
-      "fieldConfig": { "defaults": { "unit": "percent" } },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "yellow", "value": 50 },
+              { "color": "green", "value": 80 }
+            ]
+          }
+        }
+      },
       "targets": [
         {
           "expr": "cache_hits_total / (cache_hits_total + cache_misses_total) * 100",
@@ -72,11 +96,12 @@
         }
       ]
     },
+
     {
       "id": 4,
       "type": "stat",
       "title": "Drift Severity Score",
-      "description": "0=stable | 1-3=low | 4-7=soft | 8+=hard",
+      "description": "0-4 = stable | 5-7 = soft drift (exposure 60%) | 8-9 = retrain recommended | 10+ = hard drift (exposure 25%)",
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"] },
@@ -84,24 +109,27 @@
       },
       "fieldConfig": {
         "defaults": {
+          "unit": "short",
           "thresholds": {
             "steps": [
               { "color": "green", "value": 0 },
-              { "color": "yellow", "value": 4 },
-              { "color": "orange", "value": 7 },
+              { "color": "yellow", "value": 5 },
+              { "color": "orange", "value": 8 },
               { "color": "red", "value": 10 }
             ]
           }
         }
       },
       "targets": [
-        { "expr": "drift_detected", "legendFormat": "Drift Score", "refId": "A" }
+        { "expr": "drift_detected", "legendFormat": "Severity / 15", "refId": "A" }
       ]
     },
+
     {
       "id": 5,
       "type": "timeseries",
       "title": "Request Rate (per endpoint)",
+      "description": "Requests per second for each API endpoint. Spikes = high traffic. Use to identify bottlenecks.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
       "options": { "tooltip": { "mode": "multi" } },
       "fieldConfig": { "defaults": { "unit": "reqps" } },
@@ -113,13 +141,26 @@
         }
       ]
     },
+
     {
       "id": 6,
       "type": "timeseries",
       "title": "API Latency p95 (ms)",
+      "description": "95th percentile response time per endpoint. Alert if consistently above 500ms. Snapshot endpoint is expected to be 15-18s cold.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
       "options": { "tooltip": { "mode": "multi" } },
-      "fieldConfig": { "defaults": { "unit": "ms" } },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 200 },
+              { "color": "red", "value": 500 }
+            ]
+          }
+        }
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.95, rate(api_latency_seconds_bucket[5m])) * 1000",
@@ -128,10 +169,12 @@
         }
       ]
     },
+
     {
       "id": 7,
       "type": "bargauge",
-      "title": "Requests by Endpoint (total)",
+      "title": "Requests by Endpoint (Total)",
+      "description": "Cumulative request count per endpoint. Shows which endpoints are used most.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"] },
@@ -145,14 +188,17 @@
         }
       ]
     },
+
     {
       "id": 8,
       "type": "timeseries",
       "title": "Error Count (per endpoint)",
+      "description": "Rate of errors per endpoint. Any non-zero spike needs log investigation.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
       "fieldConfig": {
         "defaults": {
-          "color": { "fixedColor": "#f43f5e", "mode": "fixed" }
+          "color": { "fixedColor": "#f43f5e", "mode": "fixed" },
+          "unit": "errors/s"
         }
       },
       "targets": [
@@ -163,11 +209,25 @@
         }
       ]
     },
+
     {
       "id": 9,
       "type": "timeseries",
       "title": "Active Inferences",
+      "description": "Concurrent XGBoost inference requests in progress. Stuck at 4 = semaphore maxed out.",
       "gridPos": { "h": 6, "w": 8, "x": 0, "y": 20 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 3 },
+              { "color": "red", "value": 4 }
+            ]
+          }
+        }
+      },
       "targets": [
         {
           "expr": "inference_in_progress",
@@ -176,12 +236,68 @@
         }
       ]
     },
+
     {
       "id": 10,
       "type": "timeseries",
-      "title": "DB Query Latency p95 (ms)",
+      "title": "Model Inference Rate",
+      "description": "XGBoost predict() calls per minute. Should spike every 300s when background snapshot runs.",
       "gridPos": { "h": 6, "w": 8, "x": 8, "y": 20 },
-      "fieldConfig": { "defaults": { "unit": "ms" } },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        {
+          "expr": "rate(model_inference_total[1m]) * 60",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Model Inference Latency p95 (ms)",
+      "description": "Time taken by XGBoost predict() call. Should be < 2000ms. Over 5000ms = model too large or CPU starved.",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 20 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 1000 },
+              { "color": "red", "value": 5000 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(model_inference_latency_seconds_bucket[5m])) * 1000",
+          "legendFormat": "p95 {{model}}",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "DB Query Latency p95 (ms)",
+      "description": "PostgreSQL query response time by operation. Spike = slow query or pool exhaustion (pool_size=10).",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 26 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 500 }
+            ]
+          }
+        }
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.95, rate(db_query_latency_seconds_bucket[5m])) * 1000",
@@ -190,11 +306,14 @@
         }
       ]
     },
+
     {
-      "id": 11,
+      "id": 13,
       "type": "timeseries",
-      "title": "DB Rows Written",
-      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 20 },
+      "title": "DB Rows Written Per Second",
+      "description": "PostgreSQL write rate by table. Spike after snapshot = predictions stored. Flat = STORE_PREDICTIONS=0.",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 26 },
+      "fieldConfig": { "defaults": { "unit": "rows/s" } },
       "targets": [
         {
           "expr": "rate(db_rows_written_total[5m])",
@@ -203,14 +322,49 @@
         }
       ]
     },
+
     {
-      "id": 12,
+      "id": 14,
+      "type": "timeseries",
+      "title": "Pipeline Failures By Stage",
+      "description": "Failures in each inference pipeline stage. Any non-zero value needs log investigation immediately.",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 26 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "#f43f5e", "mode": "fixed" },
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(pipeline_failures_total[5m])",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 15,
       "type": "stat",
-      "title": "Tickers Synced (last run)",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 26 },
+      "title": "Tickers Synced (Last Run)",
+      "description": "Number of tickers successfully synced in last data sync. Should be ~100. Below 80 = Yahoo Finance issues.",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 32 },
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"] },
         "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "yellow", "value": 50 },
+              { "color": "green", "value": 90 }
+            ]
+          }
+        }
       },
       "targets": [
         {
@@ -220,11 +374,13 @@
         }
       ]
     },
+
     {
-      "id": 13,
+      "id": 16,
       "type": "stat",
       "title": "Missing Feature Ratio",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 26 },
+      "description": "Fraction of features filled with defaults during inference. Should be near 0. Above 5% = schema mismatch.",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 32 },
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"] },
         "colorMode": "background"
@@ -249,11 +405,14 @@
         }
       ]
     },
+
     {
-      "id": 14,
+      "id": 17,
       "type": "timeseries",
       "title": "Signal Distribution (LONG vs SHORT)",
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 26 },
+      "description": "Cumulative LONG and SHORT signals generated. Large imbalance = market regime shift or model bias.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 32 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
       "targets": [
         {
           "expr": "signal_distribution_total",
@@ -262,14 +421,15 @@
         }
       ]
     }
+
   ],
   "refresh": "30s",
   "schemaVersion": 38,
-  "tags": ["marketsentinel", "prometheus"],
+  "tags": ["marketsentinel", "prometheus", "ml"],
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
-  "title": "MarketSentinel — API Monitoring",
-  "uid": "marketsentinel-api-v1",
-  "version": 2
+  "title": "MarketSentinel — Production Monitoring",
+  "uid": "marketsentinel-api-v2",
+  "version": 3
 }
