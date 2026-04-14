@@ -1,5 +1,5 @@
 # =========================================================
-# PREDICTION & SNAPSHOT ROUTES v4.1
+# PREDICTION & SNAPSHOT ROUTES v4.2
 #
 # SWAGGER FIX v4.1:
 # - Added tags, summary, description to all routes
@@ -7,6 +7,14 @@
 # - signal-explanation: ticker path param documented
 # - price-history: days Query param with min/max/example
 # - All routes show proper response descriptions in /docs
+#
+# FIX v4.2:
+# - live_snapshot() now accepts optional Request parameter
+#   main.py /snapshot alias calls live_snapshot(request)
+#   old signature caused TypeError: too many arguments
+# - live_snapshot uses app.state.cache when request available
+#   was creating new RedisCache() on every request
+#   now reuses the shared singleton from app startup
 # =========================================================
 
 import time
@@ -18,7 +26,7 @@ import pandas as pd
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 
 from app.inference.pipeline import InferencePipeline
@@ -84,13 +92,34 @@ def get_pipeline() -> InferencePipeline:
             cache = RedisCache()
             init_pipeline(loader, cache)
             logger.warning(
-                "InferencePipeline lazily initialized (init_pipeline not called at startup)"
+                "InferencePipeline lazily initialized "
+                "(init_pipeline not called at startup)"
             )
         except Exception as e:
             raise RuntimeError(
                 f"InferencePipeline not initialized. Error: {e}"
             )
     return _pipeline
+
+
+# =========================================================
+# CACHE HELPER
+# =========================================================
+
+def _get_cache(request: Optional[Request] = None) -> RedisCache:
+    """
+    Return the shared cache from app state if request is available.
+    Falls back to creating a new RedisCache instance.
+
+    FIX v4.2: live_snapshot was always creating new RedisCache()
+    which bypassed the singleton connection pool from startup.
+    """
+    if request is not None:
+        try:
+            return request.app.state.cache
+        except AttributeError:
+            pass
+    return RedisCache()
 
 
 # =========================================================
@@ -162,7 +191,7 @@ Returns the full inference snapshot for all 100 S&P 500 universe tickers.
 **503** = snapshot cache empty + live computation in progress.
 Retry in 30s — the background loop will cache a result soon.
 
-**Requires:** Owner or Demo authentication (demo gets 3 requests).
+**Requires:** Owner or Demo authentication (demo gets 10 requests).
 """,
     response_description="Full snapshot with signals for all universe tickers.",
 )
@@ -172,14 +201,20 @@ Retry in 30s — the background loop will cache a result soon.
     description="Same as GET /predict/live-snapshot. POST supported for compatibility.",
     include_in_schema=False,
 )
-async def live_snapshot():
+async def live_snapshot(request: Request = None):
+    """
+    FIX v4.2: Added optional request parameter.
+    main.py /snapshot alias calls live_snapshot(request).
+    Old signature (no params) caused TypeError.
+    """
     endpoint = "/predict/live-snapshot"
     API_REQUEST_COUNT.labels(endpoint=endpoint).inc()
     start_time = time.time()
 
     try:
         pipeline = get_pipeline()
-        cache = RedisCache()
+        # FIX v4.2: use shared cache from app state
+        cache = _get_cache(request)
 
         snapshot = None
         cached = cache.get(BACKGROUND_SNAPSHOT_KEY)
@@ -281,7 +316,9 @@ async def signal_explanation(
         signal_agent = agents.get("signal_agent", {})
 
         weight = row.get("weight", 0.0)
-        derived_signal = "LONG" if weight > 0 else ("SHORT" if weight < 0 else "NEUTRAL")
+        derived_signal = (
+            "LONG" if weight > 0 else ("SHORT" if weight < 0 else "NEUTRAL")
+        )
 
         explanation = SignalExplanationResponse(
             ticker=row["ticker"],

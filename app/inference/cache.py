@@ -1,5 +1,11 @@
 # =========================================================
-# REDIS CACHE v13
+# REDIS CACHE v13.1
+#
+# Changes from v13:
+# FIX: Added get_redis_client() public method.
+#      main.py rate limiter was accessing cache._redis
+#      (private attribute) directly. Now uses public method.
+#      _redis property retained for DemoTracker compatibility.
 #
 # Changes from v12:
 # FIX: Removed list validation from set() — ms:portfolio:*
@@ -105,18 +111,28 @@ class RedisCache:
         return self._connected
 
     # =====================================================
-    # REDIS PROPERTY (for DemoTracker access)
+    # PUBLIC REDIS CLIENT ACCESS
     # =====================================================
 
-    @property
-    def _redis(self) -> Optional[redis.Redis]:
+    def get_redis_client(self) -> Optional[redis.Redis]:
         """
-        Expose raw Redis client for DemoTracker.
-        Returns None if Redis is unavailable.
+        Return the raw Redis client if connected, else None.
+
+        Use this instead of accessing _redis or _client directly.
+        Safe to call at any time — returns None if Redis is down.
+        Used by: main.py rate limiter, DemoTracker.
         """
         if self._ensure_connected():
             return self._client
         return None
+
+    @property
+    def _redis(self) -> Optional[redis.Redis]:
+        """
+        Retained for DemoTracker backward compatibility.
+        New code should use get_redis_client() instead.
+        """
+        return self.get_redis_client()
 
     # =====================================================
     # KEY BUILDER

@@ -16,34 +16,87 @@
       "type": "stat",
       "title": "Total API Requests",
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area" },
-      "targets": [{ "expr": "sum(api_requests_total)", "legendFormat": "Total", "refId": "A" }]
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        { "expr": "sum(api_requests_total)", "legendFormat": "Total", "refId": "A" }
+      ]
     },
     {
       "id": 2,
       "type": "stat",
       "title": "Error Rate %",
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
-      "fieldConfig": { "defaults": { "unit": "percent", "thresholds": { "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 2 }, { "color": "red", "value": 5 }] } } },
-      "targets": [{ "expr": "sum(api_errors_total) / sum(api_requests_total) * 100", "legendFormat": "Error %", "refId": "A" }]
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 2 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(api_errors_total) / sum(api_requests_total) * 100",
+          "legendFormat": "Error %",
+          "refId": "A"
+        }
+      ]
     },
     {
       "id": 3,
       "type": "stat",
       "title": "Cache Hit Rate %",
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background"
+      },
       "fieldConfig": { "defaults": { "unit": "percent" } },
-      "targets": [{ "expr": "cache_hits_total / (cache_hits_total + cache_misses_total) * 100", "legendFormat": "Hit Rate", "refId": "A" }]
+      "targets": [
+        {
+          "expr": "cache_hits_total / (cache_hits_total + cache_misses_total) * 100",
+          "legendFormat": "Hit Rate",
+          "refId": "A"
+        }
+      ]
     },
     {
       "id": 4,
       "type": "stat",
-      "title": "Total Inferences",
+      "title": "Drift Severity Score",
+      "description": "0=stable | 1-3=low | 4-7=soft | 8+=hard",
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
-      "targets": [{ "expr": "sum(model_inference_total)", "legendFormat": "Inferences", "refId": "A" }]
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 4 },
+              { "color": "orange", "value": 7 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        { "expr": "drift_detected", "legendFormat": "Drift Score", "refId": "A" }
+      ]
     },
     {
       "id": 5,
@@ -52,7 +105,13 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
       "options": { "tooltip": { "mode": "multi" } },
       "fieldConfig": { "defaults": { "unit": "reqps" } },
-      "targets": [{ "expr": "rate(api_requests_total[1m])", "legendFormat": "{{endpoint}}", "refId": "A" }]
+      "targets": [
+        {
+          "expr": "rate(api_requests_total[1m])",
+          "legendFormat": "{{endpoint}}",
+          "refId": "A"
+        }
+      ]
     },
     {
       "id": 6,
@@ -61,23 +120,147 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
       "options": { "tooltip": { "mode": "multi" } },
       "fieldConfig": { "defaults": { "unit": "ms" } },
-      "targets": [{ "expr": "histogram_quantile(0.95, rate(api_latency_seconds_bucket[5m])) * 1000", "legendFormat": "p95 {{endpoint}}", "refId": "A" }]
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(api_latency_seconds_bucket[5m])) * 1000",
+          "legendFormat": "p95 {{endpoint}}",
+          "refId": "A"
+        }
+      ]
     },
     {
       "id": 7,
       "type": "bargauge",
       "title": "Requests by Endpoint (total)",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal" },
-      "targets": [{ "expr": "api_requests_total", "legendFormat": "{{endpoint}}", "refId": "A" }]
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "horizontal"
+      },
+      "targets": [
+        {
+          "expr": "api_requests_total",
+          "legendFormat": "{{endpoint}}",
+          "refId": "A"
+        }
+      ]
     },
     {
       "id": 8,
       "type": "timeseries",
       "title": "Error Count (per endpoint)",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
-      "fieldConfig": { "defaults": { "color": { "fixedColor": "#f43f5e", "mode": "fixed" } } },
-      "targets": [{ "expr": "rate(api_errors_total[5m])", "legendFormat": "{{endpoint}}", "refId": "A" }]
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "#f43f5e", "mode": "fixed" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(api_errors_total[5m])",
+          "legendFormat": "{{endpoint}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Active Inferences",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "inference_in_progress",
+          "legendFormat": "Active",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "DB Query Latency p95 (ms)",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "ms" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(db_query_latency_seconds_bucket[5m])) * 1000",
+          "legendFormat": "p95 {{operation}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "DB Rows Written",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 20 },
+      "targets": [
+        {
+          "expr": "rate(db_rows_written_total[5m])",
+          "legendFormat": "{{table}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Tickers Synced (last run)",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 26 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background"
+      },
+      "targets": [
+        {
+          "expr": "db_tickers_synced_total",
+          "legendFormat": "Tickers",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Missing Feature Ratio",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 26 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 0.01 },
+              { "color": "red", "value": 0.05 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "missing_feature_ratio",
+          "legendFormat": "Missing %",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Signal Distribution (LONG vs SHORT)",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 26 },
+      "targets": [
+        {
+          "expr": "signal_distribution_total",
+          "legendFormat": "{{signal}}",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "refresh": "30s",
@@ -88,5 +271,5 @@
   "timezone": "browser",
   "title": "MarketSentinel — API Monitoring",
   "uid": "marketsentinel-api-v1",
-  "version": 1
+  "version": 2
 }

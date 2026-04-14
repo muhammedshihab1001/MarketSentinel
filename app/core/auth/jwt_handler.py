@@ -4,6 +4,9 @@
 #      raising behaviour. middleware.py + auth.py import this.
 # FIX: Added verify_owner_credentials() — alias for
 #      authenticate_owner(). auth.py calls this name.
+# FIX: OWNER_USERNAME fallback changed from "shihab" to ""
+#      Hardcoded real username was exposed in source code.
+#      Empty string is safe — auth fails cleanly if not set.
 # =========================================================
 
 import os
@@ -36,7 +39,8 @@ JWT_ALGORITHM = "HS256"
 JWT_OWNER_EXPIRE_DAYS = int(os.getenv("JWT_OWNER_EXPIRE_DAYS", "30"))
 JWT_DEMO_EXPIRE_HOURS = int(os.getenv("JWT_DEMO_EXPIRE_HOURS", "24"))
 
-OWNER_USERNAME = os.getenv("OWNER_USERNAME", "shihab")
+# FIX: removed hardcoded "shihab" fallback — empty string is safe
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "")
 OWNER_PASSWORD_HASH = os.getenv("OWNER_PASSWORD_HASH", "")
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -71,15 +75,17 @@ def create_owner_token(username: str) -> str:
         "type": "owner",
     }
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    logger.info("Owner token created | username=%s | expires=%s", username, expire.isoformat())
+    logger.info(
+        "Owner token created | username=%s | expires=%s",
+        username, expire.isoformat(),
+    )
     return token
 
 
 def create_demo_token(fingerprint: str, ip_hash: str = "") -> str:
     """
     Create a short-lived JWT for demo users.
-    FIX: ip_hash is now optional — auth.py calls create_demo_token(fingerprint).
-    Old signature was create_demo_token(ip_hash, fingerprint) — fixed here.
+    ip_hash is optional — auth.py calls create_demo_token(fingerprint).
     """
     expire = datetime.now(timezone.utc) + timedelta(hours=JWT_DEMO_EXPIRE_HOURS)
     payload = {
@@ -115,7 +121,7 @@ def verify_token(token: str) -> Optional[dict]:
 def decode_token(token: str) -> dict:
     """
     Decode and verify a JWT. Raises Exception if invalid.
-    FIX: middleware.py and auth.py import decode_token.
+    middleware.py and auth.py import decode_token.
     verify_token() returns None on failure; this raises instead.
     """
     payload = verify_token(token)
@@ -130,7 +136,15 @@ def decode_token(token: str) -> dict:
 
 def authenticate_owner(username: str, password: str) -> bool:
     if not OWNER_PASSWORD_HASH:
-        logger.error("OWNER_PASSWORD_HASH not set in .env — run scripts/generate_owner_hash.py")
+        logger.error(
+            "OWNER_PASSWORD_HASH not set in .env — "
+            "run scripts/generate_owner_hash.py"
+        )
+        return False
+    if not OWNER_USERNAME:
+        logger.error(
+            "OWNER_USERNAME not set in .env"
+        )
         return False
     if username != OWNER_USERNAME:
         return False
@@ -138,7 +152,5 @@ def authenticate_owner(username: str, password: str) -> bool:
 
 
 def verify_owner_credentials(username: str, password: str) -> bool:
-    """
-    FIX: auth.py calls verify_owner_credentials — alias for authenticate_owner.
-    """
+    """Alias for authenticate_owner — retained for compatibility."""
     return authenticate_owner(username, password)

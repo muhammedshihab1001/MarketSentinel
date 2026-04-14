@@ -576,6 +576,7 @@ class InferencePipeline:
         try:
             portfolio_context = {
                 "signals": snapshot_rows,
+                "drift": drift_result,
                 "drift_state": drift_state,
                 "gross_exposure": round(gross_exposure, 4),
                 "net_exposure": round(net_exposure, 4),

@@ -1,6 +1,6 @@
 ############################################################
 # MarketSentinel — Inference Container
-# v2.0: Multi-stage build (matches training.Dockerfile)
+# v2.1: Added PYTHONPATH=/app (was missing, training had it)
 #
 # STAGE 1 (builder): installs all build tools + pip packages
 # STAGE 2 (runtime): copies only compiled packages, no gcc/g++
@@ -51,7 +51,6 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
     pip install --prefer-binary -r requirements/inference.txt
 
 
-
 ############################################################
 # STAGE 2 — RUNTIME
 # Clean slim image — only compiled packages copied from builder
@@ -72,7 +71,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NUMEXPR_NUM_THREADS=1 \
     XGBOOST_NO_CUDA=1 \
     UVICORN_WORKERS=1 \
-    APP_ENV=production
+    APP_ENV=production \
+    # FIX v2.1: Added PYTHONPATH=/app — was missing from inference container.
+    # training.Dockerfile had it but inference did not.
+    # Without this Python may fail to resolve app/core imports
+    # when running uvicorn outside the WORKDIR context.
+    PYTHONPATH=/app
 
 # Only runtime libs — no compiler toolchain
 RUN apt-get update && apt-get install -y --no-install-recommends \

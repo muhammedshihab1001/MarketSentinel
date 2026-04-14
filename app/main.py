@@ -22,6 +22,9 @@
 #   On limit exceeded: 429 with Retry-After header.
 #   Redis unavailable: fails open (no block during downtime).
 #
+# FIX: _check_rate_limit no longer accesses cache._redis directly.
+#      Uses cache.get_redis_client() public method instead.
+#
 # All other fixes from v3.6 retained.
 # =========================================================
 
@@ -89,32 +92,30 @@ PUBLIC_PATHS = {
     "/health/live", "/health/ready", "/health/db", "/health/model",
     "/universe", "/auth/owner-login", "/auth/demo-login",
     "/auth/me", "/auth/logout", "/favicon.ico",
-    # Model info and agent list — public read-only endpoints
-    # Must match middleware FREE_PATHS or they get blocked by main.py
     "/model/info",
     "/agent/agents",
 }
 
 # =====================================================
-# FIX #19 — PER-ENDPOINT RATE LIMITS
+# PER-ENDPOINT RATE LIMITS
 #
 # Format: { path_prefix: (max_requests, window_seconds) }
 # First prefix match wins. Unlisted paths use default.
 # =====================================================
 
 PER_PATH_RATE_LIMITS = {
-    "/auth/owner-login":        (5,  60),   # brute force guard
-    "/auth/demo-login":         (10, 60),   # registration throttle
-    "/predict/live-snapshot":   (10, 60),   # expensive full inference
-    "/snapshot":                (10, 60),   # alias for live-snapshot
-    "/agent/explain":           (20, 60),   # reads from cache but guarded
-    "/agent/political-risk":    (20, 60),   # triggers news API calls
-    "/performance":             (20, 60),   # DB heavy query
-    "/health/live":             (60, 60),   # Docker probe — allow frequent
+    "/auth/owner-login":        (5,  60),
+    "/auth/demo-login":         (10, 60),
+    "/predict/live-snapshot":   (10, 60),
+    "/snapshot":                (10, 60),
+    "/agent/explain":           (20, 60),
+    "/agent/political-risk":    (20, 60),
+    "/performance":             (20, 60),
+    "/health/live":             (60, 60),
     "/health/ready":            (60, 60),
 }
 
-RATE_LIMIT_DEFAULT = (60, 60)       # fallback for all other paths
+RATE_LIMIT_DEFAULT = (60, 60)
 RATE_LIMIT_KEY_PREFIX = "ms:ratelimit:"
 
 _snapshot_lock = asyncio.Lock()
@@ -127,7 +128,11 @@ _snapshot_lock = asyncio.Lock()
 def _get_path_limit(path: str) -> tuple:
     """Return (max_requests, window_seconds) for the given path."""
     for prefix, limits in PER_PATH_RATE_LIMITS.items():
-        if path == prefix or path.startswith(prefix + "/") or path.startswith(prefix + "?"):
+        if (
+            path == prefix
+            or path.startswith(prefix + "/")
+            or path.startswith(prefix + "?")
+        ):
             return limits
     return RATE_LIMIT_DEFAULT
 
@@ -139,7 +144,10 @@ def _check_rate_limit(redis_client, client_ip: str, path: str) -> tuple:
     Returns:
         (allowed: bool, count: int, limit: int, retry_after: int)
 
-    Fails open if Redis is unavailable — never blocks on downtime.
+    Fails open if Redis is unavailable.
+
+    FIX: No longer accesses cache._redis directly.
+         redis_client is passed in explicitly.
     """
     max_requests, window_seconds = _get_path_limit(path)
     safe_path = path.replace("/", "_").replace("?", "_").strip("_")
@@ -154,7 +162,7 @@ def _check_rate_limit(redis_client, client_ip: str, path: str) -> tuple:
             return False, count, max_requests, max(0, ttl)
         return True, count, max_requests, 0
     except Exception:
-        return True, 0, max_requests, 0   # fail open
+        return True, 0, max_requests, 0
 
 
 # =====================================================
@@ -276,7 +284,7 @@ async def _daily_sync_loop():
 async def _background_snapshot_loop():
     """
     Pre-computes snapshot every SNAPSHOT_PRECOMPUTE_INTERVAL seconds.
-    asyncio.Lock prevents concurrent runs (v3.6 fix retained).
+    asyncio.Lock prevents concurrent runs.
     """
     await asyncio.sleep(30)
 
@@ -360,7 +368,8 @@ async def lifespan(app: FastAPI):
                             readiness.data_synced = True
                             readiness.sync_report = report
                             logger.info(
-                                "Background sync complete | synced=%d skipped=%d errors=%d",
+                                "Background sync complete | "
+                                "synced=%d skipped=%d errors=%d",
                                 report.get("synced", 0),
                                 report.get("skipped", 0),
                                 report.get("errors", 0),
@@ -379,9 +388,6 @@ async def lifespan(app: FastAPI):
             readiness.data_synced = True
 
         # ── Model ─────────────────────────────────────
-        # FIX: use get_model_loader() singleton so model_info.py
-        # and feature-importance routes share the same loaded instance.
-        # ModelLoader() creates a new empty instance every time.
         loader = get_model_loader()
         load_success = loader.load()
         readiness.models_loaded = load_success and loader.is_loaded()
@@ -447,7 +453,6 @@ async def lifespan(app: FastAPI):
             readiness.models_loaded, readiness.drift_baseline_loaded,
         )
 
-        # Log rate limit config
         logger.info(
             "Rate limits active | endpoints=%d | default=%d req/%ds | fails-open",
             len(PER_PATH_RATE_LIMITS),
@@ -455,7 +460,6 @@ async def lifespan(app: FastAPI):
             RATE_LIMIT_DEFAULT[1],
         )
 
-        # Security: warn if API_KEY not configured
         if not API_KEY:
             logger.warning(
                 "API_KEY is not set — programmatic access blocked. "
@@ -512,7 +516,7 @@ app.add_middleware(AuthMiddleware)
 
 
 # =====================================================
-# REQUEST MIDDLEWARE — FIX #19 per-endpoint rate limit
+# REQUEST MIDDLEWARE — per-endpoint rate limit
 # =====================================================
 
 @app.middleware("http")
@@ -520,26 +524,15 @@ async def request_context_middleware(request: Request, call_next):
 
     path = request.url.path
 
-    # ── API key / auth check ─────────────────────────
-    # Always enforced for non-public paths.
-    # Browser users: must have ms_token JWT cookie (set on login).
-    # External programmatic access: must pass X-API-KEY header.
-    #
-    # Security fix: removed "and API_KEY" condition.
-    # Old code: if path not in PUBLIC_PATHS and API_KEY:
-    #   → if API_KEY="" entire block skipped → anyone could access
-    # New code: always check, require JWT or valid API key.
+    # ── Auth check ────────────────────────────────────
     if path not in PUBLIC_PATHS:
         has_jwt = (
             request.cookies.get("ms_token")
             or request.headers.get("Authorization", "").startswith("Bearer ")
         )
         if not has_jwt:
-            # No JWT cookie — check X-API-KEY header
             client_key = request.headers.get("X-API-KEY")
             if not API_KEY:
-                # API_KEY not configured — programmatic access disabled
-                # All non-browser access rejected
                 raise HTTPException(
                     status_code=401,
                     detail="Authentication required. Please log in.",
@@ -558,12 +551,14 @@ async def request_context_middleware(request: Request, call_next):
         else (request.client.host if request.client else "unknown")
     )
 
-    # ── FIX #19: Per-endpoint rate limit check ────────
+    # ── Per-endpoint rate limit ───────────────────────
+    # FIX: uses cache.get_redis_client() not cache._redis directly
     try:
         cache = app.state.cache
-        if cache.ping() and cache._redis:
+        redis_client = cache.get_redis_client()
+        if redis_client is not None:
             allowed, count, limit, retry_after = _check_rate_limit(
-                cache._redis, client_ip, path
+                redis_client, client_ip, path
             )
             if not allowed:
                 logger.warning(
@@ -619,13 +614,14 @@ app.include_router(agent.router)
 
 # =====================================================
 # SNAPSHOT ALIAS
+# FIX: /snapshot now tracks demo quota via predict route
 # =====================================================
 
 @app.post("/snapshot")
-async def snapshot():
+async def snapshot(request: Request):
     """Full inference run — alias for POST /predict/live-snapshot."""
     from app.api.routes.predict import live_snapshot
-    return await live_snapshot()
+    return await live_snapshot(request)
 
 
 # =====================================================

@@ -383,6 +383,8 @@ class SignalAgent(BaseAgent):
 
             "signal": signal,
 
+            "score": agent_score,
+
             "alpha_strength": alpha_strength,
 
             "confidence_numeric": confidence,
