@@ -2,6 +2,10 @@
 # Prometheus scrape config for MarketSentinel
 # Place at: app/monitoring/prometheus.yml
 #
+# FIX: target changed from 'inference:8000' to 'api:8000'
+#      docker-compose service is named 'api' not 'inference'
+#      Prometheus was scraping nothing before this fix.
+#
 # Usage with Docker Compose:
 #   prometheus:
 #     image: prom/prometheus
@@ -21,7 +25,7 @@ global:
 scrape_configs:
   - job_name: marketsentinel_api
     static_configs:
-      - targets: ['inference:8000']
+      - targets: ['api:8000']
     metrics_path: /metrics
     scheme: http
     scrape_interval: 15s
