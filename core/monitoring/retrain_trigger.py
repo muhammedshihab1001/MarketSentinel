@@ -1,20 +1,30 @@
 # =========================================================
-# RETRAIN TRIGGER v1.2
+# RETRAIN TRIGGER v1.3
 # FIX: Added cooldown lock — prevents repeated retrain triggers
 # New: write_lock(), is_on_cooldown(), cooldown_remaining()
+#
+# FIX v1.3: evaluate() now accepts both int and Dict input.
+#   drift.py calls trigger.evaluate(severity_score) with int.
+#   Old signature only accepted Dict and called .get() on it,
+#   which raised AttributeError when passed an int.
+#   Result: retrain_required was always False — retrain
+#   was never triggered even when drift was critical.
+#
+#   Fix: evaluate() now accepts Union[int, Dict].
+#   If int passed → wraps in dict automatically.
+#   If dict passed → reads severity_score key as before.
 # =========================================================
 
 import os
 import json
 import time
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 logger = logging.getLogger("marketsentinel.retrain")
 
-# Cooldown defaults — override via .env
-RETRAIN_COOLDOWN_SECONDS = int(os.getenv("RETRAIN_COOLDOWN_SECONDS", "3600"))   # 1 hour
-DRIFT_RETRAIN_THRESHOLD = int(os.getenv("DRIFT_RETRAIN_THRESHOLD", "8"))         # severity 0-15
+RETRAIN_COOLDOWN_SECONDS = int(os.getenv("RETRAIN_COOLDOWN_SECONDS", "3600"))
+DRIFT_RETRAIN_THRESHOLD = int(os.getenv("DRIFT_RETRAIN_THRESHOLD", "8"))
 
 
 class RetrainTrigger:
@@ -40,11 +50,8 @@ class RetrainTrigger:
     # =====================================================
 
     def __init__(self):
-
         os.makedirs(os.path.dirname(self.EVENTS_FILE), exist_ok=True)
-
         self._events = self._load_events()
-
         self.retrain_required = any(
             e.get("retrain_required", False) for e in self._events
         )
@@ -57,9 +64,7 @@ class RetrainTrigger:
         """
         Write the cooldown lock file.
         Call this BEFORE triggering the training container.
-        The lock expires after RETRAIN_COOLDOWN_SECONDS (default 1 hour).
         """
-
         os.makedirs(os.path.dirname(self.LOCK_FILE), exist_ok=True)
 
         lock_data = {
@@ -72,21 +77,16 @@ class RetrainTrigger:
         try:
             with open(self.LOCK_FILE, "w", encoding="utf-8") as f:
                 json.dump(lock_data, f, indent=2)
-
             logger.info(
                 "Retrain lock written | expires_in=%ds",
                 RETRAIN_COOLDOWN_SECONDS,
             )
-
         except Exception as e:
             logger.warning("Failed to write retrain lock | error=%s", e)
 
     def _read_lock(self) -> Optional[dict]:
-        """Read the lock file. Returns None if file does not exist or is corrupt."""
-
         if not os.path.exists(self.LOCK_FILE):
             return None
-
         try:
             with open(self.LOCK_FILE, encoding="utf-8") as f:
                 return json.load(f)
@@ -94,44 +94,27 @@ class RetrainTrigger:
             return None
 
     def is_on_cooldown(self) -> bool:
-        """
-        Returns True if a retrain was triggered recently and the
-        cooldown period has not expired.
-        """
-
         lock = self._read_lock()
-
         if not lock:
             return False
-
         triggered_at = lock.get("triggered_at", 0)
         cooldown = lock.get("cooldown_seconds", RETRAIN_COOLDOWN_SECONDS)
-
         return (time.time() - triggered_at) < cooldown
 
     def cooldown_remaining(self) -> int:
-        """
-        Returns seconds remaining in the cooldown period.
-        Returns 0 if not on cooldown.
-        """
-
         lock = self._read_lock()
-
         if not lock:
             return 0
-
         triggered_at = lock.get("triggered_at", 0)
         cooldown = lock.get("cooldown_seconds", RETRAIN_COOLDOWN_SECONDS)
         remaining = cooldown - (time.time() - triggered_at)
-
         return max(0, int(remaining))
 
     # =====================================================
-    # LOAD EVENTS
+    # LOAD / SAVE EVENTS
     # =====================================================
 
     def _load_events(self) -> List[Dict]:
-
         if not os.path.exists(self.EVENTS_FILE):
             try:
                 with open(self.EVENTS_FILE, "w", encoding="utf-8") as f:
@@ -145,7 +128,6 @@ class RetrainTrigger:
                 data = json.load(f)
             if isinstance(data, list):
                 return data
-
         except Exception as e:
             logger.warning("Failed to load retrain events: %s", str(e))
             try:
@@ -157,12 +139,7 @@ class RetrainTrigger:
 
         return []
 
-    # =====================================================
-    # SAVE EVENTS
-    # =====================================================
-
     def _save_events(self):
-
         try:
             trimmed = self._events[-self.MAX_EVENT_HISTORY:]
             with open(self.EVENTS_FILE, "w", encoding="utf-8") as f:
@@ -170,14 +147,8 @@ class RetrainTrigger:
         except Exception as e:
             logger.warning("Failed to persist retrain events: %s", str(e))
 
-    # =====================================================
-    # LOG EVENT
-    # =====================================================
-
     def _log_event(self, severity: int, drift_state: str, suppressed: bool = False):
-
         severity = max(0, min(severity, self.MAX_SEVERITY))
-
         event = {
             "timestamp": int(time.time()),
             "severity_score": severity,
@@ -185,20 +156,37 @@ class RetrainTrigger:
             "retrain_required": severity >= self.HARD_THRESHOLD,
             "suppressed_by_cooldown": suppressed,
         }
-
         self._events.append(event)
         self._save_events()
-
         return event
 
     # =====================================================
     # EVALUATE DRIFT
-    # FIX: Now checks cooldown before setting retrain_required.
-    # If cooldown is active, retrain_required stays False even
-    # if drift is above threshold — prevents repeated triggers.
+    #
+    # FIX v1.3: Accepts Union[int, Dict] input.
+    # drift.py calls trigger.evaluate(severity_score) with int.
+    # Old code called drift_result.get() on int → AttributeError.
+    # Now normalises input to dict before processing.
     # =====================================================
 
-    def evaluate(self, drift_result: Dict) -> Dict:
+    def evaluate(self, drift_result: Union[int, Dict]) -> Dict:
+        """
+        Evaluate drift and decide if retrain is needed.
+
+        Args:
+            drift_result: Either:
+                - int: severity_score directly (from drift.py)
+                - dict: full drift result with "severity_score" key
+
+        Returns:
+            dict with retrain_required, cooldown_active, etc.
+        """
+        # FIX v1.3: normalise int input to dict
+        if isinstance(drift_result, (int, float)):
+            drift_result = {
+                "severity_score": int(drift_result),
+                "drift_state": "unknown",
+            }
 
         severity = int(drift_result.get("severity_score", 0))
         drift_state = drift_result.get("drift_state", "unknown")
@@ -214,24 +202,19 @@ class RetrainTrigger:
             if severity >= self.HARD_THRESHOLD or severity >= DRIFT_RETRAIN_THRESHOLD:
 
                 if on_cooldown:
-                    # Drift is bad but cooldown is active — suppress trigger
                     event = self._log_event(severity, drift_state, suppressed=True)
                     logger.info(
                         "Retrain suppressed by cooldown | severity=%d | remaining=%ds",
-                        severity,
-                        remaining,
+                        severity, remaining,
                     )
                 else:
-                    # Drift is bad and cooldown is clear — trigger allowed
                     retrain_required = True
                     self.retrain_required = True
                     event = self._log_event(severity, drift_state, suppressed=False)
                     logger.warning(
                         "Retrain trigger activated | severity=%d state=%s",
-                        severity,
-                        drift_state,
+                        severity, drift_state,
                     )
-
             else:
                 event = self._log_event(severity, drift_state, suppressed=False)
                 logger.info("Drift warning recorded | severity=%d", severity)
@@ -249,8 +232,6 @@ class RetrainTrigger:
     # =====================================================
 
     def clear_retrain_flag(self):
-
         self.retrain_required = False
         logger.info("Retrain flag manually cleared.")
-
         return {"retrain_required": False}
