@@ -1,9 +1,18 @@
 # =========================================================
-# MODEL LOADER v2.8
+# MODEL LOADER v2.9
 # FIX: Scan for .pkl artifacts (not .joblib — models are
 #      saved as .pkl by train_xgboost.py export_artifacts).
 # FIX: Fallback pointer file scan also looks for .pkl.
 # FIX: Added safe None-check before loading artifact.
+# FIX v2.9: POINTER_FILENAME changed from "latest.json" to
+#      "production_pointer.json". train_xgboost.py creates
+#      production_pointer.json — not latest.json. The wrong
+#      filename meant pointer lookup ALWAYS failed, falling
+#      back to directory scan which picks the alphabetically
+#      latest model (newest timestamp = weakest model after
+#      a bad training run). The good model (iter=142) was
+#      being silently ignored. production_pointer.json is
+#      now the primary pointer. latest.json checked as alias.
 # =========================================================
 
 import os
@@ -32,10 +41,14 @@ class ModelLoader:
     Supports pointer-file fallback for promoted model tracking.
     """
 
-    # FIX: Extension is .pkl — train_xgboost saves with joblib but
-    # names the file model_xgb_<version>.pkl
     MODEL_EXTENSION = ".pkl"
-    POINTER_FILENAME = "latest.json"
+
+    # FIX v2.9: training pipeline creates production_pointer.json
+    # latest.json is checked as a fallback alias for compatibility
+    POINTER_FILENAMES = [
+        "production_pointer.json",  # primary — created by train_xgboost.py
+        "latest.json",              # legacy alias
+    ]
 
     def __init__(self):
         self.registry_dir = os.getenv("XGB_REGISTRY_DIR", "artifacts/xgboost")
@@ -52,33 +65,68 @@ class ModelLoader:
 
     def _find_via_pointer(self) -> Optional[str]:
         """
-        Try to find model path via latest.json pointer file.
+        Try to find model path via pointer file.
+        Checks production_pointer.json first, then latest.json.
         Returns absolute path or None.
+
+        FIX v2.9: was only checking latest.json which training
+        pipeline never creates. Now checks production_pointer.json
+        first (created by train_xgboost.py export_artifacts).
         """
-        pointer_path = os.path.join(self.registry_dir, self.POINTER_FILENAME)
+        for pointer_filename in self.POINTER_FILENAMES:
+            pointer_path = os.path.join(self.registry_dir, pointer_filename)
 
-        if not os.path.exists(pointer_path):
-            return None
+            if not os.path.exists(pointer_path):
+                continue
 
-        try:
-            with open(pointer_path, encoding="utf-8") as f:
-                data = json.load(f)
+            try:
+                with open(pointer_path, encoding="utf-8") as f:
+                    data = json.load(f)
 
-            path = data.get("path") or data.get("model_path")
+                # production_pointer.json uses model_path (full path)
+                # latest.json uses path (relative or absolute)
+                path = (
+                    data.get("model_path")
+                    or data.get("path")
+                )
 
-            if not path:
-                return None
+                if not path:
+                    logger.warning(
+                        "Pointer file has no path field | file=%s",
+                        pointer_filename,
+                    )
+                    continue
 
-            # Resolve relative paths
-            if not os.path.isabs(path):
-                path = os.path.join(self.registry_dir, path)
+                # Resolve relative paths
+                if not os.path.isabs(path):
+                    path = os.path.join(self.registry_dir, path)
 
-            if os.path.exists(path):
-                logger.info("Model pointer found: %s", path)
+                # production_pointer.json uses container path /app/...
+                # resolve to local registry dir if /app/ not found
+                if not os.path.exists(path):
+                    filename = os.path.basename(path)
+                    local_path = os.path.join(self.registry_dir, filename)
+                    if os.path.exists(local_path):
+                        path = local_path
+                    else:
+                        logger.warning(
+                            "Pointer path not found | pointer=%s path=%s",
+                            pointer_filename, path,
+                        )
+                        continue
+
+                logger.info(
+                    "Model pointer found | file=%s path=%s",
+                    pointer_filename, path,
+                )
                 return path
 
-        except Exception as e:
-            logger.warning("Pointer file read failed: %s", e)
+            except Exception as e:
+                logger.warning(
+                    "Pointer file read failed | file=%s error=%s",
+                    pointer_filename, e,
+                )
+                continue
 
         return None
 
@@ -87,12 +135,15 @@ class ModelLoader:
         Scan the registry dir for the latest .pkl model file.
         Sorts by filename (which includes timestamp) descending.
         Returns absolute path or None.
+
+        NOTE: This is a fallback only. The best model may NOT be
+        the most recently trained one (e.g. after a bad training
+        run that stopped at iter=2). Always prefer pointer file.
         """
         if not os.path.isdir(self.registry_dir):
             logger.warning("Registry dir missing: %s", self.registry_dir)
             return None
 
-        # FIX: Look for .pkl files, not .joblib
         candidates = [
             f for f in os.listdir(self.registry_dir)
             if f.endswith(self.MODEL_EXTENSION)
@@ -107,12 +158,16 @@ class ModelLoader:
             )
             return None
 
-        # Sort descending — latest timestamp is last alphabetically
         candidates.sort(reverse=True)
         latest = candidates[0]
         path = os.path.join(self.registry_dir, latest)
 
-        logger.info("Model found via scan: %s", path)
+        logger.warning(
+            "Model found via directory scan (pointer file missing) | path=%s | "
+            "WARNING: this may not be the best model. "
+            "Set production_pointer.json to pin the correct model.",
+            path,
+        )
         return path
 
     def _find_model_path(self) -> Optional[str]:
@@ -121,7 +176,6 @@ class ModelLoader:
         """
         allow_fallback = os.getenv("MODEL_ALLOW_POINTER_FALLBACK", "1") == "1"
 
-        # Try pointer file first
         path = self._find_via_pointer()
         if path:
             return path
@@ -130,7 +184,6 @@ class ModelLoader:
             logger.error("Pointer file missing and fallback disabled.")
             return None
 
-        # Fallback to directory scan
         return self._find_via_scan()
 
     # =====================================================
@@ -147,14 +200,13 @@ class ModelLoader:
 
     def _load_metadata(self, model_path: str) -> Optional[dict]:
         """
-        Try to load companion metadata.json for the model artifact.
+        Try to load companion metadata json for the model artifact.
         Returns None if not found — metadata is optional.
         """
-        # Try same dir, same stem with .json extension
         stem = os.path.splitext(model_path)[0]
         candidates = [
             stem + ".json",
-            stem.replace("model_xgb_", "metadata_") + ".json",
+            stem.replace("model_xgb_", "metadata_xgb_") + ".json",
             os.path.join(os.path.dirname(model_path), "metadata.json"),
         ]
 
@@ -187,7 +239,6 @@ class ModelLoader:
 
                 artifact = joblib.load(model_path)
 
-                # FIX: Safe None check before attribute access
                 if artifact is None:
                     logger.error("Loaded artifact is None: %s", model_path)
                     return False
@@ -195,16 +246,20 @@ class ModelLoader:
                 self._model = artifact
                 self._artifact_hash = self._compute_artifact_hash(model_path)
 
-                # Extract version from filename: model_xgb_20260319_014404.pkl
+                # Extract version from filename
+                # model_xgb_20260319_014404.pkl → xgb_20260319_014404
                 filename = os.path.basename(model_path)
-                stem = os.path.splitext(filename)[0]  # model_xgb_20260319_014404
-                parts = stem.split("_", 2)             # ['model', 'xgb', '20260319_014404']
+                stem = os.path.splitext(filename)[0]
+                parts = stem.split("_", 2)
                 self._version = "_".join(parts[1:]) if len(parts) >= 3 else stem
 
                 # Load feature names from model if available
                 if hasattr(artifact, "feature_names"):
                     self._feature_names = list(artifact.feature_names)
-                elif hasattr(artifact, "model") and hasattr(artifact.model, "feature_names"):
+                elif (
+                    hasattr(artifact, "model")
+                    and hasattr(artifact.model, "feature_names")
+                ):
                     self._feature_names = list(artifact.model.feature_names)
 
                 # Load schema signature
@@ -217,10 +272,8 @@ class ModelLoader:
                     except Exception:
                         self._schema_signature = "unknown"
 
-                # Load companion metadata
                 self._metadata = self._load_metadata(model_path)
 
-                # Update global cache
                 _LOADED_MODEL = self._model
                 _LOADED_VERSION = self._version
                 _LOADED_HASH = self._artifact_hash
@@ -274,27 +327,29 @@ class ModelLoader:
         """
         if self._model is None:
             raise RuntimeError("Model not loaded. Call load() first.")
-
         return self._model.predict(X)
 
     def get_info(self) -> dict:
         """Return model metadata dict for /model/info endpoint."""
         meta = self._metadata or {}
-
         return {
             "model_version": self._version or "unknown",
-            "schema_signature": self._schema_signature or meta.get("schema_signature", "unknown"),
+            "schema_signature": (
+                self._schema_signature
+                or meta.get("schema_signature", "unknown")
+            ),
             "artifact_hash": self._artifact_hash or "unknown",
             "dataset_hash": meta.get("dataset_hash", "unknown"),
             "training_code_hash": meta.get("training_code_hash", "unknown"),
             "feature_checksum": meta.get("feature_checksum", "unknown"),
-            "feature_count": len(self._feature_names) if self._feature_names else 0,
+            "feature_count": (
+                len(self._feature_names) if self._feature_names else 0
+            ),
         }
 
 
 # =========================================================
 # MODULE-LEVEL SINGLETON
-# Used by app/main.py and inference pipeline
 # =========================================================
 
 _loader_instance: Optional[ModelLoader] = None
