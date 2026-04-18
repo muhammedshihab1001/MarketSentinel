@@ -4,7 +4,6 @@ import os
 import hashlib
 import logging
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -35,7 +34,7 @@ class MarketTime:
     ########################################################
 
     DEFAULT_WINDOWS = {
-        "xgboost": 2,   # FIX: was 5 — align to 730-day (2yr) training window
+        "xgboost": 2,  # FIX: was 5 — align to 730-day (2yr) training window
     }
 
     TRADING_DAYS_PER_YEAR = 252
@@ -44,9 +43,7 @@ class MarketTime:
     MIN_YEARS = 1
     MAX_YEARS = 15
 
-    FREEZE_FILE = os.path.abspath(
-        os.path.join("artifacts", "time_freeze.json")
-    )
+    FREEZE_FILE = os.path.abspath(os.path.join("artifacts", "time_freeze.json"))
 
     LOCK_FILE = FREEZE_FILE + ".lock"
 
@@ -58,9 +55,7 @@ class MarketTime:
 
     @staticmethod
     def _hash_payload(payload: dict):
-        canonical = json.dumps(
-            payload, sort_keys=True, separators=(",", ":")
-        ).encode()
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(canonical).hexdigest()
 
     @classmethod
@@ -114,7 +109,7 @@ class MarketTime:
             cls._frozen_today = frozen
             payload = {
                 "frozen_today": date_str,
-                "governance_version": cls.TIME_GOVERNANCE_VERSION
+                "governance_version": cls.TIME_GOVERNANCE_VERSION,
             }
             cls._atomic_write(cls.FREEZE_FILE, payload)
         finally:
@@ -129,7 +124,9 @@ class MarketTime:
                 payload = json.load(f)
             integrity = payload.pop("integrity_hash", None)
             if integrity != cls._hash_payload(payload):
-                raise RuntimeError("Freeze file integrity failure — possible tampering.")
+                raise RuntimeError(
+                    "Freeze file integrity failure — possible tampering."
+                )
             frozen = datetime.date.fromisoformat(payload["frozen_today"])
             if frozen > cls._utc_today():
                 raise RuntimeError("Freeze file contains future date.")
@@ -205,7 +202,7 @@ class MarketTime:
             "today": cls.today().isoformat(),
             "training_start": start,
             "training_end": end,
-            "walk_forward_anchor": anchor.isoformat()
+            "walk_forward_anchor": anchor.isoformat(),
         }
         canonical = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
         contract["time_hash"] = hashlib.sha256(canonical).hexdigest()

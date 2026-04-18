@@ -6,7 +6,6 @@ Hybrid-Ready Cross-Sectional Diagnostics
 import numpy as np
 import pandas as pd
 
-
 EPSILON = 1e-12
 MIN_CS_SIZE = 5
 
@@ -14,6 +13,7 @@ MIN_CS_SIZE = 5
 # =========================================================
 # MAIN EVALUATION FUNCTION (RANKING-ALIGNED)
 # =========================================================
+
 
 def evaluate_xgboost(
     scores,
@@ -84,10 +84,7 @@ def evaluate_xgboost(
 
         if group["forward_return"].nunique() >= 2:
 
-            corr = group["score"].corr(
-                group["forward_return"],
-                method="spearman"
-            )
+            corr = group["score"].corr(group["forward_return"], method="spearman")
 
             if np.isfinite(corr):
                 ic_list.append(corr)
@@ -103,8 +100,7 @@ def evaluate_xgboost(
             top_q = group.tail(quint)
 
             spread_q = (
-                top_q["forward_return"].mean()
-                - bottom_q["forward_return"].mean()
+                top_q["forward_return"].mean() - bottom_q["forward_return"].mean()
             )
 
             long_short_daily.append(spread_q)
@@ -113,8 +109,7 @@ def evaluate_xgboost(
             top_d = group.tail(dec)
 
             spread_d = (
-                top_d["forward_return"].mean()
-                - bottom_d["forward_return"].mean()
+                top_d["forward_return"].mean() - bottom_d["forward_return"].mean()
             )
 
             decile_spreads.append(spread_d)
@@ -135,10 +130,7 @@ def evaluate_xgboost(
 
         if std > EPSILON:
 
-            sharpe = float(
-                (spread_series.mean() / std)
-                * np.sqrt(252 / 5)
-            )
+            sharpe = float((spread_series.mean() / std) * np.sqrt(252 / 5))
 
         else:
             sharpe = 0.0

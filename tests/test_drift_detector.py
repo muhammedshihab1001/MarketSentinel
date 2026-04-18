@@ -7,10 +7,10 @@ import os
 from core.monitoring.drift_detector import DriftDetector
 from core.schema.feature_schema import MODEL_FEATURES
 
-
 ############################################################
 # SYNTHETIC DATA BUILDER
 ############################################################
+
 
 def make_dataset(rows=300, seed=42, noise_scale=1.0):
     """Build a synthetic feature DataFrame matching MODEL_FEATURES schema."""
@@ -27,6 +27,7 @@ def make_dataset(rows=300, seed=42, noise_scale=1.0):
 ############################################################
 # BASELINE CREATION
 ############################################################
+
 
 class TestBaselineCreation:
 
@@ -102,6 +103,7 @@ class TestBaselineCreation:
 # DRIFT DETECTION
 ############################################################
 
+
 class TestDriftDetection:
 
     def _make_detector_with_baseline(self, tmp_path, seed=42):
@@ -125,8 +127,12 @@ class TestDriftDetection:
         detector, df = self._make_detector_with_baseline(tmp_path)
         result = detector.detect(df)
         required = {
-            "drift_detected", "severity_score", "drift_state",
-            "drift_confidence", "exposure_scale", "coverage",
+            "drift_detected",
+            "severity_score",
+            "drift_state",
+            "drift_confidence",
+            "exposure_scale",
+            "coverage",
         }
         assert required.issubset(result.keys())
 
@@ -172,6 +178,7 @@ class TestDriftDetection:
         to suppress FutureWarning from pandas clip.
         """
         import warnings
+
         detector, df = self._make_detector_with_baseline(tmp_path)
         with warnings.catch_warnings():
             warnings.simplefilter("error", FutureWarning)
@@ -183,6 +190,7 @@ class TestDriftDetection:
 ############################################################
 # INTEGRITY
 ############################################################
+
 
 class TestBaselineIntegrity:
 

@@ -44,6 +44,7 @@ MAX_ALLOWED_DRIFT = 8
 # DATASET BUILD
 # =========================================================
 
+
 def build_dataset():
 
     market_data = MarketDataService()
@@ -82,10 +83,7 @@ def build_dataset():
 
     combined_prices = pd.concat(price_frames, ignore_index=True)
 
-    df = FeatureEngineer.build_feature_pipeline(
-        combined_prices,
-        training=False
-    )
+    df = FeatureEngineer.build_feature_pipeline(combined_prices, training=False)
 
     df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
@@ -107,6 +105,7 @@ def build_dataset():
 # =========================================================
 # BASELINE COMPARISON
 # =========================================================
+
 
 def compare_to_baseline(metrics):
 
@@ -145,6 +144,7 @@ def compare_to_baseline(metrics):
 # =========================================================
 # MAIN
 # =========================================================
+
 
 def main() -> int:
 
@@ -190,10 +190,7 @@ def main() -> int:
 
     df = build_dataset()
 
-    X = validate_feature_schema(
-        df.loc[:, MODEL_FEATURES],
-        mode="strict_contract"
-    )
+    X = validate_feature_schema(df.loc[:, MODEL_FEATURES], mode="strict_contract")
 
     # =====================================================
     # DRIFT CHECK
@@ -219,9 +216,7 @@ def main() -> int:
     # WALK FORWARD VALIDATION
     # =====================================================
 
-    validator = WalkForwardValidator(
-        model_trainer=retrain_model
-    )
+    validator = WalkForwardValidator(model_trainer=retrain_model)
 
     metrics = validator.run(df.copy())
 

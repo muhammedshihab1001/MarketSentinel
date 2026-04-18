@@ -1,31 +1,36 @@
 # =========================================================
-# DEMO TRACKER v1.4
+# DEMO TRACKER v2.0
 #
-# CRITICAL FIX: self._redis was captured once at __init__
-# time from cache._redis. When Redis reconnects (seen in
-# logs: Redis connects → disconnects → reconnects), the
-# tracker kept the dead client forever. All incr/get/expire
-# calls silently failed (fail-open), so demo limits were
-# never written to Redis. Result: users could use features
-# indefinitely without hitting the limit.
+# CRITICAL FIX: Uses cache.get_strict_client() instead of
+# fail-open helpers. When Redis is unavailable, operations
+# raise RuntimeError instead of silently returning 0/None.
 #
-# Fix: Remove self._redis entirely. Call cache._redis as a
-# property on every operation — it always returns the live
-# client or None if Redis is down.
+# ARCHITECTURE CHANGE:
+# Before: Redis down → return 0 → user gets unlimited access ❌
+# After:  Redis down → raise error → middleware blocks access ✅
 #
-# FIX 2: Fixed chained assignment bug in increment():
-#   key = _usage_key = self._usage_key(...)
-# was shadowing the method name locally (harmless but wrong).
+# Changes from v1.4:
+# - Removed all _safe_* helpers (fail-open behavior)
+# - All Redis operations now use get_strict_client() (fail-closed)
+# - increment() raises RuntimeError instead of returning 0
+# - get_count() raises RuntimeError instead of returning 0
+# - is_locked() raises RuntimeError instead of returning False
+# - Added comprehensive error logging
 #
-# FIX 3: get_usage_summary now always returns valid dict
-# even when Redis is completely unavailable (shows 0 usage,
-# not locked — correct fail-open behavior).
+# Exception handling strategy:
+# - Let exceptions bubble up to middleware
+# - Middleware decides: block demo user or allow owner bypass
+# - Clear error messages for observability
+#
+# All fixes from v1.4 retained.
 # =========================================================
 
 import os
 import time
 import hashlib
-from typing import Optional
+import logging
+
+logger = logging.getLogger("marketsentinel.demo_tracker")
 
 DEMO_REQUESTS_PER_FEATURE = int(os.getenv("DEMO_REQUESTS_PER_FEATURE", "3"))
 DEMO_BLOCK_DAYS = int(os.getenv("DEMO_BLOCK_DAYS", "7"))
@@ -34,44 +39,73 @@ DEMO_TTL_SECONDS = DEMO_BLOCK_DAYS * 86400
 
 class DemoTracker:
     """
-    Tracks per-feature demo usage in Redis.
+    Tracks per-feature demo usage in Redis using STRICT mode.
 
     Keys:
         demo:usage:{fingerprint}:{feature}  → integer counter
         demo:reg:{fingerprint}              → registration timestamp
 
-    All operations fail-open: if Redis is unavailable,
-    usage is not tracked and requests are allowed through.
+    CRITICAL: All operations use cache.get_strict_client()
+    which raises RuntimeError if Redis is unavailable.
 
-    CRITICAL: Never cache the Redis client — always fetch
-    from cache._redis property which reconnects automatically.
+    Fail-closed behavior: Redis down → operations blocked.
+    This prevents unlimited access during Redis downtime.
+
+    Exception handling:
+    - All methods may raise RuntimeError
+    - Caller (middleware) must catch and handle appropriately
+    - Owner role can bypass Redis requirement
+    - Demo role gets blocked with clear error message
     """
 
     KEY_PREFIX = "demo:usage"
     REG_PREFIX = "demo:reg"
 
     def __init__(self, cache=None):
-        # FIX: Store cache reference, NOT the Redis client.
-        # self._cache._redis is a property that reconnects.
+        """
+        Initialize DemoTracker with Redis cache reference.
+
+        Args:
+            cache: RedisCache instance (required for production use)
+        """
+        if cache is None:
+            logger.warning(
+                "DemoTracker initialized with cache=None — "
+                "all operations will fail. This should only happen "
+                "in tests or during app startup before cache is ready."
+            )
         self._cache = cache
 
     # =====================================================
-    # REDIS CLIENT — always fresh, never cached
+    # REDIS CLIENT — strict mode only
     # =====================================================
 
-    @property
-    def _redis(self):
+    def _get_redis_strict(self):
         """
-        Get live Redis client on every call.
-        Returns None if Redis is unavailable.
-        NEVER store the return value — always use this property.
+        Get Redis client in STRICT mode.
+
+        Returns:
+            redis.Redis: Connected Redis client
+
+        Raises:
+            RuntimeError: If cache is None or Redis unavailable
         """
         if self._cache is None:
-            return None
+            raise RuntimeError(
+                "DemoTracker has no cache instance — "
+                "cannot track usage. This indicates a configuration error."
+            )
+
         try:
-            return self._cache._redis
-        except Exception:
-            return None
+            return self._cache.get_strict_client()
+        except RuntimeError as e:
+            logger.error(
+                "CRITICAL: Redis unavailable for demo tracking | "
+                "error=%s | "
+                "Demo users will be blocked until Redis recovers",
+                e,
+            )
+            raise
 
     # =====================================================
     # FINGERPRINT
@@ -97,74 +131,6 @@ class DemoTracker:
         return f"{self.REG_PREFIX}:{fingerprint}"
 
     # =====================================================
-    # SAFE REDIS HELPERS
-    # Each helper gets a fresh client — fail-open on None.
-    # =====================================================
-
-    def _safe_incr(self, key: str) -> Optional[int]:
-        """Increment key, return new value or None on failure."""
-        r = self._redis
-        if r is None:
-            return None
-        try:
-            return int(r.incr(key))
-        except Exception:
-            return None
-
-    def _safe_expire(self, key: str, ttl: int) -> bool:
-        """Set TTL on key, return True on success."""
-        r = self._redis
-        if r is None:
-            return False
-        try:
-            r.expire(key, ttl)
-            return True
-        except Exception:
-            return False
-
-    def _safe_get(self, key: str) -> Optional[str]:
-        """Get string value of key, return None on failure."""
-        r = self._redis
-        if r is None:
-            return None
-        try:
-            val = r.get(key)
-            return val.decode() if isinstance(val, bytes) else val
-        except Exception:
-            return None
-
-    def _safe_set(self, key: str, value: str, ex: int) -> bool:
-        """Set key with expiry, return True on success."""
-        r = self._redis
-        if r is None:
-            return False
-        try:
-            r.set(key, value, ex=ex)
-            return True
-        except Exception:
-            return False
-
-    def _safe_ttl(self, key: str) -> int:
-        """Return TTL of key in seconds. -2 = key missing, -1 = no expiry."""
-        r = self._redis
-        if r is None:
-            return -2
-        try:
-            return int(r.ttl(key))
-        except Exception:
-            return -2
-
-    def _safe_exists(self, key: str) -> bool:
-        """Return True if key exists, False on failure."""
-        r = self._redis
-        if r is None:
-            return False
-        try:
-            return bool(r.exists(key))
-        except Exception:
-            return False
-
-    # =====================================================
     # REGISTRATION
     # =====================================================
 
@@ -172,18 +138,54 @@ class DemoTracker:
         """
         Register a new demo session fingerprint.
         Sets a 7-day TTL on the registration key.
-        Returns True if newly registered, False if already exists or Redis down.
+
+        Returns:
+            True if newly registered, False if already exists
+
+        Raises:
+            RuntimeError: If Redis is unavailable
         """
+        r = self._get_redis_strict()
         key = self._reg_key(fingerprint)
 
-        if self._safe_exists(key):
-            return False
+        try:
+            # Check if already exists
+            if r.exists(key):
+                return False
 
-        return self._safe_set(key, str(int(time.time())), ex=DEMO_TTL_SECONDS)
+            # Set registration timestamp with TTL
+            r.set(key, str(int(time.time())), ex=DEMO_TTL_SECONDS)
+            logger.info(
+                "Demo session registered | fingerprint=%s... | ttl=%ds",
+                fingerprint[:8],
+                DEMO_TTL_SECONDS,
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                "Demo registration failed | fingerprint=%s... | error=%s",
+                fingerprint[:8],
+                e,
+            )
+            raise RuntimeError(f"Failed to register demo session: {e}")
 
     def is_registered(self, fingerprint: str) -> bool:
-        """Return True if this fingerprint has an active demo session."""
-        return self._safe_exists(self._reg_key(fingerprint))
+        """
+        Return True if this fingerprint has an active demo session.
+
+        Raises:
+            RuntimeError: If Redis is unavailable
+        """
+        r = self._get_redis_strict()
+        try:
+            return bool(r.exists(self._reg_key(fingerprint)))
+        except Exception as e:
+            logger.error(
+                "Demo registration check failed | fingerprint=%s... | error=%s",
+                fingerprint[:8],
+                e,
+            )
+            raise RuntimeError(f"Failed to check demo registration: {e}")
 
     # =====================================================
     # USAGE TRACKING
@@ -192,42 +194,125 @@ class DemoTracker:
     def increment(self, fingerprint: str, feature: str) -> int:
         """
         Increment usage counter for (fingerprint, feature).
-        Returns new count, or 0 if Redis is unavailable (fail-open).
         On first increment, sets a 7-day TTL.
 
-        FIX: Removed chained assignment `key = _usage_key = ...`
-        that was shadowing the method name.
+        Returns:
+            New count after increment
+
+        Raises:
+            RuntimeError: If Redis is unavailable
+
+        CRITICAL CHANGE: No longer returns 0 on Redis failure.
+        Instead raises RuntimeError to prevent silent degradation.
         """
+        r = self._get_redis_strict()
         key = self._usage_key(fingerprint, feature)
 
-        new_count = self._safe_incr(key)
+        try:
+            new_count = int(r.incr(key))
 
-        if new_count is None:
-            # Redis down — fail open, don't block the request
-            return 0
+            # Set TTL on first use so counters auto-expire
+            if new_count == 1:
+                r.expire(key, DEMO_TTL_SECONDS)
+                logger.debug(
+                    "First usage tracked | fingerprint=%s... | feature=%s | ttl=%ds",
+                    fingerprint[:8],
+                    feature,
+                    DEMO_TTL_SECONDS,
+                )
 
-        if new_count == 1:
-            # First use — set TTL so counters auto-expire
-            self._safe_expire(key, DEMO_TTL_SECONDS)
+            logger.debug(
+                "Usage incremented | fingerprint=%s... | feature=%s | count=%d/%d",
+                fingerprint[:8],
+                feature,
+                new_count,
+                DEMO_REQUESTS_PER_FEATURE,
+            )
 
-        return new_count
+            return new_count
+
+        except Exception as e:
+            logger.error(
+                "CRITICAL: Usage increment failed | "
+                "fingerprint=%s... | feature=%s | error=%s | "
+                "Demo user will be blocked",
+                fingerprint[:8],
+                feature,
+                e,
+            )
+            raise RuntimeError(
+                f"Failed to track usage for {feature}. "
+                f"Service temporarily unavailable."
+            )
 
     def get_count(self, fingerprint: str, feature: str) -> int:
-        """Return current usage count for (fingerprint, feature)."""
-        val = self._safe_get(self._usage_key(fingerprint, feature))
+        """
+        Return current usage count for (fingerprint, feature).
+
+        Returns:
+            Current usage count (0 if key doesn't exist)
+
+        Raises:
+            RuntimeError: If Redis is unavailable
+
+        CRITICAL CHANGE: No longer returns 0 on Redis failure.
+        """
+        r = self._get_redis_strict()
+        key = self._usage_key(fingerprint, feature)
+
         try:
-            return int(val) if val is not None else 0
-        except (ValueError, TypeError):
-            return 0
+            val = r.get(key)
+            if val is None:
+                return 0
+
+            # Handle both bytes and string responses
+            if isinstance(val, bytes):
+                val = val.decode()
+
+            return int(val)
+        except Exception as e:
+            logger.error(
+                "CRITICAL: Usage count retrieval failed | "
+                "fingerprint=%s... | feature=%s | error=%s",
+                fingerprint[:8],
+                feature,
+                e,
+            )
+            raise RuntimeError(
+                f"Failed to retrieve usage count for {feature}. "
+                f"Service temporarily unavailable."
+            )
 
     def is_locked(self, fingerprint: str, feature: str) -> bool:
         """
         Return True if this feature is exhausted for this fingerprint.
-        Fails open — returns False (not locked) if Redis is down,
-        so Redis downtime never hard-blocks demo users.
+
+        Returns:
+            True if usage >= limit, False otherwise
+
+        Raises:
+            RuntimeError: If Redis is unavailable
+
+        CRITICAL CHANGE: No longer returns False (unlocked) on Redis failure.
+        Instead raises RuntimeError to prevent unlimited access.
         """
-        count = self.get_count(fingerprint, feature)
-        return count >= DEMO_REQUESTS_PER_FEATURE
+        try:
+            count = self.get_count(fingerprint, feature)
+            locked = count >= DEMO_REQUESTS_PER_FEATURE
+
+            if locked:
+                logger.info(
+                    "Demo feature locked | fingerprint=%s... | feature=%s | count=%d/%d",
+                    fingerprint[:8],
+                    feature,
+                    count,
+                    DEMO_REQUESTS_PER_FEATURE,
+                )
+
+            return locked
+        except RuntimeError:
+            # get_count already logged the error
+            raise
 
     # =====================================================
     # USAGE SUMMARY
@@ -252,39 +337,54 @@ class DemoTracker:
                 "reset_in_seconds": 604800,
                 "limit_per_feature": 3,
             }
+
+        Raises:
+            RuntimeError: If Redis is unavailable
         """
-        result = {}
-        any_unlocked = False
+        r = self._get_redis_strict()
 
-        for feature in features:
-            used = self.get_count(fingerprint, feature)
-            remaining = max(0, DEMO_REQUESTS_PER_FEATURE - used)
-            locked = used >= DEMO_REQUESTS_PER_FEATURE
+        try:
+            result = {}
+            any_unlocked = False
 
-            result[feature] = {
-                "used": used,
-                "limit": DEMO_REQUESTS_PER_FEATURE,
-                "remaining": remaining,
-                "locked": locked,
+            for feature in features:
+                used = self.get_count(fingerprint, feature)
+                remaining = max(0, DEMO_REQUESTS_PER_FEATURE - used)
+                locked = used >= DEMO_REQUESTS_PER_FEATURE
+
+                result[feature] = {
+                    "used": used,
+                    "limit": DEMO_REQUESTS_PER_FEATURE,
+                    "remaining": remaining,
+                    "locked": locked,
+                }
+
+                if not locked:
+                    any_unlocked = True
+
+            # Reset time = TTL of the registration key
+            reg_key = self._reg_key(fingerprint)
+            reset_in_seconds = int(r.ttl(reg_key))
+
+            # TTL returns -2 if key doesn't exist, -1 if no expiry
+            if reset_in_seconds < 0:
+                reset_in_seconds = DEMO_TTL_SECONDS
+
+            fully_locked = not any_unlocked and len(features) > 0
+
+            return {
+                "features": result,
+                "fully_locked": fully_locked,
+                "reset_in_seconds": max(0, reset_in_seconds),
+                "limit_per_feature": DEMO_REQUESTS_PER_FEATURE,
             }
-
-            if not locked:
-                any_unlocked = True
-
-        # Reset time = TTL of the registration key
-        reset_in_seconds = self._safe_ttl(self._reg_key(fingerprint))
-        if reset_in_seconds < 0:
-            # Key missing or no expiry — default to full block window
-            reset_in_seconds = DEMO_TTL_SECONDS
-
-        fully_locked = not any_unlocked and len(features) > 0
-
-        return {
-            "features": result,
-            "fully_locked": fully_locked,
-            "reset_in_seconds": max(0, reset_in_seconds),
-            "limit_per_feature": DEMO_REQUESTS_PER_FEATURE,
-        }
+        except Exception as e:
+            logger.error(
+                "Usage summary retrieval failed | fingerprint=%s... | error=%s",
+                fingerprint[:8],
+                e,
+            )
+            raise RuntimeError("Failed to retrieve usage summary. Service temporarily unavailable.")
 
     # =====================================================
     # RESET (owner tool)
@@ -294,18 +394,34 @@ class DemoTracker:
         """
         Reset all usage counters for a fingerprint.
         Called by owner to manually unlock a demo session.
+
+        Returns:
+            True on success
+
+        Raises:
+            RuntimeError: If Redis is unavailable
         """
-        r = self._redis
-        if r is None:
-            return False
+        r = self._get_redis_strict()
 
         try:
             keys = [self._usage_key(fingerprint, f) for f in features]
             keys.append(self._reg_key(fingerprint))
+
             pipe = r.pipeline()
             for k in keys:
                 pipe.delete(k)
             pipe.execute()
+
+            logger.info(
+                "Demo session reset | fingerprint=%s... | features=%d",
+                fingerprint[:8],
+                len(features),
+            )
             return True
-        except Exception:
-            return False
+        except Exception as e:
+            logger.error(
+                "Demo session reset failed | fingerprint=%s... | error=%s",
+                fingerprint[:8],
+                e,
+            )
+            raise RuntimeError(f"Failed to reset demo session: {e}")

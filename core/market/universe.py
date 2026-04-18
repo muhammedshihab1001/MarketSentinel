@@ -69,7 +69,13 @@ class MarketUniverse:
 
     @classmethod
     def _validate_payload(cls, payload: Dict):
-        required = {"version", "created_utc", "description", "min_history_days", "tickers"}
+        required = {
+            "version",
+            "created_utc",
+            "description",
+            "min_history_days",
+            "tickers",
+        }
         missing = required - set(payload.keys())
         if missing:
             raise RuntimeError(f"Universe config missing fields: {missing}")
@@ -97,7 +103,9 @@ class MarketUniverse:
                 )
 
         if len(tickers) > cls.MAX_UNIVERSE_SIZE:
-            raise RuntimeError(f"Universe exceeds max allowed size ({cls.MAX_UNIVERSE_SIZE}).")
+            raise RuntimeError(
+                f"Universe exceeds max allowed size ({cls.MAX_UNIVERSE_SIZE})."
+            )
 
         parsed_version = cls._parse_version(version)
         if cls._LAST_VERSION:
@@ -158,7 +166,7 @@ class MarketUniverse:
         full_size = len(tickers)
 
         if full_size > cls.RUNTIME_FETCH_LIMIT:
-            tickers = tickers[:cls.RUNTIME_FETCH_LIMIT]
+            tickers = tickers[: cls.RUNTIME_FETCH_LIMIT]
 
         # FIX (item 47): Log warning when silently capping universe.
         # Previously this cap was invisible — operators couldn't tell
@@ -171,7 +179,7 @@ class MarketUniverse:
                 cls.TRAINING_SOFT_LIMIT,
                 full_size,
             )
-            return tickers[:cls.TRAINING_SOFT_LIMIT]
+            return tickers[: cls.TRAINING_SOFT_LIMIT]
 
         return tickers
 

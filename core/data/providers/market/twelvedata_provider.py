@@ -107,8 +107,7 @@ class TwelveDataProvider(MarketDataProvider):
 
             # Evict timestamps older than the window
             cls._CALL_TIMESTAMPS = [
-                t for t in cls._CALL_TIMESTAMPS
-                if now - t < cls._WINDOW_SECS
+                t for t in cls._CALL_TIMESTAMPS if now - t < cls._WINDOW_SECS
             ]
 
             if len(cls._CALL_TIMESTAMPS) >= cls._MAX_CALLS:
@@ -254,12 +253,7 @@ class TwelveDataProvider(MarketDataProvider):
         if jumps.dropna().max() > 0.90:
             logger.warning("TwelveData: extreme price move detected for %s", ticker)
 
-        df = (
-            df
-            .drop_duplicates("date")
-            .sort_values("date")
-            .reset_index(drop=True)
-        )
+        df = df.drop_duplicates("date").sort_values("date").reset_index(drop=True)
 
         # FIX: Skip min_rows check for delta fetches — same logic as yahoo_provider.
         # Delta syncs return 4-5 rows legitimately. The old check always raised here.

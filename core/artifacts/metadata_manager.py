@@ -10,7 +10,7 @@ import tempfile
 from core.schema.feature_schema import (
     get_schema_signature,
     SCHEMA_VERSION,
-    MODEL_FEATURES
+    MODEL_FEATURES,
 )
 
 from core.market.universe import MarketUniverse
@@ -44,7 +44,7 @@ class MetadataManager:
         "training_universe",
         "universe_hash",
         "artifact_hash",
-        "metadata_integrity_hash"
+        "metadata_integrity_hash",
     ]
 
     IMMUTABLE_KEYS = {
@@ -65,11 +65,7 @@ class MetadataManager:
 
     @staticmethod
     def _canonical_json(data: dict) -> bytes:
-        return json.dumps(
-            data,
-            sort_keys=True,
-            separators=(",", ":")
-        ).encode()
+        return json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
 
     # =====================================================
     # HASHABLE METADATA SUBSET
@@ -82,11 +78,7 @@ class MetadataManager:
         metadata_integrity_hash.
         """
 
-        volatile_fields = {
-            "created_at",
-            "environment",
-            "metrics"
-        }
+        volatile_fields = {"created_at", "environment", "metrics"}
 
         return {
             k: v
@@ -162,10 +154,7 @@ class MetadataManager:
     @staticmethod
     def fingerprint_features(features: tuple) -> str:
 
-        canonical = json.dumps(
-            list(features),
-            sort_keys=False
-        ).encode()
+        canonical = json.dumps(list(features), sort_keys=False).encode()
 
         return hashlib.sha256(canonical).hexdigest()
 
@@ -227,11 +216,7 @@ class MetadataManager:
         os.makedirs(directory, exist_ok=True)
 
         with tempfile.NamedTemporaryFile(
-            mode="w",
-            delete=False,
-            dir=directory,
-            suffix=".tmp",
-            encoding="utf-8"
+            mode="w", delete=False, dir=directory, suffix=".tmp", encoding="utf-8"
         ) as tmp:
 
             json.dump(metadata, tmp, indent=2)
@@ -322,32 +307,19 @@ class MetadataManager:
             ).hexdigest()
 
         metadata = {
-
             "metadata_type": metadata_type,
             "metadata_version": MetadataManager.METADATA_VERSION,
-
             "model_name": model_name,
             "created_at": datetime.datetime.utcnow().isoformat(),
-
-            "training_window": {
-                "start": training_start,
-                "end": training_end
-            },
-
+            "training_window": {"start": training_start, "end": training_end},
             "dataset_hash": dataset_hash,
             "dataset_rows": int(dataset_rows),
-
             "features": list(features),
             "feature_count": len(features),
-
             "metrics": metrics,
-
             "schema_signature": get_schema_signature(),
             "schema_version": SCHEMA_VERSION,
-
-            "training_code_hash":
-                MetadataManager.fingerprint_training_code(),
-
+            "training_code_hash": MetadataManager.fingerprint_training_code(),
             "environment": {
                 "python": platform.python_version(),
                 "platform": platform.platform(),
@@ -355,11 +327,9 @@ class MetadataManager:
                 "numpy": np.__version__,
                 "pandas": pd.__version__,
             },
-
             "training_universe": universe_snapshot,
             "universe_hash": universe_snapshot["universe_hash"],
-
-            "artifact_hash": artifact_hash
+            "artifact_hash": artifact_hash,
         }
 
         if feature_checksum:

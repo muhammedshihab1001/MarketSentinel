@@ -3,13 +3,12 @@ Tests for AuthMiddleware — owner-only routes, demo quota,
 unauthenticated requests.
 """
 
-
 from app.core.auth.middleware import _is_owner_only, _get_feature_group
-
 
 # =====================================================
 # OWNER-ONLY PATH DETECTION
 # =====================================================
+
 
 class TestOwnerOnlyPaths:
 
@@ -36,6 +35,7 @@ class TestOwnerOnlyPaths:
 # =====================================================
 # FEATURE GROUP MAPPING
 # =====================================================
+
 
 class TestFeatureGroupMapping:
 

@@ -45,10 +45,9 @@ class FeatureEngineer:
 
         df = df.copy()
 
-        df["date"] = (
-            pd.to_datetime(df["date"], utc=True, errors="coerce")
-            .dt.normalize()
-        )
+        df["date"] = pd.to_datetime(
+            df["date"], utc=True, errors="coerce"
+        ).dt.normalize()
 
         df = df.dropna(subset=["date"])
         df = df.sort_values(["ticker", "date"])
@@ -138,9 +137,7 @@ class FeatureEngineer:
         )
 
         df["volatility"] = (
-            df["volatility_20"]
-            .fillna(cls.VOL_FLOOR)
-            .clip(lower=cls.VOL_FLOOR)
+            df["volatility_20"].fillna(cls.VOL_FLOOR).clip(lower=cls.VOL_FLOOR)
         )
 
         df["mom_vol_adj"] = (
@@ -148,16 +145,24 @@ class FeatureEngineer:
         ).clip(-5, 5)
 
         df["vol_of_vol"] = (
-            grouped["volatility"]
-            .transform(lambda x: x.rolling(20, min_periods=10).std(ddof=0))
-            .shift(1)
-        ).fillna(0).clip(0, 1)
+            (
+                grouped["volatility"]
+                .transform(lambda x: x.rolling(20, min_periods=10).std(ddof=0))
+                .shift(1)
+            )
+            .fillna(0)
+            .clip(0, 1)
+        )
 
         df["return_skew_20"] = (
-            grouped["return"]
-            .transform(lambda x: x.rolling(20, min_periods=10).skew())
-            .shift(1)
-        ).fillna(0).clip(-3, 3)
+            (
+                grouped["return"]
+                .transform(lambda x: x.rolling(20, min_periods=10).skew())
+                .shift(1)
+            )
+            .fillna(0)
+            .clip(-3, 3)
+        )
 
         ########################################################
         # LIQUIDITY FEATURES
@@ -193,9 +198,11 @@ class FeatureEngineer:
         try:
             df["rsi"] = (
                 grouped["close"]
-                .apply(lambda x: TechnicalIndicators.rsi(
-                    pd.DataFrame({"close": x}), 14, normalize=False
-                ))
+                .apply(
+                    lambda x: TechnicalIndicators.rsi(
+                        pd.DataFrame({"close": x}), 14, normalize=False
+                    )
+                )
                 .reset_index(level=0, drop=True)
             )
         except Exception:
@@ -240,8 +247,10 @@ class FeatureEngineer:
             lambda x: x.rolling(60, min_periods=20).std()
         )
         df["regime_feature"] = (
-            (df["volatility"] - vol_mean) / (vol_std + cls.EPSILON)
-        ).clip(-3, 3).fillna(0)
+            ((df["volatility"] - vol_mean) / (vol_std + cls.EPSILON))
+            .clip(-3, 3)
+            .fillna(0)
+        )
 
         df["momentum_regime_interaction"] = (
             df["momentum_composite"] * df["regime_feature"]
@@ -259,13 +268,12 @@ class FeatureEngineer:
 
         try:
             from core.monitoring.market_regime_detector import MarketRegimeDetector
+
             detector = MarketRegimeDetector()
             df = detector.add_regime_feature(df)
 
         except Exception as e:
-            logger.warning(
-                "regime_multiplier feature failed (non-blocking): %s", e
-            )
+            logger.warning("regime_multiplier feature failed (non-blocking): %s", e)
             if "regime_multiplier" not in df.columns:
                 df["regime_multiplier"] = np.float32(1.0)
             if "regime" not in df.columns:
@@ -291,15 +299,14 @@ class FeatureEngineer:
             return df
 
         df["market_dispersion"] = (
-            df.groupby("date")["return"].transform("std")
+            df.groupby("date")["return"]
+            .transform("std")
             .clip(lower=cls.DISPERSION_FLOOR)
             .fillna(0)
         )
 
         df["breadth"] = (
-            df.groupby("date")["return"]
-            .transform(lambda x: (x > 0).mean())
-            .fillna(0.5)
+            df.groupby("date")["return"].transform(lambda x: (x > 0).mean()).fillna(0.5)
         )
 
         cols_to_process = [c for c in cls.CS_FEATURE_COLS if c in df.columns]
@@ -312,9 +319,7 @@ class FeatureEngineer:
 
             cs_mean = clipped.groupby(df["date"]).transform("mean")
             cs_std = (
-                clipped.groupby(df["date"])
-                .transform("std")
-                .clip(lower=cls.VAR_FLOOR)
+                clipped.groupby(df["date"]).transform("std").clip(lower=cls.VAR_FLOOR)
             )
 
             df[f"{col}_z"] = (
@@ -323,11 +328,7 @@ class FeatureEngineer:
                 .clip(-cls.Z_CLIP, cls.Z_CLIP)
             )
 
-            df[f"{col}_rank"] = (
-                clipped.groupby(df["date"])
-                .rank(pct=True)
-                .fillna(0.5)
-            )
+            df[f"{col}_rank"] = clipped.groupby(df["date"]).rank(pct=True).fillna(0.5)
 
         return df
 
@@ -445,8 +446,7 @@ class FeatureEngineer:
         df = cls.finalize(df)
 
         logger.info(
-            "Feature pipeline complete (inference) | "
-            "rows=%d tickers=%d features=%d",
+            "Feature pipeline complete (inference) | " "rows=%d tickers=%d features=%d",
             len(df),
             df["ticker"].nunique(),
             len([c for c in df.columns if c in MODEL_FEATURES]),
@@ -467,8 +467,6 @@ class FeatureEngineer:
                     feature_version[:8],
                 )
             except Exception as e:
-                logger.warning(
-                    "Feature cache store failed (non-blocking): %s", e
-                )
+                logger.warning("Feature cache store failed (non-blocking): %s", e)
 
         return df

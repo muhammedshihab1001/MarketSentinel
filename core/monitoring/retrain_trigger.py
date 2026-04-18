@@ -141,7 +141,7 @@ class RetrainTrigger:
 
     def _save_events(self):
         try:
-            trimmed = self._events[-self.MAX_EVENT_HISTORY:]
+            trimmed = self._events[-self.MAX_EVENT_HISTORY :]
             with open(self.EVENTS_FILE, "w", encoding="utf-8") as f:
                 json.dump(trimmed, f, indent=2)
         except Exception as e:
@@ -205,7 +205,8 @@ class RetrainTrigger:
                     event = self._log_event(severity, drift_state, suppressed=True)
                     logger.info(
                         "Retrain suppressed by cooldown | severity=%d | remaining=%ds",
-                        severity, remaining,
+                        severity,
+                        remaining,
                     )
                 else:
                     retrain_required = True
@@ -213,7 +214,8 @@ class RetrainTrigger:
                     event = self._log_event(severity, drift_state, suppressed=False)
                     logger.warning(
                         "Retrain trigger activated | severity=%d state=%s",
-                        severity, drift_state,
+                        severity,
+                        drift_state,
                     )
             else:
                 event = self._log_event(severity, drift_state, suppressed=False)

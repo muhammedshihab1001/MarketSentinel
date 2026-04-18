@@ -4,18 +4,17 @@ import pytest
 
 from core.models.xgboost import SafeXGBRegressor
 
-
 ############################################################
 # DATA GENERATOR
 ############################################################
+
 
 def generate_data(rows=400, features=12):
 
     np.random.seed(42)
 
     X = pd.DataFrame(
-        np.random.randn(rows, features),
-        columns=[f"f{i}" for i in range(features)]
+        np.random.randn(rows, features), columns=[f"f{i}" for i in range(features)]
     )
 
     y = np.random.randn(rows)
@@ -26,6 +25,7 @@ def generate_data(rows=400, features=12):
 ############################################################
 # TRAINING TEST
 ############################################################
+
 
 def test_training_and_checksums():
 
@@ -48,6 +48,7 @@ def test_training_and_checksums():
 # PREDICTION TEST
 ############################################################
 
+
 def test_predict_valid():
 
     X, y = generate_data()
@@ -67,6 +68,7 @@ def test_predict_valid():
 # FIX: predict() fills missing columns with 0 (graceful inference flexibility).
 # Only NaN VALUES raise — missing columns are a schema extension case.
 ############################################################
+
 
 def test_predict_feature_mismatch_fills_gracefully():
     """
@@ -95,6 +97,7 @@ def test_predict_feature_mismatch_fills_gracefully():
 # NaN = upstream pipeline bug that should surface loudly.
 ############################################################
 
+
 def test_predict_nan_guard():
     """
     FIX (item 20): NaN in inference input raises RuntimeError.
@@ -118,12 +121,10 @@ def test_predict_nan_guard():
 # TARGET VARIANCE GUARD
 ############################################################
 
+
 def test_target_variance_guard():
 
-    X = pd.DataFrame(
-        np.random.randn(200, 10),
-        columns=[f"f{i}" for i in range(10)]
-    )
+    X = pd.DataFrame(np.random.randn(200, 10), columns=[f"f{i}" for i in range(10)])
 
     y = np.ones(200)  # zero variance target
 
@@ -137,12 +138,10 @@ def test_target_variance_guard():
 # LOW DISPERSION WARNING (NON-FATAL)
 ############################################################
 
+
 def test_low_dispersion_warning():
 
-    X = pd.DataFrame(
-        np.random.randn(300, 8),
-        columns=[f"f{i}" for i in range(8)]
-    )
+    X = pd.DataFrame(np.random.randn(300, 8), columns=[f"f{i}" for i in range(8)])
 
     y = np.random.randn(300)
 
@@ -161,6 +160,7 @@ def test_low_dispersion_warning():
 # FEATURE IMPORTANCE EXPORT  (item 19)
 # FIX: export_feature_importance() now exists on SafeXGBRegressor
 ############################################################
+
 
 def test_feature_importance_export():
 

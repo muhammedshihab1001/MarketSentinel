@@ -60,7 +60,11 @@ MOCK_SNAPSHOT = {
             },
         }
     },
-    "_political": {"political_risk_score": 0.1, "political_risk_label": "LOW", "top_events": []},
+    "_political": {
+        "political_risk_score": 0.1,
+        "political_risk_label": "LOW",
+        "top_events": [],
+    },
     "_portfolio": {"score": 0.8, "approved_trades": 1, "rejected_trades": 0},
 }
 
@@ -89,6 +93,7 @@ def client_with_snapshot():
 @pytest.fixture
 def owner_cookies():
     from app.core.auth.jwt_handler import create_owner_token
+
     token = create_owner_token("test_owner")
     return {"ms_token": token}
 
@@ -102,7 +107,9 @@ class TestAgentExplain:
         )
         assert resp.status_code == 200
 
-    def test_explain_response_has_data_wrapper(self, client_with_snapshot, owner_cookies):
+    def test_explain_response_has_data_wrapper(
+        self, client_with_snapshot, owner_cookies
+    ):
         resp = client_with_snapshot.get(
             "/agent/explain?ticker=NVDA",
             cookies=owner_cookies,
@@ -112,7 +119,9 @@ class TestAgentExplain:
         assert "data" in body
         assert body["success"] is True
 
-    def test_explain_data_has_required_fields(self, client_with_snapshot, owner_cookies):
+    def test_explain_data_has_required_fields(
+        self, client_with_snapshot, owner_cookies
+    ):
         resp = client_with_snapshot.get(
             "/agent/explain?ticker=NVDA",
             cookies=owner_cookies,
@@ -132,7 +141,9 @@ class TestAgentExplain:
         data = resp.json()["data"]
         assert data["signal"] in ("LONG", "SHORT", "NEUTRAL")
 
-    def test_explain_no_agents_sub_object_on_signals(self, client_with_snapshot, owner_cookies):
+    def test_explain_no_agents_sub_object_on_signals(
+        self, client_with_snapshot, owner_cookies
+    ):
         resp = client_with_snapshot.get(
             "/agent/explain?ticker=NVDA",
             cookies=owner_cookies,
@@ -140,14 +151,18 @@ class TestAgentExplain:
         data = resp.json()["data"]
         assert "agents" not in data
 
-    def test_explain_unknown_ticker_returns_404(self, client_with_snapshot, owner_cookies):
+    def test_explain_unknown_ticker_returns_404(
+        self, client_with_snapshot, owner_cookies
+    ):
         resp = client_with_snapshot.get(
             "/agent/explain?ticker=FAKEXYZ",
             cookies=owner_cookies,
         )
         assert resp.status_code == 404
 
-    def test_explain_missing_ticker_returns_400(self, client_with_snapshot, owner_cookies):
+    def test_explain_missing_ticker_returns_400(
+        self, client_with_snapshot, owner_cookies
+    ):
         resp = client_with_snapshot.get(
             "/agent/explain",
             cookies=owner_cookies,

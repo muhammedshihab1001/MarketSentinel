@@ -50,9 +50,7 @@ class TechnicalIndicators:
         df.columns = [c.lower() for c in df.columns]
 
         if "close" not in df.columns:
-            raise RuntimeError(
-                "TechnicalIndicators requires 'close' column."
-            )
+            raise RuntimeError("TechnicalIndicators requires 'close' column.")
 
         ####################################################
         # DATE NORMALIZATION
@@ -60,11 +58,7 @@ class TechnicalIndicators:
 
         if "date" in df.columns:
 
-            df["date"] = pd.to_datetime(
-                df["date"],
-                utc=True,
-                errors="coerce"
-            )
+            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
 
             df = df.dropna(subset=["date"])
 
@@ -74,10 +68,7 @@ class TechnicalIndicators:
         # PRICE SANITIZATION
         ####################################################
 
-        close = pd.to_numeric(
-            df["close"],
-            errors="coerce"
-        )
+        close = pd.to_numeric(df["close"], errors="coerce")
 
         close.replace([np.inf, -np.inf], np.nan, inplace=True)
 
@@ -99,10 +90,7 @@ class TechnicalIndicators:
                 "Possible Yahoo anomaly. Applying spike guard."
             )
 
-            close = close.clip(
-                lower=close.quantile(0.001),
-                upper=close.quantile(0.999)
-            )
+            close = close.clip(lower=close.quantile(0.001), upper=close.quantile(0.999))
 
         df["close"] = close.astype("float32")
 
@@ -113,22 +101,14 @@ class TechnicalIndicators:
     ####################################################
 
     @classmethod
-    def moving_average(
-        cls,
-        df: pd.DataFrame,
-        window: int = 20,
-        normalize: bool = True
-    ):
+    def moving_average(cls, df: pd.DataFrame, window: int = 20, normalize: bool = True):
 
         cls._validate_window(window)
 
         if normalize:
             df = cls._normalize_columns(df)
 
-        ma = df["close"].rolling(
-            window=window,
-            min_periods=window
-        ).mean()
+        ma = df["close"].rolling(window=window, min_periods=window).mean()
 
         return ma.astype("float32")
 
@@ -137,22 +117,14 @@ class TechnicalIndicators:
     ####################################################
 
     @classmethod
-    def ema(
-        cls,
-        df: pd.DataFrame,
-        span: int = 20,
-        normalize: bool = True
-    ):
+    def ema(cls, df: pd.DataFrame, span: int = 20, normalize: bool = True):
 
         cls._validate_window(span)
 
         if normalize:
             df = cls._normalize_columns(df)
 
-        ema = df["close"].ewm(
-            span=span,
-            adjust=False
-        ).mean()
+        ema = df["close"].ewm(span=span, adjust=False).mean()
 
         return ema.astype("float32")
 
@@ -166,7 +138,7 @@ class TechnicalIndicators:
         df: pd.DataFrame,
         window: int = None,
         period: int = None,
-        normalize: bool = True
+        normalize: bool = True,
     ):
         """
         RSI indicator.
@@ -191,9 +163,7 @@ class TechnicalIndicators:
 
         if len(close) < window:
             return pd.Series(
-                np.full(len(close), 50.0),
-                index=close.index,
-                dtype="float32"
+                np.full(len(close), 50.0), index=close.index, dtype="float32"
             )
 
         delta = close.diff()
@@ -201,17 +171,9 @@ class TechnicalIndicators:
         gain = delta.clip(lower=0)
         loss = -delta.clip(upper=0)
 
-        avg_gain = gain.ewm(
-            alpha=1 / window,
-            adjust=False,
-            min_periods=window
-        ).mean()
+        avg_gain = gain.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
 
-        avg_loss = loss.ewm(
-            alpha=1 / window,
-            adjust=False,
-            min_periods=window
-        ).mean()
+        avg_loss = loss.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
 
         rs = avg_gain / (avg_loss + cls.EPSILON)
 
@@ -227,10 +189,7 @@ class TechnicalIndicators:
 
     @classmethod
     def bollinger_bands(
-        cls,
-        df: pd.DataFrame,
-        window: int = 20,
-        normalize: bool = True
+        cls, df: pd.DataFrame, window: int = 20, normalize: bool = True
     ):
 
         cls._validate_window(window)
@@ -240,36 +199,23 @@ class TechnicalIndicators:
 
         close = df["close"]
 
-        ma = close.rolling(
-            window=window,
-            min_periods=window
-        ).mean()
+        ma = close.rolling(window=window, min_periods=window).mean()
 
-        std = close.rolling(
-            window=window,
-            min_periods=window
-        ).std(ddof=0)
+        std = close.rolling(window=window, min_periods=window).std(ddof=0)
 
         std = std.clip(lower=cls.STD_FLOOR)
 
         upper = ma + 2 * std
         lower = ma - 2 * std
 
-        return (
-            upper.astype("float32"),
-            lower.astype("float32")
-        )
+        return (upper.astype("float32"), lower.astype("float32"))
 
     ####################################################
     # MACD
     ####################################################
 
     @classmethod
-    def macd(
-        cls,
-        df: pd.DataFrame,
-        normalize: bool = True
-    ):
+    def macd(cls, df: pd.DataFrame, normalize: bool = True):
 
         if normalize:
             df = cls._normalize_columns(df)
@@ -289,7 +235,4 @@ class TechnicalIndicators:
         macd_line = macd_line.clip(-500, 500)
         signal = signal.clip(-500, 500)
 
-        return (
-            macd_line.astype("float32"),
-            signal.astype("float32")
-        )
+        return (macd_line.astype("float32"), signal.astype("float32"))

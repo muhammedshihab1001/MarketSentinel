@@ -52,8 +52,8 @@ INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
 
 _VOL_DISPLAY: Dict[str, str] = {
     "high_volatility": "high",
-    "low_volatility":  "low",
-    "normal":          "normal",
+    "low_volatility": "low",
+    "normal": "normal",
 }
 
 
@@ -83,11 +83,13 @@ class InferencePipeline:
             return self._model
         try:
             from app.api.routes.predict import _model_loader
+
             if _model_loader is not None:
                 return _model_loader
         except ImportError:
             pass
         from app.inference.model_loader import get_model_loader
+
         return get_model_loader()
 
     # =====================================================
@@ -98,6 +100,7 @@ class InferencePipeline:
     def signal_agent(self):
         if self._signal_agent is None:
             from core.agent.signal_agent import SignalAgent
+
             self._signal_agent = SignalAgent()
         return self._signal_agent
 
@@ -105,6 +108,7 @@ class InferencePipeline:
     def technical_agent(self):
         if self._technical_agent is None:
             from core.agent.technical_risk_agent import TechnicalRiskAgent
+
             self._technical_agent = TechnicalRiskAgent()
         return self._technical_agent
 
@@ -112,6 +116,7 @@ class InferencePipeline:
     def portfolio_agent(self):
         if self._portfolio_agent is None:
             from core.agent.portfolio_decision_agent import PortfolioDecisionAgent
+
             self._portfolio_agent = PortfolioDecisionAgent()
         return self._portfolio_agent
 
@@ -119,6 +124,7 @@ class InferencePipeline:
     def political_agent(self):
         if self._political_agent is None:
             from core.agent.political_risk_agent import PoliticalRiskAgent
+
             self._political_agent = PoliticalRiskAgent()
         return self._political_agent
 
@@ -164,7 +170,8 @@ class InferencePipeline:
                 if errors:
                     logger.warning(
                         "Price fetch errors for %d tickers: %s",
-                        len(errors), list(errors)[:5],
+                        len(errors),
+                        list(errors)[:5],
                     )
             else:
                 price_data = price_result
@@ -213,8 +220,7 @@ class InferencePipeline:
         dataset = dataset.dropna(subset=["date"])
 
         latest = (
-            dataset
-            .sort_values("date")
+            dataset.sort_values("date")
             .groupby("ticker", sort=False)
             .tail(1)
             .reset_index(drop=True)
@@ -222,7 +228,9 @@ class InferencePipeline:
 
         logger.info(
             "Latest-per-ticker filter | input_rows=%d output_rows=%d tickers=%d",
-            len(dataset), len(latest), latest["ticker"].nunique(),
+            len(dataset),
+            len(latest),
+            latest["ticker"].nunique(),
         )
 
         return latest
@@ -266,7 +274,11 @@ class InferencePipeline:
             signal_direction = (
                 signal_out.get("signals", {}).get("signal")
                 or signal_out.get("signal")
-                or ("LONG" if weight > 0.01 else ("SHORT" if weight < -0.01 else "NEUTRAL"))
+                or (
+                    "LONG"
+                    if weight > 0.01
+                    else ("SHORT" if weight < -0.01 else "NEUTRAL")
+                )
             )
             confidence = float(signal_out.get("confidence_numeric", 0.0))
             risk_level = signal_out.get("risk_level", "unknown")
@@ -313,9 +325,7 @@ class InferencePipeline:
             if political_approved:
                 agents_approved.append("PoliticalRiskAgent")
             else:
-                agents_flagged.append(
-                    f"PoliticalRiskAgent (label={political_label})"
-                )
+                agents_flagged.append(f"PoliticalRiskAgent (label={political_label})")
 
             # ── Natural language selection reason ─────────────
             # FIX v5.9.1: _vol_label() strips "_volatility" suffix
@@ -363,39 +373,39 @@ class InferencePipeline:
 
             if signal_warnings or technical_warnings:
                 all_warnings = list(set(signal_warnings + technical_warnings))
-                reason_parts.append(
-                    f"Active warnings: {', '.join(all_warnings[:3])}."
-                )
+                reason_parts.append(f"Active warnings: {', '.join(all_warnings[:3])}.")
 
             reason_parts.append(
                 f"Portfolio weight assigned: {weight:.4f} "
                 f"({abs(weight) * 100:.2f}% of portfolio)."
             )
 
-            rationale_list.append({
-                "rank": rank,
-                "ticker": ticker,
-                "signal": signal_direction,
-                "hybrid_score": round(hybrid_score, 6),
-                "raw_model_score": round(raw_score, 6),
-                "weight": round(weight, 6),
-                "confidence": round(confidence, 4),
-                "risk_level": risk_level,
-                "governance_score": governance_score,
-                "volatility_regime": volatility_regime,
-                "technical_bias": technical_bias,
-                "drift_context": drift_state,
-                "political_context": political_label,
-                "agent_scores": {
-                    "signal_agent": round(signal_agent_score, 4),
-                    "technical_agent": round(technical_agent_score, 4),
-                    "raw_model": round(raw_score, 4),
-                },
-                "agents_approved": agents_approved,
-                "agents_flagged": agents_flagged,
-                "warnings": list(set(signal_warnings + technical_warnings)),
-                "selection_reason": " ".join(reason_parts),
-            })
+            rationale_list.append(
+                {
+                    "rank": rank,
+                    "ticker": ticker,
+                    "signal": signal_direction,
+                    "hybrid_score": round(hybrid_score, 6),
+                    "raw_model_score": round(raw_score, 6),
+                    "weight": round(weight, 6),
+                    "confidence": round(confidence, 4),
+                    "risk_level": risk_level,
+                    "governance_score": governance_score,
+                    "volatility_regime": volatility_regime,
+                    "technical_bias": technical_bias,
+                    "drift_context": drift_state,
+                    "political_context": political_label,
+                    "agent_scores": {
+                        "signal_agent": round(signal_agent_score, 4),
+                        "technical_agent": round(technical_agent_score, 4),
+                        "raw_model": round(raw_score, 4),
+                    },
+                    "agents_approved": agents_approved,
+                    "agents_flagged": agents_flagged,
+                    "warnings": list(set(signal_warnings + technical_warnings)),
+                    "selection_reason": " ".join(reason_parts),
+                }
+            )
 
         return rationale_list
 
@@ -446,7 +456,8 @@ class InferencePipeline:
             if len(available_features) < len(MODEL_FEATURES) * 0.8:
                 logger.warning(
                     "Only %d/%d features available",
-                    len(available_features), len(MODEL_FEATURES),
+                    len(available_features),
+                    len(MODEL_FEATURES),
                 )
             feature_block = validate_feature_schema(
                 dataset.reindex(columns=MODEL_FEATURES, fill_value=0.0),
@@ -471,6 +482,7 @@ class InferencePipeline:
         drift_result = {}
         try:
             from core.monitoring.drift_detector import DriftDetector
+
             detector = DriftDetector()
             drift_result = detector.detect(dataset)
             drift_state = drift_result.get("drift_state", "none")
@@ -519,10 +531,13 @@ class InferencePipeline:
             signal_score = float(signal_output.get("score", 0.0))
             technical_score = float(technical_output.get("score", 0.0))
 
-            hybrid_score = float(np.clip(
-                0.50 * raw_score + 0.30 * signal_score + 0.20 * technical_score,
-                -1.0, 1.0,
-            ))
+            hybrid_score = float(
+                np.clip(
+                    0.50 * raw_score + 0.30 * signal_score + 0.20 * technical_score,
+                    -1.0,
+                    1.0,
+                )
+            )
 
             if political_label == "CRITICAL":
                 hybrid_score = 0.0
@@ -531,17 +546,19 @@ class InferencePipeline:
 
             weight = float(np.clip(hybrid_score * exposure_scale, -1.0, 1.0))
 
-            snapshot_rows.append({
-                "ticker": ticker,
-                "date": str(row.get("date", snapshot_date))[:10],
-                "raw_model_score": round(raw_score, 6),
-                "hybrid_consensus_score": round(hybrid_score, 6),
-                "weight": round(weight, 6),
-                "agents": {
-                    "signal_agent": signal_output,
-                    "technical_agent": technical_output,
-                },
-            })
+            snapshot_rows.append(
+                {
+                    "ticker": ticker,
+                    "date": str(row.get("date", snapshot_date))[:10],
+                    "raw_model_score": round(raw_score, 6),
+                    "hybrid_consensus_score": round(hybrid_score, 6),
+                    "weight": round(weight, 6),
+                    "agents": {
+                        "signal_agent": signal_output,
+                        "technical_agent": technical_output,
+                    },
+                }
+            )
 
         if not snapshot_rows:
             return self._error_snapshot("No valid signals produced")
@@ -569,7 +586,9 @@ class InferencePipeline:
             portfolio_bias = "BALANCED"
 
         top_5 = snapshot_rows[:TOP_K]
-        avg_hybrid = float(np.mean([r["hybrid_consensus_score"] for r in snapshot_rows]))
+        avg_hybrid = float(
+            np.mean([r["hybrid_consensus_score"] for r in snapshot_rows])
+        )
 
         # ── Portfolio agent ───────────────────────────
         portfolio_output = {}
@@ -644,6 +663,7 @@ class InferencePipeline:
         if store_preds:
             try:
                 from core.db.repository import PredictionRepository
+
                 model_ver = getattr(loader, "version", "unknown")
                 pred_records = [
                     {
@@ -654,9 +674,9 @@ class InferencePipeline:
                         "hybrid_score": r["hybrid_consensus_score"],
                         "weight": r["weight"],
                         "signal": (
-                            "LONG" if r["weight"] > 0.01
-                            else "SHORT" if r["weight"] < -0.01
-                            else "NEUTRAL"
+                            "LONG"
+                            if r["weight"] > 0.01
+                            else "SHORT" if r["weight"] < -0.01 else "NEUTRAL"
                         ),
                         "drift_state": drift_state,
                     }
@@ -665,14 +685,18 @@ class InferencePipeline:
                 PredictionRepository.store_predictions(pred_records)
                 logger.info(
                     "Predictions stored | date=%s | count=%d",
-                    snapshot_date, len(pred_records),
+                    snapshot_date,
+                    len(pred_records),
                 )
             except Exception as e:
                 logger.warning("Prediction storage failed (non-blocking): %s", e)
 
         logger.info(
             "Snapshot complete | tickers=%d | long=%d | short=%d | latency=%.0fms",
-            len(snapshot_rows), lc, sc, latency_ms,
+            len(snapshot_rows),
+            lc,
+            sc,
+            latency_ms,
         )
 
         return result

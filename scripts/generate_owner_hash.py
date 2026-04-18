@@ -75,7 +75,7 @@ def main():
     print("  Add these to your .env file:")
     print("=" * 52)
     print(f"\nOWNER_USERNAME={username}")
-    print(f'OWNER_PASSWORD_HASH="{hashed}"')   # quoted — prevents Docker $ mangling
+    print(f'OWNER_PASSWORD_HASH="{hashed}"')  # quoted — prevents Docker $ mangling
     print(f'JWT_SECRET="{jwt_secret}"')
     print("DEMO_REQUESTS_PER_FEATURE=10")
     print("DEMO_BLOCK_DAYS=7")

@@ -141,9 +141,8 @@ class MarketProviderRouter:
 
     def _repair_ohlc(self, df: pd.DataFrame) -> pd.DataFrame:
 
-        before = (
-            (df["high"] < df[["open", "close"]].max(axis=1))
-            | (df["low"] > df[["open", "close"]].min(axis=1))
+        before = (df["high"] < df[["open", "close"]].max(axis=1)) | (
+            df["low"] > df[["open", "close"]].min(axis=1)
         )
 
         violations = before.sum()
@@ -155,9 +154,7 @@ class MarketProviderRouter:
 
         if ratio > self.MAX_OHLC_VIOLATION_RATIO:
 
-            raise RuntimeError(
-                f"OHLC invariant violated in {violations} bars"
-            )
+            raise RuntimeError(f"OHLC invariant violated in {violations} bars")
 
         logger.warning(
             "Repairing %d OHLC bars (%.1f%% of dataset)",
@@ -170,7 +167,9 @@ class MarketProviderRouter:
 
         return df
 
-    def _validate_response(self, df: pd.DataFrame, ticker: str, min_rows: int) -> pd.DataFrame:
+    def _validate_response(
+        self, df: pd.DataFrame, ticker: str, min_rows: int
+    ) -> pd.DataFrame:
 
         if df is None:
             raise RuntimeError(f"Provider returned None for {ticker}")
@@ -251,9 +250,7 @@ class MarketProviderRouter:
 
             n = stats["success"]
 
-            stats["avg_latency"] = (
-                (stats["avg_latency"] * (n - 1) + latency) / n
-            )
+            stats["avg_latency"] = (stats["avg_latency"] * (n - 1) + latency) / n
 
         logger.info(
             "Market data served → provider=%s ticker=%s rows=%d latency=%.2fs",

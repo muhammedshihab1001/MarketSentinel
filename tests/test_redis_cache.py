@@ -22,10 +22,10 @@ from app.inference.cache import (
     _MEMORY_LOCK,
 )
 
-
 # =====================================================
 # HELPERS
 # =====================================================
+
 
 def _clear_memory_cache():
     """Clear memory fallback between tests."""
@@ -49,6 +49,7 @@ def _make_cache_with_mock_redis():
 # =====================================================
 # CONNECTION + PING
 # =====================================================
+
 
 class TestConnection:
 
@@ -96,6 +97,7 @@ class TestConnection:
 # KEY BUILDER
 # =====================================================
 
+
 class TestKeyBuilder:
 
     def test_build_key_returns_string(self):
@@ -136,6 +138,7 @@ class TestKeyBuilder:
 # =====================================================
 # SET + GET
 # =====================================================
+
 
 class TestSetGet:
 
@@ -205,12 +208,13 @@ class TestSetGet:
         mock_redis.setex.assert_called_once()
         # TTL arg is second positional arg to setex(key, ttl, value)
         call_args = mock_redis.setex.call_args[0]
-        assert call_args[1] > 0   # TTL must be positive
+        assert call_args[1] > 0  # TTL must be positive
 
 
 # =====================================================
 # MEMORY FALLBACK
 # =====================================================
+
 
 class TestMemoryFallback:
 
@@ -250,6 +254,7 @@ class TestMemoryFallback:
     def test_memory_fallback_evicts_when_full(self):
         """Memory cache must not grow beyond _MEMORY_MAX_ITEMS."""
         from app.inference.cache import _MEMORY_MAX_ITEMS
+
         cache = RedisCache.__new__(RedisCache)
         cache._client = None
         cache._connected = False
@@ -265,6 +270,7 @@ class TestMemoryFallback:
 # =====================================================
 # BACKGROUND SNAPSHOT
 # =====================================================
+
 
 class TestBackgroundSnapshot:
 
@@ -327,6 +333,7 @@ class TestBackgroundSnapshot:
 # DELETE
 # =====================================================
 
+
 class TestDelete:
 
     def test_delete_returns_true(self):
@@ -344,6 +351,7 @@ class TestDelete:
 # =====================================================
 # ATOMIC OPS (for DemoTracker)
 # =====================================================
+
 
 class TestAtomicOps:
 

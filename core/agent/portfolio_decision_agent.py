@@ -19,7 +19,6 @@ import numpy as np
 
 from core.agent.base_agent import BaseAgent
 
-
 # ============================================================
 # SECTOR MAP  (item 59)
 # GICS sector assignments for all 100 universe v7.0 tickers.
@@ -28,65 +27,116 @@ from core.agent.base_agent import BaseAgent
 
 TICKER_SECTOR_MAP: Dict[str, str] = {
     # Technology
-    "AAPL": "Technology", "MSFT": "Technology", "NVDA": "Technology",
-    "AMD":  "Technology", "AVGO": "Technology", "ORCL": "Technology",
-    "CRM":  "Technology", "INTC": "Technology", "QCOM": "Technology",
-    "TXN":  "Technology", "MU":   "Technology", "AMAT": "Technology",
-    "LRCX": "Technology", "ADI":  "Technology", "KLAC": "Technology",
-    "NOW":  "Technology", "ADBE": "Technology", "INTU": "Technology",
+    "AAPL": "Technology",
+    "MSFT": "Technology",
+    "NVDA": "Technology",
+    "AMD": "Technology",
+    "AVGO": "Technology",
+    "ORCL": "Technology",
+    "CRM": "Technology",
+    "INTC": "Technology",
+    "QCOM": "Technology",
+    "TXN": "Technology",
+    "MU": "Technology",
+    "AMAT": "Technology",
+    "LRCX": "Technology",
+    "ADI": "Technology",
+    "KLAC": "Technology",
+    "NOW": "Technology",
+    "ADBE": "Technology",
+    "INTU": "Technology",
     "CDNS": "Technology",
-
     # Communication Services
-    "GOOGL": "Communication", "META": "Communication",
-    "NFLX":  "Communication", "DIS":  "Communication",
-    "CMCSA": "Communication", "T":    "Communication",
-    "VZ":    "Communication", "TMUS": "Communication",
-    "AMZN":  "Communication",  # AWS + Prime (mixed but classified Comm)
-
+    "GOOGL": "Communication",
+    "META": "Communication",
+    "NFLX": "Communication",
+    "DIS": "Communication",
+    "CMCSA": "Communication",
+    "T": "Communication",
+    "VZ": "Communication",
+    "TMUS": "Communication",
+    "AMZN": "Communication",  # AWS + Prime (mixed but classified Comm)
     # Financials
-    "JPM":  "Financials", "BAC":  "Financials", "GS":   "Financials",
-    "SPGI": "Financials", "V":    "Financials", "MA":   "Financials",
-    "MS":   "Financials", "WFC":  "Financials", "BLK":  "Financials",
-    "AXP":  "Financials", "CB":   "Financials", "ICE":  "Financials",
-    "CME":  "Financials", "AON":  "Financials", "TRV":  "Financials",
-    "PGR":  "Financials", "MCO":  "Financials", "MSCI": "Financials",
-
+    "JPM": "Financials",
+    "BAC": "Financials",
+    "GS": "Financials",
+    "SPGI": "Financials",
+    "V": "Financials",
+    "MA": "Financials",
+    "MS": "Financials",
+    "WFC": "Financials",
+    "BLK": "Financials",
+    "AXP": "Financials",
+    "CB": "Financials",
+    "ICE": "Financials",
+    "CME": "Financials",
+    "AON": "Financials",
+    "TRV": "Financials",
+    "PGR": "Financials",
+    "MCO": "Financials",
+    "MSCI": "Financials",
     # Health Care
-    "UNH":  "Healthcare", "JNJ":  "Healthcare", "LLY":  "Healthcare",
-    "ABBV": "Healthcare", "MRK":  "Healthcare", "TMO":  "Healthcare",
-    "ABT":  "Healthcare", "DHR":  "Healthcare", "MDT":  "Healthcare",
-    "SYK":  "Healthcare", "EW":   "Healthcare", "ISRG": "Healthcare",
-    "BMY":  "Healthcare", "AMGN": "Healthcare",
-
+    "UNH": "Healthcare",
+    "JNJ": "Healthcare",
+    "LLY": "Healthcare",
+    "ABBV": "Healthcare",
+    "MRK": "Healthcare",
+    "TMO": "Healthcare",
+    "ABT": "Healthcare",
+    "DHR": "Healthcare",
+    "MDT": "Healthcare",
+    "SYK": "Healthcare",
+    "EW": "Healthcare",
+    "ISRG": "Healthcare",
+    "BMY": "Healthcare",
+    "AMGN": "Healthcare",
     # Consumer Discretionary
-    "HD":   "Consumer Disc", "COST": "Consumer Disc", "WMT": "Consumer Disc",
-    "MCD":  "Consumer Disc", "SBUX": "Consumer Disc", "NKE": "Consumer Disc",
-    "LOW":  "Consumer Disc", "TGT":  "Consumer Disc",
-
+    "HD": "Consumer Disc",
+    "COST": "Consumer Disc",
+    "WMT": "Consumer Disc",
+    "MCD": "Consumer Disc",
+    "SBUX": "Consumer Disc",
+    "NKE": "Consumer Disc",
+    "LOW": "Consumer Disc",
+    "TGT": "Consumer Disc",
     # Consumer Staples
-    "PG":  "Consumer Staples", "KO":  "Consumer Staples",
-    "PEP": "Consumer Staples", "CL":  "Consumer Staples",
-    "PM":  "Consumer Staples",
-
+    "PG": "Consumer Staples",
+    "KO": "Consumer Staples",
+    "PEP": "Consumer Staples",
+    "CL": "Consumer Staples",
+    "PM": "Consumer Staples",
     # Energy
-    "XOM": "Energy", "CVX":  "Energy", "SLB": "Energy",
-    "EOG": "Energy", "OXY":  "Energy", "MPC": "Energy",
-    "PSX": "Energy", "VLO":  "Energy",
-
+    "XOM": "Energy",
+    "CVX": "Energy",
+    "SLB": "Energy",
+    "EOG": "Energy",
+    "OXY": "Energy",
+    "MPC": "Energy",
+    "PSX": "Energy",
+    "VLO": "Energy",
     # Industrials
-    "CAT": "Industrials", "RTX":  "Industrials", "HON": "Industrials",
-    "UPS": "Industrials", "DE":   "Industrials", "GE":  "Industrials",
-    "LMT": "Industrials", "NOC":  "Industrials", "EMR": "Industrials",
+    "CAT": "Industrials",
+    "RTX": "Industrials",
+    "HON": "Industrials",
+    "UPS": "Industrials",
+    "DE": "Industrials",
+    "GE": "Industrials",
+    "LMT": "Industrials",
+    "NOC": "Industrials",
+    "EMR": "Industrials",
     "ITW": "Industrials",
-
     # Materials
-    "LIN": "Materials", "APD": "Materials", "ECL": "Materials",
-
+    "LIN": "Materials",
+    "APD": "Materials",
+    "ECL": "Materials",
     # Real Estate
-    "AMT": "Real Estate", "PLD": "Real Estate",
-
+    "AMT": "Real Estate",
+    "PLD": "Real Estate",
     # Utilities
-    "NEE": "Utilities", "SO": "Utilities", "DUK": "Utilities", "AEP": "Utilities",
+    "NEE": "Utilities",
+    "SO": "Utilities",
+    "DUK": "Utilities",
+    "AEP": "Utilities",
 }
 
 
@@ -172,6 +222,7 @@ class PortfolioDecisionAgent(BaseAgent):
 
         if skipped:
             import logging
+
             logging.getLogger(__name__).info(
                 "Sector neutralisation skipped %d tickers: %s",
                 len(skipped),
@@ -207,9 +258,7 @@ class PortfolioDecisionAgent(BaseAgent):
         )
 
         # FIX (item 59): Apply sector neutralisation before taking top-K
-        top_k = self._sector_neutral_select(
-            ranked, self.TOP_K, self.MAX_PER_SECTOR
-        )
+        top_k = self._sector_neutral_select(ranked, self.TOP_K, self.MAX_PER_SECTOR)
 
         # Build detailed selection
         detailed_selection = []
@@ -266,20 +315,24 @@ class PortfolioDecisionAgent(BaseAgent):
                 f"Confidence: {confidence:.2f}. Risk level: {risk_level}."
             )
 
-            detailed_selection.append({
-                "ticker": ticker,
-                "sector": sector,
-                "weight": round(weight, 6),
-                "direction": direction,
-                "hybrid_score": round(hybrid_score, 4),
-                "model_score": round(self._safe_float(stock.get("raw_model_score")), 4),
-                "confidence": round(confidence, 4),
-                "risk_level": risk_level,
-                "volatility_regime": signal_agent.get("volatility_regime"),
-                "technical_bias": tech_agent.get("bias"),
-                "warnings": combined_warnings,
-                "explanation": explanation,
-            })
+            detailed_selection.append(
+                {
+                    "ticker": ticker,
+                    "sector": sector,
+                    "weight": round(weight, 6),
+                    "direction": direction,
+                    "hybrid_score": round(hybrid_score, 4),
+                    "model_score": round(
+                        self._safe_float(stock.get("raw_model_score")), 4
+                    ),
+                    "confidence": round(confidence, 4),
+                    "risk_level": risk_level,
+                    "volatility_regime": signal_agent.get("volatility_regime"),
+                    "technical_bias": tech_agent.get("bias"),
+                    "warnings": combined_warnings,
+                    "explanation": explanation,
+                }
+            )
 
         # Portfolio metrics
         avg_confidence = float(np.mean(confidence_values)) if confidence_values else 0
@@ -290,25 +343,19 @@ class PortfolioDecisionAgent(BaseAgent):
         net_exposure = self._safe_float(snapshot.get("net_exposure"), 0)
 
         portfolio_bias = (
-            "long_bias" if net_exposure > 0.05
-            else "short_bias" if net_exposure < -0.05
-            else "market_neutral"
+            "long_bias"
+            if net_exposure > 0.05
+            else "short_bias" if net_exposure < -0.05 else "market_neutral"
         )
 
         max_weight = max(weights) if weights else 0
         concentration_risk = (
-            "high" if max_weight > 0.18
-            else "moderate" if max_weight > 0.12
-            else "low"
+            "high" if max_weight > 0.18 else "moderate" if max_weight > 0.12 else "low"
         )
 
         drift_state = drift_info.get("drift_state", "unknown")
         severity = self._safe_float(drift_info.get("severity_score"), 0)
-        drift_risk = (
-            "high" if severity > 7
-            else "moderate" if severity > 3
-            else "low"
-        )
+        drift_risk = "high" if severity > 7 else "moderate" if severity > 3 else "low"
 
         findings = {
             "average_confidence": round(avg_confidence, 4),

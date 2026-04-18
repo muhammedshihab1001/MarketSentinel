@@ -50,6 +50,7 @@ TRACKED_FEATURES = [
 # REQUEST BODY MODELS
 # =========================================================
 
+
 class OwnerLoginRequest(BaseModel):
     username: str = Field(
         ...,
@@ -76,6 +77,7 @@ class DemoLoginRequest(BaseModel):
     No body fields required. Fingerprint is derived from IP + User-Agent.
     Submit an empty JSON body {} or leave body empty.
     """
+
     class Config:
         json_schema_extra = {"example": {}}
 
@@ -83,6 +85,7 @@ class DemoLoginRequest(BaseModel):
 # =========================================================
 # HELPERS
 # =========================================================
+
 
 def _get_client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for")
@@ -104,6 +107,7 @@ def _get_tracker(request: Request) -> DemoTracker:
 # =========================================================
 # POST /auth/owner-login
 # =========================================================
+
 
 @router.post(
     "/auth/owner-login",
@@ -141,12 +145,14 @@ async def owner_login(body: OwnerLoginRequest, request: Request):
 
     token = create_owner_token(username)
 
-    resp = JSONResponse(content={
-        "authenticated": True,
-        "role": "owner",
-        "username": username,
-        "message": "Authentication successful.",
-    })
+    resp = JSONResponse(
+        content={
+            "authenticated": True,
+            "role": "owner",
+            "username": username,
+            "message": "Authentication successful.",
+        }
+    )
 
     resp.set_cookie(
         key="ms_token",
@@ -165,6 +171,7 @@ async def owner_login(body: OwnerLoginRequest, request: Request):
 # =========================================================
 # POST /auth/demo-login
 # =========================================================
+
 
 @router.post(
     "/auth/demo-login",
@@ -196,11 +203,13 @@ async def demo_login(request: Request, body: DemoLoginRequest = None):
     token = create_demo_token(fingerprint)
     summary = tracker.get_usage_summary(fingerprint, TRACKED_FEATURES)
 
-    resp = JSONResponse(content={
-        "authenticated": True,
-        "role": "demo",
-        "usage": summary,
-    })
+    resp = JSONResponse(
+        content={
+            "authenticated": True,
+            "role": "demo",
+            "usage": summary,
+        }
+    )
 
     resp.set_cookie(
         key="ms_token",
@@ -219,6 +228,7 @@ async def demo_login(request: Request, body: DemoLoginRequest = None):
 # =========================================================
 # GET /auth/me
 # =========================================================
+
 
 @router.get(
     "/auth/me",
@@ -246,23 +256,27 @@ async def get_me(request: Request):
     username = payload.get("sub")
 
     if role == "owner":
-        return JSONResponse(content={
-            "authenticated": True,
-            "role": "owner",
-            "username": username,
-            "usage": None,
-        })
+        return JSONResponse(
+            content={
+                "authenticated": True,
+                "role": "owner",
+                "username": username,
+                "usage": None,
+            }
+        )
 
     if role == "demo":
         fingerprint = payload.get("fingerprint") or username
         tracker = _get_tracker(request)
         summary = tracker.get_usage_summary(fingerprint, TRACKED_FEATURES)
-        return JSONResponse(content={
-            "authenticated": True,
-            "role": "demo",
-            "username": None,
-            "usage": summary,
-        })
+        return JSONResponse(
+            content={
+                "authenticated": True,
+                "role": "demo",
+                "username": None,
+                "usage": summary,
+            }
+        )
 
     return JSONResponse(content={"authenticated": False, "role": None})
 
@@ -270,6 +284,7 @@ async def get_me(request: Request):
 # =========================================================
 # POST /auth/logout
 # =========================================================
+
 
 @router.post(
     "/auth/logout",

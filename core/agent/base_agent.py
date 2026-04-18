@@ -35,9 +35,9 @@ class BaseAgent(ABC):
         - Is safe to call with partial or noisy data
     """
 
-    name:        str   = "BaseAgent"
-    weight:      float = 1.0    # contribution weight in hybrid consensus scoring
-    description: str   = ""     # human-readable summary for dashboards
+    name: str = "BaseAgent"
+    weight: float = 1.0  # contribution weight in hybrid consensus scoring
+    description: str = ""  # human-readable summary for dashboards
 
     # ─────────────────────────────────────────────────────
     # MAIN CONTRACT
@@ -80,11 +80,11 @@ class BaseAgent(ABC):
 
     def _format_output(
         self,
-        score:      float,
+        score: float,
         confidence: float,
-        signals:    Optional[Dict[str, Any]] = None,
-        warnings:   Optional[List[str]]      = None,
-        reasoning:  Optional[List[str]]      = None,
+        signals: Optional[Dict[str, Any]] = None,
+        warnings: Optional[List[str]] = None,
+        reasoning: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Build a standardised agent output dict.
@@ -95,24 +95,24 @@ class BaseAgent(ABC):
             - warnings are deduplicated (order preserved via dict trick)
             - reasoning order is preserved — NOT sorted (logical flow matters)
         """
-        score      = self._clip(score)
+        score = self._clip(score)
         confidence = self._clip(confidence)
 
         # Deduplicate warnings while preserving insertion order
-        raw_warnings  = warnings  or []
+        raw_warnings = warnings or []
         raw_reasoning = reasoning or []
 
-        deduped_warnings  = list(dict.fromkeys(raw_warnings))
+        deduped_warnings = list(dict.fromkeys(raw_warnings))
         deduped_reasoning = list(dict.fromkeys(raw_reasoning))
 
         return {
             "agent_name": self.name,
-            "weight":     self.weight,
-            "score":      score,
+            "weight": self.weight,
+            "score": score,
             "confidence": confidence,
-            "signals":    signals or {},
-            "warnings":   deduped_warnings,
-            "reasoning":  deduped_reasoning,
+            "signals": signals or {},
+            "warnings": deduped_warnings,
+            "reasoning": deduped_reasoning,
         }
 
     # ─────────────────────────────────────────────────────
@@ -155,8 +155,8 @@ class BaseAgent(ABC):
         Used by monitoring dashboards and the /agent/info endpoint.
         """
         return {
-            "agent_name":  self.name,
-            "weight":      self.weight,
+            "agent_name": self.name,
+            "weight": self.weight,
             "description": self.description,
         }
 

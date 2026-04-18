@@ -4,10 +4,10 @@ import pytest
 from core.artifacts.metadata_manager import MetadataManager
 from core.schema.feature_schema import MODEL_FEATURES
 
-
 ############################################################
 # VALID METADATA BUILDER
 ############################################################
+
 
 def _build_valid_metadata():
     """Build valid metadata using create_metadata().
@@ -29,13 +29,14 @@ def _build_valid_metadata():
         feature_checksum="dummy_checksum",
         extra_fields={
             "model_version": "test_v1",
-        }
+        },
     )
 
 
 ############################################################
 # BASIC INTEGRITY ROUNDTRIP
 ############################################################
+
 
 def test_metadata_integrity_roundtrip(tmp_path):
 
@@ -54,6 +55,7 @@ def test_metadata_integrity_roundtrip(tmp_path):
 ############################################################
 # REQUIRED FIELDS PRESENT
 ############################################################
+
 
 def test_metadata_required_fields_present():
 
@@ -79,6 +81,7 @@ def test_metadata_required_fields_present():
 # JSON SERIALIZATION SAFETY
 ############################################################
 
+
 def test_metadata_is_json_serializable():
 
     metadata = _build_valid_metadata()
@@ -91,6 +94,7 @@ def test_metadata_is_json_serializable():
 ############################################################
 # TAMPER DETECTION
 ############################################################
+
 
 def test_metadata_tamper_detection(tmp_path):
 
@@ -116,6 +120,7 @@ def test_metadata_tamper_detection(tmp_path):
 # DETERMINISTIC HASH
 ############################################################
 
+
 def test_metadata_integrity_hash_deterministic():
 
     m1 = _build_valid_metadata()
@@ -127,6 +132,7 @@ def test_metadata_integrity_hash_deterministic():
 ############################################################
 # HASH EXISTS AND LOOKS VALID
 ############################################################
+
 
 def test_metadata_hash_format():
 

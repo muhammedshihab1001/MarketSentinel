@@ -50,8 +50,11 @@ def _get_llm_explainer():
     global _llm_explainer_instance
     if _llm_explainer_instance is None:
         from app.agent.llm_explainer import LLMExplainer
+
         _llm_explainer_instance = LLMExplainer()
-        logger.info("LLM singleton initialised | model=%s", _llm_explainer_instance.model_name)
+        logger.info(
+            "LLM singleton initialised | model=%s", _llm_explainer_instance.model_name
+        )
     return _llm_explainer_instance
 
 
@@ -76,12 +79,14 @@ def _get_cache(request: Request):
         return request.app.state.cache
     except AttributeError:
         from app.inference.cache import RedisCache
+
         return RedisCache()
 
 
 # =========================================================
 # LLM HELPER — always returns something, never raises
 # =========================================================
+
 
 async def _safe_llm_explain(
     signal_row: dict,
@@ -112,7 +117,7 @@ async def _safe_llm_explain(
     if not llm_enabled:
         return {
             "llm_enabled": False,
-            "message": "LLM disabled. Set LLM_ENABLED=true to enable."
+            "message": "LLM disabled. Set LLM_ENABLED=true to enable.",
         }
 
     # ── API key missing ───────────────────────────────────
@@ -121,7 +126,7 @@ async def _safe_llm_explain(
         return {
             "llm_enabled": True,
             "error": "no_api_key",
-            "message": "OPENAI_API_KEY not configured. Agent response complete."
+            "message": "OPENAI_API_KEY not configured. Agent response complete.",
         }
 
     # ── Full LLM call with isolation ──────────────────────
@@ -131,10 +136,7 @@ async def _safe_llm_explain(
 
         # FIX 1: correct attribute name (no underscore prefix)
         if not explainer.enabled:
-            return {
-                "llm_enabled": False,
-                "message": "LLM disabled by configuration."
-            }
+            return {"llm_enabled": False, "message": "LLM disabled by configuration."}
 
         # FIX 2: await directly — explain() is async, not sync
         # FIX 3: correct argument names matching llm_explainer.py signature
@@ -160,21 +162,18 @@ async def _safe_llm_explain(
                     "Resets in 60s. Agent response is complete."
                 ),
                 "llm_timeout": (
-                    "LLM response timed out. "
-                    "Agent response is complete."
+                    "LLM response timed out. " "Agent response is complete."
                 ),
                 "llm_unavailable": (
-                    "LLM service unavailable. "
-                    "Agent response is complete."
+                    "LLM service unavailable. " "Agent response is complete."
                 ),
             }
             return {
                 "llm_enabled": True,
                 "error": error_code,
                 "message": messages.get(
-                    error_code,
-                    "LLM unavailable. Agent response is complete."
-                )
+                    error_code, "LLM unavailable. Agent response is complete."
+                ),
             }
 
         return result
@@ -184,7 +183,7 @@ async def _safe_llm_explain(
         return {
             "llm_enabled": True,
             "error": "llm_timeout",
-            "message": "LLM took too long. Agent response is complete."
+            "message": "LLM took too long. Agent response is complete.",
         }
 
     except Exception as exc:
@@ -192,13 +191,14 @@ async def _safe_llm_explain(
         return {
             "llm_enabled": True,
             "error": "llm_error",
-            "message": "LLM unavailable. Agent response is complete."
+            "message": "LLM unavailable. Agent response is complete.",
         }
 
 
 # =========================================================
 # GET /agent/explain?ticker=X
 # =========================================================
+
 
 @router.get(
     "/explain",
@@ -278,43 +278,42 @@ async def explain_signal(
         agents = signal_details.get(ticker, {})
 
         signal_agent_output = agents.get("signal_agent", {})
-        technical_output    = agents.get("technical_agent", {})
+        technical_output = agents.get("technical_agent", {})
 
-        raw_score    = float(signal_row.get("raw_model_score", 0.0))
+        raw_score = float(signal_row.get("raw_model_score", 0.0))
         hybrid_score = float(signal_row.get("hybrid_consensus_score", 0.0))
-        weight       = float(signal_row.get("weight", 0.0))
+        weight = float(signal_row.get("weight", 0.0))
 
-        signal_direction = (
-            signal_agent_output.get("signals", {}).get("signal")
-            or _derive_signal(weight)
-        )
+        signal_direction = signal_agent_output.get("signals", {}).get(
+            "signal"
+        ) or _derive_signal(weight)
 
         # FIX 6: Try confidence_numeric first, fall back to confidence
         # Signal agent may store under either key depending on version
-        raw_confidence = (
-            signal_agent_output.get("confidence_numeric")
-            or signal_agent_output.get("confidence")
+        raw_confidence = signal_agent_output.get(
+            "confidence_numeric"
+        ) or signal_agent_output.get("confidence")
+        confidence_numeric = (
+            round(float(raw_confidence), 4) if raw_confidence is not None else None
         )
-        confidence_numeric = round(float(raw_confidence), 4) if raw_confidence is not None else None
 
         governance_score = signal_agent_output.get("governance_score")
         if governance_score is not None:
             governance_score = int(governance_score)
 
-        risk_level        = signal_agent_output.get("risk_level", "low")
-        volatility_regime = (
-            technical_output.get("signals", {}).get("volatility_regime", "normal")
+        risk_level = signal_agent_output.get("risk_level", "low")
+        volatility_regime = technical_output.get("signals", {}).get(
+            "volatility_regime", "normal"
         )
-        technical_bias = (
-            technical_output.get("bias")
-            or technical_output.get("signals", {}).get("bias", "neutral")
-        )
+        technical_bias = technical_output.get("bias") or technical_output.get(
+            "signals", {}
+        ).get("bias", "neutral")
 
-        drift_info     = snapshot_result.get("snapshot", {}).get("drift", {})
-        drift_state    = drift_info.get("drift_state", "none")
+        drift_info = snapshot_result.get("snapshot", {}).get("drift", {})
+        drift_state = drift_info.get("drift_state", "none")
         severity_score = drift_info.get("severity_score", 0)
 
-        warnings    = signal_agent_output.get("warnings", [])
+        warnings = signal_agent_output.get("warnings", [])
         explanation = signal_agent_output.get("explanation", "")
 
         # ── LLM — fully isolated, never affects response ───────────────────
@@ -337,39 +336,38 @@ async def explain_signal(
         latency_ms = round((time.time() - start_time) * 1000, 1)
 
         # Top-5 rationale lookup
-        rationale_list = (
-            snapshot_result.get("executive_summary", {})
-            .get("top_5_rationale", [])
+        rationale_list = snapshot_result.get("executive_summary", {}).get(
+            "top_5_rationale", []
         )
-        rationale = next(
-            (r for r in rationale_list if r.get("ticker") == ticker), {}
-        )
+        rationale = next((r for r in rationale_list if r.get("ticker") == ticker), {})
 
-        return _success({
-            "ticker":                 ticker,
-            "snapshot_date":          signal_row.get("date", ""),
-            "raw_model_score":        round(raw_score, 6),
-            "weight":                 round(weight, 6),
-            "hybrid_consensus_score": round(hybrid_score, 6),
-            "signal":                 signal_direction,
-            "confidence_numeric":     confidence_numeric,
-            "governance_score":       governance_score,
-            "risk_level":             risk_level,
-            "volatility_regime":      volatility_regime,
-            "technical_bias":         technical_bias,
-            "drift_state":            drift_state,
-            "warnings":               warnings,
-            "explanation":            explanation,
-            "llm":                    llm_output,
-            # Rationale — populated for top-5 only
-            "rank":             rationale.get("rank"),
-            "agents_approved":  rationale.get("agents_approved", []),
-            "agents_flagged":   rationale.get("agents_flagged", []),
-            "selection_reason": rationale.get("selection_reason", ""),
-            "agent_scores":     rationale.get("agent_scores", {}),
-            "in_top_5":         bool(rationale),
-            "latency_ms":       latency_ms,
-        })
+        return _success(
+            {
+                "ticker": ticker,
+                "snapshot_date": signal_row.get("date", ""),
+                "raw_model_score": round(raw_score, 6),
+                "weight": round(weight, 6),
+                "hybrid_consensus_score": round(hybrid_score, 6),
+                "signal": signal_direction,
+                "confidence_numeric": confidence_numeric,
+                "governance_score": governance_score,
+                "risk_level": risk_level,
+                "volatility_regime": volatility_regime,
+                "technical_bias": technical_bias,
+                "drift_state": drift_state,
+                "warnings": warnings,
+                "explanation": explanation,
+                "llm": llm_output,
+                # Rationale — populated for top-5 only
+                "rank": rationale.get("rank"),
+                "agents_approved": rationale.get("agents_approved", []),
+                "agents_flagged": rationale.get("agents_flagged", []),
+                "selection_reason": rationale.get("selection_reason", ""),
+                "agent_scores": rationale.get("agent_scores", {}),
+                "in_top_5": bool(rationale),
+                "latency_ms": latency_ms,
+            }
+        )
 
     except HTTPException:
         raise
@@ -385,6 +383,7 @@ async def explain_signal(
 # =========================================================
 # GET /agent/political-risk?ticker=X
 # =========================================================
+
 
 @router.get(
     "/political-risk",
@@ -422,19 +421,24 @@ async def political_risk(
 
         if not political:
             from core.agent.political_risk_agent import PoliticalRiskAgent
+
             agent = PoliticalRiskAgent()
             political = agent.get_political_risk(ticker, country="US")
 
-        return _success({
-            "ticker":               ticker,
-            "political_risk_score": float(political.get("political_risk_score", 0.0)),
-            "political_risk_label": political.get("political_risk_label", "LOW"),
-            "top_events":           political.get("top_events", [])[:5],
-            "source":               political.get("source", "gdelt"),
-            "gdelt_status":         political.get("gdelt_status", "unknown"),
-            "served_from_cache":    bool(snapshot_result),
-            "latency_ms":           round((time.time() - start_time) * 1000, 1),
-        })
+        return _success(
+            {
+                "ticker": ticker,
+                "political_risk_score": float(
+                    political.get("political_risk_score", 0.0)
+                ),
+                "political_risk_label": political.get("political_risk_label", "LOW"),
+                "top_events": political.get("top_events", [])[:5],
+                "source": political.get("source", "gdelt"),
+                "gdelt_status": political.get("gdelt_status", "unknown"),
+                "served_from_cache": bool(snapshot_result),
+                "latency_ms": round((time.time() - start_time) * 1000, 1),
+            }
+        )
 
     except Exception as e:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
@@ -449,6 +453,7 @@ async def political_risk(
 # GET /agent/agents
 # =========================================================
 
+
 @router.get(
     "/agents",
     summary="Agent Pipeline Descriptions",
@@ -456,27 +461,29 @@ async def political_risk(
     response_description="Agent descriptions with weights.",
 )
 async def list_agents():
-    return _success({
-        "agents": {
-            "signal_agent": {
-                "name":        "SignalAgent",
-                "description": "Interprets XGBoost output into LONG/SHORT/NEUTRAL with confidence and risk level.",
-                "weight":      0.5,
-            },
-            "technical_risk_agent": {
-                "name":        "TechnicalRiskAgent",
-                "description": "Evaluates momentum, EMA structure, RSI, and volatility regime.",
-                "weight":      0.2,
-            },
-            "portfolio_decision_agent": {
-                "name":        "PortfolioDecisionAgent",
-                "description": "Aggregates per-ticker signals into portfolio decisions with exposure control.",
-                "weight":      0.2,
-            },
-            "political_risk_agent": {
-                "name":        "PoliticalRiskAgent",
-                "description": "Detects geopolitical risk via GDELT. CRITICAL label overrides all signals.",
-                "weight":      0.1,
-            },
+    return _success(
+        {
+            "agents": {
+                "signal_agent": {
+                    "name": "SignalAgent",
+                    "description": "Interprets XGBoost output into LONG/SHORT/NEUTRAL with confidence and risk level.",
+                    "weight": 0.5,
+                },
+                "technical_risk_agent": {
+                    "name": "TechnicalRiskAgent",
+                    "description": "Evaluates momentum, EMA structure, RSI, and volatility regime.",
+                    "weight": 0.2,
+                },
+                "portfolio_decision_agent": {
+                    "name": "PortfolioDecisionAgent",
+                    "description": "Aggregates per-ticker signals into portfolio decisions with exposure control.",
+                    "weight": 0.2,
+                },
+                "political_risk_agent": {
+                    "name": "PoliticalRiskAgent",
+                    "description": "Detects geopolitical risk via GDELT. CRITICAL label overrides all signals.",
+                    "weight": 0.1,
+                },
+            }
         }
-    })
+    )

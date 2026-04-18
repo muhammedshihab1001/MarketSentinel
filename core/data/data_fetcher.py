@@ -135,10 +135,7 @@ class StockPriceFetcher:
 
         else:
 
-            df.columns = [
-                str(c).lower().strip().replace(" ", "_")
-                for c in df.columns
-            ]
+            df.columns = [str(c).lower().strip().replace(" ", "_") for c in df.columns]
 
         if df.columns.duplicated().any():
 
@@ -170,9 +167,7 @@ class StockPriceFetcher:
 
                 return df
 
-        raise RuntimeError(
-            "Could not locate datetime column in Yahoo response."
-        )
+        raise RuntimeError("Could not locate datetime column in Yahoo response.")
 
     @staticmethod
     def _ensure_utc(series: pd.Series) -> pd.Series:
@@ -224,7 +219,9 @@ class StockPriceFetcher:
 
         return df
 
-    def _download(self, ticker: str, start: str, end: str, interval: str) -> pd.DataFrame:
+    def _download(
+        self, ticker: str, start: str, end: str, interval: str
+    ) -> pd.DataFrame:
 
         ticker = ticker.strip().upper()
 
@@ -292,7 +289,9 @@ class StockPriceFetcher:
             f"Last error: {last_exc}"
         )
 
-    def fetch(self, ticker: str, start_date: str, end_date: str, interval: str = "1d") -> pd.DataFrame:
+    def fetch(
+        self, ticker: str, start_date: str, end_date: str, interval: str = "1d"
+    ) -> pd.DataFrame:
 
         ticker = ticker.strip().upper()
 
@@ -335,9 +334,7 @@ class StockPriceFetcher:
         # yahoo_provider._normalize() and twelvedata_provider._normalize()
         # which are delta-aware. This layer should just pass data through.
         if len(df) < self.MIN_ROWS:
-            raise RuntimeError(
-                f"Insufficient history for '{ticker}': got {len(df)}"
-            )
+            raise RuntimeError(f"Insufficient history for '{ticker}': got {len(df)}")
 
         df["ticker"] = ticker
 

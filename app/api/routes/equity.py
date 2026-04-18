@@ -86,7 +86,9 @@ def get_equity(ticker: str):
         ret_20d = 0.0
         if len(df) >= 21:
             p_now = _safe_float(latest.get("close", latest.get("adj_close")))
-            p_20d = _safe_float(df.iloc[-21].get("close", df.iloc[-21].get("adj_close")))
+            p_20d = _safe_float(
+                df.iloc[-21].get("close", df.iloc[-21].get("adj_close"))
+            )
             if p_20d > 0:
                 ret_20d = (p_now - p_20d) / p_20d
 
@@ -171,14 +173,16 @@ def get_equity_history(
         history = []
         for _, row in df.iterrows():
             date_val = row["date"] if "date" in df.columns else row.name
-            history.append({
-                "date": _safe_str(date_val),
-                "open": _safe_float(row.get("open")),
-                "high": _safe_float(row.get("high")),
-                "low": _safe_float(row.get("low")),
-                "close": _safe_float(row.get("close", row.get("adj_close"))),
-                "volume": int(_safe_float(row.get("volume"), 0)),
-            })
+            history.append(
+                {
+                    "date": _safe_str(date_val),
+                    "open": _safe_float(row.get("open")),
+                    "high": _safe_float(row.get("high")),
+                    "low": _safe_float(row.get("low")),
+                    "close": _safe_float(row.get("close", row.get("adj_close"))),
+                    "volume": int(_safe_float(row.get("volume"), 0)),
+                }
+            )
 
         return {
             "ticker": ticker,

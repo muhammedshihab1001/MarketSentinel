@@ -99,9 +99,8 @@ class DataSyncService:
                 sync_type = "full"
             else:
                 # Existing ticker — fetch only missing days
-                start_date = (
-                    pd.Timestamp(latest_in_db, tz="UTC")
-                    - pd.Timedelta(days=self.OVERLAP_DAYS)
+                start_date = pd.Timestamp(latest_in_db, tz="UTC") - pd.Timedelta(
+                    days=self.OVERLAP_DAYS
                 )
                 sync_type = "delta"
 
@@ -139,7 +138,11 @@ class DataSyncService:
 
             logger.info(
                 "Sync complete | ticker=%s type=%s fetched=%d inserted=%d duration=%.2fs",
-                ticker, sync_type, rows_fetched, rows_inserted, duration,
+                ticker,
+                sync_type,
+                rows_fetched,
+                rows_inserted,
+                duration,
                 extra={"component": "data_sync", "function": "sync_ticker"},
             )
 
@@ -159,7 +162,9 @@ class DataSyncService:
 
             logger.warning(
                 "Sync failed | ticker=%s error=%s duration=%.2fs",
-                ticker, exc, duration,
+                ticker,
+                exc,
+                duration,
                 extra={"component": "data_sync", "function": "sync_ticker"},
             )
 
@@ -191,7 +196,8 @@ class DataSyncService:
 
         logger.info(
             "Universe sync starting | tickers=%d | workers=%d",
-            len(tickers), SYNC_MAX_WORKERS,
+            len(tickers),
+            SYNC_MAX_WORKERS,
             extra={"component": "data_sync", "function": "sync_universe"},
         )
 
@@ -204,8 +210,7 @@ class DataSyncService:
         with ThreadPoolExecutor(max_workers=SYNC_MAX_WORKERS) as pool:
 
             future_to_ticker = {
-                pool.submit(self.sync_ticker, ticker): ticker
-                for ticker in tickers
+                pool.submit(self.sync_ticker, ticker): ticker for ticker in tickers
             }
 
             for fut in as_completed(future_to_ticker):
@@ -245,15 +250,19 @@ class DataSyncService:
         logger.info(
             "Universe sync complete | synced=%d skipped=%d errors=%d "
             "rows_inserted=%d duration=%.2fs",
-            success_count, skip_count, error_count,
-            total_inserted, total_duration,
+            success_count,
+            skip_count,
+            error_count,
+            total_inserted,
+            total_duration,
             extra={"component": "data_sync", "function": "sync_universe"},
         )
 
         if error_count > 0:
             failed = [r["ticker"] for r in results if r["status"] == "error"]
             logger.warning(
-                "Failed tickers: %s", failed,
+                "Failed tickers: %s",
+                failed,
                 extra={"component": "data_sync", "function": "sync_universe"},
             )
 
@@ -280,8 +289,7 @@ class DataSyncService:
             from core.db.models import OHLCVDaily
 
             cutoff = (
-                pd.Timestamp.now(tz="UTC")
-                - pd.Timedelta(days=RETENTION_DAYS)
+                pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=RETENTION_DAYS)
             ).date()
 
             with get_session() as session:
@@ -294,7 +302,9 @@ class DataSyncService:
             logger.info(
                 "DB cleanup complete | deleted=%d rows older than %s "
                 "(retention=%d days)",
-                deleted, cutoff, RETENTION_DAYS,
+                deleted,
+                cutoff,
+                RETENTION_DAYS,
                 extra={"component": "data_sync", "function": "cleanup_old_data"},
             )
 
@@ -302,7 +312,8 @@ class DataSyncService:
 
         except Exception as exc:
             logger.warning(
-                "DB cleanup failed (non-blocking) | error=%s", exc,
+                "DB cleanup failed (non-blocking) | error=%s",
+                exc,
                 extra={"component": "data_sync", "function": "cleanup_old_data"},
             )
             return 0

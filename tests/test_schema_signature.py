@@ -10,7 +10,6 @@ from core.schema.feature_schema import (
     SCHEMA_VERSION,
 )
 
-
 ############################################################
 # CONTRACT LOCK
 ############################################################
@@ -19,14 +18,14 @@ from core.schema.feature_schema import (
 # For a CV project this can remain optional.
 
 EXPECTED_SCHEMA_SIGNATURE = os.getenv(
-    "SCHEMA_EXPECTED_SIGNATURE",
-    "REPLACE_WITH_REAL_SIGNATURE"
+    "SCHEMA_EXPECTED_SIGNATURE", "REPLACE_WITH_REAL_SIGNATURE"
 )
 
 
 ############################################################
 # DETERMINISM
 ############################################################
+
 
 def test_schema_signature_is_deterministic():
 
@@ -39,6 +38,7 @@ def test_schema_signature_is_deterministic():
 ############################################################
 # CONTRACT LOCK (OPTIONAL)
 ############################################################
+
 
 def test_schema_signature_matches_expected_contract():
 
@@ -65,6 +65,7 @@ def test_schema_signature_matches_expected_contract():
 # SIGNATURE FORMAT
 ############################################################
 
+
 def test_schema_signature_is_sha256():
 
     sig = get_schema_signature()
@@ -75,6 +76,7 @@ def test_schema_signature_is_sha256():
 ############################################################
 # FEATURE SANITY
 ############################################################
+
 
 def test_core_features_non_empty():
 
@@ -98,9 +100,7 @@ def test_no_duplicate_features():
 
 def test_no_overlap_between_core_and_cross():
 
-    assert not set(CORE_FEATURES).intersection(
-        set(CROSS_SECTIONAL_FEATURES)
-    )
+    assert not set(CORE_FEATURES).intersection(set(CROSS_SECTIONAL_FEATURES))
 
 
 def test_cross_sectional_suffixes():
@@ -112,6 +112,7 @@ def test_cross_sectional_suffixes():
 ############################################################
 # BASIC FEATURE COUNT CHECK
 ############################################################
+
 
 def test_total_feature_count_reasonable():
 
@@ -125,6 +126,7 @@ def test_total_feature_count_reasonable():
 # SNAPSHOT CONSISTENCY
 ############################################################
 
+
 def test_schema_snapshot_consistent_with_signature():
 
     snapshot = schema_snapshot()
@@ -136,6 +138,7 @@ def test_schema_snapshot_consistent_with_signature():
 ############################################################
 # VERSION FORMAT
 ############################################################
+
 
 def test_schema_version_string_present():
 

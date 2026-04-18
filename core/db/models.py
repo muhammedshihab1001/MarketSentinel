@@ -33,8 +33,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db.engine import Base
 
-
 # ─── OHLCV Daily Prices ──────────────────────────────────────
+
 
 class OHLCVDaily(Base):
     """
@@ -76,12 +76,12 @@ class OHLCVDaily(Base):
 
     def __repr__(self):
         return (
-            f"<OHLCVDaily ticker={self.ticker} date={self.date} "
-            f"close={self.close}>"
+            f"<OHLCVDaily ticker={self.ticker} date={self.date} " f"close={self.close}>"
         )
 
 
 # ─── Computed Features ────────────────────────────────────────
+
 
 class ComputedFeature(Base):
     """
@@ -130,7 +130,9 @@ class ComputedFeature(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            "ticker", "date", "feature_version",
+            "ticker",
+            "date",
+            "feature_version",
             name="uq_feature_ticker_date_version",
         ),
         # FIX: Composite covering index — feature_version is the primary filter
@@ -149,6 +151,7 @@ class ComputedFeature(Base):
 
 
 # ─── Model Predictions ───────────────────────────────────────
+
 
 class ModelPrediction(Base):
     """
@@ -187,7 +190,9 @@ class ModelPrediction(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            "ticker", "date", "model_version",
+            "ticker",
+            "date",
+            "model_version",
             name="uq_prediction_ticker_date_model",
         ),
         Index("ix_prediction_date_model", "date", "model_version"),

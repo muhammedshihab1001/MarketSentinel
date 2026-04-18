@@ -5,10 +5,10 @@ from datetime import datetime, timedelta
 from training.backtesting.walk_forward import WalkForwardValidator
 from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema, DTYPE
 
-
 ############################################################
 # DUMMY MODEL TRAINER
 ############################################################
+
 
 def dummy_trainer(train_df):
 
@@ -27,6 +27,7 @@ def dummy_trainer(train_df):
 # + 500 periods which extended into mid-2027 (future).
 # Now uses today - 600 days so the window is always historical.
 ############################################################
+
 
 def build_synthetic_dataset():
 
@@ -73,6 +74,7 @@ def build_synthetic_dataset():
 # END-TO-END WALK FORWARD TEST
 ############################################################
 
+
 def test_walkforward_runs_end_to_end():
 
     df = build_synthetic_dataset()
@@ -97,9 +99,15 @@ def test_walkforward_runs_end_to_end():
     assert metrics["avg_trades_per_window"] >= 1
 
     required = {
-        "avg_strategy_return", "avg_sharpe", "profit_factor",
-        "max_drawdown", "return_volatility", "final_equity",
-        "avg_turnover", "avg_win_rate", "avg_trades_per_window",
+        "avg_strategy_return",
+        "avg_sharpe",
+        "profit_factor",
+        "max_drawdown",
+        "return_volatility",
+        "final_equity",
+        "avg_turnover",
+        "avg_win_rate",
+        "avg_trades_per_window",
         "num_windows",
     }
 
@@ -109,6 +117,7 @@ def test_walkforward_runs_end_to_end():
 ############################################################
 # DETERMINISM TEST
 ############################################################
+
 
 def test_walkforward_is_deterministic():
 

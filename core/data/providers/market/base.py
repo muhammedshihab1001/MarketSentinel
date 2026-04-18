@@ -3,7 +3,6 @@ from abc import ABC, abstractmethod
 import numpy as np
 import pandas as pd
 
-
 # Floating-point tolerance for OHLC invariant checks.
 # Tiny adj_close substitutions can produce micro-violations (e.g. 1e-8 diff).
 _OHLC_TOLERANCE = 1e-6
@@ -116,17 +115,15 @@ class MarketDataProvider(ABC):
         tol = _OHLC_TOLERANCE
 
         violations = (
-            (df["high"] + tol < df["open"]) |
-            (df["high"] + tol < df["close"]) |
-            (df["low"]  - tol > df["open"]) |
-            (df["low"]  - tol > df["close"]) |
-            (df["high"] + tol < df["low"])
+            (df["high"] + tol < df["open"])
+            | (df["high"] + tol < df["close"])
+            | (df["low"] - tol > df["open"])
+            | (df["low"] - tol > df["close"])
+            | (df["high"] + tol < df["low"])
         )
 
         if violations.any():
-            raise RuntimeError(
-                "OHLC price invariant violated."
-            )
+            raise RuntimeError("OHLC price invariant violated.")
 
         # ── Ticker validation
         if df["ticker"].isna().any():
@@ -139,9 +136,7 @@ class MarketDataProvider(ABC):
         dupes = df.duplicated(subset=["ticker", "date"])
 
         if dupes.any():
-            raise RuntimeError(
-                f"Provider output has {dupes.sum()} duplicate rows."
-            )
+            raise RuntimeError(f"Provider output has {dupes.sum()} duplicate rows.")
 
         # ── Sort chronologically
         df = df.sort_values("date")

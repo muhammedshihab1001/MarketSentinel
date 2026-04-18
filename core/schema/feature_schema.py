@@ -70,13 +70,10 @@ BASE_CS_COLS: Tuple[str, ...] = (
 )
 
 CROSS_SECTIONAL_FEATURES: Tuple[str, ...] = tuple(
-    [f"{col}_z" for col in BASE_CS_COLS] +
-    [f"{col}_rank" for col in BASE_CS_COLS]
+    [f"{col}_z" for col in BASE_CS_COLS] + [f"{col}_rank" for col in BASE_CS_COLS]
 )
 
-MODEL_FEATURES: Tuple[str, ...] = tuple(
-    CORE_FEATURES + CROSS_SECTIONAL_FEATURES
-)
+MODEL_FEATURES: Tuple[str, ...] = tuple(CORE_FEATURES + CROSS_SECTIONAL_FEATURES)
 
 DTYPE = np.float32
 
@@ -97,15 +94,10 @@ _logged_missing_inference = set()
 
 def _check_duplicate_features():
 
-    duplicates = [
-        x for x in MODEL_FEATURES
-        if MODEL_FEATURES.count(x) > 1
-    ]
+    duplicates = [x for x in MODEL_FEATURES if MODEL_FEATURES.count(x) > 1]
 
     if duplicates:
-        raise RuntimeError(
-            f"Duplicate features detected in schema: {set(duplicates)}"
-        )
+        raise RuntimeError(f"Duplicate features detected in schema: {set(duplicates)}")
 
 
 def _check_forbidden_columns(df: pd.DataFrame, mode: str) -> None:
@@ -146,10 +138,7 @@ def _check_dtype_stability(df: pd.DataFrame) -> None:
 
     numeric_cols = df.select_dtypes(include=["number"]).columns
 
-    bad = [
-        c for c in numeric_cols
-        if not np.issubdtype(df[c].dtype, np.number)
-    ]
+    bad = [c for c in numeric_cols if not np.issubdtype(df[c].dtype, np.number)]
 
     if bad:
         logger.debug("Unexpected dtype detected: %s", bad)
@@ -162,9 +151,7 @@ def _check_variance(df: pd.DataFrame):
         var = df[col].var()
 
         if var < MIN_VARIANCE and col not in _logged_low_variance_core:
-            logger.debug(
-                "Low variance feature detected: %s (var=%s)", col, var
-            )
+            logger.debug("Low variance feature detected: %s (var=%s)", col, var)
             _logged_low_variance_core.add(col)
 
 
@@ -233,7 +220,7 @@ def validate_feature_schema(
                 if col.endswith("_rank"):
                     feature_df[col] = 0.5
                 elif col == "regime_multiplier":
-                    feature_df[col] = 1.0   # safe default: SIDEWAYS
+                    feature_df[col] = 1.0  # safe default: SIDEWAYS
                 else:
                     feature_df[col] = 0.0
 

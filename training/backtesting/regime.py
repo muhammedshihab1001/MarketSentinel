@@ -34,12 +34,7 @@ class MarketRegimeDetector:
 
     VALID_REGIMES = ("BULL", "BEAR", "SIDEWAYS", "CRISIS")
 
-    REGIME_MULTIPLIER = {
-        "BULL": 1.2,
-        "SIDEWAYS": 1.0,
-        "BEAR": 0.8,
-        "CRISIS": 0.4
-    }
+    REGIME_MULTIPLIER = {"BULL": 1.2, "SIDEWAYS": 1.0, "BEAR": 0.8, "CRISIS": 0.4}
 
     def __init__(self, config: RegimeConfig | None = None):
         self.config = config or RegimeConfig()
@@ -134,43 +129,29 @@ class MarketRegimeDetector:
             # RETURN SMOOTHING
             ########################################################
 
-            returns = raw_returns.ewm(
-                span=cfg.RETURN_SMOOTH_SPAN,
-                adjust=False
-            ).mean()
+            returns = raw_returns.ewm(span=cfg.RETURN_SMOOTH_SPAN, adjust=False).mean()
 
             ########################################################
             # TREND
             ########################################################
 
             ma_long = close.rolling(
-                cfg.trend_window,
-                min_periods=cfg.trend_window
+                cfg.trend_window, min_periods=cfg.trend_window
             ).mean()
 
-            trend_dev = (
-                (close - ma_long) /
-                (ma_long + cfg.EPSILON)
-            )
+            trend_dev = (close - ma_long) / (ma_long + cfg.EPSILON)
 
-            trend_dev = trend_dev.ewm(
-                span=cfg.TREND_SMOOTH_SPAN,
-                adjust=False
-            ).mean()
+            trend_dev = trend_dev.ewm(span=cfg.TREND_SMOOTH_SPAN, adjust=False).mean()
 
             ########################################################
             # VOLATILITY
             ########################################################
 
             raw_vol = returns.rolling(
-                cfg.volatility_window,
-                min_periods=cfg.volatility_window
+                cfg.volatility_window, min_periods=cfg.volatility_window
             ).std()
 
-            volatility = raw_vol.ewm(
-                span=10,
-                adjust=False
-            ).mean()
+            volatility = raw_vol.ewm(span=10, adjust=False).mean()
 
             volatility = volatility.clip(lower=cfg.MIN_VOL_FLOOR)
 
@@ -183,24 +164,21 @@ class MarketRegimeDetector:
             ready = ma_long.notna() & volatility.notna()
 
             crisis = ready & (
-                volatility > (
-                    cfg.crash_vol_threshold
-                    + cfg.HYSTERESIS_BUFFER
-                )
+                volatility > (cfg.crash_vol_threshold + cfg.HYSTERESIS_BUFFER)
             )
 
             bull = (
-                ready &
-                ~crisis &
-                (trend_dev > cfg.trend_buffer) &
-                (volatility < cfg.bull_vol_threshold)
+                ready
+                & ~crisis
+                & (trend_dev > cfg.trend_buffer)
+                & (volatility < cfg.bull_vol_threshold)
             )
 
             bear = (
-                ready &
-                ~crisis &
-                (trend_dev < -cfg.trend_buffer) &
-                (volatility > cfg.bear_vol_threshold)
+                ready
+                & ~crisis
+                & (trend_dev < -cfg.trend_buffer)
+                & (volatility > cfg.bear_vol_threshold)
             )
 
             regime[crisis] = "CRISIS"
@@ -221,10 +199,7 @@ class MarketRegimeDetector:
             ########################################################
 
             df["regime_multiplier"] = (
-                pd.Series(regime)
-                .map(self.REGIME_MULTIPLIER)
-                .fillna(1.0)
-                .values
+                pd.Series(regime).map(self.REGIME_MULTIPLIER).fillna(1.0).values
             )
 
             return df
@@ -249,18 +224,16 @@ class MarketRegimeDetector:
 
         grouped = []
 
-        for _, slice_df in df.sort_values(
-            ["ticker", "date"]
-        ).groupby("ticker", sort=False):
+        for _, slice_df in df.sort_values(["ticker", "date"]).groupby(
+            "ticker", sort=False
+        ):
 
             detected = self._detect_single_asset(slice_df)
 
             grouped.append(detected)
 
         result = (
-            pd.concat(grouped)
-            .sort_values(["date", "ticker"])
-            .reset_index(drop=True)
+            pd.concat(grouped).sort_values(["date", "ticker"]).reset_index(drop=True)
         )
 
         return result

@@ -16,10 +16,10 @@ from app.core.auth.jwt_handler import (
     authenticate_owner,
 )
 
-
 # =====================================================
 # PASSWORD HASHING
 # =====================================================
+
 
 class TestPasswordHashing:
 
@@ -74,6 +74,7 @@ class TestPasswordHashing:
 # JWT TOKEN CREATION
 # =====================================================
 
+
 class TestTokenCreation:
 
     def test_create_owner_token_returns_string(self):
@@ -112,6 +113,7 @@ class TestTokenCreation:
 # =====================================================
 # AUTHENTICATE OWNER
 # =====================================================
+
 
 class TestAuthenticateOwner:
 

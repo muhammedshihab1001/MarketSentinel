@@ -35,6 +35,7 @@ logger = get_logger(__name__)
 
 # ─── OHLCV Repository ────────────────────────────────────────
 
+
 class OHLCVRepository:
     """
     Handles all database operations for daily price data.
@@ -81,7 +82,8 @@ class OHLCVRepository:
 
             logger.debug(
                 "DB price load | ticker=%s rows=%d",
-                ticker, len(df),
+                ticker,
+                len(df),
                 extra={"component": "db.repository", "function": "get_price_data"},
             )
 
@@ -92,9 +94,8 @@ class OHLCVRepository:
 
         with get_session() as session:
 
-            stmt = (
-                select(func.max(OHLCVDaily.date))
-                .where(OHLCVDaily.ticker == ticker.upper())
+            stmt = select(func.max(OHLCVDaily.date)).where(
+                OHLCVDaily.ticker == ticker.upper()
             )
 
             return session.execute(stmt).scalar()
@@ -109,14 +110,16 @@ class OHLCVRepository:
         work = df.copy()
         work["ticker"] = work["ticker"].str.upper()
         work["date"] = pd.to_datetime(work["date"]).dt.date
-        work["open"]   = pd.to_numeric(work["open"],   errors="coerce")
-        work["high"]   = pd.to_numeric(work["high"],   errors="coerce")
-        work["low"]    = pd.to_numeric(work["low"],    errors="coerce")
-        work["close"]  = pd.to_numeric(work["close"],  errors="coerce")
+        work["open"] = pd.to_numeric(work["open"], errors="coerce")
+        work["high"] = pd.to_numeric(work["high"], errors="coerce")
+        work["low"] = pd.to_numeric(work["low"], errors="coerce")
+        work["close"] = pd.to_numeric(work["close"], errors="coerce")
         work["volume"] = pd.to_numeric(work.get("volume", 0), errors="coerce").fillna(0)
         work["source"] = "yfinance"
 
-        records = work[["ticker", "date", "open", "high", "low", "close", "volume", "source"]].to_dict("records")
+        records = work[
+            ["ticker", "date", "open", "high", "low", "close", "volume", "source"]
+        ].to_dict("records")
 
         if not records:
             return 0
@@ -152,14 +155,14 @@ class OHLCVRepository:
     def get_row_count(ticker: str) -> int:
 
         with get_session() as session:
-            stmt = (
-                select(func.count(OHLCVDaily.id))
-                .where(OHLCVDaily.ticker == ticker.upper())
+            stmt = select(func.count(OHLCVDaily.id)).where(
+                OHLCVDaily.ticker == ticker.upper()
             )
             return session.execute(stmt).scalar() or 0
 
 
 # ─── Feature Repository ──────────────────────────────────────
+
 
 class FeatureRepository:
     """
@@ -221,7 +224,9 @@ class FeatureRepository:
 
             logger.debug(
                 "DB feature load | tickers=%d rows=%d version=%s",
-                len(tickers), len(df), feature_version[:8],
+                len(tickers),
+                len(df),
+                feature_version[:8],
                 extra={"component": "db.repository", "function": "get_features"},
             )
 
@@ -265,9 +270,12 @@ class FeatureRepository:
         work = df[["ticker", "date"] + available_cols].copy()
 
         # Vectorised cast — replace non-finite with 0.0
-        feat_block = work[available_cols].apply(
-            pd.to_numeric, errors="coerce"
-        ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        feat_block = (
+            work[available_cols]
+            .apply(pd.to_numeric, errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
 
         # Build feature_data dicts — orient='records' is C-level fast
         feat_dicts = feat_block.to_dict("records")
@@ -299,7 +307,9 @@ class FeatureRepository:
 
             logger.info(
                 "DB feature store | rows=%d inserted=%d version=%s",
-                len(records), inserted, feature_version[:8],
+                len(records),
+                inserted,
+                feature_version[:8],
                 extra={
                     "component": "db.repository",
                     "function": "store_features",
@@ -313,9 +323,8 @@ class FeatureRepository:
 
         with get_session() as session:
 
-            stmt = (
-                delete(ComputedFeature)
-                .where(ComputedFeature.feature_version == feature_version)
+            stmt = delete(ComputedFeature).where(
+                ComputedFeature.feature_version == feature_version
             )
 
             result = session.execute(stmt)
@@ -323,7 +332,8 @@ class FeatureRepository:
 
             logger.info(
                 "DB feature invalidation | version=%s deleted=%d",
-                feature_version[:8], deleted,
+                feature_version[:8],
+                deleted,
                 extra={
                     "component": "db.repository",
                     "function": "invalidate_version",
@@ -334,6 +344,7 @@ class FeatureRepository:
 
 
 # ─── Prediction Repository ────────────────────────────────────
+
 
 class PredictionRepository:
 
@@ -347,19 +358,52 @@ class PredictionRepository:
         pred_df = pd.DataFrame(predictions)
 
         # Normalise columns with safe defaults
-        pred_df["ticker"]           = pred_df["ticker"].str.upper()
-        pred_df["date"]             = pd.to_datetime(pred_df["date"]).dt.date
-        pred_df["model_version"]    = pred_df.get("model_version", "unknown").fillna("unknown") if "model_version" in pred_df else "unknown"
-        pred_df["schema_signature"] = pred_df.get("schema_signature", "unknown").fillna("unknown") if "schema_signature" in pred_df else "unknown"
-        pred_df["raw_model_score"]  = pd.to_numeric(pred_df.get("raw_model_score", 0), errors="coerce").fillna(0.0)
-        pred_df["hybrid_score"]     = pd.to_numeric(pred_df.get("hybrid_score", 0),    errors="coerce").fillna(0.0)
-        pred_df["weight"]           = pd.to_numeric(pred_df.get("weight", 0),          errors="coerce").fillna(0.0)
-        pred_df["signal"]           = pred_df.get("signal",     pd.Series(dtype=str)).where(pred_df.get("signal", pd.Series(dtype=str)).notna(), None) if "signal" in pred_df else None
-        pred_df["drift_state"]      = pred_df.get("drift_state", pd.Series(dtype=str)).where(pred_df.get("drift_state", pd.Series(dtype=str)).notna(), None) if "drift_state" in pred_df else None
+        pred_df["ticker"] = pred_df["ticker"].str.upper()
+        pred_df["date"] = pd.to_datetime(pred_df["date"]).dt.date
+        pred_df["model_version"] = (
+            pred_df.get("model_version", "unknown").fillna("unknown")
+            if "model_version" in pred_df
+            else "unknown"
+        )
+        pred_df["schema_signature"] = (
+            pred_df.get("schema_signature", "unknown").fillna("unknown")
+            if "schema_signature" in pred_df
+            else "unknown"
+        )
+        pred_df["raw_model_score"] = pd.to_numeric(
+            pred_df.get("raw_model_score", 0), errors="coerce"
+        ).fillna(0.0)
+        pred_df["hybrid_score"] = pd.to_numeric(
+            pred_df.get("hybrid_score", 0), errors="coerce"
+        ).fillna(0.0)
+        pred_df["weight"] = pd.to_numeric(
+            pred_df.get("weight", 0), errors="coerce"
+        ).fillna(0.0)
+        pred_df["signal"] = (
+            pred_df.get("signal", pd.Series(dtype=str)).where(
+                pred_df.get("signal", pd.Series(dtype=str)).notna(), None
+            )
+            if "signal" in pred_df
+            else None
+        )
+        pred_df["drift_state"] = (
+            pred_df.get("drift_state", pd.Series(dtype=str)).where(
+                pred_df.get("drift_state", pd.Series(dtype=str)).notna(), None
+            )
+            if "drift_state" in pred_df
+            else None
+        )
 
         keep_cols = [
-            "ticker", "date", "model_version", "schema_signature",
-            "raw_model_score", "hybrid_score", "weight", "signal", "drift_state",
+            "ticker",
+            "date",
+            "model_version",
+            "schema_signature",
+            "raw_model_score",
+            "hybrid_score",
+            "weight",
+            "signal",
+            "drift_state",
         ]
         # Only keep columns that exist
         keep_cols = [c for c in keep_cols if c in pred_df.columns]
@@ -379,7 +423,8 @@ class PredictionRepository:
 
             logger.info(
                 "DB prediction store | total=%d inserted=%d",
-                len(records), inserted,
+                len(records),
+                inserted,
                 extra={
                     "component": "db.repository",
                     "function": "store_predictions",
@@ -396,15 +441,10 @@ class PredictionRepository:
 
         with get_session() as session:
 
-            stmt = (
-                select(ModelPrediction)
-                .where(ModelPrediction.date == date)
-            )
+            stmt = select(ModelPrediction).where(ModelPrediction.date == date)
 
             if model_version:
-                stmt = stmt.where(
-                    ModelPrediction.model_version == model_version
-                )
+                stmt = stmt.where(ModelPrediction.model_version == model_version)
 
             stmt = stmt.order_by(ModelPrediction.raw_model_score.desc())
 

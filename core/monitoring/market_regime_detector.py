@@ -42,16 +42,16 @@ class MarketRegimeDetector:
     BULL_BREADTH_MIN = 0.60
     BEAR_BREADTH_MAX = 0.40
     CRISIS_BREADTH_MAX = 0.30
-    CRISIS_VOL_MULTIPLIER = 2.0      # vol must be > 2× median to trigger crisis
+    CRISIS_VOL_MULTIPLIER = 2.0  # vol must be > 2× median to trigger crisis
 
     REGIME_MULTIPLIERS = {
-        "BULL":     1.2,
+        "BULL": 1.2,
         "SIDEWAYS": 1.0,
-        "BEAR":     0.6,
-        "CRISIS":   0.3,
+        "BEAR": 0.6,
+        "CRISIS": 0.3,
     }
 
-    WINDOW = 20   # rolling window for cross-sectional stats
+    WINDOW = 20  # rolling window for cross-sectional stats
 
     def detect(self, price_df: pd.DataFrame) -> Dict:
         """
@@ -77,7 +77,9 @@ class MarketRegimeDetector:
             df = df.sort_values("date")
 
             if "return" not in df.columns:
-                df["return"] = df.groupby("ticker")["close"].pct_change().clip(-0.5, 0.5)
+                df["return"] = (
+                    df.groupby("ticker")["close"].pct_change().clip(-0.5, 0.5)
+                )
 
             # Use the most recent N days
             recent_dates = df["date"].drop_duplicates().sort_values().tail(self.WINDOW)
@@ -119,7 +121,11 @@ class MarketRegimeDetector:
             logger.debug(
                 "Regime detected | regime=%s multiplier=%.1f breadth=%.3f "
                 "market_return=%.4f volatility=%.4f",
-                regime, multiplier, breadth, market_return, volatility,
+                regime,
+                multiplier,
+                breadth,
+                market_return,
+                volatility,
             )
 
             return {
@@ -166,11 +172,7 @@ class MarketRegimeDetector:
         df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
 
         if "return" not in df.columns:
-            df["return"] = (
-                df.groupby("ticker")["close"]
-                .pct_change()
-                .clip(-0.5, 0.5)
-            )
+            df["return"] = df.groupby("ticker")["close"].pct_change().clip(-0.5, 0.5)
 
         # Compute regime per date using trailing 20-day window
         all_dates = sorted(df["date"].unique())
@@ -178,7 +180,7 @@ class MarketRegimeDetector:
 
         for i, date in enumerate(all_dates):
             window_start_idx = max(0, i - self.WINDOW + 1)
-            window_dates = all_dates[window_start_idx: i + 1]
+            window_dates = all_dates[window_start_idx : i + 1]
             window_df = df[df["date"].isin(window_dates)]
             result = self.detect(window_df)
             date_regime_map[date] = result
@@ -188,9 +190,11 @@ class MarketRegimeDetector:
             lambda d: date_regime_map.get(d, {}).get("regime", "SIDEWAYS")
         )
         df["market_regime"] = df["regime"]
-        df["regime_multiplier"] = df["date"].map(
-            lambda d: date_regime_map.get(d, {}).get("regime_multiplier", 1.0)
-        ).astype(np.float32)
+        df["regime_multiplier"] = (
+            df["date"]
+            .map(lambda d: date_regime_map.get(d, {}).get("regime_multiplier", 1.0))
+            .astype(np.float32)
+        )
 
         logger.info(
             "Regime features added | dates=%d regime_counts=%s",

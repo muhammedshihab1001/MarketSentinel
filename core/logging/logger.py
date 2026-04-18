@@ -46,7 +46,6 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-
 # ─── Environment Detection ────────────────────────────────────
 
 APP_ENV = os.getenv("APP_ENV", "development").lower()
@@ -65,16 +64,17 @@ if IS_PRODUCTION:
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-MAIN_LOG_FILE   = LOG_DIR / "marketsentinel.log"   # INFO+  — all envs
-ISSUE_LOG_FILE  = LOG_DIR / "issues.log"           # WARNING+ — all envs
-DEBUG_LOG_FILE  = LOG_DIR / "debug.log"            # DEBUG — dev only
-ACCESS_LOG_FILE = LOG_DIR / "access.log"           # HTTP requests — all envs
+MAIN_LOG_FILE = LOG_DIR / "marketsentinel.log"  # INFO+  — all envs
+ISSUE_LOG_FILE = LOG_DIR / "issues.log"  # WARNING+ — all envs
+DEBUG_LOG_FILE = LOG_DIR / "debug.log"  # DEBUG — dev only
+ACCESS_LOG_FILE = LOG_DIR / "access.log"  # HTTP requests — all envs
 
-MAX_LOG_BYTES = 10 * 1024 * 1024   # 10 MB per file
-BACKUP_COUNT  = 5                   # 5 rotated backups kept
+MAX_LOG_BYTES = 10 * 1024 * 1024  # 10 MB per file
+BACKUP_COUNT = 5  # 5 rotated backups kept
 
 
 # ─── Formatters ──────────────────────────────────────────────
+
 
 class DetailedFormatter(logging.Formatter):
     """
@@ -115,7 +115,7 @@ class DetailedFormatter(logging.Formatter):
         try:
             full_path = str(Path(record.pathname).resolve())
             if full_path.startswith(self._PROJECT_ROOT):
-                rel = full_path[len(self._PROJECT_ROOT):].lstrip("/\\")
+                rel = full_path[len(self._PROJECT_ROOT) :].lstrip("/\\")
             else:
                 rel = record.pathname
         except Exception:
@@ -133,11 +133,11 @@ class ColorFormatter(DetailedFormatter):
     """
 
     COLORS = {
-        "DEBUG":    "\033[36m",    # cyan
-        "INFO":     "\033[32m",    # green
-        "WARNING":  "\033[33m",    # yellow
-        "ERROR":    "\033[31m",    # red
-        "CRITICAL": "\033[41m",    # red background
+        "DEBUG": "\033[36m",  # cyan
+        "INFO": "\033[32m",  # green
+        "WARNING": "\033[33m",  # yellow
+        "ERROR": "\033[31m",  # red
+        "CRITICAL": "\033[41m",  # red background
     }
     RESET = "\033[0m"
 
@@ -254,16 +254,14 @@ def setup_logging() -> None:
         debug_file_handler = RotatingFileHandler(
             DEBUG_LOG_FILE,
             maxBytes=MAX_LOG_BYTES,
-            backupCount=2,   # Only 2 backups — debug logs are large
+            backupCount=2,  # Only 2 backups — debug logs are large
             encoding="utf-8",
         )
         debug_file_handler.setLevel(logging.DEBUG)
         debug_file_handler.setFormatter(plain_formatter)
 
         # Only capture DEBUG — don't duplicate INFO+ (already in main log)
-        debug_file_handler.addFilter(
-            lambda r: r.levelno == logging.DEBUG
-        )
+        debug_file_handler.addFilter(lambda r: r.levelno == logging.DEBUG)
         root_logger.addHandler(debug_file_handler)
 
     # ── Handler 5: Access log (HTTP requests, all environments) ─
@@ -280,12 +278,17 @@ def setup_logging() -> None:
     # Only capture access logs from Uvicorn access logger
     access_logger = logging.getLogger("uvicorn.access")
     access_logger.addHandler(access_file_handler)
-    access_logger.propagate = False   # Don't duplicate in root logger
+    access_logger.propagate = False  # Don't duplicate in root logger
 
     # ── Suppress noisy third-party loggers ────────────────────
     noisy = [
-        "urllib3", "yfinance", "httpx", "httpcore",
-        "asyncio", "multipart", "passlib",
+        "urllib3",
+        "yfinance",
+        "httpx",
+        "httpcore",
+        "asyncio",
+        "multipart",
+        "passlib",
     ]
     for name in noisy:
         logging.getLogger(name).setLevel(logging.WARNING)
@@ -310,6 +313,7 @@ def setup_logging() -> None:
 
 
 # ─── Logger Factory ──────────────────────────────────────────
+
 
 def get_logger(name: str) -> logging.Logger:
     """
@@ -339,6 +343,7 @@ def get_logger(name: str) -> logging.Logger:
 
 
 # ─── Environment Info (for startup diagnostics) ───────────────
+
 
 def log_environment_summary() -> None:
     """

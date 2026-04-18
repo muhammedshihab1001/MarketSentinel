@@ -32,7 +32,6 @@ logger = get_logger(__name__)
 
 class Base(DeclarativeBase):
     """Shared declarative base for all ORM models."""
-    pass
 
 
 def _build_database_url() -> str:
@@ -76,7 +75,7 @@ def get_engine():
     url = _build_database_url()
 
     # FIX v3: Raised defaults — was 5/3/10 which caused QueuePool timeouts
-    pool_size    = int(os.getenv("DB_POOL_SIZE", "10"))
+    pool_size = int(os.getenv("DB_POOL_SIZE", "10"))
     max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "5"))
     pool_timeout = int(os.getenv("DB_POOL_TIMEOUT", "15"))
     pool_recycle = int(os.getenv("DB_POOL_RECYCLE", "1800"))
@@ -203,8 +202,11 @@ def check_db_health() -> dict:
         latency_ms = round((time.time() - start) * 1000, 2)
         return {"status": "healthy", "latency_ms": latency_ms}
     except Exception as exc:
-        logger.error("Database health check failed | error=%s", exc,
-                     extra={"component": "db.engine"})
+        logger.error(
+            "Database health check failed | error=%s",
+            exc,
+            extra={"component": "db.engine"},
+        )
         return {"status": "unhealthy", "error": str(exc)}
 
 

@@ -3,7 +3,6 @@ import pandas as pd
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
-
 EPSILON = 1e-12
 
 
@@ -44,9 +43,15 @@ class PerformanceReport:
             "turnover": float(self.turnover),
             "skewness": float(self.skewness),
             "downside_deviation": float(self.downside_deviation),
-            "tracking_error": None if self.tracking_error is None else float(self.tracking_error),
+            "tracking_error": (
+                None if self.tracking_error is None else float(self.tracking_error)
+            ),
             "beta": None if self.beta is None else float(self.beta),
-            "information_ratio": None if self.information_ratio is None else float(self.information_ratio),
+            "information_ratio": (
+                None
+                if self.information_ratio is None
+                else float(self.information_ratio)
+            ),
         }
 
 
@@ -65,7 +70,7 @@ class PerformanceEngine:
         self,
         portfolio_df: pd.DataFrame,
         forward_returns: pd.DataFrame,
-        benchmark_returns: Optional[pd.Series] = None
+        benchmark_returns: Optional[pd.Series] = None,
     ) -> PerformanceReport:
 
         if portfolio_df.empty or forward_returns.empty:
@@ -81,11 +86,7 @@ class PerformanceEngine:
         # MERGE
         ########################################################
 
-        merged = portfolio_df.merge(
-            forward_returns,
-            on=["date", "ticker"],
-            how="inner"
-        )
+        merged = portfolio_df.merge(forward_returns, on=["date", "ticker"], how="inner")
 
         if merged.empty:
             raise RuntimeError("No overlapping data for evaluation.")
@@ -99,24 +100,18 @@ class PerformanceEngine:
         merged = merged.dropna(subset=["forward_return", "weight"])
 
         merged["forward_return"] = merged["forward_return"].clip(
-            -self.MAX_DAILY_RETURN,
-            self.MAX_DAILY_RETURN
+            -self.MAX_DAILY_RETURN, self.MAX_DAILY_RETURN
         )
 
         ########################################################
         # DAILY RETURNS
         ########################################################
 
-        merged["weighted_return"] = (
-            merged["weight"].astype(float)
-            * merged["forward_return"].astype(float)
-        )
+        merged["weighted_return"] = merged["weight"].astype(float) * merged[
+            "forward_return"
+        ].astype(float)
 
-        daily = (
-            merged.groupby("date")["weighted_return"]
-            .sum()
-            .sort_index()
-        )
+        daily = merged.groupby("date")["weighted_return"].sum().sort_index()
 
         daily = daily.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
@@ -188,7 +183,7 @@ class PerformanceEngine:
             equity_curve=equity,
             drawdown_series=drawdown_series,
             rolling_sharpe=rolling_sharpe,
-            rolling_volatility=rolling_volatility
+            rolling_volatility=rolling_volatility,
         )
 
     ########################################################
@@ -255,8 +250,7 @@ class PerformanceEngine:
 
     def _turnover(self, portfolio_df):
         pivot = (
-            portfolio_df
-            .pivot(index="date", columns="ticker", values="weight")
+            portfolio_df.pivot(index="date", columns="ticker", values="weight")
             .fillna(0.0)
             .sort_index()
         )

@@ -58,10 +58,7 @@ def _build_inputs(price_map: dict, days: int):
     prices = prices.sort_values(["ticker", "date"])
 
     prices["forward_return"] = (
-        prices.groupby("ticker")["close"]
-        .pct_change()
-        .shift(-1)
-        .clip(-0.5, 0.5)
+        prices.groupby("ticker")["close"].pct_change().shift(-1).clip(-0.5, 0.5)
     )
 
     prices = prices.dropna(subset=["forward_return"])
@@ -83,6 +80,7 @@ def _build_inputs(price_map: dict, days: int):
 # =========================================================
 # GET /performance
 # =========================================================
+
 
 @router.get(
     "/performance",
@@ -207,6 +205,7 @@ async def performance_summary(
 # =========================================================
 # GET /performance/{ticker}
 # =========================================================
+
 
 @router.get(
     "/performance/{ticker}",

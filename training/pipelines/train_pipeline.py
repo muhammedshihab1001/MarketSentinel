@@ -43,10 +43,7 @@ import pandas as pd
 from core.db.models import OHLCVDaily, ComputedFeature, ModelPrediction  # noqa: F401
 
 from training.train_xgboost import main as train_xgb
-from core.schema.feature_schema import (
-    get_schema_signature,
-    schema_snapshot
-)
+from core.schema.feature_schema import get_schema_signature, schema_snapshot
 from core.artifacts.metadata_manager import MetadataManager
 from core.config.env_loader import init_env
 from core.time.market_time import MarketTime
@@ -66,8 +63,7 @@ STRICT_GOVERNANCE = os.getenv("TRAINING_STRICT_GOVERNANCE", "1") == "1"
 # FIX 2: SKIP_SYNC=1 skips data sync (use on retrain when data exists)
 # SKIP_SYNC=0 (default) always syncs before training
 SKIP_SYNC = (
-    os.getenv("SKIP_SYNC", "0") == "1"
-    or os.getenv("SKIP_DATA_SYNC", "0") == "1"
+    os.getenv("SKIP_SYNC", "0") == "1" or os.getenv("SKIP_DATA_SYNC", "0") == "1"
 )
 
 os.makedirs(RUNS_DIR, exist_ok=True)
@@ -76,6 +72,7 @@ os.makedirs(RUNS_DIR, exist_ok=True)
 # ==========================================================
 # DETERMINISM
 # ==========================================================
+
 
 def enforce_determinism():
 
@@ -92,6 +89,7 @@ def enforce_determinism():
 # ==========================================================
 # LOCKING
 # ==========================================================
+
 
 def _acquire_lock():
 
@@ -119,11 +117,7 @@ def _acquire_lock():
 
     with open(LOCK_FILE, "w") as f:
         json.dump(
-            {
-                "pid": os.getpid(),
-                "created": datetime.datetime.utcnow().isoformat()
-            },
-            f
+            {"pid": os.getpid(), "created": datetime.datetime.utcnow().isoformat()}, f
         )
 
 
@@ -140,6 +134,7 @@ def _release_lock():
 # GIT SAFETY
 # ==========================================================
 
+
 def get_git_commit():
 
     if not os.path.exists(".git"):
@@ -148,8 +143,7 @@ def get_git_commit():
 
     try:
         dirty = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, text=True, timeout=5
+            ["git", "status", "--porcelain"], capture_output=True, text=True, timeout=5
         ).stdout.strip()
 
         if dirty and STRICT_GOVERNANCE:
@@ -157,10 +151,13 @@ def get_git_commit():
                 "Repository is dirty — commit ALL changes before training."
             )
 
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL, timeout=5
-        ).decode().strip()
+        commit = (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, timeout=5
+            )
+            .decode()
+            .strip()
+        )
 
         return commit
 
@@ -173,6 +170,7 @@ def get_git_commit():
 # ENV + HARDWARE FINGERPRINT
 # ==========================================================
 
+
 def build_environment_fingerprint():
 
     payload = {
@@ -184,7 +182,7 @@ def build_environment_fingerprint():
         "hostname": socket.gethostname(),
         "cpu_count": os.cpu_count(),
         "env_hash": os.getenv("ENV_FINGERPRINT", "none"),
-        "process_id": os.getpid()
+        "process_id": os.getpid(),
     }
 
     canonical = json.dumps(payload, sort_keys=True).encode()
@@ -194,6 +192,7 @@ def build_environment_fingerprint():
 # ==========================================================
 # DATA WINDOW HASH
 # ==========================================================
+
 
 def build_window_hash(start_date, end_date):
 
@@ -205,6 +204,7 @@ def build_window_hash(start_date, end_date):
 # ==========================================================
 # LINEAGE
 # ==========================================================
+
 
 def build_lineage(start_date, end_date):
 
@@ -221,7 +221,7 @@ def build_lineage(start_date, end_date):
         "training_window": {"start": start_date, "end": end_date},
         "window_hash": build_window_hash(start_date, end_date),
         "training_universe": universe_snapshot,
-        "universe_hash": universe_hash
+        "universe_hash": universe_hash,
     }
 
     canonical = json.dumps(lineage_payload, sort_keys=True).encode()
@@ -234,10 +234,12 @@ def build_lineage(start_date, end_date):
 # PROVIDER HEALTH
 # ==========================================================
 
+
 def capture_provider_health():
 
     try:
         from sqlalchemy import text
+
         with get_session() as session:
             session.execute(text("SELECT 1"))
         return {"status": "db_healthy", "source": "postgresql"}
@@ -250,6 +252,7 @@ def capture_provider_health():
 # MANIFEST SAVE
 # ==========================================================
 
+
 def save_manifest(run_id: str, manifest: dict):
 
     final_path = os.path.join(RUNS_DIR, f"{run_id}.json")
@@ -259,8 +262,7 @@ def save_manifest(run_id: str, manifest: dict):
     ).hexdigest()
 
     with tempfile.NamedTemporaryFile(
-        mode="w", delete=False, dir=RUNS_DIR,
-        suffix=".tmp", encoding="utf-8"
+        mode="w", delete=False, dir=RUNS_DIR, suffix=".tmp", encoding="utf-8"
     ) as tmp:
         json.dump(manifest, tmp, indent=4, sort_keys=True)
         tmp.flush()
@@ -276,6 +278,7 @@ def save_manifest(run_id: str, manifest: dict):
 # INSERT to model_predictions failed with truncation error.
 # Safe to run multiple times — checks current length first.
 # ==========================================================
+
 
 def _run_db_migrations():
     """
@@ -317,6 +320,7 @@ def _run_db_migrations():
 # Skipped if SKIP_SYNC=1 (set on retrain when data exists).
 # ==========================================================
 
+
 def _sync_data_if_needed():
     """
     Sync market data from Yahoo Finance → PostgreSQL.
@@ -330,14 +334,12 @@ def _sync_data_if_needed():
 
     if SKIP_SYNC:
         logger.info(
-            "Data sync skipped (SKIP_SYNC=1). "
-            "Using existing DB data for training."
+            "Data sync skipped (SKIP_SYNC=1). " "Using existing DB data for training."
         )
         return
 
     logger.info(
-        "Starting data sync before training "
-        "(set SKIP_SYNC=1 to skip on retrain)"
+        "Starting data sync before training " "(set SKIP_SYNC=1 to skip on retrain)"
     )
 
     try:
@@ -364,7 +366,8 @@ def _sync_data_if_needed():
                 "More than 50%% of tickers failed sync (%d/%d). "
                 "Training data may be insufficient. "
                 "Check Yahoo Finance connectivity.",
-                error_count, total,
+                error_count,
+                total,
             )
 
     except Exception as exc:
@@ -379,6 +382,7 @@ def _sync_data_if_needed():
 # ==========================================================
 # MAIN PIPELINE
 # ==========================================================
+
 
 def main(create_baseline=False, promote_baseline=False):
 
@@ -395,7 +399,8 @@ def main(create_baseline=False, promote_baseline=False):
         logger.info("Database ready | function=main")
     except Exception as e:
         logger.warning(
-            "DB init failed — training will use whatever data is available | error=%s", e
+            "DB init failed — training will use whatever data is available | error=%s",
+            e,
         )
 
     # ── Step 2: Run DB migrations ─────────────────────────
@@ -414,7 +419,8 @@ def main(create_baseline=False, promote_baseline=False):
 
     logger.info(
         "Training window | start=%s | end=%s | function=main",
-        start_date, end_date,
+        start_date,
+        end_date,
     )
 
     schema_signature = get_schema_signature()
@@ -424,7 +430,8 @@ def main(create_baseline=False, promote_baseline=False):
 
     run_id = (
         datetime.datetime.utcnow().strftime("run_%Y_%m_%d_%H%M%S_%f")
-        + "_" + uuid.uuid4().hex[:6]
+        + "_"
+        + uuid.uuid4().hex[:6]
     )
 
     logger.info("Training run | run_id=%s | function=main", run_id)

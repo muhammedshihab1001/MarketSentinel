@@ -3,22 +3,22 @@ import pandas as pd
 
 from core.indicators.technical_indicators import TechnicalIndicators
 
-
 ############################################################
 # HELPER
 ############################################################
 
+
 def build_df(prices):
 
-    return pd.DataFrame({
-        "date": pd.date_range("2025-01-01", periods=len(prices)),
-        "close": prices
-    })
+    return pd.DataFrame(
+        {"date": pd.date_range("2025-01-01", periods=len(prices)), "close": prices}
+    )
 
 
 ############################################################
 # FLAT MARKET
 ############################################################
+
 
 def test_rsi_flat_market_equals_50():
 
@@ -38,6 +38,7 @@ def test_rsi_flat_market_equals_50():
 # STRONG UP TREND
 ############################################################
 
+
 def test_rsi_strong_uptrend():
 
     df = build_df(np.linspace(100, 200, 100))
@@ -52,6 +53,7 @@ def test_rsi_strong_uptrend():
 # STRONG DOWN TREND
 ############################################################
 
+
 def test_rsi_strong_downtrend():
 
     df = build_df(np.linspace(200, 100, 100))
@@ -65,6 +67,7 @@ def test_rsi_strong_downtrend():
 ############################################################
 # RSI BOUNDS SAFETY
 ############################################################
+
 
 def test_rsi_bounds():
 
@@ -82,6 +85,7 @@ def test_rsi_bounds():
 # SHORT SERIES SAFETY
 ############################################################
 
+
 def test_rsi_short_series():
 
     df = build_df(np.linspace(100, 110, 10))
@@ -94,6 +98,7 @@ def test_rsi_short_series():
 ############################################################
 # OUTPUT TYPE
 ############################################################
+
 
 def test_rsi_returns_series():
 

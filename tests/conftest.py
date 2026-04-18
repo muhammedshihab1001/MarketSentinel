@@ -11,8 +11,12 @@ from unittest.mock import MagicMock
 # if JWT_SECRET is missing — kills test collection.
 # This must be the FIRST thing in conftest.py.
 # ---------------------------------------------------
-os.environ.setdefault("JWT_SECRET", "test_secret_for_ci_only_not_production_" + "x" * 32)
-os.environ.setdefault("OWNER_PASSWORD_HASH", "$2b$12$placeholder_hash_for_testing_only_xxxxxx")
+os.environ.setdefault(
+    "JWT_SECRET", "test_secret_for_ci_only_not_production_" + "x" * 32
+)
+os.environ.setdefault(
+    "OWNER_PASSWORD_HASH", "$2b$12$placeholder_hash_for_testing_only_xxxxxx"
+)
 os.environ.setdefault("LLM_ENABLED", "0")
 os.environ.setdefault("REDIS_HOST", "invalid-host-for-tests")
 os.environ.setdefault("MODEL_ALLOW_POINTER_FALLBACK", "1")
@@ -23,9 +27,7 @@ os.environ.setdefault("SKIP_DATA_SYNC", "1")
 # ---------------------------------------------------
 # PROJECT ROOT
 # ---------------------------------------------------
-PROJECT_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..")
-)
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -173,9 +175,11 @@ MOCK_SNAPSHOT = {
 # FIXTURES
 # ---------------------------------------------------
 
+
 @pytest.fixture
 def mock_snapshot():
     import copy
+
     return copy.deepcopy(MOCK_SNAPSHOT)
 
 
@@ -225,12 +229,14 @@ def test_app(mock_cache, mock_model_loader):
 @pytest.fixture
 def owner_token():
     from app.core.auth.jwt_handler import create_owner_token
+
     return create_owner_token("test_owner")
 
 
 @pytest.fixture
 def demo_token():
     from app.core.auth.jwt_handler import create_demo_token
+
     return create_demo_token("test_fingerprint_abc123")
 
 

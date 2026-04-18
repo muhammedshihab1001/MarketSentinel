@@ -10,18 +10,16 @@ import os
 import json
 import logging
 import hashlib
-from core.schema.feature_schema import (
-    get_schema_signature,
-    MODEL_FEATURES,
-    DTYPE
-)
+from core.schema.feature_schema import get_schema_signature, MODEL_FEATURES, DTYPE
 
 try:
     from app.monitoring.metrics import DRIFT_DETECTED
 except Exception:
+
     class _NoOpMetric:
         def set(self, *_):
             pass
+
     DRIFT_DETECTED = _NoOpMetric()
 
 
@@ -71,15 +69,9 @@ class DriftDetector:
 
         os.makedirs(self.baseline_dir, exist_ok=True)
 
-        self.BASELINE_PATH = os.path.join(
-            self.baseline_dir,
-            self.BASELINE_FILENAME
-        )
+        self.BASELINE_PATH = os.path.join(self.baseline_dir, self.BASELINE_FILENAME)
 
-        self.hard_fail = os.getenv(
-            "DRIFT_HARD_FAIL",
-            "false"
-        ).lower() == "true"
+        self.hard_fail = os.getenv("DRIFT_HARD_FAIL", "false").lower() == "true"
 
     # =====================================================
     # BASELINE CREATION
@@ -92,7 +84,7 @@ class DriftDetector:
         training_code_hash: str,
         feature_checksum: str,
         model_version: str,
-        allow_overwrite: bool = False
+        allow_overwrite: bool = False,
     ):
 
         if dataset is None or dataset.empty:
@@ -125,13 +117,11 @@ class DriftDetector:
                 "std": float(series.std()),
                 "variance": float(series.var()),
                 "bin_edges": bin_edges.tolist(),
-                "expected_counts": counts.tolist()
+                "expected_counts": counts.tolist(),
             }
 
         if len(features) < self.MIN_BASELINE_FEATURES:
-            raise RuntimeError(
-                "Insufficient baseline features detected."
-            )
+            raise RuntimeError("Insufficient baseline features detected.")
 
         payload = {
             "meta": {
@@ -140,9 +130,9 @@ class DriftDetector:
                 "feature_checksum": feature_checksum,
                 "dataset_hash": dataset_hash,
                 "training_code_hash": training_code_hash,
-                "model_version": model_version
+                "model_version": model_version,
             },
-            "features": features
+            "features": features,
         }
 
         payload["integrity_hash"] = self._baseline_hash(payload)
@@ -179,10 +169,14 @@ class DriftDetector:
             if not np.isfinite(mean) or not np.isfinite(std) or std < self.EPSILON:
                 continue
 
-            block[col] = block[col].clip(
-                mean - self.FEATURE_CLIP_SIGMA * std,
-                mean + self.FEATURE_CLIP_SIGMA * std
-            ).infer_objects(copy=False)
+            block[col] = (
+                block[col]
+                .clip(
+                    mean - self.FEATURE_CLIP_SIGMA * std,
+                    mean + self.FEATURE_CLIP_SIGMA * std,
+                )
+                .infer_objects(copy=False)
+            )
 
         return block
 
@@ -256,9 +250,8 @@ class DriftDetector:
         actual_perc = np.clip(actual_perc, self.MIN_BIN_PCT, None)
 
         psi = np.sum(
-            (actual_perc - expected_perc) *
-            np.log((actual_perc + self.EPSILON) /
-                   (expected_perc + self.EPSILON))
+            (actual_perc - expected_perc)
+            * np.log((actual_perc + self.EPSILON) / (expected_perc + self.EPSILON))
         )
 
         return float(max(psi, 0.0))
@@ -307,9 +300,7 @@ class DriftDetector:
 
             baseline = self._load_verified_baseline()
 
-            numeric = self._safe_feature_block(
-                dataset.tail(self.MAX_INFERENCE_ROWS)
-            )
+            numeric = self._safe_feature_block(dataset.tail(self.MAX_INFERENCE_ROWS))
 
             drift_count = 0
             severity_accumulator = 0
@@ -342,29 +333,31 @@ class DriftDetector:
                 psi = self._psi(
                     np.array(stats.get("bin_edges", [])),
                     np.array(stats.get("expected_counts", [])),
-                    current.values
+                    current.values,
                 )
 
-                drift = any([
-                    z_score > self.z_threshold,
-                    variance_ratio > self.VARIANCE_RATIO_UPPER,
-                    variance_ratio < self.VARIANCE_RATIO_LOWER,
-                    psi > self.PSI_ALERT
-                ])
+                drift = any(
+                    [
+                        z_score > self.z_threshold,
+                        variance_ratio > self.VARIANCE_RATIO_UPPER,
+                        variance_ratio < self.VARIANCE_RATIO_LOWER,
+                        psi > self.PSI_ALERT,
+                    ]
+                )
 
                 if drift:
                     drift_count += 1
                     severity_accumulator += (
-                        min(z_score / self.z_threshold, 4) +
-                        min(abs(np.log(variance_ratio + self.EPSILON)), 4) +
-                        min(psi / self.PSI_ALERT, 4)
+                        min(z_score / self.z_threshold, 4)
+                        + min(abs(np.log(variance_ratio + self.EPSILON)), 4)
+                        + min(psi / self.PSI_ALERT, 4)
                     )
 
                 report[col] = {
                     "z_score": float(z_score),
                     "variance_ratio": float(variance_ratio),
                     "psi": float(psi),
-                    "drift": drift
+                    "drift": drift,
                 }
 
             coverage = float(evaluated_features / max(total_features, 1))
@@ -374,14 +367,15 @@ class DriftDetector:
                 severity_accumulator = 0
 
             severity_score = min(
-                int(np.sqrt(severity_accumulator)),
-                self.MAX_SEVERITY_CAP
+                int(np.sqrt(severity_accumulator)), self.MAX_SEVERITY_CAP
             )
 
             drift_state = (
-                "hard" if severity_score >= self.HARD_SEVERITY_THRESHOLD
-                else "soft" if severity_score >= self.SOFT_SEVERITY_THRESHOLD
-                else "none"
+                "hard"
+                if severity_score >= self.HARD_SEVERITY_THRESHOLD
+                else (
+                    "soft" if severity_score >= self.SOFT_SEVERITY_THRESHOLD else "none"
+                )
             )
 
             drift_confidence = min(1.0, severity_score / self.MAX_SEVERITY_CAP)
@@ -397,7 +391,7 @@ class DriftDetector:
                 "drift_state": drift_state,
                 "coverage": coverage,
                 "details": report,
-                "exposure_scale": exposure_scale
+                "exposure_scale": exposure_scale,
             }
 
         except FileNotFoundError:
@@ -411,7 +405,7 @@ class DriftDetector:
                 "drift_state": "baseline_missing",
                 "coverage": 0,
                 "details": {},
-                "exposure_scale": 1.0
+                "exposure_scale": 1.0,
             }
 
         except Exception as exc:
@@ -430,7 +424,7 @@ class DriftDetector:
                 "drift_state": "detector_failure",
                 "coverage": 0,
                 "details": {},
-                "exposure_scale": 0.4
+                "exposure_scale": 0.4,
             }
 
     # =====================================================
@@ -454,5 +448,5 @@ class DriftDetector:
 
         return {
             "baseline_exists": os.path.exists(self.BASELINE_PATH),
-            "baseline_path": self.BASELINE_PATH
+            "baseline_path": self.BASELINE_PATH,
         }

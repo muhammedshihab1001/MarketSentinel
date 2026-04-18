@@ -28,10 +28,12 @@ class YahooProvider(MarketDataProvider):
     DELTA_WINDOW_DAYS = 30
 
     ALLOWED_INTERVALS = {
-        "1d", "D",
+        "1d",
+        "D",
         "1wk",
         "1mo",
-        "1h", "60m",
+        "1h",
+        "60m",
         "15m",
         "5m",
         "1m",
@@ -67,7 +69,9 @@ class YahooProvider(MarketDataProvider):
     ############################################################
 
     @staticmethod
-    def _is_delta_fetch(start_date: str, end_date: str, delta_threshold_days: int = 30) -> bool:
+    def _is_delta_fetch(
+        start_date: str, end_date: str, delta_threshold_days: int = 30
+    ) -> bool:
         """
         Returns True if the requested date window is short enough
         to be a delta (incremental) sync rather than a full history fetch.
@@ -278,8 +282,7 @@ class YahooProvider(MarketDataProvider):
         ############################################################
 
         clean = (
-            clean
-            .drop_duplicates("date")
+            clean.drop_duplicates("date")
             .sort_values("date")
             .tail(self.MAX_ROWS)
             .reset_index(drop=True)
@@ -349,9 +352,7 @@ class YahooProvider(MarketDataProvider):
         if is_delta:
             # Delta fetch: any non-empty result is acceptable
             if len(clean) == 0:
-                raise RuntimeError(
-                    f"Delta fetch returned zero rows for {ticker}"
-                )
+                raise RuntimeError(f"Delta fetch returned zero rows for {ticker}")
         else:
             # Full historical fetch: enforce minimum row count
             if len(clean) < min_rows:
@@ -386,7 +387,9 @@ class YahooProvider(MarketDataProvider):
     # FETCH
     ############################################################
 
-    def fetch(self, ticker: str, start_date: str, end_date: str, interval: str, **kwargs) -> pd.DataFrame:
+    def fetch(
+        self, ticker: str, start_date: str, end_date: str, interval: str, **kwargs
+    ) -> pd.DataFrame:
 
         if interval not in self.ALLOWED_INTERVALS:
 

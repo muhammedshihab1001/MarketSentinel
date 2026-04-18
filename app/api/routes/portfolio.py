@@ -79,6 +79,7 @@ async def get_portfolio(request: Request):
             cache = request.app.state.cache
         except AttributeError:
             from app.inference.cache import RedisCache
+
             cache = RedisCache()
 
         # ── Load background snapshot ──────────────────
@@ -126,11 +127,13 @@ async def get_portfolio(request: Request):
             else:
                 neutral_count += 1
 
-            positions.append({
-                "ticker": sig.get("ticker", ""),
-                "weight": round(weight, 6),
-                "signal": direction,
-            })
+            positions.append(
+                {
+                    "ticker": sig.get("ticker", ""),
+                    "weight": round(weight, 6),
+                    "signal": direction,
+                }
+            )
 
         positions.sort(key=lambda x: abs(x["weight"]), reverse=True)
 

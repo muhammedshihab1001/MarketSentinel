@@ -2,10 +2,10 @@ from copy import deepcopy
 
 from core.agent.signal_agent import SignalAgent
 
-
 ############################################################
 # FIXED TEST INPUTS
 ############################################################
+
 
 def make_base_context():
 
@@ -19,18 +19,16 @@ def make_base_context():
             "momentum_20_z": 0.5,
             "regime_feature": 0.0,
         },
-        "probability_stats": {
-            "mean": 0.55,
-            "std": 0.10
-        },
+        "probability_stats": {"mean": 0.55, "std": 0.10},
         "drift_state": None,
-        "political_risk_label": None
+        "political_risk_label": None,
     }
 
 
 ############################################################
 # STRUCTURE CONTRACT
 ############################################################
+
 
 def test_signal_agent_structure():
 
@@ -52,7 +50,7 @@ def test_signal_agent_structure():
         "reasoning",
         "warnings",
         "explanation",
-        "hybrid"
+        "hybrid",
     }
 
     assert required_keys.issubset(result.keys())
@@ -65,6 +63,7 @@ def test_signal_agent_structure():
 ############################################################
 # DETERMINISM
 ############################################################
+
 
 def test_agent_is_deterministic():
 
@@ -82,6 +81,7 @@ def test_agent_is_deterministic():
 # CONFIDENCE RANGE
 ############################################################
 
+
 def test_confidence_range():
 
     agent = SignalAgent()
@@ -94,6 +94,7 @@ def test_confidence_range():
 ############################################################
 # CONFIDENCE MONOTONICITY
 ############################################################
+
 
 def test_confidence_monotonicity():
 
@@ -115,6 +116,7 @@ def test_confidence_monotonicity():
 # LOW DISPERSION WARNING
 ############################################################
 
+
 def test_low_dispersion_warning():
 
     agent = SignalAgent()
@@ -131,6 +133,7 @@ def test_low_dispersion_warning():
 # HIGH VOLATILITY REGIME
 ############################################################
 
+
 def test_high_volatility_regime():
 
     agent = SignalAgent()
@@ -146,6 +149,7 @@ def test_high_volatility_regime():
 ############################################################
 # RSI EXTREMES
 ############################################################
+
 
 def test_rsi_overbought():
 
@@ -175,6 +179,7 @@ def test_rsi_oversold():
 ############################################################
 # MOMENTUM CONTRADICTION
 ############################################################
+
 
 def test_momentum_contradiction_long():
 
@@ -206,6 +211,7 @@ def test_momentum_contradiction_short():
 # POSITION SIZE RANGE
 ############################################################
 
+
 def test_position_size_range():
 
     agent = SignalAgent()
@@ -218,6 +224,7 @@ def test_position_size_range():
 ############################################################
 # POLITICAL RISK OVERRIDE
 ############################################################
+
 
 def test_political_risk_override():
 

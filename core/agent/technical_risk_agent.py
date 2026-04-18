@@ -97,9 +97,7 @@ class TechnicalRiskAgent(BaseAgent):
 
         regime_feat = self._safe_float(row.get("regime_feature"), 0.0)
 
-        dollar_volume = max(
-            self._safe_float(row.get("dollar_volume"), 0.0), 0.0
-        )
+        dollar_volume = max(self._safe_float(row.get("dollar_volume"), 0.0), 0.0)
 
         # ─────────────────────────────────────────────
         # MOMENTUM STRENGTH
@@ -180,9 +178,7 @@ class TechnicalRiskAgent(BaseAgent):
 
         if dollar_volume < self.LOW_LIQUIDITY_THRESHOLD:
 
-            warnings.append(
-                f"Low liquidity — volume={dollar_volume:.0f}"
-            )
+            warnings.append(f"Low liquidity — volume={dollar_volume:.0f}")
 
             liquidity_score = 0.5
 
@@ -212,15 +208,7 @@ class TechnicalRiskAgent(BaseAgent):
         # SIGNAL SCORE
         # ─────────────────────────────────────────────
 
-        signal_score = float(np.mean([
-
-            momentum_strength,
-
-            ema_score,
-
-            rsi_score
-
-        ]))
+        signal_score = float(np.mean([momentum_strength, ema_score, rsi_score]))
 
         # ─────────────────────────────────────────────
         # GATE MULTIPLIER
@@ -234,23 +222,15 @@ class TechnicalRiskAgent(BaseAgent):
         # CONFIDENCE
         # ─────────────────────────────────────────────
 
-        indicator_votes = sum([
+        indicator_votes = sum(
+            [
+                1 if momentum_strength > 0.5 else 0,
+                1 if ema_score > 0.3 else 0,
+                1 if rsi_score == 1.0 else 0,
+            ]
+        )
 
-            1 if momentum_strength > 0.5 else 0,
-
-            1 if ema_score > 0.3 else 0,
-
-            1 if rsi_score == 1.0 else 0
-
-        ])
-
-        confidence = float(np.clip(
-
-            (indicator_votes / 3.0) * gate_multiplier,
-
-            0.0, 1.0
-
-        ))
+        confidence = float(np.clip((indicator_votes / 3.0) * gate_multiplier, 0.0, 1.0))
 
         governance_score = int(np.clip(final_score * 100, 0, 100))
 
@@ -269,23 +249,11 @@ class TechnicalRiskAgent(BaseAgent):
         # ─────────────────────────────────────────────
 
         output = self._format_output(
-
             score=final_score,
-
             confidence=confidence,
-
-            signals={
-
-                "bias": bias,
-
-                "volatility_regime": volatility_regime
-
-            },
-
+            signals={"bias": bias, "volatility_regime": volatility_regime},
             warnings=warnings,
-
-            reasoning=reasoning
-
+            reasoning=reasoning,
         )
 
         output["bias"] = bias
@@ -295,21 +263,13 @@ class TechnicalRiskAgent(BaseAgent):
         output["explanation"] = explanation
 
         output["component_scores"] = {
-
             "momentum": momentum_strength,
-
             "ema": ema_score,
-
             "rsi": rsi_score,
-
             "signal_score": signal_score,
-
             "liquidity": liquidity_score,
-
             "drift_penalty": drift_penalty,
-
             "volatility_multiplier": vol_multiplier,
-
         }
 
         return output

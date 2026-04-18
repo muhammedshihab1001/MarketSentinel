@@ -35,6 +35,7 @@ logger = logging.getLogger("marketsentinel.political_agent")
 # PROVIDER BASE
 # =========================================================
 
+
 class _NewsProvider:
     """Base class for all news providers."""
 
@@ -53,6 +54,7 @@ class _NewsProvider:
 # =========================================================
 # PROVIDER 1 — GDELT (free, no key)
 # =========================================================
+
 
 class _GDELTProvider(_NewsProvider):
 
@@ -93,6 +95,7 @@ class _GDELTProvider(_NewsProvider):
 # =========================================================
 # PROVIDER 2 — NewsAPI (free 100 req/day, needs key)
 # =========================================================
+
 
 class _NewsAPIProvider(_NewsProvider):
 
@@ -135,6 +138,7 @@ class _NewsAPIProvider(_NewsProvider):
 # PROVIDER 3 — GNews (free 100 req/day, needs key)
 # =========================================================
 
+
 class _GNewsProvider(_NewsProvider):
 
     name = "gnews"
@@ -175,6 +179,7 @@ class _GNewsProvider(_NewsProvider):
 # PROVIDER 4 — TheNewsAPI (free 100 req/day, needs key)
 # =========================================================
 
+
 class _TheNewsAPIProvider(_NewsProvider):
 
     name = "thenewsapi"
@@ -214,6 +219,7 @@ class _TheNewsAPIProvider(_NewsProvider):
 # =========================================================
 # PROVIDER 5 — MediaStack (free 500 req/month, needs key)
 # =========================================================
+
 
 class _MediaStackProvider(_NewsProvider):
 
@@ -256,6 +262,7 @@ class _MediaStackProvider(_NewsProvider):
 # PROVIDER 6 — CurrentsAPI (free 600 req/day, needs key)
 # =========================================================
 
+
 class _CurrentsAPIProvider(_NewsProvider):
 
     name = "currentsapi"
@@ -295,6 +302,7 @@ class _CurrentsAPIProvider(_NewsProvider):
 # POLITICAL RISK AGENT
 # =========================================================
 
+
 class PoliticalRiskAgent(BaseAgent):
 
     name = "PoliticalRiskAgent"
@@ -309,16 +317,28 @@ class PoliticalRiskAgent(BaseAgent):
 
     # ── Scoring keywords ──────────────────────────────────────
     KEYWORDS_HIGH = [
-        "war", "military", "invasion", "attack",
-        "conflict", "sanctions", "nuclear",
+        "war",
+        "military",
+        "invasion",
+        "attack",
+        "conflict",
+        "sanctions",
+        "nuclear",
     ]
     KEYWORDS_MEDIUM = [
-        "election", "government", "policy",
-        "central bank", "interest rate",
-        "regulation", "geopolitical",
+        "election",
+        "government",
+        "policy",
+        "central bank",
+        "interest rate",
+        "regulation",
+        "geopolitical",
     ]
     KEYWORDS_LOW = [
-        "trade", "economic", "inflation", "budget",
+        "trade",
+        "economic",
+        "inflation",
+        "budget",
     ]
 
     # ── Label thresholds ─────────────────────────────────────
@@ -341,6 +361,7 @@ class PoliticalRiskAgent(BaseAgent):
 
         try:
             from app.inference.cache import RedisCache
+
             self._cache = RedisCache()
             logger.debug("PoliticalRiskAgent: Redis cache connected.")
         except Exception as exc:
@@ -421,7 +442,8 @@ class PoliticalRiskAgent(BaseAgent):
                 headlines = provider.fetch(country)
                 logger.info(
                     "Political risk fetched | provider=%s | headlines=%d",
-                    provider.name, len(headlines),
+                    provider.name,
+                    len(headlines),
                 )
                 return headlines, provider.name
             except requests.Timeout:
@@ -431,7 +453,8 @@ class PoliticalRiskAgent(BaseAgent):
             except Exception as exc:
                 logger.warning(
                     "Political provider failed | provider=%s | error=%s",
-                    provider.name, exc,
+                    provider.name,
+                    exc,
                 )
 
         logger.warning(
@@ -496,16 +519,16 @@ class PoliticalRiskAgent(BaseAgent):
         cache_key = None
         if self._cache is not None:
             try:
-                cache_key = self._cache.build_key({
-                    "type": "political_risk",
-                    "ticker": ticker,
-                    "country": country,
-                })
+                cache_key = self._cache.build_key(
+                    {
+                        "type": "political_risk",
+                        "ticker": ticker,
+                        "country": country,
+                    }
+                )
                 cached = self._cache.get(cache_key)
                 if cached:
-                    logger.debug(
-                        "Political risk cache HIT | ticker=%s", ticker
-                    )
+                    logger.debug("Political risk cache HIT | ticker=%s", ticker)
                     return cached
             except Exception:
                 pass
@@ -557,7 +580,9 @@ class PoliticalRiskAgent(BaseAgent):
             "political_risk_label": label,
             "top_events": headlines[:5],
             "source": source,
-            "gdelt_status": "ok" if source == "gdelt" else f"gdelt_failed_used_{source}",
+            "gdelt_status": (
+                "ok" if source == "gdelt" else f"gdelt_failed_used_{source}"
+            ),
             "served_from_cache": False,
             "timestamp": int(time.time()),
             "cached": False,
@@ -568,9 +593,7 @@ class PoliticalRiskAgent(BaseAgent):
             try:
                 self._cache.set(cache_key, result, ttl=self.CACHE_TTL)
                 # Stale backup has 24h TTL — used when all providers fail
-                self._cache.set(
-                    cache_key + ":stale", result, ttl=86400
-                )
+                self._cache.set(cache_key + ":stale", result, ttl=86400)
             except Exception:
                 pass
 

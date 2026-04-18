@@ -45,10 +45,7 @@ class ModelRegistry:
         while True:
 
             try:
-                fd = os.open(
-                    lock_path,
-                    os.O_CREAT | os.O_EXCL | os.O_RDWR
-                )
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
 
                 os.write(fd, str(os.getpid()).encode())
                 os.close(fd)
@@ -129,9 +126,7 @@ class ModelRegistry:
         size = os.path.getsize(path)
 
         if size < min_bytes:
-            raise RuntimeError(
-                f"File too small or corrupted: {path}"
-            )
+            raise RuntimeError(f"File too small or corrupted: {path}")
 
     ########################################################
     # METADATA HARD VALIDATION
@@ -146,7 +141,7 @@ class ModelRegistry:
             "training_window",
             "training_universe",
             "features",
-            "metrics"
+            "metrics",
         ]
 
         for r in required:
@@ -154,9 +149,7 @@ class ModelRegistry:
                 raise RuntimeError(f"Metadata missing required field: {r}")
 
         if meta["schema_signature"] != get_schema_signature():
-            raise RuntimeError(
-                "Metadata schema does not match runtime schema."
-            )
+            raise RuntimeError("Metadata schema does not match runtime schema.")
 
         universe = meta["training_universe"]
 
@@ -176,11 +169,7 @@ class ModelRegistry:
         clone = dict(manifest)
         clone.pop("manifest_integrity_hash", None)
 
-        canonical = json.dumps(
-            clone,
-            sort_keys=True,
-            separators=(",", ":")
-        ).encode()
+        canonical = json.dumps(clone, sort_keys=True, separators=(",", ":")).encode()
 
         return hashlib.sha256(canonical).hexdigest()
 
@@ -212,7 +201,7 @@ class ModelRegistry:
         base_dir: str,
         model_path: str,
         metadata_path: str,
-        parent_version: str | None = None
+        parent_version: str | None = None,
     ) -> str:
 
         base_dir = os.path.realpath(base_dir)
@@ -222,15 +211,9 @@ class ModelRegistry:
 
         try:
 
-            ModelRegistry._validate_file(
-                model_path,
-                ModelRegistry.DEFAULT_MIN_BYTES
-            )
+            ModelRegistry._validate_file(model_path, ModelRegistry.DEFAULT_MIN_BYTES)
 
-            ModelRegistry._validate_file(
-                metadata_path,
-                100
-            )
+            ModelRegistry._validate_file(metadata_path, 100)
 
             meta = MetadataManager.load_metadata(metadata_path)
             ModelRegistry._validate_metadata_structure(meta)
@@ -258,37 +241,27 @@ class ModelRegistry:
                 shutil.copy2(metadata_path, staged_meta)
 
                 manifest: Dict[str, Any] = {
-
                     "version": version,
                     "created_utc": datetime.datetime.utcnow().isoformat(),
                     "stage": "candidate",
                     "parent": parent_version,
-
                     "dataset_hash": meta["dataset_hash"],
                     "schema_signature": meta["schema_signature"],
                     "training_window": meta["training_window"],
-
                     "artifacts": {
                         model_name: ModelRegistry._sha256(staged_model),
                         metadata_name: ModelRegistry._sha256(staged_meta),
                     },
-
-                    "history": []
+                    "history": [],
                 }
 
-                manifest["manifest_integrity_hash"] = (
-                    ModelRegistry._manifest_hash(manifest)
-                )
-
-                manifest_path = os.path.join(
-                    staging_dir,
-                    ModelRegistry.MANIFEST_NAME
-                )
-
-                ModelRegistry._atomic_json_write(
-                    manifest_path,
+                manifest["manifest_integrity_hash"] = ModelRegistry._manifest_hash(
                     manifest
                 )
+
+                manifest_path = os.path.join(staging_dir, ModelRegistry.MANIFEST_NAME)
+
+                ModelRegistry._atomic_json_write(manifest_path, manifest)
 
                 os.replace(staging_dir, version_dir)
 
@@ -323,8 +296,7 @@ class ModelRegistry:
             version_dir = ModelRegistry._safe_join(base_dir, version)
 
             manifest_path = ModelRegistry._safe_join(
-                version_dir,
-                ModelRegistry.MANIFEST_NAME
+                version_dir, ModelRegistry.MANIFEST_NAME
             )
 
             if not os.path.exists(manifest_path):
@@ -335,34 +307,22 @@ class ModelRegistry:
 
             manifest["stage"] = "production"
 
-            manifest["history"].append({
-                "event": "promoted",
-                "utc": datetime.datetime.utcnow().isoformat()
-            })
-
-            manifest["manifest_integrity_hash"] = (
-                ModelRegistry._manifest_hash(manifest)
+            manifest["history"].append(
+                {"event": "promoted", "utc": datetime.datetime.utcnow().isoformat()}
             )
 
-            ModelRegistry._atomic_json_write(
-                manifest_path,
-                manifest
-            )
+            manifest["manifest_integrity_hash"] = ModelRegistry._manifest_hash(manifest)
 
-            latest_path = os.path.join(
-                base_dir,
-                ModelRegistry.LATEST_POINTER
-            )
+            ModelRegistry._atomic_json_write(manifest_path, manifest)
+
+            latest_path = os.path.join(base_dir, ModelRegistry.LATEST_POINTER)
 
             pointer = {
                 "version": version,
-                "updated_utc": datetime.datetime.utcnow().isoformat()
+                "updated_utc": datetime.datetime.utcnow().isoformat(),
             }
 
-            ModelRegistry._atomic_json_write(
-                latest_path,
-                pointer
-            )
+            ModelRegistry._atomic_json_write(latest_path, pointer)
 
             ModelRegistry._fsync_dir(base_dir)
 

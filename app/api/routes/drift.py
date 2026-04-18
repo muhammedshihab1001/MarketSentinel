@@ -75,11 +75,7 @@ def _drift_from_cache(cache):
         if not snapshot_result or not isinstance(snapshot_result, dict):
             return None
 
-        drift = (
-            snapshot_result
-            .get("snapshot", {})
-            .get("drift", {})
-        )
+        drift = snapshot_result.get("snapshot", {}).get("drift", {})
 
         if drift and isinstance(drift, dict) and "drift_state" in drift:
             return drift, snapshot_result
@@ -101,6 +97,7 @@ def _drift_status_sync(cache) -> dict:
 
     try:
         from app.inference.model_loader import get_model_loader
+
         loader = get_model_loader()
         model_version = getattr(loader, "version", "") or ""
         meta = getattr(loader, "metadata", {}) or {}
@@ -118,8 +115,8 @@ def _drift_status_sync(cache) -> dict:
     if cache_result is not None:
         drift_result, snapshot_result = cache_result
         served_from_cache = True
-        snapshot_date = (
-            snapshot_result.get("snapshot", {}).get("snapshot_date", "unknown")
+        snapshot_date = snapshot_result.get("snapshot", {}).get(
+            "snapshot_date", "unknown"
         )
     else:
         logger.info("Drift cache miss — reading from DriftDetector.health()")
@@ -218,6 +215,7 @@ async def get_drift(request: Request):
         cache = getattr(request.app.state, "cache", None)
         if cache is None:
             from app.inference.cache import RedisCache
+
             cache = RedisCache()
 
         async with drift_semaphore:

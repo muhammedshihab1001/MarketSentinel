@@ -29,15 +29,19 @@ from core.config.env_loader import get_bool, get_env, get_int
 logger = logging.getLogger("marketsentinel.llm")
 
 # ── Expected keys per response type ──────────────────────────────────────────
-_STOCK_REQUIRED_KEYS:     Set[str] = {"summary", "rationale", "risk_commentary", "outlook"}
-_PORTFOLIO_REQUIRED_KEYS: Set[str] = {"portfolio_summary", "macro_risk_view", "allocation_comment"}
+_STOCK_REQUIRED_KEYS: Set[str] = {"summary", "rationale", "risk_commentary", "outlook"}
+_PORTFOLIO_REQUIRED_KEYS: Set[str] = {
+    "portfolio_summary",
+    "macro_risk_view",
+    "allocation_comment",
+}
 
 # ── Token limits ──────────────────────────────────────────────────────────────
-_STOCK_MAX_TOKENS     = 400
+_STOCK_MAX_TOKENS = 400
 _PORTFOLIO_MAX_TOKENS = 600
 
 # ── Cache batch eviction size ─────────────────────────────────────────────────
-_CACHE_EVICT_BATCH = 10   # evict oldest 10 at once when cache is full
+_CACHE_EVICT_BATCH = 10  # evict oldest 10 at once when cache is full
 
 
 class LLMExplainer:
@@ -53,19 +57,19 @@ class LLMExplainer:
     # ────────────────────────────────────────────────────────────────────────
 
     def __init__(self) -> None:
-        self.enabled               = get_bool("LLM_ENABLED",          False)
-        self.model_name            = get_env("OPENAI_MODEL",           "gpt-4o-mini")
-        self.timeout               = get_int("OPENAI_TIMEOUT",         12)
+        self.enabled = get_bool("LLM_ENABLED", False)
+        self.model_name = get_env("OPENAI_MODEL", "gpt-4o-mini")
+        self.timeout = get_int("OPENAI_TIMEOUT", 12)
         self.rate_limit_per_minute = get_int("LLM_RATE_LIMIT_PER_MIN", 30)
-        self.cache_enabled         = get_bool("LLM_CACHE_ENABLED",     True)
-        self.cache_ttl_seconds     = get_int("LLM_CACHE_TTL_SEC",      180)
-        self.audit_enabled         = get_bool("LLM_AUDIT_ENABLED",     True)
-        self.max_cache_items       = get_int("LLM_CACHE_MAX_ITEMS",    500)
+        self.cache_enabled = get_bool("LLM_CACHE_ENABLED", True)
+        self.cache_ttl_seconds = get_int("LLM_CACHE_TTL_SEC", 180)
+        self.audit_enabled = get_bool("LLM_AUDIT_ENABLED", True)
+        self.max_cache_items = get_int("LLM_CACHE_MAX_ITEMS", 500)
 
         self._request_times: List[float] = []
-        self._rate_lock  = threading.Lock()
+        self._rate_lock = threading.Lock()
 
-        self._cache:      Dict[str, Any] = {}
+        self._cache: Dict[str, Any] = {}
         self._cache_lock = threading.Lock()
 
         api_key = get_env("OPENAI_API_KEY")
@@ -82,7 +86,8 @@ class LLMExplainer:
 
         logger.info(
             "LLMExplainer ready | enabled=%s | model=%s",
-            self.enabled, self.model_name,
+            self.enabled,
+            self.model_name,
         )
 
     # ────────────────────────────────────────────────────────────────────────
@@ -96,9 +101,7 @@ class LLMExplainer:
 
         now = time.time()
         with self._rate_lock:
-            self._request_times = [
-                t for t in self._request_times if now - t < 60
-            ]
+            self._request_times = [t for t in self._request_times if now - t < 60]
             if len(self._request_times) >= self.rate_limit_per_minute:
                 return False
             self._request_times.append(now)
@@ -110,37 +113,44 @@ class LLMExplainer:
 
     def _cache_key(
         self,
-        row:              Dict[str, Any],
-        signal_output:    Dict[str, Any],
+        row: Dict[str, Any],
+        signal_output: Dict[str, Any],
         technical_output: Dict[str, Any],
-        stats:            Dict[str, Any],
+        stats: Dict[str, Any],
     ) -> str:
         payload = {
-            "ticker":      row.get("ticker"),
-            "score":       row.get("hybrid_consensus_score"),
-            "confidence":  signal_output.get("confidence_numeric"),
-            "risk":        signal_output.get("risk_level"),
-            "vol_regime":  signal_output.get("volatility_regime"),
-            "tech_bias":   technical_output.get("bias"),
-            "tech_score":  technical_output.get("score"),
+            "ticker": row.get("ticker"),
+            "score": row.get("hybrid_consensus_score"),
+            "confidence": signal_output.get("confidence_numeric"),
+            "risk": signal_output.get("risk_level"),
+            "vol_regime": signal_output.get("volatility_regime"),
+            "tech_bias": technical_output.get("bias"),
+            "tech_score": technical_output.get("score"),
             "drift_state": stats.get("drift_state"),
-            "severity":    stats.get("severity_score"),
+            "severity": stats.get("severity_score"),
         }
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True).encode()
-        ).hexdigest()
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     def _portfolio_cache_key(self, decision_report: Dict[str, Any]) -> str:
         payload = {
-            "portfolio_bias":    decision_report.get("portfolio_findings", {}).get("portfolio_bias"),
-            "avg_confidence":    decision_report.get("portfolio_findings", {}).get("average_confidence"),
-            "drift_state":       decision_report.get("portfolio_findings", {}).get("drift_state"),
-            "concentration":     decision_report.get("portfolio_findings", {}).get("concentration_risk"),
-            "snapshot_date":     decision_report.get("snapshot_date"),
+            "portfolio_bias": decision_report.get("portfolio_findings", {}).get(
+                "portfolio_bias"
+            ),
+            "avg_confidence": decision_report.get("portfolio_findings", {}).get(
+                "average_confidence"
+            ),
+            "drift_state": decision_report.get("portfolio_findings", {}).get(
+                "drift_state"
+            ),
+            "concentration": decision_report.get("portfolio_findings", {}).get(
+                "concentration_risk"
+            ),
+            "snapshot_date": decision_report.get("snapshot_date"),
         }
-        return "portfolio:" + hashlib.sha256(
-            json.dumps(payload, sort_keys=True).encode()
-        ).hexdigest()
+        return (
+            "portfolio:"
+            + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        )
 
     def _get_cached(self, key: str) -> Optional[Dict[str, Any]]:
         if not self.cache_enabled:
@@ -161,9 +171,9 @@ class LLMExplainer:
         with self._cache_lock:
             # Batch eviction: remove oldest _CACHE_EVICT_BATCH items when full
             if len(self._cache) >= self.max_cache_items:
-                oldest_keys = sorted(
-                    self._cache, key=lambda k: self._cache[k][1]
-                )[:_CACHE_EVICT_BATCH]
+                oldest_keys = sorted(self._cache, key=lambda k: self._cache[k][1])[
+                    :_CACHE_EVICT_BATCH
+                ]
                 for k in oldest_keys:
                     del self._cache[k]
             self._cache[key] = (value, time.time())
@@ -186,12 +196,12 @@ class LLMExplainer:
                 json.dumps(result, sort_keys=True).encode()
             ).hexdigest()
             record = {
-                "timestamp":     datetime.now(timezone.utc).isoformat(),
-                "ticker":        ticker,
-                "signal":        signal,
-                "model":         self.model_name,
-                "cached":        cached,
-                "status":        "error" if "error" in result else "success",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "ticker": ticker,
+                "signal": signal,
+                "model": self.model_name,
+                "cached": cached,
+                "status": "error" if "error" in result else "success",
                 "response_hash": response_hash,
             }
             logger.info("LLM_AUDIT | %s", json.dumps(record))
@@ -211,10 +221,10 @@ class LLMExplainer:
             content,
             required_keys=_STOCK_REQUIRED_KEYS,
             fallback={
-                "summary":          "Explanation unavailable.",
-                "rationale":        "Model response could not be parsed.",
-                "risk_commentary":  "Unavailable.",
-                "outlook":          "Unavailable.",
+                "summary": "Explanation unavailable.",
+                "rationale": "Model response could not be parsed.",
+                "risk_commentary": "Unavailable.",
+                "outlook": "Unavailable.",
             },
         )
 
@@ -227,22 +237,22 @@ class LLMExplainer:
             content,
             required_keys=_PORTFOLIO_REQUIRED_KEYS,
             fallback={
-                "portfolio_summary":  "Portfolio explanation unavailable.",
-                "macro_risk_view":    "Unavailable.",
+                "portfolio_summary": "Portfolio explanation unavailable.",
+                "macro_risk_view": "Unavailable.",
                 "allocation_comment": "Unavailable.",
             },
         )
 
     @staticmethod
     def _parse_json(
-        content:       str,
+        content: str,
         required_keys: Set[str],
-        fallback:      Dict[str, Any],
+        fallback: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Generic JSON parser with key validation and fallback."""
         try:
             content = content.replace("```json", "").replace("```", "").strip()
-            data    = json.loads(content)
+            data = json.loads(content)
             if not required_keys.issubset(data.keys()):
                 missing = required_keys - set(data.keys())
                 logger.warning("LLM response missing keys: %s", missing)
@@ -261,10 +271,10 @@ class LLMExplainer:
 
     def _build_stock_prompt(
         self,
-        row:              Dict[str, Any],
-        signal_output:    Dict[str, Any],
+        row: Dict[str, Any],
+        signal_output: Dict[str, Any],
         technical_output: Dict[str, Any],
-        drift_stats:      Dict[str, Any],
+        drift_stats: Dict[str, Any],
     ) -> str:
         warnings = signal_output.get("warnings", [])[:5]
         return (
@@ -283,10 +293,8 @@ class LLMExplainer:
         )
 
     def _build_portfolio_prompt(self, decision_report: Dict[str, Any]) -> str:
-        findings = json.dumps(
-            decision_report.get("portfolio_findings", {}), indent=2
-        )
-        summary  = decision_report.get("executive_summary", "")
+        findings = json.dumps(decision_report.get("portfolio_findings", {}), indent=2)
+        summary = decision_report.get("executive_summary", "")
         return (
             f"Portfolio Findings:\n{findings}\n\n"
             f"Executive Summary:\n{summary}\n\n"
@@ -300,10 +308,10 @@ class LLMExplainer:
 
     async def explain(
         self,
-        signal_row:       Dict[str, Any],
-        signal_output:    Dict[str, Any],
+        signal_row: Dict[str, Any],
+        signal_output: Dict[str, Any],
         technical_output: Dict[str, Any],
-        drift_stats:      Dict[str, Any],
+        drift_stats: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
         Generate LLM explanation for a single stock signal.
@@ -342,7 +350,7 @@ class LLMExplainer:
                     model=self.model_name,
                     messages=[
                         {
-                            "role":    "system",
+                            "role": "system",
                             "content": (
                                 "You are an institutional equity strategist. "
                                 "Return ONLY valid JSON with keys: "
@@ -357,17 +365,17 @@ class LLMExplainer:
                 timeout=self.timeout,
             )
 
-            latency     = time.time() - start
+            latency = time.time() - start
             raw_content = response.choices[0].message.content.strip()
-            parsed      = self._parse_stock_json(raw_content)
+            parsed = self._parse_stock_json(raw_content)
 
             result = {
                 "llm_enabled": True,
-                "model":       self.model_name,
-                "latency":     round(latency, 3),
-                "timestamp":   datetime.now(timezone.utc).isoformat(),
-                "structured":  parsed,
-                "cached":      False,
+                "model": self.model_name,
+                "latency": round(latency, 3),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "structured": parsed,
+                "cached": False,
             }
 
             self._set_cache(cache_key, result)
@@ -404,7 +412,7 @@ class LLMExplainer:
 
         # ── Cache check (portfolio has its own key) ───────────────────────────
         cache_key = self._portfolio_cache_key(decision_report)
-        cached    = self._get_cached(cache_key)
+        cached = self._get_cached(cache_key)
         if cached:
             logger.debug("Portfolio LLM cache hit.")
             return {**cached, "cached": True}
@@ -415,7 +423,7 @@ class LLMExplainer:
 
         # ── OpenAI call ───────────────────────────────────────────────────────
         prompt = self._build_portfolio_prompt(decision_report)
-        start  = time.time()
+        start = time.time()
 
         try:
             response = await asyncio.wait_for(
@@ -423,7 +431,7 @@ class LLMExplainer:
                     model=self.model_name,
                     messages=[
                         {
-                            "role":    "system",
+                            "role": "system",
                             "content": "Return valid JSON only.",
                         },
                         {"role": "user", "content": prompt},
@@ -434,17 +442,17 @@ class LLMExplainer:
                 timeout=self.timeout,
             )
 
-            latency     = time.time() - start
+            latency = time.time() - start
             raw_content = response.choices[0].message.content.strip()
-            parsed      = self._parse_portfolio_json(raw_content)   # ← correct parser
+            parsed = self._parse_portfolio_json(raw_content)  # ← correct parser
 
             result = {
                 "llm_enabled": True,
-                "model":       self.model_name,
-                "latency":     round(latency, 3),
-                "timestamp":   datetime.now(timezone.utc).isoformat(),
-                "structured":  parsed,
-                "cached":      False,
+                "model": self.model_name,
+                "latency": round(latency, 3),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "structured": parsed,
+                "cached": False,
             }
 
             self._set_cache(cache_key, result)

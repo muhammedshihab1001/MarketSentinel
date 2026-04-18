@@ -50,6 +50,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # PASSWORD UTILITIES
 # =========================================================
 
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
         return pwd_context.verify(plain_password, hashed_password)
@@ -65,6 +66,7 @@ def get_password_hash(plain_password: str) -> str:
 # TOKEN CREATION
 # =========================================================
 
+
 def create_owner_token(username: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(days=JWT_OWNER_EXPIRE_DAYS)
     payload = {
@@ -77,7 +79,8 @@ def create_owner_token(username: str) -> str:
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
     logger.info(
         "Owner token created | username=%s | expires=%s",
-        username, expire.isoformat(),
+        username,
+        expire.isoformat(),
     )
     return token
 
@@ -104,6 +107,7 @@ def create_demo_token(fingerprint: str, ip_hash: str = "") -> str:
 # =========================================================
 # TOKEN VERIFICATION
 # =========================================================
+
 
 def verify_token(token: str) -> Optional[dict]:
     """
@@ -134,6 +138,7 @@ def decode_token(token: str) -> dict:
 # OWNER AUTHENTICATION
 # =========================================================
 
+
 def authenticate_owner(username: str, password: str) -> bool:
     if not OWNER_PASSWORD_HASH:
         logger.error(
@@ -142,9 +147,7 @@ def authenticate_owner(username: str, password: str) -> bool:
         )
         return False
     if not OWNER_USERNAME:
-        logger.error(
-            "OWNER_USERNAME not set in .env"
-        )
+        logger.error("OWNER_USERNAME not set in .env")
         return False
     if username != OWNER_USERNAME:
         return False

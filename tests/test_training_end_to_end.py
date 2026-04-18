@@ -9,13 +9,13 @@ from training.train_xgboost import trainer
 from training.backtesting.walk_forward import WalkForwardValidator
 from core.schema.feature_schema import MODEL_FEATURES, validate_feature_schema, DTYPE
 
-
 ############################################################
 # SYNTHETIC DATASET BUILDER
 # FIX (item 37): Use relative dates — was hardcoded 2025-01-01
 # which will silently become a future date as time passes.
 # Now uses today - 500 days so tests are always historical.
 ############################################################
+
 
 def build_training_dataset():
 
@@ -62,6 +62,7 @@ def build_training_dataset():
 # TRAINING PIPELINE TEST
 ############################################################
 
+
 def test_training_pipeline_runs():
 
     df = build_training_dataset()
@@ -74,6 +75,7 @@ def test_training_pipeline_runs():
 ############################################################
 # WALK-FORWARD WITH REAL TRAINER
 ############################################################
+
 
 def test_training_walkforward():
 
@@ -95,6 +97,7 @@ def test_training_walkforward():
 ############################################################
 # ARTIFACT EXPORT TEST
 ############################################################
+
 
 def test_model_artifact_export():
 
@@ -140,6 +143,7 @@ def test_model_artifact_export():
 ############################################################
 # DETERMINISM CHECK
 ############################################################
+
 
 def test_training_deterministic():
 

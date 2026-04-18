@@ -2,13 +2,13 @@ from pydantic import BaseModel, Field, field_validator
 from datetime import date
 from typing import List, Optional, Dict, Any
 
-
 MAX_FORECAST_DAYS = 90
 
 
 # =========================================================
 # FORECAST REQUEST (LEGACY / OPTIONAL)
 # =========================================================
+
 
 class PredictionRequest(BaseModel):
     """
@@ -20,24 +20,20 @@ class PredictionRequest(BaseModel):
         default="AAPL",
         min_length=1,
         max_length=10,
-        description="Stock ticker symbol (e.g. AAPL, TSLA)"
+        description="Stock ticker symbol (e.g. AAPL, TSLA)",
     )
 
     start_date: Optional[date] = Field(
-        default=None,
-        description="Forecast start date (default = today)"
+        default=None, description="Forecast start date (default = today)"
     )
 
-    end_date: Optional[date] = Field(
-        default=None,
-        description="Forecast end date"
-    )
+    end_date: Optional[date] = Field(default=None, description="Forecast end date")
 
     forecast_days: Optional[int] = Field(
         default=30,
         ge=1,
         le=MAX_FORECAST_DAYS,
-        description="Number of days to forecast (max 90)"
+        description="Number of days to forecast (max 90)",
     )
 
     @field_validator("ticker")
@@ -74,9 +70,7 @@ class PredictionRequest(BaseModel):
     def validate_forecast_days(cls, v):
 
         if v and v > MAX_FORECAST_DAYS:
-            raise ValueError(
-                f"forecast_days cannot exceed {MAX_FORECAST_DAYS}"
-            )
+            raise ValueError(f"forecast_days cannot exceed {MAX_FORECAST_DAYS}")
 
         return v
 
@@ -84,6 +78,7 @@ class PredictionRequest(BaseModel):
 # =========================================================
 # MULTI-AGENT SIGNAL EXPLANATION
 # =========================================================
+
 
 class SignalExplanationResponse(BaseModel):
 
@@ -117,11 +112,10 @@ class SignalExplanationResponse(BaseModel):
 # META INFORMATION
 # =========================================================
 
+
 class SignalExplanationMeta(BaseModel):
 
-    model_config = {
-        "protected_namespaces": ()
-    }
+    model_config = {"protected_namespaces": ()}
 
     model_version: Optional[str] = None
     schema_signature: Optional[str] = None
@@ -136,6 +130,7 @@ class SignalExplanationMeta(BaseModel):
 # SIGNAL EXPLANATION ENVELOPE
 # =========================================================
 
+
 class SignalExplanationEnvelope(BaseModel):
 
     meta: SignalExplanationMeta
@@ -145,6 +140,7 @@ class SignalExplanationEnvelope(BaseModel):
 # =========================================================
 # LIVE SNAPSHOT RESPONSE
 # =========================================================
+
 
 class LiveSnapshotResponse(BaseModel):
 
@@ -156,6 +152,7 @@ class LiveSnapshotResponse(BaseModel):
 # =========================================================
 # AGENT EXPLAIN RESPONSE
 # =========================================================
+
 
 class AgentExplainResponse(BaseModel):
 
@@ -169,6 +166,7 @@ class AgentExplainResponse(BaseModel):
 # DRIFT STATUS RESPONSE
 # =========================================================
 
+
 class DriftStatusResponse(BaseModel):
 
     drift_state: str
@@ -179,6 +177,7 @@ class DriftStatusResponse(BaseModel):
 # =========================================================
 # PORTFOLIO RESPONSE
 # =========================================================
+
 
 class PortfolioResponse(BaseModel):
 

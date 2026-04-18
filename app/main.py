@@ -51,8 +51,15 @@ from core.schema.feature_schema import get_schema_signature
 from core.logging.logger import get_logger
 
 from app.api.routes import (
-    drift, model_info, portfolio, universe,
-    health, predict, performance, equity, agent,
+    drift,
+    model_info,
+    portfolio,
+    universe,
+    health,
+    predict,
+    performance,
+    equity,
+    agent,
 )
 from app.api.routes import auth as auth_router
 from app.core.auth.middleware import AuthMiddleware
@@ -62,13 +69,99 @@ from core.monitoring.drift_detector import DriftDetector
 from core.db.engine import init_db, check_db_health, dispose_engine
 from core.data.data_sync import DataSyncService
 
-
 # =====================================================
 # ENV INITIALIZATION
 # =====================================================
 
 init_env()
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+DEMO_REQUESTS_PER_FEATURE = int(os.getenv("DEMO_REQUESTS_PER_FEATURE", "10"))
+DEMO_BLOCK_DAYS = int(os.getenv("DEMO_BLOCK_DAYS", "7"))
 logger = get_logger("marketsentinel")
+
+
+def _validate_redis_strict() -> bool:
+    """
+    Validate that Redis strict mode is working.
+    Called during startup to ensure demo tracking will function.
+
+    Returns:
+        True if Redis strict mode passes health check
+    """
+    from app.inference.cache import RedisCache
+    from app.core.auth.demo_tracker import DemoTracker
+
+    try:
+        cache = RedisCache()
+
+        # Test 1: Basic connectivity
+        if not cache.is_available():
+            logger.warning(
+                "Redis strict mode check: Redis not available at startup | "
+                "Demo tracking will be degraded until Redis connects"
+            )
+            return False
+
+        # Test 2: Strict client access
+        try:
+            strict_client = cache.get_strict_client()
+            strict_client.ping()
+            logger.info("Redis strict mode: ✓ Basic connectivity")
+        except RuntimeError:
+            logger.error(
+                "Redis strict mode check: get_strict_client() failed | "
+                "Critical operations will be blocked"
+            )
+            return False
+
+        # Test 3: DemoTracker operations
+        try:
+            tracker = DemoTracker(cache=cache)
+            test_fp = "test_fingerprint_startup_check"
+
+            # Clean up any previous test data
+            try:
+                tracker.reset_fingerprint(test_fp, ["test_feature"])
+            except Exception:
+                pass
+
+            # Test increment
+            count = tracker.increment(test_fp, "test_feature")
+            if count != 1:
+                logger.error(
+                    "Redis strict mode check: increment returned %d, expected 1", count
+                )
+                return False
+
+            # Test get_count
+            retrieved = tracker.get_count(test_fp, "test_feature")
+            if retrieved != 1:
+                logger.error(
+                    "Redis strict mode check: get_count returned %d, expected 1",
+                    retrieved,
+                )
+                return False
+
+            # Clean up
+            tracker.reset_fingerprint(test_fp, ["test_feature"])
+
+            logger.info("Redis strict mode: ✓ DemoTracker operations")
+
+        except RuntimeError as e:
+            logger.error(
+                "Redis strict mode check: DemoTracker test failed | error=%s", e
+            )
+            return False
+
+        logger.info(
+            "Redis strict mode validation: ✅ PASSED | " "Demo tracking operational"
+        )
+        return True
+
+    except Exception as e:
+        logger.error("Redis strict mode check: Unexpected error | error=%s", e)
+        return False
 
 
 # =====================================================
@@ -88,10 +181,21 @@ SNAPSHOT_PRECOMPUTE_INTERVAL = int(os.getenv("SNAPSHOT_PRECOMPUTE_INTERVAL", "30
 DATA_STALENESS_HOURS = int(os.getenv("DATA_STALENESS_HOURS", "24"))
 
 PUBLIC_PATHS = {
-    "/", "/docs", "/openapi.json", "/redoc", "/metrics",
-    "/health/live", "/health/ready", "/health/db", "/health/model",
-    "/universe", "/auth/owner-login", "/auth/demo-login",
-    "/auth/me", "/auth/logout", "/favicon.ico",
+    "/",
+    "/docs",
+    "/openapi.json",
+    "/redoc",
+    "/metrics",
+    "/health/live",
+    "/health/ready",
+    "/health/db",
+    "/health/model",
+    "/universe",
+    "/auth/owner-login",
+    "/auth/demo-login",
+    "/auth/me",
+    "/auth/logout",
+    "/favicon.ico",
     "/model/info",
     "/agent/agents",
 }
@@ -104,15 +208,15 @@ PUBLIC_PATHS = {
 # =====================================================
 
 PER_PATH_RATE_LIMITS = {
-    "/auth/owner-login":        (5,  60),
-    "/auth/demo-login":         (10, 60),
-    "/predict/live-snapshot":   (10, 60),
-    "/snapshot":                (10, 60),
-    "/agent/explain":           (20, 60),
-    "/agent/political-risk":    (20, 60),
-    "/performance":             (20, 60),
-    "/health/live":             (60, 60),
-    "/health/ready":            (60, 60),
+    "/auth/owner-login": (5, 60),
+    "/auth/demo-login": (10, 60),
+    "/predict/live-snapshot": (10, 60),
+    "/snapshot": (10, 60),
+    "/agent/explain": (20, 60),
+    "/agent/political-risk": (20, 60),
+    "/performance": (20, 60),
+    "/health/live": (60, 60),
+    "/health/ready": (60, 60),
 }
 
 RATE_LIMIT_DEFAULT = (60, 60)
@@ -124,6 +228,7 @@ _snapshot_lock = asyncio.Lock()
 # =====================================================
 # RATE LIMIT HELPERS
 # =====================================================
+
 
 def _get_path_limit(path: str) -> tuple:
     """Return (max_requests, window_seconds) for the given path."""
@@ -169,6 +274,7 @@ def _check_rate_limit(redis_client, client_ip: str, path: str) -> tuple:
 # READINESS STATE
 # =====================================================
 
+
 class ReadinessState:
     def __init__(self):
         self.models_loaded = False
@@ -197,6 +303,7 @@ readiness = ReadinessState()
 # RESPONSE HELPERS
 # =====================================================
 
+
 def api_success(data):
     return {
         "success": True,
@@ -219,6 +326,7 @@ def api_error(message):
 # GLOBAL EXCEPTION HANDLER
 # =====================================================
 
+
 async def global_exception_handler(request: Request, exc: Exception):
     if isinstance(exc, HTTPException):
         return JSONResponse(
@@ -233,9 +341,11 @@ async def global_exception_handler(request: Request, exc: Exception):
 # DATA STALENESS CHECK
 # =====================================================
 
+
 async def _is_data_stale() -> bool:
     try:
         from core.db.repository import OHLCVRepository
+
         stored = await asyncio.to_thread(OHLCVRepository.get_stored_tickers)
         if not stored:
             logger.info("DB is empty — full sync required")
@@ -247,7 +357,9 @@ async def _is_data_stale() -> bool:
         stale = age_hours >= DATA_STALENESS_HOURS
         logger.info(
             "Data staleness check | latest=%s age_hours=%d stale=%s",
-            latest, age_hours, stale,
+            latest,
+            age_hours,
+            stale,
         )
         return stale
     except Exception as e:
@@ -258,6 +370,7 @@ async def _is_data_stale() -> bool:
 # =====================================================
 # BACKGROUND TASKS
 # =====================================================
+
 
 async def _daily_sync_loop():
     while True:
@@ -320,7 +433,8 @@ async def _background_snapshot_loop():
             except Exception as e:
                 logger.warning(
                     "Background snapshot failed | error=%s | took=%ss",
-                    e, round(time.time() - snapshot_start, 1),
+                    e,
+                    round(time.time() - snapshot_start, 1),
                 )
 
         await asyncio.sleep(SNAPSHOT_PRECOMPUTE_INTERVAL)
@@ -329,6 +443,7 @@ async def _background_snapshot_loop():
 # =====================================================
 # LIFESPAN
 # =====================================================
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -350,7 +465,8 @@ async def lifespan(app: FastAPI):
             readiness.db_connected = db_health["status"] == "healthy"
             logger.info(
                 "Database ready | status=%s latency=%.1fms",
-                db_health["status"], db_health.get("latency_ms", 0),
+                db_health["status"],
+                db_health.get("latency_ms", 0),
             )
         except Exception:
             readiness.db_connected = False
@@ -361,6 +477,7 @@ async def lifespan(app: FastAPI):
             try:
                 stale = await _is_data_stale()
                 if stale:
+
                     async def _run_sync():
                         try:
                             svc = DataSyncService()
@@ -376,6 +493,7 @@ async def lifespan(app: FastAPI):
                             )
                         except Exception:
                             logger.exception("Background sync failed")
+
                     asyncio.create_task(_run_sync())
                     logger.info("Background sync started — API serving immediately")
                 else:
@@ -409,12 +527,37 @@ async def lifespan(app: FastAPI):
         # ── Redis ─────────────────────────────────────
         try:
             cache = RedisCache()
-            readiness.redis_connected = cache.ping()
-            if not readiness.redis_connected:
-                logger.warning("Redis unavailable — degraded mode (memory fallback)")
+            redis_connected = cache.ping()
+            readiness.redis_connected = redis_connected
+
+            if redis_connected:
+                logger.info("Redis connected | host=%s port=%d", REDIS_HOST, REDIS_PORT)
+
+                # Validate strict mode functionality
+                strict_mode_ok = _validate_redis_strict()
+                if not strict_mode_ok:
+                    logger.warning(
+                        "Redis strict mode validation failed | "
+                        "Demo tracking may be degraded | "
+                        "Owner/API key access will bypass Redis checks"
+                    )
+            else:
+                logger.warning(
+                    "Redis unavailable at startup | "
+                    "Demo tracking DISABLED — demo users will be blocked | "
+                    "Owner/API key users can still access the system | "
+                    "Inference caching degraded — using memory fallback"
+                )
+
             app.state.cache = cache
-        except Exception:
-            logger.warning("Redis init failed — degraded mode")
+
+        except Exception as e:
+            logger.warning(
+                "Redis init failed | error=%s | "
+                "Demo tracking DISABLED | "
+                "Inference caching degraded",
+                e,
+            )
             cache = RedisCache()
             readiness.redis_connected = False
             app.state.cache = cache
@@ -423,9 +566,7 @@ async def lifespan(app: FastAPI):
         if readiness.models_loaded:
             try:
                 predict.init_pipeline(loader, cache)
-                logger.info(
-                    "InferencePipeline initialized | model=%s", loader.version
-                )
+                logger.info("InferencePipeline initialized | model=%s", loader.version)
             except Exception:
                 logger.exception("InferencePipeline init failed")
 
@@ -441,17 +582,33 @@ async def lifespan(app: FastAPI):
         # ── LLM + memory ──────────────────────────────
         readiness.llm_enabled = get_bool("LLM_ENABLED", False)
         process = psutil.Process(os.getpid())
-        readiness.boot_memory_mb = round(
-            process.memory_info().rss / (1024 * 1024), 2
-        )
+        readiness.boot_memory_mb = round(process.memory_info().rss / (1024 * 1024), 2)
         gc.collect()
 
         boot_time = round(time.time() - boot_start, 2)
         logger.info(
             "Startup complete | time=%ss | db=%s | redis=%s | model=%s | drift=%s",
-            boot_time, readiness.db_connected, readiness.redis_connected,
-            readiness.models_loaded, readiness.drift_baseline_loaded,
+            boot_time,
+            readiness.db_connected,
+            readiness.redis_connected,
+            readiness.models_loaded,
+            readiness.drift_baseline_loaded,
         )
+
+        # Add this new log line:
+        if readiness.redis_connected:
+            logger.info(
+                "Demo tracking: ✅ OPERATIONAL (strict mode) | "
+                "limit=%d per feature | window=%d days",
+                DEMO_REQUESTS_PER_FEATURE,
+                DEMO_BLOCK_DAYS,
+            )
+        else:
+            logger.warning(
+                "Demo tracking: ⚠️  DISABLED (Redis unavailable) | "
+                "Demo users will receive 503 errors | "
+                "Owner/API key users bypass Redis requirement"
+            )
 
         logger.info(
             "Rate limits active | endpoints=%d | default=%d req/%ds | fails-open",
@@ -519,6 +676,7 @@ app.add_middleware(AuthMiddleware)
 # REQUEST MIDDLEWARE — per-endpoint rate limit
 # =====================================================
 
+
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
 
@@ -526,10 +684,9 @@ async def request_context_middleware(request: Request, call_next):
 
     # ── Auth check ────────────────────────────────────
     if path not in PUBLIC_PATHS:
-        has_jwt = (
-            request.cookies.get("ms_token")
-            or request.headers.get("Authorization", "").startswith("Bearer ")
-        )
+        has_jwt = request.cookies.get("ms_token") or request.headers.get(
+            "Authorization", ""
+        ).startswith("Bearer ")
         if not has_jwt:
             client_key = request.headers.get("X-API-KEY")
             if not API_KEY:
@@ -563,7 +720,10 @@ async def request_context_middleware(request: Request, call_next):
             if not allowed:
                 logger.warning(
                     "Rate limit exceeded | ip=%s path=%s count=%d limit=%d",
-                    client_ip, path, count, limit,
+                    client_ip,
+                    path,
+                    count,
+                    limit,
                 )
                 resp = JSONResponse(
                     status_code=429,
@@ -617,16 +777,19 @@ app.include_router(agent.router)
 # FIX: /snapshot now tracks demo quota via predict route
 # =====================================================
 
+
 @app.post("/snapshot")
 async def snapshot(request: Request):
     """Full inference run — alias for POST /predict/live-snapshot."""
     from app.api.routes.predict import live_snapshot
+
     return await live_snapshot(request)
 
 
 # =====================================================
 # ADMIN: MANUAL SYNC
 # =====================================================
+
 
 @app.post("/admin/sync")
 async def admin_sync(request: Request):
@@ -649,41 +812,47 @@ async def admin_sync(request: Request):
             logger.exception("Manual sync failed")
 
     asyncio.create_task(_run())
-    return api_success({
-        "message": "Data sync started in background",
-        "status": "running",
-        "timestamp": dt.now(timezone.utc).isoformat(),
-    })
+    return api_success(
+        {
+            "message": "Data sync started in background",
+            "status": "running",
+            "timestamp": dt.now(timezone.utc).isoformat(),
+        }
+    )
 
 
 # =====================================================
 # ROOT
 # =====================================================
 
+
 @app.get("/")
 async def root():
     uptime = int(time.time()) - readiness.start_time
-    return api_success({
-        "service": "MarketSentinel Hybrid Portfolio Engine",
-        "status": "running",
-        "boot_id": readiness.boot_id,
-        "model_version": readiness.model_version,
-        "artifact_hash": readiness.artifact_hash,
-        "db": readiness.db_connected,
-        "redis": readiness.redis_connected,
-        "data_synced": readiness.data_synced,
-        "drift_baseline": readiness.drift_baseline_loaded,
-        "uptime_seconds": uptime,
-        "version": APP_VERSION,
-        "docs": "/docs",
-        "metrics": "/metrics",
-        "models_loaded": readiness.models_loaded,
-    })
+    return api_success(
+        {
+            "service": "MarketSentinel Hybrid Portfolio Engine",
+            "status": "running",
+            "boot_id": readiness.boot_id,
+            "model_version": readiness.model_version,
+            "artifact_hash": readiness.artifact_hash,
+            "db": readiness.db_connected,
+            "redis": readiness.redis_connected,
+            "data_synced": readiness.data_synced,
+            "drift_baseline": readiness.drift_baseline_loaded,
+            "uptime_seconds": uptime,
+            "version": APP_VERSION,
+            "docs": "/docs",
+            "metrics": "/metrics",
+            "models_loaded": readiness.models_loaded,
+        }
+    )
 
 
 # =====================================================
 # METRICS
 # =====================================================
+
 
 @app.get("/metrics")
 def metrics():

@@ -45,7 +45,7 @@ class WalkForwardValidator:
         window_size=252,
         step_size=63,
         embargo_days=FORWARD_DAYS,
-        debug=False
+        debug=False,
     ):
         self.model_trainer = model_trainer
         self.window_size = int(window_size)
@@ -73,18 +73,13 @@ class WalkForwardValidator:
 
         if missing_features:
 
-            raise RuntimeError(
-                f"Missing model features: {missing_features}"
-            )
+            raise RuntimeError(f"Missing model features: {missing_features}")
 
     # ----------------------------------------------------------
 
     def _apply_embargo(self, train_df, test_start):
 
-        embargo_cut = (
-            pd.Timestamp(test_start)
-            - pd.Timedelta(days=self.embargo_days)
-        )
+        embargo_cut = pd.Timestamp(test_start) - pd.Timedelta(days=self.embargo_days)
 
         return train_df[train_df["date"] < embargo_cut]
 
@@ -107,16 +102,9 @@ class WalkForwardValidator:
         cs_mean = df.groupby("date")["raw_forward"].transform("mean")
         cs_std = df.groupby("date")["raw_forward"].transform("std")
 
-        df["target"] = (
-            (df["raw_forward"] - cs_mean) /
-            (cs_std + self.EPSILON)
-        )
+        df["target"] = (df["raw_forward"] - cs_mean) / (cs_std + self.EPSILON)
 
-        df["target"] = np.clip(
-            df["target"],
-            -self.TARGET_CLIP,
-            self.TARGET_CLIP
-        )
+        df["target"] = np.clip(df["target"], -self.TARGET_CLIP, self.TARGET_CLIP)
 
         df = df[np.isfinite(df["target"])]
 
@@ -164,10 +152,7 @@ class WalkForwardValidator:
 
         for k in all_keys:
 
-            turnover += abs(
-                new_positions.get(k, 0.0)
-                - old_positions.get(k, 0.0)
-            )
+            turnover += abs(new_positions.get(k, 0.0) - old_positions.get(k, 0.0))
 
         return turnover
 
@@ -194,8 +179,8 @@ class WalkForwardValidator:
 
             prev_positions = {}
 
-            train_dates = unique_dates.iloc[start_idx - self.window_size:start_idx]
-            test_dates = unique_dates.iloc[start_idx:start_idx + self.step_size]
+            train_dates = unique_dates.iloc[start_idx - self.window_size : start_idx]
+            test_dates = unique_dates.iloc[start_idx : start_idx + self.step_size]
 
             if len(test_dates) < self.MIN_TEST_DAYS:
                 break
@@ -208,8 +193,7 @@ class WalkForwardValidator:
             train_df = self._apply_embargo(train_df, test_dates.iloc[0])
 
             test_df = df[
-                (df["date"] >= test_dates.iloc[0])
-                & (df["date"] <= test_dates.iloc[-1])
+                (df["date"] >= test_dates.iloc[0]) & (df["date"] <= test_dates.iloc[-1])
             ].copy()
 
             if len(train_df) < self.MIN_TRAIN_ROWS:
@@ -229,15 +213,15 @@ class WalkForwardValidator:
 
             # SAFE FEATURE VALIDATION
             X_train = validate_feature_schema(
-                train_df.loc[:, MODEL_FEATURES],
-                mode="training"
+                train_df.loc[:, MODEL_FEATURES], mode="training"
             )
 
             # FIX: Drop original MODEL_FEATURES before concat to prevent duplicate columns
-            non_feature_cols = [c for c in train_df.columns if c not in set(MODEL_FEATURES)]
+            non_feature_cols = [
+                c for c in train_df.columns if c not in set(MODEL_FEATURES)
+            ]
             train_df = pd.concat(
-                [train_df[non_feature_cols].reset_index(drop=True), X_train],
-                axis=1
+                [train_df[non_feature_cols].reset_index(drop=True), X_train], axis=1
             )
 
             model = self.model_trainer(train_df)
@@ -268,8 +252,7 @@ class WalkForwardValidator:
                 exit_slice = exit_slice[exit_slice["ticker"].isin(common)]
 
                 X = validate_feature_schema(
-                    signal_slice.loc[:, MODEL_FEATURES],
-                    mode="inference"
+                    signal_slice.loc[:, MODEL_FEATURES], mode="inference"
                 )
 
                 scores = model.predict(X)
@@ -318,13 +301,12 @@ class WalkForwardValidator:
                     signal_slice[["ticker", "close"]],
                     exit_slice[["ticker", "close"]],
                     on="ticker",
-                    suffixes=("_entry", "_exit")
+                    suffixes=("_entry", "_exit"),
                 )
 
-                merged["ret"] = (
-                    np.log(merged["close_exit"] * (1 - self.SLIPPAGE))
-                    - np.log(merged["close_entry"] * (1 + self.SLIPPAGE))
-                )
+                merged["ret"] = np.log(
+                    merged["close_exit"] * (1 - self.SLIPPAGE)
+                ) - np.log(merged["close_entry"] * (1 + self.SLIPPAGE))
 
                 period_ret = 0.0
 
@@ -342,7 +324,7 @@ class WalkForwardValidator:
                     np.clip(
                         period_ret,
                         -self.MAX_ABS_PERIOD_RETURN,
-                        self.MAX_ABS_PERIOD_RETURN
+                        self.MAX_ABS_PERIOD_RETURN,
                     )
                 )
 
@@ -373,25 +355,23 @@ class WalkForwardValidator:
 
             vol = np.std(window_returns)
 
-            sharpe = 0.0 if vol < self.EPSILON else (
-                np.mean(window_returns) / vol
-            ) * np.sqrt(252 / FORWARD_DAYS)
-
-            sharpe = float(
-                np.clip(
-                    sharpe,
-                    -self.MAX_SHARPE,
-                    self.MAX_SHARPE
-                )
+            sharpe = (
+                0.0
+                if vol < self.EPSILON
+                else (np.mean(window_returns) / vol) * np.sqrt(252 / FORWARD_DAYS)
             )
 
-            results.append({
-                "strategy_return": float(window_returns.sum()),
-                "sharpe_ratio": sharpe,
-                "turnover": turnover_sum / max(trade_count, 1),
-                "trade_count": trade_count,
-                "win_rate": float(np.mean(window_returns > 0))
-            })
+            sharpe = float(np.clip(sharpe, -self.MAX_SHARPE, self.MAX_SHARPE))
+
+            results.append(
+                {
+                    "strategy_return": float(window_returns.sum()),
+                    "sharpe_ratio": sharpe,
+                    "turnover": turnover_sum / max(trade_count, 1),
+                    "trade_count": trade_count,
+                    "win_rate": float(np.mean(window_returns > 0)),
+                }
+            )
 
             start_idx += self.step_size
 
@@ -403,9 +383,7 @@ class WalkForwardValidator:
 
         if not results or not equity_curve:
 
-            raise RuntimeError(
-                "Walk-forward produced no valid windows."
-            )
+            raise RuntimeError("Walk-forward produced no valid windows.")
 
         df = pd.DataFrame(results)
 
@@ -417,9 +395,7 @@ class WalkForwardValidator:
 
         gains = df[df["strategy_return"] > 0]["strategy_return"].sum()
 
-        losses = abs(
-            df[df["strategy_return"] < 0]["strategy_return"].sum()
-        ) or 1e-6
+        losses = abs(df[df["strategy_return"] < 0]["strategy_return"].sum()) or 1e-6
 
         return {
             "avg_strategy_return": float(df["strategy_return"].mean()),
@@ -431,5 +407,5 @@ class WalkForwardValidator:
             "avg_turnover": float(df["turnover"].mean()),
             "avg_win_rate": float(df["win_rate"].mean()),
             "avg_trades_per_window": float(df["trade_count"].mean()),
-            "num_windows": int(len(df))
+            "num_windows": int(len(df)),
         }

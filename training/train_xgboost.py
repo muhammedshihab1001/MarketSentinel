@@ -57,7 +57,7 @@ BASELINE_PATH = os.path.join(DRIFT_DIR, "baseline.json")
 PRODUCTION_POINTER = os.path.join(MODEL_DIR, "production_pointer.json")
 
 SEED = 42
-MIN_TRAINING_ROWS = 500       # lowered from 1200 — we have ~9 months currently
+MIN_TRAINING_ROWS = 500  # lowered from 1200 — we have ~9 months currently
 TARGET_CLIP = 5.0
 LOW_VARIANCE_THRESHOLD = 1e-6
 MAX_DATASET_ROWS = 1_000_000
@@ -110,10 +110,17 @@ def compute_reproducibility_hash(dataset_hash):
 # EXPORT ARTIFACTS
 # ==========================================================
 
+
 def export_artifacts(
-    model, metrics, dataset_hash, dataset_rows,
-    start_date, end_date, training_df,
-    promote_baseline=False, create_baseline=False,
+    model,
+    metrics,
+    dataset_hash,
+    dataset_rows,
+    start_date,
+    end_date,
+    training_df,
+    promote_baseline=False,
+    create_baseline=False,
 ):
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(DRIFT_DIR, exist_ok=True)
@@ -181,6 +188,7 @@ def export_artifacts(
 # never used by training or inference so they are pure waste.
 # ==========================================================
 
+
 def cleanup_old_data():
     """
     Delete ohlcv_daily rows older than CLEANUP_RETENTION_DAYS.
@@ -194,8 +202,7 @@ def cleanup_old_data():
         from core.db.models import OHLCVDaily
 
         cutoff = (
-            pd.Timestamp.now(tz="UTC")
-            - pd.Timedelta(days=CLEANUP_RETENTION_DAYS)
+            pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=CLEANUP_RETENTION_DAYS)
         ).date()
 
         with get_session() as session:
@@ -229,6 +236,7 @@ def cleanup_old_data():
 #      Also uses TRAINING_LOOKBACK_DAYS=730 not INFERENCE=400.
 # ==========================================================
 
+
 def load_training_data(start_date: str, end_date: str) -> pd.DataFrame:
     """
     Load and build feature frame for all universe tickers.
@@ -243,7 +251,9 @@ def load_training_data(start_date: str, end_date: str) -> pd.DataFrame:
 
     logger.info(
         "Loading training data | tickers=%d | window=%s → %s",
-        len(universe), start_date, end_date,
+        len(universe),
+        start_date,
+        end_date,
     )
 
     # FIX: use batch call with explicit start/end dates.
@@ -275,7 +285,8 @@ def load_training_data(start_date: str, end_date: str) -> pd.DataFrame:
 
     logger.info(
         "Price data loaded | success=%d failed=%d",
-        len(price_map), len(failures),
+        len(price_map),
+        len(failures),
     )
 
     # Combine all ticker DataFrames into one cross-sectional frame
@@ -316,6 +327,7 @@ def load_training_data(start_date: str, end_date: str) -> pd.DataFrame:
 # which stocks outperform vs underperform their peers.
 # ==========================================================
 
+
 def build_target(df: pd.DataFrame) -> pd.DataFrame:
 
     required = {"date", "ticker", "close"}
@@ -325,20 +337,15 @@ def build_target(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["date", "ticker"]).copy()
 
     # Log return FORWARD_DAYS ahead (what the model predicts)
-    df["raw_forward"] = (
-        df.groupby("ticker")["close"]
-        .transform(lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x))
+    df["raw_forward"] = df.groupby("ticker")["close"].transform(
+        lambda x: np.log(x.shift(-FORWARD_DAYS)) - np.log(x)
     )
 
     df = df.dropna(subset=["raw_forward"])
 
     # Cross-sectional z-score — relative return vs universe on same day
     cs_mean = df.groupby("date")["raw_forward"].transform("mean")
-    cs_std = (
-        df.groupby("date")["raw_forward"]
-        .transform("std")
-        .replace(0, np.nan)
-    )
+    cs_std = df.groupby("date")["raw_forward"].transform("std").replace(0, np.nan)
 
     df["target"] = (df["raw_forward"] - cs_mean) / cs_std
     df["target"] = np.clip(df["target"], -TARGET_CLIP, TARGET_CLIP)
@@ -351,6 +358,7 @@ def build_target(df: pd.DataFrame) -> pd.DataFrame:
 # ==========================================================
 # TRAINER
 # ==========================================================
+
 
 def trainer(train_df: pd.DataFrame):
 
@@ -395,6 +403,7 @@ def trainer(train_df: pd.DataFrame):
 # = ~500 trading days = ~50,000 rows with 100 tickers).
 # ==========================================================
 
+
 def get_training_window():
     """
     Compute training date window.
@@ -414,6 +423,7 @@ def get_training_window():
 # ==========================================================
 # MAIN
 # ==========================================================
+
 
 def main(
     start_date=None,
@@ -436,7 +446,9 @@ def main(
 
     logger.info(
         "Training window | start=%s end=%s lookback_days=%d",
-        start_date, end_date, TRAINING_LOOKBACK_DAYS,
+        start_date,
+        end_date,
+        TRAINING_LOOKBACK_DAYS,
     )
 
     # Load data and build features
@@ -453,8 +465,13 @@ def main(
 
     # Save model, metadata, pointer, optional baseline
     export_artifacts(
-        final_model, metrics, dataset_hash, len(final_df),
-        start_date, end_date, final_df,
+        final_model,
+        metrics,
+        dataset_hash,
+        len(final_df),
+        start_date,
+        end_date,
+        final_df,
         promote_baseline=promote_baseline,
         create_baseline=create_baseline,
     )

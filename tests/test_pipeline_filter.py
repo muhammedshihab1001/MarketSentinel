@@ -9,10 +9,10 @@ from datetime import timedelta
 
 from app.inference.pipeline import InferencePipeline
 
-
 # =====================================================
 # HELPERS
 # =====================================================
+
 
 def _make_multi_date_frame(
     tickers: list,
@@ -29,19 +29,22 @@ def _make_multi_date_frame(
     for ticker in tickers:
         for i in range(days):
             date = base + timedelta(days=i)
-            rows.append({
-                "ticker": ticker,
-                "date": date,
-                "close": 100.0 + np.random.randn(),
-                "rsi_14": 50.0 + np.random.randn(),
-                "raw_model_score": np.random.randn(),
-            })
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "date": date,
+                    "close": 100.0 + np.random.randn(),
+                    "rsi_14": 50.0 + np.random.randn(),
+                    "raw_model_score": np.random.randn(),
+                }
+            )
     return pd.DataFrame(rows)
 
 
 # =====================================================
 # CORE FILTER TESTS
 # =====================================================
+
 
 class TestFilterLatestPerTicker:
 
@@ -86,11 +89,15 @@ class TestFilterLatestPerTicker:
 
     def test_handles_single_ticker_single_day(self):
         """Single row must pass through unchanged."""
-        df = pd.DataFrame([{
-            "ticker": "AAPL",
-            "date": pd.Timestamp("2026-03-24", tz="UTC"),
-            "close": 200.0,
-        }])
+        df = pd.DataFrame(
+            [
+                {
+                    "ticker": "AAPL",
+                    "date": pd.Timestamp("2026-03-24", tz="UTC"),
+                    "close": 200.0,
+                }
+            ]
+        )
         result = InferencePipeline._filter_latest_per_ticker(df)
         assert len(result) == 1
         assert result.iloc[0]["ticker"] == "AAPL"
@@ -132,12 +139,14 @@ class TestFilterLatestPerTicker:
 
     def test_handles_mixed_date_formats(self):
         """Date column with string dates must still work."""
-        df = pd.DataFrame([
-            {"ticker": "AAPL", "date": "2026-01-01", "close": 100.0},
-            {"ticker": "AAPL", "date": "2026-03-24", "close": 200.0},
-            {"ticker": "MSFT", "date": "2026-01-01", "close": 300.0},
-            {"ticker": "MSFT", "date": "2026-03-24", "close": 400.0},
-        ])
+        df = pd.DataFrame(
+            [
+                {"ticker": "AAPL", "date": "2026-01-01", "close": 100.0},
+                {"ticker": "AAPL", "date": "2026-03-24", "close": 200.0},
+                {"ticker": "MSFT", "date": "2026-01-01", "close": 300.0},
+                {"ticker": "MSFT", "date": "2026-03-24", "close": 400.0},
+            ]
+        )
 
         result = InferencePipeline._filter_latest_per_ticker(df)
 
@@ -147,11 +156,13 @@ class TestFilterLatestPerTicker:
 
     def test_handles_nan_dates_gracefully(self):
         """Rows with NaT/NaN dates must be dropped, not crash."""
-        df = pd.DataFrame([
-            {"ticker": "AAPL", "date": "2026-03-24", "close": 100.0},
-            {"ticker": "AAPL", "date": None, "close": 200.0},
-            {"ticker": "MSFT", "date": "2026-03-24", "close": 300.0},
-        ])
+        df = pd.DataFrame(
+            [
+                {"ticker": "AAPL", "date": "2026-03-24", "close": 100.0},
+                {"ticker": "AAPL", "date": None, "close": 200.0},
+                {"ticker": "MSFT", "date": "2026-03-24", "close": 300.0},
+            ]
+        )
 
         result = InferencePipeline._filter_latest_per_ticker(df)
 

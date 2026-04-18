@@ -9,10 +9,10 @@ import pytest
 
 from training.evaluate import evaluate_xgboost
 
-
 ############################################################
 # HELPER
 ############################################################
+
 
 def _build_eval_data(n_dates=50, n_tickers=20, seed=42):
     """Build synthetic scores/returns/dates for evaluation."""
@@ -32,6 +32,7 @@ def _build_eval_data(n_dates=50, n_tickers=20, seed=42):
 # BASIC EXECUTION
 ############################################################
 
+
 def test_evaluate_runs_without_crashing():
 
     scores, fwd, dates = _build_eval_data()
@@ -44,6 +45,7 @@ def test_evaluate_runs_without_crashing():
 ############################################################
 # REQUIRED KEYS
 ############################################################
+
 
 def test_evaluate_returns_required_keys():
 
@@ -70,6 +72,7 @@ def test_evaluate_returns_required_keys():
 # METRIC FINITENESS
 ############################################################
 
+
 def test_evaluate_metrics_are_finite():
 
     scores, fwd, dates = _build_eval_data()
@@ -83,6 +86,7 @@ def test_evaluate_metrics_are_finite():
 ############################################################
 # IC RANGE
 ############################################################
+
 
 def test_ic_in_valid_range():
 
@@ -98,6 +102,7 @@ def test_ic_in_valid_range():
 # HIT RATE RANGE
 ############################################################
 
+
 def test_hit_rate_in_valid_range():
 
     scores, fwd, dates = _build_eval_data()
@@ -110,6 +115,7 @@ def test_hit_rate_in_valid_range():
 ############################################################
 # PERFECT POSITIVE SIGNAL
 ############################################################
+
 
 def test_perfect_signal_has_positive_ic():
     """When scores perfectly predict returns, IC should be positive."""
@@ -134,6 +140,7 @@ def test_perfect_signal_has_positive_ic():
 # INVERTED SIGNAL
 ############################################################
 
+
 def test_inverted_signal_has_negative_ic():
     """When scores are negatively correlated with returns, IC < 0."""
     rng = np.random.default_rng(77)
@@ -155,6 +162,7 @@ def test_inverted_signal_has_negative_ic():
 # LENGTH MISMATCH RAISES
 ############################################################
 
+
 def test_length_mismatch_raises():
 
     with pytest.raises(RuntimeError, match="mismatch"):
@@ -169,6 +177,7 @@ def test_length_mismatch_raises():
 # SAMPLE COUNT CORRECT
 ############################################################
 
+
 def test_sample_and_date_counts():
 
     scores, fwd, dates = _build_eval_data(n_dates=40, n_tickers=15)
@@ -182,6 +191,7 @@ def test_sample_and_date_counts():
 ############################################################
 # DETERMINISM
 ############################################################
+
 
 def test_evaluate_is_deterministic():
 

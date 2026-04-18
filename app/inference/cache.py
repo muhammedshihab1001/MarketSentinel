@@ -1,21 +1,29 @@
 # =========================================================
-# REDIS CACHE v13.1
+# REDIS CACHE v14.0
 #
-# Changes from v13:
-# FIX: Added get_redis_client() public method.
-#      main.py rate limiter was accessing cache._redis
-#      (private attribute) directly. Now uses public method.
-#      _redis property retained for DemoTracker compatibility.
+# Changes from v13.1:
+# CRITICAL FIX: Added strict mode for auth/demo tracking.
+#   Previously all Redis operations were fail-open (fallback
+#   to memory cache on Redis failure). This was correct for
+#   inference caching but WRONG for demo usage tracking.
 #
-# Changes from v12:
-# FIX: Removed list validation from set() — ms:portfolio:*
-#      keys store full snapshot dicts, not signal lists.
-#      The validation was firing every 2 minutes on every
-#      background snapshot cycle, blocking all per-request
-#      snapshot caching. set_background_snapshot() already
-#      handles the background snapshot key correctly.
-# FIX: _is_snapshot_key removed — validation was wrong for
-#      all use cases. Dict payloads are valid everywhere.
+#   When Redis failed, demo counters returned 0 → users got
+#   unlimited access during Redis downtime/reconnection.
+#
+# NEW METHODS:
+#   get_strict_client() → Returns Redis client or raises
+#                         RuntimeError. NO fallback.
+#                         Used by DemoTracker for critical
+#                         auth operations.
+#
+#   is_available()      → Health check. Returns True if
+#                         Redis is currently connected.
+#
+# ARCHITECTURE:
+#   - Demo tracking  → STRICT mode (fail-closed)
+#   - Inference cache → NORMAL mode (fail-open)
+#
+# All changes from v13.1 retained.
 # =========================================================
 
 import redis
@@ -53,14 +61,27 @@ _MEMORY_MAX_ITEMS = 256
 
 class RedisCache:
     """
-    Redis-backed cache for inference results.
+    Redis-backed cache for inference results and critical auth operations.
+
+    TWO MODES:
+    ----------
+    1. NORMAL (fail-open):
+       - Used for: inference caching, background snapshots
+       - Redis down → memory fallback
+       - Access via: get(), set(), get_redis_client()
+
+    2. STRICT (fail-closed):
+       - Used for: demo tracking, rate limiting, auth
+       - Redis down → RuntimeError (no fallback)
+       - Access via: get_strict_client()
 
     Key types:
         ms:background_snapshot:latest — background snapshot (fixed key)
         ms:portfolio:{hash}           — per-request snapshot
         ms:agent:{hash}               — agent explain results
         ms:political_risk:{hash}      — GDELT political risk results
-        ms:demo:{fingerprint}:{feat}  — demo usage counters (via DemoTracker)
+        ms:demo:{fingerprint}:{feat}  — demo usage counters (STRICT)
+        ms:ratelimit:{ip}:{path}      — rate limit counters (STRICT)
 
     All key types store JSON-serialisable dicts or lists.
     No structural validation is performed — that is the caller's job.
@@ -69,6 +90,8 @@ class RedisCache:
     def __init__(self):
         self._client: Optional[redis.Redis] = None
         self._connected = False
+        self._last_connection_attempt = 0
+        self._connection_attempt_interval = 5  # seconds
         self._connect()
 
     # =====================================================
@@ -76,6 +99,21 @@ class RedisCache:
     # =====================================================
 
     def _connect(self):
+        """
+        Attempt Redis connection.
+        On failure, sets _connected=False and logs warning.
+        Called at init and by _ensure_connected().
+        """
+        current_time = time.time()
+
+        # Rate limit connection attempts to avoid log spam
+        if (
+            current_time - self._last_connection_attempt
+        ) < self._connection_attempt_interval:
+            return
+
+        self._last_connection_attempt = current_time
+
         try:
             self._client = redis.Redis(
                 host=REDIS_HOST,
@@ -89,24 +127,28 @@ class RedisCache:
             self._connected = True
             logger.info(
                 "Redis connected | host=%s port=%d",
-                REDIS_HOST, REDIS_PORT,
+                REDIS_HOST,
+                REDIS_PORT,
             )
         except Exception as e:
             self._connected = False
             self._client = None
-            logger.warning(
-                "Redis unavailable — memory fallback active | %s", e
-            )
+            logger.warning("Redis unavailable — memory fallback active | error=%s", e)
 
     def _ensure_connected(self) -> bool:
-        """Try to reconnect if disconnected. Returns True if connected."""
+        """
+        Check connection and attempt reconnect if needed.
+        Returns True if connected after check.
+        """
         if self._connected and self._client is not None:
             try:
                 self._client.ping()
                 return True
             except Exception:
+                logger.warning("Redis connection lost — attempting reconnect")
                 self._connected = False
                 self._client = None
+
         self._connect()
         return self._connected
 
@@ -118,21 +160,95 @@ class RedisCache:
         """
         Return the raw Redis client if connected, else None.
 
-        Use this instead of accessing _redis or _client directly.
-        Safe to call at any time — returns None if Redis is down.
-        Used by: main.py rate limiter, DemoTracker.
+        FAIL-OPEN MODE: Returns None on Redis failure.
+        Caller should handle None by using memory fallback.
+
+        Used by:
+        - main.py rate limiter (fail-open behavior)
+        - Inference caching (fail-open behavior)
+
+        For critical operations (demo tracking), use get_strict_client().
         """
         if self._ensure_connected():
             return self._client
         return None
 
+    def get_strict_client(self) -> redis.Redis:
+        """
+        Return the raw Redis client or raise RuntimeError.
+
+        FAIL-CLOSED MODE: Raises exception on Redis failure.
+        NO FALLBACK. Used for critical operations that must not
+        silently degrade (demo tracking, auth, strict rate limits).
+
+        Raises:
+            RuntimeError: If Redis is unavailable
+
+        Used by:
+        - DemoTracker (demo usage counters)
+        - Strict rate limiting (future)
+
+        Example:
+            try:
+                r = cache.get_strict_client()
+                r.incr(key)
+            except RuntimeError:
+                # Handle Redis unavailability explicitly
+                return error_response("Service temporarily unavailable")
+        """
+        if self._ensure_connected() and self._client is not None:
+            return self._client
+
+        logger.error(
+            "CRITICAL: Redis unavailable in STRICT mode | "
+            "operation=get_strict_client | "
+            "This will block critical auth/demo operations"
+        )
+        raise RuntimeError(
+            "Redis unavailable — critical operations blocked. "
+            "Please check Redis service health."
+        )
+
     @property
     def _redis(self) -> Optional[redis.Redis]:
         """
-        Retained for DemoTracker backward compatibility.
-        New code should use get_redis_client() instead.
+        Retained for backward compatibility.
+        New code should use get_redis_client() or get_strict_client().
         """
         return self.get_redis_client()
+
+    # =====================================================
+    # HEALTH CHECK
+    # =====================================================
+
+    def is_available(self) -> bool:
+        """
+        Return True if Redis is currently connected.
+        Lightweight health check — does not attempt reconnection.
+        """
+        return self._connected and self._client is not None
+
+    def ping(self) -> bool:
+        """
+        Return True if Redis is reachable.
+        Attempts reconnection if currently disconnected.
+        """
+        if self._client is None:
+            return False
+        try:
+            return bool(self._client.ping())
+        except Exception:
+            self._connected = False
+            return False
+
+    def health(self) -> dict:
+        """Return cache health status for /health/ready endpoint."""
+        connected = self.ping()
+        return {
+            "redis_connected": connected,
+            "fallback_active": not connected,
+            "memory_cache_size": len(_MEMORY_CACHE),
+        }
 
     # =====================================================
     # KEY BUILDER
@@ -152,12 +268,13 @@ class RedisCache:
             return f"{prefix}fallback"
 
     # =====================================================
-    # GET
+    # GET (FAIL-OPEN)
     # =====================================================
 
     def get(self, key: str) -> Optional[Any]:
         """
         Retrieve cached value. Returns None on any error or miss.
+        FAIL-OPEN: Falls back to memory cache if Redis unavailable.
         Never raises.
         """
         # Try Redis first
@@ -182,12 +299,13 @@ class RedisCache:
             return value
 
     # =====================================================
-    # SET
+    # SET (FAIL-OPEN)
     # =====================================================
 
     def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
         """
         Store value in cache with TTL.
+        FAIL-OPEN: Falls back to memory cache if Redis unavailable.
         Accepts any JSON-serialisable value (dict, list, str, etc.)
         Never raises — cache failure must not crash inference.
         Returns True on success.
@@ -220,7 +338,7 @@ class RedisCache:
             return False
 
     # =====================================================
-    # DELETE
+    # DELETE (FAIL-OPEN)
     # =====================================================
 
     def delete(self, key: str) -> bool:
@@ -238,7 +356,7 @@ class RedisCache:
         return True
 
     # =====================================================
-    # BACKGROUND SNAPSHOT — FIXED KEY
+    # BACKGROUND SNAPSHOT — FIXED KEY (FAIL-OPEN)
     # =====================================================
 
     def get_background_snapshot(self) -> Optional[dict]:
@@ -269,10 +387,19 @@ class RedisCache:
 
     # =====================================================
     # ATOMIC DEMO COUNTER OPS (for DemoTracker)
+    # DEPRECATED: DemoTracker should use get_strict_client()
     # =====================================================
 
     def incr(self, key: str) -> int:
-        """Atomic increment. Returns new value or -1 on failure."""
+        """
+        Atomic increment. Returns new value or -1 on failure.
+
+        DEPRECATED: This is fail-open behavior which is WRONG
+        for demo tracking. DemoTracker should use get_strict_client()
+        directly instead of these helper methods.
+
+        Retained for backward compatibility only.
+        """
         if self._ensure_connected() and self._client is not None:
             try:
                 return int(self._client.incr(key))
@@ -281,7 +408,10 @@ class RedisCache:
         return -1
 
     def expire(self, key: str, ttl: int) -> bool:
-        """Set TTL on existing key."""
+        """
+        Set TTL on existing key.
+        DEPRECATED: Use get_strict_client() in DemoTracker.
+        """
         if self._ensure_connected() and self._client is not None:
             try:
                 self._client.expire(key, ttl)
@@ -291,33 +421,13 @@ class RedisCache:
         return False
 
     def ttl(self, key: str) -> int:
-        """Return remaining TTL in seconds. -1 if no expiry, -2 if missing."""
+        """
+        Return remaining TTL in seconds. -1 if no expiry, -2 if missing.
+        DEPRECATED: Use get_strict_client() in DemoTracker.
+        """
         if self._ensure_connected() and self._client is not None:
             try:
                 return int(self._client.ttl(key))
             except Exception:
                 pass
         return -2
-
-    # =====================================================
-    # HEALTH CHECK
-    # =====================================================
-
-    def ping(self) -> bool:
-        """Return True if Redis is reachable."""
-        if self._client is None:
-            return False
-        try:
-            return bool(self._client.ping())
-        except Exception:
-            self._connected = False
-            return False
-
-    def health(self) -> dict:
-        """Return cache health status for /health/ready endpoint."""
-        connected = self.ping()
-        return {
-            "redis_connected": connected,
-            "fallback_active": not connected,
-            "memory_cache_size": len(_MEMORY_CACHE),
-        }

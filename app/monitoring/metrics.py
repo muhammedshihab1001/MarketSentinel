@@ -1,6 +1,5 @@
 from prometheus_client import Counter, Histogram, Gauge
 
-
 # =====================================================
 # LATENCY BUCKETS (ML-AWARE)
 # =====================================================

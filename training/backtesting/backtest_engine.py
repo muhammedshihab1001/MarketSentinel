@@ -70,11 +70,7 @@ class BacktestEngine:
 
         scaled = base_size * np.clip(growth_factor, 0.7, 2.0)
 
-        scaled = np.clip(
-            scaled,
-            self.MIN_POSITION_SIZE,
-            self.MAX_POSITION_SIZE
-        )
+        scaled = np.clip(scaled, self.MIN_POSITION_SIZE, self.MAX_POSITION_SIZE)
 
         return float(scaled)
 
@@ -105,14 +101,10 @@ class BacktestEngine:
         initial_cash=10_000,
         transaction_cost=0.0005,
         slippage=0.0003,
-        position_size=0.25
+        position_size=0.25,
     ):
 
-        prices, signals = self._validate_inputs(
-            prices,
-            signals,
-            position_size
-        )
+        prices, signals = self._validate_inputs(prices, signals, position_size)
 
         prices = self._sanitize_prices(prices)
 
@@ -169,18 +161,14 @@ class BacktestEngine:
             ):
 
                 dynamic_size = self._dynamic_position_size(
-                    position_size,
-                    equity=current_equity,
-                    initial_cash=initial_cash
+                    position_size, equity=current_equity, initial_cash=initial_cash
                 )
 
                 execution_price = max(price * (1 + slippage), self.EPSILON)
 
                 deploy_cash = cash * dynamic_size
 
-                shares = (
-                    deploy_cash * (1 - transaction_cost)
-                ) / execution_price
+                shares = (deploy_cash * (1 - transaction_cost)) / execution_price
 
                 position = float(shares)
                 cash -= deploy_cash
@@ -194,19 +182,11 @@ class BacktestEngine:
             # SELL
             ################################################
 
-            elif (
-                signal == "SELL"
-                and position > 0
-                and hold_bars >= self.MIN_HOLD_BARS
-            ):
+            elif signal == "SELL" and position > 0 and hold_bars >= self.MIN_HOLD_BARS:
 
                 execution_price = max(price * (1 - slippage), self.EPSILON)
 
-                proceeds = (
-                    position
-                    * execution_price
-                    * (1 - transaction_cost)
-                )
+                proceeds = position * execution_price * (1 - transaction_cost)
 
                 capital_rotated += proceeds
 
@@ -237,15 +217,11 @@ class BacktestEngine:
             if portfolio_values:
 
                 step_return = (
-                    portfolio_value
-                    / (portfolio_values[-1] + self.EPSILON)
-                    - 1
+                    portfolio_value / (portfolio_values[-1] + self.EPSILON) - 1
                 )
 
                 step_return = np.clip(
-                    step_return,
-                    -self.MAX_SINGLE_BAR_RETURN,
-                    self.MAX_SINGLE_BAR_RETURN
+                    step_return, -self.MAX_SINGLE_BAR_RETURN, self.MAX_SINGLE_BAR_RETURN
                 )
 
             if position > 0:
@@ -264,11 +240,7 @@ class BacktestEngine:
             final_price = prices[-1]
             liquidation_price = max(final_price * (1 - slippage), self.EPSILON)
 
-            proceeds = (
-                position
-                * liquidation_price
-                * (1 - transaction_cost)
-            )
+            proceeds = position * liquidation_price * (1 - transaction_cost)
 
             cash += proceeds
             position = 0.0
@@ -294,9 +266,7 @@ class BacktestEngine:
 
         alpha = strategy_return - buy_hold_return
 
-        returns = np.diff(portfolio_values) / (
-            portfolio_values[:-1] + self.EPSILON
-        )
+        returns = np.diff(portfolio_values) / (portfolio_values[:-1] + self.EPSILON)
 
         returns = returns[np.isfinite(returns)]
 
@@ -304,33 +274,20 @@ class BacktestEngine:
 
             std = np.std(returns)
 
-            sharpe = (
-                np.mean(returns) / std * np.sqrt(252)
-                if std > 0 else 0.0
-            )
+            sharpe = np.mean(returns) / std * np.sqrt(252) if std > 0 else 0.0
 
-            sharpe = float(
-                np.clip(sharpe, -self.MAX_SHARPE, self.MAX_SHARPE)
-            )
+            sharpe = float(np.clip(sharpe, -self.MAX_SHARPE, self.MAX_SHARPE))
 
         else:
 
             sharpe = 0.0
 
-        exposure = (
-            time_in_market
-            / max(len(portfolio_values) - 1, 1)
-        )
+        exposure = time_in_market / max(len(portfolio_values) - 1, 1)
 
-        turnover = (
-            capital_rotated / initial_cash
-            if initial_cash > 0 else 0.0
-        )
+        turnover = capital_rotated / initial_cash if initial_cash > 0 else 0.0
 
         if turnover > self.MAX_TURNOVER:
-            raise RuntimeError(
-                "Turnover exceeds institutional threshold."
-            )
+            raise RuntimeError("Turnover exceeds institutional threshold.")
 
         return {
             "final_portfolio": float(portfolio_values[-1]),
@@ -341,7 +298,7 @@ class BacktestEngine:
             "trade_count": trade_count,
             "exposure": float(exposure),
             "turnover": float(turnover),
-            "equity_curve": portfolio_values.tolist()
+            "equity_curve": portfolio_values.tolist(),
         }
 
     ############################################################
@@ -357,5 +314,5 @@ class BacktestEngine:
             "trade_count": 0,
             "exposure": 0.0,
             "turnover": 0.0,
-            "equity_curve": [initial_cash]
+            "equity_curve": [initial_cash],
         }

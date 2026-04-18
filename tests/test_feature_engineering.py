@@ -5,13 +5,13 @@ from datetime import datetime, timedelta
 from core.features.feature_engineering import FeatureEngineer
 from core.schema.feature_schema import MODEL_FEATURES
 
-
 ############################################################
 # SAMPLE DATA
 # FIX (item 41): Use relative dates — was hardcoded 2022-01-01
 # (4 years back). Now uses today - 400 days so tests always
 # use recent-ish historical dates without drifting stale.
 ############################################################
+
 
 def sample_data(n_days=300):
 
@@ -21,12 +21,14 @@ def sample_data(n_days=300):
     start = (datetime.utcnow() - timedelta(days=n_days + 100)).date()
     dates = pd.date_range(start=start, periods=n_days, tz="UTC")
 
-    df = pd.DataFrame({
-        "date": np.tile(dates, 3),
-        "ticker": np.repeat(["A", "B", "C"], n_days),
-        "close": np.random.normal(100, 5, n_days * 3),
-        "volume": np.random.randint(1000, 5000, n_days * 3),
-    })
+    df = pd.DataFrame(
+        {
+            "date": np.tile(dates, 3),
+            "ticker": np.repeat(["A", "B", "C"], n_days),
+            "close": np.random.normal(100, 5, n_days * 3),
+            "volume": np.random.randint(1000, 5000, n_days * 3),
+        }
+    )
 
     return df
 
@@ -34,6 +36,7 @@ def sample_data(n_days=300):
 ############################################################
 # CORE FEATURE GENERATION
 ############################################################
+
 
 def test_pipeline_produces_model_features():
 
@@ -45,6 +48,7 @@ def test_pipeline_produces_model_features():
 ############################################################
 # CROSS-SECTIONAL FEATURES EXIST
 ############################################################
+
 
 def test_cross_sectional_features_present():
 
@@ -61,6 +65,7 @@ def test_cross_sectional_features_present():
 # Z-SCORE FEATURES GENERATED
 ############################################################
 
+
 def test_zscore_features_exist():
 
     price_df = sample_data()
@@ -72,6 +77,7 @@ def test_zscore_features_exist():
 ############################################################
 # RANK FEATURES GENERATED
 ############################################################
+
 
 def test_rank_features_exist():
 
@@ -85,6 +91,7 @@ def test_rank_features_exist():
 # VOLATILITY FLOOR ENFORCED
 ############################################################
 
+
 def test_volatility_floor():
 
     price_df = sample_data()
@@ -95,6 +102,7 @@ def test_volatility_floor():
 ############################################################
 # NON-FINITE GUARD
 ############################################################
+
 
 def test_no_infinite_values():
 
@@ -108,6 +116,7 @@ def test_no_infinite_values():
 # DATETIME NORMALIZATION
 ############################################################
 
+
 def test_datetime_normalization():
 
     price_df = sample_data()
@@ -118,6 +127,7 @@ def test_datetime_normalization():
 ############################################################
 # MODEL FEATURE ORDER STABILITY
 ############################################################
+
 
 def test_model_feature_order_stable():
 
@@ -130,6 +140,7 @@ def test_model_feature_order_stable():
 ############################################################
 # BASIC DATA ROBUSTNESS (YFINANCE STYLE NOISY DATA)
 ############################################################
+
 
 def test_pipeline_handles_noisy_data():
 

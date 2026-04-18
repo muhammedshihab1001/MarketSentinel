@@ -153,9 +153,7 @@ class SignalAgent(BaseAgent):
             political_risk_label = row.get("political_risk_label")
 
         raw_model_score = self._safe_float(
-            row.get("raw_model_score",
-                row.get("alpha_score",
-                    row.get("score")))
+            row.get("raw_model_score", row.get("alpha_score", row.get("score")))
         )
 
         final_score = float(
@@ -298,35 +296,31 @@ class SignalAgent(BaseAgent):
         # AGENT SCORE
         # ---------------------------------------------------------
 
-        agent_score = float(np.clip(
-
-            0.5 * confidence
-            + 0.3 * technical_score
-            + 0.2 * (0.0 if drift_flag else 1.0),
-
-            0.0, 1.0
-
-        ))
+        agent_score = float(
+            np.clip(
+                0.5 * confidence
+                + 0.3 * technical_score
+                + 0.2 * (0.0 if drift_flag else 1.0),
+                0.0,
+                1.0,
+            )
+        )
 
         # ---------------------------------------------------------
         # TRADE APPROVAL
         # ---------------------------------------------------------
 
         conf_threshold = (
-
             self.LOW_VOL_CONFIDENCE
             if volatility_regime == "low_volatility"
             else self.MIN_CONFIDENCE_TO_TRADE
-
         )
 
         trade_approved = (
-
             signal != "NEUTRAL"
             and confidence > conf_threshold
             and not drift_flag
             and political_risk_label != "CRITICAL"
-
         )
 
         # ---------------------------------------------------------
@@ -334,11 +328,7 @@ class SignalAgent(BaseAgent):
         # ---------------------------------------------------------
 
         position_size_hint = self._suggest_position_size(
-
-            confidence,
-            risk_level,
-            volatility_regime
-
+            confidence, risk_level, volatility_regime
         )
 
         governance_score = int(np.clip(agent_score * 100, 0, 100))
@@ -353,66 +343,38 @@ class SignalAgent(BaseAgent):
         )
 
         hybrid_output = self._format_output(
-
             score=agent_score,
-
             confidence=confidence,
-
             signals={
                 "direction": signal,
                 "trade_approved": trade_approved,
             },
-
             warnings=warnings,
-
             reasoning=reasoning,
-
         )
 
         hybrid_output["component_scores"] = {
-
             "confidence": confidence,
-
             "technical_alignment": technical_score,
-
             "drift_penalty": 0.0 if drift_flag else 1.0,
-
         }
 
         return {
-
             "signal": signal,
-
             "score": agent_score,
-
             "alpha_strength": alpha_strength,
-
             "confidence_numeric": confidence,
-
             "technical_score": technical_score,
-
             "agent_score": agent_score,
-
             "risk_level": risk_level,
-
             "volatility_regime": volatility_regime,
-
             "alignment_score": alignment,
-
             "position_size_hint": position_size_hint,
-
             "trade_approved": trade_approved,
-
             "drift_flag": drift_flag,
-
             "governance_score": governance_score,
-
             "reasoning": reasoning,
-
             "warnings": warnings,
-
             "explanation": explanation,
-
             "hybrid": hybrid_output,
-
         }

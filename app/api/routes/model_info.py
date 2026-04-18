@@ -37,6 +37,7 @@ model_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 # GET /model/info
 # =========================================================
 
+
 @router.get(
     "/info",
     summary="Model Version Info",
@@ -101,6 +102,7 @@ def _model_info_sync():
 # =========================================================
 # GET /model/feature-importance
 # =========================================================
+
 
 @router.get(
     "/feature-importance",
@@ -192,6 +194,7 @@ def _feature_importance_sync():
 # GET /model/diagnostics
 # =========================================================
 
+
 @router.get(
     "/diagnostics",
     summary="Model Diagnostics (Owner Only)",
@@ -265,6 +268,7 @@ def _model_diagnostics_sync():
 # =========================================================
 # GET /model/ic-stats
 # =========================================================
+
 
 @router.get(
     "/ic-stats",
@@ -399,12 +403,8 @@ def _ic_stats_sync(days: int) -> Dict[str, Any]:
             s = df[["date", col]].copy().rename(columns={col: "close"})
             s["ticker"] = ticker
             s["date"] = pd.to_datetime(s["date"]).dt.date.astype(str)
-            s["forward_return"] = (
-                s["close"].pct_change().shift(-1).clip(-0.5, 0.5)
-            )
-            return_frames.append(
-                s[["date", "ticker", "forward_return"]].dropna()
-            )
+            s["forward_return"] = s["close"].pct_change().shift(-1).clip(-0.5, 0.5)
+            return_frames.append(s[["date", "ticker", "forward_return"]].dropna())
 
         if not return_frames:
             raise RuntimeError("No price data for IC computation")
@@ -446,12 +446,14 @@ def _ic_stats_sync(days: int) -> Dict[str, Any]:
                 group["raw_model_score"],
                 group["forward_return"],
             )
-            daily_ic.append({
-                "date": date,
-                "ic": round(float(ic), 6),
-                "p_value": round(float(pval), 6),
-                "n_stocks": len(group),
-            })
+            daily_ic.append(
+                {
+                    "date": date,
+                    "ic": round(float(ic), 6),
+                    "p_value": round(float(pval), 6),
+                    "n_stocks": len(group),
+                }
+            )
         except Exception:
             pass
 
@@ -471,7 +473,8 @@ def _ic_stats_sync(days: int) -> Dict[str, Any]:
     ic_std = float(np.std(ic_values, ddof=1)) if len(ic_values) > 1 else 0.0
     ic_t_stat = (
         float(ic_mean / (ic_std / np.sqrt(len(ic_values)) + 1e-9))
-        if ic_std > 0 else 0.0
+        if ic_std > 0
+        else 0.0
     )
 
     if abs(ic_mean) >= 0.08:

@@ -20,7 +20,6 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from core.logging.logger import get_logger
 
-
 logger = get_logger("marketsentinel.env")
 
 _ENV_INITIALIZED = False
@@ -39,6 +38,7 @@ _KNOWN_OPENAI_MODELS = {
 # ============================================================
 # HELPERS
 # ============================================================
+
 
 def _as_bool(value: Optional[str], default: bool = False) -> bool:
     """Parse a string env value to bool."""
@@ -65,6 +65,7 @@ def _ensure_path(key: str, default: str) -> None:
 # ============================================================
 # DATABASE VALIDATION
 # ============================================================
+
 
 def _validate_database() -> None:
     """
@@ -103,6 +104,7 @@ def _validate_database() -> None:
 # MARKET PROVIDER VALIDATION
 # ============================================================
 
+
 def _validate_market_providers() -> None:
     """
     Validate available market data providers.
@@ -131,6 +133,7 @@ def _validate_market_providers() -> None:
 # ============================================================
 # LLM / OPENAI VALIDATION
 # ============================================================
+
 
 def _validate_llm() -> None:
     """
@@ -170,25 +173,28 @@ def _validate_llm() -> None:
 # ENVIRONMENT FINGERPRINT
 # ============================================================
 
+
 def _environment_fingerprint() -> None:
     """
     Generate a short SHA256 fingerprint of active configuration.
     """
 
-    payload = "".join([
-        sys.version,
-        os.getenv("MODEL_REGISTRY_PATH", ""),
-        os.getenv("FEATURE_STORE_PATH", ""),
-        os.getenv("XGB_REGISTRY_DIR", ""),
-        os.getenv("LLM_ENABLED", ""),
-        os.getenv("OPENAI_MODEL", ""),
-        os.getenv("LOG_LEVEL", ""),
-        os.getenv("MARKET_PROVIDERS_ACTIVE", ""),
-        os.getenv("YAHOO_SOFT_FAIL", ""),
-        os.getenv("YFINANCE_SOFT_MODE", ""),
-        os.getenv("POSTGRES_HOST", ""),
-        os.getenv("POSTGRES_DB", ""),
-    ])
+    payload = "".join(
+        [
+            sys.version,
+            os.getenv("MODEL_REGISTRY_PATH", ""),
+            os.getenv("FEATURE_STORE_PATH", ""),
+            os.getenv("XGB_REGISTRY_DIR", ""),
+            os.getenv("LLM_ENABLED", ""),
+            os.getenv("OPENAI_MODEL", ""),
+            os.getenv("LOG_LEVEL", ""),
+            os.getenv("MARKET_PROVIDERS_ACTIVE", ""),
+            os.getenv("YAHOO_SOFT_FAIL", ""),
+            os.getenv("YFINANCE_SOFT_MODE", ""),
+            os.getenv("POSTGRES_HOST", ""),
+            os.getenv("POSTGRES_DB", ""),
+        ]
+    )
 
     fp = hashlib.sha256(payload.encode()).hexdigest()[:12]
 
@@ -200,6 +206,7 @@ def _environment_fingerprint() -> None:
 # ============================================================
 # MAIN INIT
 # ============================================================
+
 
 def init_env() -> None:
     """
@@ -225,12 +232,10 @@ def init_env() -> None:
         # No need to call _configure_logging() here
 
         defaults = {
-
             # Artifact paths
             "MODEL_REGISTRY_PATH": "artifacts/registry",
             "FEATURE_STORE_PATH": "artifacts/feature_store",
             "XGB_REGISTRY_DIR": "artifacts/xgboost",
-
             # LLM
             "LLM_ENABLED": "0",
             "OPENAI_MODEL": "gpt-4o-mini",
@@ -239,19 +244,16 @@ def init_env() -> None:
             "LLM_CACHE_ENABLED": "1",
             "LLM_CACHE_TTL_SEC": "120",
             "LLM_AUDIT_ENABLED": "1",
-
             # Data layer
             "YAHOO_SOFT_FAIL": "1",
             "YFINANCE_SOFT_MODE": "1",
             "YAHOO_MAX_CONCURRENT": "1",
-
             # PostgreSQL
             "POSTGRES_HOST": "localhost",
             "POSTGRES_PORT": "5432",
             "POSTGRES_USER": "sentinel",
             "POSTGRES_PASSWORD": "sentinel",
             "POSTGRES_DB": "marketsentinel",
-
             # Logging
             "LOG_LEVEL": "INFO",
         }
@@ -279,7 +281,10 @@ def init_env() -> None:
 # PUBLIC ACCESSORS
 # ============================================================
 
-def get_env(key: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
+
+def get_env(
+    key: str, default: Optional[str] = None, required: bool = False
+) -> Optional[str]:
     """Read a string env value."""
 
     val = os.getenv(key, default)

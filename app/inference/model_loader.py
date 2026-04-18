@@ -47,7 +47,7 @@ class ModelLoader:
     # latest.json is checked as a fallback alias for compatibility
     POINTER_FILENAMES = [
         "production_pointer.json",  # primary — created by train_xgboost.py
-        "latest.json",              # legacy alias
+        "latest.json",  # legacy alias
     ]
 
     def __init__(self):
@@ -85,10 +85,7 @@ class ModelLoader:
 
                 # production_pointer.json uses model_path (full path)
                 # latest.json uses path (relative or absolute)
-                path = (
-                    data.get("model_path")
-                    or data.get("path")
-                )
+                path = data.get("model_path") or data.get("path")
 
                 if not path:
                     logger.warning(
@@ -111,20 +108,23 @@ class ModelLoader:
                     else:
                         logger.warning(
                             "Pointer path not found | pointer=%s path=%s",
-                            pointer_filename, path,
+                            pointer_filename,
+                            path,
                         )
                         continue
 
                 logger.info(
                     "Model pointer found | file=%s path=%s",
-                    pointer_filename, path,
+                    pointer_filename,
+                    path,
                 )
                 return path
 
             except Exception as e:
                 logger.warning(
                     "Pointer file read failed | file=%s error=%s",
-                    pointer_filename, e,
+                    pointer_filename,
+                    e,
                 )
                 continue
 
@@ -145,9 +145,9 @@ class ModelLoader:
             return None
 
         candidates = [
-            f for f in os.listdir(self.registry_dir)
-            if f.endswith(self.MODEL_EXTENSION)
-            and f.startswith("model_")
+            f
+            for f in os.listdir(self.registry_dir)
+            if f.endswith(self.MODEL_EXTENSION) and f.startswith("model_")
         ]
 
         if not candidates:
@@ -256,9 +256,8 @@ class ModelLoader:
                 # Load feature names from model if available
                 if hasattr(artifact, "feature_names"):
                     self._feature_names = list(artifact.feature_names)
-                elif (
-                    hasattr(artifact, "model")
-                    and hasattr(artifact.model, "feature_names")
+                elif hasattr(artifact, "model") and hasattr(
+                    artifact.model, "feature_names"
                 ):
                     self._feature_names = list(artifact.model.feature_names)
 
@@ -268,6 +267,7 @@ class ModelLoader:
                 else:
                     try:
                         from core.schema.feature_schema import get_schema_signature
+
                         self._schema_signature = get_schema_signature()
                     except Exception:
                         self._schema_signature = "unknown"
@@ -335,16 +335,13 @@ class ModelLoader:
         return {
             "model_version": self._version or "unknown",
             "schema_signature": (
-                self._schema_signature
-                or meta.get("schema_signature", "unknown")
+                self._schema_signature or meta.get("schema_signature", "unknown")
             ),
             "artifact_hash": self._artifact_hash or "unknown",
             "dataset_hash": meta.get("dataset_hash", "unknown"),
             "training_code_hash": meta.get("training_code_hash", "unknown"),
             "feature_checksum": meta.get("feature_checksum", "unknown"),
-            "feature_count": (
-                len(self._feature_names) if self._feature_names else 0
-            ),
+            "feature_count": (len(self._feature_names) if self._feature_names else 0),
         }
 
 

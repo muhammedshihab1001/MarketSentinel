@@ -4,22 +4,22 @@ import pytest
 
 from core.indicators.technical_indicators import TechnicalIndicators
 
-
 ############################################################
 # HELPER
 ############################################################
 
+
 def build_df(prices):
 
-    return pd.DataFrame({
-        "date": pd.date_range("2022-01-01", periods=len(prices)),
-        "close": prices
-    })
+    return pd.DataFrame(
+        {"date": pd.date_range("2022-01-01", periods=len(prices)), "close": prices}
+    )
 
 
 ############################################################
 # BASIC EXECUTION
 ############################################################
+
 
 def test_rsi_runs_without_crashing():
 
@@ -34,6 +34,7 @@ def test_rsi_runs_without_crashing():
 ############################################################
 # BOUNDS CHECK (CRITICAL)
 ############################################################
+
 
 def test_rsi_bounds():
 
@@ -51,6 +52,7 @@ def test_rsi_bounds():
 # STRONG UPTREND
 ############################################################
 
+
 def test_rsi_strong_uptrend():
 
     df = build_df(np.linspace(100, 200, 200))
@@ -64,6 +66,7 @@ def test_rsi_strong_uptrend():
 # STRONG DOWNTREND
 ############################################################
 
+
 def test_rsi_strong_downtrend():
 
     df = build_df(np.linspace(200, 100, 200))
@@ -76,6 +79,7 @@ def test_rsi_strong_downtrend():
 ############################################################
 # FLAT MARKET
 ############################################################
+
 
 def test_rsi_flat_market_equals_50():
 
@@ -95,6 +99,7 @@ def test_rsi_flat_market_equals_50():
 # NAN SAFETY
 ############################################################
 
+
 def test_rsi_no_all_nan():
 
     df = build_df([100.0] * 50)
@@ -107,6 +112,7 @@ def test_rsi_no_all_nan():
 ############################################################
 # SHORT SERIES SAFETY
 ############################################################
+
 
 def test_rsi_short_series():
 
@@ -121,11 +127,10 @@ def test_rsi_short_series():
 # COLUMN VALIDATION
 ############################################################
 
+
 def test_rsi_missing_column():
 
-    df = pd.DataFrame({
-        "price": [1, 2, 3]
-    })
+    df = pd.DataFrame({"price": [1, 2, 3]})
 
     with pytest.raises(Exception):
         TechnicalIndicators.rsi(df)

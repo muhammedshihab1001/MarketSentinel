@@ -74,6 +74,7 @@ TICKER_REGEX = re.compile(r"^[A-Z0-9\.\-]{1,12}$")
 # PIPELINE INIT
 # =========================================================
 
+
 def init_pipeline(model_loader, cache):
     global _pipeline, _model_loader, _cache_instance
     _model_loader = model_loader
@@ -96,15 +97,14 @@ def get_pipeline() -> InferencePipeline:
                 "(init_pipeline not called at startup)"
             )
         except Exception as e:
-            raise RuntimeError(
-                f"InferencePipeline not initialized. Error: {e}"
-            )
+            raise RuntimeError(f"InferencePipeline not initialized. Error: {e}")
     return _pipeline
 
 
 # =========================================================
 # CACHE HELPER
 # =========================================================
+
 
 def _get_cache(request: Optional[Request] = None) -> RedisCache:
     """
@@ -125,6 +125,7 @@ def _get_cache(request: Optional[Request] = None) -> RedisCache:
 # =========================================================
 # UTILS
 # =========================================================
+
 
 def load_default_universe() -> List[str]:
     global _universe_cache
@@ -172,6 +173,7 @@ def _date_window(days: int):
 # =========================================================
 # GET /predict/live-snapshot
 # =========================================================
+
 
 @router.get(
     "/live-snapshot",
@@ -254,6 +256,7 @@ async def live_snapshot(request: Request = None):
 # =========================================================
 # GET /predict/signal-explanation/{ticker}
 # =========================================================
+
 
 @router.get(
     "/signal-explanation/{ticker}",
@@ -368,6 +371,7 @@ async def signal_explanation(
 # GET /predict/price-history/{ticker}
 # =========================================================
 
+
 @router.get(
     "/price-history/{ticker}",
     summary="OHLCV Price History",
@@ -423,14 +427,16 @@ async def price_history(
         prices = []
         for _, row in df.iterrows():
             date_val = str(pd.Timestamp(row["date"]).date())
-            prices.append({
-                "date": date_val,
-                "open": round(float(row.get("open", 0)), 4),
-                "high": round(float(row.get("high", 0)), 4),
-                "low": round(float(row.get("low", 0)), 4),
-                "close": round(float(row.get("close", 0)), 4),
-                "volume": int(row.get("volume", 0)),
-            })
+            prices.append(
+                {
+                    "date": date_val,
+                    "open": round(float(row.get("open", 0)), 4),
+                    "high": round(float(row.get("high", 0)), 4),
+                    "low": round(float(row.get("low", 0)), 4),
+                    "close": round(float(row.get("close", 0)), 4),
+                    "volume": int(row.get("volume", 0)),
+                }
+            )
 
         return {
             "ticker": ticker,

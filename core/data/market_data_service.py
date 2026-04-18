@@ -40,9 +40,7 @@ class MarketDataService:
     get_price_data_batch() — so all callers work without changes.
     """
 
-    REQUIRED_COLUMNS = {
-        "ticker", "date", "open", "high", "low", "close", "volume"
-    }
+    REQUIRED_COLUMNS = {"ticker", "date", "open", "high", "low", "close", "volume"}
 
     DEFAULT_MIN_HISTORY_ROWS = 60
     SAFE_LAG_DAYS = 2
@@ -68,9 +66,7 @@ class MarketDataService:
         ticker = str(ticker).upper().strip()
 
         if not re.fullmatch(r"[A-Z0-9._-]{1,12}", ticker):
-            raise RuntimeError(
-                f"Unsafe or invalid ticker format: '{ticker}'"
-            )
+            raise RuntimeError(f"Unsafe or invalid ticker format: '{ticker}'")
 
         return ticker
 
@@ -83,10 +79,8 @@ class MarketDataService:
 
         requested = pd.Timestamp(date_input, tz="UTC").normalize()
 
-        safe_cutoff = (
-            pd.Timestamp.now(tz="UTC")
-            .normalize()
-            - pd.Timedelta(days=cls.SAFE_LAG_DAYS)
+        safe_cutoff = pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(
+            days=cls.SAFE_LAG_DAYS
         )
 
         return min(requested, safe_cutoff)
@@ -104,9 +98,7 @@ class MarketDataService:
 
         missing = self.REQUIRED_COLUMNS - set(df.columns)
         if missing:
-            raise RuntimeError(
-                f"Schema violation for {ticker}. Missing: {missing}"
-            )
+            raise RuntimeError(f"Schema violation for {ticker}. Missing: {missing}")
 
         df["ticker"] = ticker
 
@@ -145,7 +137,8 @@ class MarketDataService:
             if density < self.MIN_TRADING_DENSITY:
                 logger.warning(
                     "Low trading density for %s: %.2f",
-                    ticker, density,
+                    ticker,
+                    density,
                     extra={
                         "component": "market_data_service",
                         "function": "_validate_dataset",
@@ -157,16 +150,15 @@ class MarketDataService:
             if self.SOFT_FAIL_MODE and len(df) >= soft_threshold:
                 logger.warning(
                     "Short history accepted for %s (%d rows)",
-                    ticker, len(df),
+                    ticker,
+                    len(df),
                     extra={
                         "component": "market_data_service",
                         "function": "_validate_dataset",
                     },
                 )
             else:
-                raise RuntimeError(
-                    f"Insufficient history for {ticker}: got {len(df)}"
-                )
+                raise RuntimeError(f"Insufficient history for {ticker}: got {len(df)}")
 
         return df.reset_index(drop=True)
 
@@ -208,7 +200,9 @@ class MarketDataService:
 
         logger.info(
             "Market data served (DB) | ticker=%s rows=%d latency=%.1fms",
-            ticker, len(df), latency_ms,
+            ticker,
+            len(df),
+            latency_ms,
             extra={
                 "component": "market_data_service",
                 "function": "get_price_data",
@@ -268,7 +262,8 @@ class MarketDataService:
                     failures[ticker] = str(exc)
                     logger.warning(
                         "Batch fetch failed | ticker=%s | error=%s",
-                        ticker, exc,
+                        ticker,
+                        exc,
                         extra={
                             "component": "market_data_service",
                             "function": "get_price_data_batch",
@@ -284,7 +279,8 @@ class MarketDataService:
         if failures:
             logger.warning(
                 "Batch partial failure | success=%d failed=%d",
-                len(results), len(failures),
+                len(results),
+                len(failures),
                 extra={
                     "component": "market_data_service",
                     "function": "get_price_data_batch",
@@ -296,7 +292,10 @@ class MarketDataService:
         logger.info(
             "Batch fetch complete (DB, parallel) | tickers=%d "
             "success=%d failed=%d total=%.1fms",
-            len(tickers), len(results), len(failures), total_ms,
+            len(tickers),
+            len(results),
+            len(failures),
+            total_ms,
             extra={
                 "component": "market_data_service",
                 "function": "get_price_data_batch",

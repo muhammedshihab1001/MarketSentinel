@@ -63,6 +63,7 @@ def _get_redis_connected(request: Request) -> bool:
 def _get_db_connected(request: Request) -> bool:
     try:
         from core.db.engine import get_engine
+
         engine = get_engine()
         with engine.connect() as conn:
             conn.execute(__import__("sqlalchemy").text("SELECT 1"))
@@ -75,6 +76,7 @@ def _get_data_synced(request: Request) -> bool:
     try:
         from core.db.engine import get_engine
         import sqlalchemy as sa
+
         engine = get_engine()
         with engine.connect() as conn:
             result = conn.execute(sa.text("SELECT COUNT(*) FROM ohlcv_daily LIMIT 1"))
@@ -189,10 +191,12 @@ async def health_db(request: Request):
             conn.execute(sa.text("SELECT 1"))
         latency_ms = round((time.time() - t0) * 1000, 2)
 
-        return JSONResponse(content={
-            "db_connected": True,
-            "latency_ms": latency_ms,
-        })
+        return JSONResponse(
+            content={
+                "db_connected": True,
+                "latency_ms": latency_ms,
+            }
+        )
 
     except Exception as e:
         API_ERROR_COUNT.labels(endpoint=endpoint).inc()
@@ -221,11 +225,13 @@ async def health_model(request: Request):
 
     try:
         loader = request.app.state.model_loader
-        return JSONResponse(content={
-            "model_loaded": loader.is_loaded(),
-            "model_version": loader.version or "unknown",
-            "artifact_hash": loader.artifact_hash or "unknown",
-        })
+        return JSONResponse(
+            content={
+                "model_loaded": loader.is_loaded(),
+                "model_version": loader.version or "unknown",
+                "artifact_hash": loader.artifact_hash or "unknown",
+            }
+        )
     except AttributeError:
         return JSONResponse(
             content={"model_loaded": False, "model_version": "unknown"},
