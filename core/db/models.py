@@ -13,6 +13,12 @@ FIX v3: Added composite index on computed_features(feature_version, ticker, date
 
 FIX v2: schema_signature changed String(32) → String(64)
          sha256 hex digest is always 64 characters.
+
+FIX v4 (Issue #25): Added agent tracking and outcome fields to ModelPrediction
+         - Individual agent outputs (signal, technical, political)
+         - Actual forward returns for accuracy measurement
+         - Prediction correctness flags for evaluation
+         All new fields nullable for backward compatibility.
 """
 
 import datetime
@@ -20,6 +26,7 @@ from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Date,
     DateTime,
     Float,
@@ -155,25 +162,34 @@ class ComputedFeature(Base):
 
 class ModelPrediction(Base):
     """
-    Audit trail for model inference results.
+    Audit trail for model inference results with agent tracking.
 
     FIX v2: schema_signature was String(32) — sha256 hex is 64 chars.
     Changed to String(64) to prevent StringDataRightTruncation errors.
 
+    FIX v4 (Issue #25): Added agent tracking and outcome fields.
+    New fields enable:
+      - Individual agent performance measurement
+      - Prediction vs outcome comparison
+      - Agent accuracy evaluation
+      - Dynamic weight adjustment
+
+    All new fields are nullable for backward compatibility with
+    existing prediction records.
+
     Migration for existing DBs:
-        ALTER TABLE model_predictions
-        ALTER COLUMN schema_signature TYPE varchar(64);
+        See alembic/versions/001_add_agent_tracking_fields.py
     """
 
     __tablename__ = "model_predictions"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
+    # ─── Core Prediction Fields (existing) ────────────────
     ticker: Mapped[str] = mapped_column(String(20), nullable=False)
     date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
 
     model_version: Mapped[str] = mapped_column(String(64), nullable=False)
-
     schema_signature: Mapped[str] = mapped_column(String(64), nullable=False)
 
     raw_model_score: Mapped[float] = mapped_column(Float, nullable=False)
@@ -188,6 +204,89 @@ class ModelPrediction(Base):
         nullable=False,
     )
 
+    # ─── Signal Agent Outputs (Issue #25) ─────────────────
+    signal_agent_score: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        doc="SignalAgent consensus score (0.0-1.0)",
+    )
+
+    signal_agent_signal: Mapped[Optional[str]] = mapped_column(
+        String(10),
+        nullable=True,
+        doc="SignalAgent direction: LONG / SHORT / NEUTRAL",
+    )
+
+    signal_agent_confidence: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        doc="SignalAgent confidence level (0.0-1.0)",
+    )
+
+    signal_agent_risk_level: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        doc="SignalAgent risk assessment: low / moderate / high / elevated",
+    )
+
+    # ─── Technical Agent Outputs (Issue #25) ──────────────
+    technical_agent_score: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        doc="TechnicalRiskAgent quality score (0.0-1.0)",
+    )
+
+    technical_agent_bias: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        doc="TechnicalRiskAgent market bias: bullish / bearish / neutral",
+    )
+
+    technical_agent_volatility_regime: Mapped[Optional[str]] = mapped_column(
+        String(30),
+        nullable=True,
+        doc="Volatility regime: normal / high_volatility / low_volatility",
+    )
+
+    # ─── Political Agent Outputs (Issue #25) ──────────────
+    political_agent_score: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        doc="PoliticalRiskAgent geopolitical risk score (0.0-1.0)",
+    )
+
+    political_agent_label: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        doc="Political risk level: LOW / MEDIUM / HIGH / CRITICAL",
+    )
+
+    # ─── Outcome Tracking (Issue #25) ─────────────────────
+    actual_forward_return: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        doc="Actual 5-day forward return (computed after outcome period)",
+    )
+
+    outcome_fetched_at: Mapped[Optional[datetime.datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        doc="Timestamp when actual outcome was computed",
+    )
+
+    # ─── Evaluation Metrics (Issue #25) ───────────────────
+    direction_correct: Mapped[Optional[bool]] = mapped_column(
+        Boolean,
+        nullable=True,
+        doc="True if predicted signal matched actual direction",
+    )
+
+    prediction_error: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        doc="Absolute error: |predicted_score - actual_return|",
+    )
+
     __table_args__ = (
         UniqueConstraint(
             "ticker",
@@ -197,6 +296,15 @@ class ModelPrediction(Base):
         ),
         Index("ix_prediction_date_model", "date", "model_version"),
         Index("ix_prediction_ticker", "ticker"),
+        # NEW: Index for outcome queries (Issue #25)
+        Index(
+            "ix_prediction_outcome_pending",
+            "date",
+            "outcome_fetched_at",
+            postgresql_where="outcome_fetched_at IS NULL",
+        ),
+        # NEW: Index for agent evaluation queries (Issue #25)
+        Index("ix_prediction_agent_eval", "date", "direction_correct"),
     )
 
     def __repr__(self):

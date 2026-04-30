@@ -1,7 +1,14 @@
 """
-MarketSentinel — Database Repository v2.1
+MarketSentinel — Database Repository v2.2
 
-Changes from v2.0:
+Changes from v2.1:
+  FIX (Issue #25): Extended store_predictions() to save agent outputs.
+        New fields stored:
+          - Signal agent: score, signal, confidence, risk_level
+          - Technical agent: score, bias, volatility_regime
+          - Political agent: score, label
+        All fields nullable — backward compatible with old records.
+
   PERF: store_features() replaced row-by-row Python loop with
         vectorised pandas operations.
         Old: iterrows() + dict comprehension per row = O(N) Python
@@ -347,9 +354,29 @@ class FeatureRepository:
 
 
 class PredictionRepository:
+    """
+    Storage and retrieval of model predictions with agent tracking.
+
+    FIX (Issue #25): Extended to store individual agent outputs.
+    """
 
     @staticmethod
     def store_predictions(predictions: List[dict]) -> int:
+        """
+        Store predictions with agent tracking fields.
+
+        NEW (Issue #25): Extracts and stores agent-specific outputs:
+          - signal_agent: score, signal, confidence, risk_level
+          - technical_agent: score, bias, volatility_regime
+          - political_agent: score, label
+
+        Args:
+            predictions: List of prediction dicts from pipeline.
+                        Can include nested 'agents' dict with agent outputs.
+
+        Returns:
+            Number of records inserted (may be 0 if all duplicates).
+        """
 
         if not predictions:
             return 0
@@ -357,7 +384,7 @@ class PredictionRepository:
         # Vectorised preparation via DataFrame
         pred_df = pd.DataFrame(predictions)
 
-        # Normalise columns with safe defaults
+        # ─── Core Fields (existing logic) ─────────────────────
         pred_df["ticker"] = pred_df["ticker"].str.upper()
         pred_df["date"] = pd.to_datetime(pred_df["date"]).dt.date
         pred_df["model_version"] = (
@@ -394,7 +421,66 @@ class PredictionRepository:
             else None
         )
 
+        # ─── NEW (Issue #25): Extract Agent Fields ────────────
+        # Pipeline may pass agents dict with nested outputs
+        # Format: {'agents': {'signal_agent': {...}, 'technical_agent': {...}}}
+
+        def _safe_get(row, *keys, default=None):
+            """Safely navigate nested dict structure."""
+            try:
+                val = row
+                for key in keys:
+                    if isinstance(val, dict):
+                        val = val.get(key)
+                    else:
+                        return default
+                    if val is None:
+                        return default
+                return val
+            except Exception:
+                return default
+
+        # Signal Agent fields
+        pred_df["signal_agent_score"] = pred_df.apply(
+            lambda r: _safe_get(r, "agents", "signal_agent", "score"), axis=1
+        )
+        pred_df["signal_agent_signal"] = pred_df.apply(
+            lambda r: _safe_get(r, "agents", "signal_agent", "signal"), axis=1
+        )
+        pred_df["signal_agent_confidence"] = pred_df.apply(
+            lambda r: _safe_get(r, "agents", "signal_agent", "confidence_numeric"),
+            axis=1,
+        )
+        pred_df["signal_agent_risk_level"] = pred_df.apply(
+            lambda r: _safe_get(r, "agents", "signal_agent", "risk_level"), axis=1
+        )
+
+        # Technical Agent fields
+        pred_df["technical_agent_score"] = pred_df.apply(
+            lambda r: _safe_get(r, "agents", "technical_agent", "score"), axis=1
+        )
+        pred_df["technical_agent_bias"] = pred_df.apply(
+            lambda r: _safe_get(r, "agents", "technical_agent", "bias"), axis=1
+        )
+        pred_df["technical_agent_volatility_regime"] = pred_df.apply(
+            lambda r: _safe_get(
+                r, "agents", "technical_agent", "signals", "volatility_regime"
+            )
+            or _safe_get(r, "agents", "technical_agent", "volatility_regime"),
+            axis=1,
+        )
+
+        # Political Agent fields (from top-level context)
+        pred_df["political_agent_score"] = pred_df.apply(
+            lambda r: _safe_get(r, "political_risk_score"), axis=1
+        )
+        pred_df["political_agent_label"] = pred_df.apply(
+            lambda r: _safe_get(r, "political_risk_label"), axis=1
+        )
+
+        # ─── Build Records ────────────────────────────────────
         keep_cols = [
+            # Core fields
             "ticker",
             "date",
             "model_version",
@@ -404,7 +490,20 @@ class PredictionRepository:
             "weight",
             "signal",
             "drift_state",
+            # NEW: Signal agent fields
+            "signal_agent_score",
+            "signal_agent_signal",
+            "signal_agent_confidence",
+            "signal_agent_risk_level",
+            # NEW: Technical agent fields
+            "technical_agent_score",
+            "technical_agent_bias",
+            "technical_agent_volatility_regime",
+            # NEW: Political agent fields
+            "political_agent_score",
+            "political_agent_label",
         ]
+
         # Only keep columns that exist
         keep_cols = [c for c in keep_cols if c in pred_df.columns]
         records = pred_df[keep_cols].to_dict("records")
@@ -421,10 +520,19 @@ class PredictionRepository:
             result = session.execute(stmt)
             inserted = result.rowcount if result.rowcount else 0
 
+            # Count agent fields populated (for observability)
+            agent_fields_populated = sum(
+                1
+                for r in records
+                if r.get("signal_agent_score") is not None
+                or r.get("technical_agent_score") is not None
+            )
+
             logger.info(
-                "DB prediction store | total=%d inserted=%d",
+                "DB prediction store | total=%d inserted=%d agent_fields=%d",
                 len(records),
                 inserted,
+                agent_fields_populated,
                 extra={
                     "component": "db.repository",
                     "function": "store_predictions",
@@ -464,6 +572,18 @@ class PredictionRepository:
                     "signal": r.signal,
                     "drift_state": r.drift_state,
                     "predicted_at": str(r.predicted_at),
+                    # NEW (Issue #25): Include agent fields if present
+                    "signal_agent_score": r.signal_agent_score,
+                    "signal_agent_signal": r.signal_agent_signal,
+                    "signal_agent_confidence": r.signal_agent_confidence,
+                    "signal_agent_risk_level": r.signal_agent_risk_level,
+                    "technical_agent_score": r.technical_agent_score,
+                    "technical_agent_bias": r.technical_agent_bias,
+                    "technical_agent_volatility_regime": r.technical_agent_volatility_regime,
+                    "political_agent_score": r.political_agent_score,
+                    "political_agent_label": r.political_agent_label,
+                    "actual_forward_return": r.actual_forward_return,
+                    "direction_correct": r.direction_correct,
                 }
                 for r in rows
             ]

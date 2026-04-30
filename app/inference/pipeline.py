@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v5.9.1
+# INSTITUTIONAL INFERENCE PIPELINE v5.10.0
 #
 # FIX v5.8: run_snapshot() was processing ALL 27,400 rows
 #   (274 days × 100 tickers) in the per-ticker loop.
@@ -23,6 +23,11 @@
 #   - Duplicate STORE_PREDICTIONS block removed.
 #     Prediction storage was running twice per snapshot,
 #     causing unnecessary DB writes and log noise.
+#
+# FIX v5.10.0 (Issue #25): Pass agent outputs to repository.
+#   - pred_records now includes 'agents' dict with all agent outputs
+#   - Repository extracts and stores agent-specific fields
+#   - Enables agent performance tracking and evaluation
 # =========================================================
 
 import time
@@ -656,20 +661,23 @@ class InferencePipeline:
             "_portfolio": portfolio_output,
         }
 
-        # ── FIX v5.9.1: Single prediction storage block ──────
-        # Removed duplicate — was running twice per snapshot.
-        # STORE_PREDICTIONS=1 enables IC stats computation.
+        # ── FIX v5.10.0: Pass agent outputs to repository ────
+        # NEW (Issue #25): Include agents dict in pred_records
+        # Repository will extract agent-specific fields
         store_preds = os.getenv("STORE_PREDICTIONS", "0") == "1"
         if store_preds:
             try:
                 from core.db.repository import PredictionRepository
 
                 model_ver = getattr(loader, "version", "unknown")
+                schema_sig = getattr(loader, "schema_signature", "unknown")
+
                 pred_records = [
                     {
                         "ticker": r["ticker"],
                         "date": r["date"],
                         "model_version": model_ver,
+                        "schema_signature": schema_sig,
                         "raw_model_score": r["raw_model_score"],
                         "hybrid_score": r["hybrid_consensus_score"],
                         "weight": r["weight"],
@@ -679,14 +687,21 @@ class InferencePipeline:
                             else "SHORT" if r["weight"] < -0.01 else "NEUTRAL"
                         ),
                         "drift_state": drift_state,
+                        # NEW (Issue #25): Pass full agents dict
+                        "agents": r.get("agents", {}),
+                        # NEW (Issue #25): Pass political risk context
+                        "political_risk_score": political_score,
+                        "political_risk_label": political_label,
                     }
                     for r in snapshot_rows
                 ]
-                PredictionRepository.store_predictions(pred_records)
+
+                inserted = PredictionRepository.store_predictions(pred_records)
                 logger.info(
-                    "Predictions stored | date=%s | count=%d",
+                    "Predictions stored | date=%s | count=%d | inserted=%d | agent_tracking=enabled",
                     snapshot_date,
                     len(pred_records),
+                    inserted,
                 )
             except Exception as e:
                 logger.warning("Prediction storage failed (non-blocking): %s", e)
