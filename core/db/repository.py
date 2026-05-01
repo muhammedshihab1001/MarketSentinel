@@ -1,7 +1,11 @@
 """
-MarketSentinel — Database Repository v2.2
+MarketSentinel — Database Repository v2.3
 
-Changes from v2.1:
+Changes from v2.2:
+  NEW (Issue #26): Added outcome computation methods to PredictionRepository:
+        - get_predictions_needing_outcomes() — Query predictions pending outcome
+        - update_prediction_outcomes() — Batch update outcomes
+
   FIX (Issue #25): Extended store_predictions() to save agent outputs.
         New fields stored:
           - Signal agent: score, signal, confidence, risk_level
@@ -30,7 +34,7 @@ from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import select, delete, func
+from sqlalchemy import select, delete, func, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.db.engine import get_session
@@ -355,9 +359,10 @@ class FeatureRepository:
 
 class PredictionRepository:
     """
-    Storage and retrieval of model predictions with agent tracking.
+    Storage and retrieval of model predictions with agent tracking and outcomes.
 
     FIX (Issue #25): Extended to store individual agent outputs.
+    NEW (Issue #26): Added outcome computation methods.
     """
 
     @staticmethod
@@ -589,3 +594,127 @@ class PredictionRepository:
             ]
 
             return pd.DataFrame(records)
+
+    # ─── NEW (Issue #26): Outcome Computation Methods ────────
+
+    @staticmethod
+    def get_predictions_needing_outcomes(
+        start_date: str,
+        end_date: str,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Query predictions that need outcome computation.
+        
+        Returns predictions where:
+        - date is between start_date and end_date
+        - outcome_fetched_at IS NULL (not yet computed)
+        
+        Uses the ix_prediction_outcome_pending partial index for performance.
+        
+        Args:
+            start_date: Start of date range (YYYY-MM-DD)
+            end_date: End of date range (YYYY-MM-DD)
+        
+        Returns:
+            DataFrame with predictions or None if no matches
+        """
+        
+        with get_session() as session:
+            
+            stmt = (
+                select(
+                    ModelPrediction.id,
+                    ModelPrediction.ticker,
+                    ModelPrediction.date,
+                    ModelPrediction.signal,
+                    ModelPrediction.raw_model_score,
+                    ModelPrediction.predicted_at,
+                )
+                .where(
+                    ModelPrediction.date >= start_date,
+                    ModelPrediction.date <= end_date,
+                    ModelPrediction.outcome_fetched_at.is_(None),
+                )
+                .order_by(ModelPrediction.date, ModelPrediction.ticker)
+            )
+            
+            rows = session.execute(stmt).mappings().all()
+            
+            if not rows:
+                return None
+            
+            df = pd.DataFrame(rows)
+            
+            logger.debug(
+                "DB outcome query | start=%s end=%s count=%d",
+                start_date,
+                end_date,
+                len(df),
+                extra={
+                    "component": "db.repository",
+                    "function": "get_predictions_needing_outcomes",
+                },
+            )
+            
+            return df
+
+    @staticmethod
+    def update_prediction_outcomes(outcomes: List[dict]) -> int:
+        """
+        Batch update predictions with computed outcomes.
+        
+        Updates fields:
+        - actual_forward_return
+        - direction_correct
+        - prediction_error
+        - outcome_fetched_at
+        
+        Args:
+            outcomes: List of outcome dicts with:
+                - id: prediction ID
+                - actual_forward_return: computed return
+                - direction_correct: boolean
+                - prediction_error: absolute error
+                - outcome_fetched_at: timestamp
+        
+        Returns:
+            Number of records updated
+        """
+        
+        if not outcomes:
+            return 0
+        
+        with get_session() as session:
+            
+            # Batch update using SQLAlchemy bulk update
+            # More efficient than row-by-row updates
+            
+            updated_count = 0
+            
+            for outcome in outcomes:
+                
+                stmt = (
+                    update(ModelPrediction)
+                    .where(ModelPrediction.id == outcome["id"])
+                    .values(
+                        actual_forward_return=outcome["actual_forward_return"],
+                        direction_correct=outcome["direction_correct"],
+                        prediction_error=outcome["prediction_error"],
+                        outcome_fetched_at=outcome["outcome_fetched_at"],
+                    )
+                )
+                
+                result = session.execute(stmt)
+                updated_count += result.rowcount
+            
+            logger.info(
+                "DB outcome update | total=%d updated=%d",
+                len(outcomes),
+                updated_count,
+                extra={
+                    "component": "db.repository",
+                    "function": "update_prediction_outcomes",
+                },
+            )
+            
+            return updated_count
