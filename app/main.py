@@ -15,6 +15,7 @@
 #     /agent/explain            20  req / 60s
 #     /agent/political-risk     20  req / 60s
 #     /performance              20  req / 60s
+#     /agent/performance        30  req / 60s
 #     /health/live              60  req / 60s  (Docker probe)
 #     /health/ready             60  req / 60s
 #     ALL OTHER paths           60  req / 60s  (global fallback)
@@ -217,6 +218,7 @@ PER_PATH_RATE_LIMITS = {
     "/performance": (20, 60),
     "/health/live": (60, 60),
     "/health/ready": (60, 60),
+    "/agent/performance": (30, 60),
 }
 
 RATE_LIMIT_DEFAULT = (60, 60)

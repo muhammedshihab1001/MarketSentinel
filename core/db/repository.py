@@ -1,30 +1,18 @@
 """
-MarketSentinel — Database Repository v2.3
+MarketSentinel — Database Repository v2.4
 
-Changes from v2.2:
-  NEW (Issue #26): Added outcome computation methods to PredictionRepository:
-        - get_predictions_needing_outcomes() — Query predictions pending outcome
+Changes from v2.3:
+  NEW (Issue #27): Added agent performance methods:
+        - get_predictions_with_outcomes() — Query predictions for agent eval
+        - store_agent_performance() — Batch store agent metrics
+
+  NEW (Issue #26): Added outcome computation methods:
+        - get_predictions_needing_outcomes() — Query pending outcomes
         - update_prediction_outcomes() — Batch update outcomes
 
   FIX (Issue #25): Extended store_predictions() to save agent outputs.
-        New fields stored:
-          - Signal agent: score, signal, confidence, risk_level
-          - Technical agent: score, bias, volatility_regime
-          - Political agent: score, label
-        All fields nullable — backward compatible with old records.
 
-  PERF: store_features() replaced row-by-row Python loop with
-        vectorised pandas operations.
-        Old: iterrows() + dict comprehension per row = O(N) Python
-        New: df.to_dict('records') after vectorised column selection
-             = 10-20× faster for 27,400-row inserts.
-
-  PERF: store_predictions() same fix — loop replaced with
-        vectorised cast + to_dict().
-
-  PERF: get_features() uses .mappings().all() instead of
-        .scalars().all() + ORM object creation, avoiding the
-        ORM hydration overhead for read-heavy paths.
+  PERF: All methods use vectorised pandas operations.
 
   NO CHANGE to public API — all callers work without modification.
 """
@@ -38,7 +26,7 @@ from sqlalchemy import select, delete, func, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.db.engine import get_session
-from core.db.models import OHLCVDaily, ComputedFeature, ModelPrediction
+from core.db.models import OHLCVDaily, ComputedFeature, ModelPrediction, AgentPerformance
 from core.logging.logger import get_logger
 
 logger = get_logger(__name__)
@@ -117,7 +105,6 @@ class OHLCVRepository:
         if df is None or df.empty:
             return 0
 
-        # Vectorised preparation — no Python loop
         work = df.copy()
         work["ticker"] = work["ticker"].str.upper()
         work["date"] = pd.to_datetime(work["date"]).dt.date
@@ -178,15 +165,6 @@ class OHLCVRepository:
 class FeatureRepository:
     """
     Storage and retrieval of pre-computed features.
-
-    PERF notes:
-      get_features()   — uses .mappings() to avoid ORM hydration overhead.
-                         ORM object creation is ~3× slower than dict mapping
-                         for read-heavy paths with 27,400 rows.
-      store_features() — vectorised DataFrame ops replace row-by-row loop.
-                         iterrows() on 27,400 rows was the 70s INSERT culprit
-                         (Python overhead + per-row dict, not DB latency).
-                         New path: vectorised cast → to_dict('records') → bulk insert.
     """
 
     @staticmethod
@@ -214,7 +192,6 @@ class FeatureRepository:
                 .order_by(ComputedFeature.ticker, ComputedFeature.date)
             )
 
-            # .mappings() returns dicts directly — avoids ORM object hydration
             rows = session.execute(stmt).mappings().all()
 
             if not rows:
@@ -249,25 +226,6 @@ class FeatureRepository:
         feature_version: str,
         feature_columns: List[str],
     ) -> int:
-        """
-        Bulk store computed features.
-
-        PERF FIX: Replaced row-by-row iterrows() loop with vectorised ops.
-
-        Old path (slow):
-            for _, row in df.iterrows():
-                feature_data = {col: float(row[col]) for col in cols}
-                records.append({...})
-            # Python loop over 27,400 rows ≈ 5-10s of Python overhead
-            # plus the actual INSERT adds another 60s = 70s total
-
-        New path (fast):
-            1. Select only feature columns as numpy float32 array
-            2. Replace non-finite with 0.0 (vectorised)
-            3. Build records list via to_dict('records') on a small
-               3-column frame + feature_data as pre-built dicts
-            # Python overhead: <0.5s. INSERT: 2-3s. Total: ~3s.
-        """
 
         if df is None or df.empty:
             return 0
@@ -280,7 +238,6 @@ class FeatureRepository:
 
         work = df[["ticker", "date"] + available_cols].copy()
 
-        # Vectorised cast — replace non-finite with 0.0
         feat_block = (
             work[available_cols]
             .apply(pd.to_numeric, errors="coerce")
@@ -288,7 +245,6 @@ class FeatureRepository:
             .fillna(0.0)
         )
 
-        # Build feature_data dicts — orient='records' is C-level fast
         feat_dicts = feat_block.to_dict("records")
 
         tickers_upper = work["ticker"].str.upper().tolist()
@@ -363,33 +319,19 @@ class PredictionRepository:
 
     FIX (Issue #25): Extended to store individual agent outputs.
     NEW (Issue #26): Added outcome computation methods.
+    NEW (Issue #27): Added agent performance methods.
     """
 
     @staticmethod
     def store_predictions(predictions: List[dict]) -> int:
-        """
-        Store predictions with agent tracking fields.
-
-        NEW (Issue #25): Extracts and stores agent-specific outputs:
-          - signal_agent: score, signal, confidence, risk_level
-          - technical_agent: score, bias, volatility_regime
-          - political_agent: score, label
-
-        Args:
-            predictions: List of prediction dicts from pipeline.
-                        Can include nested 'agents' dict with agent outputs.
-
-        Returns:
-            Number of records inserted (may be 0 if all duplicates).
-        """
+        """Store predictions with agent tracking fields (Issue #25)."""
 
         if not predictions:
             return 0
 
-        # Vectorised preparation via DataFrame
         pred_df = pd.DataFrame(predictions)
 
-        # ─── Core Fields (existing logic) ─────────────────────
+        # ─── Core Fields ─────────────────────
         pred_df["ticker"] = pred_df["ticker"].str.upper()
         pred_df["date"] = pd.to_datetime(pred_df["date"]).dt.date
         pred_df["model_version"] = (
@@ -426,12 +368,8 @@ class PredictionRepository:
             else None
         )
 
-        # ─── NEW (Issue #25): Extract Agent Fields ────────────
-        # Pipeline may pass agents dict with nested outputs
-        # Format: {'agents': {'signal_agent': {...}, 'technical_agent': {...}}}
-
+        # ─── Agent Fields ────────────────────
         def _safe_get(row, *keys, default=None):
-            """Safely navigate nested dict structure."""
             try:
                 val = row
                 for key in keys:
@@ -445,7 +383,6 @@ class PredictionRepository:
             except Exception:
                 return default
 
-        # Signal Agent fields
         pred_df["signal_agent_score"] = pred_df.apply(
             lambda r: _safe_get(r, "agents", "signal_agent", "score"), axis=1
         )
@@ -460,7 +397,6 @@ class PredictionRepository:
             lambda r: _safe_get(r, "agents", "signal_agent", "risk_level"), axis=1
         )
 
-        # Technical Agent fields
         pred_df["technical_agent_score"] = pred_df.apply(
             lambda r: _safe_get(r, "agents", "technical_agent", "score"), axis=1
         )
@@ -475,7 +411,6 @@ class PredictionRepository:
             axis=1,
         )
 
-        # Political Agent fields (from top-level context)
         pred_df["political_agent_score"] = pred_df.apply(
             lambda r: _safe_get(r, "political_risk_score"), axis=1
         )
@@ -483,33 +418,15 @@ class PredictionRepository:
             lambda r: _safe_get(r, "political_risk_label"), axis=1
         )
 
-        # ─── Build Records ────────────────────────────────────
+        # ─── Build Records ───────────────────
         keep_cols = [
-            # Core fields
-            "ticker",
-            "date",
-            "model_version",
-            "schema_signature",
-            "raw_model_score",
-            "hybrid_score",
-            "weight",
-            "signal",
-            "drift_state",
-            # NEW: Signal agent fields
-            "signal_agent_score",
-            "signal_agent_signal",
-            "signal_agent_confidence",
-            "signal_agent_risk_level",
-            # NEW: Technical agent fields
-            "technical_agent_score",
-            "technical_agent_bias",
-            "technical_agent_volatility_regime",
-            # NEW: Political agent fields
-            "political_agent_score",
-            "political_agent_label",
+            "ticker", "date", "model_version", "schema_signature",
+            "raw_model_score", "hybrid_score", "weight", "signal", "drift_state",
+            "signal_agent_score", "signal_agent_signal", "signal_agent_confidence", "signal_agent_risk_level",
+            "technical_agent_score", "technical_agent_bias", "technical_agent_volatility_regime",
+            "political_agent_score", "political_agent_label",
         ]
 
-        # Only keep columns that exist
         keep_cols = [c for c in keep_cols if c in pred_df.columns]
         records = pred_df[keep_cols].to_dict("records")
 
@@ -525,7 +442,6 @@ class PredictionRepository:
             result = session.execute(stmt)
             inserted = result.rowcount if result.rowcount else 0
 
-            # Count agent fields populated (for observability)
             agent_fields_populated = sum(
                 1
                 for r in records
@@ -577,7 +493,6 @@ class PredictionRepository:
                     "signal": r.signal,
                     "drift_state": r.drift_state,
                     "predicted_at": str(r.predicted_at),
-                    # NEW (Issue #25): Include agent fields if present
                     "signal_agent_score": r.signal_agent_score,
                     "signal_agent_signal": r.signal_agent_signal,
                     "signal_agent_confidence": r.signal_agent_confidence,
@@ -595,29 +510,14 @@ class PredictionRepository:
 
             return pd.DataFrame(records)
 
-    # ─── NEW (Issue #26): Outcome Computation Methods ────────
+    # ─── Issue #26: Outcome Methods ──────────────────────────
 
     @staticmethod
     def get_predictions_needing_outcomes(
         start_date: str,
         end_date: str,
     ) -> Optional[pd.DataFrame]:
-        """
-        Query predictions that need outcome computation.
-        
-        Returns predictions where:
-        - date is between start_date and end_date
-        - outcome_fetched_at IS NULL (not yet computed)
-        
-        Uses the ix_prediction_outcome_pending partial index for performance.
-        
-        Args:
-            start_date: Start of date range (YYYY-MM-DD)
-            end_date: End of date range (YYYY-MM-DD)
-        
-        Returns:
-            DataFrame with predictions or None if no matches
-        """
+        """Query predictions needing outcome computation (Issue #26)."""
         
         with get_session() as session:
             
@@ -660,34 +560,12 @@ class PredictionRepository:
 
     @staticmethod
     def update_prediction_outcomes(outcomes: List[dict]) -> int:
-        """
-        Batch update predictions with computed outcomes.
-        
-        Updates fields:
-        - actual_forward_return
-        - direction_correct
-        - prediction_error
-        - outcome_fetched_at
-        
-        Args:
-            outcomes: List of outcome dicts with:
-                - id: prediction ID
-                - actual_forward_return: computed return
-                - direction_correct: boolean
-                - prediction_error: absolute error
-                - outcome_fetched_at: timestamp
-        
-        Returns:
-            Number of records updated
-        """
+        """Batch update predictions with outcomes (Issue #26)."""
         
         if not outcomes:
             return 0
         
         with get_session() as session:
-            
-            # Batch update using SQLAlchemy bulk update
-            # More efficient than row-by-row updates
             
             updated_count = 0
             
@@ -718,3 +596,146 @@ class PredictionRepository:
             )
             
             return updated_count
+
+    # ─── Issue #27: Agent Performance Methods ────────────────
+
+    @staticmethod
+    def get_predictions_with_outcomes(
+        start_date: str,
+        end_date: str,
+    ) -> Optional[pd.DataFrame]:
+        """Query predictions with outcomes for agent evaluation (Issue #27)."""
+        
+        with get_session() as session:
+            
+            stmt = (
+                select(ModelPrediction)
+                .where(
+                    ModelPrediction.date >= start_date,
+                    ModelPrediction.date <= end_date,
+                    ModelPrediction.outcome_fetched_at.is_not(None),
+                )
+                .order_by(ModelPrediction.date)
+            )
+            
+            rows = session.execute(stmt).scalars().all()
+            
+            if not rows:
+                return None
+            
+            records = [
+                {
+                    "id": r.id,
+                    "ticker": r.ticker,
+                    "date": str(r.date),
+                    "signal": r.signal,
+                    "raw_model_score": r.raw_model_score,
+                    "signal_agent_score": r.signal_agent_score,
+                    "signal_agent_signal": r.signal_agent_signal,
+                    "signal_agent_confidence": r.signal_agent_confidence,
+                    "signal_agent_risk_level": r.signal_agent_risk_level,
+                    "technical_agent_score": r.technical_agent_score,
+                    "technical_agent_bias": r.technical_agent_bias,
+                    "technical_agent_volatility_regime": r.technical_agent_volatility_regime,
+                    "actual_forward_return": r.actual_forward_return,
+                    "direction_correct": r.direction_correct,
+                    "prediction_error": r.prediction_error,
+                }
+                for r in rows
+            ]
+            
+            df = pd.DataFrame(records)
+            
+            logger.debug(
+                "DB agent eval query | start=%s end=%s count=%d",
+                start_date,
+                end_date,
+                len(df),
+                extra={
+                    "component": "db.repository",
+                    "function": "get_predictions_with_outcomes",
+                },
+            )
+            
+            return df
+
+    @staticmethod
+    def store_agent_performance(records: List[dict]) -> int:
+        """Store agent performance metrics (Issue #27)."""
+        
+        if not records:
+            return 0
+        
+        with get_session() as session:
+            
+            stmt = pg_insert(AgentPerformance).values(records)
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_agent_perf_name_date",
+                set_={
+                    "direction_accuracy": stmt.excluded.direction_accuracy,
+                    "sharpe_ratio": stmt.excluded.sharpe_ratio,
+                    "num_predictions": stmt.excluded.num_predictions,
+                    "avg_score": stmt.excluded.avg_score,
+                    "confidence_calibration": stmt.excluded.confidence_calibration,
+                    "mean_absolute_error": stmt.excluded.mean_absolute_error,
+                },
+            )
+            
+            result = session.execute(stmt)
+            upserted = result.rowcount if result.rowcount else 0
+            
+            logger.info(
+                "DB agent performance store | total=%d upserted=%d",
+                len(records),
+                upserted,
+                extra={
+                    "component": "db.repository",
+                    "function": "store_agent_performance",
+                },
+            )
+            
+            return upserted
+
+    @staticmethod
+    def get_agent_performance(
+        agent_name: Optional[str] = None,
+        days: int = 30,
+    ) -> Optional[pd.DataFrame]:
+        """Query agent performance history (Issue #27)."""
+        
+        with get_session() as session:
+            
+            cutoff = pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=days)
+            
+            stmt = select(AgentPerformance).where(
+                AgentPerformance.evaluation_date >= cutoff.strftime("%Y-%m-%d")
+            )
+            
+            if agent_name:
+                stmt = stmt.where(AgentPerformance.agent_name == agent_name)
+            
+            stmt = stmt.order_by(
+                AgentPerformance.agent_name,
+                AgentPerformance.evaluation_date,
+            )
+            
+            rows = session.execute(stmt).scalars().all()
+            
+            if not rows:
+                return None
+            
+            records = [
+                {
+                    "agent_name": r.agent_name,
+                    "evaluation_date": str(r.evaluation_date),
+                    "direction_accuracy": r.direction_accuracy,
+                    "sharpe_ratio": r.sharpe_ratio,
+                    "num_predictions": r.num_predictions,
+                    "avg_score": r.avg_score,
+                    "confidence_calibration": r.confidence_calibration,
+                    "mean_absolute_error": r.mean_absolute_error,
+                }
+                for r in rows
+            ]
+            
+            return pd.DataFrame(records)

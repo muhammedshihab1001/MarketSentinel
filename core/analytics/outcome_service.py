@@ -32,7 +32,7 @@ import pandas as pd
 import numpy as np
 
 from core.data.market_data_service import MarketDataService
-from core.db.repository import PredictionRepository, OHLCVRepository
+from core.db.repository import PredictionRepository
 from core.logging.logger import get_logger
 
 logger = get_logger(__name__)
@@ -239,7 +239,6 @@ class OutcomeService:
                 ticker=ticker,
                 start_date=min_date.strftime("%Y-%m-%d"),
                 end_date=max_date.strftime("%Y-%m-%d"),
-                min_history=5,
             )
         except Exception as e:
             logger.warning(
@@ -306,7 +305,6 @@ class OutcomeService:
             return None
         
         # Find actual price at t+5 (may not be exactly 5 days due to weekends/holidays)
-        target_date = pred_date + pd.Timedelta(days=FORWARD_DAYS)
         price_t5 = None
         
         # Search forward up to 10 calendar days to find next trading day
@@ -318,9 +316,10 @@ class OutcomeService:
         
         if price_t5 is None:
             logger.debug(
-                "No price found for target date | ticker=%s target=%s",
+                "No price found for target date | ticker=%s pred_date=%s offset=+%d",
                 ticker,
-                target_date.strftime("%Y-%m-%d"),
+                pred_date.strftime("%Y-%m-%d"),
+                FORWARD_DAYS,
                 extra={"component": "outcome_service", "function": "_compute_single_outcome"},
             )
             return None

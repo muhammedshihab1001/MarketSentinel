@@ -139,7 +139,7 @@ CACHE_MISSES = Counter(
 
 
 # =====================================================
-# DATABASE OBSERVABILITY  (NEW)
+# DATABASE OBSERVABILITY
 # =====================================================
 
 DB_QUERY_COUNT = Counter(
@@ -192,4 +192,44 @@ PIPELINE_FAILURES = Counter(
 INFERENCE_IN_PROGRESS = Gauge(
     "inference_in_progress",
     "Number of active inferences",
+)
+
+
+# =====================================================
+# AGENT PERFORMANCE METRICS (Issue #28)
+# =====================================================
+
+AGENT_DIRECTION_ACCURACY = Gauge(
+    "agent_direction_accuracy",
+    "Agent direction prediction accuracy (0.0-1.0)",
+    ["agent_name"],  # labels: signal_agent, technical_agent, model_only
+)
+
+AGENT_SHARPE_CONTRIBUTION = Gauge(
+    "agent_sharpe_contribution",
+    "Agent Sharpe ratio contribution",
+    ["agent_name"],
+)
+
+AGENT_NUM_PREDICTIONS = Gauge(
+    "agent_num_predictions",
+    "Number of predictions evaluated for agent",
+    ["agent_name"],
+)
+
+AGENT_CONFIDENCE_CALIBRATION = Gauge(
+    "agent_confidence_calibration",
+    "Confidence calibration score (signal_agent only)",
+    ["agent_name"],
+)
+
+MODEL_ONLY_SHARPE = Gauge(
+    "model_only_sharpe",
+    "Raw model Sharpe ratio (baseline)",
+)
+
+AGENT_WEIGHT = Gauge(
+    "agent_weight",
+    "Current agent weight in hybrid scoring",
+    ["agent_name"],
 )

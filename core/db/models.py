@@ -1,24 +1,16 @@
 """
 MarketSentinel — ORM Models
 
-Three core tables:
+Core tables:
   1. ohlcv_daily        — Raw price data from Yahoo Finance
   2. computed_features  — Pre-computed feature engineering output
   3. model_predictions  — Stored inference results for audit trail
+  4. agent_performance  — Agent evaluation metrics (Issue #27)
 
 FIX v3: Added composite index on computed_features(feature_version, ticker, date)
-         Previous single-column ix_feature_version caused full table scan on
-         the FeatureRepository.get_features() query — 3s for 27,400 rows.
-         Composite index makes it a covered index lookup: ~5ms.
-
 FIX v2: schema_signature changed String(32) → String(64)
-         sha256 hex digest is always 64 characters.
-
 FIX v4 (Issue #25): Added agent tracking and outcome fields to ModelPrediction
-         - Individual agent outputs (signal, technical, political)
-         - Actual forward returns for accuracy measurement
-         - Prediction correctness flags for evaluation
-         All new fields nullable for backward compatibility.
+FIX v5 (Issue #27): Added AgentPerformance table for agent metrics
 """
 
 import datetime
@@ -311,4 +303,108 @@ class ModelPrediction(Base):
         return (
             f"<ModelPrediction ticker={self.ticker} date={self.date} "
             f"score={self.raw_model_score:.4f}>"
+        )
+
+
+# ─── Agent Performance ───────────────────────────────────────
+
+
+class AgentPerformance(Base):
+    """
+    Stores agent evaluation metrics over time.
+    
+    NEW (Issue #27): Tracks agent accuracy and performance.
+    Enables performance-based weight adjustment.
+    
+    Query pattern: WHERE agent_name = ? AND evaluation_date >= ?
+    """
+
+    __tablename__ = "agent_performance"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    agent_name: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        doc="Agent identifier: signal_agent, technical_agent, model_only",
+    )
+
+    evaluation_date: Mapped[datetime.date] = mapped_column(
+        Date,
+        nullable=False,
+        doc="Date when evaluation was performed",
+    )
+
+    period_start: Mapped[datetime.date] = mapped_column(
+        Date,
+        nullable=False,
+        doc="Start of evaluation period",
+    )
+
+    period_end: Mapped[datetime.date] = mapped_column(
+        Date,
+        nullable=False,
+        doc="End of evaluation period",
+    )
+
+    # ─── Performance Metrics ──────────────────────────────
+    direction_accuracy: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        doc="Fraction of correct direction predictions (0.0-1.0)",
+    )
+
+    sharpe_ratio: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        doc="Annualized Sharpe ratio of agent's predictions",
+    )
+
+    num_predictions: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        doc="Number of predictions evaluated",
+    )
+
+    avg_score: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        doc="Average agent score during period",
+    )
+
+    confidence_calibration: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        doc="Confidence calibration score (signal_agent only)",
+    )
+
+    mean_absolute_error: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        doc="Mean absolute prediction error (model_only)",
+    )
+
+    evaluated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        doc="Timestamp when evaluation was performed",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_name",
+            "evaluation_date",
+            name="uq_agent_perf_name_date",
+        ),
+        Index("ix_agent_perf_name", "agent_name"),
+        Index("ix_agent_perf_date", "evaluation_date"),
+        Index("ix_agent_perf_name_date", "agent_name", "evaluation_date"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<AgentPerformance agent={self.agent_name} date={self.evaluation_date} "
+            f"accuracy={self.direction_accuracy:.2%}>"
         )

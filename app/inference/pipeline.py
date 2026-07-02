@@ -1,5 +1,5 @@
 # =========================================================
-# INSTITUTIONAL INFERENCE PIPELINE v5.10.0
+# INSTITUTIONAL INFERENCE PIPELINE v5.11.0
 #
 # FIX v5.8: run_snapshot() was processing ALL 27,400 rows
 #   (274 days × 100 tickers) in the per-ticker loop.
@@ -33,6 +33,7 @@
 import time
 import logging
 import os
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional
@@ -51,8 +52,8 @@ INFERENCE_LOOKBACK_DAYS = int(os.getenv("INFERENCE_LOOKBACK_DAYS", "400"))
 # FIX v5.9.1 — Volatility regime display mapping
 # Converts internal enum to clean human-readable label.
 # Prevents double-word: "low_volatility" → "low"
-# Then used as: "low volatility regime" ✅
-# Not:          "low volatility volatility regime" ❌
+# Then used as: "low volatility regime" 
+# Not:          "low volatility volatility regime" 
 # =========================================================
 
 _VOL_DISPLAY: Dict[str, str] = {
@@ -418,13 +419,76 @@ class InferencePipeline:
     # RUN SNAPSHOT
     # =====================================================
 
+    @staticmethod
+    def _load_agent_weights() -> dict:
+        """
+        Load dynamic agent weights from config/agent_weights.json.
+
+        Issue #30: Hybrid score uses performance-based weights that are
+        updated weekly by update_agent_weights.py.
+
+        Falls back to hardcoded defaults if file is missing or corrupt
+        so inference never fails due to a bad config file.
+
+        Returns:
+            Dict with keys: raw_model, signal_agent, technical_agent
+        """
+        _DEFAULTS = {
+            "raw_model": 0.50,
+            "signal_agent": 0.30,
+            "technical_agent": 0.20,
+        }
+        try:
+            import json
+
+            config_path = (
+                Path(os.path.dirname(__file__)).parent.parent
+                / "config"
+                / "agent_weights.json"
+            )
+            if not config_path.exists():
+                # Try relative path when running inside Docker
+                config_path = Path("/app/config/agent_weights.json")
+
+            if config_path.exists():
+                with open(config_path, "r") as f:
+                    cfg = json.load(f)
+                weights = cfg.get("weights", {})
+
+                # Validate all keys present and sum ~1.0
+                required = {"raw_model", "signal_agent", "technical_agent"}
+                if required.issubset(weights.keys()):
+                    total = sum(weights[k] for k in required)
+                    if 0.95 <= total <= 1.05:
+                        logger.debug(
+                            "Dynamic weights loaded | raw=%.2f signal=%.2f tech=%.2f",
+                            weights["raw_model"],
+                            weights["signal_agent"],
+                            weights["technical_agent"],
+                        )
+                        return {k: weights[k] for k in required}
+
+        except Exception as e:
+            logger.warning("Weight config load failed, using defaults | error=%s", e)
+
+        return _DEFAULTS
+
     def run_snapshot(self, snapshot_date: Optional[str] = None) -> dict:
         start_time = time.time()
 
         if snapshot_date is None:
             snapshot_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
-        logger.info("Running snapshot | date=%s", snapshot_date)
+        # ── Issue #30: Load dynamic agent weights ─────
+        agent_weights = self._load_agent_weights()
+        w_raw    = agent_weights["raw_model"]
+        w_signal = agent_weights["signal_agent"]
+        w_tech   = agent_weights["technical_agent"]
+
+        logger.info(
+            "Running snapshot | date=%s weights=raw:%.2f sig:%.2f tech:%.2f",
+            snapshot_date, w_raw, w_signal, w_tech,
+        )
 
         # ── Get model ─────────────────────────────────
         try:
@@ -536,9 +600,11 @@ class InferencePipeline:
             signal_score = float(signal_output.get("score", 0.0))
             technical_score = float(technical_output.get("score", 0.0))
 
+            # Issue #30: Use dynamic weights from agent_weights.json
+            # Weights updated weekly by update_agent_weights.py based on performance
             hybrid_score = float(
                 np.clip(
-                    0.50 * raw_score + 0.30 * signal_score + 0.20 * technical_score,
+                    w_raw * raw_score + w_signal * signal_score + w_tech * technical_score,
                     -1.0,
                     1.0,
                 )

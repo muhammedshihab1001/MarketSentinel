@@ -157,6 +157,7 @@ services:
       - ./artifacts:/app/artifacts
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./config:/app/config
 
     depends_on:
       redis:
@@ -173,6 +174,125 @@ services:
 
     mem_limit: 1536m
     cpus: 1.0
+
+
+  ####################################################
+  # OUTCOME SCHEDULER (Issue #26)
+  # Computes actual forward returns for predictions
+  # Runs daily at 6:00 AM
+  ####################################################
+  outcome-scheduler:
+    container_name: marketsentinel-outcomes
+    
+    build:
+      context: .
+      dockerfile: docker/inference.Dockerfile
+    
+    restart: unless-stopped
+    
+    networks:
+      - marketsentinel-net
+    
+    env_file:
+      - .env
+    
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=sentinel
+      - POSTGRES_PASSWORD=sentinel
+      - POSTGRES_DB=marketsentinel
+      - DATABASE_URL=postgresql+psycopg2://sentinel:sentinel@postgres:5432/marketsentinel
+    
+    volumes:
+      - ./scripts:/app/scripts
+      - ./core:/app/core
+      - ./logs:/app/logs
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+    
+    entrypoint: >
+      sh -c "
+        echo 'Outcome scheduler started. Running daily at 6:00 AM.';
+        while true; do
+          CURRENT_HOUR=$$(date +%H);
+          if [ $$CURRENT_HOUR -eq 6 ]; then
+            echo 'Running outcome computation...';
+            python scripts/compute_outcomes.py >> logs/outcomes.log 2>&1;
+            echo 'Sleeping 23 hours...';
+            sleep 82800;
+          else
+            echo 'Waiting for 6:00 AM... Current hour: $$CURRENT_HOUR';
+            sleep 3600;
+          fi;
+        done
+      "
+    
+    mem_limit: 256m
+    cpus: 0.5
+
+
+  ####################################################
+  # AGENT EVALUATOR (Issue #27)
+  # Computes agent accuracy metrics
+  # Runs daily at 7:00 AM (after outcomes)
+  ####################################################
+  agent-evaluator:
+    container_name: marketsentinel-agent-eval
+    
+    build:
+      context: .
+      dockerfile: docker/inference.Dockerfile
+    
+    restart: unless-stopped
+    
+    networks:
+      - marketsentinel-net
+    
+    env_file:
+      - .env
+    
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=sentinel
+      - POSTGRES_PASSWORD=sentinel
+      - POSTGRES_DB=marketsentinel
+      - DATABASE_URL=postgresql+psycopg2://sentinel:sentinel@postgres:5432/marketsentinel
+    
+    volumes:
+      - ./scripts:/app/scripts
+      - ./core:/app/core
+      - ./logs:/app/logs
+      - ./config:/app/config
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+    
+    entrypoint: >
+      sh -c "
+        echo 'Agent evaluator started. Running daily at 7:00 AM.';
+        while true; do
+          CURRENT_HOUR=$$(date +%H);
+          if [ $$CURRENT_HOUR -eq 7 ]; then
+            echo 'Running agent evaluation...';
+            python scripts/evaluate_agents.py >> logs/agent_eval.log 2>&1;
+            echo 'Updating agent weights...';
+            python scripts/update_agent_weights.py >> logs/agent_weights.log 2>&1;
+            echo 'Sleeping 23 hours...';
+            sleep 82800;
+          else
+            echo 'Waiting for 7:00 AM... Current hour: $$CURRENT_HOUR';
+            sleep 3600;
+          fi;
+        done
+      "
+    
+    mem_limit: 256m
+    cpus: 0.5
 
 
   ####################################################
